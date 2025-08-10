@@ -1,0 +1,13 @@
+[project]
+name = "fractal-curve-tokenizer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "==3.12.11"
+dependencies = [
+    "einops>=0.7.0",
+    "pytest>=8.4.1",
+    "pytest-runner>=6.0.1",
+    "torch==2.4.0",
+    "torchvision==0.19.0",
+]
