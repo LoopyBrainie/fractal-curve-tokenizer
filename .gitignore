@@ -130,3 +130,4 @@ dmypy.json
 
 #ignore the workspace files
 workspace/
+tests/

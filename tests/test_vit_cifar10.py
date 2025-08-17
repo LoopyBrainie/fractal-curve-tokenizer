@@ -4,6 +4,7 @@ from torchvision import transforms
 from torch.utils.data import DataLoader
 from vit_pytorch import ViT
 import os
+import glob
 
 # 数据预处理：resize到ViT输入尺寸，转为tensor
 transform = transforms.Compose([
@@ -35,12 +36,16 @@ model = ViT(
 )
 
 # 自动加载训练后模型权重
-ckpt_path = "vit_cifar10.pth"
-if os.path.exists(ckpt_path):
-    model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
-    print(f"已加载模型权重: {ckpt_path}")
+
+# 自动查找最新的模型权重文件
+ckpt_dir = "workspace"
+ckpt_list = sorted(glob.glob(os.path.join(ckpt_dir, "vit_cifar10_*.pth")), reverse=True)
+if ckpt_list:
+    ckpt_path = ckpt_list[0]
+    model.load_state_dict(torch.load(ckpt_path, map_location="cpu", weights_only=True))
+    print(f"已加载最新模型权重: {ckpt_path}")
 else:
-    print(f"未找到模型权重 {ckpt_path}，请先训练并保存模型。")
+    print(f"未找到模型权重 {os.path.join(ckpt_dir, 'vit_cifar10_*.pth')}，请先训练并保存模型。")
 
 model.eval()
 

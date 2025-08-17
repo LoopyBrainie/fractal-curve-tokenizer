@@ -78,9 +78,11 @@ for epoch in range(num_epochs):
 # 保存模型，命名包含训练开始日期和序号
 date_str = datetime.datetime.now().strftime("%Y%m%d")
 base_name = f"vit_cifar10_{date_str}"
+ckpt_dir = "workspace"
+os.makedirs(ckpt_dir, exist_ok=True)
 idx = 1
 while True:
-    ckpt_name = f"{base_name}_{idx}.pth"
+    ckpt_name = os.path.join(ckpt_dir, f"{base_name}_{idx}.pth")
     if not os.path.exists(ckpt_name):
         break
     idx += 1
