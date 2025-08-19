@@ -1,0 +1,69 @@
+{
+  "experiment_info": {
+    "timestamp": "2025-08-19T11:41:35.684981",
+    "experiment_id": "fractal_vit_complete_20250819_113315",
+    "device": "cpu",
+    "config": {
+      "dataset": {
+        "name": "CIFAR10",
+        "val_split": 0.1,
+        "subset_size": 1000
+      },
+      "model": {
+        "image_size": 32,
+        "num_classes": 10,
+        "dim": 256,
+        "depth": 6,
+        "heads": 8,
+        "mlp_dim": 384,
+        "channels": 3,
+        "dim_head": 32,
+        "dropout": 0.1,
+        "emb_dropout": 0.1,
+        "min_patch_size": [
+          4,
+          4
+        ],
+        "max_level": 3,
+        "learnable_split": true,
+        "pool": "cls"
+      },
+      "training": {
+        "num_epochs": 5,
+        "batch_size": 64,
+        "learning_rate": 0.0003,
+        "weight_decay": 0.05,
+        "optimizer": "adamw",
+        "scheduler": "cosine",
+        "warmup_ratio": 0.1,
+        "betas": [
+          0.9,
+          0.999
+        ]
+      },
+      "use_enhanced": true,
+      "use_amp": true,
+      "use_tensorboard": true,
+      "num_workers": 2,
+      "aux_loss_weight": 0.1,
+      "early_stopping_patience": null,
+      "resume_from_checkpoint": null
+    }
+  },
+  "results": {
+    "best_val_accuracy": 23.0,
+    "best_epoch": 1,
+    "final_train_accuracy": 20.8,
+    "final_val_accuracy": 16.0,
+    "total_epochs": 5
+  },
+  "model_info": {
+    "total_parameters": 10099417,
+    "trainable_parameters": 10099417
+  },
+  "file_locations": {
+    "experiment_dir": "D:\\myProject\\fractal-curve-tokenizer\\experiments\\fractal_vit_complete_20250819_113315",
+    "best_model": "D:\\myProject\\fractal-curve-tokenizer\\workspace\\models\\fractal_vit\\fractal_vit_best_20250819_113315.pth",
+    "training_curves": "D:\\myProject\\fractal-curve-tokenizer\\workspace\\visualizations\\fractal_vit_training_curves_20250819_113315.png"
+  }
+}

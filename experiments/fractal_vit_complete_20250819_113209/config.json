@@ -1,0 +1,52 @@
+{
+  "dataset": {
+    "name": "CIFAR10",
+    "val_split": 0.1,
+    "subset_size": 1000
+  },
+  "model": {
+    "image_size": 32,
+    "num_classes": 10,
+    "dim": 256,
+    "depth": 6,
+    "heads": 8,
+    "mlp_dim": 384,
+    "channels": 3,
+    "dim_head": 32,
+    "dropout": 0.1,
+    "emb_dropout": 0.1,
+    "min_patch_size": [
+      4,
+      4
+    ],
+    "max_level": 3,
+    "learnable_split": true,
+    "pool": "cls"
+  },
+  "training": {
+    "num_epochs": 5,
+    "batch_size": 64,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.05,
+    "optimizer": "adamw",
+    "scheduler": "cosine",
+    "warmup_ratio": 0.1,
+    "betas": [
+      0.9,
+      0.999
+    ]
+  },
+  "use_enhanced": true,
+  "use_amp": true,
+  "use_tensorboard": true,
+  "num_workers": 2,
+  "aux_loss_weight": 0.1,
+  "early_stopping_patience": null,
+  "resume_from_checkpoint": null,
+  "experiment_id": "fractal_vit_complete_20250819_113209",
+  "directories": {
+    "experiment": "D:\\myProject\\fractal-curve-tokenizer\\experiments\\fractal_vit_complete_20250819_113209",
+    "workspace_models": "D:\\myProject\\fractal-curve-tokenizer\\workspace\\models\\fractal_vit",
+    "workspace_results": "D:\\myProject\\fractal-curve-tokenizer\\workspace\\results"
+  }
+}

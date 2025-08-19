@@ -130,4 +130,15 @@ dmypy.json
 
 #ignore the workspace files
 workspace/
-tests/
+data/
+
+# Machine Learning model files and checkpoints
+*.pth
+*.pkl
+*.model
+*.weights
+*.h5
+*.ckpt
+experiments/*/checkpoints/
+experiments/*/logs/
+experiments/*/wandb/
