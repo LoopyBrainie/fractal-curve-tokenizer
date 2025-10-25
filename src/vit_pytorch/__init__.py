@@ -6,7 +6,6 @@ from .fractal_vit import (
     NextGenerationFractalViT,
     SimpleFractalViT,
 )
-from .legacy import LegacyFractalHilbertTokenizer
 from .positional import AdvancedFractalPositionEmbedding
 from .tokenization import BaseTokenizer, BaseTokenProcessor, TokenSequence, TokenizerOutput
 from .transformer import EnhancedFractalTransformer, EnhancedFractalTransformerBlock
@@ -22,7 +21,6 @@ __all__ = [
     "EnhancedFractalTransformerBlock",
     "NextGenerationFractalViT",
     "HilbertAwareMultiScaleAttention",
-    "LegacyFractalHilbertTokenizer",
     "SimpleFractalViT",
     "TokenSequence",
     "TokenizerOutput",

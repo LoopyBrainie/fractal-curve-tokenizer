@@ -4,11 +4,20 @@ import argparse
 import statistics
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
 import torch
 from torch import nn
 from torch.optim.adamw import AdamW
+
+import sys
+
+# Allow running the script directly without installing the package.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 from vit_pytorch.fractal_curve_tokenizer import FractalHilbertTokenizer
 from vit_pytorch.fractal_vit import NextGenerationFractalViT, SimpleFractalViT
