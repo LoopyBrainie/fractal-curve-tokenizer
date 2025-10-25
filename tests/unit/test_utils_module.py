@@ -1,0 +1,42 @@
+import torch
+
+from vit_pytorch.features import compute_token_features
+from vit_pytorch.utils import create_attention_mask
+
+
+def test_compute_token_features_shapes() -> None:
+    tokens = torch.randn(3, 16)
+    features = compute_token_features(tokens, level=2, patch_size=(8, 8))
+
+    assert features.stats.shape == (3, 2)
+    assert features.edge.shape == (3, 1)
+    assert features.spatial.shape == (3, 2)
+    assert features.level.shape == (3, 1)
+
+    assert torch.allclose(features.level[:, 0], torch.full((3,), 2.0))
+    assert torch.all(features.spatial[:, 0] == 8.0)
+    assert torch.all(features.spatial[:, 1] == 8.0)
+
+
+def test_compute_token_features_single_value_edge_is_zero() -> None:
+    tokens = torch.randn(4, 1)
+    features = compute_token_features(tokens, level=0, patch_size=(4, 4))
+
+    assert torch.all(features.edge == 0)
+
+
+def test_create_attention_mask_empty_input() -> None:
+    mask = create_attention_mask([], torch.device("cpu"))
+    assert mask.numel() == 0
+    assert mask.shape == (0, 0, 0)
+
+
+def test_create_attention_mask_level_relationships() -> None:
+    level_info = torch.tensor([[1], [1], [2], [4]])
+    mask = create_attention_mask([level_info], torch.device("cpu"))
+
+    assert mask.shape == (1, 4, 4)
+    assert torch.allclose(mask[0, 0, 1], torch.tensor(1.2))
+    assert torch.allclose(mask[0, 0, 2], torch.tensor(1.1))
+    assert torch.allclose(mask[0, 0, 3], torch.tensor(1.0))
+    assert torch.allclose(mask[0, 2, 3], torch.tensor(1.0))

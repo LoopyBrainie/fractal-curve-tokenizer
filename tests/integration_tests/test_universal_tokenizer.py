@@ -39,18 +39,24 @@ def test_various_image_sizes():
         
         try:
             # 分形分割
-            tokens_list, levels_list = tokenizer(image)
-            
-            if len(tokens_list) > 0 and len(tokens_list[0]) > 0:
-                tokens = tokens_list[0]
-                levels = levels_list[0]
-                
-                print(f"  - 成功分割为 {len(tokens)} 个tokens")
+            output = tokenizer.tokenize(image)
+            sequences = output.sequences
+
+            if len(sequences) > 0 and sequences[0].tokens.shape[0] > 0:
+                sequence = sequences[0]
+                tokens = sequence.tokens
+                levels = sequence.get_levels()
+
+                if levels is None:
+                    print("  - 未找到层级信息")
+                    continue
+
+                print(f"  - 成功分割为 {tokens.shape[0]} 个tokens")
                 print(f"  - Token维度: {tokens[0].shape}")
                 print(f"  - 层级分布: {levels[:5].tolist()}")  # 显示前5个层级
-                
+
                 # 检查token尺寸一致性
-                token_dims = [token.shape[0] for token in tokens_list[0]]
+                token_dims = [token.shape[0] for token in tokens]
                 if len(set(token_dims)) == 1:
                     print(f"  ✓ 所有tokens维度一致: {token_dims[0]}")
                 else:
@@ -81,8 +87,8 @@ def test_adaptive_hilbert():
     ]
     
     for level, h, w, desc in test_cases:
-        order = tokenizer.get_hilbert_order_for_level(level, h, w)
-        adaptive_order = tokenizer.adaptive_hilbert_order(h, w, level)
+        order = tokenizer.get_enhanced_hilbert_order(level, h, w)
+        adaptive_order = tokenizer.adaptive_hilbert_mapping([0, 1, 2, 3], h, w)
         
         print(f"{desc} (Level {level}, {h}x{w}):")
         print(f"  - 基础顺序: {order}")
@@ -112,13 +118,13 @@ def test_extreme_cases():
         
         try:
             image = torch.randn(1, 3, h, w)
-            tokens_list, levels_list = tokenizer(image)
-            
-            if len(tokens_list) > 0:
-                tokens = tokens_list[0]
-                levels = levels_list[0]
-                print(f"  ✓ 生成 {len(tokens)} 个tokens")
-                print(f"  ✓ Token形状: {tokens[0].shape if len(tokens) > 0 else 'None'}")
+            output = tokenizer.tokenize(image)
+            sequences = output.sequences
+
+            if len(sequences) > 0 and sequences[0].tokens.shape[0] > 0:
+                tokens = sequences[0].tokens
+                print(f"  ✓ 生成 {tokens.shape[0]} 个tokens")
+                print(f"  ✓ Token形状: {tokens[0].shape if tokens.shape[0] > 0 else 'None'}")
             else:
                 print("  - 无tokens生成")
                 
@@ -145,18 +151,18 @@ def test_learnable_split():
     image = torch.randn(2, 3, 64, 64)  # 批量测试
     
     # 可学习分割
-    tokens_learnable, levels_learnable = tokenizer_learnable(image)
+    output_learnable = tokenizer_learnable.tokenize(image)
     
     # 固定分割  
-    tokens_fixed, levels_fixed = tokenizer_fixed(image)
-    
+    output_fixed = tokenizer_fixed.tokenize(image)
+
     print(f"可学习分割:")
-    for i in range(len(tokens_learnable)):
-        print(f"  图像{i}: {len(tokens_learnable[i])} tokens")
+    for idx, sequence in enumerate(output_learnable.sequences):
+        print(f"  图像{idx}: {sequence.tokens.shape[0]} tokens")
         
     print(f"固定分割:")
-    for i in range(len(tokens_fixed)):
-        print(f"  图像{i}: {len(tokens_fixed[i])} tokens")
+    for idx, sequence in enumerate(output_fixed.sequences):
+        print(f"  图像{idx}: {sequence.tokens.shape[0]} tokens")
 
 def visualize_tokenization(h=32, w=32):
     """可视化分形分割过程"""
@@ -175,20 +181,25 @@ def visualize_tokenization(h=32, w=32):
     image[0, 1] = x
     image[0, 2] = (y + x) / 2
     
-    tokens_list, levels_list = tokenizer(image)
-    
-    if len(tokens_list) > 0:
-        tokens = tokens_list[0]
-        levels = levels_list[0]
-        
-        print(f"总共生成 {len(tokens)} 个tokens")
-        
+    output = tokenizer.tokenize(image)
+    sequences = output.sequences
+
+    if len(sequences) > 0 and sequences[0].tokens.shape[0] > 0:
+        tokens = sequences[0].tokens
+        levels = sequences[0].get_levels()
+
+        if levels is None:
+            print("未找到层级信息")
+            return
+
+        print(f"总共生成 {tokens.shape[0]} 个tokens")
+
         # 统计每层的token数量
         level_counts = {}
         for level_info in levels:
             depth = level_info[0].item()
             level_counts[depth] = level_counts.get(depth, 0) + 1
-            
+
         print("各层token分布:")
         for depth in sorted(level_counts.keys()):
             print(f"  层级 {depth}: {level_counts[depth]} 个tokens")

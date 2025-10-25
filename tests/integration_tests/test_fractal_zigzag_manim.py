@@ -1,35 +1,48 @@
-from manimlib.scene.scene import Scene
-from manimlib.mobject.geometry import Square
-from manimlib.mobject.geometry import VMobject
-from manimlib.mobject.types import VGroup
-from manimlib.mobject.geometry import Dot
-from manimlib.constants import ORIGIN, YELLOW, GREEN, RED
-from manimlib.animation.creation import ShowCreation
+import math
 import numpy as np
-from vit_pytorch.fractal_curve_tokenizer import zigzag_indices
+import pytest
 
-class FractalZigzagPatch(Scene):
+pytest.importorskip("manimlib")
+
+from manimlib.animation.creation import ShowCreation
+from manimlib.constants import GREEN, ORIGIN, RED, YELLOW
+from manimlib.mobject.geometry import Dot, Square
+from manimlib.mobject.types.vectorized_mobject import VMobject, VGroup
+from manimlib.scene.scene import Scene
+
+from vit_pytorch.fractal_curve_tokenizer import FractalHilbertTokenizer
+
+
+class FractalHilbertPatch(Scene):
     def construct(self):
-        # 设定patch大小
-        height, width = 9, 16
-        # 生成之字形索引
-        idxs = zigzag_indices(height, width)
-        # 画网格
+        grid_size = 8
+        hilbert_order = int(math.log2(grid_size))
+        tokenizer = FractalHilbertTokenizer(min_patch_size=(1, 1), max_level=hilbert_order)
+        coords = tokenizer.generate_true_hilbert_curve(hilbert_order)
+
         grid = VGroup()
-        for r in range(height):
-            for c in range(width):
-                rect = Square(0.4).move_to(np.array([c, r, 0]))
+        for row in range(grid_size):
+            for col in range(grid_size):
+                rect = Square(0.35).move_to(np.array([col, row, 0]))
                 grid.add(rect)
+
         grid.move_to(ORIGIN)
         self.add(grid)
-        # 画走线
+
         path = VMobject(color=YELLOW)
-        path.set_points_as_corners([
-            np.array([c, r, 0]) for r, c in idxs
-        ])
+        path.set_points_as_corners([np.array([x, y, 0]) for x, y in coords])
         self.play(ShowCreation(path), run_time=3)
-        # 标记入口和出口
-        start = Dot(np.array([idxs[0][1], idxs[0][0], 0]), color=GREEN)
-        end = Dot(np.array([idxs[-1][1], idxs[-1][0], 0]), color=RED)
+
+        start = Dot(np.array([coords[0][0], coords[0][1], 0]), color=GREEN)
+        end = Dot(np.array([coords[-1][0], coords[-1][1], 0]), color=RED)
         self.add(start, end)
         self.wait(2)
+
+
+def test_hilbert_curve_coordinates_are_unique() -> None:
+    tokenizer = FractalHilbertTokenizer(min_patch_size=(1, 1))
+    coords = tokenizer.generate_true_hilbert_curve(3)
+
+    assert len(coords) == 64
+    assert coords[0] == (0, 0)
+    assert len({tuple(point) for point in coords}) == len(coords)
