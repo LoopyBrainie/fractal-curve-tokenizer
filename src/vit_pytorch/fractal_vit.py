@@ -86,15 +86,12 @@ class EnhancedFractalTokenProcessor(BaseTokenProcessor):
             )
 
         # 多尺度适配器
-        self.scale_adapters = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(output_dim, output_dim),
-                    nn.LayerNorm(output_dim),
-                    nn.GELU(),
-                )
-                for _ in range(max_level + 1)
-            ]
+        # REFACTORED: Replaced ModuleList with shared adapter + level embedding
+        self.level_embedding = nn.Embedding(max_level + 1, output_dim)
+        self.shared_scale_adapter = nn.Sequential(
+            nn.Linear(output_dim * 2, output_dim), # Input: concatenated token + level_emb
+            nn.LayerNorm(output_dim),
+            nn.GELU(),
         )
 
         # 动态权重网络
@@ -161,16 +158,21 @@ class EnhancedFractalTokenProcessor(BaseTokenProcessor):
 
             # 多尺度自适应
             if level_tensor.numel() > 0 and level_tensor.shape[0] > 0:
-                adapted = []
-                for j, token in enumerate(proj_tokens):
-                    if j < level_tensor.shape[0]:
-                        level_idx = int(level_tensor[j, 0].clamp(0, self.max_level).item())
-                        adapted_token = self.scale_adapters[level_idx](token.unsqueeze(0)).squeeze(0)
-                    else:
-                        adapted_token = token
-                    adapted.append(adapted_token)
-
-                final_tokens = torch.stack(adapted)
+                # Vectorized implementation
+                depths = level_tensor[:, 0].clamp(0, self.max_level).long()
+                
+                # 1. Get level embeddings: (seq_len, dim)
+                level_embs = self.level_embedding(depths)
+                
+                # 2. Expand to batch size if needed (assuming proj_tokens is [batch, seq_len, dim])
+                # Note: proj_tokens comes from processing a single sequence in the loop, so it's (seq_len, dim)
+                # Wait, the loop iterates over batch. So proj_tokens is (seq_len, dim).
+                
+                # 3. Concatenate: (seq_len, dim * 2)
+                adapter_input = torch.cat([proj_tokens, level_embs], dim=-1)
+                
+                # 4. Apply shared adapter
+                final_tokens = self.shared_scale_adapter(adapter_input)
             else:
                 final_tokens = proj_tokens
 
@@ -187,8 +189,6 @@ class EnhancedFractalTokenProcessor(BaseTokenProcessor):
 
 class NextGenerationFractalViT(nn.Module):
     """
-    下一代分形ViT，完全对齐增强的FractalHilbertTokenizer特性：
-
     核心特性：
     - 可学习的分割决策网络（6特征输入）
     - 真正的Hilbert曲线递归算法（支持多方向）
@@ -340,113 +340,174 @@ class NextGenerationFractalViT(nn.Module):
         if len(tokens_list) != batch_size:
             raise ValueError("Tokenizer output sequence count does not match batch size.")
 
-        # 2. 批量处理
-        batch_outputs = []
+        # 2. 准备 Batch Padding
+        # 过滤掉空 Token 的情况 (虽然理论上不应该发生，但为了健壮性)
+        valid_indices = []
+        valid_tokens = []
+        valid_levels = []
+        lengths = []
+
+        for i in range(batch_size):
+            t = tokens_list[i]
+            l = levels_list[i]
+            if t.numel() > 0:
+                valid_indices.append(i)
+                valid_tokens.append(t)
+                valid_levels.append(l)
+                lengths.append(t.shape[0])
+            else:
+                # 处理空图片的情况: 创建一个 dummy token
+                dummy_token = torch.zeros(1, self.dim, device=device)
+                dummy_level = torch.zeros(1, self.max_level + 4, dtype=torch.long, device=device) # 假设 info_len 足够
+                valid_indices.append(i)
+                valid_tokens.append(dummy_token)
+                valid_levels.append(dummy_level)
+                lengths.append(1)
+
+        # 使用 pad_sequence 进行对齐
+        # padded_tokens: (B, Max_Len, Dim)
+        padded_tokens = torch.nn.utils.rnn.pad_sequence(valid_tokens, batch_first=True)
+        
+        # padded_levels: (B, Max_Len, Info_Dim)
+        # 注意: levels 的 info_len 可能不一致，需要先统一 info_len
+        max_info_len = max([l.shape[1] for l in valid_levels])
+        uniform_levels = []
+        for l in valid_levels:
+            if l.shape[1] < max_info_len:
+                padding = torch.zeros(l.shape[0], max_info_len - l.shape[1], dtype=torch.long, device=device)
+                l = torch.cat([l, padding], dim=1)
+            uniform_levels.append(l)
+            
+        padded_levels = torch.nn.utils.rnn.pad_sequence(uniform_levels, batch_first=True, padding_value=0)
+
+        # 3. 位置编码 (Batch 处理)
+        # padded_levels: (B, Max_Len, Info_Dim)
+        # 我们需要生成 sequence_positions: (B, Max_Len)
+        max_len = padded_tokens.shape[1]
+        seq_positions = torch.arange(max_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        
+        # AdvancedFractalPositionEmbedding 需要支持 Batch 输入
+        # 目前它只支持 (Seq, Info)，我们需要修改它或者 reshape
+        # 临时方案: Reshape -> Forward -> Reshape
+        # 但 positional embedding 内部有广播逻辑，可能需要调整。
+        # 让我们先假设 positional embedding 可以处理 (B*L, Info) 或者我们修改 positional.py
+        
+        # 为了避免修改 positional.py 的接口太复杂，我们这里先 flatten 处理
+        # 但这样会丢失 batch 内的相对位置信息吗？不会，因为 seq_positions 是正确的
+        
+        # 实际上，AdvancedFractalPositionEmbedding 的 forward 接受 levels_info (N, Info)
+        # 我们可以把 Batch 和 Seq 维度合并
+        flat_levels = padded_levels.reshape(-1, padded_levels.shape[-1])
+        flat_pos_emb = self.pos_embedding(flat_levels) # (B*MaxLen, Dim)
+        pos_emb = flat_pos_emb.reshape(batch_size, max_len, -1)
+        
+        x = padded_tokens + pos_emb
+
+        # 4. 添加 CLS Token
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1) # (B, 1, Dim)
+        x = torch.cat((cls_tokens, x), dim=1) # (B, 1+MaxLen, Dim)
+
+        # 更新 Levels (添加 CLS 的 level info，全 0)
+        cls_level = torch.zeros(batch_size, 1, padded_levels.shape[-1], dtype=torch.long, device=device)
+        padded_levels = torch.cat([cls_level, padded_levels], dim=1) # (B, 1+MaxLen, Info_Dim)
+
+        x = self.dropout(x)
+
+        # 5. 创建 Attention Mask
+        # True 表示被 Mask (不参与计算)，False 表示保留
+        # 初始全 False (保留)
+        # 形状: (B, 1+MaxLen) -> 扩展为 (B, 1, 1, 1+MaxLen) 或 (B, 1+MaxLen, 1+MaxLen)
+        # PyTorch MultiheadAttention 的 key_padding_mask 是 (B, S)
+        # 但我们的 Transformer Block 内部可能用了自定义 Attention
+        
+        # 构建 key_padding_mask: (B, 1+MaxLen)
+        # CLS token (index 0) 永远有效
+        key_padding_mask = torch.zeros(batch_size, x.shape[1], dtype=torch.bool, device=device)
+        
+        for i, length in enumerate(lengths):
+            # 有效长度是 length，加上 CLS 是 length + 1
+            # 所以从 length + 1 开始 mask
+            if length + 1 < x.shape[1]:
+                key_padding_mask[i, length + 1:] = True
+
+        # 转换 mask 为 attention 矩阵所需的形状 (B, 1, Seq, Seq) 或 (B, Seq, Seq)
+        # 我们的 Attention 模块接受 attention_mask
+        # 如果是 True/False mask, 通常 True 表示 Mask 掉
+        # 但在 utils.create_attention_mask 中，通常返回的是 1/0 mask (1保留, 0 mask)
+        # 让我们检查一下 attention.py 的实现:
+        # dots.masked_fill_(~attention_mask.bool(), mask_value)
+        # 这意味着 attention_mask 必须是: True(保留), False(Mask掉)
+        
+        attn_mask = ~key_padding_mask # (B, Seq) -> True 保留
+        # 扩展为 (B, 1, 1, Seq) 以便广播? 
+        # Attention 内部: dots (B, H, N, N)
+        # 我们需要 (B, 1, 1, N) 或者 (B, 1, N, N)
+        attn_mask = attn_mask.unsqueeze(1).unsqueeze(2) # (B, 1, 1, Seq)
+        # 这样只会 mask Key，Query 都能关注到 Key
+        
+        # 6. Transformer 处理 (Batch 模式)
+        # 注意: transformer.py 需要能处理 Batch 的 levels_info
+        x = self.transformer(x, padded_levels, attn_mask, self.use_dynamic_depth)
+
+        # 7. 池化策略
+        if self.pool == "cls":
+            pooled = x[:, 0]
+        elif self.pool == "mean":
+            # 只对非 Padding 部分求平均
+            # x: (B, 1+MaxLen, Dim)
+            # mask: (B, 1+MaxLen) True=Valid
+            token_x = x[:, 1:] # (B, MaxLen, Dim)
+            token_mask = ~key_padding_mask[:, 1:] # (B, MaxLen) True=Valid
+            
+            # 将 Padding 部分置 0
+            token_x = token_x * token_mask.unsqueeze(-1).float()
+            
+            # 求和
+            sum_x = token_x.sum(dim=1) # (B, Dim)
+            
+            # 有效数量
+            valid_counts = token_mask.sum(dim=1, keepdim=True).float().clamp(min=1.0)
+            
+            pooled = sum_x / valid_counts
+        else:
+            # 混合池化
+            pooling_weights = self.pooling_selector(x.transpose(1, 2)) # (B, 2)
+            cls_pooled = x[:, 0]
+            
+            # Mean pooling logic
+            token_x = x[:, 1:]
+            token_mask = ~key_padding_mask[:, 1:]
+            token_x = token_x * token_mask.unsqueeze(-1).float()
+            sum_x = token_x.sum(dim=1)
+            valid_counts = token_mask.sum(dim=1, keepdim=True).float().clamp(min=1.0)
+            mean_pooled = sum_x / valid_counts
+            
+            pooled = pooling_weights[:, 0:1] * cls_pooled + pooling_weights[:, 1:2] * mean_pooled
+
+        pooled = self.to_latent(pooled)
+        final_output = self.mlp_head(pooled)
+
+        # 8. 辅助信息 (可选)
+        # 初始化为空列表，确保变量已定义
         aux_infos = []
         features_list = []
 
-        for b in range(batch_size):
-            tokens = tokens_list[b]
-            levels = levels_list[b]
-
-            if tokens.device != device:
-                tokens = tokens.to(device)
-            if levels.device != device:
-                levels = levels.to(device)
-
-            if tokens.numel() == 0 or tokens.shape[0] == 0:
-                batch_outputs.append(torch.zeros(1, self.num_classes, device=device))
-                if return_aux_info:
-                    aux_infos.append({
-                        "num_tokens": 0,
-                        "levels_used": [],
-                        "token_distribution": torch.zeros(self.max_level + 1, device=device),
-                    })
-                if return_features:
-                    features_list.append(torch.zeros(6, device=device))
-                continue
-
-            # 3. Token处理和投影
-            x = tokens.unsqueeze(0)
-            level_info = levels
-
-            # 4. 位置编码
-            if level_info.numel() > 0:
-                seq_positions = torch.arange(x.shape[1], device=device)
-                pos_emb = self.pos_embedding(level_info, seq_positions)
-                x = x + pos_emb.unsqueeze(0)
-
-            # 5. 添加CLS token
-            cls_tokens = self.cls_token.expand(1, -1, -1)
-            x = torch.cat((cls_tokens, x), dim=1)
-
-            if level_info.numel() > 0:
-                cls_level = torch.zeros(1, level_info.shape[1], device=device, dtype=level_info.dtype)
-                level_info = torch.cat([cls_level, level_info], dim=0)
-
-            x = self.dropout(x)
-
-            # 6. 创建注意力掩码
-            attention_mask = None
-            if level_info.numel() > 0:
-                token_levels = level_info[1:] if level_info.shape[0] > 1 else torch.empty(0, 0, device=device)
-                base_mask = create_attention_mask([token_levels], device)
-                attention_mask = torch.ones(1, x.shape[1], x.shape[1], device=device)
-                if base_mask.numel() > 0:
-                    seq_tokens = base_mask.shape[-1]
-                    attention_mask[:, 1 : seq_tokens + 1, 1 : seq_tokens + 1] = base_mask[0, :seq_tokens, :seq_tokens]
-
-            # 7. Transformer处理
-            x = self.transformer(x, level_info, attention_mask, self.use_dynamic_depth)
-
-            # 8. 池化策略选择
-            if self.pool == "cls":
-                pooled = x[:, 0].squeeze(0)
-            elif self.pool == "mean":
-                if x.shape[1] > 1:
-                    if level_info.numel() > 0 and level_info.shape[0] > 1:
-                        token_levels = level_info[1:, 0].clamp(0, self.max_level)
-                        weights = F.softmax(self.level_weights[token_levels], dim=0)
-                        pooled = torch.sum(x[0, 1:] * weights.unsqueeze(-1), dim=0)
-                    else:
-                        pooled = x[:, 1:].mean(dim=1).squeeze(0)
-                else:
-                    pooled = x[:, 0].squeeze(0)
-            else:
-                pooling_weights = self.pooling_selector(x.transpose(1, 2))
-                cls_pooled = x[:, 0]
-                mean_pooled = x[:, 1:].mean(dim=1) if x.shape[1] > 1 else cls_pooled
-                pooled = (pooling_weights[0, 0] * cls_pooled + pooling_weights[0, 1] * mean_pooled).squeeze(0)
-
-            pooled = self.to_latent(pooled)
-            output = self.mlp_head(pooled.unsqueeze(0))
-
-            batch_outputs.append(output)
-
+        if return_aux_info or return_features:
             if return_aux_info:
-                if level_info.numel() > 0 and level_info.shape[0] > 1:
-                    depths = level_info[1:, 0]
-                    unique_levels = depths.unique().tolist()
-                    max_level_for_bincount = min(self.max_level, depths.max().item()) if depths.numel() > 0 else 0
-                    token_dist = torch.bincount(depths.long(), minlength=int(max_level_for_bincount + 1)).float()
-                    full_token_dist = torch.zeros(self.max_level + 1, device=device)
-                    full_token_dist[: token_dist.shape[0]] = token_dist
-                else:
-                    unique_levels = []
-                    full_token_dist = torch.zeros(self.max_level + 1, device=device)
-
-                aux_info = {
-                    "num_tokens": tokens.shape[0],
-                    "levels_used": unique_levels,
-                    "token_distribution": full_token_dist,
-                }
-                aux_infos.append(aux_info)
-
+                for i in range(batch_size):
+                    l = levels_list[i]
+                    if l.numel() > 0:
+                        depths = l[:, 0]
+                        unique = depths.unique().tolist()
+                        # ... 简化统计 ...
+                        aux_infos.append({"num_tokens": lengths[i], "levels_used": unique})
+                    else:
+                        aux_infos.append({"num_tokens": 0})
+            
             if return_features:
-                features = self.feature_analyzer(pooled)
-                features_list.append(features)
-
-        final_output = torch.cat(batch_outputs, dim=0)
+                # 批量计算 features
+                batch_features = self.feature_analyzer(pooled)
+                features_list = [f for f in batch_features]
 
         if return_aux_info and return_features:
             return final_output, aux_infos, features_list

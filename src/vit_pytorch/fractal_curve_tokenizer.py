@@ -172,8 +172,14 @@ class FractalHilbertTokenizer(BaseTokenizer):
                 split_prob = self.split_decision(features).item()
                 should_stop = split_prob < self.adaptive_threshold
             else:
-                # 默认策略：尽可能深度分割，但有层级限制
-                should_stop = level >= 10  # 默认最大10层
+                # 默认策略：如果设置了 adaptive_threshold，则基于方差进行自适应分割
+                if self.adaptive_threshold is not None and self.adaptive_threshold > 0:
+                    patch_var = torch.var(patch)
+                    # 如果方差小于阈值，说明区域平坦，可以停止分割
+                    should_stop = patch_var < self.adaptive_threshold
+                else:
+                    # 否则尽可能深度分割，但有层级限制
+                    should_stop = level >= 10  # 默认最大10层
 
         if should_stop:
             # 停止分形，输出当前patch作为token

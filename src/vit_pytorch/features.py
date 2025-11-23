@@ -37,7 +37,11 @@ def compute_token_features(
     batch_size = tokens.shape[0]
     patch_height, patch_width = patch_size
 
-    token_var = torch.var(tokens, dim=-1, keepdim=True)
+    if tokens.shape[-1] > 1:
+        token_var = torch.var(tokens, dim=-1, keepdim=True)
+    else:
+        token_var = torch.zeros(batch_size, 1, device=device)
+
     token_mean = torch.mean(tokens, dim=-1, keepdim=True)
 
     if tokens.shape[-1] > 1:

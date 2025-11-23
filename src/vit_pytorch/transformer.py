@@ -28,8 +28,20 @@ class EnhancedFractalTransformerBlock(nn.Module):
         self.ff = AdaptiveFractalFeedForward(dim=dim, hidden_dim=mlp_dim, dropout=dropout, max_level=max_level)
 
         self.residual_weights = nn.Parameter(torch.ones(2))
-        self.level_aware_norm1 = nn.ModuleList([nn.LayerNorm(dim) for _ in range(max_level + 1)])
-        self.level_aware_norm2 = nn.ModuleList([nn.LayerNorm(dim) for _ in range(max_level + 1)])
+        
+        # REFACTORED: Replaced ModuleList of LayerNorms with Embeddings for Gamma/Beta
+        # This reduces parameters from 50*2*dim to 2*dim (plus embedding table)
+        self.norm1_gamma = nn.Embedding(max_level + 1, dim)
+        self.norm1_beta = nn.Embedding(max_level + 1, dim)
+        self.norm2_gamma = nn.Embedding(max_level + 1, dim)
+        self.norm2_beta = nn.Embedding(max_level + 1, dim)
+        
+        # Initialize to identity (gamma=1, beta=0)
+        nn.init.ones_(self.norm1_gamma.weight)
+        nn.init.zeros_(self.norm1_beta.weight)
+        nn.init.ones_(self.norm2_gamma.weight)
+        nn.init.zeros_(self.norm2_beta.weight)
+        
         self.default_norm1 = nn.LayerNorm(dim)
         self.default_norm2 = nn.LayerNorm(dim)
 
@@ -37,23 +49,34 @@ class EnhancedFractalTransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         levels_info: Optional[torch.Tensor],
-        norm_layers: nn.ModuleList,
+        gamma_emb: nn.Embedding,
+        beta_emb: nn.Embedding,
         default_norm: nn.LayerNorm,
     ) -> torch.Tensor:
         if levels_info is None or levels_info.numel() == 0:
             return default_norm(x)
 
-        batch_size, seq_len, _ = x.shape
-        output = torch.zeros_like(x)
-        depths = levels_info[:, 0].clamp(0, self.max_level)
-
-        for i in range(seq_len):
-            level_idx = int(depths[i].item())
-            token = x[:, i : i + 1, :]
-            normed_token = norm_layers[level_idx](token)
-            output[:, i : i + 1, :] = normed_token
-
-        return output
+        # Vectorized implementation
+        batch_size, seq_len, dim = x.shape
+        
+        # Handle both (Seq, Info) and (Batch, Seq, Info) shapes for levels_info
+        if levels_info.dim() == 2:
+            # Old behavior: (Seq, Info) -> broadcast to batch
+            depths = levels_info[:, 0].clamp(0, self.max_level).long() # (seq_len,)
+            gamma = gamma_emb(depths).unsqueeze(0) # (1, seq_len, dim)
+            beta = beta_emb(depths).unsqueeze(0) # (1, seq_len, dim)
+        else:
+            # New behavior: (Batch, Seq, Info)
+            depths = levels_info[:, :, 0].clamp(0, self.max_level).long() # (B, S)
+            gamma = gamma_emb(depths) # (B, S, dim)
+            beta = beta_emb(depths) # (B, S, dim)
+        
+        # Manual LayerNorm: (x - mean) / std * gamma + beta
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        x_norm = (x - mean) / torch.sqrt(var + 1e-5)
+        
+        return x_norm * gamma + beta
 
     def forward(
         self,
@@ -61,11 +84,11 @@ class EnhancedFractalTransformerBlock(nn.Module):
         levels_info: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        norm1_x = self._apply_level_aware_norm(x, levels_info, self.level_aware_norm1, self.default_norm1)
+        norm1_x = self._apply_level_aware_norm(x, levels_info, self.norm1_gamma, self.norm1_beta, self.default_norm1)
         attn_out = self.attention(norm1_x, levels_info, attention_mask)
         x = x + attn_out * self.residual_weights[0]
 
-        norm2_x = self._apply_level_aware_norm(x, levels_info, self.level_aware_norm2, self.default_norm2)
+        norm2_x = self._apply_level_aware_norm(x, levels_info, self.norm2_gamma, self.norm2_beta, self.default_norm2)
         ff_out = self.ff(norm2_x, levels_info)
         x = x + ff_out * self.residual_weights[1]
 

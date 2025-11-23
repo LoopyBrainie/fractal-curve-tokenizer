@@ -36,20 +36,19 @@ class AdaptiveFractalFeedForward(nn.Module):
         )
 
         if use_level_adaptation:
-            self.level_adapters = nn.ModuleList(
-                [
-                    nn.Sequential(
-                        nn.Linear(dim, hidden_dim // 2),
-                        nn.ReLU(),
-                        nn.Linear(hidden_dim // 2, dim),
-                        nn.Dropout(dropout),
-                    )
-                    for _ in range(max_level + 1)
-                ]
+            # REFACTORED: Replaced 50 separate adapters with a single shared adapter + level embedding
+            # This drastically reduces parameter count and enables vectorized execution.
+            self.level_embedding = nn.Embedding(max_level + 1, dim)
+            self.shared_level_adapter = nn.Sequential(
+                nn.Linear(dim * 2, hidden_dim // 2), # Input: concatenated token + level_emb
+                nn.ReLU(),
+                nn.Linear(hidden_dim // 2, dim),
+                nn.Dropout(dropout),
             )
             self.level_mixing_weights = nn.Parameter(torch.ones(max_level + 1))
         else:
-            self.level_adapters = None
+            self.level_embedding = None
+            self.shared_level_adapter = None
             self.level_mixing_weights = None
 
         if use_feature_gating:
@@ -81,20 +80,30 @@ class AdaptiveFractalFeedForward(nn.Module):
         main_out = self.main_net(x_norm)
 
         if self.use_level_adaptation and levels_info is not None and levels_info.numel() > 0:
-            depths = levels_info[:, 0].clamp(0, self.max_level)
-            level_outputs = []
-            for i, depth in enumerate(depths):
-                depth_idx = int(depth.item())
-                if i < seq_len:
-                    token_input = x_norm[:, i : i + 1, :]
-                    level_out = self.level_adapters[depth_idx](token_input)
-                    level_outputs.append(level_out)
-
-            if level_outputs:
-                level_adapted = torch.cat(level_outputs, dim=1)
+            if levels_info.dim() == 2:
+                # Old behavior: (Seq, Info)
+                depths = levels_info[:, 0].clamp(0, self.max_level).long()
+                level_embs = self.level_embedding(depths) # (Seq, Dim)
+                level_embs = level_embs.unsqueeze(0).expand(batch, -1, -1) # (Batch, Seq, Dim)
+                
                 mixing_weights = F.softmax(self.level_mixing_weights[depths], dim=0)
                 mixing_weights = mixing_weights.view(1, seq_len, 1)
-                main_out = main_out * (1 - mixing_weights) + level_adapted * mixing_weights
+            else:
+                # New behavior: (Batch, Seq, Info)
+                depths = levels_info[:, :, 0].clamp(0, self.max_level).long() # (Batch, Seq)
+                level_embs = self.level_embedding(depths) # (Batch, Seq, Dim)
+                
+                # Softmax across sequence dimension to match original behavior
+                mixing_weights = F.softmax(self.level_mixing_weights[depths], dim=1) # (Batch, Seq)
+                mixing_weights = mixing_weights.unsqueeze(-1) # (Batch, Seq, 1)
+            
+            # 3. Concatenate with input: (batch, seq_len, dim * 2)
+            adapter_input = torch.cat([x_norm, level_embs], dim=-1)
+            
+            # 4. Pass through shared adapter
+            level_adapted = self.shared_level_adapter(adapter_input)
+            
+            main_out = main_out * (1 - mixing_weights) + level_adapted * mixing_weights
 
         if self.use_feature_gating and self.feature_gate is not None:
             gates = self.feature_gate(x_norm)

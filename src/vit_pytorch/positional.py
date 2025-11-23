@@ -27,50 +27,31 @@ class AdvancedFractalPositionEmbedding(nn.Module):
         self.use_hilbert_encoding = use_hilbert_encoding
         self.use_spatial_encoding = use_spatial_encoding
 
+        # 1. 深度编码 (Depth Embedding)
         self.depth_embedding = nn.Embedding(max_level + 1, dim)
 
-        if use_hilbert_encoding:
-            self.path_embedding = nn.Embedding(max_seq_len, dim)
-            self.path_encoder = nn.LSTM(
-                input_size=dim,
-                hidden_size=dim // 2,
-                num_layers=2,
-                batch_first=True,
-                bidirectional=True,
-            )
+        # 2. 层级路径编码 (Hierarchical Path Embedding)
+        # 替代原有的 LSTM 和 2D 绝对位置编码
+        # 每个层级有 4 个象限 (0, 1, 2, 3)
+        # 总共 max_level * 4 个唯一的层级-象限组合
+        self.quadrant_embedding = nn.Embedding(max_level * 4, dim)
 
-        if use_spatial_encoding:
-            self.spatial_embedding_2d = nn.Parameter(torch.randn(1, max_seq_len, dim))
-            self.scale_embedding = nn.Embedding(max_level + 1, dim)
-
-        input_dim = dim
-        if use_hilbert_encoding:
-            input_dim += dim
-        if use_spatial_encoding:
-            input_dim += dim * 2
-
+        # 3. 融合网络 (简化版)
+        # 输入: Depth Emb + Path Emb
         self.fusion_network = nn.Sequential(
-            nn.Linear(input_dim, dim * 2),
-            nn.LayerNorm(dim * 2),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(dim * 2, dim),
-            nn.LayerNorm(dim),
         )
 
-        self.encoding_weights = nn.Parameter(torch.ones(4))
         self.level_attention_bias = nn.Parameter(torch.zeros(max_level + 1, max_level + 1))
 
         self._init_parameters()
 
     def _init_parameters(self) -> None:
         nn.init.normal_(self.depth_embedding.weight, std=0.02)
-        if self.use_hilbert_encoding:
-            nn.init.normal_(self.path_embedding.weight, std=0.02)
-        if self.use_spatial_encoding:
-            nn.init.normal_(self.spatial_embedding_2d, std=0.02)
-            nn.init.normal_(self.scale_embedding.weight, std=0.02)
-
+        nn.init.normal_(self.quadrant_embedding.weight, std=0.02)
         nn.init.uniform_(self.level_attention_bias, -0.1, 0.1)
 
     def forward(
@@ -82,56 +63,49 @@ class AdvancedFractalPositionEmbedding(nn.Module):
             return torch.zeros(0, self.dim, device=levels_info.device, dtype=torch.float32)
 
         device = levels_info.device
-        seq_len = levels_info.shape[0]
-
-        depths = levels_info[:, 0].clamp(0, self.max_level)
+        
+        # levels_info: (..., max_info_len)
+        # col 0: depth
+        # col 1..: path indices (0-3)
+        
+        depths = levels_info[..., 0].clamp(0, self.max_level).long()
+        paths = levels_info[..., 1:].long() # (..., path_len)
+        
+        # 1. 深度编码
         depth_emb = self.depth_embedding(depths)
 
-        embeddings = [depth_emb]
-
-        if self.use_hilbert_encoding and levels_info.shape[1] > 1:
-            path_info = levels_info[:, 1:]
-            path_embeddings = []
-            for i in range(path_info.shape[1]):
-                path_indices = path_info[:, i].clamp(0, self.max_seq_len - 1)
-                path_emb = self.path_embedding(path_indices)
-                path_embeddings.append(path_emb)
-
-            if path_embeddings:
-                path_sequence = torch.stack(path_embeddings, dim=1)
-                path_encoded, _ = self.path_encoder(path_sequence)
-                path_final = path_encoded[:, -1, :]
-                embeddings.append(path_final)
-            else:
-                embeddings.append(torch.zeros_like(depth_emb))
-
-        if self.use_spatial_encoding:
-            if sequence_positions is not None:
-                seq_pos = sequence_positions.clamp(0, self.max_seq_len - 1)
-            else:
-                seq_pos = torch.arange(seq_len, device=device).clamp(0, self.max_seq_len - 1)
-
-            spatial_emb = self.spatial_embedding_2d[0, seq_pos, :]
-            embeddings.append(spatial_emb)
-
-            scale_emb = self.scale_embedding(depths)
-            embeddings.append(scale_emb)
-
-        combined_emb = torch.cat(embeddings, dim=-1)
-        fused_emb = self.fusion_network(combined_emb)
-
-        if len(embeddings) == 4:
-            weighted_emb = (
-                embeddings[0] * self.encoding_weights[0]
-                + embeddings[1] * self.encoding_weights[1]
-                + embeddings[2] * self.encoding_weights[2]
-                + embeddings[3] * self.encoding_weights[3]
-            ) / self.encoding_weights.sum()
-        else:
-            weighted_emb = fused_emb
-
-        final_emb = fused_emb + weighted_emb * 0.1
-        return final_emb
+        # 2. 层级路径编码
+        # 计算每个路径节点的全局索引: level_index * 4 + quadrant_index
+        # paths 的第 j 列对应第 j+1 层 (因为 col 0 是 depth)
+        
+        path_len = paths.shape[-1]
+        
+        # 生成层级偏移量: [0, 4, 8, ..., (path_len-1)*4]
+        level_offsets = torch.arange(path_len, device=device) * 4
+        
+        # 广播相加: (..., path_len) + (path_len,) -> (..., path_len)
+        flat_indices = paths + level_offsets
+        
+        # 安全截断，防止越界 (虽然理论上不应该发生)
+        flat_indices = flat_indices.clamp(0, self.max_level * 4 - 1)
+        
+        # 查找 Embedding: (..., path_len, dim)
+        path_embs = self.quadrant_embedding(flat_indices)
+        
+        # 创建掩码: 只保留有效层级的路径节点
+        # mask[i, j] = 1 if j < depths[i] else 0
+        seq_indices = torch.arange(path_len, device=device)
+        mask = seq_indices < depths.unsqueeze(-1) # (..., path_len)
+        
+        # 应用掩码并求和: (..., dim)
+        # 这实现了 "Level 1 Emb + Level 2 Emb + ..." 的逻辑
+        path_final = (path_embs * mask.unsqueeze(-1)).sum(dim=-2)
+        
+        # 3. 融合
+        # 直接相加，保留层级和位置信息
+        combined_emb = depth_emb + path_final
+        
+        return self.fusion_network(combined_emb)
 
     def get_attention_bias(self, depths: torch.Tensor) -> torch.Tensor:
         num_tokens = len(depths)

@@ -67,42 +67,59 @@ class HilbertAwareMultiScaleAttention(nn.Module):
         if not self.use_hilbert_bias or levels_info.numel() == 0:
             return None
 
-        seq_len = levels_info.shape[0]
         device = levels_info.device
 
-        if levels_info.shape[1] <= 1:
-            return None
-
-        paths = levels_info[:, 1:].float()
-        bias_matrix = torch.zeros(self.heads, seq_len, seq_len, device=device)
-
-        for i in range(seq_len):
-            for j in range(seq_len):
-                if i == j:
-                    continue
-
-                path_i = paths[i]
-                path_j = paths[j]
-
-                path_dist = torch.norm(path_i - path_j).unsqueeze(0)
-                path_sim = F.cosine_similarity(path_i.unsqueeze(0), path_j.unsqueeze(0), dim=1)
-
-                path_features = torch.cat([path_dist, path_sim])
-                bias = self.hilbert_bias_network(path_features)
-                bias_matrix[:, i, j] = bias
-
-        return bias_matrix
+        if levels_info.dim() == 2:
+            # Old behavior: (Seq, Info)
+            seq_len = levels_info.shape[0]
+            if levels_info.shape[1] <= 1:
+                return None
+            paths = levels_info[:, 1:].float() # (S, Path)
+            path_i = paths.unsqueeze(1) # (S, 1, Path)
+            path_j = paths.unsqueeze(0) # (1, S, Path)
+            
+            path_dist = torch.norm(path_i - path_j, dim=2)
+            path_sim = F.cosine_similarity(path_i, path_j, dim=2, eps=1e-6)
+            path_features = torch.stack([path_dist, path_sim], dim=-1) # (S, S, 2)
+            
+            bias = self.hilbert_bias_network(path_features) # (S, S, H)
+            return bias.permute(2, 0, 1) # (H, S, S)
+        else:
+            # New behavior: (Batch, Seq, Info)
+            batch_size, seq_len, info_dim = levels_info.shape
+            if info_dim <= 1:
+                return None
+            
+            paths = levels_info[:, :, 1:].float() # (B, S, Path)
+            path_i = paths.unsqueeze(2) # (B, S, 1, Path)
+            path_j = paths.unsqueeze(1) # (B, 1, S, Path)
+            
+            path_dist = torch.norm(path_i - path_j, dim=3) # (B, S, S)
+            path_sim = F.cosine_similarity(path_i, path_j, dim=3, eps=1e-6) # (B, S, S)
+            
+            path_features = torch.stack([path_dist, path_sim], dim=-1) # (B, S, S, 2)
+            
+            bias = self.hilbert_bias_network(path_features) # (B, S, S, H)
+            return bias.permute(0, 3, 1, 2) # (B, H, S, S)
 
     def _compute_level_bias(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
         if levels_info.numel() == 0:
             return None
 
-        depths = levels_info[:, 0]
-        level_diff = depths.unsqueeze(0) - depths.unsqueeze(1)
-        level_diff = level_diff.clamp(-self.max_level, self.max_level) + self.max_level
-
-        rel_pos_bias = self.relative_pos_embedding(level_diff)
-        return rel_pos_bias.permute(2, 0, 1)
+        if levels_info.dim() == 2:
+            # Old behavior: (Seq, Info)
+            depths = levels_info[:, 0]
+            level_diff = depths.unsqueeze(0) - depths.unsqueeze(1)
+            level_diff = level_diff.clamp(-self.max_level, self.max_level) + self.max_level
+            rel_pos_bias = self.relative_pos_embedding(level_diff)
+            return rel_pos_bias.permute(2, 0, 1) # (H, S, S)
+        else:
+            # New behavior: (Batch, Seq, Info)
+            depths = levels_info[:, :, 0] # (B, S)
+            level_diff = depths.unsqueeze(2) - depths.unsqueeze(1) # (B, S, S)
+            level_diff = level_diff.clamp(-self.max_level, self.max_level) + self.max_level
+            rel_pos_bias = self.relative_pos_embedding(level_diff) # (B, S, S, H)
+            return rel_pos_bias.permute(0, 3, 1, 2) # (B, H, S, S)
 
     def forward(
         self,
@@ -120,19 +137,33 @@ class HilbertAwareMultiScaleAttention(nn.Module):
         dots = dots * self.scale_weights.view(1, -1, 1, 1)
 
         if self.use_level_scaling and levels_info is not None and levels_info.numel() > 0:
-            depths = levels_info[:, 0].clamp(0, self.max_level)
-            level_scales = self.level_scale_embedding(depths)
-            level_scales = level_scales.transpose(0, 1).unsqueeze(0).unsqueeze(-1)
+            if levels_info.dim() == 2:
+                depths = levels_info[:, 0].clamp(0, self.max_level)
+                level_scales = self.level_scale_embedding(depths)
+                level_scales = level_scales.transpose(0, 1).unsqueeze(0).unsqueeze(-1)
+            else:
+                depths = levels_info[:, :, 0].clamp(0, self.max_level) # (B, S)
+                level_scales = self.level_scale_embedding(depths) # (B, S, H)
+                level_scales = level_scales.permute(0, 2, 1).unsqueeze(-1) # (B, H, S, 1)
+            
             dots = dots * level_scales
 
         if levels_info is not None:
             hilbert_bias = self._compute_hilbert_bias(levels_info)
             if hilbert_bias is not None:
-                dots = dots + hilbert_bias.unsqueeze(0) * 0.1
+                # hilbert_bias: (H, S, S) or (B, H, S, S)
+                if hilbert_bias.dim() == 3:
+                    dots = dots + hilbert_bias.unsqueeze(0) * 0.1
+                else:
+                    dots = dots + hilbert_bias * 0.1
 
             level_bias = self._compute_level_bias(levels_info)
             if level_bias is not None:
-                dots = dots + level_bias.unsqueeze(0) * 0.05
+                # level_bias: (H, S, S) or (B, H, S, S)
+                if level_bias.dim() == 3:
+                    dots = dots + level_bias.unsqueeze(0) * 0.05
+                else:
+                    dots = dots + level_bias * 0.05
 
         if attention_mask is not None:
             mask_value = -torch.finfo(dots.dtype).max
