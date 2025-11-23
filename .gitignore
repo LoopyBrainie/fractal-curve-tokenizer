@@ -128,7 +128,7 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-#ignore the workspace files
+# Workspace and Data
 workspace/
 data/
 
@@ -139,6 +139,22 @@ data/
 *.weights
 *.h5
 *.ckpt
-experiments/*/checkpoints/
-experiments/*/logs/
-experiments/*/wandb/
+
+# Experiments and Logs
+experiments/*
+!experiments/.gitkeep
+!experiments/README.md
+
+# IDE and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Profiling and Logs
+*.prof
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
