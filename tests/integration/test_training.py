@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
+import pytest
 
 from vit_pytorch.fractal_vit import NextGenerationFractalViT, SimpleFractalViT
 from vit_pytorch.tokenization import BaseTokenProcessor, BaseTokenizer, TokenSequence, TokenizerOutput
@@ -18,7 +19,10 @@ class DummyTokenizer(BaseTokenizer):
         batch: list[TokenSequence] = []
         for _ in range(images.shape[0]):
             tokens = torch.full((self.tokens_per_image, self.token_dim), 0.5, device=images.device)
-            levels = torch.zeros(self.tokens_per_image, 1, dtype=torch.long, device=images.device)
+            # Create dummy levels with enough columns to satisfy max_info_len check if needed
+            # But NextGenerationFractalViT handles variable lengths.
+            # Let's give it 2 columns (depth, path)
+            levels = torch.zeros(self.tokens_per_image, 2, dtype=torch.long, device=images.device)
             batch.append(TokenSequence(tokens=tokens, metadata={"levels": levels}))
         return TokenizerOutput(batch)
 
@@ -39,10 +43,14 @@ class DummyPositional(nn.Module):
         self.dim = dim
         self.called = False
 
-    def forward(self, levels_info: torch.Tensor, sequence_positions: torch.Tensor | None = None) -> torch.Tensor:  # type: ignore[override]
+    def forward(self, levels_info: torch.Tensor, sequence_positions: torch.Tensor | None = None) -> torch.Tensor:
         self.called = True
         if levels_info.numel() == 0:
             return torch.zeros(0, self.dim, device=levels_info.device)
+        
+        # levels_info shape can be (Batch, Seq, Info) or (Batch*Seq, Info) depending on caller
+        # But we just need to return (Batch, Seq, Dim) or (Batch*Seq, Dim) matching input[0]
+        
         return torch.zeros(levels_info.shape[0], self.dim, device=levels_info.device)
 
 
@@ -102,6 +110,8 @@ def test_simple_vit_single_training_step_updates_parameters() -> None:
     optimizer.zero_grad()
     logits = model(inputs)
     loss = criterion(logits, labels)
+    
+    # Handle auxiliary loss
     if hasattr(model, "get_tokenizer_loss"):
         aux_loss = model.get_tokenizer_loss()
     elif hasattr(model, "enhanced_model"):
