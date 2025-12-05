@@ -9,10 +9,29 @@ from .attention import HilbertAwareMultiScaleAttention
 from .feedforward import AdaptiveFractalFeedForward
 
 
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks)."""
+
+    def __init__(self, drop_prob: float = 0.0, scale_by_keep: bool = True):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+        self.scale_by_keep = scale_by_keep
+
+    def forward(self, x):
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        if keep_prob > 0.0 and self.scale_by_keep:
+            random_tensor.div_(keep_prob)
+        return x * random_tensor
+
+
 class EnhancedFractalTransformerBlock(nn.Module):
     """Hierarchically aware transformer block extracted for reuse."""
 
-    def __init__(self, dim: int, heads: int, dim_head: int, mlp_dim: int, dropout: float = 0.0, max_level: int = 50):
+    def __init__(self, dim: int, heads: int, dim_head: int, mlp_dim: int, dropout: float = 0.0, max_level: int = 50, drop_path: float = 0.0):
         super().__init__()
         self.dim = dim
         self.max_level = max_level
@@ -28,6 +47,8 @@ class EnhancedFractalTransformerBlock(nn.Module):
         self.ff = AdaptiveFractalFeedForward(dim=dim, hidden_dim=mlp_dim, dropout=dropout, max_level=max_level)
 
         self.residual_weights = nn.Parameter(torch.ones(2))
+        
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         
         # REFACTORED: Replaced ModuleList of LayerNorms with Embeddings for Gamma/Beta
         # This reduces parameters from 50*2*dim to 2*dim (plus embedding table)
@@ -86,11 +107,11 @@ class EnhancedFractalTransformerBlock(nn.Module):
     ) -> torch.Tensor:
         norm1_x = self._apply_level_aware_norm(x, levels_info, self.norm1_gamma, self.norm1_beta, self.default_norm1)
         attn_out = self.attention(norm1_x, levels_info, attention_mask)
-        x = x + attn_out * self.residual_weights[0]
+        x = x + self.drop_path(attn_out * self.residual_weights[0])
 
         norm2_x = self._apply_level_aware_norm(x, levels_info, self.norm2_gamma, self.norm2_beta, self.default_norm2)
         ff_out = self.ff(norm2_x, levels_info)
-        x = x + ff_out * self.residual_weights[1]
+        x = x + self.drop_path(ff_out * self.residual_weights[1])
 
         return x
 
@@ -107,11 +128,15 @@ class EnhancedFractalTransformer(nn.Module):
         mlp_dim: int,
         dropout: float = 0.0,
         max_level: int = 50,
+        drop_path_rate: float = 0.1,
     ):
         super().__init__()
         self.dim = dim
         self.depth = depth
         self.max_level = max_level
+
+        # Stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
 
         self.layers = nn.ModuleList(
             [
@@ -122,8 +147,9 @@ class EnhancedFractalTransformer(nn.Module):
                     mlp_dim=mlp_dim,
                     dropout=dropout,
                     max_level=max_level,
+                    drop_path=dpr[i],
                 )
-                for _ in range(depth)
+                for i in range(depth)
             ]
         )
 

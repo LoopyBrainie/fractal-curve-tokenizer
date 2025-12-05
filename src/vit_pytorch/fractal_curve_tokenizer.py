@@ -6,35 +6,54 @@ import torch.nn as nn
 from .tokenization import BaseTokenizer, TokenSequence, TokenizerOutput
 
 
-class LearnableSplitDecision(nn.Module):
-    """增强的可学习分割决策网络"""
+class MiniCNN(nn.Module):
+    """轻量级CNN特征提取器，用于分割决策"""
 
-    def __init__(self, patch_features=6, hidden_dim=128):
+    def __init__(self, in_channels=3, hidden_dim=16, out_dim=32):
         super().__init__()
-        # patch_features: [level, height, width, variance, mean, edge_density] 等特征
         self.net = nn.Sequential(
-            nn.Linear(patch_features, hidden_dim),
+            nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1, stride=2),  # 下采样
+            nn.ReLU(),
+            nn.Conv2d(hidden_dim, out_dim, kernel_size=3, padding=1, stride=2),  # 再次下采样
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),  # 全局池化
+            nn.Flatten(),
+        )
+
+    def forward(self, x):
+        # x: [B, C, H, W] or [C, H, W]
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
+        return self.net(x)
+
+
+class LearnableSplitDecision(nn.Module):
+    """增强的可学习分割决策网络，支持CNN特征和Gumbel-Softmax"""
+
+    def __init__(self, patch_features=6, cnn_features=32, hidden_dim=128):
+        super().__init__()
+        # patch_features: [level, height, width, variance, mean, edge_density]
+        # cnn_features: 来自MiniCNN的特征维度
+        self.net = nn.Sequential(
+            nn.Linear(patch_features + cnn_features, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 4, 1),
-            nn.Sigmoid(),  # 输出 0-1 的分割概率
+            nn.Linear(hidden_dim // 2, 2),  # 输出2个logits: [not_split, split]
         )
 
-        # 初始化偏置，让初始分割倾向于继续分割
+        # 初始化偏置，让初始分割倾向于继续分割 (index 1)
         with torch.no_grad():
-            self.net[-2].bias.fill_(1.0)  # 偏向继续分割
+            self.net[-1].bias[1] += 2.0
 
-    def forward(self, patch_features):
+    def forward(self, combined_features):
         """
-        patch_features: [batch_size, patch_features]
-        returns: [batch_size] 分割概率
+        combined_features: [batch_size, total_features]
+        returns: logits [batch_size, 2]
         """
-        return self.net(patch_features).squeeze(-1)
+        return self.net(combined_features)
 
 
 class FractalHilbertTokenizer(BaseTokenizer):
@@ -53,9 +72,19 @@ class FractalHilbertTokenizer(BaseTokenizer):
 
         if learnable_split:
             # 增强的分割决策网络，支持更多特征
-            self.split_decision = LearnableSplitDecision(patch_features=6, hidden_dim=128)
+            self.cnn_encoder = MiniCNN(in_channels=3, hidden_dim=16, out_dim=32)
+            self.split_decision = LearnableSplitDecision(patch_features=6, cnn_features=32, hidden_dim=128)
         else:
+            self.cnn_encoder = None
             self.split_decision = None
+
+        # 用于存储REINFORCE所需的log_probs
+        self.saved_log_probs = []
+        self.saved_entropies = []
+
+    def clear_saved_actions(self):
+        self.saved_log_probs = []
+        self.saved_entropies = []
 
     def tokenize(self, images):
         if images.dim() != 4:
@@ -68,6 +97,10 @@ class FractalHilbertTokenizer(BaseTokenizer):
         if self.learnable_split and self.split_decision is not None:
             # 确保可学习分割网络与输入位于同一设备
             self.split_decision = self.split_decision.to(images.device)
+            self.cnn_encoder = self.cnn_encoder.to(images.device)
+
+        # 清空之前的动作记录
+        self.clear_saved_actions()
 
         min_patch_dim = max(1, min(self.min_patch_size))
         longest_edge = max(height, width)
@@ -166,11 +199,38 @@ class FractalHilbertTokenizer(BaseTokenizer):
             should_stop = True
         else:
             # 使用增强的可学习分割决策
-            if self.learnable_split and self.split_decision is not None:
+            if self.learnable_split and self.split_decision is not None and self.cnn_encoder is not None:
                 # 计算增强的patch特征
                 features = self._extract_enhanced_patch_features(patch, level, H, W)
-                split_prob = self.split_decision(features).item()
-                should_stop = split_prob < self.adaptive_threshold
+                # 计算CNN特征
+                cnn_feat = self.cnn_encoder(patch) # [1, 32]
+                
+                # 组合特征
+                combined = torch.cat([features, cnn_feat], dim=1) # [1, 38]
+                
+                # 获取logits [1, 2]
+                logits = self.split_decision(combined)
+                
+                # REINFORCE / Gumbel-Softmax 逻辑
+                if self.training:
+                    # 使用 Gumbel-Softmax 采样动作 (引入随机性)
+                    # hard=True 返回 one-hot, 但梯度是软的 (虽然这里我们只用采样结果做决策)
+                    # 或者直接从 Categorical 采样用于 REINFORCE
+                    probs = torch.softmax(logits, dim=-1)
+                    dist = torch.distributions.Categorical(probs)
+                    action = dist.sample()
+                    
+                    # 保存 log_prob 用于 REINFORCE
+                    self.saved_log_probs.append(dist.log_prob(action))
+                    self.saved_entropies.append(dist.entropy())
+                    
+                    # action 0: stop (not split), action 1: split
+                    should_stop = (action.item() == 0)
+                else:
+                    # 推理模式：直接取最大概率
+                    action = torch.argmax(logits, dim=-1)
+                    should_stop = (action.item() == 0)
+                    
             else:
                 # 默认策略：如果设置了 adaptive_threshold，则基于方差进行自适应分割
                 if self.adaptive_threshold is not None and self.adaptive_threshold > 0:

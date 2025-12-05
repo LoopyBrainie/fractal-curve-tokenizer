@@ -32,7 +32,7 @@ else:
     GradScalerType = Any
 
 from torch.optim.adamw import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader, Dataset, SubsetRandomSampler
 import torchvision.transforms as transforms
@@ -193,12 +193,16 @@ def build_transforms(spec: DatasetSpec) -> Tuple[transforms.Compose, transforms.
         train_ops = [transforms.Resize(32), transforms.ToTensor(), transforms.Normalize(spec.mean, spec.std)]
         test_ops = train_ops.copy()
     else:
+        # 增强的数据增强策略：Mixup/CutMix 需要在 Batch 层面做，这里做基础增强
+        # 引入 AutoAugment 或 RandAugment
         train_ops = [
             transforms.Resize(spec.image_size),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(10),
+            transforms.RandomCrop(spec.image_size, padding=4), # 增加 RandomCrop
+            transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10), # 引入 AutoAugment
             transforms.ToTensor(),
             transforms.Normalize(spec.mean, spec.std),
+            transforms.RandomErasing(p=0.25), # 引入 RandomErasing
         ]
         test_ops = [
             transforms.Resize(spec.image_size),
@@ -341,6 +345,13 @@ def train_one_epoch(
             if isinstance(output, tuple):
                 output = output[0]
             loss = F.cross_entropy(output, target)
+            
+            # 添加 Tokenizer 辅助 Loss (REINFORCE + 正则化)
+            if hasattr(model, "get_tokenizer_loss"):
+                # 注意：如果是 DataParallel，可能需要 model.module.get_tokenizer_loss()
+                # 这里假设是单卡
+                aux_loss = model.get_tokenizer_loss()
+                loss = loss + aux_loss
 
         if scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -390,9 +401,37 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, desc: s
     return avg_loss, accuracy
 
 
-def save_history(paths: ExperimentPaths, args: argparse.Namespace, history: Dict[str, list], summary: Dict[str, float]) -> None:
-    payload = {
+def get_detailed_config(args: argparse.Namespace, model: nn.Module, device: torch.device) -> Dict[str, Any]:
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    config = {
         "arguments": vars(args),
+        "model_statistics": {
+            "total_parameters": total_params,
+            "trainable_parameters": trainable_params,
+            "model_class": model.__class__.__name__,
+        },
+        "system_information": {
+            "device": str(device),
+            "torch_version": torch.__version__,
+            "cuda_available": torch.cuda.is_available(),
+        },
+    }
+    if torch.cuda.is_available():
+        config["system_information"]["cuda_device_name"] = torch.cuda.get_device_name(0)
+
+    return config
+
+
+def save_history(
+    paths: ExperimentPaths,
+    config: Dict[str, Any],
+    history: Dict[str, list],
+    summary: Dict[str, float],
+) -> None:
+    payload = {
+        "config": config,
         "history": history,
         "summary": summary,
         "timestamp": paths.timestamp,
@@ -400,6 +439,11 @@ def save_history(paths: ExperimentPaths, args: argparse.Namespace, history: Dict
     history_path = paths.experiment_dir / "training_history.json"
     with history_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
+
+    # Also save detailed config to logs
+    logs_config_path = paths.logs_dir / "experiment_config.json"
+    with logs_config_path.open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2)
 
     workspace_summary_path = paths.workspace_results_dir / f"fractal_vit_simple_{paths.timestamp}.json"
     with workspace_summary_path.open("w", encoding="utf-8") as handle:
@@ -523,6 +567,12 @@ def main() -> None:
 
     model = model.to(device)
 
+    # Generate detailed config
+    detailed_config = get_detailed_config(args, model, device)
+    # Save immediately to logs for reference
+    with (paths.logs_dir / "experiment_config.json").open("w", encoding="utf-8") as f:
+        json.dump(detailed_config, f, indent=2)
+
     train_loader, val_loader, test_loader = create_dataloaders(
         spec,
         batch_size=args.batch_size,
@@ -538,12 +588,13 @@ def main() -> None:
         weight_decay=args.weight_decay,
         betas=(0.9, 0.999),
     )
-    scheduler = CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=max(args.epochs // 4, 1),
-        T_mult=2,
-        eta_min=args.lr * 0.01,
-    )
+    
+    # Warmup + Cosine Annealing
+    warmup_epochs = 5
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs - warmup_epochs, eta_min=args.lr * 0.01)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
+    
     scaler = create_grad_scaler(args.use_amp, device)
 
     history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
@@ -564,6 +615,7 @@ def main() -> None:
         )
         val_loss, val_acc = evaluate(model, val_loader, device, desc="val")
         scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
@@ -571,7 +623,9 @@ def main() -> None:
         history["val_acc"].append(val_acc)
 
         print(
-            f"Epoch {epoch}/{args.epochs} → train: loss={train_loss:.4f}, acc={train_acc:.2f}% | val: loss={val_loss:.4f}, acc={val_acc:.2f}%"
+            f"Epoch {epoch}/{args.epochs} | LR: {current_lr:.2e} | "
+            f"Train: loss={train_loss:.4f}, acc={train_acc:.2f}% | "
+            f"Val: loss={val_loss:.4f}, acc={val_acc:.2f}%"
         )
 
         if val_acc > best_val_acc:
@@ -598,7 +652,7 @@ def main() -> None:
         "epochs_ran": len(history["train_loss"]),
         "elapsed_seconds": elapsed,
     }
-    save_history(paths, args, history, summary)
+    save_history(paths, detailed_config, history, summary)
     plot_curves(paths, history)
 
     print("Training finished")

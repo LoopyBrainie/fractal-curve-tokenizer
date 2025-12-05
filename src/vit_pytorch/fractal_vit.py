@@ -519,15 +519,35 @@ class NextGenerationFractalViT(nn.Module):
 
     def get_tokenizer_loss(self) -> torch.Tensor:
         """获取tokenizer的辅助损失（可学习分割决策的正则化）"""
+        loss = torch.tensor(0.0, device=self.aux_loss_weight.device)
+        
+        # 1. REINFORCE Loss
+        if hasattr(self.tokenizer, "saved_log_probs") and len(self.tokenizer.saved_log_probs) > 0:
+            # 我们需要一个 Reward 信号。
+            # 理想情况下，Reward 应该是 (Accuracy - Baseline) 或者 (-Loss)。
+            # 但在这里我们无法直接访问 Accuracy 或 Classification Loss。
+            # 作为一个折衷，我们可以在 forward 中计算并传入，或者在这里暂时只计算 Entropy 正则化
+            # 真正的 REINFORCE 需要在外部训练循环中计算，因为需要 task loss。
+            # 这里我们只返回 Entropy Loss 来鼓励探索，防止过早收敛到单一策略
+            
+            entropies = torch.stack(self.tokenizer.saved_entropies)
+            entropy_loss = -0.01 * entropies.mean() # 鼓励高熵 (探索)
+            loss = loss + entropy_loss
+            
+        # 2. 结构正则化 (Token数量和层级)
+        # 严格控制：默认权重极低，或者由外部调度器控制
+        # 这里我们只计算基础值，权重由外部传入或使用默认极小值
+        
+        # 收集当前batch的统计信息
+        # 注意：这需要重新运行一遍tokenize或者缓存统计信息。
+        # 由于我们在forward中已经运行了tokenize，我们可以缓存一些信息在self中吗？
+        # 为了简单起见，我们假设外部循环会处理主要的结构惩罚，这里只处理参数正则化
+        
         if hasattr(self.tokenizer, "split_decision") and self.tokenizer.split_decision is not None:
             weight_reg = sum(p.pow(2).sum() for p in self.tokenizer.split_decision.parameters())
-            level_balance_loss = torch.var(self.level_weights)
+            loss = loss + weight_reg * 1e-5
 
-            total_loss = weight_reg * 0.001 + level_balance_loss * 0.01
-
-            return total_loss * self.aux_loss_weight
-
-        return torch.tensor(0.0, requires_grad=True, device=self.aux_loss_weight.device)
+        return loss * self.aux_loss_weight
 
     def analyze_tokenization(self, img: torch.Tensor) -> Dict[str, Any]:
         """分析tokenization过程，返回详细统计信息"""
