@@ -10,16 +10,17 @@ Fractal Curve Tokenizer introduces a novel approach to image tokenization in Vis
 
 Key technologies include:
 
-* **Adaptive Fractal Tokenization**: Recursively splits image patches based on content complexity.
+* **Learnable Fractal Tokenization**: Uses a **MiniCNN** and **REINFORCE** (with Gumbel-Softmax) to learn optimal image splitting strategies dynamically during training.
 * **Hilbert Curve Traversal**: Preserves 2D spatial locality when flattening tokens into a 1D sequence using true recursive Hilbert curves.
 * **Advanced Positional Embedding**: Encodes hierarchical depth and path history to maintain structural context.
 * **Batch Processing with Padding**: Efficiently handles variable-length token sequences within a batch.
 
 ## Features
 
-* **Adaptive Resolution**: Automatically adjusts token density based on image content.
+* **Adaptive Resolution**: Automatically adjusts token density based on image content complexity.
+* **Differentiable Tokenizer**: The splitting decision is fully differentiable and optimized end-to-end.
 * **Spatial Locality Preservation**: Uses Hilbert curves to maintain better spatial relationships than raster scan order.
-* **Multi-Scale Feature Extraction**: Captures features at various scales simultaneously.
+* **Robust Regularization**: Integrated **DropPath** (Stochastic Depth) and Entropy Regularization to prevent overfitting.
 * **Efficient Batch Training**: Optimized `pad_sequence` and masking implementation for high-speed training.
 * **Flexible Architecture**: Supports both `NextGenerationFractalViT` (full feature set) and `SimpleFractalViT` (lightweight, backward compatible).
 
@@ -73,21 +74,36 @@ The project includes a robust training script located at `examples/training/trai
 python examples/training/train_fractal_vit.py --dataset cifar10 --epochs 50 --batch-size 64
 ```
 
-#### Key Arguments
+#### Full Argument List
 
-* `--dataset`: Choose dataset (`cifar10`, `cifar100`, `mnist`). Default: `cifar10`.
-* `--epochs`: Number of training epochs. Default: `50`.
-* `--batch-size`: Batch size. Default: `64`.
-* `--lr`: Learning rate. Default: `5e-4`.
-* `--quick-test`: Run a short 5-epoch training on a small subset of data to verify the pipeline.
-
-    ```bash
-    python examples/training/train_fractal_vit.py --quick-test
-    ```
-
-* `--use-simple`: Force the use of `SimpleFractalViT` (lighter model) instead of the full `NextGenerationFractalViT`. Recommended for CPU training or baseline comparisons.
-* `--device`: Manually specify device (`cpu`, `cuda`, `auto`). Default: `auto`.
-* `--num-workers`: Number of data loading workers. Default: `2`.
+| Argument | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--dataset` | str | `cifar10` | Dataset to use: `cifar10`, `cifar100`, `mnist`, `imagenet`, `coco`, `caltech256`, `tiny-imagenet`. |
+| `--data-root` | str | `None` | Path to the root directory of the dataset (required for ImageNet/COCO/TinyImageNet). |
+| `--epochs` | int | `50` | Number of training epochs. |
+| `--batch-size` | int | `64` | Batch size for training. |
+| `--lr` | float | `5e-4` | Initial learning rate. |
+| `--weight-decay` | float | `0.01` | Weight decay for optimizer. |
+| `--val-split` | float | `0.1` | Fraction of training data to use for validation. |
+| `--subset-size` | int | `None` | Limit the number of training samples (for debugging). |
+| `--dim` | int | `192` | Model embedding dimension. |
+| `--depth` | int | `8` | Depth of the Transformer. |
+| `--heads` | int | `8` | Number of attention heads. |
+| `--dim-head` | int | `32` | Dimension of each attention head. |
+| `--dropout` | float | `0.1` | Dropout rate. |
+| `--emb-dropout` | float | `0.1` | Embedding dropout rate. |
+| `--max-level` | int | `4` | Maximum recursion level for fractal tokenization. |
+| `--pool` | str | `cls` | Pooling method: `cls` or `mean`. |
+| `--use-simple` | flag | `False` | Use `SimpleFractalViT` instead of `NextGenerationFractalViT`. |
+| `--no-learnable-split` | flag | `False` | Disable the learnable split decision network (use heuristic). |
+| `--quick-test` | flag | `False` | Run a quick 5-epoch test on a small subset. |
+| `--use-amp` | flag | `False` | Enable Automatic Mixed Precision (AMP) training. |
+| `--gradient-clip` | float | `1.0` | Gradient clipping value. |
+| `--num-workers` | int | `2` | Number of data loading workers. |
+| `--seed` | int | `42` | Random seed for reproducibility. |
+| `--disable-hilbert-bias` | flag | `False` | Disable Hilbert-path attention bias (faster on CPU). |
+| `--force-next-gen` | flag | `False` | Force using `NextGenerationFractalViT` even on CPU. |
+| `--device` | str | `auto` | Device to use: `auto`, `cpu`, `cuda`. |
 
 #### Output
 

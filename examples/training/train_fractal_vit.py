@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from torch import nn
 
 try:
@@ -36,7 +37,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader, Dataset, SubsetRandomSampler
 import torchvision.transforms as transforms
-from torchvision.datasets import CIFAR10, CIFAR100, MNIST
+from torchvision.datasets import CIFAR10, CIFAR100, MNIST, ImageFolder, CocoDetection, Caltech256
 from tqdm import tqdm
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = PROJECT_ROOT / "src"
@@ -44,6 +45,64 @@ if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
 from vit_pytorch.fractal_vit import NextGenerationFractalViT, SimpleFractalViT
+
+
+class CocoClassificationWrapper(CocoDetection):
+    """Wrapper for COCO dataset to behave like a classification dataset.
+    It selects the category of the largest object in the image as the label.
+    """
+    def __init__(self, root, annFile, transform=None, target_transform=None, transforms=None):
+        super().__init__(root, annFile, transform, target_transform, transforms)
+        # Map COCO category IDs (non-contiguous) to 0-79
+        self.cat_ids = sorted(self.coco.getCatIds())
+        self.cat2label = {cat_id: i for i, cat_id in enumerate(self.cat_ids)}
+
+    def __getitem__(self, index):
+        img, target = super().__getitem__(index)
+        # Target is a list of dicts. Pick the largest object.
+        if not target:
+            # No object? Return a dummy label (0) or handle as background
+            label = 0
+        else:
+            # Find largest area
+            best_obj = max(target, key=lambda x: x['area'])
+            cat_id = best_obj['category_id']
+            label = self.cat2label.get(cat_id, 0)
+        
+        return img, label
+
+
+class TinyImageNetVal(Dataset):
+    """Custom Dataset for Tiny ImageNet Validation Set."""
+    def __init__(self, root: Path, class_to_idx: Dict[str, int], transform=None):
+        self.root = Path(root)
+        self.images_dir = self.root / "images"
+        self.annotations_file = self.root / "val_annotations.txt"
+        self.class_to_idx = class_to_idx
+        self.transform = transform
+        self.data = []
+        
+        if not self.annotations_file.exists():
+             raise FileNotFoundError(f"Validation annotations not found: {self.annotations_file}")
+
+        with open(self.annotations_file, "r") as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) >= 2:
+                    self.data.append((parts[0], parts[1]))
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        img_name, cls_name = self.data[idx]
+        img_path = self.images_dir / img_name
+        img = Image.open(img_path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        # Some validation classes might not be in train if dataset is corrupted, but usually safe
+        label = self.class_to_idx[cls_name]
+        return img, label
 
 
 def autocast_context(device: torch.device, enabled: bool):
@@ -181,6 +240,42 @@ def get_dataset_spec(dataset: str) -> DatasetSpec:
             std=(0.3081,),
             dataset_cls=MNIST,
         ),
+        "imagenet": DatasetSpec(
+            name="ImageNet",
+            num_classes=1000,
+            image_size=224,
+            channels=3,
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225),
+            dataset_cls=ImageFolder,
+        ),
+        "coco": DatasetSpec(
+            name="COCO",
+            num_classes=80,
+            image_size=224,
+            channels=3,
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225),
+            dataset_cls=CocoClassificationWrapper,
+        ),
+        "caltech256": DatasetSpec(
+            name="Caltech256",
+            num_classes=257,
+            image_size=224,
+            channels=3,
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225),
+            dataset_cls=Caltech256,
+        ),
+        "tiny-imagenet": DatasetSpec(
+            name="TinyImageNet",
+            num_classes=200,
+            image_size=64,
+            channels=3,
+            mean=(0.4802, 0.4481, 0.3975),
+            std=(0.2302, 0.2265, 0.2262),
+            dataset_cls=TinyImageNetVal, # Placeholder, handled specially
+        ),
     }
 
     if dataset not in specs:
@@ -219,32 +314,21 @@ def create_dataloaders(
     subset_size: Optional[int],
     num_workers: int,
     pin_memory: bool,
+    data_root_override: Optional[str] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     if subset_size is not None and subset_size < 2:
         raise ValueError("subset_size must be at least 2 when provided")
 
-    data_root = PROJECT_ROOT / "workspace" / "data"
+    if data_root_override:
+        data_root = Path(data_root_override)
+    else:
+        data_root = PROJECT_ROOT / "workspace" / "data"
+    
     data_root.mkdir(parents=True, exist_ok=True)
 
     train_transform, test_transform = build_transforms(spec)
-    train_dataset = spec.dataset_cls(root=str(data_root), train=True, download=True, transform=train_transform)
-    test_dataset = spec.dataset_cls(root=str(data_root), train=False, download=True, transform=test_transform)
-
-    indices = np.arange(len(train_dataset))
-    np.random.shuffle(indices)
-    if subset_size is not None:
-        indices = indices[:subset_size + max(1, int(subset_size * val_split))]
-
-    val_count = max(1, int(len(indices) * val_split))
-    if val_count >= len(indices):
-        val_count = max(1, len(indices) - 1)
-
-    val_indices = indices[:val_count]
-    train_indices = indices[val_count:]
-    if len(train_indices) == 0:
-        train_indices = val_indices[:1]
-        val_indices = val_indices[1:]
-
+    
+    # Helper for creating loaders
     def make_loader(dataset: Dataset, sampler_indices: np.ndarray, shuffle: bool = False) -> DataLoader:
         if shuffle:
             return DataLoader(
@@ -262,6 +346,107 @@ def create_dataloaders(
             num_workers=num_workers,
             pin_memory=pin_memory,
         )
+
+    if spec.name == "Caltech256":
+        # Caltech256 does not have a standard train/test split. We perform a random split.
+        # We load the dataset twice: once with train transforms, once with test transforms.
+        full_train_set = spec.dataset_cls(root=str(data_root), transform=train_transform, download=True)
+        full_test_set = spec.dataset_cls(root=str(data_root), transform=test_transform, download=True)
+        
+        num_total = len(full_train_set)
+        indices = np.arange(num_total)
+        np.random.shuffle(indices)
+        
+        if subset_size is not None:
+            indices = indices[:subset_size]
+            num_total = len(indices)
+            
+        # Split: 10% Test, Val split from args, rest Train
+        test_split = 0.1
+        test_count = max(1, int(num_total * test_split))
+        val_count = max(1, int(num_total * val_split))
+        train_count = num_total - test_count - val_count
+        
+        if train_count <= 0:
+             raise ValueError("Dataset too small for the requested split sizes.")
+
+        test_indices = indices[:test_count]
+        val_indices = indices[test_count : test_count + val_count]
+        train_indices = indices[test_count + val_count :]
+        
+        train_loader = make_loader(full_train_set, train_indices)
+        val_loader = make_loader(full_test_set, val_indices) # Use test transform for val
+        test_loader = make_loader(full_test_set, test_indices)
+        
+        print(f"Loaded {spec.name} → train: {len(train_indices)}, val: {len(val_indices)}, test: {len(test_indices)}")
+        return train_loader, val_loader, test_loader
+
+    if spec.name == "TinyImageNet":
+        train_dir = data_root / "train"
+        val_dir = data_root / "val"
+        if not train_dir.exists() or not val_dir.exists():
+             raise FileNotFoundError(f"Tiny ImageNet requires 'train' and 'val' folders in {data_root}")
+        
+        # Train set is standard ImageFolder
+        train_dataset = ImageFolder(str(train_dir), transform=train_transform)
+        
+        # Val set needs custom loader to handle annotations file
+        # We pass train_dataset.class_to_idx to ensure class mapping consistency
+        val_dataset = TinyImageNetVal(val_dir, train_dataset.class_to_idx, transform=test_transform)
+        
+        # Tiny ImageNet 'test' set has no labels, so we use 'val' set for testing as well
+        test_dataset = val_dataset 
+        
+        # Create loaders
+        # Note: Tiny ImageNet Val is already a separate split, so we don't need to split train_dataset
+        # unless user wants to carve out a validation set from train.
+        # Standard practice: Train on 'train', Evaluate on 'val'.
+        
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+        
+        print(f"Loaded {spec.name} → train: {len(train_dataset)}, val: {len(val_dataset)}, test: {len(test_dataset)}")
+        return train_loader, val_loader, test_loader
+
+    if spec.name == "ImageNet":
+        # Expects root to have train/val folders
+        train_dir = data_root / "train"
+        val_dir = data_root / "val"
+        if not train_dir.exists() or not val_dir.exists():
+             raise FileNotFoundError(f"ImageNet requires 'train' and 'val' folders in {data_root}")
+        train_dataset = spec.dataset_cls(root=str(train_dir), transform=train_transform)
+        test_dataset = spec.dataset_cls(root=str(val_dir), transform=test_transform)
+    elif spec.name == "COCO":
+        # Expects standard COCO structure
+        train_img_dir = data_root / "train2017"
+        val_img_dir = data_root / "val2017"
+        train_ann = data_root / "annotations" / "instances_train2017.json"
+        val_ann = data_root / "annotations" / "instances_val2017.json"
+        
+        if not train_img_dir.exists() or not train_ann.exists():
+             raise FileNotFoundError(f"COCO requires train2017/val2017 and annotations in {data_root}")
+
+        train_dataset = spec.dataset_cls(root=str(train_img_dir), annFile=str(train_ann), transform=train_transform)
+        test_dataset = spec.dataset_cls(root=str(val_img_dir), annFile=str(val_ann), transform=test_transform)
+    else:
+        train_dataset = spec.dataset_cls(root=str(data_root), train=True, download=True, transform=train_transform)
+        test_dataset = spec.dataset_cls(root=str(data_root), train=False, download=True, transform=test_transform)
+
+    indices = np.arange(len(train_dataset))
+    np.random.shuffle(indices)
+    if subset_size is not None:
+        indices = indices[:subset_size + max(1, int(subset_size * val_split))]
+
+    val_count = max(1, int(len(indices) * val_split))
+    if val_count >= len(indices):
+        val_count = max(1, len(indices) - 1)
+
+    val_indices = indices[:val_count]
+    train_indices = indices[val_count:]
+    if len(train_indices) == 0:
+        train_indices = val_indices[:1]
+        val_indices = val_indices[1:]
 
     train_loader = make_loader(train_dataset, train_indices)
     val_loader = make_loader(train_dataset, val_indices)
@@ -496,7 +681,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--dataset", choices=["cifar10", "cifar100", "mnist"], default="cifar10")
+    parser.add_argument("--dataset", choices=["cifar10", "cifar100", "mnist", "imagenet", "coco", "caltech256", "tiny-imagenet"], default="cifar10")
+    parser.add_argument("--data-root", type=str, default=None, help="Path to dataset root directory")
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument("--subset-size", type=int, default=None, help="Limit training samples for quick iterations")
     parser.add_argument("--dim", type=int, default=192)
@@ -580,6 +766,7 @@ def main() -> None:
         subset_size=args.subset_size,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
+        data_root_override=args.data_root,
     )
 
     optimizer = AdamW(

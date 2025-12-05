@@ -10,16 +10,17 @@ Fractal Curve Tokenizer 为 Vision Transformers 引入了一种新颖的图像�
 
 关键技术包括：
 
-* **自适应分形分词 (Adaptive Fractal Tokenization)**：根据内容复杂性递归分割图像块。
+* **可学习的分形分词 (Learnable Fractal Tokenization)**：利用 **MiniCNN** 和 **REINFORCE** (结合 Gumbel-Softmax) 在训练过程中动态学习最优的图像分割策略。
 * **希尔伯特曲线遍历 (Hilbert Curve Traversal)**：使用真正的递归希尔伯特曲线将 token 展平为 1D 序列时，保留 2D 空间局部性。
 * **高级位置嵌入 (Advanced Positional Embedding)**：编码层级深度和路径历史以保持结构上下文。
 * **带填充的批处理 (Batch Processing with Padding)**：高效处理批次内的可变长度 token 序列。
 
 ## 特性 (Features)
 
-* **自适应分辨率 (Adaptive Resolution)**：根据图像内容自动调整 token 密度。
+* **自适应分辨率 (Adaptive Resolution)**：根据图像内容复杂性自动调整 token 密度。
+* **可微分分词器 (Differentiable Tokenizer)**：分割决策是完全可微分的，并进行端到端优化。
 * **空间局部性保持 (Spatial Locality Preservation)**：使用希尔伯特曲线比光栅扫描顺序更好地保持空间关系。
-* **多尺度特征提取 (Multi-Scale Feature Extraction)**：同时捕获不同尺度的特征。
+* **强健的正则化 (Robust Regularization)**：集成 **DropPath** (随机深度) 和熵正则化以防止过拟合。
 * **高效批次训练 (Efficient Batch Training)**：优化的 `pad_sequence` 和掩码实现，用于高速训练。
 * **灵活架构 (Flexible Architecture)**：支持 `NextGenerationFractalViT`（全功能集）和 `SimpleFractalViT`（轻量级，向后兼容）。
 
@@ -73,21 +74,36 @@ logits = model(img) # (1, 1000)
 python examples/training/train_fractal_vit.py --dataset cifar10 --epochs 50 --batch-size 64
 ```
 
-#### 关键参数
+#### 完整参数列表 (Full Argument List)
 
-* `--dataset`: 选择数据集 (`cifar10`, `cifar100`, `mnist`)。默认值: `cifar10`。
-* `--epochs`: 训练轮数。默认值: `50`。
-* `--batch-size`: 批次大小。默认值: `64`。
-* `--lr`: 学习率。默认值: `5e-4`。
-* `--quick-test`: 在一小部分数据上运行简短的 5 轮训练以验证流程。
-
-    ```bash
-    python examples/training/train_fractal_vit.py --quick-test
-    ```
-
-* `--use-simple`: 强制使用 `SimpleFractalViT`（更轻量的模型）而不是完整的 `NextGenerationFractalViT`。推荐用于 CPU 训练或基准比较。
-* `--device`: 手动指定设备 (`cpu`, `cuda`, `auto`)。默认值: `auto`。
-* `--num-workers`: 数据加载工作线程数。默认值: `2`。
+| 参数 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `--dataset` | str | `cifar10` | 使用的数据集: `cifar10`, `cifar100`, `mnist`, `imagenet`, `coco`, `caltech256`, `tiny-imagenet`。 |
+| `--data-root` | str | `None` | 数据集根目录路径 (ImageNet/COCO/TinyImageNet 必需)。 |
+| `--epochs` | int | `50` | 训练轮数。 |
+| `--batch-size` | int | `64` | 训练批次大小。 |
+| `--lr` | float | `5e-4` | 初始学习率。 |
+| `--weight-decay` | float | `0.01` | 优化器权重衰减。 |
+| `--val-split` | float | `0.1` | 用于验证的训练数据比例。 |
+| `--subset-size` | int | `None` | 限制训练样本数量（用于调试）。 |
+| `--dim` | int | `192` | 模型嵌入维度。 |
+| `--depth` | int | `8` | Transformer 深度。 |
+| `--heads` | int | `8` | 注意力头数。 |
+| `--dim-head` | int | `32` | 每个注意力头的维度。 |
+| `--dropout` | float | `0.1` | Dropout 比率。 |
+| `--emb-dropout` | float | `0.1` | 嵌入层 Dropout 比率。 |
+| `--max-level` | int | `4` | 分形分词的最大递归层级。 |
+| `--pool` | str | `cls` | 池化方法: `cls` 或 `mean`。 |
+| `--use-simple` | flag | `False` | 使用 `SimpleFractalViT` 而不是 `NextGenerationFractalViT`。 |
+| `--no-learnable-split` | flag | `False` | 禁用可学习的分割决策网络（使用启发式规则）。 |
+| `--quick-test` | flag | `False` | 在小数据集上运行快速的 5 轮测试。 |
+| `--use-amp` | flag | `False` | 启用自动混合精度 (AMP) 训练。 |
+| `--gradient-clip` | float | `1.0` | 梯度裁剪阈值。 |
+| `--num-workers` | int | `2` | 数据加载工作线程数。 |
+| `--seed` | int | `42` | 随机种子。 |
+| `--disable-hilbert-bias` | flag | `False` | 禁用希尔伯特路径注意力偏置（CPU 上更快）。 |
+| `--force-next-gen` | flag | `False` | 即使在 CPU 上也强制使用 `NextGenerationFractalViT`。 |
+| `--device` | str | `auto` | 使用的设备: `auto`, `cpu`, `cuda`。 |
 
 #### 输出 (Output)
 
