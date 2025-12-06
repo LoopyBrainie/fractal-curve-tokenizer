@@ -61,22 +61,24 @@ class LearnableSplitDecision(nn.Module):
 
 
 class FractalHilbertTokenizer(BaseTokenizer):
-    def __init__(self, min_patch_size=(1, 1), max_level=None, learnable_split=True, adaptive_threshold=0.5):
+    def __init__(self, min_patch_size=(1, 1), max_level=None, learnable_split=True, adaptive_threshold=0.5, channels=3):
         """
         min_patch_size: 最小整数patch尺寸 (min_h, min_w) - 默认到像素级别
         max_level: 最大递归层数 (None表示无限制，只受min_patch_size限制)
         learnable_split: 是否使用可学习的分割决策
         adaptive_threshold: 自适应分割阈值
+        channels: 输入图像的通道数 (RGB=3, 灰度=1)
         """
         super().__init__()
         self.min_patch_size = min_patch_size
         self.max_level = max_level  # 可以为None，表示无限制
         self.learnable_split = learnable_split
         self.adaptive_threshold = adaptive_threshold
+        self.channels = channels
 
         if learnable_split:
             # 增强的分割决策网络，支持更多特征
-            self.cnn_encoder = MiniCNN(in_channels=3, hidden_dim=16, out_dim=32)
+            self.cnn_encoder = MiniCNN(in_channels=channels, hidden_dim=16, out_dim=32)
             self.split_decision = LearnableSplitDecision(patch_features=6, cnn_features=32, hidden_dim=128)
         else:
             self.cnn_encoder = None

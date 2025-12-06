@@ -513,12 +513,27 @@ def train_one_epoch(
     total_epochs: int,
     scaler: GradScalerType,
     gradient_clip: float,
-) -> Tuple[float, float]:
+    baseline_ema: Optional[float] = None,
+) -> Tuple[float, float, float]:
+    """
+    训练一个 epoch
+    
+    Args:
+        baseline_ema: REINFORCE 基线的指数移动平均值，用于减少方差
+    
+    Returns:
+        (avg_loss, accuracy, updated_baseline_ema)
+    """
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
     progress = tqdm(loader, desc=f"Epoch {epoch}/{total_epochs}", leave=False)
+    
+    # 初始化基线 EMA
+    if baseline_ema is None:
+        baseline_ema = 0.0
+    ema_decay = 0.99  # EMA 衰减系数
 
     for data, target in progress:
         data = data.to(device, non_blocking=True)
@@ -529,14 +544,30 @@ def train_one_epoch(
             output = model(data)
             if isinstance(output, tuple):
                 output = output[0]
-            loss = F.cross_entropy(output, target)
+            ce_loss = F.cross_entropy(output, target)
             
             # 添加 Tokenizer 辅助 Loss (REINFORCE + 正则化)
+            aux_loss = torch.tensor(0.0, device=device)
             if hasattr(model, "get_tokenizer_loss"):
-                # 注意：如果是 DataParallel，可能需要 model.module.get_tokenizer_loss()
-                # 这里假设是单卡
-                aux_loss = model.get_tokenizer_loss()
-                loss = loss + aux_loss
+                # 计算 REINFORCE 奖励：使用负损失作为奖励
+                # 损失越低 -> 奖励越高 -> 鼓励当前的分割策略
+                with torch.no_grad():
+                    reward = -ce_loss.item()
+                    # 更新基线 EMA
+                    baseline_ema = ema_decay * baseline_ema + (1 - ema_decay) * reward
+                
+                # 获取策略梯度损失
+                aux_loss = model.get_tokenizer_loss(
+                    reward=reward,
+                    baseline=baseline_ema,
+                    entropy_coef=0.01,
+                )
+                
+                # 清空 tokenizer 缓存，为下一个 batch 做准备
+                if hasattr(model, "clear_tokenizer_cache"):
+                    model.clear_tokenizer_cache()
+            
+            loss = ce_loss + aux_loss
 
         if scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -559,7 +590,7 @@ def train_one_epoch(
 
     avg_loss = running_loss / max(len(loader), 1)
     accuracy = 100.0 * correct / max(total, 1)
-    return avg_loss, accuracy
+    return avg_loss, accuracy, baseline_ema
 
 
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, desc: str) -> Tuple[float, float]:
@@ -787,10 +818,11 @@ def main() -> None:
     history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
     best_val_acc = 0.0
     best_state: Optional[Dict[str, object]] = None
+    baseline_ema: Optional[float] = None  # REINFORCE 基线
 
     start_time = time.time()
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = train_one_epoch(
+        train_loss, train_acc, baseline_ema = train_one_epoch(
             model,
             train_loader,
             optimizer,
@@ -799,6 +831,7 @@ def main() -> None:
             args.epochs,
             scaler,
             args.gradient_clip,
+            baseline_ema=baseline_ema,
         )
         val_loss, val_acc = evaluate(model, val_loader, device, desc="val")
         scheduler.step()

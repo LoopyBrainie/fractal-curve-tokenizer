@@ -25,7 +25,7 @@ class TestFractalHilbertTokenizer:
         min_patch: tuple[int, int],
         max_level: int | None,
     ) -> None:
-        tokenizer = FractalHilbertTokenizer(min_patch_size=min_patch, max_level=max_level)
+        tokenizer = FractalHilbertTokenizer(min_patch_size=min_patch, max_level=max_level, channels=channels)
         images = torch.randn(batch, channels, height, width)
 
         output = tokenizer.tokenize(images)

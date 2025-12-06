@@ -239,6 +239,7 @@ class NextGenerationFractalViT(nn.Module):
                 max_level=max_level,
                 learnable_split=learnable_split,
                 adaptive_threshold=adaptive_threshold,
+                channels=channels,
             )
 
         # 允许外部访问统一接口
@@ -517,37 +518,58 @@ class NextGenerationFractalViT(nn.Module):
             return final_output, features_list
         return final_output
 
-    def get_tokenizer_loss(self) -> torch.Tensor:
-        """获取tokenizer的辅助损失（可学习分割决策的正则化）"""
+    def get_tokenizer_loss(
+        self,
+        reward: Optional[float] = None,
+        baseline: Optional[float] = None,
+        entropy_coef: float = 0.01,
+    ) -> torch.Tensor:
+        """
+        获取 tokenizer 的策略梯度损失 (REINFORCE)
+        
+        Args:
+            reward: 外部提供的奖励信号（如 -classification_loss）
+                    正值鼓励当前分割策略，负值惩罚
+            baseline: 基线值，用于减少方差。如果为 None，则不使用基线
+            entropy_coef: 熵正则化系数，鼓励探索（默认 0.01）
+        
+        Returns:
+            torch.Tensor: 策略梯度损失
+        """
         loss = torch.tensor(0.0, device=self.aux_loss_weight.device)
         
-        # 1. REINFORCE Loss
+        # 1. REINFORCE 策略梯度损失
         if hasattr(self.tokenizer, "saved_log_probs") and len(self.tokenizer.saved_log_probs) > 0:
-            # 我们需要一个 Reward 信号。
-            # 理想情况下，Reward 应该是 (Accuracy - Baseline) 或者 (-Loss)。
-            # 但在这里我们无法直接访问 Accuracy 或 Classification Loss。
-            # 作为一个折衷，我们可以在 forward 中计算并传入，或者在这里暂时只计算 Entropy 正则化
-            # 真正的 REINFORCE 需要在外部训练循环中计算，因为需要 task loss。
-            # 这里我们只返回 Entropy Loss 来鼓励探索，防止过早收敛到单一策略
+            log_probs = torch.stack(self.tokenizer.saved_log_probs)
             
-            entropies = torch.stack(self.tokenizer.saved_entropies)
-            entropy_loss = -0.01 * entropies.mean() # 鼓励高熵 (探索)
-            loss = loss + entropy_loss
+            # 真正的策略梯度：-reward * log_prob
+            # reward > 0 时，增加该动作的概率
+            # reward < 0 时，减少该动作的概率
+            if reward is not None:
+                # 计算优势函数 (advantage)
+                advantage = reward if baseline is None else (reward - baseline)
+                # 策略梯度：最大化 reward * log_prob，即最小化 -reward * log_prob
+                policy_loss = -advantage * log_probs.mean()
+                loss = loss + policy_loss
             
-        # 2. 结构正则化 (Token数量和层级)
-        # 严格控制：默认权重极低，或者由外部调度器控制
-        # 这里我们只计算基础值，权重由外部传入或使用默认极小值
+            # 2. 熵正则化 (鼓励探索，防止策略过早收敛)
+            if hasattr(self.tokenizer, "saved_entropies") and len(self.tokenizer.saved_entropies) > 0:
+                entropies = torch.stack(self.tokenizer.saved_entropies)
+                # 负号：最大化熵 = 最小化负熵
+                entropy_loss = -entropy_coef * entropies.mean()
+                loss = loss + entropy_loss
         
-        # 收集当前batch的统计信息
-        # 注意：这需要重新运行一遍tokenize或者缓存统计信息。
-        # 由于我们在forward中已经运行了tokenize，我们可以缓存一些信息在self中吗？
-        # 为了简单起见，我们假设外部循环会处理主要的结构惩罚，这里只处理参数正则化
-        
+        # 3. 分割决策网络的权重正则化 (防止过拟合)
         if hasattr(self.tokenizer, "split_decision") and self.tokenizer.split_decision is not None:
             weight_reg = sum(p.pow(2).sum() for p in self.tokenizer.split_decision.parameters())
             loss = loss + weight_reg * 1e-5
 
         return loss * self.aux_loss_weight
+    
+    def clear_tokenizer_cache(self) -> None:
+        """清空 tokenizer 的动作缓存，应在每个 batch 结束后调用"""
+        if hasattr(self.tokenizer, "clear_saved_actions"):
+            self.tokenizer.clear_saved_actions()
 
     def analyze_tokenization(self, img: torch.Tensor) -> Dict[str, Any]:
         """分析tokenization过程，返回详细统计信息"""
