@@ -12,8 +12,10 @@ class MiniCNN(nn.Module):
     def __init__(self, in_channels=3, hidden_dim=16, out_dim=32):
         super().__init__()
         self.net = nn.Sequential(
+            nn.InstanceNorm2d(in_channels), # 归一化输入，防止数值过大
             nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1, stride=2),  # 下采样
             nn.ReLU(),
+            nn.InstanceNorm2d(hidden_dim), # 中间层归一化
             nn.Conv2d(hidden_dim, out_dim, kernel_size=3, padding=1, stride=2),  # 再次下采样
             nn.ReLU(),
             nn.AdaptiveAvgPool2d((1, 1)),  # 全局池化
@@ -34,8 +36,10 @@ class LearnableSplitDecision(nn.Module):
         super().__init__()
         # patch_features: [level, height, width, variance, mean, edge_density]
         # cnn_features: 来自MiniCNN的特征维度
+        input_dim = patch_features + cnn_features
         self.net = nn.Sequential(
-            nn.Linear(patch_features + cnn_features, hidden_dim),
+            nn.LayerNorm(input_dim), # 关键：对混合特征进行归一化，防止方差等大数值主导
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim // 2),
@@ -208,16 +212,25 @@ class FractalHilbertTokenizer(BaseTokenizer):
                 # 组合特征
                 combined = torch.cat([features, cnn_feat], dim=1) # [1, 38]
                 
+                # 关键修复：检查输入特征是否包含 NaN/Inf，防止污染网络
+                if torch.isnan(combined).any() or torch.isinf(combined).any():
+                    combined = torch.nan_to_num(combined, nan=0.0, posinf=1.0, neginf=-1.0)
+
                 # 获取logits [1, 2]
                 logits = self.split_decision(combined)
                 
+                # 关键修复：截断 logits 防止 softmax 数值不稳定
+                logits = torch.clamp(logits, min=-10.0, max=10.0)
+                
                 # REINFORCE / Gumbel-Softmax 逻辑
                 if self.training:
-                    # 使用 Gumbel-Softmax 采样动作 (引入随机性)
-                    # hard=True 返回 one-hot, 但梯度是软的 (虽然这里我们只用采样结果做决策)
-                    # 或者直接从 Categorical 采样用于 REINFORCE
-                    probs = torch.softmax(logits, dim=-1)
-                    dist = torch.distributions.Categorical(probs)
+                    # 再次检查 logits NaN/Inf (虽然前面截断过，但为了双重保险)
+                    if torch.isnan(logits).any() or torch.isinf(logits).any():
+                        logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
+
+                    # 改用 logits 初始化 Categorical，数值更稳定
+                    # 避免了手动 softmax 可能出现的极小值下溢问题
+                    dist = torch.distributions.Categorical(logits=logits)
                     action = dist.sample()
                     
                     # 保存 log_prob 用于 REINFORCE
@@ -346,15 +359,28 @@ class FractalHilbertTokenizer(BaseTokenizer):
         else:
             texture_complexity = patch_var
 
+        # 关键修复：特征归一化和对数变换，防止数值过大
+        # 1. 归一化尺寸和层级
+        norm_level = float(level) / 10.0  # 假设最大层级约10
+        norm_h = float(h) / 256.0         # 假设最大尺寸约256
+        norm_w = float(w) / 256.0
+
+        # 2. 对数变换处理方差和边缘密度（这些值可能跨度很大）
+        log_var = torch.log1p(patch_var).clamp(max=10.0)
+        log_edge = torch.log1p(edge_density).clamp(max=10.0)
+        
+        # 3. 均值归一化 (假设输入已经大致在0-1或-1-1之间，但为了保险起见)
+        norm_mean = torch.clamp(patch_mean, -3.0, 3.0)
+
         # 构建特征向量: [level, height, width, variance, mean, edge_density]
         feature_values = torch.stack(
             [
-                torch.tensor(float(level), device=device),
-                torch.tensor(float(h), device=device),
-                torch.tensor(float(w), device=device),
-                patch_var.float(),
-                patch_mean.float(),
-                edge_density.float(),
+                torch.tensor(norm_level, device=device),
+                torch.tensor(norm_h, device=device),
+                torch.tensor(norm_w, device=device),
+                log_var.float(),
+                norm_mean.float(),
+                log_edge.float(),
             ]
         )
 

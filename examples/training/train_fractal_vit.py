@@ -777,9 +777,9 @@ def main() -> None:
     )
     
     # Warmup + Cosine Annealing
-    warmup_epochs = 5
+    warmup_epochs = min(5, args.epochs // 2)
     warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
-    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs - warmup_epochs, eta_min=args.lr * 0.01)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs - warmup_epochs), eta_min=args.lr * 0.01)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
     
     scaler = create_grad_scaler(args.use_amp, device)
