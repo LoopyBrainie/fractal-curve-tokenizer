@@ -86,19 +86,18 @@ class TestFractalHilbertTokenizer:
         assert sum(widths) == 32
 
     def test_high_threshold_disables_recursive_splitting(self) -> None:
-        # Test the learnable split logic with high threshold (should stop early)
-        # Note: learnable_split=True requires split_decision module, which is initialized in __init__
+        # Test the adaptive threshold logic with high threshold (should stop early)
+        # Note: learnable_split=False uses adaptive_threshold based on patch variance
+        # High threshold means patch_var < threshold is likely True -> should_stop
         tokenizer = FractalHilbertTokenizer(
             min_patch_size=(4, 4),
             max_level=5,
-            learnable_split=True,
-            adaptive_threshold=1.1,  # Threshold > 1 means probability (0-1) will always be < threshold
+            learnable_split=False,  # Use variance-based threshold, not neural network
+            adaptive_threshold=100.0,  # Very high threshold, all patches will have var < 100
         )
         
-        # Mock split_decision to return 0.5 (which is < 1.1, so should_stop = True)
-        # Wait, logic is: should_stop = split_prob < self.adaptive_threshold
-        # If threshold is 1.1, and prob is 0.5, then 0.5 < 1.1 is True -> Stop.
-        # Correct.
+        # With high threshold, variance-based stopping: patch_var < 100 is True -> Stop
+        # So the first patch (whole image) should stop immediately
         
         images = torch.randn(1, 3, 32, 32)
         output = tokenizer.tokenize(images)

@@ -41,7 +41,7 @@
 *   **操作**: 调用 `self.pos_embedding(padded_levels)`。
 *   **细节**:
     *   输入层级信息 `(B, S_max, Info_Len)`。
-    *   `AdvancedFractalPositionEmbedding` 计算深度编码和路径编码。
+    *   `AdvancedFractalPositionEmbedding` 原生支持 Batch 输入，计算深度编码和路径编码。
 *   **输出**: `pos_emb` `(B, S_max, Dim)`。
 *   **融合**: `x = padded_tokens + pos_emb`。
 

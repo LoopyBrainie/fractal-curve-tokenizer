@@ -40,9 +40,10 @@
 
 ## 4.2 辅助方法
 
-### `get_attention_bias(levels_info)`
+### `get_attention_bias(depths)`
 *   **功能**: 计算基于层级差的注意力偏置矩阵。
 *   **逻辑**:
-    *   提取深度 `d`。
-    *   计算 `bias[i, j] = table[d[i], d[j]]`。
+    *   输入深度张量 `depths` `(N,)`。
+    *   **向量化实现**: 使用广播机制 `depths[None, :]` 和 `depths[:, None]` 一次性查表。
+    *   `bias[i, j] = table[d[i], d[j]]`。
 *   **用途**: 可选地加到 Attention Logits 中（但在 `attention.py` 中已有类似实现，此处为备用或解耦实现）。

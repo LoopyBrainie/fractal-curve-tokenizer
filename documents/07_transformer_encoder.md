@@ -20,7 +20,7 @@
         *   如果启用动态深度，`x = x * weight`。
     3.  **全局上下文注意力 (Global Context Attention)**:
         *   在所有层之后，执行一次标准的 `MultiheadAttention`。
-        *   **关键点**: 必须传入 `key_padding_mask` 以忽略 Padding Token。
+        *   **关键点**: 将 `attention_mask` (True=保留) 转换为 `key_padding_mask` (True=Mask) 以忽略 Padding Token。
         *   `x = x + global_context * 0.1` (残差连接)。
     4.  **层级聚合 (Level Aggregation)**:
         *   `aggregated = level_aggregator(x)`。

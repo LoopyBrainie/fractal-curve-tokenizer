@@ -387,20 +387,9 @@ class NextGenerationFractalViT(nn.Module):
         max_len = padded_tokens.shape[1]
         seq_positions = torch.arange(max_len, device=device).unsqueeze(0).expand(batch_size, -1)
         
-        # AdvancedFractalPositionEmbedding 需要支持 Batch 输入
-        # 目前它只支持 (Seq, Info)，我们需要修改它或者 reshape
-        # 临时方案: Reshape -> Forward -> Reshape
-        # 但 positional embedding 内部有广播逻辑，可能需要调整。
-        # 让我们先假设 positional embedding 可以处理 (B*L, Info) 或者我们修改 positional.py
-        
-        # 为了避免修改 positional.py 的接口太复杂，我们这里先 flatten 处理
-        # 但这样会丢失 batch 内的相对位置信息吗？不会，因为 seq_positions 是正确的
-        
-        # 实际上，AdvancedFractalPositionEmbedding 的 forward 接受 levels_info (N, Info)
-        # 我们可以把 Batch 和 Seq 维度合并
-        flat_levels = padded_levels.reshape(-1, padded_levels.shape[-1])
-        flat_pos_emb = self.pos_embedding(flat_levels) # (B*MaxLen, Dim)
-        pos_emb = flat_pos_emb.reshape(batch_size, max_len, -1)
+        # AdvancedFractalPositionEmbedding 原生支持 (..., info_len) 输入
+        # 因此可以直接传入 (B, MaxLen, Info) 格式，无需 flatten/reshape
+        pos_emb = self.pos_embedding(padded_levels)  # (B, MaxLen, Dim)
         
         x = padded_tokens + pos_emb
 

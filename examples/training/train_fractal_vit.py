@@ -284,26 +284,64 @@ def get_dataset_spec(dataset: str) -> DatasetSpec:
 
 
 def build_transforms(spec: DatasetSpec) -> Tuple[transforms.Compose, transforms.Compose]:
+    """
+    构建数据增强管道
+    
+    根据不同数据集选择合适的增强策略：
+    - MNIST: 简单增强（灰度图不适合颜色变换）
+    - CIFAR10/100: 使用 CIFAR10 AutoAugment 策略
+    - ImageNet 类: 使用 IMAGENET AutoAugment 策略
+    """
+    # 数据集到 AutoAugment 策略的映射
+    augment_policies = {
+        "CIFAR10": transforms.AutoAugmentPolicy.CIFAR10,
+        "CIFAR100": transforms.AutoAugmentPolicy.CIFAR10,  # CIFAR10 策略对 CIFAR100 也有效
+        "MNIST": None,  # MNIST 不使用 AutoAugment
+        "ImageNet": transforms.AutoAugmentPolicy.IMAGENET,
+        "COCO": transforms.AutoAugmentPolicy.IMAGENET,
+        "Caltech256": transforms.AutoAugmentPolicy.IMAGENET,
+        "TinyImageNet": transforms.AutoAugmentPolicy.IMAGENET,
+    }
+    
+    policy = augment_policies.get(spec.name)
+    
     if spec.name.lower() == "mnist":
-        train_ops = [transforms.Resize(32), transforms.ToTensor(), transforms.Normalize(spec.mean, spec.std)]
-        test_ops = train_ops.copy()
+        # MNIST: 灰度图，使用简单增强
+        train_ops = [
+            transforms.Resize(32),
+            transforms.RandomRotation(10),  # 轻微旋转
+            transforms.ToTensor(),
+            transforms.Normalize(spec.mean, spec.std),
+        ]
+        test_ops = [
+            transforms.Resize(32),
+            transforms.ToTensor(),
+            transforms.Normalize(spec.mean, spec.std),
+        ]
     else:
-        # 增强的数据增强策略：Mixup/CutMix 需要在 Batch 层面做，这里做基础增强
-        # 引入 AutoAugment 或 RandAugment
+        # 彩色图像：使用更丰富的增强策略
         train_ops = [
             transforms.Resize(spec.image_size),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomCrop(spec.image_size, padding=4), # 增加 RandomCrop
-            transforms.AutoAugment(transforms.AutoAugmentPolicy.CIFAR10), # 引入 AutoAugment
+            transforms.RandomCrop(spec.image_size, padding=4),
+        ]
+        
+        # 根据数据集选择对应的 AutoAugment 策略
+        if policy is not None:
+            train_ops.append(transforms.AutoAugment(policy))
+        
+        train_ops.extend([
             transforms.ToTensor(),
             transforms.Normalize(spec.mean, spec.std),
-            transforms.RandomErasing(p=0.25), # 引入 RandomErasing
-        ]
+            transforms.RandomErasing(p=0.25),  # 随机擦除
+        ])
+        
         test_ops = [
             transforms.Resize(spec.image_size),
             transforms.ToTensor(),
             transforms.Normalize(spec.mean, spec.std),
         ]
+    
     return transforms.Compose(train_ops), transforms.Compose(test_ops)
 
 
