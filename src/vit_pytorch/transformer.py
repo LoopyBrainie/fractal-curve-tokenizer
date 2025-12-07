@@ -185,7 +185,15 @@ class EnhancedFractalTransformer(nn.Module):
                 x = x * weight
 
         if seq_len > 1:
-            global_context, _ = self.global_context_attn(x, x, x)
+            # 将 attention_mask (B, 1, 1, Seq) 转换为 key_padding_mask (B, Seq)
+            # attention_mask: True = 保留, False = mask
+            # key_padding_mask: True = mask, False = 保留 (相反的语义)
+            key_padding_mask = None
+            if attention_mask is not None:
+                # attention_mask: (B, 1, 1, Seq) -> (B, Seq), 然后取反
+                key_padding_mask = ~attention_mask.squeeze(1).squeeze(1).bool()
+            
+            global_context, _ = self.global_context_attn(x, x, x, key_padding_mask=key_padding_mask)
             x = x + global_context * 0.1
 
         if levels_info is not None and levels_info.numel() > 0:

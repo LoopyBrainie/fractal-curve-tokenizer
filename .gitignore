@@ -158,3 +158,4 @@ experiments/*
 # OS generated files
 .DS_Store
 Thumbs.db
+IMPROVEMENT_PLAN.md

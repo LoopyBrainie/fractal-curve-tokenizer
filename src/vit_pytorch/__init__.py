@@ -6,6 +6,7 @@ from .fractal_vit import (
     NextGenerationFractalViT,
     SimpleFractalViT,
 )
+from .hilbert import HilbertCurve, get_quadrant_order, hilbert_distance_to_xy, xy_to_hilbert_distance
 from .positional import AdvancedFractalPositionEmbedding
 from .tokenization import BaseTokenizer, BaseTokenProcessor, TokenSequence, TokenizerOutput
 from .transformer import EnhancedFractalTransformer, EnhancedFractalTransformerBlock
@@ -19,6 +20,10 @@ __all__ = [
     "EnhancedFractalTokenProcessor",
     "EnhancedFractalTransformer",
     "EnhancedFractalTransformerBlock",
+    "HilbertCurve",
+    "get_quadrant_order",
+    "hilbert_distance_to_xy",
+    "xy_to_hilbert_distance",
     "NextGenerationFractalViT",
     "HilbertAwareMultiScaleAttention",
     "SimpleFractalViT",

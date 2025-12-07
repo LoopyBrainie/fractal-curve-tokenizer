@@ -108,13 +108,20 @@ class AdvancedFractalPositionEmbedding(nn.Module):
         return self.fusion_network(combined_emb)
 
     def get_attention_bias(self, depths: torch.Tensor) -> torch.Tensor:
-        num_tokens = len(depths)
-        bias = torch.zeros(num_tokens, num_tokens, device=depths.device)
-
-        for i in range(num_tokens):
-            for j in range(num_tokens):
-                depth_i = depths[i].clamp(0, self.max_level).long()
-                depth_j = depths[j].clamp(0, self.max_level).long()
-                bias[i, j] = self.level_attention_bias[depth_i, depth_j]
-
+        """
+        计算基于层级的注意力偏置矩阵
+        
+        Args:
+            depths: (N,) 每个 token 的深度值
+            
+        Returns:
+            (N, N) 注意力偏置矩阵
+        """
+        # 向量化实现，避免双重循环
+        depths_clamped = depths.clamp(0, self.max_level).long()  # (N,)
+        
+        # 使用高级索引一次性获取所有偏置
+        # bias[i, j] = level_attention_bias[depths[i], depths[j]]
+        bias = self.level_attention_bias[depths_clamped.unsqueeze(1), depths_clamped.unsqueeze(0)]
+        
         return bias

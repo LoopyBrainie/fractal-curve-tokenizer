@@ -11,9 +11,11 @@
     *   `CocoClassificationWrapper`: 将 COCO 目标检测数据集转换为分类数据集（取最大物体类别）。
     *   `TinyImageNetVal`: 自定义加载器处理 TinyImageNet 的验证集标注文件。
 *   **数据增强**：
-    *   `AutoAugment`: 自动增强策略 (CIFAR10/ImageNet 策略)。
-    *   `RandomErasing`: 随机擦除。
-    *   `RandomCrop`, `RandomHorizontalFlip`: 基础增强。
+    *   **策略分发**: 根据数据集类型自动选择增强策略。
+    *   `MNIST`: 简单增强（Resize, RandomRotation, Normalize）。
+    *   `CIFAR10/100`: 使用 `AutoAugmentPolicy.CIFAR10`。
+    *   `ImageNet/COCO`: 使用 `AutoAugmentPolicy.IMAGENET`。
+    *   通用增强: `RandomCrop`, `RandomHorizontalFlip`, `RandomErasing`。
 
 ## 9.2 模型构建与配置
 

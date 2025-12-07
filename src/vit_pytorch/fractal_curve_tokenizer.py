@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 
+from .hilbert import HilbertCurve, get_quadrant_order
 from .tokenization import BaseTokenizer, TokenSequence, TokenizerOutput
 
 
@@ -302,7 +303,8 @@ class FractalHilbertTokenizer(BaseTokenizer):
 
     def _determine_traversal_order(self, level, h, w, num_patches):
         if num_patches == 4:
-            return self.get_enhanced_hilbert_order(level, h, w)
+            # 使用统一的 Hilbert 模块获取遍历顺序
+            return get_quadrant_order(level, h, w)
 
         if num_patches == 2:
             # 对于高度分割，按从上到下；宽度分割，从左到右
@@ -476,237 +478,8 @@ class FractalHilbertTokenizer(BaseTokenizer):
         candidate = max(lower_bound, min(candidate, upper_bound))
         return candidate
 
-    def recursive_hilbert_order(self, level, h, w, orientation="up"):
-        """
-        递归生成真正的Hilbert曲线遍历顺序
-
-        Args:
-            level: 当前递归层级
-            h, w: 当前patch的高度和宽度
-            orientation: 曲线方向 ('up', 'right', 'down', 'left')
-
-        Returns:
-            List[int]: 四个象限的遍历顺序 [0,1,2,3] -> [左上,右上,左下,右下]
-        """
-        # 基础情况：最小分割单元或达到层级限制
-        max_level_check = (self.max_level is not None) and (level >= self.max_level)
-        min_size_check = (h <= 2 and w <= 2)
-
-        if max_level_check or min_size_check:
-            return self._get_base_hilbert_order(orientation)
-
-        # 计算宽高比，用于调整Hilbert曲线的形状
-        aspect_ratio = w / h if h > 0 else 1.0
-
-        # 根据递归层级和方向生成Hilbert顺序
-        return self._generate_hilbert_sequence(level, aspect_ratio, orientation)
-
-    def _get_base_hilbert_order(self, orientation):
-        """
-        根据方向返回基础的Hilbert曲线顺序
-        标准Hilbert曲线在2x2网格中的四种基本形态
-        """
-        base_orders = {
-            "up": [2, 0, 1, 3],  # 左下→左上→右上→右下 (向上开口)
-            "right": [0, 2, 3, 1],  # 左上→左下→右下→右上 (向右开口)
-            "down": [1, 3, 2, 0],  # 右上→右下→左下→左上 (向下开口)
-            "left": [3, 1, 0, 2],  # 右下→右上→左上→左下 (向左开口)
-        }
-        return base_orders.get(orientation, base_orders["up"])
-
-    def _generate_hilbert_sequence(self, level, aspect_ratio, orientation):
-        """
-        基于递归层级和宽高比生成Hilbert序列
-        实现真正的分形递归性质
-        """
-        # 根据Hilbert曲线的递归性质，每个象限内部的方向会发生变化
-        orientation_map = {
-            "up": ["left", "up", "up", "right"],  # 四个象限的子方向
-            "right": ["up", "right", "right", "down"],
-            "down": ["right", "down", "down", "left"],
-            "left": ["down", "left", "left", "up"],
-        }
-
-        # 获取当前方向对应的基础顺序
-        base_order = self._get_base_hilbert_order(orientation)
-
-        # 根据宽高比调整：非正方形区域的特殊处理
-        if aspect_ratio > 1.6:  # 宽矩形
-            # 对于宽矩形，优化水平遍历
-            return self._adjust_for_wide_rectangle(base_order, level)
-        if aspect_ratio < 0.625:  # 高矩形
-            # 对于高矩形，优化垂直遍历
-            return self._adjust_for_tall_rectangle(base_order, level)
-        # 接近正方形，使用标准Hilbert顺序
-        return base_order
-
-    def _adjust_for_wide_rectangle(self, base_order, level):
-        """为宽矩形调整Hilbert顺序，优化水平连续性"""
-        # 宽矩形时，优先保持水平方向的连续性
-        if level % 2 == 0:
-            # 偶数层：左→右优先
-            return [2, 0, 1, 3]  # 左下→左上→右上→右下
-        # 奇数层：保持Hilbert性质但调整顺序
-        return [0, 2, 3, 1]  # 左上→左下→右下→右上
-
-    def _adjust_for_tall_rectangle(self, base_order, level):
-        """为高矩形调整Hilbert顺序，优化垂直连续性"""
-        # 高矩形时，优先保持垂直方向的连续性
-        if level % 2 == 0:
-            # 偶数层：上→下优先
-            return [0, 1, 3, 2]  # 左上→右上→右下→左下
-        # 奇数层：保持Hilbert性质但调整顺序
-        return [2, 3, 1, 0]  # 左下→右下→右上→左上
-
-    def generate_true_hilbert_curve(self, n=2):
-        """
-        生成真正的n阶Hilbert曲线坐标序列
-        返回坐标点列表，可用于验证算法正确性
-
-        Args:
-            n: Hilbert曲线的阶数 (2^n x 2^n 网格)
-
-        Returns:
-            List[Tuple[int, int]]: 按Hilbert曲线顺序排列的坐标点
-        """
-        if n == 0:
-            return [(0, 0)]
-
-        # 递归生成前一阶的曲线
-        prev_points = self.generate_true_hilbert_curve(n - 1)
-
-        # 四个象限的变换
-        # 左下象限：旋转90度逆时针，然后翻转x坐标
-        q1 = [(y, x) for x, y in prev_points]
-
-        # 左上象限：直接复制并上移
-        q2 = [(x, y + 2 ** (n - 1)) for x, y in prev_points]
-
-        # 右上象限：直接复制并右上移
-        q3 = [(x + 2 ** (n - 1), y + 2 ** (n - 1)) for x, y in prev_points]
-
-        # 右下象限：旋转90度顺时针，翻转y坐标，然后右移
-        q4 = [(2 ** (n - 1) - 1 - y + 2 ** (n - 1), 2 ** (n - 1) - 1 - x) for x, y in prev_points]
-
-        # 按Hilbert顺序连接四个象限
-        return q1 + q2 + q3 + q4
-
-    def hilbert_distance(self, x, y, n):
-        """
-        计算点(x,y)在n阶Hilbert曲线上的距离
-        用于将2D坐标映射为1D距离
-
-        Args:
-            x, y: 2D坐标
-            n: Hilbert曲线阶数
-
-        Returns:
-            int: 在Hilbert曲线上的距离
-        """
-        d = 0
-        s = n // 2
-
-        while s > 0:
-            rx = 1 if x & s else 0
-            ry = 1 if y & s else 0
-            d += s * s * ((3 * rx) ^ ry)
-
-            # 旋转坐标
-            if ry == 0:
-                if rx == 1:
-                    x = s - 1 - x
-                    y = s - 1 - y
-                x, y = y, x
-
-            s //= 2
-
-        return d
-
-    def adaptive_hilbert_mapping(self, patch_indices, h, w):
-        """
-        为任意尺寸的patch网格生成自适应Hilbert映射
-
-        Args:
-            patch_indices: 要排序的patch索引列表 [0,1,2,3]
-            h, w: patch网格的高度和宽度
-
-        Returns:
-            List[int]: 按Hilbert顺序重排的索引
-        """
-        if len(patch_indices) != 4:
-            return patch_indices
-
-        # 将4个象限映射到坐标
-        coords = [
-            (0, 1),  # 左上 (0)
-            (1, 1),  # 右上 (1)
-            (0, 0),  # 左下 (2)
-            (1, 0),  # 右下 (3)
-        ]
-
-        # 根据实际尺寸调整坐标缩放
-        scaled_coords = []
-        for i, (x, y) in enumerate(coords):
-            # 将单位坐标映射到实际patch尺寸
-            actual_x = int(x * (w - 1)) if w > 1 else x
-            actual_y = int(y * (h - 1)) if h > 1 else y
-            scaled_coords.append((actual_x, actual_y, i))
-
-        # 计算每个坐标在Hilbert曲线上的距离
-        max_dim = max(h, w)
-        # 找到最小的2的幂次方大于等于max_dim
-        n = 1
-        while (1 << n) < max_dim:
-            n += 1
-        curve_size = 1 << n
-
-        # 计算Hilbert距离并排序
-        hilbert_distances = []
-        for x, y, idx in scaled_coords:
-            # 将坐标归一化到curve_size范围内
-            norm_x = int(x * curve_size / max_dim) if max_dim > 0 else 0
-            norm_y = int(y * curve_size / max_dim) if max_dim > 0 else 0
-            dist = self.hilbert_distance(norm_x, norm_y, curve_size)
-            hilbert_distances.append((dist, idx))
-
-        # 按Hilbert距离排序
-        hilbert_distances.sort()
-
-        return [idx for _, idx in hilbert_distances]
-
-    def get_enhanced_hilbert_order(self, level, h, w):
-        """
-        增强版Hilbert顺序生成器
-        结合递归算法和自适应映射
-        """
-        # 基础patch索引
-        patch_indices = [0, 1, 2, 3]
-
-        aspect_ratio = w / h if h > 0 else 1.0
-
-        # 使用自适应映射计算基础顺序
-        adaptive_order = self.adaptive_hilbert_mapping(patch_indices, h, w)
-
-        # 浅层保持自适应顺序，快速对齐边界情况
-        if level <= 1:
-            return adaptive_order
-
-        orientation = self._get_orientation_for_level(level)
-        base_order = self._get_base_hilbert_order(orientation)
-
-        if aspect_ratio > 1.6:
-            return self._adjust_for_wide_rectangle(base_order, level)
-        if aspect_ratio < 0.625:
-            return self._adjust_for_tall_rectangle(base_order, level)
-        if abs(aspect_ratio - 1.0) < 0.3:
-            return base_order
-
-        return adaptive_order
-
-    def _get_orientation_for_level(self, level):
-        """根据递归层级确定Hilbert曲线方向"""
-        orientations = ["up", "right", "down", "left"]
-        return orientations[level % 4]
+    # 注意: Hilbert 曲线相关方法已迁移至 hilbert.py 模块
+    # 使用 from .hilbert import HilbertCurve, get_quadrant_order
 
     def default_should_split(self, patch, level):
         """默认分割策略：只看层数和patch大小"""

@@ -57,7 +57,7 @@
             4.  返回 `([token], [level_info])`。
         *   **动作 1 (继续分割)**:
             1.  调用 `_adaptive_split(patch)` 将 Patch 切分为 4 个子块（左上、右上、左下、右下）。
-            2.  调用 `_determine_traversal_order` 获取 Hilbert 遍历顺序（如 `[2, 0, 1, 3]`）。
+            2.  调用 `_determine_traversal_order` (内部委托给 `hilbert` 模块) 获取 Hilbert 遍历顺序（如 `[2, 0, 1, 3]`）。
             3.  **递归**: 按顺序对每个子块调用 `fractal_partition`。
             4.  **聚合**: 将所有子块返回的 Token 和 Level 列表拼接并返回。
 
