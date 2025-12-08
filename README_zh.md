@@ -114,6 +114,139 @@ python examples/training/train_fractal_vit.py --dataset cifar10 --epochs 50 --ba
 * `visualizations/`: 损失和准确率曲线。
 * `training_history.json`: 每个 epoch 的详细指标。
 
+## 基准测试 (Benchmarking)
+
+本项目包含全面的基准测试工具，用于评估模型性能、分词效率、收敛行为以及与标准 ViT 的对比。
+
+### 1. 模型性能基准测试
+
+测试前向/反向传播时间和分词分析：
+
+```bash
+python -m tests.benchmarks.benchmark_fractal_vit
+```
+
+**关键指标：**
+- 前向/反向传播时间（毫秒）
+- 分词时间和 token 数量分布
+- 模型参数量和内存使用
+- 吞吐量（图像/秒）
+
+**结果：** 保存到 `benchmark_results/`，包含 JSON 指标和可选可视化。
+
+### 2. 收敛性分析
+
+在合成分类任务上分析训练收敛性：
+
+```bash
+python -m tests.benchmarks.check_convergence \
+  --output-dir benchmark_results \
+  --image-size 32 \
+  --num-epochs 20 \
+  --num-runs 3
+```
+
+**参数说明：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--output-dir` | str | `benchmark_results` | 结果输出目录 |
+| `--image-size` | int | `32` | 合成数据的图像尺寸 |
+| `--num-classes` | int | `4` | 分类类别数 |
+| `--num-epochs` | int | `30` | 每次运行的训练轮数 |
+| `--num-runs` | int | `3` | 重复运行次数 |
+
+**测试场景：**
+- 颜色分类（简单任务）
+- 图案分类（中等难度）
+- 复杂度分类（困难任务）
+
+**输出指标：**
+- 收敛速度（达到阈值所需轮数）
+- 最终训练/验证准确率和损失
+- 过拟合检测
+- 损失方差和梯度统计
+
+### 3. 标准 ViT 对比
+
+将 FractalViT 各版本与标准基于 patch 的 ViT 进行对比：
+
+```bash
+python -m tests.benchmarks.compare_fractal_vs_standard \
+  --output-dir benchmark_results \
+  --image-size 64 \
+  --num-epochs 20 \
+  --batch-size 8
+```
+
+**参数说明：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--output-dir` | str | `benchmark_results` | 输出目录 |
+| `--image-size` | int | `64` | 输入图像尺寸 |
+| `--num-classes` | int | `10` | 分类数量 |
+| `--batch-size` | int | `8` | 批次大小 |
+| `--num-epochs` | int | `20` | 训练轮数 |
+| `--plot` | flag | `False` | 生成对比图表 |
+
+**对比指标：**
+- 分词效率（自适应 vs 固定 patch）
+- 计算性能（前向/反向速度）
+- 内存使用
+- 训练收敛和最终准确率
+- 参数数量
+
+### 4. 预训练模型评估
+
+评估训练好的 `.pth` 检查点，生成全面的指标和可视化：
+
+```bash
+python -m tests.benchmarks.evaluate_pretrained \
+  --checkpoint experiments/fractal_vit_simple_20251208/checkpoints/best.pth \
+  --visualize \
+  --num-samples 500 \
+  --output-dir benchmark_results/pretrained_eval
+```
+
+**参数说明：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--checkpoint` | str | **必需** | `.pth` 检查点文件路径 |
+| `--output-dir` | str | `{checkpoint_dir}/evaluation` | 结果输出目录 |
+| `--visualize` | flag | `False` | 生成可视化图表 |
+| `--num-samples` | int | `None` | 测试样本数量（None = 全部）|
+| `--batch-size` | int | `32` | 评估批次大小 |
+
+**评估指标：**
+- 测试准确率（top-1 和 top-5）
+- 吞吐量（图像/秒）
+- 分词分析（token 数量分布）
+- 图像复杂度与 token 数量的相关性
+
+**生成的可视化（如果使用 `--visualize`）：**
+- `tokenization_analysis.png`：示例图像及其 token 分布
+- `complexity_vs_tokens.png`：复杂度 vs token 数量散点图
+- `performance_summary.png`：准确率和吞吐量图表
+- `confusion_matrix.png`：混淆矩阵（小样本量时）
+- `evaluation_results.json`：JSON 格式的完整指标
+
+**多检查点评估示例：**
+
+```bash
+# 评估最佳模型
+python -m tests.benchmarks.evaluate_pretrained \
+  -c experiments/fractal_vit_simple_20251208_222817/checkpoints/best.pth \
+  --visualize
+
+# 在子集上快速评估
+python -m tests.benchmarks.evaluate_pretrained \
+  -c workspace/models/fractal_vit/fractal_vit_simple_best.pth \
+  --num-samples 100 \
+  -o quick_eval
+```
+
 ## 测试 (Testing)
 
 本项目使用 `pytest` 进行测试。测试套件已重组为单元测试和集成测试。
@@ -144,9 +277,16 @@ fractal-curve-tokenizer/
 │   └── training/
 │       └── train_fractal_vit.py    # 主训练脚本
 ├── tests/
+│   ├── benchmarks/                 # 全面的基准测试套件
+│   │   ├── benchmark_fractal_vit.py    # 性能基准测试
+│   │   ├── check_convergence.py        # 收敛性分析
+│   │   ├── compare_fractal_vs_standard.py # ViT 对比
+│   │   ├── evaluate_pretrained.py      # 预训练模型评估
+│   │   └── benchmark_metrics.py        # 核心指标定义
 │   ├── unit/                       # 组件单元测试
 │   └── integration/                # 工作流集成测试
 ├── experiments/                    # 训练输出 (git 忽略)
+├── benchmark_results/              # 基准测试输出和可视化
 └── workspace/                      # 本地数据和模型 (git 忽略)
 ```
 

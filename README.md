@@ -114,6 +114,139 @@ Training artifacts are saved in the `experiments/` directory, organized by times
 * `visualizations/`: Loss and accuracy curves.
 * `training_history.json`: Detailed metrics for every epoch.
 
+## Benchmarking
+
+The project includes comprehensive benchmarking tools to evaluate model performance, tokenization efficiency, convergence behavior, and comparison with standard ViT.
+
+### 1. Model Performance Benchmark
+
+Benchmark forward/backward pass timing and tokenization analysis:
+
+```bash
+python -m tests.benchmarks.benchmark_fractal_vit
+```
+
+**Key Metrics:**
+- Forward/backward pass timing (ms)
+- Tokenization time and token count distribution
+- Model parameters and memory usage
+- Images per second throughput
+
+**Results:** Saved to `benchmark_results/` with JSON metrics and optional visualizations.
+
+### 2. Convergence Analysis
+
+Analyze training convergence on synthetic classification tasks:
+
+```bash
+python -m tests.benchmarks.check_convergence \
+  --output-dir benchmark_results \
+  --image-size 32 \
+  --num-epochs 20 \
+  --num-runs 3
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--output-dir` | str | `benchmark_results` | Output directory for results |
+| `--image-size` | int | `32` | Image size for synthetic data |
+| `--num-classes` | int | `4` | Number of classes |
+| `--num-epochs` | int | `30` | Training epochs per run |
+| `--num-runs` | int | `3` | Number of repeated runs |
+
+**Tested Scenarios:**
+- Color classification (simple task)
+- Pattern classification (moderate difficulty)
+- Complexity classification (challenging task)
+
+**Output Metrics:**
+- Convergence speed (epochs to reach threshold)
+- Final train/validation accuracy and loss
+- Overfitting detection
+- Loss variance and gradient statistics
+
+### 3. Standard ViT Comparison
+
+Compare FractalViT variants against standard patch-based ViT:
+
+```bash
+python -m tests.benchmarks.compare_fractal_vs_standard \
+  --output-dir benchmark_results \
+  --image-size 64 \
+  --num-epochs 20 \
+  --batch-size 8
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--output-dir` | str | `benchmark_results` | Output directory |
+| `--image-size` | int | `64` | Input image size |
+| `--num-classes` | int | `10` | Number of classes |
+| `--batch-size` | int | `8` | Batch size |
+| `--num-epochs` | int | `20` | Training epochs |
+| `--plot` | flag | `False` | Generate comparison plots |
+
+**Comparison Metrics:**
+- Tokenization efficiency (adaptive vs fixed patches)
+- Computational performance (forward/backward speed)
+- Memory usage
+- Training convergence and final accuracy
+- Parameter count
+
+### 4. Pretrained Model Evaluation
+
+Evaluate trained `.pth` checkpoints with comprehensive metrics and visualizations:
+
+```bash
+python -m tests.benchmarks.evaluate_pretrained \
+  --checkpoint experiments/fractal_vit_simple_20251208/checkpoints/best.pth \
+  --visualize \
+  --num-samples 500 \
+  --output-dir benchmark_results/pretrained_eval
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--checkpoint` | str | **required** | Path to `.pth` checkpoint file |
+| `--output-dir` | str | `{checkpoint_dir}/evaluation` | Output directory for results |
+| `--visualize` | flag | `False` | Generate visualization plots |
+| `--num-samples` | int | `None` | Number of test samples (None = all) |
+| `--batch-size` | int | `32` | Evaluation batch size |
+
+**Evaluation Metrics:**
+- Test accuracy (top-1 and top-5)
+- Throughput (images/second)
+- Tokenization analysis (token count distribution)
+- Image complexity vs token count correlation
+
+**Generated Visualizations (if `--visualize`):**
+- `tokenization_analysis.png`: Sample images with token distribution
+- `complexity_vs_tokens.png`: Scatter plot of complexity vs tokens
+- `performance_summary.png`: Accuracy and throughput charts
+- `confusion_matrix.png`: Confusion matrix (for small sample sizes)
+- `evaluation_results.json`: Complete metrics in JSON format
+
+**Example with Multiple Checkpoints:**
+
+```bash
+# Evaluate your best model
+python -m tests.benchmarks.evaluate_pretrained \
+  -c experiments/fractal_vit_simple_20251208_222817/checkpoints/best.pth \
+  --visualize
+
+# Quick evaluation on subset
+python -m tests.benchmarks.evaluate_pretrained \
+  -c workspace/models/fractal_vit/fractal_vit_simple_best.pth \
+  --num-samples 100 \
+  -o quick_eval
+```
+
 ## Testing
 
 The project uses `pytest` for testing. The test suite has been reorganized into unit and integration tests.
@@ -144,9 +277,16 @@ fractal-curve-tokenizer/
 │   └── training/
 │       └── train_fractal_vit.py    # Main training script
 ├── tests/
+│   ├── benchmarks/                 # Comprehensive benchmarking suite
+│   │   ├── benchmark_fractal_vit.py    # Performance benchmarks
+│   │   ├── check_convergence.py        # Convergence analysis
+│   │   ├── compare_fractal_vs_standard.py # ViT comparison
+│   │   ├── evaluate_pretrained.py      # Pretrained model evaluation
+│   │   └── benchmark_metrics.py        # Core metrics definitions
 │   ├── unit/                       # Unit tests for components
 │   └── integration/                # Integration tests for workflows
 ├── experiments/                    # Training outputs (ignored by git)
+├── benchmark_results/              # Benchmark outputs and visualizations
 └── workspace/                      # Local data and models (ignored by git)
 ```
 
