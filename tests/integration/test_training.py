@@ -48,10 +48,14 @@ class DummyPositional(nn.Module):
         if levels_info.numel() == 0:
             return torch.zeros(0, self.dim, device=levels_info.device)
         
-        # levels_info shape can be (Batch, Seq, Info) or (Batch*Seq, Info) depending on caller
-        # But we just need to return (Batch, Seq, Dim) or (Batch*Seq, Dim) matching input[0]
-        
-        return torch.zeros(levels_info.shape[0], self.dim, device=levels_info.device)
+        # levels_info shape is (Batch, Seq, Info) from NextGenerationFractalViT
+        # We need to return (Batch, Seq, Dim) matching the expected shape
+        if levels_info.dim() == 3:
+            # Shape: (B, Seq, Info) -> return (B, Seq, Dim)
+            return torch.zeros(levels_info.shape[0], levels_info.shape[1], self.dim, device=levels_info.device)
+        else:
+            # Shape: (Batch*Seq, Info) -> return (Batch*Seq, Dim)
+            return torch.zeros(levels_info.shape[0], self.dim, device=levels_info.device)
 
 
 def test_vit_uses_custom_components() -> None:

@@ -10,6 +10,7 @@ from vit_pytorch.utils import (
     pair,
     exists,
     default,
+    sanitize_tensor,
 )
 
 
@@ -155,3 +156,54 @@ class TestCreateAttentionMask:
         mask = create_attention_mask(levels_info, torch.device("cpu"))
         
         assert mask.shape == (2, 3, 3)  # max_len = 3
+
+
+class TestSanitizeTensor:
+    """Tests for sanitize_tensor function."""
+
+    def test_clean_tensor_unchanged(self) -> None:
+        """Test that a clean tensor is returned unchanged."""
+        tensor = torch.tensor([1.0, 2.0, 3.0])
+        result = sanitize_tensor(tensor)
+        assert torch.equal(result, tensor)
+
+    def test_nan_replaced(self) -> None:
+        """Test that NaN values are replaced."""
+        tensor = torch.tensor([1.0, float('nan'), 3.0])
+        result = sanitize_tensor(tensor)
+        assert not torch.isnan(result).any()
+        assert result[1].item() == 0.0  # default nan_value
+
+    def test_posinf_replaced(self) -> None:
+        """Test that positive infinity is replaced."""
+        tensor = torch.tensor([1.0, float('inf'), 3.0])
+        result = sanitize_tensor(tensor)
+        assert not torch.isinf(result).any()
+        assert result[1].item() == 1.0  # default posinf_value
+
+    def test_neginf_replaced(self) -> None:
+        """Test that negative infinity is replaced."""
+        tensor = torch.tensor([1.0, float('-inf'), 3.0])
+        result = sanitize_tensor(tensor)
+        assert not torch.isinf(result).any()
+        assert result[1].item() == -1.0  # default neginf_value
+
+    def test_custom_replacement_values(self) -> None:
+        """Test with custom replacement values."""
+        tensor = torch.tensor([float('nan'), float('inf'), float('-inf')])
+        result = sanitize_tensor(
+            tensor, nan_value=99.0, posinf_value=100.0, neginf_value=-100.0
+        )
+        assert result[0].item() == 99.0
+        assert result[1].item() == 100.0
+        assert result[2].item() == -100.0
+
+    def test_multidimensional_tensor(self) -> None:
+        """Test with multi-dimensional tensor."""
+        tensor = torch.tensor([[1.0, float('nan')], [float('inf'), 2.0]])
+        result = sanitize_tensor(tensor)
+        assert result.shape == tensor.shape
+        assert not torch.isnan(result).any()
+        assert not torch.isinf(result).any()
+        assert result[0, 1].item() == 0.0
+        assert result[1, 0].item() == 1.0
