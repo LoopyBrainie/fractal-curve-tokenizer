@@ -66,3 +66,27 @@
     *   同一层级：权重 1.2 (强关联)
     *   相邻层级：权重 1.1 (中关联)
     *   其他：权重 1.0
+
+### extract_depths()
+**功能**：统一从 `levels_info` 提取深度索引。
+**逻辑**：
+*   自动处理 `(Seq, Info)` 和 `(Batch, Seq, Info)` 两种输入形状。
+*   提取第 0 维（深度信息）。
+*   执行 `clamp(0, max_level)` 确保索引安全。
+
+### normalize_levels_info()
+**功能**：规范化 `levels_info` 维度。
+**逻辑**：
+*   将 `(Seq, Info)` 自动升维为 `(1, Seq, Info)` 以统一批处理逻辑。
+
+## 2.4 fractal_curve_tokenizer.py - 内部数据结构
+
+### PatchInfo dataclass
+用于 BFS 批处理过程中追踪 Patch 状态。
+
+*   **属性**：
+    *   `patch`: `torch.Tensor` `(C, H, W)`，图像块数据。
+    *   `level`: `int`，当前递归深度。
+    *   `coord`: `List[int]`，象限路径坐标。
+    *   `dfs_order`: `float`，**关键属性**，用于在 BFS 过程中保持 Hilbert DFS 遍历顺序。
+
