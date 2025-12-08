@@ -8,9 +8,10 @@ import json
 import random
 import sys
 import time
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -45,6 +46,252 @@ if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
 from vit_pytorch.fractal_vit import NextGenerationFractalViT, SimpleFractalViT
+
+
+# ============================================================================
+# 自适应 Tokenization 监控
+# ============================================================================
+
+@dataclass
+class TokenizationStats:
+    """每个 batch 的 tokenization 统计数据。"""
+    avg_tokens_per_image: float = 0.0
+    min_tokens: int = 0
+    max_tokens: int = 0
+    std_tokens: float = 0.0
+    levels_used: List[int] = field(default_factory=list)
+    max_level_reached: int = 0
+    split_decisions: int = 0  # 总分割决策次数
+    split_ratio: float = 0.0  # 选择分割的比例
+
+
+class AdaptiveTokenMonitor:
+    """监控自适应 tokenization 特性的工具类。
+    
+    用于验证模型是否按预期实现了基于 Hilbert curve 的自适应分词：
+    1. 简单图像应生成较少的 tokens
+    2. 复杂图像应生成较多的 tokens  
+    3. 分割决策应随训练进行而优化
+    4. 不同层级的使用应反映图像复杂度
+    """
+    
+    def __init__(self) -> None:
+        self.epoch_stats: Dict[int, List[TokenizationStats]] = defaultdict(list)
+        self.complexity_correlation: List[Tuple[float, int]] = []  # (图像复杂度, token数)
+        self.split_ratio_history: List[float] = []  # 每个 epoch 的平均分割比例
+    
+    @torch.no_grad()
+    def analyze_batch(
+        self,
+        model: nn.Module,
+        images: torch.Tensor,
+        epoch: int,
+    ) -> TokenizationStats:
+        """分析一个 batch 的 tokenization 行为。"""
+        tokenizer = getattr(model, "tokenizer", None) or getattr(model, "fractal_tokenizer", None)
+        if tokenizer is None:
+            # SimpleFractalViT wraps enhanced_model
+            enhanced = getattr(model, "enhanced_model", None)
+            if enhanced:
+                tokenizer = getattr(enhanced, "tokenizer", None)
+        
+        if tokenizer is None:
+            return TokenizationStats()
+        
+        # 获取 tokenization 结果
+        output = tokenizer.tokenize(images)
+        sequences = output.sequences
+        
+        token_counts = [seq.tokens.shape[0] for seq in sequences]
+        levels_used_all: List[int] = []
+        max_level = 0
+        
+        for seq in sequences:
+            levels = seq.metadata.get("levels", None)
+            if levels is not None and levels.numel() > 0:
+                depths = levels[:, 0].tolist()
+                levels_used_all.extend(depths)
+                max_level = max(max_level, max(depths))
+        
+        # 计算图像复杂度（使用方差作为代理）
+        for i, seq in enumerate(sequences):
+            img_var = images[i].var().item()
+            self.complexity_correlation.append((img_var, token_counts[i]))
+        
+        # 计算分割决策统计
+        split_decisions = len(getattr(tokenizer, "saved_log_probs", []))
+        # 注意：saved_log_probs 可能在 clear_saved_actions 后为空
+        
+        stats = TokenizationStats(
+            avg_tokens_per_image=float(np.mean(token_counts)),
+            min_tokens=int(np.min(token_counts)),
+            max_tokens=int(np.max(token_counts)),
+            std_tokens=float(np.std(token_counts)),
+            levels_used=sorted(list(set(levels_used_all))),
+            max_level_reached=max_level,
+            split_decisions=split_decisions,
+        )
+        
+        self.epoch_stats[epoch].append(stats)
+        return stats
+    
+    def get_epoch_summary(self, epoch: int) -> Dict[str, Any]:
+        """获取一个 epoch 的汇总统计。"""
+        stats_list = self.epoch_stats.get(epoch, [])
+        if not stats_list:
+            return {}
+        
+        avg_tokens = np.mean([s.avg_tokens_per_image for s in stats_list])
+        std_tokens = np.mean([s.std_tokens for s in stats_list])
+        min_tokens = min(s.min_tokens for s in stats_list)
+        max_tokens = max(s.max_tokens for s in stats_list)
+        all_levels = set()
+        for s in stats_list:
+            all_levels.update(s.levels_used)
+        max_level = max(s.max_level_reached for s in stats_list)
+        
+        return {
+            "epoch": epoch,
+            "avg_tokens_per_image": float(avg_tokens),
+            "token_std_across_images": float(std_tokens),
+            "min_tokens": min_tokens,
+            "max_tokens": max_tokens,
+            "levels_used": sorted(list(all_levels)),
+            "max_level_reached": max_level,
+            "token_range": max_tokens - min_tokens,
+            "is_adaptive": max_tokens > min_tokens,  # 关键指标
+        }
+    
+    def compute_complexity_correlation(self) -> float:
+        """计算图像复杂度与 token 数量的相关性。
+        
+        正相关表示复杂图像产生更多 tokens（期望行为）。
+        """
+        if len(self.complexity_correlation) < 10:
+            return 0.0
+        
+        complexities = [c[0] for c in self.complexity_correlation]
+        token_counts = [c[1] for c in self.complexity_correlation]
+        
+        # Pearson 相关系数
+        corr = np.corrcoef(complexities, token_counts)[0, 1]
+        return float(corr) if not np.isnan(corr) else 0.0
+    
+    def get_full_report(self) -> Dict[str, Any]:
+        """生成完整的监控报告。"""
+        epochs = sorted(self.epoch_stats.keys())
+        epoch_summaries = [self.get_epoch_summary(e) for e in epochs]
+        
+        complexity_corr = self.compute_complexity_correlation()
+        
+        # 检查自适应性趋势
+        token_ranges = [s.get("token_range", 0) for s in epoch_summaries]
+        adaptivity_trend = "improving" if len(token_ranges) > 1 and token_ranges[-1] > token_ranges[0] else "stable"
+        
+        return {
+            "epoch_summaries": epoch_summaries,
+            "complexity_token_correlation": complexity_corr,
+            "adaptivity_trend": adaptivity_trend,
+            "is_working_as_expected": complexity_corr > 0.1,  # 期望正相关
+            "diagnosis": self._generate_diagnosis(complexity_corr, epoch_summaries),
+        }
+    
+    def _generate_diagnosis(self, corr: float, summaries: List[Dict]) -> str:
+        """生成诊断信息。"""
+        messages = []
+        
+        if corr > 0.3:
+            messages.append("[OK] 自适应分词工作正常：复杂图像产生更多 tokens")
+        elif corr > 0.1:
+            messages.append("[~] 自适应分词有轻微效果，但可能需要更多训练")
+        elif corr > -0.1:
+            messages.append("[X] 自适应分词效果不明显：token 数与图像复杂度无关")
+        else:
+            messages.append("[X] 异常：复杂图像反而产生更少 tokens")
+        
+        if summaries:
+            last = summaries[-1]
+            if last.get("token_range", 0) > 0:
+                messages.append(f"[OK] 不同图像产生不同数量的 tokens (范围: {last.get('min_tokens')}-{last.get('max_tokens')})")
+            else:
+                messages.append("[X] 所有图像产生相同数量的 tokens（可能是非自适应模式）")
+            
+            if len(last.get("levels_used", [])) > 1:
+                messages.append(f"[OK] 使用了多个层级: {last.get('levels_used')}")
+            else:
+                messages.append("[~] 只使用了单一层级")
+        
+        return "\n".join(messages)
+
+
+def analyze_adaptive_tokenization(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    num_samples: int = 100,
+) -> Dict[str, Any]:
+    """分析模型的自适应 tokenization 特性。
+    
+    创建简单和复杂图像，验证 tokenization 是否有差异。
+    """
+    model.eval()
+    tokenizer = getattr(model, "tokenizer", None) or getattr(model, "fractal_tokenizer", None)
+    if tokenizer is None:
+        enhanced = getattr(model, "enhanced_model", None)
+        if enhanced:
+            tokenizer = getattr(enhanced, "tokenizer", None)
+    
+    if tokenizer is None:
+        return {"error": "无法找到 tokenizer"}
+    
+    results = {
+        "simple_images": [],
+        "complex_images": [],
+        "real_images": [],
+    }
+    
+    # 获取一个 batch 来确定图像尺寸
+    sample_batch = next(iter(loader))[0]
+    _, c, h, w = sample_batch.shape
+    
+    with torch.no_grad():
+        # 1. 测试简单图像（均匀颜色）
+        simple_img = torch.zeros(1, c, h, w, device=device)
+        output = tokenizer.tokenize(simple_img)
+        simple_tokens = output.sequences[0].tokens.shape[0]
+        results["simple_images"].append(simple_tokens)
+        
+        # 2. 测试复杂图像（随机噪声）
+        complex_img = torch.randn(1, c, h, w, device=device)
+        output = tokenizer.tokenize(complex_img)
+        complex_tokens = output.sequences[0].tokens.shape[0]
+        results["complex_images"].append(complex_tokens)
+        
+        # 3. 测试真实图像
+        count = 0
+        for images, _ in loader:
+            images = images.to(device)
+            output = tokenizer.tokenize(images)
+            for seq in output.sequences:
+                results["real_images"].append(seq.tokens.shape[0])
+                count += 1
+                if count >= num_samples:
+                    break
+            if count >= num_samples:
+                break
+    
+    analysis = {
+        "simple_image_tokens": int(np.mean(results["simple_images"])),
+        "complex_image_tokens": int(np.mean(results["complex_images"])),
+        "real_image_tokens_mean": float(np.mean(results["real_images"])),
+        "real_image_tokens_std": float(np.std(results["real_images"])),
+        "real_image_tokens_min": int(np.min(results["real_images"])),
+        "real_image_tokens_max": int(np.max(results["real_images"])),
+        "is_adaptive": int(np.mean(results["complex_images"])) > int(np.mean(results["simple_images"])),
+        "adaptivity_ratio": float(np.mean(results["complex_images"])) / max(float(np.mean(results["simple_images"])), 1),
+    }
+    
+    return analysis
 
 
 class CocoClassificationWrapper(CocoDetection):
@@ -744,6 +991,92 @@ def plot_curves(paths: ExperimentPaths, history: Dict[str, list]) -> None:
         print("matplotlib is not installed, skipping curve export")
 
 
+def plot_tokenization_analysis(
+    paths: ExperimentPaths,
+    monitor: AdaptiveTokenMonitor,
+    final_analysis: Dict[str, Any],
+) -> None:
+    """绘制自适应 tokenization 分析图表。"""
+    try:
+        import matplotlib.pyplot as plt
+        
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # 1. Token 数量随 epoch 变化
+        epoch_summaries = monitor.get_full_report().get("epoch_summaries", [])
+        if epoch_summaries:
+            epochs = [s["epoch"] for s in epoch_summaries]
+            avg_tokens = [s["avg_tokens_per_image"] for s in epoch_summaries]
+            min_tokens = [s["min_tokens"] for s in epoch_summaries]
+            max_tokens = [s["max_tokens"] for s in epoch_summaries]
+            
+            ax = axes[0, 0]
+            ax.fill_between(epochs, min_tokens, max_tokens, alpha=0.3, label="Token Range")
+            ax.plot(epochs, avg_tokens, "b-", linewidth=2, label="Avg Tokens")
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("Tokens per Image")
+            ax.set_title("Token Count Over Training")
+            ax.legend()
+            ax.grid(True)
+        
+        # 2. Simple vs Complex image token comparison
+        ax = axes[0, 1]
+        simple = final_analysis.get("simple_image_tokens", 0)
+        complex_ = final_analysis.get("complex_image_tokens", 0)
+        bars = ax.bar(["Simple\n(Uniform)", "Complex\n(Noise)"], [simple, complex_], color=["green", "red"])
+        ax.set_ylabel("Token Count")
+        ax.set_title("Adaptivity: Simple vs Complex Images")
+        for bar, val in zip(bars, [simple, complex_]):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5, 
+                   str(val), ha='center', va='bottom', fontsize=12)
+        
+        # 3. Image complexity vs Token count scatter plot
+        ax = axes[1, 0]
+        if monitor.complexity_correlation:
+            complexities = [c[0] for c in monitor.complexity_correlation[-500:]]  # Last 500 samples
+            token_counts = [c[1] for c in monitor.complexity_correlation[-500:]]
+            ax.scatter(complexities, token_counts, alpha=0.5, s=10)
+            ax.set_xlabel("Image Variance (Complexity Proxy)")
+            ax.set_ylabel("Token Count")
+            corr = monitor.compute_complexity_correlation()
+            ax.set_title(f"Complexity-Token Correlation (r={corr:.3f})")
+            ax.grid(True)
+        
+        # 4. Level usage distribution
+        ax = axes[1, 1]
+        if epoch_summaries:
+            last_summary = epoch_summaries[-1]
+            levels = last_summary.get("levels_used", [])
+            if levels:
+                # Count usage per level
+                level_counts: Dict[int, int] = defaultdict(int)
+                for stats in monitor.epoch_stats.get(last_summary["epoch"], []):
+                    for level in stats.levels_used:
+                        level_counts[level] += 1
+                
+                if level_counts:
+                    sorted_levels = sorted(level_counts.keys())
+                    counts = [level_counts[l] for l in sorted_levels]
+                    ax.bar([f"Level {l}" for l in sorted_levels], counts)
+                    ax.set_ylabel("Usage Count")
+                    ax.set_title("Level Distribution (Last Epoch)")
+                    ax.tick_params(axis='x', rotation=45)
+        
+        plt.tight_layout()
+        
+        # 保存
+        exp_path = paths.visuals_dir / "tokenization_analysis.png"
+        plt.savefig(exp_path, dpi=150, bbox_inches="tight")
+        workspace_path = paths.workspace_visuals_dir / f"tokenization_analysis_{paths.timestamp}.png"
+        plt.savefig(workspace_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        
+        print(f"Tokenization analysis saved to: {exp_path}")
+        
+    except ImportError:
+        print("matplotlib is not installed, skipping tokenization analysis plot")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Quick Fractal ViT trainer")
     parser.add_argument("--epochs", type=int, default=50)
@@ -857,8 +1190,22 @@ def main() -> None:
     best_val_acc = 0.0
     best_state: Optional[Dict[str, object]] = None
     baseline_ema: Optional[float] = None  # REINFORCE 基线
+    
+    # 初始化自适应 tokenization 监控器
+    token_monitor = AdaptiveTokenMonitor()
+    monitor_interval = max(1, args.epochs // 10)  # 每 10% 的 epochs 监控一次
 
     start_time = time.time()
+    
+    # 训练前分析初始 tokenization 特性
+    print("\n=== 训练前 Tokenization 分析 ===")
+    initial_analysis = analyze_adaptive_tokenization(model, val_loader, device, num_samples=50)
+    print(f"简单图像 tokens: {initial_analysis.get('simple_image_tokens', 'N/A')}")
+    print(f"复杂图像 tokens: {initial_analysis.get('complex_image_tokens', 'N/A')}")
+    print(f"自适应性: {'[YES]' if initial_analysis.get('is_adaptive') else '[NO]'}")
+    print(f"自适应比率: {initial_analysis.get('adaptivity_ratio', 0):.2f}x")
+    print()
+    
     for epoch in range(1, args.epochs + 1):
         train_loss, train_acc, baseline_ema = train_one_epoch(
             model,
@@ -885,6 +1232,15 @@ def main() -> None:
             f"Train: loss={train_loss:.4f}, acc={train_acc:.2f}% | "
             f"Val: loss={val_loss:.4f}, acc={val_acc:.2f}%"
         )
+        
+        # 定期监控 tokenization 特性
+        if epoch % monitor_interval == 0 or epoch == 1:
+            # 在验证集上采样分析
+            sample_batch = next(iter(val_loader))[0].to(device)
+            stats = token_monitor.analyze_batch(model, sample_batch, epoch)
+            print(f"  [Token Monitor] avg={stats.avg_tokens_per_image:.1f}, "
+                  f"range=[{stats.min_tokens}-{stats.max_tokens}], "
+                  f"levels={stats.levels_used}")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -904,16 +1260,42 @@ def main() -> None:
         model.load_state_dict(best_state["model"])  # type: ignore[arg-type]
 
     test_loss, test_acc = evaluate(model, test_loader, device, desc="test")
+    
+    # 训练后分析 tokenization 特性
+    print("\n=== 训练后 Tokenization 分析 ===")
+    final_analysis = analyze_adaptive_tokenization(model, val_loader, device, num_samples=50)
+    print(f"简单图像 tokens: {final_analysis.get('simple_image_tokens', 'N/A')}")
+    print(f"复杂图像 tokens: {final_analysis.get('complex_image_tokens', 'N/A')}")
+    print(f"真实图像 tokens: 均值={final_analysis.get('real_image_tokens_mean', 0):.1f}, "
+          f"范围=[{final_analysis.get('real_image_tokens_min', 0)}-{final_analysis.get('real_image_tokens_max', 0)}]")
+    print(f"自适应性: {'[YES]' if final_analysis.get('is_adaptive') else '[NO]'}")
+    print(f"自适应比率: {final_analysis.get('adaptivity_ratio', 0):.2f}x")
+    
+    # 生成完整监控报告
+    monitor_report = token_monitor.get_full_report()
+    print(f"\n=== 自适应 Tokenization 诊断 ===")
+    print(monitor_report.get("diagnosis", "无诊断信息"))
+    print(f"复杂度-Token 相关系数: {monitor_report.get('complexity_token_correlation', 0):.3f}")
+    
     summary = {
         "best_val_acc": best_val_acc,
         "test_acc": test_acc,
         "epochs_ran": len(history["train_loss"]),
         "elapsed_seconds": elapsed,
+        "tokenization_analysis": {
+            "initial": initial_analysis,
+            "final": final_analysis,
+            "complexity_correlation": monitor_report.get("complexity_token_correlation", 0),
+            "is_working_as_expected": monitor_report.get("is_working_as_expected", False),
+        },
     }
     save_history(paths, detailed_config, history, summary)
     plot_curves(paths, history)
+    
+    # 绘制 tokenization 分析图表
+    plot_tokenization_analysis(paths, token_monitor, final_analysis)
 
-    print("Training finished")
+    print("\nTraining finished")
     print(f"Best val accuracy: {best_val_acc:.2f}%")
     print(f"Test accuracy: {test_acc:.2f}%")
     print(f"Artifacts: {paths.experiment_dir}")
