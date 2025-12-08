@@ -1,13 +1,33 @@
+# -*- coding: utf-8 -*-
+"""Fractal Hilbert Curve Tokenizer.
+
+This module implements a hierarchical image tokenizer based on fractal 
+partitioning and Hilbert curve traversal. It supports learnable split 
+decisions using reinforcement learning (REINFORCE algorithm).
+"""
+
+from __future__ import annotations
+
+import logging
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .constants import (
+    DEFAULT_MAX_LEVEL,
+    EXTRA_DEPTH_CAP,
+    LOGITS_CLAMP_MAX,
+    LOGITS_CLAMP_MIN,
+)
 from .hilbert import HilbertCurve, get_quadrant_order
 from .tokenization import BaseTokenizer, TokenSequence, TokenizerOutput
+from .utils import sanitize_tensor
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -20,9 +40,22 @@ class PatchInfo:
     
 
 class MiniCNN(nn.Module):
-    """轻量级CNN特征提取器，用于分割决策"""
+    """轻量级CNN特征提取器，用于分割决策。
+    
+    将输入 patch 通过两层卷积和全局池化转换为固定维度的特征向量。
+    
+    Args:
+        in_channels: 输入通道数（RGB=3，灰度=1）
+        hidden_dim: 隐藏层维度
+        out_dim: 输出特征维度
+    """
 
-    def __init__(self, in_channels=3, hidden_dim=16, out_dim=32):
+    def __init__(
+        self,
+        in_channels: int = 3,
+        hidden_dim: int = 16,
+        out_dim: int = 32,
+    ) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.InstanceNorm2d(in_channels), # 归一化输入，防止数值过大
@@ -35,17 +68,38 @@ class MiniCNN(nn.Module):
             nn.Flatten(),
         )
 
-    def forward(self, x):
-        # x: [B, C, H, W] or [C, H, W]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """前向传播。
+        
+        Args:
+            x: 输入张量，形状为 [B, C, H, W] 或 [C, H, W]
+            
+        Returns:
+            特征向量，形状为 [B, out_dim]
+        """
         if x.dim() == 3:
             x = x.unsqueeze(0)
         return self.net(x)
 
 
 class LearnableSplitDecision(nn.Module):
-    """增强的可学习分割决策网络，支持CNN特征和Gumbel-Softmax"""
+    """增强的可学习分割决策网络，支持CNN特征和Gumbel-Softmax。
+    
+    该网络接收 patch 的手工特征（层级、尺寸、方差等）和 CNN 提取的特征，
+    输出两个 logits 表示「不分割」和「分割」的倾向。
+    
+    Args:
+        patch_features: 手工特征维度（默认6：level, height, width, variance, mean, edge_density）
+        cnn_features: CNN 提取的特征维度
+        hidden_dim: 隐藏层维度
+    """
 
-    def __init__(self, patch_features=6, cnn_features=32, hidden_dim=128):
+    def __init__(
+        self,
+        patch_features: int = 6,
+        cnn_features: int = 32,
+        hidden_dim: int = 128,
+    ) -> None:
         super().__init__()
         # patch_features: [level, height, width, variance, mean, edge_density]
         # cnn_features: 来自MiniCNN的特征维度
@@ -65,22 +119,50 @@ class LearnableSplitDecision(nn.Module):
         with torch.no_grad():
             self.net[-1].bias[1] += 2.0
 
-    def forward(self, combined_features):
-        """
-        combined_features: [batch_size, total_features]
-        returns: logits [batch_size, 2]
+    def forward(self, combined_features: torch.Tensor) -> torch.Tensor:
+        """前向传播。
+        
+        Args:
+            combined_features: 组合特征，形状为 [batch_size, total_features]
+            
+        Returns:
+            logits，形状为 [batch_size, 2]，分别表示不分割和分割的倾向
         """
         return self.net(combined_features)
 
 
 class FractalHilbertTokenizer(BaseTokenizer):
-    def __init__(self, min_patch_size=(1, 1), max_level=None, learnable_split=True, adaptive_threshold=0.5, channels=3):
-        """
-        min_patch_size: 最小整数patch尺寸 (min_h, min_w) - 默认到像素级别
-        max_level: 最大递归层数 (None表示无限制，只受min_patch_size限制)
+    """基于分形 Hilbert 曲线的图像 Tokenizer。
+    
+    该 Tokenizer 使用自适应分形分割将图像递归分解为多尺度 tokens，
+    并按 Hilbert 曲线顺序遍历以保持空间局部性。
+    
+    Attributes:
+        min_patch_size: 最小 patch 尺寸 (height, width)
+        max_level: 最大递归层数
         learnable_split: 是否使用可学习的分割决策
-        adaptive_threshold: 自适应分割阈值
-        channels: 输入图像的通道数 (RGB=3, 灰度=1)
+        adaptive_threshold: 自适应分割的方差阈值
+        channels: 输入图像通道数
+        cnn_encoder: CNN 特征提取器（仅 learnable_split=True 时）
+        split_decision: 分割决策网络（仅 learnable_split=True 时）
+    """
+    
+    def __init__(
+        self,
+        min_patch_size: Tuple[int, int] = (1, 1),
+        max_level: Optional[int] = None,
+        learnable_split: bool = True,
+        adaptive_threshold: float = 0.5,
+        channels: int = 3,
+    ) -> None:
+        """初始化 FractalHilbertTokenizer。
+        
+        Args:
+            min_patch_size: 最小整数 patch 尺寸 (min_h, min_w)，默认到像素级别
+            max_level: 最大递归层数，None 表示无限制（只受 min_patch_size 限制）
+            learnable_split: 是否使用可学习的分割决策
+            adaptive_threshold: 自适应分割阈值
+            channels: 输入图像的通道数（RGB=3，灰度=1）
         """
         super().__init__()
         self.min_patch_size = min_patch_size
@@ -91,15 +173,15 @@ class FractalHilbertTokenizer(BaseTokenizer):
 
         if learnable_split:
             # 增强的分割决策网络，支持更多特征
-            self.cnn_encoder = MiniCNN(in_channels=channels, hidden_dim=16, out_dim=32)
-            self.split_decision = LearnableSplitDecision(patch_features=6, cnn_features=32, hidden_dim=128)
+            self.cnn_encoder: Optional[MiniCNN] = MiniCNN(in_channels=channels, hidden_dim=16, out_dim=32)
+            self.split_decision: Optional[LearnableSplitDecision] = LearnableSplitDecision(patch_features=6, cnn_features=32, hidden_dim=128)
         else:
             self.cnn_encoder = None
             self.split_decision = None
 
         # 用于存储REINFORCE所需的log_probs
-        self.saved_log_probs = []
-        self.saved_entropies = []
+        self.saved_log_probs: List[torch.Tensor] = []
+        self.saved_entropies: List[torch.Tensor] = []
         
         # 预注册 Sobel 核为 buffer，避免每次调用时重复创建
         sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
@@ -107,19 +189,35 @@ class FractalHilbertTokenizer(BaseTokenizer):
         self.register_buffer('sobel_x', sobel_x)
         self.register_buffer('sobel_y', sobel_y)
 
-    def clear_saved_actions(self):
+    def clear_saved_actions(self) -> None:
+        """清空保存的动作记录（log_probs 和 entropies）。"""
         self.saved_log_probs = []
         self.saved_entropies = []
 
-    def tokenize(self, images):
+    def tokenize(self, images: torch.Tensor) -> TokenizerOutput:
+        """将图像批次转换为 token 序列。
+        
+        Args:
+            images: 输入图像批次，形状为 [B, C, H, W]
+            
+        Returns:
+            TokenizerOutput 包含每个图像的 token 序列
+            
+        Raises:
+            ValueError: 如果输入形状不是 4D 张量
+        """
         if images.dim() != 4:
-            raise ValueError(f"Expected input with shape [B, C, H, W], got {tuple(images.shape)}")
+            raise ValueError(
+                f"FractalHilbertTokenizer.tokenize expects 4D input [B, C, H, W], "
+                f"got {images.dim()}D tensor with shape {tuple(images.shape)}. "
+                f"Hint: Use images.unsqueeze(0) for single image input."
+            )
 
         batch_size, channels, height, width = images.shape
         estimated_max_level = self._estimate_max_possible_level(height, width)
         dynamic_depth_cap = self.max_level if self.max_level is not None else max(estimated_max_level + 5, 12)
 
-        if self.learnable_split and self.split_decision is not None:
+        if self.learnable_split and self.split_decision is not None and self.cnn_encoder is not None:
             # 确保可学习分割网络与输入位于同一设备
             self.split_decision = self.split_decision.to(images.device)
             self.cnn_encoder = self.cnn_encoder.to(images.device)
@@ -161,6 +259,10 @@ class FractalHilbertTokenizer(BaseTokenizer):
                 )
 
             if len(tokens_raw) == 0:
+                logger.warning(
+                    "Empty token sequence generated for image %d (shape: %s)",
+                    b, tuple(image.shape)
+                )
                 empty_tokens = torch.empty(0, flattened_patch_dim, device=sample_device)
                 empty_levels = torch.empty(0, max_info_len, dtype=torch.long, device=sample_device)
                 sequences.append(TokenSequence(tokens=empty_tokens, metadata={"levels": empty_levels}))
@@ -175,18 +277,48 @@ class FractalHilbertTokenizer(BaseTokenizer):
 
         return TokenizerOutput(sequences)
 
-    def forward(self, images):
+    def forward(
+        self, images: torch.Tensor
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """前向传播，返回 legacy 格式的输出。
+        
+        Args:
+            images: 输入图像批次，形状为 [B, C, H, W]
+            
+        Returns:
+            (tokens, levels) 元组，与 tokenize_legacy 相同
+        """
         output = self.tokenize(images)
         legacy = output.to_legacy()
         return legacy.tokens, legacy.levels
 
-    def tokenize_legacy(self, images):
+    def tokenize_legacy(
+        self, images: torch.Tensor
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """将图像转换为 token 序列（legacy 格式）。
+        
+        Args:
+            images: 输入图像批次，形状为 [B, C, H, W]
+            
+        Returns:
+            (tokens, levels) 元组：
+            - tokens: 每个图像的 token 张量列表
+            - levels: 每个图像的层级信息张量列表
+        """
         output = self.tokenize(images)
         legacy = output.to_legacy()
         return legacy.tokens, legacy.levels
 
-    def _estimate_max_possible_level(self, h, w):
-        """估算给定尺寸下可能达到的最大层级"""
+    def _estimate_max_possible_level(self, h: int, w: int) -> int:
+        """估算给定尺寸下可能达到的最大层级。
+        
+        Args:
+            h: 图像高度
+            w: 图像宽度
+            
+        Returns:
+            最大可能的递归层级
+        """
         min_h, min_w = self.min_patch_size
         max_level_h = 0
         max_level_w = 0
@@ -209,110 +341,115 @@ class FractalHilbertTokenizer(BaseTokenizer):
 
         return max(max_level_h, max_level_w)
 
-    def fractal_partition(self, patch, level, coord, max_info_len, depth_limit):
-        # patch: [C, H, W], coord: 当前分形路径向量, max_info_len: 最大信息长度
+    def _decide_should_stop(
+        self,
+        patch: torch.Tensor,
+        level: int,
+        depth_limit: int,
+        can_split: bool,
+    ) -> bool:
+        """决定是否应该停止分割。
+        
+        Args:
+            patch: 输入 patch [C, H, W]
+            level: 当前递归层级
+            depth_limit: 最大递归深度
+            can_split: 是否可以物理分割
+            
+        Returns:
+            True 表示应该停止分割
+        """
         C, H, W = patch.shape
-        min_h, min_w = self.min_patch_size
-        tokens = []
-        levels = []
-
-        # 检查是否可以继续分割（支持无限细分）
-        # 只要当前patch大于最小尺寸就可以分割，不要求分割后满足最小尺寸
-        can_split_h = H > min_h
-        can_split_w = W > min_w
-        can_split = can_split_h or can_split_w  # 只要任一维度可分割就继续
-
-        # 检查层级限制
+        
+        # 基本停止条件
         level_limit_reached = level >= depth_limit
-
-        # 基本停止条件 - 增强版，防止无限递归
         basic_stop = not can_split or level_limit_reached
 
-        # 增加额外的安全检查：如果patch太小或层级太深，强制停止
-        extra_depth_cap = depth_limit + 5
+        # 安全检查：patch 太小或层级太深
+        extra_depth_cap = depth_limit + EXTRA_DEPTH_CAP
         safety_check = (H <= 1 and W <= 1) or (level >= extra_depth_cap)
 
         if basic_stop or safety_check:
-            should_stop = True
-        else:
-            # 使用增强的可学习分割决策
-            if self.learnable_split and self.split_decision is not None and self.cnn_encoder is not None:
-                # 计算增强的patch特征
-                features = self._extract_enhanced_patch_features(patch, level, H, W)
-                # 计算CNN特征
-                cnn_feat = self.cnn_encoder(patch) # [1, 32]
-                
-                # 组合特征
-                combined = torch.cat([features, cnn_feat], dim=1) # [1, 38]
-                
-                # 关键修复：检查输入特征是否包含 NaN/Inf，防止污染网络
-                if torch.isnan(combined).any() or torch.isinf(combined).any():
-                    combined = torch.nan_to_num(combined, nan=0.0, posinf=1.0, neginf=-1.0)
+            if level_limit_reached:
+                logger.debug(
+                    "Depth limit reached at level %d (limit: %d), patch size: %dx%d",
+                    level, depth_limit, H, W
+                )
+            return True
 
-                # 获取logits [1, 2]
-                logits = self.split_decision(combined)
-                
-                # 关键修复：截断 logits 防止 softmax 数值不稳定
-                logits = torch.clamp(logits, min=-10.0, max=10.0)
-                
-                # REINFORCE / Gumbel-Softmax 逻辑
-                if self.training:
-                    # 再次检查 logits NaN/Inf (虽然前面截断过，但为了双重保险)
-                    if torch.isnan(logits).any() or torch.isinf(logits).any():
-                        logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
+        # 使用增强的可学习分割决策
+        if self.learnable_split and self.split_decision is not None and self.cnn_encoder is not None:
+            features = self._extract_enhanced_patch_features(patch, level, H, W)
+            cnn_feat = self.cnn_encoder(patch)
+            combined = torch.cat([features, cnn_feat], dim=1)
+            combined = sanitize_tensor(combined)
 
-                    # 改用 logits 初始化 Categorical，数值更稳定
-                    # 避免了手动 softmax 可能出现的极小值下溢问题
-                    dist = torch.distributions.Categorical(logits=logits)
-                    action = dist.sample()
-                    
-                    # 保存 log_prob 用于 REINFORCE
-                    self.saved_log_probs.append(dist.log_prob(action))
-                    self.saved_entropies.append(dist.entropy())
-                    
-                    # action 0: stop (not split), action 1: split
-                    should_stop = (action.item() == 0)
-                else:
-                    # 推理模式：直接取最大概率
-                    action = torch.argmax(logits, dim=-1)
-                    should_stop = (action.item() == 0)
-                    
+            logits = self.split_decision(combined)
+            logits = torch.clamp(logits, min=LOGITS_CLAMP_MIN, max=LOGITS_CLAMP_MAX)
+            
+            if self.training:
+                logits = sanitize_tensor(
+                    logits, posinf_value=LOGITS_CLAMP_MAX, neginf_value=LOGITS_CLAMP_MIN
+                )
+
+                dist = torch.distributions.Categorical(logits=logits)
+                action = dist.sample()
+                
+                self.saved_log_probs.append(dist.log_prob(action))
+                self.saved_entropies.append(dist.entropy())
+                
+                return action.item() == 0
             else:
-                # 默认策略：如果设置了 adaptive_threshold，则基于方差进行自适应分割
-                if self.adaptive_threshold is not None and self.adaptive_threshold > 0:
-                    patch_var = torch.var(patch)
-                    # 如果方差小于阈值，说明区域平坦，可以停止分割
-                    should_stop = patch_var < self.adaptive_threshold
-                else:
-                    # 否则尽可能深度分割，但有层级限制
-                    should_stop = level >= 10  # 默认最大10层
+                action = torch.argmax(logits, dim=-1)
+                return action.item() == 0
+        else:
+            # 默认策略
+            if self.adaptive_threshold is not None and self.adaptive_threshold > 0:
+                patch_var = torch.var(patch)
+                return bool(patch_var.item() < self.adaptive_threshold)
+            else:
+                return level >= DEFAULT_MAX_LEVEL
+
+    def fractal_partition(
+        self,
+        patch: torch.Tensor,
+        level: int,
+        coord: List[int],
+        max_info_len: int,
+        depth_limit: int,
+    ) -> Tuple[List[torch.Tensor], List[List[int]]]:
+        """递归执行分形分割。
+        
+        Args:
+            patch: 输入 patch，形状为 [C, H, W]
+            level: 当前递归层级
+            coord: 当前 Hilbert 路径坐标
+            max_info_len: levels_info 的最大长度
+            depth_limit: 最大递归深度
+            
+        Returns:
+            (tokens, levels) 元组：
+            - tokens: 扁平化的 token 张量列表
+            - levels: 层级信息列表（每个元素为 int 列表）
+        """
+        C, H, W = patch.shape
+        min_h, min_w = self.min_patch_size
+        tokens: List[torch.Tensor] = []
+        levels: List[List[int]] = []
+
+        can_split_h = H > min_h
+        can_split_w = W > min_w
+        can_split = can_split_h or can_split_w
+
+        should_stop = self._decide_should_stop(patch, level, depth_limit, can_split)
 
         if should_stop:
-            # 停止分形，输出当前patch作为token
-            # 自适应patch尺寸处理
-            processed_patch = self._process_patch_to_fixed_size(patch, H, W)
-            patch_flat = processed_patch.reshape(-1)
-            tokens.append(patch_flat)
-
-            # 记录详细的层级信息（动态长度）
-            depth = level
-            path = coord.copy()
-            # 动态填充到指定长度
-            padded = [depth] + path + [0] * (max_info_len - 1 - len(path))
-            levels.append(padded[:max_info_len])
-            return tokens, levels
+            return self._create_token_output(patch, level, coord, max_info_len)
 
         sub_patches = self._adaptive_split(patch, H, W, can_split_h, can_split_w)
 
         if not sub_patches:
-            processed_patch = self._process_patch_to_fixed_size(patch, H, W)
-            patch_flat = processed_patch.reshape(-1)
-            tokens.append(patch_flat)
-            depth = level
-            path = coord.copy()
-            padded = [depth] + path + [0] * (max_info_len - 1 - len(path))
-            levels.append(padded[:max_info_len])
-            return tokens, levels
+            return self._create_token_output(patch, level, coord, max_info_len)
 
         traversal_order = self._determine_traversal_order(level, H, W, len(sub_patches))
 
@@ -331,7 +468,47 @@ class FractalHilbertTokenizer(BaseTokenizer):
                     levels.extend(lvls)
         return tokens, levels
 
-    def _determine_traversal_order(self, level, h, w, num_patches):
+    def _create_token_output(
+        self,
+        patch: torch.Tensor,
+        level: int,
+        coord: List[int],
+        max_info_len: int,
+    ) -> Tuple[List[torch.Tensor], List[List[int]]]:
+        """将 patch 转换为 token 输出。
+        
+        Args:
+            patch: 输入 patch [C, H, W]
+            level: 当前层级
+            coord: Hilbert 路径坐标
+            max_info_len: levels_info 的最大长度
+            
+        Returns:
+            (tokens, levels) 单元素列表
+        """
+        _, H, W = patch.shape
+        processed_patch = self._process_patch_to_fixed_size(patch, H, W)
+        patch_flat = processed_patch.reshape(-1)
+
+        path = coord.copy()
+        padded = [level] + path + [0] * (max_info_len - 1 - len(path))
+        
+        return [patch_flat], [padded[:max_info_len]]
+
+    def _determine_traversal_order(
+        self, level: int, h: int, w: int, num_patches: int
+    ) -> List[int]:
+        """确定子 patch 的遍历顺序。
+        
+        Args:
+            level: 当前递归层级
+            h: patch 高度
+            w: patch 宽度
+            num_patches: 子 patch 数量
+            
+        Returns:
+            遍历顺序索引列表
+        """
         if num_patches == 4:
             # 使用统一的 Hilbert 模块获取遍历顺序
             return get_quadrant_order(level, h, w)
@@ -342,7 +519,31 @@ class FractalHilbertTokenizer(BaseTokenizer):
 
         return list(range(num_patches))
 
-    def _adaptive_split(self, patch, h, w, can_split_h, can_split_w):
+    def _adaptive_split(
+        self,
+        patch: torch.Tensor,
+        h: int,
+        w: int,
+        can_split_h: bool,
+        can_split_w: bool,
+    ) -> List[torch.Tensor]:
+        """自适应分割 patch。
+        
+        根据 patch 的高度和宽度是否可分割，决定分割方式：
+        - 两个维度都可分割：四分法
+        - 只有高度可分割：水平二分法
+        - 只有宽度可分割：垂直二分法
+        
+        Args:
+            patch: 输入 patch，形状为 [C, H, W]
+            h: patch 高度
+            w: patch 宽度
+            can_split_h: 高度是否可分割
+            can_split_w: 宽度是否可分割
+            
+        Returns:
+            子 patch 列表
+        """
         if can_split_h and can_split_w:
             return self._intelligent_quadrant_split(patch, h, w)
 
@@ -362,8 +563,20 @@ class FractalHilbertTokenizer(BaseTokenizer):
 
         return []
 
-    def _extract_enhanced_patch_features(self, patch, level, h, w):
-        """提取增强的patch特征用于分割决策"""
+    def _extract_enhanced_patch_features(
+        self, patch: torch.Tensor, level: int, h: int, w: int
+    ) -> torch.Tensor:
+        """提取增强的 patch 特征用于分割决策。
+        
+        Args:
+            patch: 输入 patch，形状为 [C, H, W]
+            level: 当前递归层级
+            h: patch 高度
+            w: patch 宽度
+            
+        Returns:
+            特征向量，形状为 [1, 6]
+        """
         import torch.nn.functional as F
         device = patch.device
 
@@ -422,10 +635,21 @@ class FractalHilbertTokenizer(BaseTokenizer):
 
         return features
 
-    def _process_patch_to_fixed_size(self, patch, h, w):
-        """将patch处理为固定尺寸，支持任意输入尺寸"""
-        import torch.nn.functional as F
-
+    def _process_patch_to_fixed_size(
+        self, patch: torch.Tensor, h: int, w: int
+    ) -> torch.Tensor:
+        """将 patch 处理为固定尺寸，支持任意输入尺寸。
+        
+        使用 padding 和裁剪/插值将 patch 调整到 min_patch_size。
+        
+        Args:
+            patch: 输入 patch，形状为 [C, H, W]
+            h: 当前 patch 高度
+            w: 当前 patch 宽度
+            
+        Returns:
+            调整后的 patch，形状为 [C, min_h, min_w]
+        """
         min_h, min_w = self.min_patch_size
 
         if h == min_h and w == min_w:
@@ -466,8 +690,19 @@ class FractalHilbertTokenizer(BaseTokenizer):
 
         return patch
 
-    def _intelligent_quadrant_split(self, patch, h, w):
-        """智能的四分法分割，确保每个子patch都是整数尺寸"""
+    def _intelligent_quadrant_split(
+        self, patch: torch.Tensor, h: int, w: int
+    ) -> List[torch.Tensor]:
+        """智能四分法分割，确保每个子 patch 都是整数尺寸。
+        
+        Args:
+            patch: 输入 patch，形状为 [C, H, W]
+            h: patch 高度
+            w: patch 宽度
+            
+        Returns:
+            四个子 patch 的列表，顺序为 [左上, 右上, 左下, 右下]
+        """
         mid_h = self._calculate_split_index(h, self.min_patch_size[0], w)
         mid_w = self._calculate_split_index(w, self.min_patch_size[1], h)
 
@@ -483,7 +718,21 @@ class FractalHilbertTokenizer(BaseTokenizer):
 
         return sub_patches
 
-    def _calculate_split_index(self, length, min_size, secondary_length):
+    def _calculate_split_index(
+        self, length: int, min_size: int, secondary_length: int
+    ) -> int:
+        """计算分割索引位置。
+        
+        根据当前维度长度、最小尺寸和另一维度长度，计算最佳分割位置。
+        
+        Args:
+            length: 当前维度长度
+            min_size: 该维度的最小尺寸
+            secondary_length: 另一维度的长度（用于宽高比调整）
+            
+        Returns:
+            分割索引位置
+        """
         if length <= 1:
             return 1
 
@@ -511,11 +760,22 @@ class FractalHilbertTokenizer(BaseTokenizer):
     # 注意: Hilbert 曲线相关方法已迁移至 hilbert.py 模块
     # 使用 from .hilbert import HilbertCurve, get_quadrant_order
 
-    def default_should_split(self, patch, level):
-        """默认分割策略：只看层数和patch大小"""
+    def default_should_split(
+        self, patch: torch.Tensor, level: int
+    ) -> bool:
+        """默认分割策略：只看层数和 patch 大小。
+        
+        Args:
+            patch: 输入 patch，形状为 [C, H, W]
+            level: 当前递归层级
+            
+        Returns:
+            是否应该继续分割
+        """
         _channels, height, width = patch.shape
         min_h, min_w = self.min_patch_size
-        return level < self.max_level and (height > min_h or width > min_w)
+        max_level = self.max_level if self.max_level is not None else 50
+        return level < max_level and (height > min_h or width > min_w)
 
     # ==================== 批处理优化方法 ====================
     
@@ -632,10 +892,10 @@ class FractalHilbertTokenizer(BaseTokenizer):
         final_tokens.sort(key=lambda x: x[0])
         
         # 提取排序后的 tokens 和 levels
-        tokens = [t[1] for t in final_tokens]
-        levels = [t[2] for t in final_tokens]
+        sorted_tokens = [item[1] for item in final_tokens]
+        sorted_levels = [item[2] for item in final_tokens]
         
-        return tokens, levels
+        return sorted_tokens, sorted_levels
     
     def _batch_decide_splits(
         self,
@@ -740,6 +1000,7 @@ class FractalHilbertTokenizer(BaseTokenizer):
         # 由于 patches 尺寸可能不同，需要逐个处理或 padding
         # 这里采用逐个处理但保持批量决策
         cnn_features_list = []
+        assert self.cnn_encoder is not None  # 类型守卫，此方法只在 learnable_split=True 时调用
         for info in patches:
             cnn_feat = self.cnn_encoder(info.patch)  # [1, 32]
             cnn_features_list.append(cnn_feat)
@@ -748,18 +1009,15 @@ class FractalHilbertTokenizer(BaseTokenizer):
         
         # 3. 组合特征
         combined = torch.cat([batch_features, batch_cnn_features], dim=1)  # [batch_size, 38]
-        
-        # 检查 NaN/Inf
-        if torch.isnan(combined).any() or torch.isinf(combined).any():
-            combined = torch.nan_to_num(combined, nan=0.0, posinf=1.0, neginf=-1.0)
+        combined = sanitize_tensor(combined)
         
         # 4. 批量获取 logits
+        assert self.split_decision is not None  # 类型守卫
         logits = self.split_decision(combined)  # [batch_size, 2]
-        logits = torch.clamp(logits, min=-10.0, max=10.0)
-        
-        # 检查 NaN/Inf
-        if torch.isnan(logits).any() or torch.isinf(logits).any():
-            logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
+        logits = torch.clamp(logits, min=LOGITS_CLAMP_MIN, max=LOGITS_CLAMP_MAX)
+        logits = sanitize_tensor(
+            logits, posinf_value=LOGITS_CLAMP_MAX, neginf_value=LOGITS_CLAMP_MIN
+        )
         
         # 5. 决策
         decisions: List[bool] = []

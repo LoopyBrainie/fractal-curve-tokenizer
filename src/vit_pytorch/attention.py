@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""Hilbert-aware multi-scale attention module.
+
+This module implements HilbertAwareMultiScaleAttention, which encodes
+hierarchical depth and Hilbert path relationships to modulate attention weights.
+"""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -7,15 +14,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from .constants import HILBERT_BIAS_SCALE, LEVEL_BIAS_SCALE
 from .utils import extract_depths
 
 
 class HilbertAwareMultiScaleAttention(nn.Module):
-    """Hilbert curve aware multi-scale attention.
+    """Hilbert 曲线感知的多尺度注意力机制。
 
-    Encodes hierarchical depth and Hilbert path relationships to modulate attention
-    weights. Extracted from the former monolithic fractal ViT module to improve
-    composability and testing.
+    通过编码层级深度和 Hilbert 路径关系来调制注意力权重。
+    
+    Attributes:
+        heads: 注意力头数
+        dim_head: 每个头的维度
+        max_level: 最大层级
+        use_hilbert_bias: 是否使用 Hilbert 偏置
+        use_level_scaling: 是否使用层级缩放
+        scale: 注意力缩放因子
     """
 
     def __init__(
@@ -27,7 +41,18 @@ class HilbertAwareMultiScaleAttention(nn.Module):
         max_level: int = 50,
         use_hilbert_bias: bool = True,
         use_level_scaling: bool = True,
-    ):
+    ) -> None:
+        """初始化 HilbertAwareMultiScaleAttention。
+        
+        Args:
+            dim: 输入维度
+            heads: 注意力头数
+            dim_head: 每个头的维度
+            dropout: Dropout 比率
+            max_level: 最大层级
+            use_hilbert_bias: 是否使用 Hilbert 路径偏置
+            use_level_scaling: 是否使用层级缩放
+        """
         super().__init__()
         self.heads = heads
         self.dim_head = dim_head
@@ -42,7 +67,7 @@ class HilbertAwareMultiScaleAttention(nn.Module):
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
 
         if use_hilbert_bias:
-            self.hilbert_bias_network = nn.Sequential(
+            self.hilbert_bias_network: Optional[nn.Sequential] = nn.Sequential(
                 nn.Linear(2, 64),
                 nn.ReLU(),
                 nn.Linear(64, heads),
@@ -52,7 +77,7 @@ class HilbertAwareMultiScaleAttention(nn.Module):
             self.hilbert_bias_network = None
 
         if use_level_scaling:
-            self.level_scale_embedding = nn.Embedding(max_level + 1, heads)
+            self.level_scale_embedding: Optional[nn.Embedding] = nn.Embedding(max_level + 1, heads)
             nn.init.constant_(self.level_scale_embedding.weight, 1.0)
             nn.init.normal_(self.level_scale_embedding.weight, std=0.1)
         else:
@@ -66,8 +91,19 @@ class HilbertAwareMultiScaleAttention(nn.Module):
         self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
 
     def _compute_hilbert_bias(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+        """计算基于 Hilbert 路径的注意力偏置。
+        
+        Args:
+            levels_info: 层级信息张量，形状为 (Seq, Info) 或 (Batch, Seq, Info)
+            
+        Returns:
+            Hilbert 偏置张量，形状为 (H, S, S) 或 (B, H, S, S)，若无效则返回 None
+        """
         if not self.use_hilbert_bias or levels_info.numel() == 0:
             return None
+
+        # Type guard: guaranteed non-None when use_hilbert_bias is True
+        assert self.hilbert_bias_network is not None
 
         device = levels_info.device
 
@@ -105,6 +141,14 @@ class HilbertAwareMultiScaleAttention(nn.Module):
             return bias.permute(0, 3, 1, 2) # (B, H, S, S)
 
     def _compute_level_bias(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+        """计算基于层级差异的相对位置偏置。
+        
+        Args:
+            levels_info: 层级信息张量，形状为 (Seq, Info) 或 (Batch, Seq, Info)
+            
+        Returns:
+            层级偏置张量，形状为 (H, S, S) 或 (B, H, S, S)，若无效则返回 None
+        """
         if levels_info.numel() == 0:
             return None
 
@@ -129,6 +173,16 @@ class HilbertAwareMultiScaleAttention(nn.Module):
         levels_info: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """前向传播。
+        
+        Args:
+            x: 输入张量，形状为 [B, N, D]
+            levels_info: 层级信息（可选）
+            attention_mask: 注意力掩码（可选）
+            
+        Returns:
+            输出张量，形状为 [B, N, D]
+        """
         batch, _, _ = x.shape
 
         x = self.norm(x)
@@ -139,6 +193,9 @@ class HilbertAwareMultiScaleAttention(nn.Module):
         dots = dots * self.scale_weights.view(1, -1, 1, 1)
 
         if self.use_level_scaling and levels_info is not None and levels_info.numel() > 0:
+            # Type guard: guaranteed non-None when use_level_scaling is True
+            assert self.level_scale_embedding is not None
+            
             depths = extract_depths(levels_info, self.max_level)
             if levels_info.dim() == 2:
                 level_scales = self.level_scale_embedding(depths)
@@ -154,17 +211,17 @@ class HilbertAwareMultiScaleAttention(nn.Module):
             if hilbert_bias is not None:
                 # hilbert_bias: (H, S, S) or (B, H, S, S)
                 if hilbert_bias.dim() == 3:
-                    dots = dots + hilbert_bias.unsqueeze(0) * 0.1
+                    dots = dots + hilbert_bias.unsqueeze(0) * HILBERT_BIAS_SCALE
                 else:
-                    dots = dots + hilbert_bias * 0.1
+                    dots = dots + hilbert_bias * HILBERT_BIAS_SCALE
 
             level_bias = self._compute_level_bias(levels_info)
             if level_bias is not None:
                 # level_bias: (H, S, S) or (B, H, S, S)
                 if level_bias.dim() == 3:
-                    dots = dots + level_bias.unsqueeze(0) * 0.05
+                    dots = dots + level_bias.unsqueeze(0) * LEVEL_BIAS_SCALE
                 else:
-                    dots = dots + level_bias * 0.05
+                    dots = dots + level_bias * LEVEL_BIAS_SCALE
 
         if attention_mask is not None:
             mask_value = -torch.finfo(dots.dtype).max

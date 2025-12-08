@@ -1,3 +1,11 @@
+# -*- coding: utf-8 -*-
+"""Fractal Vision Transformer Implementation.
+
+This module provides the NextGenerationFractalViT model, a Vision Transformer
+variant that uses fractal Hilbert curve-based tokenization for hierarchical
+multi-scale image representation.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -16,14 +24,27 @@ from .utils import create_attention_mask, pair
 
 
 class NextGenerationFractalViT(nn.Module):
-    """
+    """下一代分形视觉 Transformer。
+    
     核心特性：
     - 可学习的分割决策网络（6特征输入）
-    - 真正的Hilbert曲线递归算法（支持多方向）
-    - 动态层级管理（最大50层）
-    - 智能patch处理和特征增强
+    - 真正的 Hilbert 曲线递归算法（支持多方向）
+    - 动态层级管理（最大 50 层）
+    - 智能 patch 处理和特征增强
     - 边缘检测和纹理复杂度分析
     - 自适应多尺度处理
+    
+    Attributes:
+        image_size: 输入图像尺寸
+        num_classes: 分类类别数
+        dim: 模型维度
+        pool: 池化策略 ('cls', 'mean' 或其他)
+        max_level: 最大递归层级
+        use_dynamic_depth: 是否使用动态深度
+        tokenizer: 图像 tokenizer
+        token_processor: token 处理器
+        pos_embedding: 位置编码
+        transformer: Transformer 模块
     """
 
     def __init__(
@@ -50,8 +71,34 @@ class NextGenerationFractalViT(nn.Module):
         use_dynamic_depth: bool = False,
         tokenizer: Optional[BaseTokenizer] = None,
         token_processor: Optional[BaseTokenProcessor] = None,
-        position_embedding: Optional["AdvancedFractalPositionEmbedding"] = None,
-    ):
+        position_embedding: Optional[AdvancedFractalPositionEmbedding] = None,
+    ) -> None:
+        """初始化 NextGenerationFractalViT。
+        
+        Args:
+            image_size: 输入图像尺寸（整数或 (H, W) 元组）
+            num_classes: 分类类别数
+            dim: 模型嵌入维度
+            depth: Transformer 层数
+            heads: 注意力头数
+            mlp_dim: MLP 隐藏层维度
+            pool: 池化策略 ('cls', 'mean' 或混合)
+            channels: 输入图像通道数
+            dim_head: 每个注意力头的维度
+            dropout: Dropout 比率
+            emb_dropout: 嵌入层 Dropout 比率
+            min_patch_size: 最小 patch 尺寸
+            max_level: 最大递归层级
+            learnable_split: 是否使用可学习分割决策
+            adaptive_threshold: 自适应分割阈值
+            use_hilbert_encoding: 是否使用 Hilbert 编码
+            use_spatial_encoding: 是否使用空间编码
+            use_feature_enhancement: 是否使用特征增强
+            use_dynamic_depth: 是否使用动态深度
+            tokenizer: 自定义 tokenizer（可选）
+            token_processor: 自定义 token 处理器（可选）
+            position_embedding: 自定义位置编码（可选）
+        """
         super().__init__()
 
         self.image_size = pair(image_size)
@@ -149,17 +196,24 @@ class NextGenerationFractalViT(nn.Module):
             nn.Linear(dim // 2, 6),
         )
 
-    def forward(
-        self,
-        img: torch.Tensor,
-        return_attention: bool = False,
-        return_aux_info: bool = False,
-        return_features: bool = False,
-    ):
+    def _prepare_tokens(
+        self, img: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int], List[torch.Tensor]]:
+        """准备 tokens 和进行 padding。
+        
+        Args:
+            img: 输入图像 [B, C, H, W]
+            
+        Returns:
+            (padded_tokens, padded_levels, lengths, levels_list):
+            - padded_tokens: 填充后的 tokens [B, MaxLen, Dim]
+            - padded_levels: 填充后的层级信息 [B, MaxLen, InfoDim]
+            - lengths: 每个样本的有效 token 数量
+            - levels_list: 原始层级列表（用于辅助输出）
+        """
         batch_size = img.shape[0]
         device = img.device
 
-        # 1. 分形tokenization
         token_output = self.tokenizer.tokenize(img)
         processed_output = self.token_processor(token_output) if self.token_processor is not None else token_output
         legacy_output = processed_output.to_legacy()
@@ -167,11 +221,12 @@ class NextGenerationFractalViT(nn.Module):
         levels_list = legacy_output.levels
 
         if len(tokens_list) != batch_size:
-            raise ValueError("Tokenizer output sequence count does not match batch size.")
+            raise ValueError(
+                f"SimpleFractalViT._prepare_tokens: Tokenizer output count ({len(tokens_list)}) "
+                f"does not match batch size ({batch_size}). "
+                f"Hint: Ensure the tokenizer is correctly configured for batch processing."
+            )
 
-        # 2. 准备 Batch Padding
-        # 过滤掉空 Token 的情况 (虽然理论上不应该发生，但为了健壮性)
-        valid_indices = []
         valid_tokens = []
         valid_levels = []
         lengths = []
@@ -180,119 +235,122 @@ class NextGenerationFractalViT(nn.Module):
             t = tokens_list[i]
             l = levels_list[i]
             if t.numel() > 0:
-                valid_indices.append(i)
                 valid_tokens.append(t)
                 valid_levels.append(l)
                 lengths.append(t.shape[0])
             else:
                 # 处理空图片的情况: 创建一个 dummy token
                 dummy_token = torch.zeros(1, self.dim, device=device)
-                dummy_level = torch.zeros(1, self.max_level + 4, dtype=torch.long, device=device) # 假设 info_len 足够
-                valid_indices.append(i)
+                dummy_level = torch.zeros(1, self.max_level + 4, dtype=torch.long, device=device)
                 valid_tokens.append(dummy_token)
                 valid_levels.append(dummy_level)
                 lengths.append(1)
 
-        # 使用 pad_sequence 进行对齐
-        # padded_tokens: (B, Max_Len, Dim)
         padded_tokens = torch.nn.utils.rnn.pad_sequence(valid_tokens, batch_first=True)
         
-        # padded_levels: (B, Max_Len, Info_Dim)
-        # 注意: levels 的 info_len 可能不一致，需要先统一 info_len
-        max_info_len = max([l.shape[1] for l in valid_levels])
+        max_info_len = max([level_info.shape[1] for level_info in valid_levels])
         uniform_levels = []
-        for l in valid_levels:
-            if l.shape[1] < max_info_len:
-                padding = torch.zeros(l.shape[0], max_info_len - l.shape[1], dtype=torch.long, device=device)
-                l = torch.cat([l, padding], dim=1)
-            uniform_levels.append(l)
+        for level_info in valid_levels:
+            if level_info.shape[1] < max_info_len:
+                padding = torch.zeros(level_info.shape[0], max_info_len - level_info.shape[1], dtype=torch.long, device=device)
+                level_info = torch.cat([level_info, padding], dim=1)
+            uniform_levels.append(level_info)
             
         padded_levels = torch.nn.utils.rnn.pad_sequence(uniform_levels, batch_first=True, padding_value=0)
 
-        # 3. 位置编码 (Batch 处理)
-        # padded_levels: (B, Max_Len, Info_Dim)
-        # 我们需要生成 sequence_positions: (B, Max_Len)
-        max_len = padded_tokens.shape[1]
-        seq_positions = torch.arange(max_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        return padded_tokens, padded_levels, lengths, levels_list
+
+    def _apply_position_and_cls(
+        self,
+        padded_tokens: torch.Tensor,
+        padded_levels: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """添加位置编码和 CLS token。
         
-        # AdvancedFractalPositionEmbedding 原生支持 (..., info_len) 输入
-        # 因此可以直接传入 (B, MaxLen, Info) 格式，无需 flatten/reshape
-        pos_emb = self.pos_embedding(padded_levels)  # (B, MaxLen, Dim)
-        
+        Args:
+            padded_tokens: 填充后的 tokens [B, MaxLen, Dim]
+            padded_levels: 填充后的层级信息 [B, MaxLen, InfoDim]
+            
+        Returns:
+            (x, padded_levels):
+            - x: 带位置编码和 CLS 的序列 [B, 1+MaxLen, Dim]
+            - padded_levels: 更新后的层级信息（包含 CLS） [B, 1+MaxLen, InfoDim]
+        """
+        batch_size = padded_tokens.shape[0]
+        device = padded_tokens.device
+
+        pos_emb = self.pos_embedding(padded_levels)
         x = padded_tokens + pos_emb
 
-        # 4. 添加 CLS Token
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1) # (B, 1, Dim)
-        x = torch.cat((cls_tokens, x), dim=1) # (B, 1+MaxLen, Dim)
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
 
-        # 更新 Levels (添加 CLS 的 level info，全 0)
         cls_level = torch.zeros(batch_size, 1, padded_levels.shape[-1], dtype=torch.long, device=device)
-        padded_levels = torch.cat([cls_level, padded_levels], dim=1) # (B, 1+MaxLen, Info_Dim)
+        padded_levels = torch.cat([cls_level, padded_levels], dim=1)
 
         x = self.dropout(x)
 
-        # 5. 创建 Attention Mask
-        # True 表示被 Mask (不参与计算)，False 表示保留
-        # 初始全 False (保留)
-        # 形状: (B, 1+MaxLen) -> 扩展为 (B, 1, 1, 1+MaxLen) 或 (B, 1+MaxLen, 1+MaxLen)
-        # PyTorch MultiheadAttention 的 key_padding_mask 是 (B, S)
-        # 但我们的 Transformer Block 内部可能用了自定义 Attention
+        return x, padded_levels
+
+    def _create_attention_mask(
+        self,
+        batch_size: int,
+        seq_len: int,
+        lengths: List[int],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """创建 attention mask。
         
-        # 构建 key_padding_mask: (B, 1+MaxLen)
-        # CLS token (index 0) 永远有效
-        key_padding_mask = torch.zeros(batch_size, x.shape[1], dtype=torch.bool, device=device)
+        Args:
+            batch_size: batch 大小
+            seq_len: 序列长度（包含 CLS）
+            lengths: 每个样本的有效 token 数量（不含 CLS）
+            device: 设备
+            
+        Returns:
+            (attn_mask, key_padding_mask):
+            - attn_mask: attention mask [B, 1, 1, Seq]
+            - key_padding_mask: padding mask [B, Seq]
+        """
+        key_padding_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
         
         for i, length in enumerate(lengths):
-            # 有效长度是 length，加上 CLS 是 length + 1
-            # 所以从 length + 1 开始 mask
-            if length + 1 < x.shape[1]:
+            if length + 1 < seq_len:
                 key_padding_mask[i, length + 1:] = True
 
-        # 转换 mask 为 attention 矩阵所需的形状 (B, 1, Seq, Seq) 或 (B, Seq, Seq)
-        # 我们的 Attention 模块接受 attention_mask
-        # 如果是 True/False mask, 通常 True 表示 Mask 掉
-        # 但在 utils.create_attention_mask 中，通常返回的是 1/0 mask (1保留, 0 mask)
-        # 让我们检查一下 attention.py 的实现:
-        # dots.masked_fill_(~attention_mask.bool(), mask_value)
-        # 这意味着 attention_mask 必须是: True(保留), False(Mask掉)
-        
-        attn_mask = ~key_padding_mask # (B, Seq) -> True 保留
-        # 扩展为 (B, 1, 1, Seq) 以便广播? 
-        # Attention 内部: dots (B, H, N, N)
-        # 我们需要 (B, 1, 1, N) 或者 (B, 1, N, N)
-        attn_mask = attn_mask.unsqueeze(1).unsqueeze(2) # (B, 1, 1, Seq)
-        # 这样只会 mask Key，Query 都能关注到 Key
-        
-        # 6. Transformer 处理 (Batch 模式)
-        # 注意: transformer.py 需要能处理 Batch 的 levels_info
-        x = self.transformer(x, padded_levels, attn_mask, self.use_dynamic_depth)
+        attn_mask = ~key_padding_mask
+        attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)
 
-        # 7. 池化策略
+        return attn_mask, key_padding_mask
+
+    def _apply_pooling(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """应用池化策略。
+        
+        Args:
+            x: transformer 输出 [B, Seq, Dim]
+            key_padding_mask: padding mask [B, Seq]
+            
+        Returns:
+            pooled: 池化后的表示 [B, Dim]
+        """
         if self.pool == "cls":
-            pooled = x[:, 0]
+            return x[:, 0]
         elif self.pool == "mean":
-            # 只对非 Padding 部分求平均
-            # x: (B, 1+MaxLen, Dim)
-            # mask: (B, 1+MaxLen) True=Valid
-            token_x = x[:, 1:] # (B, MaxLen, Dim)
-            token_mask = ~key_padding_mask[:, 1:] # (B, MaxLen) True=Valid
-            
-            # 将 Padding 部分置 0
+            token_x = x[:, 1:]
+            token_mask = ~key_padding_mask[:, 1:]
             token_x = token_x * token_mask.unsqueeze(-1).float()
-            
-            # 求和
-            sum_x = token_x.sum(dim=1) # (B, Dim)
-            
-            # 有效数量
+            sum_x = token_x.sum(dim=1)
             valid_counts = token_mask.sum(dim=1, keepdim=True).float().clamp(min=1.0)
-            
-            pooled = sum_x / valid_counts
+            return sum_x / valid_counts
         else:
             # 混合池化
-            pooling_weights = self.pooling_selector(x.transpose(1, 2)) # (B, 2)
+            pooling_weights = self.pooling_selector(x.transpose(1, 2))
             cls_pooled = x[:, 0]
             
-            # Mean pooling logic
             token_x = x[:, 1:]
             token_mask = ~key_padding_mask[:, 1:]
             token_x = token_x * token_mask.unsqueeze(-1).float()
@@ -300,39 +358,111 @@ class NextGenerationFractalViT(nn.Module):
             valid_counts = token_mask.sum(dim=1, keepdim=True).float().clamp(min=1.0)
             mean_pooled = sum_x / valid_counts
             
-            pooled = pooling_weights[:, 0:1] * cls_pooled + pooling_weights[:, 1:2] * mean_pooled
+            return pooling_weights[:, 0:1] * cls_pooled + pooling_weights[:, 1:2] * mean_pooled
 
+    def _prepare_auxiliary_output(
+        self,
+        batch_size: int,
+        lengths: List[int],
+        levels_list: List[torch.Tensor],
+        pooled: torch.Tensor,
+        return_aux_info: bool,
+        return_features: bool,
+    ) -> Tuple[List[Dict[str, Any]], List[torch.Tensor]]:
+        """准备辅助输出。
+        
+        Args:
+            batch_size: batch 大小
+            lengths: 有效 token 数量列表
+            levels_list: 层级信息列表
+            pooled: 池化后的表示
+            return_aux_info: 是否返回辅助信息
+            return_features: 是否返回特征
+            
+        Returns:
+            (aux_infos, features_list)
+        """
+        aux_infos: List[Dict[str, Any]] = []
+        features_list: List[torch.Tensor] = []
+
+        if return_aux_info:
+            for i in range(batch_size):
+                l = levels_list[i]
+                if l.numel() > 0:
+                    depths = l[:, 0]
+                    unique = depths.unique().tolist()
+                    aux_infos.append({"num_tokens": lengths[i], "levels_used": unique})
+                else:
+                    aux_infos.append({"num_tokens": 0})
+        
+        if return_features:
+            batch_features = self.feature_analyzer(pooled)
+            features_list = [f for f in batch_features]
+
+        return aux_infos, features_list
+
+    def forward(
+        self,
+        img: torch.Tensor,
+        return_attention: bool = False,
+        return_aux_info: bool = False,
+        return_features: bool = False,
+    ) -> Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, List[Dict[str, Any]]],
+        Tuple[torch.Tensor, List[torch.Tensor]],
+        Tuple[torch.Tensor, List[Dict[str, Any]], List[torch.Tensor]],
+    ]:
+        """前向传播。
+        
+        Args:
+            img: 输入图像，形状为 [B, C, H, W]
+            return_attention: 是否返回注意力权重（已弃用）
+            return_aux_info: 是否返回辅助信息
+            return_features: 是否返回特征
+            
+        Returns:
+            根据参数返回不同类型：
+            - 默认：分类 logits [B, num_classes]
+            - return_aux_info=True：(logits, aux_infos)
+            - return_features=True：(logits, features)
+            - 两者都为 True：(logits, aux_infos, features)
+        """
+        batch_size = img.shape[0]
+        device = img.device
+
+        # 1. 准备 tokens
+        padded_tokens, padded_levels, lengths, levels_list = self._prepare_tokens(img)
+
+        # 2. 添加位置编码和 CLS token
+        x, padded_levels = self._apply_position_and_cls(padded_tokens, padded_levels)
+
+        # 3. 创建 attention mask
+        attn_mask, key_padding_mask = self._create_attention_mask(
+            batch_size, x.shape[1], lengths, device
+        )
+
+        # 4. Transformer 处理
+        x = self.transformer(x, padded_levels, attn_mask, self.use_dynamic_depth)
+
+        # 5. 池化
+        pooled = self._apply_pooling(x, key_padding_mask)
         pooled = self.to_latent(pooled)
         final_output = self.mlp_head(pooled)
 
-        # 8. 辅助信息 (可选)
-        # 初始化为空列表，确保变量已定义
-        aux_infos = []
-        features_list = []
-
+        # 6. 辅助输出
         if return_aux_info or return_features:
-            if return_aux_info:
-                for i in range(batch_size):
-                    l = levels_list[i]
-                    if l.numel() > 0:
-                        depths = l[:, 0]
-                        unique = depths.unique().tolist()
-                        # ... 简化统计 ...
-                        aux_infos.append({"num_tokens": lengths[i], "levels_used": unique})
-                    else:
-                        aux_infos.append({"num_tokens": 0})
+            aux_infos, features_list = self._prepare_auxiliary_output(
+                batch_size, lengths, levels_list, pooled, return_aux_info, return_features
+            )
             
+            if return_aux_info and return_features:
+                return final_output, aux_infos, features_list
+            if return_aux_info:
+                return final_output, aux_infos
             if return_features:
-                # 批量计算 features
-                batch_features = self.feature_analyzer(pooled)
-                features_list = [f for f in batch_features]
+                return final_output, features_list
 
-        if return_aux_info and return_features:
-            return final_output, aux_infos, features_list
-        if return_aux_info:
-            return final_output, aux_infos
-        if return_features:
-            return final_output, features_list
         return final_output
 
     def get_tokenizer_loss(
@@ -389,14 +519,24 @@ class NextGenerationFractalViT(nn.Module):
             self.tokenizer.clear_saved_actions()
 
     def analyze_tokenization(self, img: torch.Tensor) -> Dict[str, Any]:
-        """分析tokenization过程，返回详细统计信息"""
+        """分析 tokenization 过程，返回详细统计信息。
+        
+        Args:
+            img: 输入图像，形状为 [B, C, H, W]
+            
+        Returns:
+            包含以下键的字典：
+            - batch_size: 批次大小
+            - per_image_stats: 每张图像的统计信息列表
+            - overall_stats: 整体统计信息
+        """
         with torch.no_grad():
             token_output = self.tokenizer.tokenize(img)
             legacy_output = token_output.to_legacy()
             tokens_list = legacy_output.tokens
             levels_list = legacy_output.levels
 
-            analysis = {"batch_size": len(tokens_list), "per_image_stats": [], "overall_stats": {}}
+            analysis: Dict[str, Any] = {"batch_size": len(tokens_list), "per_image_stats": [], "overall_stats": {}}
 
             all_levels = []
             total_tokens = 0
@@ -452,7 +592,14 @@ EnhancedFractalViT = NextGenerationFractalViT
 
 
 class SimpleFractalViT(nn.Module):
-    """简化版本，保持向后兼容性，使用合理默认参数"""
+    """简化版分形 ViT，保持向后兼容性。
+    
+    使用合理的默认参数，禁用可学习分割以获得更快的推理速度。
+    
+    Attributes:
+        enhanced_model: 内部的 NextGenerationFractalViT 实例
+        pool: 池化策略
+    """
 
     def __init__(
         self,
@@ -470,7 +617,24 @@ class SimpleFractalViT(nn.Module):
         emb_dropout: float = 0.0,
         min_patch_size: Tuple[int, int] = (4, 4),
         max_level: int = 5,
-    ):
+    ) -> None:
+        """初始化 SimpleFractalViT。
+        
+        Args:
+            image_size: 输入图像尺寸
+            num_classes: 分类类别数
+            dim: 模型维度
+            depth: Transformer 层数
+            heads: 注意力头数
+            mlp_dim: MLP 隐藏层维度
+            pool: 池化策略
+            channels: 输入通道数
+            dim_head: 每个注意力头的维度
+            dropout: Dropout 比率
+            emb_dropout: 嵌入层 Dropout 比率
+            min_patch_size: 最小 patch 尺寸
+            max_level: 最大递归层级（默认 5，比完整版更保守）
+        """
         super().__init__()
 
         self.enhanced_model = NextGenerationFractalViT(

@@ -1,3 +1,11 @@
+# -*- coding: utf-8 -*-
+"""Adaptive fractal-aware feed-forward network module.
+
+This module implements AdaptiveFractalFeedForward, a feed-forward block
+that is aware of the hierarchical structure from the fractal tokenizer,
+applying depth-dependent scaling to the hidden representations.
+"""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -10,7 +18,19 @@ from .utils import extract_depths
 
 
 class AdaptiveFractalFeedForward(nn.Module):
-    """Adaptive feed-forward block aware of tokenizer hierarchy."""
+    """Adaptive feed-forward block aware of tokenizer hierarchy.
+    
+    This module applies a feed-forward transformation to the input,
+    with optional depth-aware level adaptation and feature gating.
+    
+    Args:
+        dim: Input/output dimension.
+        hidden_dim: Hidden layer dimension.
+        dropout: Dropout rate.
+        max_level: Maximum hierarchical level for embeddings.
+        use_level_adaptation: Whether to use level-aware adaptation.
+        use_feature_gating: Whether to use feature gating.
+    """
 
     def __init__(
         self,
@@ -40,21 +60,21 @@ class AdaptiveFractalFeedForward(nn.Module):
         if use_level_adaptation:
             # REFACTORED: Replaced 50 separate adapters with a single shared adapter + level embedding
             # This drastically reduces parameter count and enables vectorized execution.
-            self.level_embedding = nn.Embedding(max_level + 1, dim)
-            self.shared_level_adapter = nn.Sequential(
+            self.level_embedding: Optional[nn.Embedding] = nn.Embedding(max_level + 1, dim)
+            self.shared_level_adapter: Optional[nn.Sequential] = nn.Sequential(
                 nn.Linear(dim * 2, hidden_dim // 2), # Input: concatenated token + level_emb
                 nn.ReLU(),
                 nn.Linear(hidden_dim // 2, dim),
                 nn.Dropout(dropout),
             )
-            self.level_mixing_weights = nn.Parameter(torch.ones(max_level + 1))
+            self.level_mixing_weights: Optional[nn.Parameter] = nn.Parameter(torch.ones(max_level + 1))
         else:
             self.level_embedding = None
             self.shared_level_adapter = None
             self.level_mixing_weights = None
 
         if use_feature_gating:
-            self.feature_gate = nn.Sequential(
+            self.feature_gate: Optional[nn.Sequential] = nn.Sequential(
                 nn.Linear(dim, hidden_dim // 4),
                 nn.ReLU(),
                 nn.Linear(hidden_dim // 4, hidden_dim),
@@ -66,6 +86,17 @@ class AdaptiveFractalFeedForward(nn.Module):
         self.activation_selector = nn.Sequential(nn.Linear(dim, 3), nn.Softmax(dim=-1))
 
     def _apply_dynamic_activation(self, x: torch.Tensor, activation_weights: torch.Tensor) -> torch.Tensor:
+        """应用动态加权的激活函数组合。
+        
+        根据输入计算的权重，混合 GELU、ReLU 和 Swish 三种激活函数。
+        
+        Args:
+            x: 输入张量，形状为 [B, S, D]。
+            activation_weights: 激活函数权重，形状为 [B, S, 3]。
+            
+        Returns:
+            加权混合后的输出，形状为 [B, S, D]。
+        """
         gelu_out = F.gelu(x)
         relu_out = F.relu(x)
         swish_out = x * torch.sigmoid(x)
@@ -76,12 +107,26 @@ class AdaptiveFractalFeedForward(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, levels_info: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """前向传播。
+        
+        Args:
+            x: 输入张量，形状为 [B, S, D]。
+            levels_info: 层级信息，形状为 (S, Info) 或 (B, S, Info)。
+            
+        Returns:
+            输出张量，形状为 [B, S, D]。
+        """
         batch, seq_len, _ = x.shape
         x_norm = self.norm(x)
 
         main_out = self.main_net(x_norm)
 
         if self.use_level_adaptation and levels_info is not None and levels_info.numel() > 0:
+            # Type guard: these are guaranteed non-None when use_level_adaptation is True
+            assert self.level_embedding is not None
+            assert self.shared_level_adapter is not None
+            assert self.level_mixing_weights is not None
+            
             if levels_info.dim() == 2:
                 # Old behavior: (Seq, Info)
                 depths = extract_depths(levels_info, self.max_level)

@@ -5,6 +5,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from .constants import EMBEDDING_INIT_STD, HILBERT_BIAS_SCALE
+
 
 class AdvancedFractalPositionEmbedding(nn.Module):
     """
@@ -50,9 +52,9 @@ class AdvancedFractalPositionEmbedding(nn.Module):
         self._init_parameters()
 
     def _init_parameters(self) -> None:
-        nn.init.normal_(self.depth_embedding.weight, std=0.02)
-        nn.init.normal_(self.quadrant_embedding.weight, std=0.02)
-        nn.init.uniform_(self.level_attention_bias, -0.1, 0.1)
+        nn.init.normal_(self.depth_embedding.weight, std=EMBEDDING_INIT_STD)
+        nn.init.normal_(self.quadrant_embedding.weight, std=EMBEDDING_INIT_STD)
+        nn.init.uniform_(self.level_attention_bias, -HILBERT_BIAS_SCALE, HILBERT_BIAS_SCALE)
 
     def forward(
         self,

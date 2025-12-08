@@ -1,8 +1,19 @@
+# -*- coding: utf-8 -*-
+"""Utility functions for the fractal ViT package.
+
+This module provides common utility functions used throughout the package,
+including tensor operations, attention mask generation, and helper functions
+for handling hierarchical level information.
+"""
+
 from __future__ import annotations
 
+import logging
 from typing import List, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 def pair(value: int | Tuple[int, int]) -> Tuple[int, int]:
@@ -15,6 +26,37 @@ def exists(value) -> bool:
 
 def default(value, default_value):
     return value if exists(value) else default_value
+
+
+def sanitize_tensor(
+    tensor: torch.Tensor,
+    nan_value: float = 0.0,
+    posinf_value: float = 1.0,
+    neginf_value: float = -1.0,
+) -> torch.Tensor:
+    """清理张量中的 NaN 和 Inf 值。
+    
+    检查张量中是否存在 NaN 或 Inf 值，如果存在则替换为指定的默认值。
+    这对于数值稳定性很重要，特别是在处理 softmax 或归一化操作时。
+    
+    Args:
+        tensor: 输入张量
+        nan_value: NaN 值的替换值，默认为 0.0
+        posinf_value: 正无穷的替换值，默认为 1.0
+        neginf_value: 负无穷的替换值，默认为 -1.0
+        
+    Returns:
+        清理后的张量（如果没有 NaN/Inf 则返回原张量）
+    """
+    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+        logger.debug(
+            "sanitize_tensor: Detected NaN/Inf in tensor with shape %s, replacing values",
+            tuple(tensor.shape)
+        )
+        return torch.nan_to_num(
+            tensor, nan=nan_value, posinf=posinf_value, neginf=neginf_value
+        )
+    return tensor
 
 
 def create_attention_mask(levels_info: List[torch.Tensor], device: torch.device) -> torch.Tensor:

@@ -116,7 +116,9 @@ class EnhancedFractalTokenProcessor(BaseTokenProcessor):
 
         if patch_info_list and len(patch_info_list) != len(batch):
             raise ValueError(
-                "Length of patch_info_list must match the number of token sequences."
+                f"TokenProcessor.process: patch_info_list length ({len(patch_info_list)}) "
+                f"does not match token sequence count ({len(batch)}). "
+                f"Hint: Ensure patch_info_list has one entry per image in the batch."
             )
 
         for index, sequence in enumerate(batch):

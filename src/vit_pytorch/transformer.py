@@ -1,11 +1,23 @@
+# -*- coding: utf-8 -*-
+"""Fractal-aware transformer blocks.
+
+This module implements transformer components that are aware of the
+hierarchical structure from the fractal tokenizer, including DropPath
+for stochastic depth and FractalTransformerBlock for the main transformer layer.
+"""
+
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import torch
 import torch.nn as nn
 
+logger = logging.getLogger(__name__)
+
 from .attention import HilbertAwareMultiScaleAttention
+from .constants import GLOBAL_CONTEXT_SCALE
 from .feedforward import AdaptiveFractalFeedForward
 from .utils import extract_depths
 
@@ -19,6 +31,14 @@ class DropPath(nn.Module):
         self.scale_by_keep = scale_by_keep
 
     def forward(self, x):
+        """前向传播，应用随机路径丢弃。
+        
+        Args:
+            x: 输入张量。
+            
+        Returns:
+            经过 DropPath 处理后的张量。
+        """
         if self.drop_prob == 0.0 or not self.training:
             return x
         keep_prob = 1 - self.drop_prob
@@ -30,7 +50,20 @@ class DropPath(nn.Module):
 
 
 class EnhancedFractalTransformerBlock(nn.Module):
-    """Hierarchically aware transformer block extracted for reuse."""
+    """Hierarchically aware transformer block extracted for reuse.
+    
+    This block combines Hilbert-aware attention with adaptive feed-forward,
+    using level-dependent normalization for depth-aware processing.
+    
+    Args:
+        dim: Input/output dimension.
+        heads: Number of attention heads.
+        dim_head: Dimension per head.
+        mlp_dim: Feed-forward hidden dimension.
+        dropout: Dropout rate.
+        max_level: Maximum hierarchical level.
+        drop_path: DropPath rate for stochastic depth.
+    """
 
     def __init__(self, dim: int, heads: int, dim_head: int, mlp_dim: int, dropout: float = 0.0, max_level: int = 50, drop_path: float = 0.0):
         super().__init__()
@@ -75,6 +108,20 @@ class EnhancedFractalTransformerBlock(nn.Module):
         beta_emb: nn.Embedding,
         default_norm: nn.LayerNorm,
     ) -> torch.Tensor:
+        """应用层级感知的 LayerNorm。
+        
+        根据每个 token 的层级深度选择对应的 gamma 和 beta 参数。
+        
+        Args:
+            x: 输入张量，形状为 [B, S, D]。
+            levels_info: 层级信息，可为 None。
+            gamma_emb: Gamma 参数的嵌入表。
+            beta_emb: Beta 参数的嵌入表。
+            default_norm: 默认的 LayerNorm（当无层级信息时使用）。
+            
+        Returns:
+            归一化后的张量，形状为 [B, S, D]。
+        """
         if levels_info is None or levels_info.numel() == 0:
             return default_norm(x)
 
@@ -106,6 +153,16 @@ class EnhancedFractalTransformerBlock(nn.Module):
         levels_info: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """前向传播。
+        
+        Args:
+            x: 输入张量，形状为 [B, S, D]。
+            levels_info: 层级信息（可选）。
+            attention_mask: 注意力掩码（可选）。
+            
+        Returns:
+            输出张量，形状为 [B, S, D]。
+        """
         norm1_x = self._apply_level_aware_norm(x, levels_info, self.norm1_gamma, self.norm1_beta, self.default_norm1)
         attn_out = self.attention(norm1_x, levels_info, attention_mask)
         x = x + self.drop_path(attn_out * self.residual_weights[0])
@@ -118,7 +175,22 @@ class EnhancedFractalTransformerBlock(nn.Module):
 
 
 class EnhancedFractalTransformer(nn.Module):
-    """High-level transformer stack coordinating block execution."""
+    """High-level transformer stack coordinating block execution.
+    
+    This module stacks multiple EnhancedFractalTransformerBlock layers,
+    adding global context attention and level aggregation for enhanced
+    hierarchical processing.
+    
+    Args:
+        dim: Input/output dimension.
+        depth: Number of transformer blocks.
+        heads: Number of attention heads.
+        dim_head: Dimension per head.
+        mlp_dim: Feed-forward hidden dimension.
+        dropout: Dropout rate.
+        max_level: Maximum hierarchical level.
+        drop_path_rate: Maximum DropPath rate (linearly increased).
+    """
 
     def __init__(
         self,
@@ -171,6 +243,17 @@ class EnhancedFractalTransformer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         use_dynamic_depth: bool = False,
     ) -> torch.Tensor:
+        """前向传播。
+        
+        Args:
+            x: 输入张量，形状为 [B, S, D]。
+            levels_info: 层级信息（可选）。
+            attention_mask: 注意力掩码（可选）。
+            use_dynamic_depth: 是否使用动态深度选择。
+            
+        Returns:
+            输出张量，形状为 [B, S, D]。
+        """
         batch_size, seq_len, dim = x.shape
 
         layer_weights = None
@@ -195,7 +278,7 @@ class EnhancedFractalTransformer(nn.Module):
                 key_padding_mask = ~attention_mask.squeeze(1).squeeze(1).bool()
             
             global_context, _ = self.global_context_attn(x, x, x, key_padding_mask=key_padding_mask)
-            x = x + global_context * 0.1
+            x = x + global_context * GLOBAL_CONTEXT_SCALE
 
         if levels_info is not None and levels_info.numel() > 0:
             aggregated = self.level_aggregator(x)
