@@ -18,6 +18,7 @@
 
 **Step 2: Token 处理与投影 (Token Processing)**
 *   **操作**: 调用 `self.token_processor.process(token_output)`。
+*   **模块**: `src/vit_pytorch/token_processor.py` (已解耦)。
 *   **内部流程** (在 `EnhancedFractalTokenProcessor` 中):
     1.  遍历每个序列。
     2.  `token_projection`: 线性映射 `Patch_Dim -> Dim`。
@@ -91,6 +92,8 @@
 ---
 
 ## 8.2 辅助类：EnhancedFractalTokenProcessor
+
+> **注意**: 此类已从 `fractal_vit.py` 移至 `src/vit_pytorch/token_processor.py`。
 
 ### `process(batch)`
 负责将原始像素数据映射到语义空间。

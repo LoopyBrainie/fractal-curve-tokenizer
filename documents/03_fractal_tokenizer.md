@@ -23,43 +23,49 @@
 *   **执行流程**:
     1.  **初始化**: 计算 `estimated_max_level`，清空 `saved_log_probs`（用于 REINFORCE）。
     2.  **Batch 循环**: 遍历 Batch 中的每一张图片 `image`。
-    3.  **递归调用**: 对每张图片调用 `fractal_partition(image, level=0, ...)`。
-    4.  **结果收集**: 将 `fractal_partition` 返回的 `tokens` (List[Tensor]) 和 `levels` (List[List[int]]) 封装进 `TokenSequence`。
+    3.  **分割调用**: 调用 `fractal_partition(image, level=0, ...)`。
+        *   默认使用 **BFS 批处理模式** (`fractal_partition_batched`) 以提高 GPU 利用率。
+        *   可通过配置回退到递归模式 (`fractal_partition_recursive`)。
+    4.  **结果收集**: 将返回的 `tokens` (List[Tensor]) 和 `levels` (List[List[int]]) 封装进 `TokenSequence`。
     5.  **封装**: 返回 `TokenizerOutput(sequences)`。
 
-### `fractal_partition(patch, level, coord, ...)`
-这是递归分割的核心引擎。
+### `fractal_partition_batched(image, ...)` (BFS 模式)
+这是默认的高效分割引擎，采用广度优先搜索 (BFS) 和批处理策略。
 
-*   **输入参数**:
-    *   `patch`: 当前图像块 `(C, H, W)`。
-    *   `level`: 当前递归深度 (int)。
-    *   `coord`: 当前路径坐标列表 (List[int])，记录了从根节点到当前的象限路径。
+*   **核心思想**: 将同一层级的所有 Patch 收集起来，组成 Batch 一次性通过 CNN 和策略网络，避免递归调用产生的大量微小 Kernel。
+*   **数据结构**: `PatchInfo` dataclass
+    *   `patch`: 图像块张量。
+    *   `level`: 当前层级。
+    *   `coord`: 象限坐标路径。
+    *   `dfs_order`: **关键属性**，用于在 BFS 过程中追踪 Hilbert DFS 遍历顺序。
 *   **执行流程**:
-    1.  **停止条件检查**:
-        *   物理限制: `H <= min_h` 或 `W <= min_w`。
-        *   深度限制: `level >= max_level`。
-        *   安全限制: 防止无限递归。
-    2.  **分割决策 (Decision Phase)**:
-        *   **可学习模式 (`learnable_split=True`)**:
-            1.  **特征提取**: 调用 `_extract_enhanced_patch_features` 获取 6 维统计特征（方差、均值、边缘密度等）。
-            2.  **CNN 特征**: 调用 `cnn_encoder(patch)` 获取 32 维视觉特征。
-            3.  **特征融合**: 拼接得到 38 维特征向量。
-            4.  **策略网络**: `split_decision(combined)` 输出 Logits `[not_split, split]`。
-            5.  **采样**:
-                *   训练时: `Categorical(logits).sample()`，并保存 `log_prob`。
-                *   推理时: `argmax(logits)`。
-        *   **启发式模式**: 计算 Patch 方差，若 `var < threshold` 则停止。
-    3.  **动作执行 (Action Phase)**:
-        *   **动作 0 (停止分割)**:
-            1.  调用 `_process_patch_to_fixed_size(patch)` 将 Patch 统一为 `min_patch_size`。
-            2.  展平为 Token 向量 `(C * min_h * min_w)`。
-            3.  记录层级信息 `[level, q_1, q_2, ..., q_level, 0, ...]`.
-            4.  返回 `([token], [level_info])`。
-        *   **动作 1 (继续分割)**:
-            1.  调用 `_adaptive_split(patch)` 将 Patch 切分为 4 个子块（左上、右上、左下、右下）。
-            2.  调用 `_determine_traversal_order` (内部委托给 `hilbert` 模块) 获取 Hilbert 遍历顺序（如 `[2, 0, 1, 3]`）。
-            3.  **递归**: 按顺序对每个子块调用 `fractal_partition`。
-            4.  **聚合**: 将所有子块返回的 Token 和 Level 列表拼接并返回。
+    1.  **初始化队列**: 将整图作为第一个 `PatchInfo` 加入队列 `current_level_patches`。
+    2.  **层级循环 (BFS)**: 当队列不为空且 `level < max_level`：
+        *   **批处理决策**:
+            *   收集当前层所有 Patch。
+            *   调用 `_batch_decide_splits` 统一计算分割概率。
+            *   对于 `learnable_split`，调用 `_batch_learnable_decision` 一次性前向传播 CNN 和 MLP。
+        *   **动作执行**:
+            *   **停止分割**: 将 Patch 加入 `final_patches` 列表。
+            *   **继续分割**:
+                *   调用 `_adaptive_split` 切分 Patch。
+                *   计算子节点的 `dfs_order` (父节点 order + 偏移量)。
+                *   将子节点加入 `next_level_patches`。
+        *   **推进**: `current_level_patches = next_level_patches`。
+    3.  **处理剩余**: 将达到最大深度的 Patch 加入 `final_patches`。
+    4.  **重排序**: 根据 `dfs_order` 对 `final_patches` 进行排序，恢复 Hilbert 遍历顺序。
+    5.  **后处理**: 统一 Patch 尺寸并展平，返回 Token 列表。
+
+### `fractal_partition_recursive(patch, ...)` (递归模式)
+传统的深度优先 (DFS) 实现，逻辑直观但 GPU 效率较低。
+
+*   **流程**:
+    1.  **检查停止条件**: 尺寸过小或达到最大深度。
+    2.  **单次决策**: 对当前 Patch 运行策略网络。
+    3.  **递归**:
+        *   若分割：切分 Patch，计算 Hilbert 顺序，递归调用子节点。
+        *   若停止：处理并返回当前 Patch。
+    4.  **聚合**: 拼接子节点的返回结果。
 
 ### `_adaptive_split(patch, H, W, ...)`
 负责具体的张量切分操作。

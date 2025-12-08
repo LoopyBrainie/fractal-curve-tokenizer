@@ -37,11 +37,13 @@ fractal-curve-tokenizer/
 ├── src/
 │   └── vit_pytorch/
 │       ├── fractal_vit.py          # [核心] 完整模型定义 (NextGenerationFractalViT)
-│       ├── fractal_curve_tokenizer.py # [核心] 分形分词器与 Hilbert 算法
+│       ├── fractal_curve_tokenizer.py # [核心] 分形分词器 (含 BFS 批处理)
+│       ├── token_processor.py      # [核心] Token 特征处理与增强
 │       ├── transformer.py          # 增强型 Transformer 编码器块
 │       ├── attention.py            # Hilbert 感知多尺度注意力机制
 │       ├── positional.py           # 高级分形位置编码
 │       ├── feedforward.py          # 自适应前馈网络
+│       ├── hilbert.py              # Hilbert 曲线算法与缓存
 │       ├── tokenization.py         # 基础数据结构与抽象基类
 │       ├── features.py             # Token 特征计算工具
 │       └── utils.py                # 通用工具函数
