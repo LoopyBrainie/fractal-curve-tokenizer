@@ -31,6 +31,7 @@ graph TD
 | 模块 | 对应文件 | 核心功能 |
 | :--- | :--- | :--- |
 | **Tokenizer** | `src/vit_pytorch/fractal_curve_tokenizer.py` | 图像 -> 变长 Token 序列，包含策略网络。 |
+| **Token Processor** | `src/vit_pytorch/token_processor.py` | Token 特征投影、层级嵌入与增强。 |
 | **Model** | `src/vit_pytorch/fractal_vit.py` | 组装整个模型，处理 Batch 对齐和 Loss 计算。 |
 | **Transformer** | `src/vit_pytorch/transformer.py` | 定制的 Transformer 块，支持层级感知。 |
 | **Attention** | `src/vit_pytorch/attention.py` | 希尔伯特感知注意力机制。 |
