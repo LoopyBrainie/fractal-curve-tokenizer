@@ -71,15 +71,21 @@ The project includes a robust training script located at `examples/training/trai
 #### Basic Training Command
 
 ```bash
+# CIFAR-10 (auto-downloads)
 python examples/training/train_fractal_vit.py --dataset cifar10 --epochs 50 --batch-size 64
+
+# Tiny ImageNet (auto-downloads ~237 MB)
+python examples/training/train_fractal_vit.py --dataset tiny-imagenet --quick-test
 ```
+
+**Note:** Datasets like CIFAR-10, CIFAR-100, MNIST, and Tiny ImageNet are automatically downloaded to `workspace/data/` on first use. Large datasets (ImageNet, COCO) require manual download.
 
 #### Full Argument List
 
 | Argument | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `--dataset` | str | `cifar10` | Dataset to use: `cifar10`, `cifar100`, `mnist`, `imagenet`, `coco`, `caltech256`, `tiny-imagenet`. |
-| `--data-root` | str | `None` | Path to the root directory of the dataset (required for ImageNet/COCO/TinyImageNet). |
+| `--data-root` | str | `workspace/data` | Path to the root directory of the dataset. Auto-created for supported datasets. |
 | `--epochs` | int | `50` | Number of training epochs. |
 | `--batch-size` | int | `64` | Batch size for training. |
 | `--lr` | float | `5e-4` | Initial learning rate. |

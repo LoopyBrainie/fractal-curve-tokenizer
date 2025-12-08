@@ -71,15 +71,21 @@ logits = model(img) # (1, 1000)
 #### 基础训练命令
 
 ```bash
+# CIFAR-10（自动下载）
 python examples/training/train_fractal_vit.py --dataset cifar10 --epochs 50 --batch-size 64
+
+# Tiny ImageNet（自动下载 ~237 MB）
+python examples/training/train_fractal_vit.py --dataset tiny-imagenet --quick-test
 ```
+
+**注意：** CIFAR-10、CIFAR-100、MNIST 和 Tiny ImageNet 等数据集在首次使用时会自动下载到 `workspace/data/`。大型数据集（ImageNet、COCO）需要手动下载。
 
 #### 完整参数列表 (Full Argument List)
 
 | 参数 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
 | `--dataset` | str | `cifar10` | 使用的数据集: `cifar10`, `cifar100`, `mnist`, `imagenet`, `coco`, `caltech256`, `tiny-imagenet`。 |
-| `--data-root` | str | `None` | 数据集根目录路径 (ImageNet/COCO/TinyImageNet 必需)。 |
+| `--data-root` | str | `workspace/data` | 数据集根目录路径。支持的数据集会自动创建此目录。 |
 | `--epochs` | int | `50` | 训练轮数。 |
 | `--batch-size` | int | `64` | 训练批次大小。 |
 | `--lr` | float | `5e-4` | 初始学习率。 |
