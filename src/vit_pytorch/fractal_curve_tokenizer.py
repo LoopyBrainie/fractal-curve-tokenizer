@@ -1,11 +1,23 @@
 import math
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .hilbert import HilbertCurve, get_quadrant_order
 from .tokenization import BaseTokenizer, TokenSequence, TokenizerOutput
 
+
+@dataclass
+class PatchInfo:
+    """追踪 BFS 中每个 patch 的元信息"""
+    patch: torch.Tensor      # [C, H, W]
+    level: int               # 当前递归深度
+    coord: List[int]         # Hilbert 路径
+    dfs_order: float         # DFS 顺序索引，用于最终排序
+    
 
 class MiniCNN(nn.Module):
     """轻量级CNN特征提取器，用于分割决策"""
@@ -88,6 +100,12 @@ class FractalHilbertTokenizer(BaseTokenizer):
         # 用于存储REINFORCE所需的log_probs
         self.saved_log_probs = []
         self.saved_entropies = []
+        
+        # 预注册 Sobel 核为 buffer，避免每次调用时重复创建
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
 
     def clear_saved_actions(self):
         self.saved_log_probs = []
@@ -118,17 +136,29 @@ class FractalHilbertTokenizer(BaseTokenizer):
 
         flattened_patch_dim = channels * self.min_patch_size[0] * self.min_patch_size[1]
 
+        # 根据是否启用可学习分割决定使用批处理还是递归
+        use_batch = self.learnable_split and self.split_decision is not None
+        
         for b in range(batch_size):
             image = images[b]
             sample_device = image.device
 
-            tokens_raw, levels_raw = self.fractal_partition(
-                image,
-                level=0,
-                coord=[],
-                max_info_len=max_info_len,
-                depth_limit=dynamic_depth_cap,
-            )
+            if use_batch:
+                # 使用BFS批处理版本 - 减少GPU kernel调用
+                tokens_raw, levels_raw = self.fractal_partition_batched(
+                    image,
+                    max_info_len=max_info_len,
+                    depth_limit=dynamic_depth_cap,
+                )
+            else:
+                # 使用原始递归版本 - 用于无可学习分割的场景
+                tokens_raw, levels_raw = self.fractal_partition(
+                    image,
+                    level=0,
+                    coord=[],
+                    max_info_len=max_info_len,
+                    depth_limit=dynamic_depth_cap,
+                )
 
             if len(tokens_raw) == 0:
                 empty_tokens = torch.empty(0, flattened_patch_dim, device=sample_device)
@@ -341,13 +371,13 @@ class FractalHilbertTokenizer(BaseTokenizer):
         patch_var = torch.var(patch)
         patch_mean = torch.mean(patch)
 
-        # 边缘密度特征（使用Sobel算子）
+        # 边缘密度特征（使用预注册的Sobel算子）
         gray_patch = torch.mean(patch, dim=0, keepdim=True).unsqueeze(0)  # [1, 1, H, W]
 
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=device).view(1, 1, 3, 3)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=device).view(1, 1, 3, 3)
-
         if h >= 3 and w >= 3:  # 确保patch足够大来应用卷积
+            # 确保 Sobel 核与输入在同一设备
+            sobel_x = self.sobel_x.to(device)
+            sobel_y = self.sobel_y.to(device)
             edge_x = F.conv2d(gray_patch, sobel_x, padding=1)
             edge_y = F.conv2d(gray_patch, sobel_y, padding=1)
             edge_magnitude = torch.sqrt(edge_x**2 + edge_y**2)
@@ -486,3 +516,272 @@ class FractalHilbertTokenizer(BaseTokenizer):
         _channels, height, width = patch.shape
         min_h, min_w = self.min_patch_size
         return level < self.max_level and (height > min_h or width > min_w)
+
+    # ==================== 批处理优化方法 ====================
+    
+    def fractal_partition_batched(
+        self,
+        patch: torch.Tensor,
+        max_info_len: int,
+        depth_limit: int,
+    ) -> Tuple[List[torch.Tensor], List[List[int]]]:
+        """
+        批处理版本的分形分割，使用 BFS 实现层级批处理。
+        
+        核心优化：对同一层级的所有 patches 批量计算 CNN 特征和分割决策，
+        而非逐个递归计算。保持 Hilbert 曲线遍历顺序不变。
+        
+        Args:
+            patch: 输入图像 [C, H, W]
+            max_info_len: levels_info 的最大长度
+            depth_limit: 最大递归深度
+            
+        Returns:
+            (tokens, levels): 与原 fractal_partition 相同的输出格式
+        """
+        device = patch.device
+        min_h, min_w = self.min_patch_size
+        
+        # 初始化 BFS 队列
+        # dfs_order 用于最终排序，初始为 0
+        queue: List[PatchInfo] = [PatchInfo(patch=patch, level=0, coord=[], dfs_order=0.0)]
+        
+        # 最终输出的 token 列表（需要按 dfs_order 排序）
+        final_tokens: List[Tuple[float, torch.Tensor, List[int]]] = []
+        
+        while queue:
+            # 按层级分组，批量处理同一层的 patches
+            current_level = queue[0].level
+            
+            # 收集当前层的所有 patches
+            current_batch: List[PatchInfo] = []
+            remaining: List[PatchInfo] = []
+            
+            for info in queue:
+                if info.level == current_level:
+                    current_batch.append(info)
+                else:
+                    remaining.append(info)
+            
+            queue = remaining
+            
+            if not current_batch:
+                continue
+            
+            # 批量决策：哪些 patches 应该分割
+            split_decisions = self._batch_decide_splits(current_batch, depth_limit)
+            
+            # 处理每个 patch
+            for i, info in enumerate(current_batch):
+                should_split = split_decisions[i]
+                C, H, W = info.patch.shape
+                
+                can_split_h = H > min_h
+                can_split_w = W > min_w
+                can_split = can_split_h or can_split_w
+                
+                # 如果不能分割或决策为停止，输出为 token
+                if not can_split or not should_split:
+                    processed = self._process_patch_to_fixed_size(info.patch, H, W)
+                    token = processed.reshape(-1)
+                    
+                    # 构建 levels_info
+                    depth = info.level
+                    path = info.coord.copy()
+                    padded = [depth] + path + [0] * (max_info_len - 1 - len(path))
+                    levels = padded[:max_info_len]
+                    
+                    final_tokens.append((info.dfs_order, token, levels))
+                else:
+                    # 分割并加入队列
+                    sub_patches = self._adaptive_split(info.patch, H, W, can_split_h, can_split_w)
+                    
+                    if not sub_patches:
+                        # 分割失败，作为 token 输出
+                        processed = self._process_patch_to_fixed_size(info.patch, H, W)
+                        token = processed.reshape(-1)
+                        depth = info.level
+                        path = info.coord.copy()
+                        padded = [depth] + path + [0] * (max_info_len - 1 - len(path))
+                        levels = padded[:max_info_len]
+                        final_tokens.append((info.dfs_order, token, levels))
+                    else:
+                        # 获取 Hilbert 遍历顺序
+                        traversal_order = self._determine_traversal_order(
+                            info.level, H, W, len(sub_patches)
+                        )
+                        
+                        # 计算子 patch 的 DFS 顺序
+                        # 使用分数索引保持正确的 DFS 顺序
+                        num_children = len(sub_patches)
+                        for child_idx, patch_idx in enumerate(traversal_order):
+                            if patch_idx < len(sub_patches):
+                                sub = sub_patches[patch_idx].contiguous()
+                                if sub.numel() > 0:
+                                    # DFS 顺序：父节点顺序 + 子节点在遍历中的位置
+                                    child_dfs_order = info.dfs_order + child_idx / (num_children * (10 ** (info.level + 1)))
+                                    new_info = PatchInfo(
+                                        patch=sub,
+                                        level=info.level + 1,
+                                        coord=info.coord + [patch_idx],
+                                        dfs_order=child_dfs_order,
+                                    )
+                                    queue.append(new_info)
+        
+        # 按 DFS 顺序排序
+        final_tokens.sort(key=lambda x: x[0])
+        
+        # 提取排序后的 tokens 和 levels
+        tokens = [t[1] for t in final_tokens]
+        levels = [t[2] for t in final_tokens]
+        
+        return tokens, levels
+    
+    def _batch_decide_splits(
+        self,
+        batch: List[PatchInfo],
+        depth_limit: int,
+    ) -> List[bool]:
+        """
+        批量决定一组 patches 是否应该分割。
+        
+        对于 learnable_split=True，批量计算 CNN 特征和分割网络输出。
+        对于非学习模式，使用方差阈值。
+        
+        Args:
+            batch: 同一层级的 PatchInfo 列表
+            depth_limit: 最大深度限制
+            
+        Returns:
+            布尔列表，True 表示应该分割
+        """
+        decisions: List[bool] = []
+        device = batch[0].patch.device if batch else None
+        min_h, min_w = self.min_patch_size
+        
+        # 收集可分割的 patches 用于批量处理
+        splittable_indices: List[int] = []
+        splittable_patches: List[PatchInfo] = []
+        
+        for i, info in enumerate(batch):
+            C, H, W = info.patch.shape
+            can_split_h = H > min_h
+            can_split_w = W > min_w
+            can_split = can_split_h or can_split_w
+            level_limit_reached = info.level >= depth_limit
+            
+            # 安全检查
+            extra_depth_cap = depth_limit + 5
+            safety_check = (H <= 1 and W <= 1) or (info.level >= extra_depth_cap)
+            
+            if not can_split or level_limit_reached or safety_check:
+                decisions.append(False)
+            else:
+                splittable_indices.append(i)
+                splittable_patches.append(info)
+                decisions.append(True)  # 暂时标记为 True，后面更新
+        
+        if not splittable_patches:
+            return decisions
+        
+        # 批量决策
+        if self.learnable_split and self.split_decision is not None and self.cnn_encoder is not None:
+            # 批量计算 CNN 特征
+            batch_decisions = self._batch_learnable_decision(splittable_patches)
+            
+            # 更新决策
+            for idx, decision in zip(splittable_indices, batch_decisions):
+                decisions[idx] = decision
+        else:
+            # 非学习模式：使用方差阈值
+            for idx, info in zip(splittable_indices, splittable_patches):
+                if self.adaptive_threshold is not None and self.adaptive_threshold > 0:
+                    patch_var = torch.var(info.patch)
+                    should_stop = patch_var < self.adaptive_threshold
+                    decisions[idx] = not should_stop
+                else:
+                    # 默认继续分割，但有层级限制
+                    decisions[idx] = info.level < 10
+        
+        return decisions
+    
+    def _batch_learnable_decision(
+        self,
+        patches: List[PatchInfo],
+    ) -> List[bool]:
+        """
+        使用学习网络批量决定分割。
+        
+        批处理优化：将多个 patches 的特征提取合并为批量操作。
+        
+        Args:
+            patches: 待决策的 PatchInfo 列表
+            
+        Returns:
+            布尔列表，True 表示应该分割
+        """
+        if not patches:
+            return []
+        
+        device = patches[0].patch.device
+        batch_size = len(patches)
+        
+        # 1. 批量提取手工特征 (这部分仍需逐个计算，因为尺寸可能不同)
+        features_list = []
+        for info in patches:
+            C, H, W = info.patch.shape
+            features = self._extract_enhanced_patch_features(info.patch, info.level, H, W)
+            features_list.append(features)
+        
+        # Stack features: [batch_size, 6]
+        batch_features = torch.cat(features_list, dim=0)  # [batch_size, 6]
+        
+        # 2. 批量计算 CNN 特征
+        # 由于 patches 尺寸可能不同，需要逐个处理或 padding
+        # 这里采用逐个处理但保持批量决策
+        cnn_features_list = []
+        for info in patches:
+            cnn_feat = self.cnn_encoder(info.patch)  # [1, 32]
+            cnn_features_list.append(cnn_feat)
+        
+        batch_cnn_features = torch.cat(cnn_features_list, dim=0)  # [batch_size, 32]
+        
+        # 3. 组合特征
+        combined = torch.cat([batch_features, batch_cnn_features], dim=1)  # [batch_size, 38]
+        
+        # 检查 NaN/Inf
+        if torch.isnan(combined).any() or torch.isinf(combined).any():
+            combined = torch.nan_to_num(combined, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        # 4. 批量获取 logits
+        logits = self.split_decision(combined)  # [batch_size, 2]
+        logits = torch.clamp(logits, min=-10.0, max=10.0)
+        
+        # 检查 NaN/Inf
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        # 5. 决策
+        decisions: List[bool] = []
+        
+        if self.training:
+            # REINFORCE: 采样动作
+            dist = torch.distributions.Categorical(logits=logits)
+            actions = dist.sample()  # [batch_size]
+            
+            # 保存 log_probs 和 entropies (批量)
+            log_probs = dist.log_prob(actions)  # [batch_size]
+            entropies = dist.entropy()  # [batch_size]
+            
+            for i in range(batch_size):
+                self.saved_log_probs.append(log_probs[i])
+                self.saved_entropies.append(entropies[i])
+                # action 0: stop (not split), action 1: split
+                decisions.append(actions[i].item() == 1)
+        else:
+            # 推理模式：取最大概率
+            actions = torch.argmax(logits, dim=-1)  # [batch_size]
+            for i in range(batch_size):
+                decisions.append(actions[i].item() == 1)
+        
+        return decisions

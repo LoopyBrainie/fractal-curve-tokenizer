@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from .attention import HilbertAwareMultiScaleAttention
 from .feedforward import AdaptiveFractalFeedForward
+from .utils import extract_depths
 
 
 class DropPath(nn.Module):
@@ -83,12 +84,12 @@ class EnhancedFractalTransformerBlock(nn.Module):
         # Handle both (Seq, Info) and (Batch, Seq, Info) shapes for levels_info
         if levels_info.dim() == 2:
             # Old behavior: (Seq, Info) -> broadcast to batch
-            depths = levels_info[:, 0].clamp(0, self.max_level).long() # (seq_len,)
+            depths = extract_depths(levels_info, self.max_level) # (seq_len,)
             gamma = gamma_emb(depths).unsqueeze(0) # (1, seq_len, dim)
             beta = beta_emb(depths).unsqueeze(0) # (1, seq_len, dim)
         else:
             # New behavior: (Batch, Seq, Info)
-            depths = levels_info[:, :, 0].clamp(0, self.max_level).long() # (B, S)
+            depths = extract_depths(levels_info, self.max_level) # (B, S)
             gamma = gamma_emb(depths) # (B, S, dim)
             beta = beta_emb(depths) # (B, S, dim)
         

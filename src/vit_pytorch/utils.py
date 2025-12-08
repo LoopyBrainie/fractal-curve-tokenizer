@@ -76,3 +76,34 @@ def create_attention_mask(levels_info: List[torch.Tensor], device: torch.device)
     mask = torch.where(valid_mask, mask, torch.tensor(1.0, device=device))
 
     return mask
+
+
+def extract_depths(levels_info: torch.Tensor, max_level: int) -> torch.Tensor:
+    """统一从 levels_info 提取深度索引，自动处理 2D/3D 张量。
+    
+    Args:
+        levels_info: 层级信息张量，形状为 (Seq, Info) 或 (Batch, Seq, Info)
+        max_level: 最大层级值，用于 clamp
+        
+    Returns:
+        深度索引张量，形状为 (Seq,) 或 (Batch, Seq)
+    """
+    if levels_info.dim() == 2:
+        depths = levels_info[:, 0]
+    else:
+        depths = levels_info[:, :, 0]
+    return depths.clamp(0, max_level).long()
+
+
+def normalize_levels_info(levels_info: torch.Tensor) -> torch.Tensor:
+    """规范化 levels_info 为 (Batch, Seq, Info) 格式。
+    
+    Args:
+        levels_info: 层级信息张量，形状为 (Seq, Info) 或 (Batch, Seq, Info)
+        
+    Returns:
+        规范化后的张量，形状为 (Batch, Seq, Info)
+    """
+    if levels_info.dim() == 2:
+        return levels_info.unsqueeze(0)
+    return levels_info

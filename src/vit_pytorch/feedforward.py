@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .utils import extract_depths
+
 
 class AdaptiveFractalFeedForward(nn.Module):
     """Adaptive feed-forward block aware of tokenizer hierarchy."""
@@ -82,7 +84,7 @@ class AdaptiveFractalFeedForward(nn.Module):
         if self.use_level_adaptation and levels_info is not None and levels_info.numel() > 0:
             if levels_info.dim() == 2:
                 # Old behavior: (Seq, Info)
-                depths = levels_info[:, 0].clamp(0, self.max_level).long()
+                depths = extract_depths(levels_info, self.max_level)
                 level_embs = self.level_embedding(depths) # (Seq, Dim)
                 level_embs = level_embs.unsqueeze(0).expand(batch, -1, -1) # (Batch, Seq, Dim)
                 
@@ -90,7 +92,7 @@ class AdaptiveFractalFeedForward(nn.Module):
                 mixing_weights = mixing_weights.view(1, seq_len, 1)
             else:
                 # New behavior: (Batch, Seq, Info)
-                depths = levels_info[:, :, 0].clamp(0, self.max_level).long() # (Batch, Seq)
+                depths = extract_depths(levels_info, self.max_level) # (Batch, Seq)
                 level_embs = self.level_embedding(depths) # (Batch, Seq, Dim)
                 
                 # Softmax across sequence dimension to match original behavior

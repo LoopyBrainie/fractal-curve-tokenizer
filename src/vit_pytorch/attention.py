@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from .utils import extract_depths
+
 
 class HilbertAwareMultiScaleAttention(nn.Module):
     """Hilbert curve aware multi-scale attention.
@@ -108,14 +110,14 @@ class HilbertAwareMultiScaleAttention(nn.Module):
 
         if levels_info.dim() == 2:
             # Old behavior: (Seq, Info)
-            depths = levels_info[:, 0]
+            depths = extract_depths(levels_info, self.max_level)
             level_diff = depths.unsqueeze(0) - depths.unsqueeze(1)
             level_diff = level_diff.clamp(-self.max_level, self.max_level) + self.max_level
             rel_pos_bias = self.relative_pos_embedding(level_diff)
             return rel_pos_bias.permute(2, 0, 1) # (H, S, S)
         else:
             # New behavior: (Batch, Seq, Info)
-            depths = levels_info[:, :, 0] # (B, S)
+            depths = extract_depths(levels_info, self.max_level) # (B, S)
             level_diff = depths.unsqueeze(2) - depths.unsqueeze(1) # (B, S, S)
             level_diff = level_diff.clamp(-self.max_level, self.max_level) + self.max_level
             rel_pos_bias = self.relative_pos_embedding(level_diff) # (B, S, S, H)
@@ -137,12 +139,11 @@ class HilbertAwareMultiScaleAttention(nn.Module):
         dots = dots * self.scale_weights.view(1, -1, 1, 1)
 
         if self.use_level_scaling and levels_info is not None and levels_info.numel() > 0:
+            depths = extract_depths(levels_info, self.max_level)
             if levels_info.dim() == 2:
-                depths = levels_info[:, 0].clamp(0, self.max_level)
                 level_scales = self.level_scale_embedding(depths)
                 level_scales = level_scales.transpose(0, 1).unsqueeze(0).unsqueeze(-1)
             else:
-                depths = levels_info[:, :, 0].clamp(0, self.max_level) # (B, S)
                 level_scales = self.level_scale_embedding(depths) # (B, S, H)
                 level_scales = level_scales.permute(0, 2, 1).unsqueeze(-1) # (B, H, S, 1)
             
