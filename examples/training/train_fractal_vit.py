@@ -6,12 +6,15 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import shutil
 import sys
 import time
+import zipfile
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from urllib.request import urlretrieve
 
 import numpy as np
 import torch
@@ -530,6 +533,127 @@ def get_dataset_spec(dataset: str) -> DatasetSpec:
     return specs[dataset]
 
 
+# ============================================================================
+# Dataset Auto-Download Functions
+# ============================================================================
+
+def download_with_progress(url: str, dest: Path, desc: str = "Downloading") -> None:
+    """Download file with progress bar."""
+    def progress_hook(count, block_size, total_size):
+        if total_size > 0:
+            percent = min(int(count * block_size * 100 / total_size), 100)
+            bar_length = 50
+            filled = int(bar_length * percent / 100)
+            bar = '█' * filled + '░' * (bar_length - filled)
+            sys.stdout.write(f'\r{desc}: [{bar}] {percent}%')
+            sys.stdout.flush()
+    
+    print(f"\n{desc} from {url}")
+    urlretrieve(url, dest, progress_hook)
+    print()  # New line after progress
+
+
+def auto_download_tiny_imagenet(data_root: Path) -> bool:
+    """Automatically download and prepare Tiny ImageNet dataset.
+    
+    Args:
+        data_root: Root directory where the dataset will be stored
+        
+    Returns:
+        True if successful or already exists, False if failed
+    """
+    train_dir = data_root / "train"
+    val_dir = data_root / "val"
+    
+    # Check if already exists
+    if train_dir.exists() and val_dir.exists():
+        num_train_classes = len(list(train_dir.glob('*')))
+        if num_train_classes >= 200:  # Tiny ImageNet has 200 classes
+            print(f"✓ Tiny ImageNet already exists at {data_root}")
+            return True
+    
+    print("=" * 70)
+    print("Tiny ImageNet not found. Downloading automatically...")
+    print("=" * 70)
+    
+    url = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+    zip_path = data_root / "tiny-imagenet-200.zip"
+    extract_dir = data_root / "tiny-imagenet-200"
+    
+    try:
+        # Create data directory
+        data_root.mkdir(parents=True, exist_ok=True)
+        
+        # Download
+        if not zip_path.exists():
+            download_with_progress(url, zip_path, "Downloading Tiny ImageNet (~237 MB)")
+        else:
+            print(f"✓ ZIP file already exists: {zip_path}")
+        
+        # Extract
+        if not extract_dir.exists():
+            print("Extracting archive...")
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                # Extract with progress
+                members = zip_ref.namelist()
+                for i, member in enumerate(members):
+                    if i % 100 == 0:
+                        percent = int((i / len(members)) * 100)
+                        sys.stdout.write(f'\rExtracting: {percent}%')
+                        sys.stdout.flush()
+                    zip_ref.extract(member, data_root)
+                print('\rExtracting: 100%')
+        
+        # Move directories
+        src_train = extract_dir / "train"
+        src_val = extract_dir / "val"
+        
+        if not train_dir.exists() and src_train.exists():
+            print(f"Moving train/ to {train_dir}")
+            shutil.move(str(src_train), str(train_dir))
+        
+        if not val_dir.exists() and src_val.exists():
+            print(f"Moving val/ to {val_dir}")
+            shutil.move(str(src_val), str(val_dir))
+        
+        # Clean up
+        print("Cleaning up temporary files...")
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir)
+        if zip_path.exists():
+            zip_path.unlink()
+        
+        print("=" * 70)
+        print("✓ Tiny ImageNet download and setup complete!")
+        print("=" * 70)
+        
+        return True
+        
+    except Exception as e:
+        print(f"\n✗ Error downloading Tiny ImageNet: {e}")
+        print("\nPlease download manually:")
+        print(f"1. Visit: {url}")
+        print(f"2. Extract to: {data_root}")
+        return False
+
+
+def check_and_download_dataset(dataset_name: str, data_root: Path) -> bool:
+    """Check if dataset exists and download if necessary.
+    
+    Args:
+        dataset_name: Name of the dataset
+        data_root: Root directory for dataset storage
+        
+    Returns:
+        True if dataset is ready, False otherwise
+    """
+    if dataset_name == "tiny-imagenet":
+        return auto_download_tiny_imagenet(data_root)
+    
+    # For other datasets (CIFAR, MNIST), torchvision handles download automatically
+    return True
+
+
 def build_transforms(spec: DatasetSpec) -> Tuple[transforms.Compose, transforms.Compose]:
     """
     构建数据增强管道
@@ -669,8 +793,52 @@ def create_dataloaders(
     if spec.name == "TinyImageNet":
         train_dir = data_root / "train"
         val_dir = data_root / "val"
+        
+        # Try auto-download if not exists
         if not train_dir.exists() or not val_dir.exists():
-             raise FileNotFoundError(f"Tiny ImageNet requires 'train' and 'val' folders in {data_root}")
+            print(f"\nTiny ImageNet not found at {data_root}")
+            if not auto_download_tiny_imagenet(data_root):
+                # If auto-download failed, show manual instructions
+                error_msg = f"""
+╔══════════════════════════════════════════════════════════════════════════╗
+║                    Tiny ImageNet Dataset Not Found                      ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+Automatic download failed. Please download manually:
+
+Expected directory structure:
+  {data_root}/
+    ├── train/           # 100,000 training images (200 classes, 500 each)
+    └── val/             # 10,000 validation images
+
+Manual download instructions:
+
+1. Download the dataset:
+   wget http://cs231n.stanford.edu/tiny-imagenet-200.zip
+   
+   OR visit: http://cs231n.stanford.edu/tiny-imagenet-200.zip
+
+2. Extract and prepare:
+   unzip tiny-imagenet-200.zip
+   mv tiny-imagenet-200/train {data_root}/train
+   mv tiny-imagenet-200/val {data_root}/val
+
+3. For Windows (PowerShell):
+   Invoke-WebRequest -Uri "http://cs231n.stanford.edu/tiny-imagenet-200.zip" -OutFile "tiny-imagenet-200.zip"
+   Expand-Archive -Path "tiny-imagenet-200.zip" -DestinationPath "."
+   Move-Item "tiny-imagenet-200\\train" "{data_root}\\train"
+   Move-Item "tiny-imagenet-200\\val" "{data_root}\\val"
+
+Note: The dataset is ~237 MB compressed, ~500 MB uncompressed.
+
+Alternatively, use a different dataset like CIFAR-10 or CIFAR-100:
+  python examples/training/train_fractal_vit.py --dataset cifar10 --quick-test
+"""
+                raise FileNotFoundError(error_msg)
+        
+        # Verify directories exist after download attempt
+        if not train_dir.exists() or not val_dir.exists():
+            raise FileNotFoundError(f"Failed to prepare Tiny ImageNet at {data_root}")
         
         # Train set is standard ImageFolder
         train_dataset = ImageFolder(str(train_dir), transform=train_transform)
@@ -699,7 +867,37 @@ def create_dataloaders(
         train_dir = data_root / "train"
         val_dir = data_root / "val"
         if not train_dir.exists() or not val_dir.exists():
-             raise FileNotFoundError(f"ImageNet requires 'train' and 'val' folders in {data_root}")
+            error_msg = f"""
+╔══════════════════════════════════════════════════════════════════════════╗
+║                     ImageNet Dataset Not Found                          ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+Expected directory structure:
+  {data_root}/
+    ├── train/           # 1,281,167 training images (1000 classes)
+    └── val/             # 50,000 validation images
+
+ImageNet requires registration and manual download:
+
+1. Register and download from:
+   https://image-net.org/download.php
+   
+2. Download ILSVRC2012_img_train.tar and ILSVRC2012_img_val.tar
+
+3. Extract and organize:
+   mkdir -p {data_root}/train {data_root}/val
+   tar -xf ILSVRC2012_img_train.tar -C {data_root}/train
+   tar -xf ILSVRC2012_img_val.tar -C {data_root}/val
+
+Note: ImageNet is very large (~150 GB). Consider using:
+  - Tiny ImageNet (64x64, 200 classes, ~500 MB)
+  - CIFAR-100 (32x32, 100 classes, ~170 MB)
+  - CIFAR-10 (32x32, 10 classes, ~170 MB)
+
+Quick test with smaller dataset:
+  python examples/training/train_fractal_vit.py --dataset cifar10 --quick-test
+"""
+            raise FileNotFoundError(error_msg)
         train_dataset = spec.dataset_cls(root=str(train_dir), transform=train_transform)
         test_dataset = spec.dataset_cls(root=str(val_dir), transform=test_transform)
     elif spec.name == "COCO":
@@ -710,7 +908,43 @@ def create_dataloaders(
         val_ann = data_root / "annotations" / "instances_val2017.json"
         
         if not train_img_dir.exists() or not train_ann.exists():
-             raise FileNotFoundError(f"COCO requires train2017/val2017 and annotations in {data_root}")
+            error_msg = f"""
+╔══════════════════════════════════════════════════════════════════════════╗
+║                      COCO Dataset Not Found                              ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+Expected directory structure:
+  {data_root}/
+    ├── train2017/       # 118,287 training images
+    ├── val2017/         # 5,000 validation images
+    └── annotations/
+        ├── instances_train2017.json
+        └── instances_val2017.json
+
+Download COCO 2017 dataset:
+
+1. Download images and annotations:
+   wget http://images.cocodataset.org/zips/train2017.zip
+   wget http://images.cocodataset.org/zips/val2017.zip
+   wget http://images.cocodataset.org/annotations/annotations_trainval2017.zip
+
+2. Extract:
+   unzip train2017.zip -d {data_root}
+   unzip val2017.zip -d {data_root}
+   unzip annotations_trainval2017.zip -d {data_root}
+
+3. For Windows (PowerShell):
+   Invoke-WebRequest -Uri "http://images.cocodataset.org/zips/train2017.zip" -OutFile "train2017.zip"
+   Invoke-WebRequest -Uri "http://images.cocodataset.org/zips/val2017.zip" -OutFile "val2017.zip"
+   Invoke-WebRequest -Uri "http://images.cocodataset.org/annotations/annotations_trainval2017.zip" -OutFile "annotations.zip"
+   Expand-Archive train2017.zip -DestinationPath "{data_root}"
+   Expand-Archive val2017.zip -DestinationPath "{data_root}"
+   Expand-Archive annotations.zip -DestinationPath "{data_root}"
+
+Note: COCO is large (~25 GB). Consider starting with smaller datasets:
+  python examples/training/train_fractal_vit.py --dataset cifar10 --quick-test
+"""
+            raise FileNotFoundError(error_msg)
 
         train_dataset = spec.dataset_cls(root=str(train_img_dir), annFile=str(train_ann), transform=train_transform)
         test_dataset = spec.dataset_cls(root=str(val_img_dir), annFile=str(val_ann), transform=test_transform)
