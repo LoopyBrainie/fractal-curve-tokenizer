@@ -83,29 +83,30 @@ class MiniCNN(nn.Module):
 
 
 class LearnableSplitDecision(nn.Module):
-    """增强的可学习分割决策网络，支持CNN特征和Gumbel-Softmax。
+    """可学习分割决策网络。
     
-    该网络接收 patch 的手工特征（层级、尺寸、方差等）和 CNN 提取的特征，
+    该网络接收 patch 的手工特征（层级、尺寸、方差等），可选地加入 CNN 特征，
     输出两个 logits 表示「不分割」和「分割」的倾向。
     
     Args:
         patch_features: 手工特征维度（默认6：level, height, width, variance, mean, edge_density）
-        cnn_features: CNN 提取的特征维度
+        cnn_features: CNN 提取的特征维度，0 表示不使用 CNN
         hidden_dim: 隐藏层维度
     """
 
     def __init__(
         self,
         patch_features: int = 6,
-        cnn_features: int = 32,
-        hidden_dim: int = 128,
+        cnn_features: int = 0,
+        hidden_dim: int = 64,
     ) -> None:
         super().__init__()
         # patch_features: [level, height, width, variance, mean, edge_density]
-        # cnn_features: 来自MiniCNN的特征维度
+        # cnn_features: 来自MiniCNN的特征维度，0 表示不使用
+        self.cnn_features = cnn_features
         input_dim = patch_features + cnn_features
         self.net = nn.Sequential(
-            nn.LayerNorm(input_dim), # 关键：对混合特征进行归一化，防止方差等大数值主导
+            nn.LayerNorm(input_dim),
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
@@ -143,7 +144,8 @@ class FractalHilbertTokenizer(BaseTokenizer):
         learnable_split: 是否使用可学习的分割决策
         adaptive_threshold: 自适应分割的方差阈值
         channels: 输入图像通道数
-        cnn_encoder: CNN 特征提取器（仅 learnable_split=True 时）
+        use_cnn: 是否使用 CNN 特征（默认 False，用于 benchmark 对比）
+        cnn_encoder: CNN 特征提取器（仅 use_cnn=True 时）
         split_decision: 分割决策网络（仅 learnable_split=True 时）
     """
     
@@ -154,6 +156,7 @@ class FractalHilbertTokenizer(BaseTokenizer):
         learnable_split: bool = True,
         adaptive_threshold: float = 0.5,
         channels: int = 3,
+        use_cnn: bool = False,
     ) -> None:
         """初始化 FractalHilbertTokenizer。
         
@@ -163,6 +166,7 @@ class FractalHilbertTokenizer(BaseTokenizer):
             learnable_split: 是否使用可学习的分割决策
             adaptive_threshold: 自适应分割阈值
             channels: 输入图像的通道数（RGB=3，灰度=1）
+            use_cnn: 是否使用 CNN 特征提取（默认 False，仅用手工特征）
         """
         super().__init__()
         self.min_patch_size = min_patch_size
@@ -170,11 +174,20 @@ class FractalHilbertTokenizer(BaseTokenizer):
         self.learnable_split = learnable_split
         self.adaptive_threshold = adaptive_threshold
         self.channels = channels
+        self.use_cnn = use_cnn
 
         if learnable_split:
-            # 增强的分割决策网络，支持更多特征
-            self.cnn_encoder: Optional[MiniCNN] = MiniCNN(in_channels=channels, hidden_dim=16, out_dim=32)
-            self.split_decision: Optional[LearnableSplitDecision] = LearnableSplitDecision(patch_features=6, cnn_features=32, hidden_dim=128)
+            # CNN 特征提取器（可选）
+            if use_cnn:
+                self.cnn_encoder: Optional[MiniCNN] = MiniCNN(in_channels=channels, hidden_dim=16, out_dim=32)
+                cnn_dim = 32
+            else:
+                self.cnn_encoder = None
+                cnn_dim = 0
+            # 分割决策网络
+            self.split_decision: Optional[LearnableSplitDecision] = LearnableSplitDecision(
+                patch_features=6, cnn_features=cnn_dim, hidden_dim=64
+            )
         else:
             self.cnn_encoder = None
             self.split_decision = None
@@ -217,10 +230,11 @@ class FractalHilbertTokenizer(BaseTokenizer):
         estimated_max_level = self._estimate_max_possible_level(height, width)
         dynamic_depth_cap = self.max_level if self.max_level is not None else max(estimated_max_level + 5, 12)
 
-        if self.learnable_split and self.split_decision is not None and self.cnn_encoder is not None:
+        if self.learnable_split and self.split_decision is not None:
             # 确保可学习分割网络与输入位于同一设备
             self.split_decision = self.split_decision.to(images.device)
-            self.cnn_encoder = self.cnn_encoder.to(images.device)
+            if self.use_cnn and self.cnn_encoder is not None:
+                self.cnn_encoder = self.cnn_encoder.to(images.device)
 
         # 清空之前的动作记录
         self.clear_saved_actions()
@@ -377,11 +391,22 @@ class FractalHilbertTokenizer(BaseTokenizer):
                 )
             return True
 
-        # 使用增强的可学习分割决策
-        if self.learnable_split and self.split_decision is not None and self.cnn_encoder is not None:
+        # 使用可学习分割决策
+        if self.learnable_split and self.split_decision is not None:
             features = self._extract_enhanced_patch_features(patch, level, H, W)
-            cnn_feat = self.cnn_encoder(patch)
-            combined = torch.cat([features, cnn_feat], dim=1)
+            
+            # 可选：添加 CNN 特征
+            if self.use_cnn and self.cnn_encoder is not None:
+                # CNN 需要最小尺寸 (InstanceNorm 要求空间尺寸 > 1)
+                MIN_CNN_SIZE = 4
+                if H >= MIN_CNN_SIZE and W >= MIN_CNN_SIZE:
+                    cnn_feat = self.cnn_encoder(patch)
+                else:
+                    cnn_feat = torch.zeros(1, 32, device=patch.device)
+                combined = torch.cat([features, cnn_feat], dim=1)
+            else:
+                combined = features
+            
             combined = sanitize_tensor(combined)
 
             logits = self.split_decision(combined)
@@ -945,8 +970,8 @@ class FractalHilbertTokenizer(BaseTokenizer):
             return decisions
         
         # 批量决策
-        if self.learnable_split and self.split_decision is not None and self.cnn_encoder is not None:
-            # 批量计算 CNN 特征
+        if self.learnable_split and self.split_decision is not None:
+            # 批量计算特征和分割决策
             batch_decisions = self._batch_learnable_decision(splittable_patches)
             
             # 更新决策
@@ -996,19 +1021,25 @@ class FractalHilbertTokenizer(BaseTokenizer):
         # Stack features: [batch_size, 6]
         batch_features = torch.cat(features_list, dim=0)  # [batch_size, 6]
         
-        # 2. 批量计算 CNN 特征
-        # 由于 patches 尺寸可能不同，需要逐个处理或 padding
-        # 这里采用逐个处理但保持批量决策
-        cnn_features_list = []
-        assert self.cnn_encoder is not None  # 类型守卫，此方法只在 learnable_split=True 时调用
-        for info in patches:
-            cnn_feat = self.cnn_encoder(info.patch)  # [1, 32]
-            cnn_features_list.append(cnn_feat)
+        # 2. 可选：批量计算 CNN 特征
+        if self.use_cnn and self.cnn_encoder is not None:
+            # 由于 patches 尺寸可能不同，需要逐个处理
+            # CNN 需要最小尺寸 (InstanceNorm 要求空间尺寸 > 1)
+            MIN_CNN_SIZE = 4
+            cnn_features_list = []
+            for info in patches:
+                C, H, W = info.patch.shape
+                if H >= MIN_CNN_SIZE and W >= MIN_CNN_SIZE:
+                    cnn_feat = self.cnn_encoder(info.patch)  # [1, 32]
+                else:
+                    # Patch 太小，使用零填充代替 CNN 特征
+                    cnn_feat = torch.zeros(1, 32, device=device)
+                cnn_features_list.append(cnn_feat)
+            batch_cnn_features = torch.cat(cnn_features_list, dim=0)  # [batch_size, 32]
+            combined = torch.cat([batch_features, batch_cnn_features], dim=1)  # [batch_size, 38]
+        else:
+            combined = batch_features  # [batch_size, 6]
         
-        batch_cnn_features = torch.cat(cnn_features_list, dim=0)  # [batch_size, 32]
-        
-        # 3. 组合特征
-        combined = torch.cat([batch_features, batch_cnn_features], dim=1)  # [batch_size, 38]
         combined = sanitize_tensor(combined)
         
         # 4. 批量获取 logits
