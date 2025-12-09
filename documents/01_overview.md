@@ -46,6 +46,7 @@ fractal-curve-tokenizer/
 │       ├── hilbert.py              # Hilbert 曲线算法与缓存
 │       ├── tokenization.py         # 基础数据结构与抽象基类
 │       ├── features.py             # Token 特征计算工具
+│       ├── constants.py            # [配置] 全局常量与超参数
 │       └── utils.py                # 通用工具函数
 ├── examples/
 │   └── training/

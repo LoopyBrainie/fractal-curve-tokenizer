@@ -7,6 +7,10 @@
 脚本通过 `DatasetSpec` dataclass 统一管理不同数据集的配置。
 
 *   **支持列表**：CIFAR10, CIFAR100, MNIST, ImageNet, COCO (分类模式), Caltech256, TinyImageNet。
+*   **自动下载**：
+    *   `CIFAR10`, `CIFAR100`, `MNIST`: 使用 `torchvision` 自动下载。
+    *   `TinyImageNet`: 脚本内置自动下载器，从斯坦福官网下载并解压 (~237MB)。
+    *   `ImageNet`, `COCO`: 由于体积巨大，脚本会提供详细的手动下载和目录结构说明。
 *   **特殊处理**：
     *   `CocoClassificationWrapper`: 将 COCO 目标检测数据集转换为分类数据集（取最大物体类别）。
     *   `TinyImageNetVal`: 自定义加载器处理 TinyImageNet 的验证集标注文件。

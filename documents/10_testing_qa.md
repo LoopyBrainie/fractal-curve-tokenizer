@@ -38,13 +38,32 @@ tests/
 *   **Hilbert 测试 (`test_hilbert.py`)**:
     *   验证 Hilbert 曲线生成的正确性和缓存机制。
 
-## 10.3 基准测试
+## 10.3 基准测试与评估
 
-`tests/benchmarks/compare_fractal_vs_standard.py` 提供了一个公平的对比脚本。
-*   **对比对象**: `NextGenerationFractalViT` vs 标准 `StandardViT` (基于 PyTorch 原生 Transformer)。
-*   **指标**:
-    *   参数量 (Parameters)。
-    *   峰值显存占用 (Peak Memory)。
-    *   推理延迟 (Inference Latency)。
-    *   吞吐量 (Throughput)。
+`tests/benchmarks/` 目录包含了一套完整的性能评估工具。
+
+### 1. 核心对比 (`compare_fractal_vs_standard.py`)
+提供与标准 ViT 的公平对比。
+*   **对比对象**: `NextGenerationFractalViT` vs `StandardViT` (PyTorch 原生实现)。
+*   **指标**: 参数量、显存占用、推理延迟、吞吐量。
 *   **目的**: 量化分形 Tokenizer 带来的性能开销与收益。
+
+### 2. 综合性能基准 (`benchmark_fractal_vit.py`)
+深入分析 Fractal ViT 的各项性能指标。
+*   **测试项**:
+    *   **Tokenizer 效率**: 纯 Tokenizer 的吞吐量 (img/s)。
+    *   **端到端性能**: 完整模型的前向/反向传播速度。
+    *   **显存分析**: 详细的显存占用分布。
+*   **特性**: 支持不同 Batch Size 和 Image Size 的压力测试。
+
+### 3. 预训练评估 (`evaluate_pretrained.py`)
+用于评估已训练模型的性能。
+*   **功能**: 加载 Checkpoint 并在指定数据集上运行验证。
+*   **可视化**: 支持生成预测结果的可视化网格 (`--visualize`)。
+*   **指标**: Top-1 Accuracy, Top-5 Accuracy, Loss。
+
+### 4. 收敛性检查 (`check_convergence.py`)
+用于快速验证模型是否具备学习能力。
+*   **方法**: 在极小数据集（如 100 张图）上过拟合。
+*   **判定**: 如果 Loss 能迅速下降到接近 0，说明模型架构无严重 Bug。
+

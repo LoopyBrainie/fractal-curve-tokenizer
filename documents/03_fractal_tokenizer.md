@@ -6,7 +6,7 @@
 
 1.  **输入**: 原始图像 Batch `(B, C, H, W)`。
 2.  **处理**: 对每张图像独立进行递归分割。
-    *   提取局部特征。
+    *   提取局部特征（手工特征 + 可选 CNN 特征）。
     *   通过策略网络决策是否分割。
     *   若分割，按 Hilbert 顺序递归处理子块。
     *   若停止，将当前 Patch 处理为固定尺寸并展平。
@@ -19,7 +19,9 @@
 ### `tokenize(images)`
 这是分词器的入口函数。
 
-*   **输入参数**: `images` (Tensor): 形状 `(B, C, H, W)`。
+*   **输入参数**:
+    *   `images` (Tensor): 形状 `(B, C, H, W)`。
+    *   `use_cnn` (bool): 是否启用 CNN 特征提取（默认 False，仅使用手工特征以提升速度）。
 *   **执行流程**:
     1.  **初始化**: 计算 `estimated_max_level`，清空 `saved_log_probs`（用于 REINFORCE）。
     2.  **Batch 循环**: 遍历 Batch 中的每一张图片 `image`。
