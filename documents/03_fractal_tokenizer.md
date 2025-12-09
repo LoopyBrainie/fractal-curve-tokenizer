@@ -21,7 +21,7 @@
 
 *   **输入参数**:
     *   `images` (Tensor): 形状 `(B, C, H, W)`。
-    *   `use_cnn` (bool): 是否启用 CNN 特征提取（默认 False，仅使用手工特征以提升速度）。
+    *   *(注: `use_cnn` 选项已移至 `__init__` 初始化参数，不再作为 `tokenize` 的参数)*
 *   **执行流程**:
     1.  **初始化**: 计算 `estimated_max_level`，清空 `saved_log_probs`（用于 REINFORCE）。
     2.  **Batch 循环**: 遍历 Batch 中的每一张图片 `image`。

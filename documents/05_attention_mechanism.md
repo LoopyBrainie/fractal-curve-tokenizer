@@ -29,13 +29,19 @@
 
 **Step 4: Hilbert 偏置注入 (Hilbert Bias)**
 *   **条件**: `use_hilbert_bias=True`。
-*   **调用**: `_compute_hilbert_bias(levels_info)`。
-*   **逻辑**:
-    1.  提取路径坐标 `paths` `(B, S, Path_Len)`。
-    2.  计算所有 Token 对之间的 **欧氏距离** 和 **余弦相似度**。
-    3.  得到特征图 `(B, S, S, 2)`。
-    4.  通过 MLP `hilbert_bias_network` 映射为 `(B, S, S, Heads)`。
-    5.  变换为 `(B, Heads, S, S)`。
+*   **模式选择**: 由 `bias_mode` 参数控制 (`original`, `low_rank`, `hierarchical`)。
+*   **模式详解**:
+    1.  **Original 模式** (默认):
+        *   计算所有 Token 对的欧氏距离和余弦相似度。
+        *   通过 MLP 映射为 Bias。
+        *   复杂度: $O(S^2)$，显存占用较高。
+    2.  **Low Rank 模式** (`low_rank`):
+        *   将 Bias 分解为两个低秩矩阵 $U \in \mathbb{R}^{S \times r}$ 和 $V \in \mathbb{R}^{S \times r}$。
+        *   $Bias = U \times V^T$。
+        *   复杂度: $O(S \cdot r)$，大幅降低显存占用 (r=32 时仅为原来的 1/8)。
+    3.  **Hierarchical 模式** (`hierarchical`):
+        *   基于 Token 的层级差异 (Level Difference) 和路径距离计算 Bias。
+        *   强调层级结构，具有更好的可解释性。
 *   **操作**: `dots = dots + hilbert_bias * 0.1`。
 *   **意义**: 让模型显式感知 Token 在 Hilbert 曲线上的空间邻近关系。
 

@@ -48,6 +48,14 @@ tests/
 *   **指标**: 参数量、显存占用、推理延迟、吞吐量。
 *   **目的**: 量化分形 Tokenizer 带来的性能开销与收益。
 
+### 2. CNN 消融实验 (`benchmark_cnn_ablation.py`)
+验证 CNN 特征提取对分割决策的影响。
+*   **对比设置**:
+    *   **Baseline**: 仅使用手工特征 (6维: level, height, width, variance, mean, edge_density)。
+    *   **With CNN**: 手工特征 + CNN 特征 (6+32=38维)。
+*   **评估指标**: 训练收敛速度、验证准确率、Token 数量分布、训练耗时。
+*   **目的**: 确定引入 CNN 特征提取器是否物有所值（即带来的精度提升是否超过了计算开销）。
+
 ### 2. 综合性能基准 (`benchmark_fractal_vit.py`)
 深入分析 Fractal ViT 的各项性能指标。
 *   **测试项**:

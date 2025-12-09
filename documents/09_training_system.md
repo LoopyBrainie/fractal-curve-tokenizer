@@ -8,6 +8,7 @@
 
 *   **支持列表**：CIFAR10, CIFAR100, MNIST, ImageNet, COCO (分类模式), Caltech256, TinyImageNet。
 *   **自动下载**：
+    *   通过 `--auto-download` 标志启用。
     *   `CIFAR10`, `CIFAR100`, `MNIST`: 使用 `torchvision` 自动下载。
     *   `TinyImageNet`: 脚本内置自动下载器，从斯坦福官网下载并解压 (~237MB)。
     *   `ImageNet`, `COCO`: 由于体积巨大，脚本会提供详细的手动下载和目录结构说明。
@@ -24,6 +25,9 @@
 ## 9.2 模型构建与配置
 
 *   `build_model()`: 根据参数实例化 `NextGenerationFractalViT` 或 `SimpleFractalViT`。
+*   **关键参数**:
+    *   `--bias-mode`: 选择 Hilbert Bias 模式 (`original`, `low_rank`, `hierarchical`)。
+    *   `--rank`: 设置 Low Rank 模式的秩 (默认 32)。
 *   **自适应策略**：
     *   如果检测到 CPU 环境，自动切换到 `SimpleFractalViT` 并减小模型规模，以允许在无 GPU 环境下调试。
     *   `--disable-hilbert-bias`: 在 CPU 上自动禁用 Hilbert Bias 计算以提升速度。
