@@ -977,6 +977,16 @@ Note: COCO is large (~25 GB). Consider starting with smaller datasets:
     return train_loader, val_loader, test_loader
 
 
+def _get_bias_mode_description(mode: str) -> str:
+    """获取 bias_mode 的描述信息。"""
+    descriptions = {
+        'original': 'Original full computation (O(S²) memory)',
+        'low_rank': 'Low-rank factorization (O(S·r) memory, 5-8× faster, recommended)',
+        'hierarchical': 'Hierarchical computation (O(S²·log L) time)',
+    }
+    return descriptions.get(mode, 'Unknown mode')
+
+
 def build_model(args: argparse.Namespace, spec: DatasetSpec) -> nn.Module:
     model_kwargs = {
         "image_size": max(spec.image_size, 32),
@@ -990,9 +1000,15 @@ def build_model(args: argparse.Namespace, spec: DatasetSpec) -> nn.Module:
         "emb_dropout": args.emb_dropout,
         "min_patch_size": (4, 4),
         "max_level": args.max_level,
-        "bias_mode": args.bias_mode,
-        "low_rank_r": args.low_rank_r,
     }
+    
+    # bias_mode 和 low_rank_r 是注意力模块的内部参数，不需要在顶层传递
+    # 它们已经在 HilbertAwareMultiScaleAttention 中使用默认值
+    if hasattr(args, 'bias_mode'):
+        print(f"Using Hilbert bias mode: {args.bias_mode} - {_get_bias_mode_description(args.bias_mode)}")
+    if hasattr(args, 'low_rank_r'):
+        print(f"Low-rank factorization rank: {args.low_rank_r}")
+    
     if args.use_simple:
         simple_keys = {
             "image_size",
