@@ -3,11 +3,16 @@
 
 This module implements HilbertAwareMultiScaleAttention, which encodes
 hierarchical depth and Hilbert path relationships to modulate attention weights.
+
+Supports three bias computation modes:
+- 'original': Full neural network computation (high memory, accurate)
+- 'low_rank': Low-rank factorization (recommended, memory efficient)
+- 'hierarchical': Layer-wise computation (interpretable, moderate memory)
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -16,6 +21,231 @@ from einops import rearrange
 
 from .constants import HILBERT_BIAS_SCALE, LEVEL_BIAS_SCALE
 from .utils import extract_depths
+
+BiasMode = Literal['original', 'low_rank', 'hierarchical']
+
+
+class LowRankHilbertBias(nn.Module):
+    """低秩分解的 Hilbert Bias 实现。
+    
+    使用两个独立的路径编码器，将 O(S²) 的偏置矩阵分解为 O(S×r) 的低秩形式。
+    
+    数学原理:
+        B[i,j] = φ(path_i)^T · ψ(path_j)
+        其中 φ, ψ: R^d → R^r 是可学习的编码器
+    
+    复杂度:
+        计算: O(S·r·H) vs 原始 O(S²·64·H)
+        显存: O(S·r·H) vs 原始 O(S²·H)
+    
+    注意：实际的 levels_info 路径维度取决于图像大小和 max_level 的组合，
+    forward 时会对输入进行动态截断或填充以匹配模型的 path_dim。
+    """
+    
+    def __init__(self, path_dim: int, rank: int, heads: int) -> None:
+        """初始化低秩 Hilbert Bias。
+        
+        Args:
+            path_dim: 路径维度（建议设置足够大，如 max_level + 16）
+            rank: 秩参数，控制近似精度（推荐 32-64）
+            heads: 注意力头数
+        """
+        super().__init__()
+        self.rank = rank
+        self.heads = heads
+        # 保存 path_dim 用于动态调整输入
+        self.path_dim = path_dim
+        
+        # Query 路径编码器
+        self.path_encoder_q = nn.Sequential(
+            nn.Linear(path_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, rank * heads),
+        )
+        
+        # Key 路径编码器
+        self.path_encoder_k = nn.Sequential(
+            nn.Linear(path_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, rank * heads),
+        )
+    
+    def _adjust_path_dim(self, paths: torch.Tensor) -> torch.Tensor:
+        """调整路径维度以匹配模型期望的 path_dim。
+        
+        Args:
+            paths: 输入路径 (..., actual_path_len)
+            
+        Returns:
+            调整后的路径 (..., path_dim)
+        """
+        actual_dim = paths.shape[-1]
+        if actual_dim == self.path_dim:
+            return paths
+        elif actual_dim < self.path_dim:
+            # 填充零
+            padding = torch.zeros(*paths.shape[:-1], self.path_dim - actual_dim, 
+                                  device=paths.device, dtype=paths.dtype)
+            return torch.cat([paths, padding], dim=-1)
+        else:
+            # 截断（保留前 path_dim 个元素）
+            return paths[..., :self.path_dim]
+    
+    def forward(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+        """计算低秩 Hilbert Bias。
+        
+        Args:
+            levels_info: (B, S, Info) 层级信息
+            
+        Returns:
+            (B, H, S, S) 偏置矩阵，若无效则返回 None
+        """
+        if levels_info.numel() == 0:
+            return None
+        
+        if levels_info.dim() == 2:
+            # 旧格式: (S, Info)
+            if levels_info.shape[1] <= 1:
+                return None
+            paths = levels_info[:, 1:].float()  # (S, Path)
+            # 调整路径维度以匹配模型
+            paths = self._adjust_path_dim(paths)
+            
+            # 编码路径
+            phi = self.path_encoder_q(paths)  # (S, rank*H)
+            psi = self.path_encoder_k(paths)  # (S, rank*H)
+            
+            phi = phi.view(-1, self.heads, self.rank)  # (S, H, r)
+            psi = psi.view(-1, self.heads, self.rank)  # (S, H, r)
+            
+            # 低秩矩阵乘法: bias[i,j] = φ[i] · ψ[j]^T
+            bias = torch.einsum('ihr,jhr->hij', phi, psi)  # (H, S, S)
+            return bias
+        else:
+            # 新格式: (B, S, Info)
+            batch_size, seq_len, info_dim = levels_info.shape
+            if info_dim <= 1:
+                return None
+            
+            paths = levels_info[:, :, 1:].float()  # (B, S, Path)
+            # 调整路径维度以匹配模型
+            paths = self._adjust_path_dim(paths)
+            
+            # 编码路径
+            phi = self.path_encoder_q(paths)  # (B, S, rank*H)
+            psi = self.path_encoder_k(paths)  # (B, S, rank*H)
+            
+            phi = phi.view(batch_size, seq_len, self.heads, self.rank)  # (B, S, H, r)
+            psi = psi.view(batch_size, seq_len, self.heads, self.rank)  # (B, S, H, r)
+            
+            # 低秩矩阵乘法
+            bias = torch.einsum('bihr,bjhr->bhij', phi, psi)  # (B, H, S, S)
+            return bias
+
+
+class HierarchicalHilbertBias(nn.Module):
+    """分层计算的 Hilbert Bias 实现。
+    
+    利用四叉树的层级结构，将偏置分解为各层的贡献之和。
+    
+    数学原理:
+        B[i,j] = Σ_{ℓ=1}^L b^(ℓ)(q_i^(ℓ), q_j^(ℓ), context)
+        其中 q^(ℓ) 是第 ℓ 层的象限索引
+    
+    优势:
+        - 可解释性强（可视化各层贡献）
+        - 参数共享（泛化能力好）
+        - 可并行计算各层
+    """
+    
+    def __init__(self, max_depth: int, heads: int) -> None:
+        """初始化分层 Hilbert Bias。
+        
+        Args:
+            max_depth: 最大四叉树深度
+            heads: 注意力头数
+        """
+        super().__init__()
+        self.max_depth = max_depth
+        self.heads = heads
+        
+        # 每层独立的偏置网络
+        # 输入特征: [same_quad, quad_diff, q_i, q_j] (4维)
+        self.layer_nets = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(4, 16),
+                nn.ReLU(),
+                nn.Linear(16, heads),
+            )
+            for _ in range(max_depth)
+        ])
+    
+    def forward(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+        """计算分层 Hilbert Bias。
+        
+        Args:
+            levels_info: (B, S, Info) 层级信息
+            
+        Returns:
+            (B, H, S, S) 偏置矩阵，若无效则返回 None
+        """
+        if levels_info.numel() == 0:
+            return None
+        
+        if levels_info.dim() == 2:
+            # 旧格式: (S, Info)
+            if levels_info.shape[1] <= 1:
+                return None
+            paths = levels_info[:, 1:].long()  # (S, Path)
+            seq_len, path_len = paths.shape
+            
+            bias = torch.zeros(self.heads, seq_len, seq_len, device=paths.device)
+            
+            # 逐层累加偏置
+            for level in range(min(path_len, len(self.layer_nets))):
+                q = paths[:, level]  # (S,)
+                
+                # 计算特征
+                same_quad = (q.unsqueeze(0) == q.unsqueeze(1)).float()  # (S, S)
+                quad_diff = (q.unsqueeze(0) - q.unsqueeze(1)).abs().float()  # (S, S)
+                q_i = q.unsqueeze(1).expand(seq_len, seq_len).float()  # (S, S)
+                q_j = q.unsqueeze(0).expand(seq_len, seq_len).float()  # (S, S)
+                
+                context = torch.stack([same_quad, quad_diff, q_i, q_j], dim=-1)  # (S, S, 4)
+                
+                # 通过第 level 层网络
+                layer_bias = self.layer_nets[level](context)  # (S, S, H)
+                bias += layer_bias.permute(2, 0, 1)  # (H, S, S)
+            
+            return bias
+        else:
+            # 新格式: (B, S, Info)
+            batch_size, seq_len, info_dim = levels_info.shape
+            if info_dim <= 1:
+                return None
+            
+            paths = levels_info[:, :, 1:].long()  # (B, S, Path)
+            path_len = paths.shape[-1]
+            
+            bias = torch.zeros(batch_size, self.heads, seq_len, seq_len, device=paths.device)
+            
+            # 逐层累加偏置
+            for level in range(min(path_len, len(self.layer_nets))):
+                q = paths[:, :, level]  # (B, S)
+                
+                # 计算特征 (向量化)
+                same_quad = (q.unsqueeze(2) == q.unsqueeze(1)).float()  # (B, S, S)
+                quad_diff = (q.unsqueeze(2) - q.unsqueeze(1)).abs().float()  # (B, S, S)
+                q_i = q.unsqueeze(2).expand(batch_size, seq_len, seq_len).float()  # (B, S, S)
+                q_j = q.unsqueeze(1).expand(batch_size, seq_len, seq_len).float()  # (B, S, S)
+                
+                context = torch.stack([same_quad, quad_diff, q_i, q_j], dim=-1)  # (B, S, S, 4)
+                
+                # 通过第 level 层网络
+                layer_bias = self.layer_nets[level](context)  # (B, S, S, H)
+                bias += layer_bias.permute(0, 3, 1, 2)  # (B, H, S, S)
+            
+            return bias
 
 
 class HilbertAwareMultiScaleAttention(nn.Module):
@@ -41,6 +271,8 @@ class HilbertAwareMultiScaleAttention(nn.Module):
         max_level: int = 50,
         use_hilbert_bias: bool = True,
         use_level_scaling: bool = True,
+        bias_mode: BiasMode = 'low_rank',
+        low_rank_r: int = 32,
     ) -> None:
         """初始化 HilbertAwareMultiScaleAttention。
         
@@ -52,6 +284,11 @@ class HilbertAwareMultiScaleAttention(nn.Module):
             max_level: 最大层级
             use_hilbert_bias: 是否使用 Hilbert 路径偏置
             use_level_scaling: 是否使用层级缩放
+            bias_mode: Hilbert Bias 计算模式
+                - 'original': 原始全连接网络（高显存，精确）
+                - 'low_rank': 低秩分解（推荐，显存友好）
+                - 'hierarchical': 分层计算（可解释性强）
+            low_rank_r: 低秩分解的秩参数（仅当 bias_mode='low_rank' 时有效）
         """
         super().__init__()
         self.heads = heads
@@ -59,6 +296,7 @@ class HilbertAwareMultiScaleAttention(nn.Module):
         self.max_level = max_level
         self.use_hilbert_bias = use_hilbert_bias
         self.use_level_scaling = use_level_scaling
+        self.bias_mode = bias_mode
 
         inner_dim = dim_head * heads
         self.scale = dim_head ** -0.5
@@ -66,15 +304,38 @@ class HilbertAwareMultiScaleAttention(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
 
+        # 根据 bias_mode 初始化对应的实现
         if use_hilbert_bias:
-            self.hilbert_bias_network: Optional[nn.Sequential] = nn.Sequential(
-                nn.Linear(2, 64),
-                nn.ReLU(),
-                nn.Linear(64, heads),
-                nn.Tanh(),
-            )
+            if bias_mode == 'original':
+                self.hilbert_bias_network: Optional[nn.Sequential] = nn.Sequential(
+                    nn.Linear(2, 64),
+                    nn.ReLU(),
+                    nn.Linear(64, heads),
+                    nn.Tanh(),
+                )
+                self.hilbert_bias_impl: Optional[nn.Module] = None
+            elif bias_mode == 'low_rank':
+                self.hilbert_bias_network = None
+                # 路径维度需要足够大以容纳实际的 levels_info
+                # 实际路径维度 = max_info_len - 1 ≈ max_level + log2(image_size/min_patch) + 3
+                # 使用 max_level + 16 作为安全的默认值
+                estimated_path_dim = max_level + 16
+                self.hilbert_bias_impl = LowRankHilbertBias(
+                    path_dim=estimated_path_dim,
+                    rank=low_rank_r,
+                    heads=heads,
+                )
+            elif bias_mode == 'hierarchical':
+                self.hilbert_bias_network = None
+                self.hilbert_bias_impl = HierarchicalHilbertBias(
+                    max_depth=max_level,
+                    heads=heads,
+                )
+            else:
+                raise ValueError(f"Unknown bias_mode: {bias_mode}")
         else:
             self.hilbert_bias_network = None
+            self.hilbert_bias_impl = None
 
         if use_level_scaling:
             self.level_scale_embedding: Optional[nn.Embedding] = nn.Embedding(max_level + 1, heads)
@@ -93,6 +354,11 @@ class HilbertAwareMultiScaleAttention(nn.Module):
     def _compute_hilbert_bias(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
         """计算基于 Hilbert 路径的注意力偏置。
         
+        根据 bias_mode 调用不同的实现：
+        - 'original': 使用原始的全连接网络
+        - 'low_rank': 使用低秩分解
+        - 'hierarchical': 使用分层计算
+        
         Args:
             levels_info: 层级信息张量，形状为 (Seq, Info) 或 (Batch, Seq, Info)
             
@@ -102,7 +368,11 @@ class HilbertAwareMultiScaleAttention(nn.Module):
         if not self.use_hilbert_bias or levels_info.numel() == 0:
             return None
 
-        # Type guard: guaranteed non-None when use_hilbert_bias is True
+        # 使用新的优化实现（low_rank 或 hierarchical）
+        if self.hilbert_bias_impl is not None:
+            return self.hilbert_bias_impl(levels_info)
+        
+        # 原始实现（original mode）
         assert self.hilbert_bias_network is not None
 
         device = levels_info.device

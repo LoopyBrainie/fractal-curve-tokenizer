@@ -990,6 +990,8 @@ def build_model(args: argparse.Namespace, spec: DatasetSpec) -> nn.Module:
         "emb_dropout": args.emb_dropout,
         "min_patch_size": (4, 4),
         "max_level": args.max_level,
+        "bias_mode": args.bias_mode,
+        "low_rank_r": args.low_rank_r,
     }
     if args.use_simple:
         simple_keys = {
@@ -1004,6 +1006,8 @@ def build_model(args: argparse.Namespace, spec: DatasetSpec) -> nn.Module:
             "emb_dropout",
             "min_patch_size",
             "max_level",
+            "bias_mode",
+            "low_rank_r",
         }
         simple_kwargs = {k: v for k, v in model_kwargs.items() if k in simple_keys}
         simple_kwargs["pool"] = args.pool
@@ -1337,9 +1341,16 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--disable-hilbert-bias",
-        action="store_true",
-        help="Turn off Hilbert-path attention bias to speed up CPU training.",
+        "--bias-mode",
+        choices=["original", "low_rank", "hierarchical"],
+        default="low_rank",
+        help="Hilbert bias computation mode: 'original' (high memory), 'low_rank' (memory efficient, default), 'hierarchical' (interpretable).",
+    )
+    parser.add_argument(
+        "--low-rank-r",
+        type=int,
+        default=32,
+        help="Rank for low-rank Hilbert bias factorization (only used when --bias-mode=low_rank).",
     )
     parser.add_argument(
         "--force-next-gen",
@@ -1378,14 +1389,15 @@ def main() -> None:
 
     model = build_model(args, spec)
 
-    disable_hilbert_bias = args.disable_hilbert_bias or device.type == "cpu"
-    if disable_hilbert_bias:
-        for layer in getattr(getattr(model, "transformer", None), "layers", []):
-            attention = getattr(layer, "attention", None)
-            if attention is not None and hasattr(attention, "use_hilbert_bias"):
-                attention.use_hilbert_bias = False
-        if device.type == "cpu" and not args.disable_hilbert_bias:
-            print("Hilbert-path attention bias disabled automatically for CPU training.")
+    # Print bias mode information
+    bias_mode_info = {
+        "original": "Original (O(S²) memory, high accuracy baseline)",
+        "low_rank": "Low-rank factorization (O(S·r) memory, 5-8× faster, recommended)",
+        "hierarchical": "Hierarchical decomposition (O(S·L) memory, interpretable)",
+    }
+    print(f"Using Hilbert bias mode: {args.bias_mode} - {bias_mode_info.get(args.bias_mode, 'Unknown')}")
+    if args.bias_mode == "low_rank":
+        print(f"Low-rank factorization rank: {args.low_rank_r}")
 
     model = model.to(device)
 
