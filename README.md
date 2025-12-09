@@ -72,10 +72,10 @@ The project includes a robust training script located at `examples/training/trai
 
 ```bash
 # CIFAR-10 (auto-downloads)
-python examples/training/train_fractal_vit.py --dataset cifar10 --epochs 50 --batch-size 64
+uv run python examples/training/train_fractal_vit.py --dataset cifar10 --epochs 50 --batch-size 64
 
 # Tiny ImageNet (auto-downloads ~237 MB)
-python examples/training/train_fractal_vit.py --dataset tiny-imagenet --quick-test
+uv run python examples/training/train_fractal_vit.py --dataset tiny-imagenet --quick-test
 ```
 
 **Note:** Datasets like CIFAR-10, CIFAR-100, MNIST, and Tiny ImageNet are automatically downloaded to `workspace/data/` on first use. Large datasets (ImageNet, COCO) require manual download.
@@ -129,7 +129,7 @@ The project includes comprehensive benchmarking tools to evaluate model performa
 Benchmark forward/backward pass timing and tokenization analysis:
 
 ```bash
-python -m tests.benchmarks.benchmark_fractal_vit
+uv run python -m tests.benchmarks.benchmark_fractal_vit
 ```
 
 **Key Metrics:**
@@ -145,7 +145,7 @@ python -m tests.benchmarks.benchmark_fractal_vit
 Analyze training convergence on synthetic classification tasks:
 
 ```bash
-python -m tests.benchmarks.check_convergence \
+uv run python -m tests.benchmarks.check_convergence \
   --output-dir benchmark_results \
   --image-size 32 \
   --num-epochs 20 \
@@ -178,7 +178,7 @@ python -m tests.benchmarks.check_convergence \
 Compare FractalViT variants against standard patch-based ViT:
 
 ```bash
-python -m tests.benchmarks.compare_fractal_vs_standard \
+uv run python -m tests.benchmarks.compare_fractal_vs_standard \
   --output-dir benchmark_results \
   --image-size 64 \
   --num-epochs 20 \
@@ -208,7 +208,7 @@ python -m tests.benchmarks.compare_fractal_vs_standard \
 Evaluate trained `.pth` checkpoints with comprehensive metrics and visualizations:
 
 ```bash
-python -m tests.benchmarks.evaluate_pretrained \
+uv run python -m tests.benchmarks.evaluate_pretrained \
   --checkpoint experiments/fractal_vit_simple_20251208/checkpoints/best.pth \
   --visualize \
   --num-samples 500 \
@@ -242,16 +242,30 @@ python -m tests.benchmarks.evaluate_pretrained \
 
 ```bash
 # Evaluate your best model
-python -m tests.benchmarks.evaluate_pretrained \
+uv run python -m tests.benchmarks.evaluate_pretrained \
   -c experiments/fractal_vit_simple_20251208_222817/checkpoints/best.pth \
   --visualize
 
 # Quick evaluation on subset
-python -m tests.benchmarks.evaluate_pretrained \
+uv run python -m tests.benchmarks.evaluate_pretrained \
   -c workspace/models/fractal_vit/fractal_vit_simple_best.pth \
   --num-samples 100 \
   -o quick_eval
 ```
+
+### 5. CNN Ablation Study
+
+Evaluate the impact of using CNN features for split decisions versus using only handcrafted features.
+
+```bash
+uv run python tests/benchmarks/benchmark_cnn_ablation.py --dataset cifar10 --epochs 20
+```
+
+**Arguments:**
+- `--dataset`: Dataset to use (`cifar10`, `tiny-imagenet`).
+- `--epochs`: Number of training epochs.
+- `--batch-size`: Batch size (default: 64).
+- `--use-cnn`: Enable CNN features (default: False in benchmark to test baseline).
 
 ## Testing
 

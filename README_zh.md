@@ -72,10 +72,10 @@ logits = model(img) # (1, 1000)
 
 ```bash
 # CIFAR-10（自动下载）
-python examples/training/train_fractal_vit.py --dataset cifar10 --epochs 50 --batch-size 64
+uv run python examples/training/train_fractal_vit.py --dataset cifar10 --epochs 50 --batch-size 64
 
 # Tiny ImageNet（自动下载 ~237 MB）
-python examples/training/train_fractal_vit.py --dataset tiny-imagenet --quick-test
+uv run python examples/training/train_fractal_vit.py --dataset tiny-imagenet --quick-test
 ```
 
 **注意：** CIFAR-10、CIFAR-100、MNIST 和 Tiny ImageNet 等数据集在首次使用时会自动下载到 `workspace/data/`。大型数据集（ImageNet、COCO）需要手动下载。
@@ -129,7 +129,7 @@ python examples/training/train_fractal_vit.py --dataset tiny-imagenet --quick-te
 测试前向/反向传播时间和分词分析：
 
 ```bash
-python -m tests.benchmarks.benchmark_fractal_vit
+uv run python -m tests.benchmarks.benchmark_fractal_vit
 ```
 
 **关键指标：**
@@ -145,7 +145,7 @@ python -m tests.benchmarks.benchmark_fractal_vit
 在合成分类任务上分析训练收敛性：
 
 ```bash
-python -m tests.benchmarks.check_convergence \
+uv run python -m tests.benchmarks.check_convergence \
   --output-dir benchmark_results \
   --image-size 32 \
   --num-epochs 20 \
@@ -242,16 +242,30 @@ python -m tests.benchmarks.evaluate_pretrained \
 
 ```bash
 # 评估最佳模型
-python -m tests.benchmarks.evaluate_pretrained \
+uv run python -m tests.benchmarks.evaluate_pretrained \
   -c experiments/fractal_vit_simple_20251208_222817/checkpoints/best.pth \
   --visualize
 
 # 在子集上快速评估
-python -m tests.benchmarks.evaluate_pretrained \
+uv run python -m tests.benchmarks.evaluate_pretrained \
   -c workspace/models/fractal_vit/fractal_vit_simple_best.pth \
   --num-samples 100 \
   -o quick_eval
 ```
+
+### 5. CNN 消融实验 (CNN Ablation Study)
+
+评估使用 CNN 特征进行分割决策与仅使用手工特征相比的影响。
+
+```bash
+uv run python tests/benchmarks/benchmark_cnn_ablation.py --dataset cifar10 --epochs 20
+```
+
+**参数:**
+- `--dataset`: 使用的数据集 (`cifar10`, `tiny-imagenet`)。
+- `--epochs`: 训练轮数。
+- `--batch-size`: 批次大小 (默认: 64)。
+- `--use-cnn`: 启用 CNN 特征 (基准测试中默认为 False 以测试基线)。
 
 ## 测试 (Testing)
 
