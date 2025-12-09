@@ -1006,8 +1006,6 @@ def build_model(args: argparse.Namespace, spec: DatasetSpec) -> nn.Module:
             "emb_dropout",
             "min_patch_size",
             "max_level",
-            "bias_mode",
-            "low_rank_r",
         }
         simple_kwargs = {k: v for k, v in model_kwargs.items() if k in simple_keys}
         simple_kwargs["pool"] = args.pool
