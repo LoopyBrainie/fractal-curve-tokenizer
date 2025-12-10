@@ -11,6 +11,10 @@ os.environ.setdefault('CUDA_LAUNCH_BLOCKING', '0')
 os.environ.setdefault('OMP_NUM_THREADS', '2')
 os.environ.setdefault('MKL_NUM_THREADS', '2')
 
+# torch.compile 优化配置：减少 recompilation 警告
+os.environ.setdefault('TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS', '1')
+os.environ.setdefault('TORCH_COMPILE_DISABLE', '0')
+
 import argparse
 import json
 import multiprocessing
@@ -1565,8 +1569,14 @@ def main() -> None:
     compiled_model = None
     if hasattr(torch, 'compile') and device.type == 'cuda' and not args.quick_test:
         try:
+            # 配置 torch._dynamo 以减少重编译警告
+            if hasattr(torch, '_dynamo') and hasattr(torch._dynamo, 'config'):
+                torch._dynamo.config.cache_size_limit = 64  # 默认 8，增加到 64
+                torch._dynamo.config.suppress_errors = False  # 显示完整错误
+            
             compiled_model = torch.compile(model, mode="reduce-overhead")
             print("Model compiled with torch.compile(mode='reduce-overhead')")
+            print("  torch._dynamo.config.cache_size_limit = 64 (reduces recompilation)")
         except Exception as e:
             print(f"torch.compile() failed, using eager mode: {e}")
             compiled_model = None
