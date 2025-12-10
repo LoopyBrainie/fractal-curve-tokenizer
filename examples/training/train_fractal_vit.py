@@ -49,7 +49,26 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from vit_pytorch.fractal_vit import NextGenerationFractalViT, SimpleFractalViT
+from vit_pytorch.fractal_vit import NextGenerationFractalViT
+
+import multiprocessing
+
+# ============================================================================
+# DataLoader 优化配置
+# ============================================================================
+
+def get_optimal_num_workers() -> int:
+    """获取最优的 worker 数量。"""
+    cpu_count = multiprocessing.cpu_count()
+    # 通常使用 CPU 核心数的一半到全部，但不超过 8
+    return min(max(2, cpu_count // 2), 8)
+
+
+def worker_init_fn(worker_id: int) -> None:
+    """DataLoader worker 初始化函数，确保每个 worker 有不同的随机种子。"""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 # ============================================================================
@@ -738,24 +757,24 @@ def create_dataloaders(
 
     train_transform, test_transform = build_transforms(spec)
     
-    # Helper for creating loaders
+    # Helper for creating loaders with optimized settings
+    use_persistent_workers = num_workers > 0
+    prefetch = 2 if num_workers > 0 else None
+    
     def make_loader(dataset: Dataset, sampler_indices: np.ndarray, shuffle: bool = False) -> DataLoader:
+        common_kwargs = {
+            "batch_size": batch_size,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+            "persistent_workers": use_persistent_workers,
+            "prefetch_factor": prefetch,
+            "worker_init_fn": worker_init_fn if num_workers > 0 else None,
+            "drop_last": False,
+        }
         if shuffle:
-            return DataLoader(
-                dataset,
-                batch_size=batch_size,
-                shuffle=True,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-            )
+            return DataLoader(dataset, shuffle=True, **common_kwargs)
         sampler = SubsetRandomSampler(sampler_indices.tolist())
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-        )
+        return DataLoader(dataset, sampler=sampler, **common_kwargs)
 
     if spec.name == "Caltech256":
         # Caltech256 does not have a standard train/test split. We perform a random split.
@@ -851,14 +870,22 @@ Alternatively, use a different dataset like CIFAR-10 or CIFAR-100:
         # Tiny ImageNet 'test' set has no labels, so we use 'val' set for testing as well
         test_dataset = val_dataset 
         
-        # Create loaders
+        # Create loaders with optimized settings
         # Note: Tiny ImageNet Val is already a separate split, so we don't need to split train_dataset
         # unless user wants to carve out a validation set from train.
         # Standard practice: Train on 'train', Evaluate on 'val'.
+        loader_kwargs = {
+            "batch_size": batch_size,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+            "persistent_workers": num_workers > 0,
+            "prefetch_factor": 2 if num_workers > 0 else None,
+            "worker_init_fn": worker_init_fn if num_workers > 0 else None,
+        }
         
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+        train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+        val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+        test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
         
         print(f"Loaded {spec.name} → train: {len(train_dataset)}, val: {len(val_dataset)}, test: {len(test_dataset)}")
         return train_loader, val_loader, test_loader
@@ -989,56 +1016,37 @@ def _get_bias_mode_description(mode: str) -> str:
 
 
 def build_model(args: argparse.Namespace, spec: DatasetSpec) -> nn.Module:
-    model_kwargs = {
-        "image_size": max(spec.image_size, 32),
-        "num_classes": spec.num_classes,
-        "dim": args.dim,
-        "depth": args.depth,
-        "heads": args.heads,
-        "mlp_dim": args.dim * 2,
-        "channels": spec.channels,
-        "dropout": args.dropout,
-        "emb_dropout": args.emb_dropout,
-        "min_patch_size": (4, 4),
-        "max_level": args.max_level,
-    }
+    """构建 NextGenerationFractalViT 模型。
     
-    # bias_mode 和 low_rank_r 是注意力模块的内部参数，不需要在顶层传递
-    # 它们已经在 HilbertAwareMultiScaleAttention 中使用默认值
-    if hasattr(args, 'bias_mode'):
-        print(f"Using Hilbert bias mode: {args.bias_mode} - {_get_bias_mode_description(args.bias_mode)}")
-    if hasattr(args, 'low_rank_r'):
-        print(f"Low-rank factorization rank: {args.low_rank_r}")
+    注意: SimpleFractalViT 已被移除，所有训练都使用 NextGenerationFractalViT。
+    --use-simple 参数已废弃但仍被接受以保持向后兼容。
+    """
+    # 警告已废弃的参数
+    if getattr(args, 'use_simple', False):
+        print("⚠️  Warning: --use-simple is deprecated and will be ignored.")
+        print("   All training now uses NextGenerationFractalViT.")
     
-    if args.use_simple:
-        simple_keys = {
-            "image_size",
-            "num_classes",
-            "dim",
-            "depth",
-            "heads",
-            "mlp_dim",
-            "channels",
-            "dropout",
-            "emb_dropout",
-            "min_patch_size",
-            "max_level",
-        }
-        simple_kwargs = {k: v for k, v in model_kwargs.items() if k in simple_keys}
-        simple_kwargs["pool"] = args.pool
-        simple_kwargs["dim_head"] = args.dim_head
-        model = SimpleFractalViT(**simple_kwargs)
-    else:
-        model = NextGenerationFractalViT(
-            **model_kwargs,
-            pool=args.pool,
-            dim_head=args.dim_head,
-            learnable_split=not args.no_learnable_split,
-        )
+    model = NextGenerationFractalViT(
+        image_size=max(spec.image_size, 32),
+        num_classes=spec.num_classes,
+        dim=args.dim,
+        depth=args.depth,
+        heads=args.heads,
+        mlp_dim=args.dim * 2,
+        pool=args.pool,
+        channels=spec.channels,
+        dim_head=args.dim_head,
+        dropout=args.dropout,
+        emb_dropout=args.emb_dropout,
+        min_patch_size=(4, 4),
+        max_level=args.max_level,
+        learnable_split=not args.no_learnable_split,
+    )
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: total={total_params:,}, trainable={trainable_params:,}")
+    print(f"Model: NextGenerationFractalViT")
+    print(f"Parameters: total={total_params:,}, trainable={trainable_params:,}")
     return model
 
 
@@ -1331,13 +1339,19 @@ def plot_tokenization_analysis(
 
 
 def main() -> None:
-    # Set multiprocessing start method to 'spawn' for better compatibility with DataLoader workers
-    # This is especially important on Windows and when using multiple workers
+    # =========================================================================
+    # Multiprocessing 配置
+    # =========================================================================
+    # 在 Windows 和 CUDA 环境下，使用 'spawn' 方法以确保:
+    # 1. CUDA 上下文不会被 fork 到子进程（会导致错误）
+    # 2. 全局状态正确初始化
+    # 3. DataLoader workers 正常工作
     try:
-        multiprocessing.set_start_method('spawn', force=True)
+        # 只在未设置时设置，避免重复设置错误
+        if multiprocessing.get_start_method(allow_none=True) is None:
+            multiprocessing.set_start_method('spawn')
     except RuntimeError:
-        # Start method has already been set
-        pass
+        pass  # 已经设置过了
     
     parser = argparse.ArgumentParser(description="Quick Fractal ViT trainer")
     parser.add_argument("--epochs", type=int, default=50)
@@ -1356,12 +1370,12 @@ def main() -> None:
     parser.add_argument("--emb-dropout", type=float, default=0.1)
     parser.add_argument("--max-level", type=int, default=4)
     parser.add_argument("--pool", choices=["cls", "mean"], default="cls")
-    parser.add_argument("--use-simple", action="store_true")
+    parser.add_argument("--use-simple", action="store_true", help="[DEPRECATED] Ignored, always uses NextGenerationFractalViT")
     parser.add_argument("--no-learnable-split", action="store_true")
     parser.add_argument("--quick-test", action="store_true")
     parser.add_argument("--use-amp", action="store_true")
     parser.add_argument("--gradient-clip", type=float, default=1.0)
-    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=-1, help="Number of DataLoader workers. -1 for auto-detect.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--bias-mode",
@@ -1375,11 +1389,7 @@ def main() -> None:
         default=32,
         help="Rank for low-rank Hilbert bias factorization (only used when --bias-mode=low_rank).",
     )
-    parser.add_argument(
-        "--force-next-gen",
-        action="store_true",
-        help="Keep NextGeneration model even on CPU (may be very slow).",
-    )
+    # --force-next-gen 已移除，现在始终使用 NextGenerationFractalViT
     parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda"],
@@ -1390,25 +1400,33 @@ def main() -> None:
 
     set_seed(args.seed)
 
+    # 自动检测最优 worker 数量
+    if args.num_workers < 0:
+        args.num_workers = get_optimal_num_workers()
+        print(f"Auto-detected num_workers: {args.num_workers}")
+
     if args.quick_test:
         if args.epochs == parser.get_default("epochs"):
             args.epochs = 5
         if args.subset_size is None:
             args.subset_size = 512
+        # quick-test 模式下减少 workers 以加快启动
+        args.num_workers = min(args.num_workers, 2)
         print("Quick-test mode: epochs capped and subset sampling enabled")
 
     device = resolve_device(args.device)
 
     spec = get_dataset_spec(args.dataset)
-    paths = prepare_experiment_paths("fractal_vit_simple")
+    paths = prepare_experiment_paths("fractal_vit")
 
-    if device.type == "cpu" and not args.use_simple and not args.force_next_gen:
-        print("CPU detected; switching to SimpleFractalViT with lighter configuration for faster training.")
-        args.use_simple = True
-        args.dim = min(args.dim, 128)
-        args.depth = min(args.depth, 4)
-        args.heads = min(args.heads, 4)
+    # CPU 模式下自动降低模型复杂度以加速训练
+    if device.type == "cpu":
+        print("CPU detected; reducing model complexity for faster training.")
+        args.dim = min(args.dim, 192)
+        args.depth = min(args.depth, 6)
+        args.heads = min(args.heads, 6)
         args.dim_head = min(args.dim_head, 32)
+        print(f"  Adjusted: dim={args.dim}, depth={args.depth}, heads={args.heads}")
 
     model = build_model(args, spec)
 
