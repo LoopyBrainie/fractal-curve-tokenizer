@@ -3,10 +3,19 @@
 
 from __future__ import annotations
 
+# 必须在导入其他模块之前设置这些环境变量
+import os
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:512')
+os.environ.setdefault('CUDA_LAUNCH_BLOCKING', '0')
+# 减少 OpenMP 线程数以避免 CPU 过载
+os.environ.setdefault('OMP_NUM_THREADS', '2')
+os.environ.setdefault('MKL_NUM_THREADS', '2')
+
 import argparse
 import json
 import multiprocessing
 import random
+import signal
 import shutil
 import sys
 import time
@@ -57,18 +66,75 @@ import multiprocessing
 # DataLoader 优化配置
 # ============================================================================
 
+def _diagnose_dataloader_config(num_workers: int, batch_size: int) -> None:
+    """诊断并提供 DataLoader 配置建议。"""
+    try:
+        import psutil
+    except ImportError:
+        # psutil 不是必需的依赖
+        return
+    
+    # 检测共享内存大小
+    try:
+        shm_stats = psutil.disk_usage('/dev/shm')
+        shm_gb = shm_stats.total / (1024**3)
+        shm_free_gb = shm_stats.free / (1024**3)
+        
+        print(f"\n📊 DataLoader Configuration:")
+        print(f"  Workers: {num_workers}")
+        print(f"  Batch size: {batch_size}")
+        print(f"  Shared memory: {shm_gb:.1f}GB total, {shm_free_gb:.1f}GB free")
+        
+        # 估算内存需求
+        # 每个 worker 大约需要 batch_size * image_size * channels * sizeof(float32) 的内存
+        estimated_mb_per_worker = batch_size * 64 * 64 * 3 * 4 / (1024**2) * 2  # *2 for prefetch
+        total_estimated_mb = estimated_mb_per_worker * num_workers
+        
+        print(f"  Estimated memory per worker: ~{estimated_mb_per_worker:.0f}MB")
+        print(f"  Total estimated: ~{total_estimated_mb:.0f}MB")
+        
+        # 提供建议
+        if total_estimated_mb > shm_free_gb * 1024 * 0.8:
+            print(f"  ⚠️  WARNING: Workers may exceed shared memory!")
+            recommended = max(1, int(shm_free_gb * 1024 * 0.8 / estimated_mb_per_worker))
+            print(f"  💡 Recommended: --num-workers {recommended}")
+        elif num_workers > 8 and shm_gb < 4:
+            print(f"  ⚠️  WARNING: High worker count with limited shared memory")
+            print(f"  💡 Consider: --num-workers 4-8 for --shm-size=4g")
+        else:
+            print(f"  ✓ Configuration looks good")
+        
+        print()
+    except Exception:
+        # psutil 可能不可用或在某些环境下失败
+        pass
+
+
 def get_optimal_num_workers() -> int:
-    """获取最优的 worker 数量。"""
+    """获取最优的 worker 数量。
+    
+    考虑因素:
+    - CPU 核心数
+    - 共享内存大小（容器环境重要）
+    - 系统类型（容器 vs 本地）
+    
+    容器建议:
+    - --shm-size=4g: 推荐 4-8 workers
+    - --shm-size=8g: 推荐 8-12 workers
+    - 不足 2g: 推荐 0-2 workers
+    """
     cpu_count = multiprocessing.cpu_count()
-    # 通常使用 CPU 核心数的一半到全部，但不超过 8
-    return min(max(2, cpu_count // 2), 8)
-
-
-def worker_init_fn(worker_id: int) -> None:
-    """DataLoader worker 初始化函数，确保每个 worker 有不同的随机种子。"""
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
+    
+    # 检测是否在容器中（通过 /.dockerenv 或 cgroup）
+    in_container = os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv')
+    
+    if in_container:
+        # 容器环境：更保守的设置
+        # 共享内存通常是瓶颈，不是 CPU
+        return min(max(2, cpu_count // 3), 8)
+    else:
+        # 本地环境：可以更激进
+        return min(max(2, cpu_count // 2), 8)
 
 
 # ============================================================================
@@ -768,7 +834,6 @@ def create_dataloaders(
             "pin_memory": pin_memory,
             "persistent_workers": use_persistent_workers,
             "prefetch_factor": prefetch,
-            "worker_init_fn": worker_init_fn if num_workers > 0 else None,
             "drop_last": False,
         }
         if shuffle:
@@ -880,7 +945,6 @@ Alternatively, use a different dataset like CIFAR-10 or CIFAR-100:
             "pin_memory": pin_memory,
             "persistent_workers": num_workers > 0,
             "prefetch_factor": 2 if num_workers > 0 else None,
-            "worker_init_fn": worker_init_fn if num_workers > 0 else None,
         }
         
         train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
@@ -1060,12 +1124,14 @@ def train_one_epoch(
     scaler: GradScalerType,
     gradient_clip: float,
     baseline_ema: Optional[float] = None,
+    accum_steps: int = 1,
 ) -> Tuple[float, float, float]:
     """
     训练一个 epoch
     
     Args:
         baseline_ema: REINFORCE 基线的指数移动平均值，用于减少方差
+        accum_steps: P1 优化 - 梯度累积步数，用于模拟更大 batch size
     
     Returns:
         (avg_loss, accuracy, updated_baseline_ema)
@@ -1081,11 +1147,14 @@ def train_one_epoch(
         baseline_ema = 0.0
     ema_decay = 0.99  # EMA 衰减系数
 
-    for data, target in progress:
+    for step, (data, target) in enumerate(progress):
         data = data.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
+        # P1 优化：梯度累积 - 仅在累积周期开始时清零
+        if step % accum_steps == 0:
+            optimizer.zero_grad(set_to_none=True)
+        
         with autocast_context(device, scaler.is_enabled()):
             output = model(data)
             if isinstance(output, tuple):
@@ -1113,33 +1182,46 @@ def train_one_epoch(
                 if hasattr(model, "clear_tokenizer_cache"):
                     model.clear_tokenizer_cache()
             
-            loss = ce_loss + aux_loss
+            # P1 优化：梯度累积 - 损失除以累积步数
+            loss = (ce_loss + aux_loss) / accum_steps
 
         if scaler.is_enabled():
             scaler.scale(loss).backward()
-            if gradient_clip > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            # P1 优化：仅在累积周期结束时更新
+            if (step + 1) % accum_steps == 0 or (step + 1) == len(loader):
+                if gradient_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                scaler.step(optimizer)
+                scaler.update()
         else:
             loss.backward()
-            if gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
-            optimizer.step()
+            # P1 优化：仅在累积周期结束时更新
+            if (step + 1) % accum_steps == 0 or (step + 1) == len(loader):
+                if gradient_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                optimizer.step()
 
-        running_loss += loss.item()
+        # 记录未缩放的损失用于监控
+        running_loss += loss.item() * accum_steps
         preds = output.argmax(dim=1)
         correct += preds.eq(target).sum().item()
         total += target.size(0)
-        progress.set_postfix(loss=f"{loss.item():.4f}", acc=f"{100.0 * correct / max(total, 1):.1f}%")
+        progress.set_postfix(loss=f"{loss.item() * accum_steps:.4f}", acc=f"{100.0 * correct / max(total, 1):.1f}%")
 
     avg_loss = running_loss / max(len(loader), 1)
     accuracy = 100.0 * correct / max(total, 1)
     return avg_loss, accuracy, baseline_ema
 
 
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, desc: str) -> Tuple[float, float]:
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    desc: str,
+    use_amp: bool = False,
+) -> Tuple[float, float]:
+    """P1 优化：评估阶段支持 AMP，加速 20-30%"""
     model.eval()
     running_loss = 0.0
     correct = 0
@@ -1149,10 +1231,14 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, desc: s
         for data, target in tqdm(loader, desc=desc, leave=False):
             data = data.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
-            output = model(data)
-            if isinstance(output, tuple):
-                output = output[0]
-            loss = F.cross_entropy(output, target)
+            
+            # P1 优化：评估时也使用 AMP
+            with autocast_context(device, use_amp):
+                output = model(data)
+                if isinstance(output, tuple):
+                    output = output[0]
+                loss = F.cross_entropy(output, target)
+            
             running_loss += loss.item()
             preds = output.argmax(dim=1)
             correct += preds.eq(target).sum().item()
@@ -1342,14 +1428,17 @@ def main() -> None:
     # =========================================================================
     # Multiprocessing 配置
     # =========================================================================
-    # 在 Windows 和 CUDA 环境下，使用 'spawn' 方法以确保:
-    # 1. CUDA 上下文不会被 fork 到子进程（会导致错误）
-    # 2. 全局状态正确初始化
-    # 3. DataLoader workers 正常工作
+    # 配置 multiprocessing 启动方法:
+    # - Windows: 必须使用 'spawn'
+    # - Linux/Mac: 优先使用 'fork'（更快），在 CUDA 环境下使用 'spawn'
     try:
-        # 只在未设置时设置，避免重复设置错误
-        if multiprocessing.get_start_method(allow_none=True) is None:
-            multiprocessing.set_start_method('spawn')
+        current_method = multiprocessing.get_start_method(allow_none=True)
+        if current_method is None:
+            # 在 Linux 上，fork 比 spawn 快得多，且更稳定
+            if sys.platform == 'linux' and not torch.cuda.is_available():
+                multiprocessing.set_start_method('fork')
+            else:
+                multiprocessing.set_start_method('spawn')
     except RuntimeError:
         pass  # 已经设置过了
     
@@ -1375,6 +1464,7 @@ def main() -> None:
     parser.add_argument("--quick-test", action="store_true")
     parser.add_argument("--use-amp", action="store_true")
     parser.add_argument("--gradient-clip", type=float, default=1.0)
+    parser.add_argument("--accum-steps", type=int, default=1, help="Gradient accumulation steps for larger effective batch size")
     parser.add_argument("--num-workers", type=int, default=-1, help="Number of DataLoader workers. -1 for auto-detect.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -1404,17 +1494,30 @@ def main() -> None:
     if args.num_workers < 0:
         args.num_workers = get_optimal_num_workers()
         print(f"Auto-detected num_workers: {args.num_workers}")
+    
+    # 诊断 DataLoader 配置
+    if args.num_workers > 0:
+        _diagnose_dataloader_config(args.num_workers, args.batch_size)
 
     if args.quick_test:
         if args.epochs == parser.get_default("epochs"):
             args.epochs = 5
         if args.subset_size is None:
             args.subset_size = 512
-        # quick-test 模式下减少 workers 以加快启动
-        args.num_workers = min(args.num_workers, 2)
-        print("Quick-test mode: epochs capped and subset sampling enabled")
+        # quick-test 模式下使用单线程以避免 multiprocessing 问题
+        args.num_workers = 0
+        print("Quick-test mode: epochs capped, subset sampling enabled, single-threaded loading")
 
     device = resolve_device(args.device)
+
+    # P0 优化：启用 cuDNN benchmark 模式（固定输入尺寸时加速 5-15%）
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
+        # 可选：启用 TF32 以获得更快的矩阵运算（Ampere+ GPU）
+        if hasattr(torch.backends.cuda, 'matmul'):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        print("CUDA optimizations enabled: cudnn.benchmark=True, TF32=True")
 
     spec = get_dataset_spec(args.dataset)
     paths = prepare_experiment_paths("fractal_vit")
@@ -1441,6 +1544,21 @@ def main() -> None:
         print(f"Low-rank factorization rank: {args.low_rank_r}")
 
     model = model.to(device)
+
+    # P0 优化：torch.compile() 加速（PyTorch 2.0+，预期 15-40% 加速）
+    # 注意：compiled_model 用于前向传播，原始 model 用于保存状态等
+    compiled_model = None
+    if hasattr(torch, 'compile') and device.type == 'cuda' and not args.quick_test:
+        try:
+            compiled_model = torch.compile(model, mode="reduce-overhead")
+            print("Model compiled with torch.compile(mode='reduce-overhead')")
+        except Exception as e:
+            print(f"torch.compile() failed, using eager mode: {e}")
+            compiled_model = None
+    
+    # 使用编译模型进行训练（如果可用）
+    # type: ignore 用于抑制 torch.compile 返回类型的静态分析警告
+    train_model: nn.Module = compiled_model if compiled_model is not None else model  # type: ignore[assignment]
 
     # Generate detailed config
     detailed_config = get_detailed_config(args, model, device)
@@ -1483,29 +1601,32 @@ def main() -> None:
     monitor_interval = max(1, args.epochs // 10)  # 每 10% 的 epochs 监控一次
 
     start_time = time.time()
+    interrupted = False  # 跟踪是否被中断
     
     # 训练前分析初始 tokenization 特性
     print("\n=== 训练前 Tokenization 分析 ===")
-    initial_analysis = analyze_adaptive_tokenization(model, val_loader, device, num_samples=50)
+    initial_analysis = analyze_adaptive_tokenization(train_model, val_loader, device, num_samples=50)
     print(f"简单图像 tokens: {initial_analysis.get('simple_image_tokens', 'N/A')}")
     print(f"复杂图像 tokens: {initial_analysis.get('complex_image_tokens', 'N/A')}")
     print(f"自适应性: {'[YES]' if initial_analysis.get('is_adaptive') else '[NO]'}")
     print(f"自适应比率: {initial_analysis.get('adaptivity_ratio', 0):.2f}x")
     print()
     
-    for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc, baseline_ema = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            device,
-            epoch,
-            args.epochs,
+    try:
+        for epoch in range(1, args.epochs + 1):
+            train_loss, train_acc, baseline_ema = train_one_epoch(
+                train_model,
+                train_loader,
+                optimizer,
+                device,
+                epoch,
+                args.epochs,
             scaler,
             args.gradient_clip,
             baseline_ema=baseline_ema,
+            accum_steps=args.accum_steps,
         )
-        val_loss, val_acc = evaluate(model, val_loader, device, desc="val")
+        val_loss, val_acc = evaluate(train_model, val_loader, device, desc="val", use_amp=args.use_amp)
         scheduler.step()
         current_lr = optimizer.param_groups[0]["lr"]
 
@@ -1524,7 +1645,7 @@ def main() -> None:
         if epoch % monitor_interval == 0 or epoch == 1:
             # 在验证集上采样分析
             sample_batch = next(iter(val_loader))[0].to(device)
-            stats = token_monitor.analyze_batch(model, sample_batch, epoch)
+            stats = token_monitor.analyze_batch(train_model, sample_batch, epoch)
             print(f"  [Token Monitor] avg={stats.avg_tokens_per_image:.1f}, "
                   f"range=[{stats.min_tokens}-{stats.max_tokens}], "
                   f"levels={stats.levels_used}")
@@ -1542,15 +1663,72 @@ def main() -> None:
             save_best_checkpoint(paths, best_state)
             print(f"New best validation accuracy: {best_val_acc:.2f}% (epoch {epoch})")
 
+    except KeyboardInterrupt:
+        # =========================================================================
+        # 优雅中断处理：Ctrl+C 时保存当前状态
+        # =========================================================================
+        interrupted = True
+        elapsed = time.time() - start_time
+        print("\n" + "=" * 70)
+        print("⚠️  训练被中断 (Ctrl+C)")
+        print("=" * 70)
+        print("正在保存当前训练状态...")
+        
+        # 保存中断时的检查点
+        interrupt_checkpoint = {
+            "epoch": len(history["train_loss"]),
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "val_acc": best_val_acc,
+            "args": vars(args),
+            "interrupted": True,
+        }
+        interrupt_path = paths.checkpoints_dir / "interrupted.pth"
+        torch.save(interrupt_checkpoint, interrupt_path)
+        print(f"  ✓ 中断检查点已保存: {interrupt_path}")
+        
+        # 保存训练历史
+        if history["train_loss"]:
+            summary = {
+                "best_val_acc": best_val_acc,
+                "test_acc": None,  # 未完成测试
+                "epochs_ran": len(history["train_loss"]),
+                "elapsed_seconds": elapsed,
+                "interrupted": True,
+                "tokenization_analysis": {
+                    "initial": initial_analysis,
+                    "final": None,
+                },
+            }
+            save_history(paths, detailed_config, history, summary)
+            print(f"  ✓ 训练历史已保存")
+            
+            # 尝试绘制曲线
+            try:
+                plot_curves(paths, history)
+                print(f"  ✓ 训练曲线已保存")
+            except Exception:
+                pass
+        
+        print(f"\n训练统计:")
+        print(f"  已完成 epochs: {len(history['train_loss'])}/{args.epochs}")
+        print(f"  最佳验证准确率: {best_val_acc:.2f}%")
+        print(f"  已用时间: {elapsed:.1f}s")
+        print(f"  实验目录: {paths.experiment_dir}")
+        print("\n要恢复训练，请从检查点加载模型状态。")
+        print("=" * 70)
+        sys.exit(0)
+
     elapsed = time.time() - start_time
     if best_state is not None:
         model.load_state_dict(best_state["model"])  # type: ignore[arg-type]
 
-    test_loss, test_acc = evaluate(model, test_loader, device, desc="test")
+    test_loss, test_acc = evaluate(train_model, test_loader, device, desc="test", use_amp=args.use_amp)
     
     # 训练后分析 tokenization 特性
     print("\n=== 训练后 Tokenization 分析 ===")
-    final_analysis = analyze_adaptive_tokenization(model, val_loader, device, num_samples=50)
+    final_analysis = analyze_adaptive_tokenization(train_model, val_loader, device, num_samples=50)
     print(f"简单图像 tokens: {final_analysis.get('simple_image_tokens', 'N/A')}")
     print(f"复杂图像 tokens: {final_analysis.get('complex_image_tokens', 'N/A')}")
     print(f"真实图像 tokens: 均值={final_analysis.get('real_image_tokens_mean', 0):.1f}, "
@@ -1589,4 +1767,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # 对于使用 spawn 的 multiprocessing，必须有 __main__ 保护
+    # 这可以防止在 worker 进程中重新执行主代码
+    multiprocessing.freeze_support()  # Windows 支持
     main()
