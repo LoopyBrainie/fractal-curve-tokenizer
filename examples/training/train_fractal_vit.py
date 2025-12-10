@@ -825,7 +825,8 @@ def create_dataloaders(
     
     # Helper for creating loaders with optimized settings
     use_persistent_workers = num_workers > 0
-    prefetch = 2 if num_workers > 0 else None
+    # 提高 prefetch_factor 以保持 GPU 饱和
+    prefetch = 4 if num_workers > 0 else None
     
     def make_loader(dataset: Dataset, sampler_indices: np.ndarray, shuffle: bool = False) -> DataLoader:
         common_kwargs = {
@@ -835,6 +836,8 @@ def create_dataloaders(
             "persistent_workers": use_persistent_workers,
             "prefetch_factor": prefetch,
             "drop_last": False,
+            # 显式设置 spawn：避免 CUDA context 继承问题，支持跨平台
+            "multiprocessing_context": 'spawn' if num_workers > 0 else None,
         }
         if shuffle:
             return DataLoader(dataset, shuffle=True, **common_kwargs)
@@ -944,7 +947,9 @@ Alternatively, use a different dataset like CIFAR-10 or CIFAR-100:
             "num_workers": num_workers,
             "pin_memory": pin_memory,
             "persistent_workers": num_workers > 0,
-            "prefetch_factor": 2 if num_workers > 0 else None,
+            "prefetch_factor": 4 if num_workers > 0 else None,
+            "drop_last": False,
+            "multiprocessing_context": 'spawn' if num_workers > 0 else None,
         }
         
         train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
@@ -1426,21 +1431,31 @@ def plot_tokenization_analysis(
 
 def main() -> None:
     # =========================================================================
-    # Multiprocessing 配置
+    # Multiprocessing 配置（关键：避免数据瓶颈）
     # =========================================================================
-    # 配置 multiprocessing 启动方法:
-    # - Windows: 必须使用 'spawn'
-    # - Linux/Mac: 优先使用 'fork'（更快），在 CUDA 环境下使用 'spawn'
+    # 策略：
+    # 1. CUDA 环境: 强制 'spawn' (避免 CUDA context 继承导致 GPU 空转/abort)
+    # 2. CPU 环境: Linux 用 'fork' (快 3-5x), Windows 自动 'spawn'
+    # 3. DataLoader 会显式设置 multiprocessing_context='spawn' 作为双保险
     try:
         current_method = multiprocessing.get_start_method(allow_none=True)
         if current_method is None:
-            # 在 Linux 上，fork 比 spawn 快得多，且更稳定
-            if sys.platform == 'linux' and not torch.cuda.is_available():
-                multiprocessing.set_start_method('fork')
-            else:
+            if sys.platform == 'linux':
+                # Linux 环境根据 CUDA 可用性选择
+                if torch.cuda.is_available():
+                    multiprocessing.set_start_method('spawn')
+                    print("✓ Using 'spawn' multiprocessing (CUDA safe - prevents context inheritance)")
+                else:
+                    multiprocessing.set_start_method('fork')
+                    print("✓ Using 'fork' multiprocessing (CPU mode - 3-5x faster)")
+            elif sys.platform == 'win32':
+                # Windows 必须使用 spawn（唯一支持的方式）
                 multiprocessing.set_start_method('spawn')
+                print("✓ Using 'spawn' multiprocessing (Windows)")
     except RuntimeError:
-        pass  # 已经设置过了
+        # 已经设置过，获取当前方法并显示
+        current = multiprocessing.get_start_method()
+        print(f"✓ Using existing multiprocessing method: '{current}'")
     
     parser = argparse.ArgumentParser(description="Quick Fractal ViT trainer")
     parser.add_argument("--epochs", type=int, default=50)
