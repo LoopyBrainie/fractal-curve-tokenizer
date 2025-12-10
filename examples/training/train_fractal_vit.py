@@ -5,7 +5,18 @@ from __future__ import annotations
 
 # 必须在导入其他模块之前设置这些环境变量
 import os
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:512')
+import sys
+
+# 从命令行参数读取 max_split_size_mb（如果提供）
+_max_split_mb = 512
+for i, arg in enumerate(sys.argv):
+    if arg == '--max-split-size-mb' and i + 1 < len(sys.argv):
+        try:
+            _max_split_mb = int(sys.argv[i + 1])
+        except ValueError:
+            pass
+
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', f'max_split_size_mb:{_max_split_mb}')
 os.environ.setdefault('CUDA_LAUNCH_BLOCKING', '0')
 # 减少 OpenMP 线程数以避免 CPU 过载
 os.environ.setdefault('OMP_NUM_THREADS', '2')
@@ -1485,6 +1496,8 @@ def main() -> None:
     parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--accum-steps", type=int, default=1, help="Gradient accumulation steps for larger effective batch size")
     parser.add_argument("--num-workers", type=int, default=-1, help="Number of DataLoader workers. -1 for auto-detect.")
+    parser.add_argument("--use-gradient-checkpointing", action="store_true", help="Enable gradient checkpointing (saves 30-50%% memory, ~10%% slower)")
+    parser.add_argument("--max-split-size-mb", type=int, default=512, help="CUDA memory allocator max split size (MB). Lower = less fragmentation, slower.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--bias-mode",
@@ -1537,6 +1550,11 @@ def main() -> None:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
         print("CUDA optimizations enabled: cudnn.benchmark=True, TF32=True")
+        
+        # 内存优化：清空 CUDA 缓存，减少碎片
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print("✓ CUDA cache cleared")
 
     spec = get_dataset_spec(args.dataset)
     paths = prepare_experiment_paths("fractal_vit")
@@ -1563,6 +1581,17 @@ def main() -> None:
         print(f"Low-rank factorization rank: {args.low_rank_r}")
 
     model = model.to(device)
+    
+    # 内存优化：启用梯度检查点（减少 30-50% 激活值内存，代价：~10% 训练速度）
+    if args.use_gradient_checkpointing:
+        if hasattr(model, 'gradient_checkpointing_enable'):
+            model.gradient_checkpointing_enable()
+            print("✓ Gradient checkpointing enabled (saves 30-50% activation memory)")
+        elif hasattr(model, 'set_grad_checkpointing'):
+            model.set_grad_checkpointing(True)
+            print("✓ Gradient checkpointing enabled (saves 30-50% activation memory)")
+        else:
+            print("⚠️  Warning: Model does not support gradient checkpointing")
 
     # P0 优化：torch.compile() 加速（PyTorch 2.0+，预期 15-40% 加速）
     # 注意：compiled_model 用于前向传播，原始 model 用于保存状态等
