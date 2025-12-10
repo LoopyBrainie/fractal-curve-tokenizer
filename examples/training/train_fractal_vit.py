@@ -16,7 +16,9 @@ for i, arg in enumerate(sys.argv):
         except ValueError:
             pass
 
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', f'max_split_size_mb:{_max_split_mb}')
+# CUDA 内存管理优化：解决碎片化和 OOM 问题
+cuda_alloc_conf = f'max_split_size_mb:{_max_split_mb},expandable_segments:True'
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', cuda_alloc_conf)
 os.environ.setdefault('CUDA_LAUNCH_BLOCKING', '0')
 # 减少 OpenMP 线程数以避免 CPU 过载
 os.environ.setdefault('OMP_NUM_THREADS', '2')
@@ -494,14 +496,32 @@ class ExperimentPaths:
     timestamp: str
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+def aggressive_memory_cleanup():
+    """激进的内存清理：解决 CUDA OOM 问题"""
+    import gc
+    import torch
+
+    try:
+        # 1. 强制垃圾回收
+        gc.collect()
+
+        # 2. 清空 CUDA 缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()  # 等待所有 CUDA 操作完成
+
+        # 3. 清理未使用的显存块
+        if hasattr(torch.cuda, 'memory_summary'):
+            summary = torch.cuda.memory_summary()
+            print("CUDA Memory Summary:")
+            print(f"  Allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+            print(f"  Reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+            print(f"  Free: {(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_reserved()) / 1024**3:.2f} GB")
+
+        print("✓ Aggressive memory cleanup completed")
+
+    except Exception as e:
+        print(f"⚠️  Memory cleanup warning: {e}")
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -1555,6 +1575,12 @@ def main() -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             print("✓ CUDA cache cleared")
+
+    # ============================================================================
+    # 内存优化：激进清理（解决 CUDA OOM 问题）
+    # ============================================================================
+    if device.type == 'cuda':
+        aggressive_memory_cleanup()
 
     spec = get_dataset_spec(args.dataset)
     paths = prepare_experiment_paths("fractal_vit")
