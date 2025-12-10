@@ -100,16 +100,46 @@ uv run python examples/training/train_fractal_vit.py --dataset tiny-imagenet --q
 | `--emb-dropout` | float | `0.1` | 嵌入层 Dropout 比率。 |
 | `--max-level` | int | `4` | 分形分词的最大递归层级。 |
 | `--pool` | str | `cls` | 池化方法: `cls` 或 `mean`。 |
-| `--use-simple` | flag | `False` | 使用 `SimpleFractalViT` 而不是 `NextGenerationFractalViT`。 |
+| `--use-simple` | flag | `False` | **[已废弃]** 已忽略，始终使用 `NextGenerationFractalViT`。 |
 | `--no-learnable-split` | flag | `False` | 禁用可学习的分割决策网络（使用启发式规则）。 |
 | `--quick-test` | flag | `False` | 在小数据集上运行快速的 5 轮测试。 |
 | `--use-amp` | flag | `False` | 启用自动混合精度 (AMP) 训练。 |
 | `--gradient-clip` | float | `1.0` | 梯度裁剪阈值。 |
-| `--num-workers` | int | `2` | 数据加载工作线程数。 |
+| `--accum-steps` | int | `1` | **[新增]** 梯度累积步数，用于实现更大的有效 batch size。 |
+| `--num-workers` | int | `-1` | 数据加载工作线程数。`-1` 表示自动检测。 |
 | `--seed` | int | `42` | 随机种子。 |
-| `--disable-hilbert-bias` | flag | `False` | 禁用希尔伯特路径注意力偏置（CPU 上更快）。 |
-| `--force-next-gen` | flag | `False` | 即使在 CPU 上也强制使用 `NextGenerationFractalViT`。 |
+| `--bias-mode` | str | `low_rank` | 希尔伯特偏置模式: `original`, `low_rank`, `hierarchical`。 |
+| `--low-rank-r` | int | `32` | 低秩希尔伯特偏置分解的秩。 |
 | `--device` | str | `auto` | 使用的设备: `auto`, `cpu`, `cuda`。 |
+
+#### 训练优化 (v2.0)
+
+训练脚本包含多项性能优化：
+
+| 优化项 | 说明 | 预期加速 |
+|--------|------|----------|
+| `torch.compile()` | PyTorch 2.0+ JIT 编译（仅 CUDA） | 15-40% |
+| `cudnn.benchmark` | cuDNN 自动调优器（固定输入尺寸） | 5-15% |
+| TF32 启用 | Ampere+ GPU 的 TensorFloat-32 | 5-10% |
+| 评估阶段 AMP | 验证/测试时使用混合精度 | 20-30% 推理 |
+| `set_to_none=True` | 更快的梯度清零 | 1-3% |
+| `pin_memory` + `non_blocking` | 异步 CPU-GPU 数据传输 | 可变 |
+| 优雅中断 | Ctrl+C 在退出前保存检查点 | - |
+
+**梯度累积示例：**
+
+```bash
+# 模拟 batch size 256，使用有限 GPU 内存 (64 x 4 = 256)
+uv run python examples/training/train_fractal_vit.py \
+    --batch-size 64 --accum-steps 4 --use-amp
+```
+
+**容器环境 (Docker/Podman)：**
+
+```bash
+# 推荐用于 --shm-size=4g 容器
+python train_fractal_vit.py --num-workers 8 --use-amp
+```
 
 #### 输出 (Output)
 

@@ -100,16 +100,46 @@ uv run python examples/training/train_fractal_vit.py --dataset tiny-imagenet --q
 | `--emb-dropout` | float | `0.1` | Embedding dropout rate. |
 | `--max-level` | int | `4` | Maximum recursion level for fractal tokenization. |
 | `--pool` | str | `cls` | Pooling method: `cls` or `mean`. |
-| `--use-simple` | flag | `False` | Use `SimpleFractalViT` instead of `NextGenerationFractalViT`. |
+| `--use-simple` | flag | `False` | **[DEPRECATED]** Ignored, always uses `NextGenerationFractalViT`. |
 | `--no-learnable-split` | flag | `False` | Disable the learnable split decision network (use heuristic). |
 | `--quick-test` | flag | `False` | Run a quick 5-epoch test on a small subset. |
 | `--use-amp` | flag | `False` | Enable Automatic Mixed Precision (AMP) training. |
 | `--gradient-clip` | float | `1.0` | Gradient clipping value. |
-| `--num-workers` | int | `2` | Number of data loading workers. |
+| `--accum-steps` | int | `1` | **[NEW]** Gradient accumulation steps for larger effective batch size. |
+| `--num-workers` | int | `-1` | Number of data loading workers. `-1` for auto-detect. |
 | `--seed` | int | `42` | Random seed for reproducibility. |
-| `--disable-hilbert-bias` | flag | `False` | Disable Hilbert-path attention bias (faster on CPU). |
-| `--force-next-gen` | flag | `False` | Force using `NextGenerationFractalViT` even on CPU. |
+| `--bias-mode` | str | `low_rank` | Hilbert bias mode: `original`, `low_rank`, `hierarchical`. |
+| `--low-rank-r` | int | `32` | Rank for low-rank Hilbert bias factorization. |
 | `--device` | str | `auto` | Device to use: `auto`, `cpu`, `cuda`. |
+
+#### Training Optimizations (v2.0)
+
+The training script includes several performance optimizations:
+
+| Optimization | Description | Expected Speedup |
+|-------------|-------------|------------------|
+| `torch.compile()` | PyTorch 2.0+ JIT compilation (CUDA only) | 15-40% |
+| `cudnn.benchmark` | cuDNN auto-tuner for fixed input sizes | 5-15% |
+| TF32 enabled | TensorFloat-32 for Ampere+ GPUs | 5-10% |
+| Evaluation AMP | Mixed precision during validation/test | 20-30% inference |
+| `set_to_none=True` | Faster gradient zeroing | 1-3% |
+| `pin_memory` + `non_blocking` | Async CPU-GPU data transfer | Variable |
+| Graceful interruption | Ctrl+C saves checkpoint before exit | - |
+
+**Gradient Accumulation Example:**
+
+```bash
+# Simulate batch size 256 with limited GPU memory (64 x 4 = 256)
+uv run python examples/training/train_fractal_vit.py \
+    --batch-size 64 --accum-steps 4 --use-amp
+```
+
+**Container Environment (Docker/Podman):**
+
+```bash
+# Recommended for --shm-size=4g containers
+python train_fractal_vit.py --num-workers 8 --use-amp
+```
 
 #### Output
 
