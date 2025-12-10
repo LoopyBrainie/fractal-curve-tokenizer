@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 import random
 import shutil
 import sys
@@ -1330,6 +1331,14 @@ def plot_tokenization_analysis(
 
 
 def main() -> None:
+    # Set multiprocessing start method to 'spawn' for better compatibility with DataLoader workers
+    # This is especially important on Windows and when using multiple workers
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # Start method has already been set
+        pass
+    
     parser = argparse.ArgumentParser(description="Quick Fractal ViT trainer")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
