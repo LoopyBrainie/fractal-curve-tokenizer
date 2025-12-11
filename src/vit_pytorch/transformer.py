@@ -13,6 +13,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +199,8 @@ class EnhancedFractalTransformer(nn.Module):
     adding global context attention and level aggregation for enhanced
     hierarchical processing.
     
+    Supports gradient checkpointing for memory-efficient training.
+    
     Args:
         dim: Input/output dimension.
         depth: Number of transformer blocks.
@@ -208,6 +211,7 @@ class EnhancedFractalTransformer(nn.Module):
         max_level: Maximum hierarchical level.
         drop_path_rate: Maximum DropPath rate (linearly increased).
         ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
+        use_checkpoint: Whether to use gradient checkpointing (saves memory).
     """
 
     def __init__(
@@ -221,12 +225,14 @@ class EnhancedFractalTransformer(nn.Module):
         max_level: int = 50,
         drop_path_rate: float = 0.1,
         ffn_type: FFNType = 'swiglu_level',
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         self.dim = dim
         self.depth = depth
         self.max_level = max_level
         self.ffn_type = ffn_type
+        self.use_checkpoint = use_checkpoint
 
         # Stochastic depth decay rule
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
@@ -283,7 +289,11 @@ class EnhancedFractalTransformer(nn.Module):
             layer_weights = self.depth_selector(pooled)
 
         for i, layer in enumerate(self.layers):
-            x = layer(x, levels_info, attention_mask)
+            if self.use_checkpoint and self.training:
+                # Gradient checkpointing: 重新计算激活值以节省显存
+                x = checkpoint(layer, x, levels_info, attention_mask, use_reentrant=False)
+            else:
+                x = layer(x, levels_info, attention_mask)
 
             if layer_weights is not None:
                 weight = layer_weights[:, i : i + 1].unsqueeze(-1)
