@@ -19,7 +19,7 @@ from .fractal_curve_tokenizer import FractalHilbertTokenizer
 from .positional import AdvancedFractalPositionEmbedding
 from .token_processor import EnhancedFractalTokenProcessor
 from .tokenization import BaseTokenProcessor, BaseTokenizer, TokenSequence, TokenizerOutput
-from .transformer import EnhancedFractalTransformer
+from .transformer import EnhancedFractalTransformer, FFNType
 from .utils import create_attention_mask, pair
 
 
@@ -69,6 +69,7 @@ class NextGenerationFractalViT(nn.Module):
         use_spatial_encoding: bool = True,
         use_feature_enhancement: bool = True,
         use_dynamic_depth: bool = False,
+        ffn_type: FFNType = 'swiglu_level',
         tokenizer: Optional[BaseTokenizer] = None,
         token_processor: Optional[BaseTokenProcessor] = None,
         position_embedding: Optional[AdvancedFractalPositionEmbedding] = None,
@@ -95,6 +96,7 @@ class NextGenerationFractalViT(nn.Module):
             use_spatial_encoding: 是否使用空间编码
             use_feature_enhancement: 是否使用特征增强
             use_dynamic_depth: 是否使用动态深度
+            ffn_type: FFN 变体 ('gelu', 'swiglu', 'swiglu_level')
             tokenizer: 自定义 tokenizer（可选）
             token_processor: 自定义 token 处理器（可选）
             position_embedding: 自定义位置编码（可选）
@@ -107,6 +109,7 @@ class NextGenerationFractalViT(nn.Module):
         self.pool = pool
         self.max_level = max_level
         self.use_dynamic_depth = use_dynamic_depth
+        self.ffn_type = ffn_type
 
         if tokenizer is None:
             tokenizer = FractalHilbertTokenizer(
@@ -163,6 +166,7 @@ class NextGenerationFractalViT(nn.Module):
             mlp_dim=mlp_dim,
             dropout=dropout,
             max_level=max_level,
+            ffn_type=ffn_type,
         )
 
         # 分类头

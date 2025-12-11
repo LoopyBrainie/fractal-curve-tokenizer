@@ -1,5 +1,5 @@
 from .attention import HilbertAwareMultiScaleAttention
-from .feedforward import AdaptiveFractalFeedForward
+from .feedforward import AdaptiveFractalFeedForward, FFNType, SwiGLUFFN
 from .fractal_curve_tokenizer import FractalHilbertTokenizer
 from .fractal_vit import (
     NextGenerationFractalViT,
@@ -18,6 +18,7 @@ __all__ = [
     "BaseTokenProcessor",
     "BaseTokenizer",
     "extract_depths",
+    "FFNType",
     "FractalHilbertTokenizer",
     "EnhancedFractalTokenProcessor",
     "EnhancedFractalTransformer",
@@ -28,6 +29,7 @@ __all__ = [
     "xy_to_hilbert_distance",
     "NextGenerationFractalViT",
     "normalize_levels_info",
+    "SwiGLUFFN",
     "HilbertAwareMultiScaleAttention",
     "SimpleFractalViT",
     "TokenSequence",
