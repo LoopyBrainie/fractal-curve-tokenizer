@@ -7,6 +7,12 @@
 - Shared Memory: 8GB
 - CPU Workers: 12 available
 
+**Dataset Setup:**
+Tiny ImageNet will be **automatically downloaded** (~237 MB) on first run. The script will:
+1. Download `tiny-imagenet-200.zip` from Stanford
+2. Extract and organize the dataset structure
+3. Reorganize validation set for PyTorch ImageFolder compatibility
+
 **Recommended Configuration:**
 
 ```bash
