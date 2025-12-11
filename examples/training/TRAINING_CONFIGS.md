@@ -147,3 +147,50 @@ CUDA: True
 GPU: NVIDIA GeForce RTX 4070 Laptop GPU
 Compute: (8, 9)  # Ampere architecture
 ```
+
+---
+
+## Troubleshooting
+
+### Tiny ImageNet Download Issues
+
+**Problem: "File is not a zip file" or corrupted download**
+
+Solution:
+```bash
+# Remove corrupted files
+rm -f /app/data/tiny-imagenet-200.zip
+rm -rf /app/data/tiny-imagenet-200
+
+# Re-run training (will automatically re-download)
+uv run python examples/training/train_fractal_vit.py --dataset tiny-imagenet ...
+```
+
+The script now automatically:
+- Validates file size before extraction
+- Tests zip file integrity
+- Removes corrupted files and re-downloads
+- Shows extraction progress
+
+**Problem: Out of Memory (OOM) during training**
+
+Solutions:
+```bash
+# Option 1: Reduce batch size
+--batch-size 64 --accum-steps 2  # Effective batch = 128
+
+# Option 2: Reduce model size
+--dim 192 --depth 8
+
+# Option 3: Reduce workers
+--num-workers 4
+```
+
+**Problem: Training too slow**
+
+Checklist:
+- ✅ Is `--use-amp` enabled?
+- ✅ Is GPU utilization >90%? (check with `nvidia-smi`)
+- ✅ Are you using `--num-workers 8`?
+- ✅ Is laptop plugged in and on high-performance mode?
+- ✅ Check for thermal throttling (GPU temp should be <85°C)
