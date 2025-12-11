@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 from .attention import HilbertAwareMultiScaleAttention
 from .constants import GLOBAL_CONTEXT_SCALE
-from .feedforward import AdaptiveFractalFeedForward
+from .feedforward import AdaptiveFractalFeedForward, FFNType
 from .utils import extract_depths
 
 
@@ -63,9 +63,20 @@ class EnhancedFractalTransformerBlock(nn.Module):
         dropout: Dropout rate.
         max_level: Maximum hierarchical level.
         drop_path: DropPath rate for stochastic depth.
+        ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
     """
 
-    def __init__(self, dim: int, heads: int, dim_head: int, mlp_dim: int, dropout: float = 0.0, max_level: int = 50, drop_path: float = 0.0):
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        dim_head: int,
+        mlp_dim: int,
+        dropout: float = 0.0,
+        max_level: int = 50,
+        drop_path: float = 0.0,
+        ffn_type: FFNType = 'swiglu_level',
+    ):
         super().__init__()
         self.dim = dim
         self.max_level = max_level
@@ -78,7 +89,13 @@ class EnhancedFractalTransformerBlock(nn.Module):
             max_level=max_level,
         )
 
-        self.ff = AdaptiveFractalFeedForward(dim=dim, hidden_dim=mlp_dim, dropout=dropout, max_level=max_level)
+        self.ff = AdaptiveFractalFeedForward(
+            dim=dim,
+            hidden_dim=mlp_dim,
+            dropout=dropout,
+            max_level=max_level,
+            ffn_type=ffn_type,
+        )
 
         self.residual_weights = nn.Parameter(torch.ones(2))
         
@@ -190,6 +207,7 @@ class EnhancedFractalTransformer(nn.Module):
         dropout: Dropout rate.
         max_level: Maximum hierarchical level.
         drop_path_rate: Maximum DropPath rate (linearly increased).
+        ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
     """
 
     def __init__(
@@ -202,11 +220,13 @@ class EnhancedFractalTransformer(nn.Module):
         dropout: float = 0.0,
         max_level: int = 50,
         drop_path_rate: float = 0.1,
+        ffn_type: FFNType = 'swiglu_level',
     ):
         super().__init__()
         self.dim = dim
         self.depth = depth
         self.max_level = max_level
+        self.ffn_type = ffn_type
 
         # Stochastic depth decay rule
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
@@ -221,6 +241,7 @@ class EnhancedFractalTransformer(nn.Module):
                     dropout=dropout,
                     max_level=max_level,
                     drop_path=dpr[i],
+                    ffn_type=ffn_type,
                 )
                 for i in range(depth)
             ]

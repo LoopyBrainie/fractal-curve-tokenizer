@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union
 
@@ -42,6 +43,11 @@ class PatchInfo:
 class MiniCNN(nn.Module):
     """轻量级CNN特征提取器，用于分割决策。
     
+    .. deprecated:: 0.3.0
+        MiniCNN 已废弃，消融实验表明其增加训练开销 45% 但无准确率收益。
+        建议使用 `use_cnn=False`（默认值），仅使用 6 维手工特征进行分割决策。
+        此类将在 v1.0 中移除。
+    
     将输入 patch 通过两层卷积和全局池化转换为固定维度的特征向量。
     
     Args:
@@ -56,6 +62,12 @@ class MiniCNN(nn.Module):
         hidden_dim: int = 16,
         out_dim: int = 32,
     ) -> None:
+        warnings.warn(
+            "MiniCNN 已废弃，消融实验表明其增加训练开销 45% 但无准确率收益。"
+            "建议使用 use_cnn=False（默认值）。此类将在 v1.0 中移除。",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         super().__init__()
         self.net = nn.Sequential(
             nn.InstanceNorm2d(in_channels), # 归一化输入，防止数值过大
@@ -177,8 +189,15 @@ class FractalHilbertTokenizer(BaseTokenizer):
         self.use_cnn = use_cnn
 
         if learnable_split:
-            # CNN 特征提取器（可选）
+            # CNN 特征提取器（已废弃，默认禁用）
             if use_cnn:
+                warnings.warn(
+                    "use_cnn=True 已废弃。消融实验表明 CNN 特征增加 45% 训练开销但无准确率收益，"
+                    "且降低 Token 自适应性（范围从 60 降至 33）。建议使用 use_cnn=False（默认值）。"
+                    "此参数将在 v1.0 中移除。",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
                 self.cnn_encoder: Optional[MiniCNN] = MiniCNN(in_channels=channels, hidden_dim=16, out_dim=32)
                 cnn_dim = 32
             else:
