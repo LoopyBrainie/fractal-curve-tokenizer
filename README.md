@@ -66,89 +66,146 @@ logits = model(img) # (1, 1000)
 
 ### Training
 
-The project includes a robust training script located at `examples/training/train_fractal_vit.py`. This script supports training on CIFAR-10, CIFAR-100, and MNIST.
+The project includes a comprehensive training script at `examples/training/train_fractal_vit.py` with support for multiple datasets and advanced training features.
 
-#### Basic Training Command
+#### Quick Start
 
 ```bash
-# CIFAR-10 (auto-downloads)
-uv run python examples/training/train_fractal_vit.py --dataset cifar10 --epochs 50 --batch-size 64
+# CIFAR-10 with default settings
+uv run python examples/training/train_fractal_vit.py --dataset cifar10 --epochs 50
 
-# Tiny ImageNet (auto-downloads ~237 MB)
-uv run python examples/training/train_fractal_vit.py --dataset tiny-imagenet --quick-test
+# Tiny ImageNet with SwiGLU FFN (recommended)
+uv run python examples/training/train_fractal_vit.py \
+    --dataset tiny-imagenet \
+    --ffn-type swiglu_level \
+    --epochs 100 \
+    --warmup-epochs 10
+
+# Quick test (5 epochs, 512 samples)
+uv run python examples/training/train_fractal_vit.py --quick-test --use-amp
 ```
 
-**Note:** Datasets like CIFAR-10, CIFAR-100, MNIST, and Tiny ImageNet are automatically downloaded to `workspace/data/` on first use. Large datasets (ImageNet, COCO) require manual download.
+#### FFN Architecture Selection
 
-#### Full Argument List
+The training script supports three Feed-Forward Network variants:
+
+| FFN Type | Parameters | Speed | Recommendation |
+|----------|-----------|-------|----------------|
+| `gelu` | 379K | Baseline | Legacy/baseline only |
+| `swiglu` | 334K (-11.9%) | Fast | Lightweight tasks |
+| `swiglu_level` | 357K (-5.8%) | Medium | **Default, best balance** |
+
+**Example:**
+```bash
+# Use SwiGLU + Level Adaptation (default)
+uv run python examples/training/train_fractal_vit.py --ffn-type swiglu_level
+
+# Use lightweight SwiGLU
+uv run python examples/training/train_fractal_vit.py --ffn-type swiglu
+```
+
+#### Supported Datasets
+
+| Dataset | Auto-Download | Classes | Image Size | Notes |
+|---------|--------------|---------|------------|-------|
+| `cifar10` | ✅ | 10 | 32×32 | Default dataset |
+| `cifar100` | ✅ | 100 | 32×32 | More challenging |
+| `mnist` | ✅ | 10 | 28×28 | Grayscale digits |
+| `tiny-imagenet` | ❌ Manual | 200 | 64×64 | Requires download |
+
+**Tiny ImageNet Setup:**
+```bash
+# Download and extract manually
+cd data
+wget http://cs231n.stanford.edu/tiny-imagenet-200.zip
+unzip tiny-imagenet-200.zip
+# Expected structure:
+# data/tiny-imagenet-200/train/n01443537/images/*.JPEG
+# data/tiny-imagenet-200/val/images/*.JPEG
+```
+
+#### Key Training Parameters
 
 | Argument | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `--dataset` | str | `cifar10` | Dataset to use: `cifar10`, `cifar100`, `mnist`, `imagenet`, `coco`, `caltech256`, `tiny-imagenet`. |
-| `--data-root` | str | `workspace/data` | Path to the root directory of the dataset. Auto-created for supported datasets. |
-| `--epochs` | int | `50` | Number of training epochs. |
-| `--batch-size` | int | `64` | Batch size for training. |
-| `--lr` | float | `5e-4` | Initial learning rate. |
-| `--weight-decay` | float | `0.01` | Weight decay for optimizer. |
-| `--val-split` | float | `0.1` | Fraction of training data to use for validation. |
-| `--subset-size` | int | `None` | Limit the number of training samples (for debugging). |
-| `--dim` | int | `192` | Model embedding dimension. |
-| `--depth` | int | `8` | Depth of the Transformer. |
-| `--heads` | int | `8` | Number of attention heads. |
-| `--dim-head` | int | `32` | Dimension of each attention head. |
-| `--dropout` | float | `0.1` | Dropout rate. |
-| `--emb-dropout` | float | `0.1` | Embedding dropout rate. |
-| `--max-level` | int | `4` | Maximum recursion level for fractal tokenization. |
-| `--pool` | str | `cls` | Pooling method: `cls` or `mean`. |
-| `--use-simple` | flag | `False` | **[DEPRECATED]** Ignored, always uses `NextGenerationFractalViT`. |
-| `--no-learnable-split` | flag | `False` | Disable the learnable split decision network (use heuristic). |
-| `--quick-test` | flag | `False` | Run a quick 5-epoch test on a small subset. |
-| `--use-amp` | flag | `False` | Enable Automatic Mixed Precision (AMP) training. |
-| `--gradient-clip` | float | `1.0` | Gradient clipping value. |
-| `--accum-steps` | int | `1` | **[NEW]** Gradient accumulation steps for larger effective batch size. |
-| `--num-workers` | int | `-1` | Number of data loading workers. `-1` for auto-detect. |
-| `--seed` | int | `42` | Random seed for reproducibility. |
-| `--bias-mode` | str | `low_rank` | Hilbert bias mode: `original`, `low_rank`, `hierarchical`. |
-| `--low-rank-r` | int | `32` | Rank for low-rank Hilbert bias factorization. |
-| `--device` | str | `auto` | Device to use: `auto`, `cpu`, `cuda`. |
+| `--dataset` | str | `cifar10` | Dataset: `cifar10`, `cifar100`, `mnist`, `tiny-imagenet` |
+| `--epochs` | int | `50` | Number of training epochs |
+| `--batch-size` | int | `64` | Training batch size |
+| `--lr` | float | `5e-4` | Initial learning rate |
+| `--warmup-epochs` | int | `10` | **[NEW]** Number of warmup epochs |
+| `--weight-decay` | float | `0.01` | Weight decay (L2 regularization) |
+| `--val-split` | float | `0.1` | Validation split ratio |
+| `--dim` | int | `192` | Model embedding dimension |
+| `--depth` | int | `8` | Transformer depth (layers) |
+| `--heads` | int | `8` | Number of attention heads |
+| `--dim-head` | int | `32` | Dimension per attention head |
+| `--max-level` | int | `4` | Maximum fractal recursion level |
+| `--ffn-type` | str | `swiglu_level` | **[NEW]** FFN type: `gelu`, `swiglu`, `swiglu_level` |
+| `--pool` | str | `cls` | Pooling method: `cls` or `mean` |
+| `--dropout` | float | `0.1` | Dropout rate |
+| `--gradient-clip` | float | `1.0` | Gradient clipping value |
+| `--use-amp` | flag | `False` | Enable mixed precision training |
+| `--accum-steps` | int | `1` | Gradient accumulation steps |
+| `--num-workers` | int | `4` | Data loading workers |
+| `--no-learnable-split` | flag | `False` | Disable learnable tokenization |
+| `--quick-test` | flag | `False` | Quick 5-epoch test on 512 samples |
 
-#### Training Optimizations (v2.0)
+#### Performance Optimizations
 
-The training script includes several performance optimizations:
+The training script includes automatic performance enhancements:
 
-| Optimization | Description | Expected Speedup |
-|-------------|-------------|------------------|
-| `torch.compile()` | PyTorch 2.0+ JIT compilation (CUDA only) | 15-40% |
-| `cudnn.benchmark` | cuDNN auto-tuner for fixed input sizes | 5-15% |
-| TF32 enabled | TensorFloat-32 for Ampere+ GPUs | 5-10% |
-| Evaluation AMP | Mixed precision during validation/test | 20-30% inference |
-| `set_to_none=True` | Faster gradient zeroing | 1-3% |
-| `pin_memory` + `non_blocking` | Async CPU-GPU data transfer | Variable |
-| Graceful interruption | Ctrl+C saves checkpoint before exit | - |
+| Optimization | Auto-Enabled | Expected Speedup | Requirements |
+|-------------|--------------|------------------|--------------|
+| TF32 Acceleration | ✅ CUDA | ~8× matmul speed | Ampere+ GPU (RTX 30/40) |
+| cuDNN Benchmark | ✅ CUDA | 5-15% | Fixed input sizes |
+| Spawn Multiprocessing | ✅ Always | Stability | CUDA compatibility |
+| Persistent Workers | ✅ Always | Faster epochs | num_workers > 0 |
+| Mixed Precision (AMP) | ⚙️ `--use-amp` | 20-40% | Modern GPU |
+| Gradient Accumulation | ⚙️ `--accum-steps` | Larger batch | Limited VRAM |
 
-**Gradient Accumulation Example:**
-
+**Example: Maximum Performance**
 ```bash
-# Simulate batch size 256 with limited GPU memory (64 x 4 = 256)
+# RTX 3090/4090 optimal settings
 uv run python examples/training/train_fractal_vit.py \
-    --batch-size 64 --accum-steps 4 --use-amp
+    --dataset cifar100 \
+    --ffn-type swiglu_level \
+    --batch-size 128 \
+    --use-amp \
+    --num-workers 4 \
+    --warmup-epochs 10
 ```
 
-**Container Environment (Docker/Podman):**
-
+**Example: Limited VRAM**
 ```bash
-# Recommended for --shm-size=4g containers
-python train_fractal_vit.py --num-workers 8 --use-amp
+# Simulate batch size 256 with 8GB VRAM
+uv run python examples/training/train_fractal_vit.py \
+    --batch-size 64 \
+    --accum-steps 4 \
+    --use-amp
 ```
 
-#### Output
+#### Training Output
 
-Training artifacts are saved in the `experiments/` directory, organized by timestamp:
+Training artifacts are automatically saved in `experiments/` directory, organized by timestamp:
 
-* `checkpoints/`: Saved model weights (`best.pth`).
-* `logs/`: Training logs.
-* `visualizations/`: Loss and accuracy curves.
-* `training_history.json`: Detailed metrics for every epoch.
+```
+experiments/
+└── fractal_vit_20251211_142110/
+    ├── checkpoints/
+    │   └── best.pth              # Best model weights
+    ├── logs/
+    │   ├── config.json           # Training configuration
+    │   ├── metrics.json          # Per-epoch metrics
+    │   └── final.json            # Final results + tokenization analysis
+    └── visualizations/           # (Optional) Visualization plots
+```
+
+**Detailed logs include:**
+* Train/validation loss and accuracy per epoch
+* Learning rate schedule
+* Token count statistics and adaptivity analysis
+* Variance-token correlation assessment
+* GPU information and training time
 
 ## Benchmarking
 

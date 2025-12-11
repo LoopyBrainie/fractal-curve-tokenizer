@@ -66,87 +66,146 @@ logits = model(img) # (1, 1000)
 
 ### 训练 (Training)
 
-本项目包含一个位于 `examples/training/train_fractal_vit.py` 的健壮训练脚本。该脚本支持在 CIFAR-10, CIFAR-100 和 MNIST 上进行训练。
+项目包含功能完善的训练脚本 `examples/training/train_fractal_vit.py`，支持多种数据集和高级训练特性。
 
-#### 基础训练命令
+#### 快速开始
 
 ```bash
-# CIFAR-10（自动下载）
-uv run python examples/training/train_fractal_vit.py --dataset cifar10 --epochs 50 --batch-size 64
+# CIFAR-10 默认设置
+uv run python examples/training/train_fractal_vit.py --dataset cifar10 --epochs 50
 
-# Tiny ImageNet（自动下载 ~237 MB）
-uv run python examples/training/train_fractal_vit.py --dataset tiny-imagenet --quick-test
+# Tiny ImageNet 使用 SwiGLU FFN（推荐）
+uv run python examples/training/train_fractal_vit.py \
+    --dataset tiny-imagenet \
+    --ffn-type swiglu_level \
+    --epochs 100 \
+    --warmup-epochs 10
+
+# 快速测试（5轮，512样本）
+uv run python examples/training/train_fractal_vit.py --quick-test --use-amp
 ```
 
-**注意：** CIFAR-10、CIFAR-100、MNIST 和 Tiny ImageNet 等数据集在首次使用时会自动下载到 `workspace/data/`。大型数据集（ImageNet、COCO）需要手动下载。
+#### FFN 架构选择
 
-#### 完整参数列表 (Full Argument List)
+训练脚本支持三种前馈网络变体：
+
+| FFN 类型 | 参数量 | 速度 | 推荐场景 |
+|----------|--------|------|----------|
+| `gelu` | 379K | 基准 | 仅用于基准对比 |
+| `swiglu` | 334K (-11.9%) | 快 | 轻量级任务 |
+| `swiglu_level` | 357K (-5.8%) | 中等 | **默认，最佳平衡** |
+
+**示例：**
+```bash
+# 使用 SwiGLU + Level Adaptation（默认）
+uv run python examples/training/train_fractal_vit.py --ffn-type swiglu_level
+
+# 使用轻量级 SwiGLU
+uv run python examples/training/train_fractal_vit.py --ffn-type swiglu
+```
+
+#### 支持的数据集
+
+| 数据集 | 自动下载 | 类别数 | 图像尺寸 | 备注 |
+|--------|---------|--------|---------|------|
+| `cifar10` | ✅ | 10 | 32×32 | 默认数据集 |
+| `cifar100` | ✅ | 100 | 32×32 | 更具挑战性 |
+| `mnist` | ✅ | 10 | 28×28 | 灰度数字 |
+| `tiny-imagenet` | ❌ 手动 | 200 | 64×64 | 需要下载 |
+
+**Tiny ImageNet 设置：**
+```bash
+# 手动下载和解压
+cd data
+wget http://cs231n.stanford.edu/tiny-imagenet-200.zip
+unzip tiny-imagenet-200.zip
+# 预期目录结构：
+# data/tiny-imagenet-200/train/n01443537/images/*.JPEG
+# data/tiny-imagenet-200/val/images/*.JPEG
+```
+
+#### 关键训练参数
 
 | 参数 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `--dataset` | str | `cifar10` | 使用的数据集: `cifar10`, `cifar100`, `mnist`, `imagenet`, `coco`, `caltech256`, `tiny-imagenet`。 |
-| `--data-root` | str | `workspace/data` | 数据集根目录路径。支持的数据集会自动创建此目录。 |
-| `--epochs` | int | `50` | 训练轮数。 |
-| `--batch-size` | int | `64` | 训练批次大小。 |
-| `--lr` | float | `5e-4` | 初始学习率。 |
-| `--weight-decay` | float | `0.01` | 优化器权重衰减。 |
-| `--val-split` | float | `0.1` | 用于验证的训练数据比例。 |
-| `--subset-size` | int | `None` | 限制训练样本数量（用于调试）。 |
-| `--dim` | int | `192` | 模型嵌入维度。 |
-| `--depth` | int | `8` | Transformer 深度。 |
-| `--heads` | int | `8` | 注意力头数。 |
-| `--dim-head` | int | `32` | 每个注意力头的维度。 |
-| `--dropout` | float | `0.1` | Dropout 比率。 |
-| `--emb-dropout` | float | `0.1` | 嵌入层 Dropout 比率。 |
-| `--max-level` | int | `4` | 分形分词的最大递归层级。 |
-| `--pool` | str | `cls` | 池化方法: `cls` 或 `mean`。 |
-| `--use-simple` | flag | `False` | **[已废弃]** 已忽略，始终使用 `NextGenerationFractalViT`。 |
-| `--no-learnable-split` | flag | `False` | 禁用可学习的分割决策网络（使用启发式规则）。 |
-| `--quick-test` | flag | `False` | 在小数据集上运行快速的 5 轮测试。 |
-| `--use-amp` | flag | `False` | 启用自动混合精度 (AMP) 训练。 |
-| `--gradient-clip` | float | `1.0` | 梯度裁剪阈值。 |
-| `--accum-steps` | int | `1` | **[新增]** 梯度累积步数，用于实现更大的有效 batch size。 |
-| `--num-workers` | int | `-1` | 数据加载工作线程数。`-1` 表示自动检测。 |
-| `--seed` | int | `42` | 随机种子。 |
-| `--bias-mode` | str | `low_rank` | 希尔伯特偏置模式: `original`, `low_rank`, `hierarchical`。 |
-| `--low-rank-r` | int | `32` | 低秩希尔伯特偏置分解的秩。 |
-| `--device` | str | `auto` | 使用的设备: `auto`, `cpu`, `cuda`。 |
+| `--dataset` | str | `cifar10` | 数据集: `cifar10`, `cifar100`, `mnist`, `tiny-imagenet` |
+| `--epochs` | int | `50` | 训练轮数 |
+| `--batch-size` | int | `64` | 训练批次大小 |
+| `--lr` | float | `5e-4` | 初始学习率 |
+| `--warmup-epochs` | int | `10` | **[新]** Warmup 轮数 |
+| `--weight-decay` | float | `0.01` | 权重衰减（L2正则化） |
+| `--val-split` | float | `0.1` | 验证集划分比例 |
+| `--dim` | int | `192` | 模型嵌入维度 |
+| `--depth` | int | `8` | Transformer 深度（层数） |
+| `--heads` | int | `8` | 注意力头数量 |
+| `--dim-head` | int | `32` | 每个注意力头的维度 |
+| `--max-level` | int | `4` | 最大分形递归层级 |
+| `--ffn-type` | str | `swiglu_level` | **[新]** FFN类型: `gelu`, `swiglu`, `swiglu_level` |
+| `--pool` | str | `cls` | 池化方法: `cls` 或 `mean` |
+| `--dropout` | float | `0.1` | Dropout 比率 |
+| `--gradient-clip` | float | `1.0` | 梯度裁剪值 |
+| `--use-amp` | flag | `False` | 启用混合精度训练 |
+| `--accum-steps` | int | `1` | 梯度累积步数 |
+| `--num-workers` | int | `4` | 数据加载工作进程数 |
+| `--no-learnable-split` | flag | `False` | 禁用可学习分词 |
+| `--quick-test` | flag | `False` | 快速5轮测试，512样本 |
 
-#### 训练优化 (v2.0)
+#### 性能优化
 
-训练脚本包含多项性能优化：
+训练脚本包含自动性能增强：
 
-| 优化项 | 说明 | 预期加速 |
-|--------|------|----------|
-| `torch.compile()` | PyTorch 2.0+ JIT 编译（仅 CUDA） | 15-40% |
-| `cudnn.benchmark` | cuDNN 自动调优器（固定输入尺寸） | 5-15% |
-| TF32 启用 | Ampere+ GPU 的 TensorFloat-32 | 5-10% |
-| 评估阶段 AMP | 验证/测试时使用混合精度 | 20-30% 推理 |
-| `set_to_none=True` | 更快的梯度清零 | 1-3% |
-| `pin_memory` + `non_blocking` | 异步 CPU-GPU 数据传输 | 可变 |
-| 优雅中断 | Ctrl+C 在退出前保存检查点 | - |
+| 优化项 | 自动启用 | 预期加速 | 要求 |
+|--------|---------|----------|------|
+| TF32 加速 | ✅ CUDA | ~8× 矩阵运算 | Ampere+ GPU (RTX 30/40) |
+| cuDNN Benchmark | ✅ CUDA | 5-15% | 固定输入尺寸 |
+| Spawn 多进程 | ✅ 始终 | 稳定性 | CUDA 兼容性 |
+| 持久化 Workers | ✅ 始终 | 更快的 epoch | num_workers > 0 |
+| 混合精度 (AMP) | ⚙️ `--use-amp` | 20-40% | 现代 GPU |
+| 梯度累积 | ⚙️ `--accum-steps` | 更大批次 | 有限显存 |
 
-**梯度累积示例：**
-
+**示例：最大性能**
 ```bash
-# 模拟 batch size 256，使用有限 GPU 内存 (64 x 4 = 256)
+# RTX 3090/4090 最优设置
 uv run python examples/training/train_fractal_vit.py \
-    --batch-size 64 --accum-steps 4 --use-amp
+    --dataset cifar100 \
+    --ffn-type swiglu_level \
+    --batch-size 128 \
+    --use-amp \
+    --num-workers 4 \
+    --warmup-epochs 10
 ```
 
-**容器环境 (Docker/Podman)：**
-
+**示例：有限显存**
 ```bash
-# 推荐用于 --shm-size=4g 容器
-python train_fractal_vit.py --num-workers 8 --use-amp
+# 用 8GB 显存模拟 batch size 256
+uv run python examples/training/train_fractal_vit.py \
+    --batch-size 64 \
+    --accum-steps 4 \
+    --use-amp
 ```
 
-#### 输出 (Output)
+#### 训练输出
 
-训练产物保存在 `experiments/` 目录下，按时间戳组织：
+训练产物自动保存在 `experiments/` 目录下，按时间戳组织：
 
-* `checkpoints/`: 保存的模型权重 (`best.pth`)。
-* `logs/`: 训练日志。
+```
+experiments/
+└── fractal_vit_20251211_142110/
+    ├── checkpoints/
+    │   └── best.pth              # 最佳模型权重
+    ├── logs/
+    │   ├── config.json           # 训练配置
+    │   ├── metrics.json          # 每轮指标
+    │   └── final.json            # 最终结果 + tokenization 分析
+    └── visualizations/           # (可选) 可视化图表
+```
+
+**详细日志包含：**
+* 每轮的训练/验证损失和准确率
+* 学习率变化
+* Token 数量统计和自适应性分析
+* Variance-token 相关性评估
+* GPU 信息和训练时间
 * `visualizations/`: 损失和准确率曲线。
 * `training_history.json`: 每个 epoch 的详细指标。
 
