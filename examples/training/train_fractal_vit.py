@@ -50,7 +50,10 @@ import argparse
 import json
 import multiprocessing
 import random
+import shutil
 import time
+import urllib.request
+import zipfile
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -147,6 +150,109 @@ class EpochMetrics:
     lr: float
     time: float
     tokens: Optional[TokenStats] = None
+
+
+# ============================================================================
+# Tiny ImageNet 下载和组织
+# ============================================================================
+
+def download_and_setup_tiny_imagenet(data_root: Path) -> bool:
+    """下载并设置 Tiny ImageNet 数据集
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    target_dir = data_root / "tiny-imagenet-200"
+    
+    # 检查是否已存在
+    if (target_dir / "train").exists() and (target_dir / "val").exists():
+        return True
+    
+    print("\n" + "="*70)
+    print("Downloading Tiny ImageNet...")
+    print("="*70)
+    
+    zip_path = data_root / "tiny-imagenet-200.zip"
+    url = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+    
+    # 下载
+    if not zip_path.exists():
+        print(f"Downloading from {url}...")
+        print("This may take several minutes (~237 MB)...")
+        
+        try:
+            with tqdm(unit='B', unit_scale=True, unit_divisor=1024, miniters=1) as pbar:
+                def reporthook(block_num, block_size, total_size):
+                    if pbar.total is None and total_size > 0:
+                        pbar.total = total_size
+                    pbar.update(block_size)
+                
+                urllib.request.urlretrieve(url, zip_path, reporthook=reporthook)
+            print(f"✓ Downloaded to {zip_path}")
+        except Exception as e:
+            print(f"✗ Download failed: {e}")
+            return False
+    else:
+        print(f"✓ Found existing zip: {zip_path}")
+    
+    # 解压
+    print("\nExtracting archive...")
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(data_root)
+        print(f"✓ Extracted to {target_dir}")
+    except Exception as e:
+        print(f"✗ Extraction failed: {e}")
+        return False
+    
+    # 组织验证集（Tiny ImageNet 的 val 目录需要重新组织）
+    val_dir = target_dir / "val"
+    val_images_dir = val_dir / "images"
+    
+    if val_images_dir.exists():
+        print("\nOrganizing validation set...")
+        
+        # 读取验证集标注
+        val_annotations = val_dir / "val_annotations.txt"
+        if val_annotations.exists():
+            # 创建类别目录
+            img_to_class = {}
+            with open(val_annotations, 'r') as f:
+                for line in f:
+                    parts = line.strip().split('\t')
+                    if len(parts) >= 2:
+                        img_name = parts[0]
+                        class_id = parts[1]
+                        img_to_class[img_name] = class_id
+            
+            # 移动图像到对应类别目录
+            for img_name, class_id in tqdm(img_to_class.items(), desc="Organizing"):
+                class_dir = val_dir / class_id / "images"
+                class_dir.mkdir(parents=True, exist_ok=True)
+                
+                src = val_images_dir / img_name
+                dst = class_dir / img_name
+                
+                if src.exists() and not dst.exists():
+                    shutil.move(str(src), str(dst))
+            
+            # 删除原始 images 目录
+            if val_images_dir.exists() and not any(val_images_dir.iterdir()):
+                val_images_dir.rmdir()
+            
+            print("✓ Validation set organized")
+    
+    # 清理 zip 文件（可选）
+    if zip_path.exists():
+        try:
+            zip_path.unlink()
+            print(f"✓ Cleaned up {zip_path.name}")
+        except:
+            pass
+    
+    print("="*70)
+    print("✓ Tiny ImageNet setup complete!\n")
+    return True
 
 
 # ============================================================================
@@ -443,19 +549,22 @@ def create_dataloaders(
         train_ds = datasets.MNIST(data_root, train=True, download=True, transform=train_tf)
         test_ds = datasets.MNIST(data_root, train=False, download=True, transform=test_tf)
     elif spec.name == "TinyImageNet":
-        # Tiny ImageNet 需要手动下载和组织
+        # Tiny ImageNet 自动下载和组织
         train_dir = data_root / "tiny-imagenet-200" / "train"
         test_dir = data_root / "tiny-imagenet-200" / "val"
         
-        if not train_dir.exists():
-            raise FileNotFoundError(
-                f"\nTiny ImageNet not found at {data_root / 'tiny-imagenet-200'}\n"
-                f"Please download from: http://cs231n.stanford.edu/tiny-imagenet-200.zip\n"
-                f"Extract to: {data_root}\n"
-                f"Expected structure:\n"
-                f"  {data_root}/tiny-imagenet-200/train/n01443537/images/*.JPEG\n"
-                f"  {data_root}/tiny-imagenet-200/val/images/*.JPEG\n"
-            )
+        if not train_dir.exists() or not test_dir.exists():
+            print("\n⚠️  Tiny ImageNet not found, attempting automatic download...")
+            success = download_and_setup_tiny_imagenet(data_root)
+            if not success:
+                raise FileNotFoundError(
+                    f"\nAutomatic download failed. Please manually download:\n"
+                    f"URL: http://cs231n.stanford.edu/tiny-imagenet-200.zip\n"
+                    f"Extract to: {data_root}\n"
+                    f"Expected structure:\n"
+                    f"  {data_root}/tiny-imagenet-200/train/n01443537/images/*.JPEG\n"
+                    f"  {data_root}/tiny-imagenet-200/val/n01443537/images/*.JPEG\n"
+                )
         
         train_ds = datasets.ImageFolder(str(train_dir), transform=train_tf)
         test_ds = datasets.ImageFolder(str(test_dir), transform=test_tf)
