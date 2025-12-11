@@ -69,6 +69,7 @@ class NextGenerationFractalViT(nn.Module):
         use_spatial_encoding: bool = True,
         use_feature_enhancement: bool = True,
         use_dynamic_depth: bool = False,
+        use_checkpoint: bool = False,
         ffn_type: FFNType = 'swiglu_level',
         tokenizer: Optional[BaseTokenizer] = None,
         token_processor: Optional[BaseTokenProcessor] = None,
@@ -109,6 +110,7 @@ class NextGenerationFractalViT(nn.Module):
         self.pool = pool
         self.max_level = max_level
         self.use_dynamic_depth = use_dynamic_depth
+        self.use_checkpoint = use_checkpoint
         self.ffn_type = ffn_type
 
         if tokenizer is None:
@@ -167,6 +169,7 @@ class NextGenerationFractalViT(nn.Module):
             dropout=dropout,
             max_level=max_level,
             ffn_type=ffn_type,
+            use_checkpoint=use_checkpoint,
         )
 
         # 分类头
