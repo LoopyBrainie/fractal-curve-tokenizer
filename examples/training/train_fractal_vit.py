@@ -164,9 +164,12 @@ def download_and_setup_tiny_imagenet(data_root: Path) -> bool:
     """
     target_dir = data_root / "tiny-imagenet-200"
     
-    # 检查是否已存在
+    # 检查是否已存在且完整
     if (target_dir / "train").exists() and (target_dir / "val").exists():
-        return True
+        # 快速验证：检查训练集是否有足够的类别
+        train_classes = len(list((target_dir / "train").iterdir()))
+        if train_classes >= 200:
+            return True
     
     print("\n" + "="*70)
     print("Downloading Tiny ImageNet...")
@@ -174,35 +177,76 @@ def download_and_setup_tiny_imagenet(data_root: Path) -> bool:
     
     zip_path = data_root / "tiny-imagenet-200.zip"
     url = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+    expected_size = 248100043  # ~237 MB
+    
+    # 检查现有 zip 文件是否有效
+    if zip_path.exists():
+        print(f"Found existing zip: {zip_path}")
+        
+        # 验证文件大小
+        actual_size = zip_path.stat().st_size
+        if actual_size < expected_size * 0.95:  # 允许 5% 误差
+            print(f"⚠️  File size mismatch (expected ~{expected_size}, got {actual_size})")
+            print("Removing corrupted file and re-downloading...")
+            zip_path.unlink()
+        else:
+            # 验证是否为有效 zip 文件
+            try:
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    # 测试 zip 文件完整性
+                    if zf.testzip() is not None:
+                        print("⚠️  Zip file is corrupted")
+                        print("Removing corrupted file and re-downloading...")
+                        zip_path.unlink()
+                    else:
+                        print("✓ Zip file verified")
+            except zipfile.BadZipFile:
+                print("⚠️  Invalid zip file")
+                print("Removing corrupted file and re-downloading...")
+                zip_path.unlink()
     
     # 下载
     if not zip_path.exists():
-        print(f"Downloading from {url}...")
+        print(f"\nDownloading from {url}...")
         print("This may take several minutes (~237 MB)...")
         
         try:
-            with tqdm(unit='B', unit_scale=True, unit_divisor=1024, miniters=1) as pbar:
+            with tqdm(unit='B', unit_scale=True, unit_divisor=1024, miniters=1, desc="Downloading") as pbar:
                 def reporthook(block_num, block_size, total_size):
                     if pbar.total is None and total_size > 0:
                         pbar.total = total_size
                     pbar.update(block_size)
                 
                 urllib.request.urlretrieve(url, zip_path, reporthook=reporthook)
-            print(f"✓ Downloaded to {zip_path}")
+            
+            # 验证下载的文件
+            downloaded_size = zip_path.stat().st_size
+            print(f"\n✓ Downloaded {downloaded_size:,} bytes")
+            
+            if downloaded_size < expected_size * 0.95:
+                print(f"⚠️  Downloaded file seems incomplete (expected ~{expected_size:,} bytes)")
+                return False
+                
         except Exception as e:
-            print(f"✗ Download failed: {e}")
+            print(f"\n✗ Download failed: {e}")
+            if zip_path.exists():
+                zip_path.unlink()
             return False
-    else:
-        print(f"✓ Found existing zip: {zip_path}")
     
     # 解压
     print("\nExtracting archive...")
     try:
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(data_root)
+            # 显示解压进度
+            members = zip_ref.namelist()
+            for member in tqdm(members, desc="Extracting"):
+                zip_ref.extract(member, data_root)
         print(f"✓ Extracted to {target_dir}")
     except Exception as e:
         print(f"✗ Extraction failed: {e}")
+        # 清理部分解压的文件
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
         return False
     
     # 组织验证集（Tiny ImageNet 的 val 目录需要重新组织）
