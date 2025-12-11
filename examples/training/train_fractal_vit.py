@@ -113,6 +113,7 @@ class TrainingConfig:
     pool: str
     ffn_type: str
     learnable_split: bool
+    gradient_checkpoint: bool
     
     # 训练
     epochs: int
@@ -527,13 +528,15 @@ def create_model(config: TrainingConfig, spec: DatasetSpec) -> NextGenerationFra
         min_patch_size=(4, 4),
         max_level=config.max_level,
         learnable_split=config.learnable_split,
-        ffn_type=config.ffn_type,
+        use_checkpoint=config.gradient_checkpoint,
+        ffn_type=config.ffn_type,  # type: ignore
     )
     
     params = sum(p.numel() for p in model.parameters())
     print(f"\n{'='*70}")
     print(f"Model: NextGenerationFractalViT")
     print(f"FFN Type: {config.ffn_type}")
+    print(f"Gradient Checkpoint: {config.gradient_checkpoint}")
     print(f"Parameters: {params:,}")
     print(f"{'='*70}\n")
     
@@ -672,21 +675,33 @@ def train_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler,  # torch.amp.GradScaler (避免类型检查问题)
     clip: float,
     accum: int,
     use_amp: bool,
-) -> Tuple[float, float]:
-    """训练一个 epoch"""
+) -> Tuple[float, float, Dict[str, float]]:
+    """训练一个 epoch，返回 (loss, accuracy, perf_stats)"""
     model.train()
     total_loss, correct, total = 0.0, 0, 0
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)  # 更高效的梯度清零
+    
+    # 性能监控
+    batch_times = []
+    data_times = []
+    cuda_mem_peak = 0.0
     
     pbar = tqdm(loader, desc="Train")
+    data_start = time.time()
+    
     for i, (imgs, labels) in enumerate(pbar):
-        imgs, labels = imgs.to(device), labels.to(device)
+        data_times.append(time.time() - data_start)
+        batch_start = time.time()
         
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        # non_blocking=True 实现异步数据传输
+        imgs = imgs.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        
+        with torch.amp.autocast('cuda', enabled=use_amp):
             outs, _ = model(imgs, return_aux_info=True)
             loss = F.cross_entropy(outs, labels) / accum
         
@@ -697,16 +712,31 @@ def train_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
         
         total_loss += loss.item() * accum
         _, pred = outs.max(1)
         total += labels.size(0)
         correct += pred.eq(labels).sum().item()
         
+        batch_times.append(time.time() - batch_start)
+        
+        # 更新 CUDA 内存峰值
+        if device.type == 'cuda':
+            cuda_mem_peak = max(cuda_mem_peak, torch.cuda.max_memory_allocated() / 1024**3)
+        
         pbar.set_postfix(loss=f'{loss.item()*accum:.4f}', acc=f'{100.*correct/total:.1f}%')
+        data_start = time.time()
     
-    return total_loss / len(loader), 100.0 * correct / total
+    # 性能统计
+    perf_stats = {
+        'avg_batch_time': np.mean(batch_times) if batch_times else 0.0,
+        'avg_data_time': np.mean(data_times) if data_times else 0.0,
+        'throughput': total / sum(batch_times) if batch_times else 0.0,  # samples/sec
+        'cuda_mem_peak_gb': cuda_mem_peak,
+    }
+    
+    return total_loss / len(loader), 100.0 * correct / total, perf_stats
 
 
 @torch.no_grad()
@@ -722,9 +752,10 @@ def evaluate(
     
     pbar = tqdm(loader, desc="Eval")
     for imgs, labels in pbar:
-        imgs, labels = imgs.to(device), labels.to(device)
+        imgs = imgs.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
         
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=use_amp):
             outs, _ = model(imgs, return_aux_info=True)
             loss = F.cross_entropy(outs, labels)
         
@@ -764,6 +795,8 @@ def main():
     parser.add_argument("--ffn-type", type=str, default="swiglu_level",
                        choices=["gelu", "swiglu", "swiglu_level"])
     parser.add_argument("--no-learnable-split", action="store_true")
+    parser.add_argument("--gradient-checkpoint", action="store_true",
+                       help="Use gradient checkpointing to save memory (slower but ~40%% less VRAM)")
     
     # 训练
     parser.add_argument("--epochs", type=int, default=50)
@@ -781,6 +814,13 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--quick-test", action="store_true")
+    
+    # 性能优化
+    parser.add_argument("--compile", action="store_true",
+                       help="Use torch.compile() for model optimization (PyTorch 2.0+)")
+    parser.add_argument("--compile-mode", type=str, default="reduce-overhead",
+                       choices=["default", "reduce-overhead", "max-autotune"],
+                       help="torch.compile mode (default: reduce-overhead)")
     
     args = parser.parse_args()
     
@@ -816,6 +856,7 @@ def main():
         pool=args.pool,
         ffn_type=args.ffn_type,
         learnable_split=not args.no_learnable_split,
+        gradient_checkpoint=args.gradient_checkpoint,
         epochs=args.epochs,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
@@ -853,6 +894,17 @@ def main():
     
     # 模型和数据
     model = create_model(config, spec).to(device)
+    
+    # torch.compile() 优化 (PyTorch 2.0+)
+    if args.compile and hasattr(torch, 'compile'):
+        print(f"⚡ Compiling model with mode='{args.compile_mode}'...")
+        try:
+            model = torch.compile(model, mode=args.compile_mode)
+            print("  ✓ Model compiled successfully\n")
+        except Exception as e:
+            print(f"  ⚠ Compilation failed: {e}")
+            print("  → Falling back to eager mode\n")
+    
     train_loader, val_loader, test_loader = create_dataloaders(
         spec, config.batch_size, config.val_split, config.subset_size,
         config.num_workers, device.type == "cuda"
@@ -872,24 +924,34 @@ def main():
     print(f"✓ Optimizer: AdamW (lr={config.learning_rate:.2e}, wd={config.weight_decay})")
     print(f"✓ Scheduler: {warmup} warmup epochs + cosine annealing\n")
     
-    scaler = torch.cuda.amp.GradScaler(enabled=config.use_amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=config.use_amp)
     
     # Tokenization 监控
     tok_monitor = TokenizationMonitor()
     monitor_freq = max(1, config.epochs // 10)
     
+    # 显存清理函数
+    def clear_cuda_cache():
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+    
     # 训练
     print(f"{'='*70}")
     print("TRAINING START")
-    print(f"{'='*70}\n")
+    print(f"{'='*70}")
+    if config.gradient_checkpoint:
+        print("⚡ Gradient Checkpointing: ENABLED (saves ~40% VRAM)")
+    print("")
     
     best_val = 0.0
+    clear_cuda_cache()  # 训练前清理
     
     try:
         for epoch in range(1, config.epochs + 1):
             start = time.time()
             
-            train_loss, train_acc = train_epoch(
+            train_loss, train_acc, perf_stats = train_epoch(
                 model, train_loader, optimizer, device, scaler,
                 config.gradient_clip, config.accum_steps, config.use_amp
             )
@@ -915,6 +977,11 @@ def main():
                 tokens=tok_stats,
             )
             exp_mgr.log_epoch(metrics)
+            
+            # 显示性能统计（每 5 轮或第一轮）
+            if epoch == 1 or epoch % 5 == 0:
+                print(f"  📊 Perf: {perf_stats['throughput']:.1f} samples/s, "
+                      f"mem={perf_stats['cuda_mem_peak_gb']:.2f}GB")
             
             # 保存最佳
             if val_acc > best_val:
