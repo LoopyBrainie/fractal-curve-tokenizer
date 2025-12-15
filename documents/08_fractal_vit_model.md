@@ -1,111 +1,229 @@
 # 第八章：完整 ViT 模型 (fractal_vit.py)
 
-本章详尽描述了数据在 `NextGenerationFractalViT` 模型中的完整流动过程，从输入图像到最终分类结果。
+本章详尽描述了数据在 `NextGenerationFractalViT` 模型中的完整流动过程。
 
-## 8.1 核心类：NextGenerationFractalViT
+## 8.1 数学形式化
 
-### `forward(img, ...)` 数据流详解
+$$I \xrightarrow{\text{Tokenize}} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{CLS}} [c; T'] \xrightarrow{\text{Transformer}} X' \xrightarrow{\text{Pool}} z \xrightarrow{\text{MLP}} \hat{y}$$
 
-此函数串联了整个模型的处理管线。
+**损失函数**:
+$$\mathcal{L} = \mathcal{L}_{CE}(y, \hat{y}) + \lambda \cdot \mathcal{L}_{aux}$$
+
+- Legacy Tokenizer: $\mathcal{L}_{aux} = \mathcal{L}_{REINFORCE}$ (策略梯度)
+- Streaming Tokenizer: $\mathcal{L}_{aux} = 0$ (端到端可微)
+
+---
+
+## 8.2 Tokenizer 类型选项
+
+| tokenizer_type | 实现类 | 特点 | 状态 |
+| :--- | :--- | :--- | :--- |
+| `legacy` | `FractalHilbertTokenizer` | BFS + REINFORCE | ⚠️ 废弃 |
+| `streaming` | `StreamingFractalTokenizer` | 固定多尺度 | ✅ 稳定 |
+| `streaming_v2` | `StreamingFractalTokenizerV2` | Gumbel-Softmax | ✅ 推荐 |
+
+---
+
+## 8.3 核心类：NextGenerationFractalViT
+
+### 初始化参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `image_size` | int | - | 输入图像尺寸 |
+| `num_classes` | int | - | 分类类别数 |
+| `dim` | int | - | 模型维度 |
+| `depth` | int | 6 | Transformer 层数 |
+| `heads` | int | 8 | 注意力头数 |
+| `mlp_dim` | int | - | FFN 隐藏层维度 |
+| `pool` | str | 'cls' | 池化策略 |
+| `dropout` | float | 0.1 | Dropout 比率 |
+| `tokenizer_type` | str | 'streaming_v2' | Tokenizer 类型 |
+| `bias_mode` | str | 'low_rank' | Hilbert Bias 模式 |
+| `ffn_type` | str | 'swiglu_level' | FFN 类型 |
+
+### forward(img, ...) 数据流详解
 
 **Step 1: 分形分词 (Tokenization)**
-*   **输入**: `img` 张量 `(B, C, H, W)`。
-*   **操作**: 调用 `self.tokenizer.tokenize(img)`。
-*   **输出**: `token_output` (`TokenizerOutput` 对象)。
-    *   包含 $B$ 个 `TokenSequence`。
-    *   第 $i$ 个序列包含 $N_i$ 个 Token，张量形状 `(N_i, Patch_Dim)`。
-    *   $N_i$ 是动态的，取决于图像复杂度。
+```python
+token_output = self.tokenizer.tokenize(img)
+# token_output: TokenizerOutput
+# - sequences: List[TokenSequence]
+# - 每个序列: tokens (N, D), levels (N, Info_Len)
+```
 
-**Step 2: Token 处理与投影 (Token Processing)**
-*   **操作**: 调用 `self.token_processor.process(token_output)`。
-*   **模块**: `src/vit_pytorch/token_processor.py` (已解耦)。
-*   **内部流程** (在 `EnhancedFractalTokenProcessor` 中):
-    1.  遍历每个序列。
-    2.  `token_projection`: 线性映射 `Patch_Dim -> Dim`。
-    3.  `level_type_embedding`: 根据层级加 Embedding。
-    4.  `feature_enhancement`: 计算统计特征 -> MLP -> 加到 Token 上。
-    5.  `shared_scale_adapter`: 多尺度适配。
-*   **输出**: `processed_output` (`TokenizerOutput`)。Token 维度变为 `Dim`。
+**Step 2: 批次对齐 (Batch Padding)**
+```python
+# 提取 tokens 和 levels
+tokens_list = [seq.tokens for seq in token_output.sequences]
+levels_list = [seq.get_levels() for seq in token_output.sequences]
 
-**Step 3: 批次对齐 (Batch Padding)**
-*   **问题**: Transformer 需要固定形状的 Batch 输入，但 $N_i$ 各不相同。
-*   **操作**:
-    1.  提取所有 Token 张量。
-    2.  使用 `torch.nn.utils.rnn.pad_sequence(..., batch_first=True)`。
-    3.  记录 `lengths` 和 `valid_indices`。
-*   **输出**:
-    *   `padded_tokens`: `(B, S_max, Dim)`，其中 $S_{max} = \max(N_i)$。
-    *   `padded_levels`: `(B, S_max, Info_Len)`。
-    *   `key_padding_mask`: `(B, S_max)`，True 表示 Padding 位置。
+# Padding
+padded_tokens = pad_sequence(tokens_list, batch_first=True)  # (B, S_max, D)
+padded_levels = pad_sequence(levels_list, batch_first=True)  # (B, S_max, Info)
 
-**Step 4: 位置编码 (Positional Embedding)**
-*   **操作**: 调用 `self.pos_embedding(padded_levels)`。
-*   **细节**:
-    *   输入层级信息 `(B, S_max, Info_Len)`。
-    *   `AdvancedFractalPositionEmbedding` 原生支持 Batch 输入，计算深度编码和路径编码。
-*   **输出**: `pos_emb` `(B, S_max, Dim)`。
-*   **融合**: `x = padded_tokens + pos_emb`。
+# 生成 mask
+key_padding_mask = create_padding_mask(lengths)  # (B, S_max)
+```
 
-**Step 5: 添加 CLS Token**
-*   **操作**:
-    *   扩展 `self.cls_token` 为 `(B, 1, Dim)`。
-    *   `torch.cat([cls_tokens, x], dim=1)`。
-*   **输出**: `x` 形状变为 `(B, S_max + 1, Dim)`。
-*   **Mask 更新**: `key_padding_mask` 扩展为 `(B, S_max + 1)`，第一位（CLS）设为 False（有效）。
+**Step 3: 位置编码 (Positional Embedding)**
+```python
+pos_emb = self.pos_embedding(padded_levels)  # (B, S_max, D)
+x = padded_tokens + pos_emb
+```
+
+**Step 4: 添加 CLS Token**
+```python
+cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, D)
+x = torch.cat([cls_tokens, x], dim=1)  # (B, S_max + 1, D)
+
+# 更新 mask
+cls_levels = torch.zeros(B, 1, Info_Len)
+levels_info = torch.cat([cls_levels, padded_levels], dim=1)
+```
+
+**Step 5: Dropout**
+```python
+x = self.dropout(x)
+```
 
 **Step 6: Transformer 编码**
-*   **操作**: 调用 `self.transformer(x, levels_info, attn_mask)`。
-*   **输入**:
-    *   `x`: `(B, S_max + 1, Dim)`。
-    *   `levels_info`: 包含 CLS 的层级信息。
-    *   `attn_mask`: 由 `key_padding_mask` 转换而来，用于屏蔽 Padding。
-*   **输出**: 编码后的 `x` `(B, S_max + 1, Dim)`。
+```python
+attn_mask = ~key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S+1)
+x = self.transformer(x, levels_info, attn_mask)  # (B, S+1, D)
+```
 
 **Step 7: 池化 (Pooling)**
-*   **策略**:
-    *   `cls`: 取 `x[:, 0]`。
-    *   `mean`: 取 `x[:, 1:]`，结合 Mask 计算加权平均（忽略 Padding）。
-    *   `hybrid`: 学习一个权重，融合 CLS 和 Mean。
-*   **输出**: `pooled` `(B, Dim)`。
+```python
+if self.pool == 'cls':
+    pooled = x[:, 0]  # (B, D)
+elif self.pool == 'mean':
+    # 忽略 CLS 和 Padding
+    mask = ~key_padding_mask[:, 1:]  # (B, S)
+    pooled = (x[:, 1:] * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True)
+```
 
 **Step 8: 分类头 (Classification Head)**
-*   **操作**: `self.mlp_head(pooled)`。
-    *   `LayerNorm` -> `Linear` -> `GELU` -> `Dropout` -> `Linear`。
-*   **输出**: `final_output` `(B, NumClasses)`。
+```python
+logits = self.mlp_head(pooled)  # (B, num_classes)
+# mlp_head: LayerNorm -> Linear -> GELU -> Dropout -> Linear
+```
 
 ---
 
-### `get_tokenizer_loss(...)` 数据流详解
+## 8.4 SimpleFractalViT
 
-此函数用于训练阶段的策略更新。
+简化版模型，用于快速实验和调试。
 
-*   **输入**: `reward` (通常是 `-CrossEntropyLoss`)。
-*   **数据源**: `self.tokenizer.saved_log_probs` (List[Tensor])。
-*   **计算流程**:
-    1.  **堆叠**: 将所有 Log Probs 堆叠为张量。
-    2.  **优势计算**: `advantage = reward - baseline`。
-    3.  **策略梯度**: `policy_loss = -advantage * log_probs.mean()`。
-        *   *注：此处存在 P0 级改进点，应按样本计算而非全局平均。*
-    4.  **熵正则化**: 计算 `saved_entropies` 的均值，`loss -= coef * entropy`。
-*   **输出**: `aux_loss` (Scalar Tensor)，用于加到总 Loss 中反向传播。
+### 与 NextGenerationFractalViT 的区别
+
+| 特性 | NextGeneration | Simple |
+| :--- | :--- | :--- |
+| 层级自适应 | ✅ | ❌ |
+| Hilbert Bias | ✅ 可选 | ❌ |
+| 动态深度 | ✅ 可选 | ❌ |
+| 全局注意力 | ✅ | ❌ |
+| 参数量 | 较大 | 较小 |
 
 ---
 
-## 8.2 辅助类：EnhancedFractalTokenProcessor
+## 8.5 辅助方法
 
-> **注意**: 此类已从 `fractal_vit.py` 移至 `src/vit_pytorch/token_processor.py`。
+### get_tokenizer_loss() (仅 Legacy Tokenizer)
 
-### `process(batch)`
-负责将原始像素数据映射到语义空间。
+用于训练阶段的策略更新。
 
-*   **输入**: `TokenizerOutput`。
-*   **流程**:
-    1.  **归一化**: `LayerNorm` 输入 Token。
-    2.  **投影**: `Linear` 映射到 `output_dim`。
-    3.  **类型注入**: 根据 Token 的 `level` 添加 `level_type_embedding`。
-    4.  **特征增强 (Feature Enhancement)**:
-        *   计算 Token 的统计特征（方差、边缘密度等）。
-        *   通过 `stats_processor`, `edge_processor` 等 MLP 处理。
-        *   融合并加回到 Token Embedding。
-    5.  **动态加权**: `dynamic_weighting` 网络计算每个 Token 的重要性权重并缩放。
-*   **输出**: 处理后的 `TokenizerOutput`。
+**输入**: `reward` (通常是 `-CrossEntropyLoss`)
+
+**计算流程**:
+1. **堆叠**: 将所有 Log Probs 堆叠为张量
+2. **优势计算**: `advantage = reward - baseline`
+3. **策略梯度**: `policy_loss = -advantage * log_probs.mean()`
+4. **熵正则化**: `loss -= coef * entropy`
+
+**输出**: `aux_loss` (标量)
+
+### clear_tokenizer_cache()
+
+清空 tokenizer 的缓存，防止内存泄漏。
+
+---
+
+## 8.6 使用示例
+
+```python
+from vit_pytorch import NextGenerationFractalViT
+
+model = NextGenerationFractalViT(
+    image_size=224,
+    num_classes=1000,
+    dim=384,
+    depth=6,
+    heads=6,
+    mlp_dim=768,
+    tokenizer_type='streaming_v2',
+    bias_mode='low_rank',
+    ffn_type='swiglu_level',
+)
+
+images = torch.randn(2, 3, 224, 224)
+logits = model(images)  # (2, 1000)
+```
+
+---
+
+## 8.7 架构图
+
+```
+Input Image (B, C, H, W)
+        │
+        ▼
+┌─────────────────────────────┐
+│ StreamingFractalTokenizerV2 │
+│ - MultiScalePatchEncoder    │
+│ - Gumbel-Softmax Selection  │
+│ - HilbertIndexer            │
+└─────────────────────────────┘
+        │
+        ▼
+  TokenizerOutput
+  (tokens, levels)
+        │
+        ▼
+┌─────────────────────────────┐
+│    Batch Padding & Mask     │
+└─────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────┐
+│ AdvancedFractalPosition     │
+│ Embedding                   │
+│ - Depth Embedding           │
+│ - Path Embedding            │
+│ - Fusion Network            │
+└─────────────────────────────┘
+        │
+        ▼
+    Add CLS Token
+        │
+        ▼
+┌─────────────────────────────┐
+│ EnhancedFractalTransformer  │
+│ - Level-Aware LayerNorm     │
+│ - HilbertAwareAttention     │
+│ - SwiGLU FFN                │
+│ - DropPath                  │
+└─────────────────────────────┘
+        │
+        ▼
+    Pooling (cls/mean)
+        │
+        ▼
+┌─────────────────────────────┐
+│       MLP Head              │
+│ LN -> Linear -> GELU -> Linear
+└─────────────────────────────┘
+        │
+        ▼
+   Logits (B, num_classes)
+```
