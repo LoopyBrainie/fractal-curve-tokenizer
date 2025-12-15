@@ -1,3 +1,35 @@
+# -*- coding: utf-8 -*-
+"""
+Tokenization 抽象基类模块
+
+数学形式化
+============
+
+Tokenizer 抽象定义:
+    T: R^{B × C × H × W} → TokenizerOutput
+    
+    TokenizerOutput 包含:
+    - sequences: List[TokenSequence], 长度为 B
+    - 每个 TokenSequence:
+        - tokens: R^{N_i × D}, token 嵌入
+        - levels: Z^{N_i × info_len}, 层级信息
+
+levels_info 格式:
+    col 0: depth (深度值 d ∈ {0, ..., L_max})
+    col 1+: path (路径索引 q^(j) ∈ {0, 1, 2, 3})
+
+类对照表
+----------
++-------------------+--------------------------------------+
+| 类                 | 用途                                  |
++===================+======================================+
+| TokenSequence     | 单个样本的 token 序列                  |
+| TokenizerOutput   | 批次输出，包含多个 TokenSequence       |
+| LegacyTokenizerOutput| 向后兼容的 (tokens, levels) 格式    |
+| BaseTokenizer     | Tokenizer 抽象基类                    |
+| BaseTokenProcessor| TokenProcessor 抽象基类              |
++-------------------+--------------------------------------+
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field

@@ -1,14 +1,37 @@
 # -*- coding: utf-8 -*-
-"""Adaptive fractal-aware feed-forward network module.
+"""自适应分形前馈网络模块
 
-This module implements AdaptiveFractalFeedForward, a feed-forward block
-that is aware of the hierarchical structure from the fractal tokenizer,
-applying depth-dependent scaling to the hidden representations.
+数学形式化
+============
 
-Supported FFN types:
-- 'gelu': Standard GELU FFN (original)
-- 'swiglu': SwiGLU FFN (LLaMA-style, recommended)
-- 'swiglu_level': SwiGLU + Level Adaptation (best balance)
+SwiGLU FFN (LLaMA/PaLM 风格):
+    SwiGLU(x) = W_out · (Swish(W_gate · x) ⊙ (W_value · x))
+    其中 Swish(x) = x · σ(x), σ 是 sigmoid
+
+层级自适应 (Level Adaptation):
+    Output = (1 - α_d) · FFN(x) + α_d · Adapter([x; E_level(d)])
+    其中:
+    - α_d = softmax(MixingWeights)_d
+    - Adapter 是小型 MLP
+    - [;] 表示拼接
+
+类对照表
+----------
++---------------------------+------------------------------------------+
+| 类                         | 数学定义                                   |
++===========================+==========================================+
+| SwiGLUFFN                 | x → W_out(Swish(W_g x) ⊙ W_v x)         |
+| AdaptiveFractalFeedForward| x → (1-α)FFN(x) + α Adapter(x,d)       |
++---------------------------+------------------------------------------+
+
+FFN 变体选项 (ffn_type):
+- 'gelu': 标准 GELU FFN（原始，向后兼容）
+- 'swiglu': SwiGLU FFN（轻量级，无层级自适应）
+- 'swiglu_level': SwiGLU + Level Adaptation（推荐，最佳平衡）
+
+废弃特性:
+- use_feature_gating: SwiGLU 已内置门控
+- Dynamic Activation: 消融实验表明熵 > 90%，无效
 """
 
 from __future__ import annotations

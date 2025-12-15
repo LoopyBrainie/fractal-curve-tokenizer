@@ -1,26 +1,76 @@
 # -*- coding: utf-8 -*-
-"""Fractal Vision Transformer Implementation.
+"""
+分形视觉 Transformer (Fractal ViT)
 
-This module provides the NextGenerationFractalViT model, a Vision Transformer
-variant that uses fractal Hilbert curve-based tokenization for hierarchical
-multi-scale image representation.
+数学形式化
+============
+
+完整前向传播:
+    1. Tokenization:  (T, L) = Tokenizer(I)
+       其中 I ∈ R^{B × C × H × W}, T ∈ R^{B × N × D}, L ∈ Z^{B × N}
+    
+    2. 位置编码:      T' = T + E_pos(T, L)
+    
+    3. CLS + Dropout: X = Dropout([CLS; T'])
+    
+    4. Transformer:   X' = Transformer(X, L)
+    
+    5. 池化:          z = Pool(X')
+       - cls:  z = X'[:, 0]
+       - mean: z = mean(X'[:, 1:])
+    
+    6. 分类:          ŷ = MLP(z)
+
+损失函数:
+    L = L_CE(y, ŷ) + λ · L_aux
+    - Legacy: L_aux = L_REINFORCE (策略梯度)
+    - Streaming: L_aux = 0 (端到端可微)
+
+Tokenizer 选项
+--------------
++---------------+-------------------------------+------------------+
+| tokenizer_type| 实现                           | 特点              |
++===============+===============================+==================+
+| legacy        | FractalHilbertTokenizer       | BFS + REINFORCE  |
+|               |                               | 已废弃            |
++---------------+-------------------------------+------------------+
+| streaming     | StreamingFractalTokenizer     | 固定多尺度        |
++---------------+-------------------------------+------------------+
+| streaming_v2  | StreamingFractalTokenizerV2   | Gumbel-Softmax   |
+|               |                               | 推荐              |
++---------------+-------------------------------+------------------+
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+import warnings
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .features import TokenFeatures, compute_token_features
-from .fractal_curve_tokenizer import FractalHilbertTokenizer
 from .positional import AdvancedFractalPositionEmbedding
-from .token_processor import EnhancedFractalTokenProcessor
+from .streaming_tokenizer import StreamingFractalTokenizer, StreamingFractalTokenizerV2
 from .tokenization import BaseTokenProcessor, BaseTokenizer, TokenSequence, TokenizerOutput
 from .transformer import EnhancedFractalTransformer, FFNType
 from .utils import create_attention_mask, pair
+
+# 延迟导入废弃模块，仅在需要时加载
+def _get_legacy_tokenizer():
+    """延迟导入 FractalHilbertTokenizer (废弃)。"""
+    from ._deprecated.fractal_curve_tokenizer import FractalHilbertTokenizer
+    return FractalHilbertTokenizer
+
+def _get_legacy_processor():
+    """延迟导入 EnhancedFractalTokenProcessor (废弃)。"""
+    from ._deprecated.token_processor import EnhancedFractalTokenProcessor
+    return EnhancedFractalTokenProcessor
+
+
+# Tokenizer 类型定义
+TokenizerType = Literal["legacy", "streaming", "streaming_v2"]
 
 
 class NextGenerationFractalViT(nn.Module):
@@ -74,6 +124,10 @@ class NextGenerationFractalViT(nn.Module):
         tokenizer: Optional[BaseTokenizer] = None,
         token_processor: Optional[BaseTokenProcessor] = None,
         position_embedding: Optional[AdvancedFractalPositionEmbedding] = None,
+        # === ARCH-P1: 新增 Streaming Tokenizer 支持 ===
+        tokenizer_type: TokenizerType = "legacy",
+        num_scales: int = 4,
+        streaming_tau: float = 1.0,
     ) -> None:
         """初始化 NextGenerationFractalViT。
         
@@ -98,9 +152,15 @@ class NextGenerationFractalViT(nn.Module):
             use_feature_enhancement: 是否使用特征增强
             use_dynamic_depth: 是否使用动态深度
             ffn_type: FFN 变体 ('gelu', 'swiglu', 'swiglu_level')
-            tokenizer: 自定义 tokenizer（可选）
+            tokenizer: 自定义 tokenizer（可选，若提供则忽略 tokenizer_type）
             token_processor: 自定义 token 处理器（可选）
             position_embedding: 自定义位置编码（可选）
+            tokenizer_type: tokenizer 类型选择
+                - "legacy": 使用 FractalHilbertTokenizer (BFS + REINFORCE)
+                - "streaming": 使用 StreamingFractalTokenizer (固定多尺度)
+                - "streaming_v2": 使用 StreamingFractalTokenizerV2 (Gumbel-Softmax 自适应)
+            num_scales: [streaming only] 多尺度金字塔层数
+            streaming_tau: [streaming_v2 only] Gumbel-Softmax 温度参数
         """
         super().__init__()
 
@@ -112,8 +172,23 @@ class NextGenerationFractalViT(nn.Module):
         self.use_dynamic_depth = use_dynamic_depth
         self.use_checkpoint = use_checkpoint
         self.ffn_type = ffn_type
+        
+        # === ARCH-P1: 保存 tokenizer 类型用于后续条件分支 ===
+        self.tokenizer_type = tokenizer_type
+        self._is_streaming = tokenizer_type in ("streaming", "streaming_v2")
 
-        if tokenizer is None:
+        # === Tokenizer 选择逻辑 ===
+        if tokenizer is not None:
+            # 用户提供自定义 tokenizer，直接使用
+            pass
+        elif tokenizer_type == "legacy":
+            warnings.warn(
+                "tokenizer_type='legacy' 已废弃，推荐使用 'streaming_v2'。"
+                "Legacy tokenizer 将在 v1.0 中移除。",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            FractalHilbertTokenizer = _get_legacy_tokenizer()
             tokenizer = FractalHilbertTokenizer(
                 min_patch_size=min_patch_size,
                 max_level=max_level,
@@ -121,17 +196,45 @@ class NextGenerationFractalViT(nn.Module):
                 adaptive_threshold=adaptive_threshold,
                 channels=channels,
             )
+        elif tokenizer_type == "streaming":
+            # 构造多尺度 patch_sizes: 从 min_patch_size 起倍增
+            base_ps = min_patch_size[0]
+            patch_sizes_tuple = tuple(base_ps * (2 ** i) for i in range(num_scales))
+            tokenizer = StreamingFractalTokenizer(
+                image_size=self.image_size,
+                channels=channels,
+                d_model=dim,
+                patch_sizes=patch_sizes_tuple,
+                max_level=max_level,
+            )
+        elif tokenizer_type == "streaming_v2":
+            base_ps = min_patch_size[0]
+            patch_sizes_tuple = tuple(base_ps * (2 ** i) for i in range(num_scales))
+            tokenizer = StreamingFractalTokenizerV2(
+                image_size=self.image_size,
+                channels=channels,
+                d_model=dim,
+                patch_sizes=patch_sizes_tuple,
+                max_level=max_level,
+                gumbel_temperature=streaming_tau,
+            )
+        else:
+            raise ValueError(f"Unknown tokenizer_type: {tokenizer_type}")
 
         # 允许外部访问统一接口
         self.tokenizer = tokenizer
         # 兼容旧属性名
         self.fractal_tokenizer = tokenizer
 
-        # 计算token维度
+        # 计算token维度（仅用于 legacy tokenizer）
         patch_dim = channels * min_patch_size[0] * min_patch_size[1]
 
-        # 增强的token处理器
-        if token_processor is None:
+        # 增强的token处理器（streaming tokenizer 不需要）
+        if self._is_streaming:
+            # Streaming tokenizer 已直接输出 D-dim embeddings，无需 token_processor
+            self.token_processor = None
+        elif token_processor is None:
+            EnhancedFractalTokenProcessor = _get_legacy_processor()
             token_processor = EnhancedFractalTokenProcessor(
                 input_dim=patch_dim,
                 output_dim=dim,
@@ -139,8 +242,9 @@ class NextGenerationFractalViT(nn.Module):
                 max_level=max_level,
                 use_feature_enhancement=use_feature_enhancement,
             )
-
-        self.token_processor = token_processor
+            self.token_processor = token_processor
+        else:
+            self.token_processor = token_processor
 
         # 高级分形位置编码
         if position_embedding is None:
@@ -208,6 +312,10 @@ class NextGenerationFractalViT(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, List[int], List[torch.Tensor]]:
         """准备 tokens 和进行 padding。
         
+        数学形式化：
+            - Legacy: T, L = P(T_BFS(I)) where N is variable
+            - Streaming: T, L = S(I) where N = (H/p) × (W/p) is fixed
+        
         Args:
             img: 输入图像 [B, C, H, W]
             
@@ -221,6 +329,53 @@ class NextGenerationFractalViT(nn.Module):
         batch_size = img.shape[0]
         device = img.device
 
+        # === ARCH-P1: Streaming tokenizer 快速路径 ===
+        if self._is_streaming:
+            # Streaming tokenizer 直接输出 D-dim embeddings
+            # 输出: tokens [B, N, D], levels [B, N]
+            # N = (H/p) × (W/p) 是固定的，无需 padding
+            token_output = self.tokenizer.tokenize(img)
+            
+            # 使用 TokenizerOutput 的标准方法获取数据
+            tokens_list = token_output.tokens_list()   # List[Tensor[N, D]]
+            levels_raw = token_output.levels_list()    # List[Tensor[N, info_len]]
+            
+            # 转换为 batched tensors
+            # 注意: streaming tokenizer 的 N 是固定的，所有样本相同
+            tokens_stacked = torch.stack(tokens_list, dim=0)  # [B, N, D]
+            
+            # 构建 level info (需要扩展为与 legacy 兼容的格式)
+            # Legacy format: [B, N, max_level+4]
+            # Streaming: levels_raw 已经是 [N, info_len] 格式
+            N = tokens_stacked.shape[1]
+            
+            # 直接堆叠 levels
+            if levels_raw[0].dim() == 1:
+                # 如果是 1D，需要扩展
+                padded_levels = torch.zeros(
+                    batch_size, N, self.max_level + 4,
+                    dtype=torch.long, device=device
+                )
+                for i, lv in enumerate(levels_raw):
+                    padded_levels[i, :, 0] = lv
+            else:
+                # 已经是 2D [N, info_len]
+                levels_stacked = torch.stack(levels_raw, dim=0)  # [B, N, info_len]
+                # 可能需要 padding 到 max_level + 4
+                info_len = levels_stacked.shape[2]
+                if info_len < self.max_level + 4:
+                    pad_size = self.max_level + 4 - info_len
+                    padding = torch.zeros(batch_size, N, pad_size, dtype=torch.long, device=device)
+                    padded_levels = torch.cat([levels_stacked, padding], dim=2)
+                else:
+                    padded_levels = levels_stacked[:, :, :self.max_level + 4]
+            
+            lengths = [N] * batch_size  # 固定长度
+            levels_list = levels_raw  # 保存原始 levels
+            
+            return tokens_stacked, padded_levels, lengths, levels_list
+
+        # === Legacy tokenizer 路径 ===
         token_output = self.tokenizer.tokenize(img)
         processed_output = self.token_processor(token_output) if self.token_processor is not None else token_output
         legacy_output = processed_output.to_legacy()
@@ -489,9 +644,20 @@ class NextGenerationFractalViT(nn.Module):
         
         Returns:
             torch.Tensor: 策略梯度损失
+            
+        Note:
+            对于 streaming tokenizer（streaming, streaming_v2），此方法返回零损失，
+            因为它们使用 Gumbel-Softmax（完全可微分），不需要 REINFORCE。
         """
         loss = torch.tensor(0.0, device=self.aux_loss_weight.device)
         
+        # === ARCH-P1: Streaming tokenizer 不使用 REINFORCE ===
+        if self._is_streaming:
+            # StreamingFractalTokenizer 使用 Gumbel-Softmax，梯度直接反向传播
+            # 无需策略梯度损失
+            return loss
+        
+        # === Legacy tokenizer: REINFORCE 策略梯度损失 ===
         # 1. REINFORCE 策略梯度损失
         if hasattr(self.tokenizer, "saved_log_probs") and len(self.tokenizer.saved_log_probs) > 0:
             log_probs = torch.stack(self.tokenizer.saved_log_probs)
@@ -624,6 +790,10 @@ class SimpleFractalViT(nn.Module):
         emb_dropout: float = 0.0,
         min_patch_size: Tuple[int, int] = (4, 4),
         max_level: int = 5,
+        # === ARCH-P1: 新增 Streaming Tokenizer 支持 ===
+        tokenizer_type: TokenizerType = "legacy",
+        num_scales: int = 4,
+        streaming_tau: float = 1.0,
     ) -> None:
         """初始化 SimpleFractalViT。
         
@@ -641,6 +811,12 @@ class SimpleFractalViT(nn.Module):
             emb_dropout: 嵌入层 Dropout 比率
             min_patch_size: 最小 patch 尺寸
             max_level: 最大递归层级（默认 5，比完整版更保守）
+            tokenizer_type: tokenizer 类型选择
+                - "legacy": 使用 FractalHilbertTokenizer (BFS + REINFORCE)
+                - "streaming": 使用 StreamingFractalTokenizer (固定多尺度)
+                - "streaming_v2": 使用 StreamingFractalTokenizerV2 (Gumbel-Softmax 自适应)
+            num_scales: [streaming only] 多尺度金字塔层数
+            streaming_tau: [streaming_v2 only] Gumbel-Softmax 温度参数
         """
         super().__init__()
 
@@ -663,6 +839,10 @@ class SimpleFractalViT(nn.Module):
             use_spatial_encoding=True,
             use_feature_enhancement=False,
             use_dynamic_depth=False,
+            # === ARCH-P1: 传递 tokenizer_type 参数 ===
+            tokenizer_type=tokenizer_type,
+            num_scales=num_scales,
+            streaming_tau=streaming_tau,
         )
 
         self.tokenizer = self.enhanced_model.tokenizer
@@ -675,6 +855,7 @@ class SimpleFractalViT(nn.Module):
         self.pool = pool
         self.to_latent = self.enhanced_model.to_latent
         self.mlp_head = self.enhanced_model.mlp_head
+        self.tokenizer_type = tokenizer_type
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
         return self.enhanced_model(img, return_attention=False, return_aux_info=False, return_features=False)

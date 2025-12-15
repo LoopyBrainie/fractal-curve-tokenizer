@@ -2,6 +2,9 @@
 
 This module contains the EnhancedFractalTokenProcessor class, which handles
 token processing with multi-scale features, edge information, and texture analysis.
+
+.. deprecated:: 0.4.0
+    此模块已废弃。功能已集成到 StreamingFractalTokenizer。
 """
 from __future__ import annotations
 
@@ -10,14 +13,21 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from .features import TokenFeatures, compute_token_features
-from .tokenization import BaseTokenProcessor, TokenSequence, TokenizerOutput
+# 使用父包的导入
+from vit_pytorch.features import TokenFeatures, compute_token_features
+from vit_pytorch.tokenization import BaseTokenProcessor, TokenSequence, TokenizerOutput
 
 
 class EnhancedFractalTokenProcessor(BaseTokenProcessor):
     """
     增强的分形token处理器，对齐tokenizer的特征提取能力
     支持多尺度特征、边缘信息和纹理分析
+    
+    .. deprecated:: 0.4.0
+        推荐使用 :class:`StreamingFractalTokenizer`，其将 patch 分割与特征处理
+        统一为单次前向，无需单独的 TokenProcessor。
+        使用 ``NextGenerationFractalViT(tokenizer_type='streaming')`` 启用。
+        此类将在 v1.0 中移除。
     """
 
     def __init__(

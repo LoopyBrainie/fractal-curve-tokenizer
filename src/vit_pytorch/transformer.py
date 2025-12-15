@@ -1,9 +1,37 @@
 # -*- coding: utf-8 -*-
-"""Fractal-aware transformer blocks.
+"""
+分形感知 Transformer 模块
 
-This module implements transformer components that are aware of the
-hierarchical structure from the fractal tokenizer, including DropPath
-for stochastic depth and FractalTransformerBlock for the main transformer layer.
+数学形式化
+============
+
+Transformer Block:
+    x' = x + DropPath(Attention(LN(x), L))
+    x'' = x' + DropPath(FFN(LN(x'), L))
+
+其中:
+- Attention: HilbertAwareMultiScaleAttention
+- FFN: AdaptiveFractalFeedForward  
+- L: levels_info 层级信息
+- DropPath: 随机深度正则化
+
+DropPath (Stochastic Depth):
+    训练时: output = x * Bernoulli(1 - drop_prob) / (1 - drop_prob)
+    推理时: output = x
+
+全局上下文:
+    global_ctx = mean(x) * GLOBAL_CONTEXT_SCALE
+    x' = x + global_ctx
+
+类对照表
+----------
++----------------------------------+----------------------------------+
+| 类                                | 数学定义                           |
++==================================+==================================+
+| DropPath                         | x → x * mask / keep_prob         |
+| EnhancedFractalTransformerBlock  | x → Attn + FFN + GlobalCtx       |
+| EnhancedFractalTransformer       | 堆叠 depth 个 TransformerBlock   |
++----------------------------------+----------------------------------+
 """
 
 from __future__ import annotations

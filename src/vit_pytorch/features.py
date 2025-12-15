@@ -1,3 +1,29 @@
+# -*- coding: utf-8 -*-
+"""
+Token 特征计算模块
+
+数学形式化
+============
+
+TokenFeatures 包含 4 类特征:
+
+1. 统计特征 (stats ∈ R^{N × 2}):
+   - variance: σ² = Var(token)
+   - mean: μ = E[token]
+
+2. 边缘特征 (edge ∈ R^{N × 1}):
+   - edge_density = mean(|diff(token)|)
+   表征局部梯度强度
+
+3. 空间特征 (spatial ∈ R^{N × 2}):
+   - height, width (归一化后的 patch 尺寸)
+
+4. 层级特征 (level ∈ R^{N × 1}):
+   - depth 值，用于层级感知处理
+
+总特征维度: 6 维
+用途: 分割决策网络的输入特征
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass

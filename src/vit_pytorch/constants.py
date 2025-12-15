@@ -1,8 +1,26 @@
 # -*- coding: utf-8 -*-
-"""全局常量定义。
+"""
+全局常量定义模块
 
-此模块包含项目中使用的所有魔法数字和配置常量，
-便于统一管理和调整。
+数学形式化
+============
+
+本模块定义项目中所有超参数的默认值。
+
+层级常量:
+    L_max ∈ {10, 50}     最大递归深度
+    L_extra = 5          深度安全余量
+
+缩放因子:
+    λ_hilbert = 0.1      Hilbert 偏置: B_h → λ_hilbert · B_h
+    λ_level = 0.05       层级偏置: B_l → λ_level · B_l
+    λ_global = 0.1       全局上下文: ctx → λ_global · ctx
+
+初始化:
+    σ_emb = 0.02         嵌入层初始化标准差
+
+Logits 裁剪:
+    logits = clamp(logits, -10, 10)  防止数值溢出
 """
 
 from __future__ import annotations
