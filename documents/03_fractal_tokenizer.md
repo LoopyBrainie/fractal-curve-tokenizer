@@ -1,116 +1,177 @@
-# 第三章：分形 Tokenizer 核心 (fractal_curve_tokenizer.py)
+# 第三章：分形 Tokenizer 核心 (streaming_tokenizer.py)
 
-本章详尽描述了图像数据如何通过分形分词器被转化为 Token 序列。这是整个模型的数据入口，决定了后续处理的粒度和质量。
+本章详尽描述了图像数据如何通过流式分形分词器被转化为 Token 序列。这是整个模型的数据入口。
 
 ## 3.1 数据流概览
 
-1.  **输入**: 原始图像 Batch `(B, C, H, W)`。
-2.  **处理**: 对每张图像独立进行递归分割。
-    *   提取局部特征（手工特征 + 可选 CNN 特征）。
-    *   通过策略网络决策是否分割。
-    *   若分割，按 Hilbert 顺序递归处理子块。
-    *   若停止，将当前 Patch 处理为固定尺寸并展平。
-3.  **输出**: `TokenizerOutput` 对象，包含 $B$ 个 `TokenSequence`，每个序列长度 $N_i$ 不定。
+```mermaid
+graph LR
+    A[Image B×C×H×W] --> B[MultiScalePatchEncoder]
+    B --> C[ConvPyramid]
+    C --> D{尺度选择}
+    D -->|V1: 固定| E[直接使用]
+    D -->|V2: Gumbel-Softmax| F[自适应选择]
+    E --> G[HilbertIndexer]
+    F --> G
+    G --> H[Hilbert 重排序]
+    H --> I[TokenizerOutput]
+```
+
+**数学形式化**:
+$$T: \mathbb{R}^{B \times C \times H \times W} \to (\mathbb{R}^{B \times N \times D}, \mathbb{Z}^{B \times N})$$
+
+其中 $N = \frac{H}{p} \times \frac{W}{p}$ 是固定的 token 数量。
 
 ---
 
-## 3.2 核心类：FractalHilbertTokenizer
+## 3.2 核心类：MultiScalePatchEncoder
 
-### `tokenize(images)`
-这是分词器的入口函数。
+多尺度卷积金字塔，为每个尺度生成特征图。
 
-*   **输入参数**:
-    *   `images` (Tensor): 形状 `(B, C, H, W)`。
-    *   *(注: `use_cnn` 选项已移至 `__init__` 初始化参数，不再作为 `tokenize` 的参数)*
-*   **执行流程**:
-    1.  **初始化**: 计算 `estimated_max_level`，清空 `saved_log_probs`（用于 REINFORCE）。
-    2.  **Batch 循环**: 遍历 Batch 中的每一张图片 `image`。
-    3.  **分割调用**: 调用 `fractal_partition(image, level=0, ...)`。
-        *   默认使用 **BFS 批处理模式** (`fractal_partition_batched`) 以提高 GPU 利用率。
-        *   可通过配置回退到递归模式 (`fractal_partition_recursive`)。
-    4.  **结果收集**: 将返回的 `tokens` (List[Tensor]) 和 `levels` (List[List[int]]) 封装进 `TokenSequence`。
-    5.  **封装**: 返回 `TokenizerOutput(sequences)`。
+### 数学定义
+$$F_s = \text{Conv}_s(I), \quad s \in \{1, \ldots, S\}$$
 
-### `fractal_partition_batched(image, ...)` (BFS 模式)
-这是默认的高效分割引擎，采用广度优先搜索 (BFS) 和批处理策略。
+每个尺度的卷积配置：
+- `kernel_size = stride = patch_size_s`
+- 输出维度：`dim`
 
-*   **核心思想**: 将同一层级的所有 Patch 收集起来，组成 Batch 一次性通过 CNN 和策略网络，避免递归调用产生的大量微小 Kernel。
-*   **数据结构**: `PatchInfo` dataclass
-    *   `patch`: 图像块张量。
-    *   `level`: 当前层级。
-    *   `coord`: 象限坐标路径。
-    *   `dfs_order`: **关键属性**，用于在 BFS 过程中追踪 Hilbert DFS 遍历顺序。
-*   **执行流程**:
-    1.  **初始化队列**: 将整图作为第一个 `PatchInfo` 加入队列 `current_level_patches`。
-    2.  **层级循环 (BFS)**: 当队列不为空且 `level < max_level`：
-        *   **批处理决策**:
-            *   收集当前层所有 Patch。
-            *   调用 `_batch_decide_splits` 统一计算分割概率。
-            *   对于 `learnable_split`，调用 `_batch_learnable_decision` 一次性前向传播 CNN 和 MLP。
-        *   **动作执行**:
-            *   **停止分割**: 将 Patch 加入 `final_patches` 列表。
-            *   **继续分割**:
-                *   调用 `_adaptive_split` 切分 Patch。
-                *   计算子节点的 `dfs_order` (父节点 order + 偏移量)。
-                *   将子节点加入 `next_level_patches`。
-        *   **推进**: `current_level_patches = next_level_patches`。
-    3.  **处理剩余**: 将达到最大深度的 Patch 加入 `final_patches`。
-    4.  **重排序**: 根据 `dfs_order` 对 `final_patches` 进行排序，恢复 Hilbert 遍历顺序。
-    5.  **后处理**: 统一 Patch 尺寸并展平，返回 Token 列表。
+### 代码结构
+```python
+class MultiScalePatchEncoder(nn.Module):
+    def __init__(self, in_channels, dim, scales):
+        # scales: List[int], 如 [4, 8, 16]
+        self.encoders = nn.ModuleList([
+            nn.Conv2d(in_channels, dim, kernel_size=s, stride=s)
+            for s in scales
+        ])
+```
 
-### `fractal_partition_recursive(patch, ...)` (递归模式)
-传统的深度优先 (DFS) 实现，逻辑直观但 GPU 效率较低。
-
-*   **流程**:
-    1.  **检查停止条件**: 尺寸过小或达到最大深度。
-    2.  **单次决策**: 对当前 Patch 运行策略网络。
-    3.  **递归**:
-        *   若分割：切分 Patch，计算 Hilbert 顺序，递归调用子节点。
-        *   若停止：处理并返回当前 Patch。
-    4.  **聚合**: 拼接子节点的返回结果。
-
-### `_adaptive_split(patch, H, W, ...)`
-负责具体的张量切分操作。
-
-*   **逻辑**:
-    *   尝试 **智能四分法** (`_intelligent_quadrant_split`)：寻找最接近中心的整数分割点。
-    *   如果无法四分（如长条形），则退化为 **二分法**。
-    *   使用 `tensor[:, :split_h, :split_w]` 等切片操作生成子块。
-
-### `_process_patch_to_fixed_size(patch, H, W)`
-负责将任意尺寸的叶子节点 Patch 归一化。
-
-*   **逻辑**:
-    *   如果 Patch 尺寸等于 `min_patch_size`: 直接返回。
-    *   如果 Patch 尺寸小于 `min_patch_size`: 使用 `F.pad` 进行填充。
-    *   如果 Patch 尺寸大于 `min_patch_size`: 使用 `F.adaptive_avg_pool2d` 下采样。
-*   **目的**: 确保输入 Transformer 的所有 Token 维度一致。
+### 输出
+- 多个特征图：`List[Tensor]`，每个形状为 `(B, D, H/s, W/s)`
 
 ---
 
-## 3.3 辅助神经网络类
+## 3.3 核心类：HilbertIndexer
 
-### `MiniCNN`
-轻量级特征提取器，为决策网络提供视觉信息。
+预计算 Hilbert 曲线索引，用于特征重排序。
 
-*   **输入**: `(B, C, H, W)` 或 `(C, H, W)`。
-*   **结构**:
-    1.  `InstanceNorm2d`: 归一化，消除亮度差异。
-    2.  `Conv2d` (3->16, k=3, s=2) + `ReLU`: 下采样。
-    3.  `InstanceNorm2d`.
-    4.  `Conv2d` (16->32, k=3, s=2) + `ReLU`: 下采样。
-    5.  `AdaptiveAvgPool2d((1, 1))`: 全局池化。
-    6.  `Flatten`: 展平。
-*   **输出**: `(B, 32)` 特征向量。
+### 数学定义
+$$H: \text{Grid}_{h \times w} \to \text{Seq}_{n}$$
 
-### `LearnableSplitDecision`
-策略网络 (Policy Network)。
+将 2D 网格按 Hilbert 曲线顺序展平为 1D 序列。
 
-*   **输入**: `(B, 38)` (6 统计特征 + 32 CNN 特征)。
-*   **结构**:
-    1.  `LayerNorm`: 归一化混合特征。
-    2.  `Linear(38, 128)` -> `ReLU` -> `Dropout`.
-    3.  `Linear(128, 64)` -> `ReLU` -> `Dropout`.
-    4.  `Linear(64, 2)`.
-*   **输出**: `(B, 2)` Logits，分别对应 `[停止, 分割]`。
-*   **初始化**: 偏置 `bias[1] += 2.0`，初始阶段倾向于分割，鼓励探索。
+### 接口
+```python
+@staticmethod
+@lru_cache(maxsize=64)
+def get_hilbert_order(grid_size: int) -> torch.Tensor:
+    """返回索引张量，将光栅顺序映射到 Hilbert 顺序。"""
+```
+
+### 特点
+- 使用 `@lru_cache` 缓存，避免重复计算
+- 调用 `HilbertCurve.d_to_xy()` 进行坐标转换
+
+---
+
+## 3.4 核心类：StreamingFractalTokenizer (V1)
+
+固定多尺度 tokenization，不涉及动态选择。
+
+### 初始化参数
+| 参数 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `image_size` | int | - | 输入图像尺寸 |
+| `dim` | int | - | 输出 token 维度 |
+| `patch_size` | int | 8 | 基础 patch 尺寸 |
+| `in_channels` | int | 3 | 输入通道数 |
+
+### tokenize() 方法
+
+**输入**: `images` 张量 `(B, C, H, W)`
+
+**流程**:
+1. **卷积编码**: 通过 `patch_embed` 卷积层提取特征
+2. **展平**: 将特征图展平为序列
+3. **Hilbert 重排序**: 使用 `HilbertIndexer` 重排序
+4. **层级信息生成**: 固定深度 = 0
+
+**输出**: `TokenizerOutput` 包含 B 个 `TokenSequence`
+
+---
+
+## 3.5 核心类：StreamingFractalTokenizerV2 (推荐)
+
+使用 Gumbel-Softmax 实现端到端可微的尺度选择。
+
+### 数学定义
+
+**尺度分数计算**:
+$$\pi_{ij} = \text{softmax}(\text{ScoreNet}(F_{ij}) / \tau)$$
+
+**Gumbel-Softmax (训练时)**:
+$$\hat{\pi}_k = \frac{\exp((\log \pi_k + g_k) / \tau)}{\sum_l \exp((\log \pi_l + g_l) / \tau)}$$
+
+其中 $g_k \sim \text{Gumbel}(0, 1)$
+
+**硬选择 (推理时)**:
+$$s^* = \arg\max_s \pi_s$$
+
+### 初始化参数
+| 参数 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `image_size` | int | - | 输入图像尺寸 |
+| `dim` | int | - | 输出 token 维度 |
+| `scales` | List[int] | [4, 8, 16] | 可选尺度列表 |
+| `temperature` | float | 1.0 | Gumbel-Softmax 温度 |
+| `in_channels` | int | 3 | 输入通道数 |
+
+### tokenize() 方法
+
+**流程**:
+1. **多尺度编码**: 通过 `MultiScalePatchEncoder` 提取多尺度特征
+2. **尺度分数**: 对每个位置计算各尺度的分数
+3. **尺度选择**:
+   - 训练: Gumbel-Softmax 软选择
+   - 推理: argmax 硬选择
+4. **特征融合**: 加权组合各尺度特征
+5. **Hilbert 重排序**: 按 Hilbert 顺序重排
+
+**输出**: `TokenizerOutput`
+
+---
+
+## 3.6 与旧版 FractalHilbertTokenizer 的对比
+
+| 特性 | 旧版 (BFS + REINFORCE) | 新版 (Streaming) |
+| :--- | :--- | :--- |
+| **分割方式** | 递归四叉树 | 固定网格 |
+| **决策机制** | 策略网络 + 采样 | 卷积 + Gumbel-Softmax |
+| **可微性** | 不可微，需 REINFORCE | 端到端可微 |
+| **Token 数量** | 变长 | 固定 |
+| **GPU 效率** | 低（Python 循环） | 高（全 GPU 执行） |
+| **训练稳定性** | 低（高方差） | 高 |
+
+---
+
+## 3.7 使用示例
+
+```python
+from vit_pytorch import StreamingFractalTokenizerV2
+
+# 创建 tokenizer
+tokenizer = StreamingFractalTokenizerV2(
+    image_size=224,
+    dim=384,
+    scales=[4, 8, 16],
+    temperature=1.0,
+)
+
+# Tokenize
+images = torch.randn(2, 3, 224, 224)
+output = tokenizer.tokenize(images)
+
+# 输出结构
+print(len(output.sequences))  # 2
+print(output.sequences[0].tokens.shape)  # (N, 384)
+```

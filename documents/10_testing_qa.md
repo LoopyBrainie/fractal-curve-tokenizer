@@ -6,72 +6,130 @@
 
 ```text
 tests/
-├── unit/                   # 单元测试：测试单个组件的功能
+├── unit/                   # 单元测试：测试单个组件
 │   ├── test_fractal_vit.py
-│   ├── test_tokenizer.py
-│   ├── test_utils.py
+│   ├── test_streaming_tokenizer.py
+│   ├── test_attention.py
+│   ├── test_feedforward.py
 │   ├── test_hilbert.py
-│   └── ...
+│   ├── test_positional.py
+│   └── test_utils.py
 ├── integration/            # 集成测试：测试完整流程
 │   ├── test_training.py
 │   └── test_system.py
 ├── benchmarks/             # 性能基准测试
+│   ├── benchmark_fractal_vit.py
 │   └── compare_fractal_vs_standard.py
 └── conftest.py             # Pytest 配置和 Fixtures
 ```
 
+---
+
 ## 10.2 单元测试覆盖范围
 
-*   **Tokenizer 测试 (`test_tokenizer.py`)**:
-    *   验证不同输入尺寸和 Batch Size 下的输出形状。
-    *   验证极端长宽比下的处理能力。
-    *   **批处理一致性**: 验证 BFS 批处理模式与递归模式输出完全一致。
-    *   **Hilbert 顺序**: 验证批处理模式下仍能保持正确的 Hilbert 遍历顺序。
-*   **模型测试 (`test_fractal_vit.py`)**:
-    *   **自适应能力**: 验证复杂图像比简单图像产生更多的 Token。
-    *   **Batch 处理**: 验证 Padding 和 Masking 机制在变长序列下的正确性。
-    *   **位置编码**: 验证不同路径产生不同的 Embedding。
-    *   **Mask 有效性**: 验证 Padding Token 不会影响有效 Token 的计算结果。
-*   **工具测试 (`test_utils.py`)**:
-    *   验证统一的深度提取 (`extract_depths`) 和层级规范化函数。
-    *   验证特征计算和 Mask 生成函数的正确性。
-*   **Hilbert 测试 (`test_hilbert.py`)**:
-    *   验证 Hilbert 曲线生成的正确性和缓存机制。
+### Tokenizer 测试 (`test_streaming_tokenizer.py`)
+- ✅ 不同输入尺寸和 Batch Size 下的输出形状
+- ✅ Hilbert 重排序的正确性
+- ✅ V1 和 V2 的输出一致性
+- ✅ 多尺度特征提取
 
-## 10.3 基准测试与评估
+### 模型测试 (`test_fractal_vit.py`)
+- ✅ 前向传播形状正确性
+- ✅ 不同 tokenizer_type 的支持
+- ✅ Batch 处理（Padding 和 Masking）
+- ✅ 位置编码注入
 
-`tests/benchmarks/` 目录包含了一套完整的性能评估工具。
+### 注意力测试 (`test_attention.py`)
+- ✅ 不同 bias_mode 的正确性
+- ✅ Low-Rank 分解精度
+- ✅ Mask 有效性
 
-### 1. 核心对比 (`compare_fractal_vs_standard.py`)
-提供与标准 ViT 的公平对比。
-*   **对比对象**: `NextGenerationFractalViT` vs `StandardViT` (PyTorch 原生实现)。
-*   **指标**: 参数量、显存占用、推理延迟、吞吐量。
-*   **目的**: 量化分形 Tokenizer 带来的性能开销与收益。
+### FFN 测试 (`test_feedforward.py`)
+- ✅ SwiGLU 输出形状
+- ✅ 层级自适应机制
+- ✅ 不同 ffn_type 的支持
 
-### 2. CNN 消融实验 (`benchmark_cnn_ablation.py`)
-验证 CNN 特征提取对分割决策的影响。
-*   **对比设置**:
-    *   **Baseline**: 仅使用手工特征 (6维: level, height, width, variance, mean, edge_density)。
-    *   **With CNN**: 手工特征 + CNN 特征 (6+32=38维)。
-*   **评估指标**: 训练收敛速度、验证准确率、Token 数量分布、训练耗时。
-*   **目的**: 确定引入 CNN 特征提取器是否物有所值（即带来的精度提升是否超过了计算开销）。
+### Hilbert 测试 (`test_hilbert.py`)
+- ✅ d ↔ (x,y) 双向映射
+- ✅ 边界情况处理
+- ✅ 缓存机制
 
-### 2. 综合性能基准 (`benchmark_fractal_vit.py`)
-深入分析 Fractal ViT 的各项性能指标。
-*   **测试项**:
-    *   **Tokenizer 效率**: 纯 Tokenizer 的吞吐量 (img/s)。
-    *   **端到端性能**: 完整模型的前向/反向传播速度。
-    *   **显存分析**: 详细的显存占用分布。
-*   **特性**: 支持不同 Batch Size 和 Image Size 的压力测试。
+### 工具测试 (`test_utils.py`)
+- ✅ `extract_depths` 维度处理
+- ✅ `normalize_levels_info` 升维
+- ✅ `create_attention_mask` 向量化
 
-### 3. 预训练评估 (`evaluate_pretrained.py`)
-用于评估已训练模型的性能。
-*   **功能**: 加载 Checkpoint 并在指定数据集上运行验证。
-*   **可视化**: 支持生成预测结果的可视化网格 (`--visualize`)。
-*   **指标**: Top-1 Accuracy, Top-5 Accuracy, Loss。
+---
 
-### 4. 收敛性检查 (`check_convergence.py`)
-用于快速验证模型是否具备学习能力。
-*   **方法**: 在极小数据集（如 100 张图）上过拟合。
-*   **判定**: 如果 Loss 能迅速下降到接近 0，说明模型架构无严重 Bug。
+## 10.3 运行测试
 
+```bash
+# 运行所有测试
+uv run pytest tests/ -v
+
+# 运行单元测试
+uv run pytest tests/unit/ -v
+
+# 运行特定测试文件
+uv run pytest tests/unit/test_streaming_tokenizer.py -v
+
+# 运行带覆盖率
+uv run pytest tests/ --cov=vit_pytorch --cov-report=html
+```
+
+---
+
+## 10.4 基准测试与评估
+
+### 核心对比 (`compare_fractal_vs_standard.py`)
+
+与标准 ViT 的公平对比：
+- **对比对象**: `NextGenerationFractalViT` vs `StandardViT`
+- **指标**: 参数量、显存占用、推理延迟、吞吐量
+
+### 综合性能基准 (`benchmark_fractal_vit.py`)
+
+深入分析各项性能指标：
+- **Tokenizer 效率**: 纯 Tokenizer 的吞吐量 (img/s)
+- **端到端性能**: 完整模型的前向/反向传播速度
+- **显存分析**: 详细的显存占用分布
+
+---
+
+## 10.5 废弃模块测试
+
+废弃模块的测试位于 `tests/unit/test_deprecated.py`：
+- ✅ 延迟导入正确性
+- ✅ DeprecationWarning 发出
+- ✅ 功能完整性（向后兼容）
+
+---
+
+## 10.6 测试状态
+
+| 测试类别 | 数量 | 状态 |
+| :--- | :--- | :--- |
+| 单元测试 | ~100 | ✅ 通过 |
+| 集成测试 | ~20 | ✅ 通过 |
+| 基准测试 | ~10 | ✅ 通过 |
+| **总计** | **~130** | **✅ 全部通过** |
+
+---
+
+## 10.7 持续集成
+
+建议的 CI/CD 配置：
+
+```yaml
+# .github/workflows/test.yml
+name: Tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync
+      - run: uv run pytest tests/ -v --tb=short
+```

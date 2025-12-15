@@ -2,67 +2,162 @@
 
 本章详细解析 `HilbertAwareMultiScaleAttention`，这是模型理解分形结构和空间关系的核心组件。
 
-## 5.1 类：HilbertAwareMultiScaleAttention
+## 5.1 数学形式化
 
-### `forward(x, levels_info, attention_mask)`
+### 标准多头注意力
+$$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) \cdot V$$
 
-**Step 1: 投影 (QKV Projection)**
-*   **输入**: `x` `(B, S, Dim)`。
-*   **操作**:
-    *   `self.norm(x)`。
-    *   `self.to_qkv(x)` -> `(B, S, 3 * Inner_Dim)`。
-    *   `chunk(3)` 分离出 Q, K, V。
-    *   `rearrange` 重排为多头格式 `(B, Heads, S, Dim_Head)`。
+### Hilbert 感知注意力
+$$\text{HilbertAttn}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}} \cdot \sigma_{scale} + B_{hilbert} + B_{level}\right) \cdot V$$
 
-**Step 2: 点积注意力 (Dot Product)**
-*   **操作**: `matmul(q, k.transpose)`。
-*   **输出**: `dots` `(B, Heads, S, S)` (Attention Logits)。
-*   **缩放**: 乘以 `scale` ($\frac{1}{\sqrt{d_k}}$)。
+---
 
-**Step 3: 层级缩放 (Level Scaling)**
-*   **条件**: `use_level_scaling=True`。
-*   **逻辑**:
-    *   从 `levels_info` 获取深度 `depths` `(B, S)`。
-    *   查表 `level_scale_embedding` 获取缩放因子 `(B, S, Heads)`。
-    *   调整形状并广播，乘以 `dots`。
-*   **目的**: 调节不同层级 Token 的注意力分布锐度。
+## 5.2 偏置项详解
 
-**Step 4: Hilbert 偏置注入 (Hilbert Bias)**
-*   **条件**: `use_hilbert_bias=True`。
-*   **模式选择**: 由 `bias_mode` 参数控制 (`original`, `low_rank`, `hierarchical`)。
-*   **模式详解**:
-    1.  **Original 模式** (默认):
-        *   计算所有 Token 对的欧氏距离和余弦相似度。
-        *   通过 MLP 映射为 Bias。
-        *   复杂度: $O(S^2)$，显存占用较高。
-    2.  **Low Rank 模式** (`low_rank`):
-        *   将 Bias 分解为两个低秩矩阵 $U \in \mathbb{R}^{S \times r}$ 和 $V \in \mathbb{R}^{S \times r}$。
-        *   $Bias = U \times V^T$。
-        *   复杂度: $O(S \cdot r)$，大幅降低显存占用 (r=32 时仅为原来的 1/8)。
-    3.  **Hierarchical 模式** (`hierarchical`):
-        *   基于 Token 的层级差异 (Level Difference) 和路径距离计算 Bias。
-        *   强调层级结构，具有更好的可解释性。
-*   **操作**: `dots = dots + hilbert_bias * 0.1`。
-*   **意义**: 让模型显式感知 Token 在 Hilbert 曲线上的空间邻近关系。
+### 1. Low-Rank Hilbert Bias (低秩分解，推荐)
 
-**Step 5: 相对层级偏置 (Level Bias)**
-*   **调用**: `_compute_level_bias(levels_info)`。
-*   **逻辑**:
-    1.  计算深度差 `diff = depth_i - depth_j`。
-    2.  查表 `relative_pos_embedding`。
-*   **操作**: `dots = dots + level_bias * 0.05`。
-*   **意义**: 编码跨层级关系（如父节点关注子节点）。
+**数学定义**:
+$$B_{hilbert}[i,j] = \phi(p_i)^T \cdot \psi(p_j)$$
 
-**Step 6: 掩码 (Masking)**
-*   **输入**: `attention_mask` `(B, 1, 1, S)` (True=保留, False=Mask)。
-*   **操作**: `dots.masked_fill_(~attention_mask, -inf)`。
-*   **作用**: 确保 Padding Token 的注意力权重为 0。
+其中 $\phi, \psi: \mathbb{R}^d \to \mathbb{R}^r$ 是可学习线性投影。
 
-**Step 7: Softmax 与 输出**
-*   **操作**:
-    *   `attn = softmax(dots)`。
-    *   `attn = dropout(attn)`。
-    *   `out = matmul(attn, v)`。
-    *   `rearrange` 合并多头 -> `(B, S, Dim)`。
-    *   `to_out` 线性投影。
-*   **输出**: `out` `(B, S, Dim)`。
+**复杂度对比**:
+| 指标 | Original | Low-Rank (r=32) |
+| :--- | :--- | :--- |
+| 计算 | $O(S^2 \cdot 64)$ | $O(S \cdot r)$ |
+| 显存 | $O(S^2)$ | $O(S \cdot r)$ |
+
+**实现类**: `LowRankHilbertBias`
+```python
+class LowRankHilbertBias(nn.Module):
+    def __init__(self, path_dim, rank, heads):
+        self.path_encoder_q = nn.Sequential(...)  # φ
+        self.path_encoder_k = nn.Sequential(...)  # ψ
+```
+
+### 2. Hierarchical Hilbert Bias (分层计算)
+
+**数学定义**:
+$$B_{hilbert}[i,j] = \sum_{\ell=1}^{L} b^{(\ell)}(q_i^{(\ell)}, q_j^{(\ell)})$$
+
+利用四叉树层级结构，各层独立计算。
+
+**特点**:
+- 可解释性强
+- 强调层级结构
+
+### 3. Level Bias (相对层级偏置)
+
+**数学定义**:
+$$B_{level}[i,j] = \text{Embedding}(\text{clamp}(d_i - d_j + L, 0, 2L))$$
+
+**作用**: 编码跨层级关系（如父节点关注子节点）
+
+### 4. Level Scaling (层级缩放)
+
+**数学定义**:
+$$\sigma_{scale}(d) = \text{LevelScaleEmb}(d)$$
+
+**作用**: 深层 token 使用较小缩放，调节注意力分布锐度
+
+---
+
+## 5.3 类：HilbertAwareMultiScaleAttention
+
+### 初始化参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `dim` | int | - | 输入维度 |
+| `heads` | int | 8 | 注意力头数 |
+| `dim_head` | int | 64 | 每头维度 |
+| `dropout` | float | 0.0 | Dropout 比率 |
+| `use_hilbert_bias` | bool | True | 是否使用 Hilbert 偏置 |
+| `bias_mode` | str | 'low_rank' | 偏置模式 |
+| `rank` | int | 32 | Low-Rank 秩 |
+| `max_level` | int | 50 | 最大层级 |
+
+### forward(x, levels_info, attention_mask)
+
+**Step 1: QKV 投影**
+```python
+x = self.norm(x)
+qkv = self.to_qkv(x)  # (B, S, 3 * Inner_Dim)
+q, k, v = qkv.chunk(3, dim=-1)
+q, k, v = map(rearrange, [q, k, v], ['b s (h d) -> b h s d'] * 3)
+```
+
+**Step 2: 点积注意力**
+```python
+dots = torch.matmul(q, k.transpose(-1, -2))  # (B, H, S, S)
+dots = dots * self.scale  # 1/√d_k
+```
+
+**Step 3: 层级缩放**
+```python
+if self.use_level_scaling:
+    depths = extract_depths(levels_info, self.max_level)
+    scale_factors = self.level_scale_embedding(depths)
+    dots = dots * scale_factors
+```
+
+**Step 4: Hilbert 偏置注入**
+```python
+if self.use_hilbert_bias:
+    hilbert_bias = self._compute_hilbert_bias(levels_info)
+    dots = dots + hilbert_bias * HILBERT_BIAS_SCALE
+```
+
+**Step 5: 层级偏置**
+```python
+level_bias = self._compute_level_bias(levels_info)
+dots = dots + level_bias * LEVEL_BIAS_SCALE
+```
+
+**Step 6: 掩码**
+```python
+dots.masked_fill_(~attention_mask, float('-inf'))
+```
+
+**Step 7: Softmax 与输出**
+```python
+attn = F.softmax(dots, dim=-1)
+attn = self.dropout(attn)
+out = torch.matmul(attn, v)
+out = rearrange(out, 'b h s d -> b s (h d)')
+return self.to_out(out)
+```
+
+---
+
+## 5.4 bias_mode 选项对比
+
+| 模式 | 复杂度 | 显存 | 精度 | 可解释性 |
+| :--- | :--- | :--- | :--- | :--- |
+| `original` | $O(S^2)$ | 高 | 最高 | 低 |
+| `low_rank` | $O(S \cdot r)$ | 低 | 高 | 中 |
+| `hierarchical` | $O(S \cdot L)$ | 中 | 中 | 最高 |
+
+**推荐**: 对于大多数场景，使用 `low_rank` 模式 (rank=32)。
+
+---
+
+## 5.5 使用示例
+
+```python
+from vit_pytorch import HilbertAwareMultiScaleAttention
+
+attn = HilbertAwareMultiScaleAttention(
+    dim=384,
+    heads=6,
+    dim_head=64,
+    bias_mode='low_rank',
+    rank=32,
+)
+
+x = torch.randn(2, 100, 384)  # (B, S, D)
+levels_info = torch.zeros(2, 100, 10, dtype=torch.long)  # (B, S, Info)
+mask = torch.ones(2, 1, 1, 100, dtype=torch.bool)
+
+out = attn(x, levels_info, mask)  # (2, 100, 384)
+```
