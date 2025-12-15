@@ -1,50 +1,37 @@
 #!/usr/bin/env python3
-"""Fractal ViT Training Script - Optimized for Experimentation
+"""Fractal ViT Training Script - 简洁版
 
-重写版本 (2025-12-11):
-- 完全采用 NextGenerationFractalViT 和 ffn_type 参数
-- 详细的实验日志和指标追踪
-- 支持 SwiGLU + Level Adaptation 等 FFN 变体
-- 改进的 tokenization 监控和分析
-- 优化的内存管理和训练效率
+特性：
+1. StreamingFractalTokenizerV2：Gumbel-Softmax 自适应多尺度
+2. SwiGLU FFN：现代化前馈网络
+3. Hilbert 曲线重排序：保持空间局部性
+4. AMP 混合精度训练
 
-主要改进:
-1. 移除 SimpleFractalViT，统一使用 NextGenerationFractalViT
-2. 新增 --ffn-type 参数（gelu / swiglu / swiglu_level）
-3. 结构化的实验日志（JSON 格式）
-4. 详细的 tokenization 自适应性分析
-5. 改进的错误处理和训练中断恢复
+使用示例：
+    # CIFAR-10 快速测试
+    python train_fractal_vit.py --quick-test --use-amp
+    
+    # Tiny ImageNet 完整训练
+    python train_fractal_vit.py --dataset tiny-imagenet --epochs 100 --use-amp
 """
 
 from __future__ import annotations
 
 import os
 import sys
-
-# ============================================================================
-# 环境配置（必须在导入 torch 之前）
-# ============================================================================
-
-# 强制设置 multiprocessing 启动方法为 spawn（CUDA 兼容）
+import platform
 import multiprocessing as _mp
+
+# 强制 spawn 方法（CUDA + 容器必需）
 try:
     _mp.set_start_method('spawn', force=True)
 except RuntimeError:
-    pass  # 已经设置过
+    pass
 
-_max_split_mb = 512
-for i, arg in enumerate(sys.argv):
-    if arg == '--max-split-size-mb' and i + 1 < len(sys.argv):
-        try:
-            _max_split_mb = int(sys.argv[i + 1])
-        except ValueError:
-            pass
-
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 
-                      f'max_split_size_mb:{_max_split_mb},expandable_segments:True')
-os.environ.setdefault('CUDA_LAUNCH_BLOCKING', '0')
-os.environ.setdefault('OMP_NUM_THREADS', '2')
-os.environ.setdefault('MKL_NUM_THREADS', '2')
+# CUDA 内存优化
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:512,expandable_segments:True')
+os.environ.setdefault('OMP_NUM_THREADS', '4')
+os.environ.setdefault('MKL_NUM_THREADS', '4')
 
 import argparse
 import json
@@ -52,12 +39,11 @@ import multiprocessing
 import random
 import shutil
 import time
-import urllib.request
 import zipfile
-from collections import defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.request import urlretrieve
 
 import numpy as np
 import torch
@@ -65,11 +51,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader, SubsetRandomSampler
+from torch.utils.data import DataLoader, Dataset, SubsetRandomSampler
 from torchvision import datasets, transforms
 from tqdm import tqdm
 
-# 项目路径设置
+# AMP 兼容层
+try:
+    from torch.amp import autocast, GradScaler
+    _NEW_AMP = True
+except ImportError:
+    from torch.cuda.amp import autocast, GradScaler  # type: ignore
+    _NEW_AMP = False
+
+# 项目路径
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
@@ -110,10 +104,9 @@ class TrainingConfig:
     mlp_dim: int
     dim_head: int
     max_level: int
+    num_scales: int
     pool: str
     ffn_type: str
-    learnable_split: bool
-    gradient_checkpoint: bool
     
     # 训练
     epochs: int
@@ -124,180 +117,12 @@ class TrainingConfig:
     gradient_clip: float
     use_amp: bool
     accum_steps: int
+    warmup_epochs: int
+    gradient_checkpoint: bool
     
     # 系统
     seed: int
     device: str
-
-
-@dataclass
-class TokenStats:
-    """Tokenization 统计"""
-    avg_tokens: float
-    min_tokens: int
-    max_tokens: int
-    std_tokens: float
-    levels_used: List[int]
-
-
-@dataclass
-class EpochMetrics:
-    """Epoch 指标"""
-    epoch: int
-    train_loss: float
-    train_acc: float
-    val_loss: float
-    val_acc: float
-    lr: float
-    time: float
-    tokens: Optional[TokenStats] = None
-
-
-# ============================================================================
-# Tiny ImageNet 下载和组织
-# ============================================================================
-
-def download_and_setup_tiny_imagenet(data_root: Path) -> bool:
-    """下载并设置 Tiny ImageNet 数据集
-    
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    target_dir = data_root / "tiny-imagenet-200"
-    
-    # 检查是否已存在且完整
-    if (target_dir / "train").exists() and (target_dir / "val").exists():
-        # 快速验证：检查训练集是否有足够的类别
-        train_classes = len(list((target_dir / "train").iterdir()))
-        if train_classes >= 200:
-            return True
-    
-    print("\n" + "="*70)
-    print("Downloading Tiny ImageNet...")
-    print("="*70)
-    
-    zip_path = data_root / "tiny-imagenet-200.zip"
-    url = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
-    expected_size = 248100043  # ~237 MB
-    
-    # 检查现有 zip 文件是否有效
-    if zip_path.exists():
-        print(f"Found existing zip: {zip_path}")
-        
-        # 验证文件大小
-        actual_size = zip_path.stat().st_size
-        if actual_size < expected_size * 0.95:  # 允许 5% 误差
-            print(f"⚠️  File size mismatch (expected ~{expected_size}, got {actual_size})")
-            print("Removing corrupted file and re-downloading...")
-            zip_path.unlink()
-        else:
-            # 验证是否为有效 zip 文件
-            try:
-                with zipfile.ZipFile(zip_path, 'r') as zf:
-                    # 测试 zip 文件完整性
-                    if zf.testzip() is not None:
-                        print("⚠️  Zip file is corrupted")
-                        print("Removing corrupted file and re-downloading...")
-                        zip_path.unlink()
-                    else:
-                        print("✓ Zip file verified")
-            except zipfile.BadZipFile:
-                print("⚠️  Invalid zip file")
-                print("Removing corrupted file and re-downloading...")
-                zip_path.unlink()
-    
-    # 下载
-    if not zip_path.exists():
-        print(f"\nDownloading from {url}...")
-        print("This may take several minutes (~237 MB)...")
-        
-        try:
-            with tqdm(unit='B', unit_scale=True, unit_divisor=1024, miniters=1, desc="Downloading") as pbar:
-                def reporthook(block_num, block_size, total_size):
-                    if pbar.total is None and total_size > 0:
-                        pbar.total = total_size
-                    pbar.update(block_size)
-                
-                urllib.request.urlretrieve(url, zip_path, reporthook=reporthook)
-            
-            # 验证下载的文件
-            downloaded_size = zip_path.stat().st_size
-            print(f"\n✓ Downloaded {downloaded_size:,} bytes")
-            
-            if downloaded_size < expected_size * 0.95:
-                print(f"⚠️  Downloaded file seems incomplete (expected ~{expected_size:,} bytes)")
-                return False
-                
-        except Exception as e:
-            print(f"\n✗ Download failed: {e}")
-            if zip_path.exists():
-                zip_path.unlink()
-            return False
-    
-    # 解压
-    print("\nExtracting archive...")
-    try:
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            # 显示解压进度
-            members = zip_ref.namelist()
-            for member in tqdm(members, desc="Extracting"):
-                zip_ref.extract(member, data_root)
-        print(f"✓ Extracted to {target_dir}")
-    except Exception as e:
-        print(f"✗ Extraction failed: {e}")
-        # 清理部分解压的文件
-        if target_dir.exists():
-            shutil.rmtree(target_dir, ignore_errors=True)
-        return False
-    
-    # 组织验证集（Tiny ImageNet 的 val 目录需要重新组织）
-    val_dir = target_dir / "val"
-    val_images_dir = val_dir / "images"
-    
-    if val_images_dir.exists():
-        print("\nOrganizing validation set...")
-        
-        # 读取验证集标注
-        val_annotations = val_dir / "val_annotations.txt"
-        if val_annotations.exists():
-            # 创建类别目录
-            img_to_class = {}
-            with open(val_annotations, 'r') as f:
-                for line in f:
-                    parts = line.strip().split('\t')
-                    if len(parts) >= 2:
-                        img_name = parts[0]
-                        class_id = parts[1]
-                        img_to_class[img_name] = class_id
-            
-            # 移动图像到对应类别目录
-            for img_name, class_id in tqdm(img_to_class.items(), desc="Organizing"):
-                class_dir = val_dir / class_id / "images"
-                class_dir.mkdir(parents=True, exist_ok=True)
-                
-                src = val_images_dir / img_name
-                dst = class_dir / img_name
-                
-                if src.exists() and not dst.exists():
-                    shutil.move(str(src), str(dst))
-            
-            # 删除原始 images 目录
-            if val_images_dir.exists() and not any(val_images_dir.iterdir()):
-                val_images_dir.rmdir()
-            
-            print("✓ Validation set organized")
-    
-    # 清理 zip 文件（可选）
-    if zip_path.exists():
-        try:
-            zip_path.unlink()
-            print(f"✓ Cleaned up {zip_path.name}")
-        except:
-            pass
-    
-    print("="*70)
-    print("✓ Tiny ImageNet setup complete!\n")
-    return True
 
 
 # ============================================================================
@@ -305,197 +130,51 @@ def download_and_setup_tiny_imagenet(data_root: Path) -> bool:
 # ============================================================================
 
 DATASETS = {
-    "cifar10": DatasetSpec(
-        name="CIFAR10",
-        num_classes=10,
-        image_size=32,
-        channels=3,
-        mean=(0.4914, 0.4822, 0.4465),
-        std=(0.2470, 0.2435, 0.2616),
-    ),
-    "cifar100": DatasetSpec(
-        name="CIFAR100",
-        num_classes=100,
-        image_size=32,
-        channels=3,
-        mean=(0.5071, 0.4865, 0.4409),
-        std=(0.2673, 0.2564, 0.2762),
-    ),
-    "mnist": DatasetSpec(
-        name="MNIST",
-        num_classes=10,
-        image_size=28,
-        channels=1,
-        mean=(0.1307,),
-        std=(0.3081,),
-    ),
-    "tiny-imagenet": DatasetSpec(
-        name="TinyImageNet",
-        num_classes=200,
-        image_size=64,
-        channels=3,
-        mean=(0.485, 0.456, 0.406),
-        std=(0.229, 0.224, 0.225),
-    ),
+    "cifar10": DatasetSpec("CIFAR10", 10, 32, 3, (0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+    "cifar100": DatasetSpec("CIFAR100", 100, 32, 3, (0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762)),
+    "mnist": DatasetSpec("MNIST", 10, 28, 1, (0.1307,), (0.3081,)),
+    "tiny-imagenet": DatasetSpec("TinyImageNet", 200, 64, 3, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
 }
 
 
 # ============================================================================
-# Tokenization 监控
+# 环境检测
 # ============================================================================
 
-class TokenizationMonitor:
-    """监控 tokenization 自适应性"""
+def detect_environment() -> Dict[str, Any]:
+    """检测运行环境"""
+    env = {
+        'in_container': os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv'),
+        'platform': platform.system(),
+        'cpu_count': multiprocessing.cpu_count(),
+        'recommended_workers': 4,
+    }
     
-    def __init__(self):
-        self.epoch_stats: Dict[int, List[TokenStats]] = defaultdict(list)
-        self.variance_token_pairs: List[Tuple[float, int]] = []
+    if env['platform'] == 'Linux':
+        try:
+            import psutil
+            shm = psutil.disk_usage('/dev/shm')
+            shm_gb = shm.total / (1024**3)
+            if shm_gb >= 8:
+                env['recommended_workers'] = min(12, env['cpu_count'])
+            elif shm_gb >= 4:
+                env['recommended_workers'] = min(8, env['cpu_count'])
+        except ImportError:
+            pass
     
-    @torch.no_grad()
-    def analyze_batch(self, model: nn.Module, images: torch.Tensor, epoch: int) -> TokenStats:
-        """分析一个 batch"""
-        tokenizer = getattr(model, "tokenizer", None)
-        if tokenizer is None:
-            return TokenStats(0, 0, 0, 0, [])
-        
-        output = tokenizer.tokenize(images)
-        sequences = output.sequences
-        
-        token_counts = [seq.tokens.shape[0] for seq in sequences]
-        all_levels = []
-        
-        for seq in sequences:
-            levels = seq.metadata.get("levels", None)
-            if levels is not None and levels.numel() > 0:
-                all_levels.extend(levels[:, 0].tolist())
-        
-        # 记录 variance-token 关系
-        for i, count in enumerate(token_counts):
-            var = images[i].var().item()
-            self.variance_token_pairs.append((var, count))
-        
-        stats = TokenStats(
-            avg_tokens=float(np.mean(token_counts)),
-            min_tokens=int(np.min(token_counts)),
-            max_tokens=int(np.max(token_counts)),
-            std_tokens=float(np.std(token_counts)),
-            levels_used=sorted(list(set(all_levels))) if all_levels else [],
-        )
-        
-        self.epoch_stats[epoch].append(stats)
-        return stats
-    
-    def compute_correlation(self) -> float:
-        """计算 variance-token 相关性"""
-        if len(self.variance_token_pairs) < 10:
-            return 0.0
-        vars_list = [v for v, _ in self.variance_token_pairs]
-        tokens_list = [t for _, t in self.variance_token_pairs]
-        corr = np.corrcoef(vars_list, tokens_list)[0, 1]
-        return float(corr) if not np.isnan(corr) else 0.0
-    
-    def get_report(self) -> Dict[str, Any]:
-        """生成报告"""
-        summaries = []
-        for epoch in sorted(self.epoch_stats.keys()):
-            stats_list = self.epoch_stats[epoch]
-            summaries.append({
-                "epoch": epoch,
-                "avg_tokens": float(np.mean([s.avg_tokens for s in stats_list])),
-                "token_range": [
-                    min(s.min_tokens for s in stats_list),
-                    max(s.max_tokens for s in stats_list),
-                ],
-            })
-        
-        return {
-            "epoch_summaries": summaries,
-            "correlation": self.compute_correlation(),
-            "is_adaptive": self.compute_correlation() > 0.1,
-        }
+    return env
 
 
-# ============================================================================
-# 实验管理
-# ============================================================================
-
-class ExperimentManager:
-    """实验管理器"""
-    
-    def __init__(self, base_dir: Path, name: str):
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self.exp_dir = base_dir / f"{name}_{timestamp}"
-        self.ckpt_dir = self.exp_dir / "checkpoints"
-        self.log_dir = self.exp_dir / "logs"
-        
-        for d in [self.ckpt_dir, self.log_dir]:
-            d.mkdir(parents=True, exist_ok=True)
-        
-        self.metrics: List[EpochMetrics] = []
-        self.start_time = time.time()
-    
-    def save_config(self, config: TrainingConfig):
-        """保存配置"""
-        path = self.log_dir / "config.json"
-        with open(path, 'w') as f:
-            json.dump(asdict(config), f, indent=2)
-    
-    def log_epoch(self, metrics: EpochMetrics):
-        """记录 epoch"""
-        self.metrics.append(metrics)
-        
-        # 打印
-        print(f"\n{'='*70}")
-        print(f"Epoch {metrics.epoch}")
-        print(f"{'='*70}")
-        print(f"Train: loss={metrics.train_loss:.4f}, acc={metrics.train_acc:.2f}%")
-        print(f"Val:   loss={metrics.val_loss:.4f}, acc={metrics.val_acc:.2f}%")
-        print(f"LR: {metrics.lr:.2e}, Time: {metrics.time:.1f}s")
-        if metrics.tokens:
-            t = metrics.tokens
-            print(f"Tokens: avg={t.avg_tokens:.1f}, range=[{t.min_tokens}-{t.max_tokens}]")
-        print(f"{'='*70}\n")
-        
-        # 保存
-        path = self.log_dir / "metrics.json"
-        with open(path, 'w') as f:
-            json.dump([asdict(m) for m in self.metrics], f, indent=2)
-    
-    def save_checkpoint(self, model: nn.Module, optimizer, name: str, **kwargs):
-        """保存检查点"""
-        path = self.ckpt_dir / f"{name}.pth"
-        checkpoint = {
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            **kwargs
-        }
-        torch.save(checkpoint, path)
-    
-    def log_final(self, test_loss: float, test_acc: float, token_report: Dict):
-        """记录最终结果"""
-        best_val = max(m.val_acc for m in self.metrics)
-        
-        final = {
-            "test_loss": test_loss,
-            "test_acc": test_acc,
-            "best_val_acc": best_val,
-            "total_time": time.time() - self.start_time,
-            "tokenization": token_report,
-        }
-        
-        path = self.log_dir / "final.json"
-        with open(path, 'w') as f:
-            json.dump(final, f, indent=2)
-        
-        print(f"\n{'='*70}")
-        print("FINAL RESULTS")
-        print(f"{'='*70}")
-        print(f"Best Val: {best_val:.2f}%")
-        print(f"Test: {test_acc:.2f}%")
-        print(f"Time: {final['total_time']:.1f}s")
-        print(f"Adaptive: {token_report.get('is_adaptive', False)}")
-        print(f"Correlation: {token_report.get('correlation', 0):.3f}")
-        print(f"{'='*70}\n")
+def print_environment_info(env: Dict[str, Any]) -> None:
+    """打印环境信息"""
+    print("\n" + "="*70)
+    print("Environment")
+    print("="*70)
+    print(f"  Platform: {env['platform']}")
+    print(f"  Container: {'Yes' if env['in_container'] else 'No'}")
+    print(f"  CPU Cores: {env['cpu_count']}")
+    print(f"  Recommended Workers: {env['recommended_workers']}")
+    print("="*70 + "\n")
 
 
 # ============================================================================
@@ -503,7 +182,7 @@ class ExperimentManager:
 # ============================================================================
 
 def set_seed(seed: int):
-    """设置种子"""
+    """设置随机种子"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -511,45 +190,206 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def create_model(config: TrainingConfig, spec: DatasetSpec) -> NextGenerationFractalViT:
-    """创建模型"""
-    model = NextGenerationFractalViT(
-        image_size=max(spec.image_size, 32),
-        num_classes=spec.num_classes,
-        dim=config.dim,
-        depth=config.depth,
-        heads=config.heads,
-        mlp_dim=config.mlp_dim,
-        pool=config.pool,
-        channels=spec.channels,
-        dim_head=config.dim_head,
-        dropout=config.dropout,
-        emb_dropout=config.emb_dropout,
-        min_patch_size=(4, 4),
-        max_level=config.max_level,
-        learnable_split=config.learnable_split,
-        use_checkpoint=config.gradient_checkpoint,
-        ffn_type=config.ffn_type,  # type: ignore
-    )
-    
-    params = sum(p.numel() for p in model.parameters())
-    print(f"\n{'='*70}")
-    print(f"Model: NextGenerationFractalViT")
-    print(f"FFN Type: {config.ffn_type}")
-    print(f"Gradient Checkpoint: {config.gradient_checkpoint}")
-    print(f"Parameters: {params:,}")
-    print(f"{'='*70}\n")
-    
-    return model
+def get_amp_context(device: torch.device, enabled: bool):
+    """获取 AMP autocast 上下文"""
+    if _NEW_AMP:
+        return autocast('cuda', enabled=enabled)
+    else:
+        return autocast(enabled=enabled)
 
+
+def create_grad_scaler(enabled: bool) -> GradScaler:
+    """创建 GradScaler"""
+    if _NEW_AMP:
+        return GradScaler('cuda', enabled=enabled)
+    else:
+        return GradScaler(enabled=enabled)
+
+
+# ============================================================================
+# Tiny ImageNet 下载
+# ============================================================================
+
+def download_with_progress(url: str, dest: Path, desc: str = "Downloading") -> bool:
+    """带进度条的下载函数"""
+    import urllib.request
+    
+    try:
+        # 获取文件大小
+        with urllib.request.urlopen(url, timeout=30) as response:
+            total_size = int(response.headers.get('Content-Length', 0))
+        
+        # 下载
+        downloaded = 0
+        block_size = 8192
+        
+        with urllib.request.urlopen(url, timeout=30) as response:
+            with open(dest, 'wb') as f:
+                with tqdm(total=total_size, unit='B', unit_scale=True, desc=desc) as pbar:
+                    while True:
+                        buffer = response.read(block_size)
+                        if not buffer:
+                            break
+                        f.write(buffer)
+                        downloaded += len(buffer)
+                        pbar.update(len(buffer))
+        
+        return True
+    except Exception as e:
+        print(f"\n[ERROR] Download failed: {e}")
+        if dest.exists():
+            dest.unlink()
+        return False
+
+
+def download_tiny_imagenet(data_root: Path) -> bool:
+    """下载并设置 Tiny ImageNet
+    
+    数据集信息:
+    - 200 类，每类 500 张训练图像
+    - 训练集: 100,000 张 64x64 图像
+    - 验证集: 10,000 张图像
+    - 测试集: 10,000 张图像（无标签）
+    
+    下载源:
+    - 主源: Stanford CS231n
+    - 大小: ~237MB
+    """
+    target_dir = data_root / "tiny-imagenet-200"
+    
+    # 检查是否已存在
+    if (target_dir / "train").exists() and (target_dir / "val").exists():
+        train_classes = len(list((target_dir / "train").iterdir()))
+        val_has_classes = any((target_dir / "val").iterdir())
+        if train_classes >= 200 and val_has_classes:
+            print(f"[OK] Tiny ImageNet already exists at {target_dir}")
+            return True
+    
+    print("\n" + "="*60)
+    print("Downloading Tiny ImageNet Dataset")
+    print("="*60)
+    print(f"  Target: {target_dir}")
+    print(f"  Size: ~237MB")
+    print("="*60 + "\n")
+    
+    zip_path = data_root / "tiny-imagenet-200.zip"
+    
+    # 检查已缓存的 zip 是否有效
+    if zip_path.exists():
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                # 验证 zip 文件
+                if zf.testzip() is not None:
+                    raise zipfile.BadZipFile("Corrupted zip file")
+                if len(zf.namelist()) < 100:  # Tiny ImageNet 应该有很多文件
+                    raise zipfile.BadZipFile("Incomplete zip file")
+            print(f"[OK] Using cached zip: {zip_path}")
+        except (zipfile.BadZipFile, Exception) as e:
+            print(f"[WARN] Cached zip is invalid: {e}")
+            print("[*] Removing corrupted file and re-downloading...")
+            zip_path.unlink()
+    
+    # 尝试多个下载源
+    urls = [
+        "http://cs231n.stanford.edu/tiny-imagenet-200.zip",
+        "https://image-net.org/data/tiny-imagenet-200.zip",
+    ]
+    
+    if not zip_path.exists():
+        download_success = False
+        for i, url in enumerate(urls):
+            print(f"[{i+1}/{len(urls)}] Trying: {url}")
+            if download_with_progress(url, zip_path, "Tiny ImageNet"):
+                # 验证下载的文件
+                try:
+                    with zipfile.ZipFile(zip_path, 'r') as zf:
+                        if zf.testzip() is not None:
+                            raise zipfile.BadZipFile("Downloaded file is corrupted")
+                    download_success = True
+                    print("[OK] Download complete and verified")
+                    break
+                except zipfile.BadZipFile as e:
+                    print(f"[WARN] Downloaded file is invalid: {e}")
+                    if zip_path.exists():
+                        zip_path.unlink()
+            print(f"[WARN] Failed, trying next source...")
+        
+        if not download_success:
+            print("\n[ERROR] All download sources failed.")
+            print("Please download manually from:")
+            print("  http://cs231n.stanford.edu/tiny-imagenet-200.zip")
+            print(f"And place it at: {zip_path}")
+            return False
+    
+    # 解压
+    print("\nExtracting...")
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            total = len(zf.namelist())
+            with tqdm(total=total, desc="Extracting", unit="files") as pbar:
+                for member in zf.namelist():
+                    zf.extract(member, data_root)
+                    pbar.update(1)
+        print("[OK] Extraction complete")
+    except Exception as e:
+        print(f"[ERROR] Extraction failed: {e}")
+        return False
+    
+    # 组织验证集（原始格式是所有图片在一个文件夹）
+    val_dir = target_dir / "val"
+    val_images_dir = val_dir / "images"
+    
+    if val_images_dir.exists():
+        print("\nOrganizing validation set by class...")
+        val_annotations = val_dir / "val_annotations.txt"
+        
+        if val_annotations.exists():
+            # 读取标注
+            with open(val_annotations, 'r') as f:
+                lines = f.readlines()
+            
+            # 按类别组织
+            for line in tqdm(lines, desc="Organizing"):
+                parts = line.strip().split('\t')
+                if len(parts) >= 2:
+                    img_name, class_id = parts[0], parts[1]
+                    class_dir = val_dir / class_id / "images"
+                    class_dir.mkdir(parents=True, exist_ok=True)
+                    src = val_images_dir / img_name
+                    dst = class_dir / img_name
+                    if src.exists() and not dst.exists():
+                        shutil.move(str(src), str(dst))
+            
+            # 删除原始 images 文件夹
+            if val_images_dir.exists():
+                shutil.rmtree(val_images_dir)
+            
+            print("[OK] Validation set organized")
+        else:
+            print("[WARN] val_annotations.txt not found")
+    
+    # 验证
+    train_classes = len(list((target_dir / "train").iterdir()))
+    val_classes = len([d for d in (target_dir / "val").iterdir() if d.is_dir()])
+    print(f"\n[OK] Dataset ready:")
+    print(f"  Train classes: {train_classes}")
+    print(f"  Val classes: {val_classes}")
+    
+    # 清理 zip
+    if zip_path.exists():
+        zip_path.unlink()
+        print("[OK] Cleaned up zip file")
+    
+    return True
+
+
+# ============================================================================
+# 数据加载
+# ============================================================================
 
 def create_dataloaders(
     spec: DatasetSpec,
-    batch_size: int,
-    val_split: float,
-    subset_size: Optional[int],
-    num_workers: int,
-    pin_memory: bool,
+    config: TrainingConfig,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """创建数据加载器"""
     
@@ -596,23 +436,10 @@ def create_dataloaders(
         train_ds = datasets.MNIST(data_root, train=True, download=True, transform=train_tf)
         test_ds = datasets.MNIST(data_root, train=False, download=True, transform=test_tf)
     elif spec.name == "TinyImageNet":
-        # Tiny ImageNet 自动下载和组织
+        if not download_tiny_imagenet(data_root):
+            raise FileNotFoundError("Failed to download Tiny ImageNet")
         train_dir = data_root / "tiny-imagenet-200" / "train"
         test_dir = data_root / "tiny-imagenet-200" / "val"
-        
-        if not train_dir.exists() or not test_dir.exists():
-            print("\n⚠️  Tiny ImageNet not found, attempting automatic download...")
-            success = download_and_setup_tiny_imagenet(data_root)
-            if not success:
-                raise FileNotFoundError(
-                    f"\nAutomatic download failed. Please manually download:\n"
-                    f"URL: http://cs231n.stanford.edu/tiny-imagenet-200.zip\n"
-                    f"Extract to: {data_root}\n"
-                    f"Expected structure:\n"
-                    f"  {data_root}/tiny-imagenet-200/train/n01443537/images/*.JPEG\n"
-                    f"  {data_root}/tiny-imagenet-200/val/n01443537/images/*.JPEG\n"
-                )
-        
         train_ds = datasets.ImageFolder(str(train_dir), transform=train_tf)
         test_ds = datasets.ImageFolder(str(test_dir), transform=test_tf)
     else:
@@ -621,49 +448,82 @@ def create_dataloaders(
     # 划分
     indices = np.arange(len(train_ds))
     np.random.shuffle(indices)
-    if subset_size:
-        indices = indices[:subset_size]
+    if config.subset_size:
+        indices = indices[:config.subset_size]
     
-    val_size = max(1, int(len(indices) * val_split))
+    val_size = max(1, int(len(indices) * config.val_split))
     train_idx, val_idx = indices[val_size:], indices[:val_size]
     
-    # 创建 loader
-    # 强制使用 spawn（已在顶部设置，这里确保兼容性）
-    mp_context = 'spawn' if num_workers > 0 else None
+    # DataLoader 参数
+    mp_context = 'spawn' if config.num_workers > 0 else None
+    loader_kwargs = {
+        'batch_size': config.batch_size,
+        'num_workers': config.num_workers,
+        'pin_memory': config.num_workers > 0,
+        'multiprocessing_context': mp_context,
+        'persistent_workers': config.num_workers > 1,
+    }
+    if config.num_workers > 0:
+        loader_kwargs['prefetch_factor'] = 4
     
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        sampler=SubsetRandomSampler(train_idx),
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        multiprocessing_context=mp_context,
-        persistent_workers=num_workers > 0,  # 保持 worker 进程
-    )
+    train_loader = DataLoader(train_ds, sampler=SubsetRandomSampler(train_idx), **loader_kwargs)
+    val_loader = DataLoader(train_ds, sampler=SubsetRandomSampler(val_idx), **loader_kwargs)
     
-    val_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        sampler=SubsetRandomSampler(val_idx),
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        multiprocessing_context=mp_context,
-        persistent_workers=num_workers > 0,
-    )
+    test_kwargs = loader_kwargs.copy()
+    test_kwargs['shuffle'] = False
+    test_loader = DataLoader(test_ds, **test_kwargs)
     
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        multiprocessing_context=mp_context,
-        persistent_workers=num_workers > 0,
-    )
-    
-    print(f"✓ Data: train={len(train_idx)}, val={len(val_idx)}, test={len(test_ds)}\n")
+    print(f"[OK] Data: train={len(train_idx)}, val={len(val_idx)}, test={len(test_ds)}")
     
     return train_loader, val_loader, test_loader
+
+
+# ============================================================================
+# CUDA Prefetcher
+# ============================================================================
+
+class CudaPrefetcher:
+    """CUDA 异步数据预取器"""
+    
+    def __init__(self, loader: DataLoader, device: torch.device):
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream() if device.type == 'cuda' else None
+        
+    def __iter__(self):
+        self.loader_iter = iter(self.loader)
+        self.preload()
+        return self
+    
+    def preload(self):
+        try:
+            self.next_batch = next(self.loader_iter)
+        except StopIteration:
+            self.next_batch = None
+            return
+        
+        if self.stream is not None:
+            with torch.cuda.stream(self.stream):
+                self.next_data = (
+                    self.next_batch[0].to(self.device, non_blocking=True),
+                    self.next_batch[1].to(self.device, non_blocking=True),
+                )
+        else:
+            self.next_data = self.next_batch
+    
+    def __next__(self):
+        if self.stream is not None:
+            torch.cuda.current_stream().wait_stream(self.stream)
+        
+        if self.next_batch is None:
+            raise StopIteration
+        
+        data = self.next_data
+        self.preload()
+        return data
+    
+    def __len__(self):
+        return len(self.loader)
 
 
 # ============================================================================
@@ -675,64 +535,76 @@ def train_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    scaler,  # torch.amp.GradScaler (避免类型检查问题)
-    clip: float,
-    accum: int,
-    use_amp: bool,
+    scaler: GradScaler,
+    config: TrainingConfig,
+    profile: bool = False,
 ) -> Tuple[float, float, Dict[str, float]]:
-    """训练一个 epoch，返回 (loss, accuracy, perf_stats)"""
+    """训练一个 epoch"""
     model.train()
     total_loss, correct, total = 0.0, 0, 0
-    optimizer.zero_grad(set_to_none=True)  # 更高效的梯度清零
+    optimizer.zero_grad(set_to_none=True)
     
-    # 性能监控
-    batch_times = []
-    data_times = []
+    batch_times, data_times, forward_times = [], [], []
     cuda_mem_peak = 0.0
     
-    pbar = tqdm(loader, desc="Train")
+    data_iter = CudaPrefetcher(loader, device) if device.type == 'cuda' else loader
+    pbar = tqdm(data_iter, desc="Train", total=len(loader))
     data_start = time.time()
     
-    for i, (imgs, labels) in enumerate(pbar):
-        data_times.append(time.time() - data_start)
+    for i, batch in enumerate(pbar):
+        data_time = time.time() - data_start
+        data_times.append(data_time)
         batch_start = time.time()
         
-        # non_blocking=True 实现异步数据传输
-        imgs = imgs.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        imgs, labels = batch
+        if device.type != 'cuda':
+            imgs = imgs.to(device)
+            labels = labels.to(device)
         
-        with torch.amp.autocast('cuda', enabled=use_amp):
+        forward_start = time.time()
+        with get_amp_context(device, config.use_amp):
             outs, _ = model(imgs, return_aux_info=True)
-            loss = F.cross_entropy(outs, labels) / accum
+            loss = F.cross_entropy(outs, labels) / config.accum_steps
+        
+        forward_time = time.time() - forward_start
+        forward_times.append(forward_time)
         
         scaler.scale(loss).backward()
         
-        if (i + 1) % accum == 0:
+        if (i + 1) % config.accum_steps == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
         
-        total_loss += loss.item() * accum
+        total_loss += loss.item() * config.accum_steps
         _, pred = outs.max(1)
         total += labels.size(0)
         correct += pred.eq(labels).sum().item()
         
         batch_times.append(time.time() - batch_start)
         
-        # 更新 CUDA 内存峰值
         if device.type == 'cuda':
             cuda_mem_peak = max(cuda_mem_peak, torch.cuda.max_memory_allocated() / 1024**3)
         
-        pbar.set_postfix(loss=f'{loss.item()*accum:.4f}', acc=f'{100.*correct/total:.1f}%')
+        if profile and (i < 5 or i % 100 == 0):
+            pbar.set_postfix(
+                loss=f'{loss.item()*config.accum_steps:.3f}',
+                acc=f'{100.*correct/total:.1f}%',
+                data=f'{data_time*1000:.0f}ms',
+                fwd=f'{forward_time*1000:.0f}ms'
+            )
+        else:
+            pbar.set_postfix(loss=f'{loss.item()*config.accum_steps:.4f}', acc=f'{100.*correct/total:.1f}%')
+        
         data_start = time.time()
     
-    # 性能统计
     perf_stats = {
-        'avg_batch_time': np.mean(batch_times) if batch_times else 0.0,
-        'avg_data_time': np.mean(data_times) if data_times else 0.0,
-        'throughput': total / sum(batch_times) if batch_times else 0.0,  # samples/sec
+        'avg_batch_time': np.mean(batch_times) if batch_times else 0,
+        'avg_data_time': np.mean(data_times) if data_times else 0,
+        'avg_forward_time': np.mean(forward_times) if forward_times else 0,
+        'throughput': total / sum(batch_times) if batch_times else 0,
         'cuda_mem_peak_gb': cuda_mem_peak,
     }
     
@@ -750,12 +622,12 @@ def evaluate(
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
     
-    pbar = tqdm(loader, desc="Eval")
-    for imgs, labels in pbar:
-        imgs = imgs.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+    for batch in tqdm(loader, desc="Eval"):
+        imgs, labels = batch
+        imgs = imgs.to(device)
+        labels = labels.to(device)
         
-        with torch.amp.autocast('cuda', enabled=use_amp):
+        with get_amp_context(device, use_amp):
             outs, _ = model(imgs, return_aux_info=True)
             loss = F.cross_entropy(outs, labels)
         
@@ -763,8 +635,6 @@ def evaluate(
         _, pred = outs.max(1)
         total += labels.size(0)
         correct += pred.eq(labels).sum().item()
-        
-        pbar.set_postfix(loss=f'{loss.item():.4f}', acc=f'{100.*correct/total:.1f}%')
     
     return total_loss / len(loader), 100.0 * correct / total
 
@@ -774,14 +644,14 @@ def evaluate(
 # ============================================================================
 
 def main():
-    """主入口"""
     parser = argparse.ArgumentParser(description="Fractal ViT Training")
     
     # 数据集
     parser.add_argument("--dataset", type=str, default="cifar10", 
                        choices=["cifar10", "cifar100", "mnist", "tiny-imagenet"])
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=None,
+                       help="Number of workers (auto-detect if not set)")
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument("--subset-size", type=int, default=None)
     
@@ -791,12 +661,13 @@ def main():
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--dim-head", type=int, default=32)
     parser.add_argument("--max-level", type=int, default=4)
+    parser.add_argument("--num-scales", type=int, default=3,
+                       help="Number of scales for multi-scale tokenizer")
     parser.add_argument("--pool", type=str, default="cls", choices=["cls", "mean"])
     parser.add_argument("--ffn-type", type=str, default="swiglu_level",
                        choices=["gelu", "swiglu", "swiglu_level"])
-    parser.add_argument("--no-learnable-split", action="store_true")
     parser.add_argument("--gradient-checkpoint", action="store_true",
-                       help="Use gradient checkpointing to save memory (slower but ~40%% less VRAM)")
+                       help="Enable gradient checkpointing to save memory")
     
     # 训练
     parser.add_argument("--epochs", type=int, default=50)
@@ -805,31 +676,31 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--emb-dropout", type=float, default=0.1)
     parser.add_argument("--gradient-clip", type=float, default=1.0)
-    parser.add_argument("--warmup-epochs", type=int, default=10,
-                       help="Number of warmup epochs (default: 10)")
+    parser.add_argument("--warmup-epochs", type=int, default=10)
     parser.add_argument("--use-amp", action="store_true")
     parser.add_argument("--accum-steps", type=int, default=1)
     
     # 系统
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--quick-test", action="store_true")
-    
-    # 性能优化
-    parser.add_argument("--compile", action="store_true",
-                       help="Use torch.compile() for model optimization (PyTorch 2.0+)")
-    parser.add_argument("--compile-mode", type=str, default="reduce-overhead",
-                       choices=["default", "reduce-overhead", "max-autotune"],
-                       help="torch.compile mode (default: reduce-overhead)")
     
     args = parser.parse_args()
     
+    # 环境检测
+    env = detect_environment()
+    print_environment_info(env)
+    
+    # 自动设置 workers
+    if args.num_workers is None:
+        args.num_workers = env['recommended_workers']
+        print(f"Auto-detected num_workers: {args.num_workers}")
+    
     # Quick test
     if args.quick_test:
-        args.epochs = 5
-        args.subset_size = 512
-        args.num_workers = 0
-        print("⚡ Quick test mode\n")
+        args.epochs = 3
+        args.subset_size = 256
+        print("[*] Quick test mode\n")
     
     # 初始化
     set_seed(args.seed)
@@ -853,10 +724,9 @@ def main():
         mlp_dim=args.dim * 2,
         dim_head=args.dim_head,
         max_level=args.max_level,
+        num_scales=args.num_scales,
         pool=args.pool,
         ffn_type=args.ffn_type,
-        learnable_split=not args.no_learnable_split,
-        gradient_checkpoint=args.gradient_checkpoint,
         epochs=args.epochs,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
@@ -865,148 +735,155 @@ def main():
         gradient_clip=args.gradient_clip,
         use_amp=args.use_amp,
         accum_steps=args.accum_steps,
+        warmup_epochs=args.warmup_epochs,
+        gradient_checkpoint=args.gradient_checkpoint,
         seed=args.seed,
         device=str(device),
     )
     
-    # 实验管理
-    exp_mgr = ExperimentManager(PROJECT_ROOT / "experiments", "fractal_vit")
-    exp_mgr.save_config(config)
-    print(f"✓ Experiment: {exp_mgr.exp_dir}\n")
+    # 创建模型 - 仅使用 streaming_v2
+    model = NextGenerationFractalViT(
+        image_size=max(spec.image_size, 32),
+        num_classes=spec.num_classes,
+        dim=config.dim,
+        depth=config.depth,
+        heads=config.heads,
+        mlp_dim=config.mlp_dim,
+        pool=config.pool,
+        channels=spec.channels,
+        dim_head=config.dim_head,
+        dropout=config.dropout,
+        emb_dropout=config.emb_dropout,
+        min_patch_size=(4, 4),
+        max_level=config.max_level,
+        use_checkpoint=config.gradient_checkpoint,
+        ffn_type=config.ffn_type,
+        # 固定使用 streaming_v2
+        tokenizer_type="streaming_v2",
+        num_scales=config.num_scales,
+        streaming_tau=1.0,
+    ).to(device)
     
-    # CUDA 优化
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-        
-        # 启用 TF32 加速（Ampere 及以上 GPU）
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        
-        torch.cuda.empty_cache()
-        
-        # 输出 GPU 信息
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_cap = torch.cuda.get_device_capability(0)
-        print(f"✓ CUDA optimized: {gpu_name}")
-        print(f"  - Compute Capability: {gpu_cap[0]}.{gpu_cap[1]}")
-        print(f"  - TF32 Enabled: {gpu_cap[0] >= 8}")
-        print(f"  - cuDNN Benchmark: True\n")
-    
-    # 模型和数据
-    model = create_model(config, spec).to(device)
-    
-    # torch.compile() 优化 (PyTorch 2.0+)
-    if args.compile and hasattr(torch, 'compile'):
-        print(f"⚡ Compiling model with mode='{args.compile_mode}'...")
-        try:
-            model = torch.compile(model, mode=args.compile_mode)
-            print("  ✓ Model compiled successfully\n")
-        except Exception as e:
-            print(f"  ⚠ Compilation failed: {e}")
-            print("  → Falling back to eager mode\n")
-    
-    train_loader, val_loader, test_loader = create_dataloaders(
-        spec, config.batch_size, config.val_split, config.subset_size,
-        config.num_workers, device.type == "cuda"
-    )
-    
-    # 优化器和学习率调度器
-    optimizer = AdamW(model.parameters(), lr=config.learning_rate, 
-                     weight_decay=config.weight_decay)
-    
-    # Warmup 策略：默认 10 轮
-    warmup = min(args.warmup_epochs, config.epochs // 2)
-    warmup_sch = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup)
-    cosine_sch = CosineAnnealingLR(optimizer, T_max=config.epochs - warmup, 
-                                   eta_min=config.learning_rate * 0.01)
-    scheduler = SequentialLR(optimizer, [warmup_sch, cosine_sch], milestones=[warmup])
-    
-    print(f"✓ Optimizer: AdamW (lr={config.learning_rate:.2e}, wd={config.weight_decay})")
-    print(f"✓ Scheduler: {warmup} warmup epochs + cosine annealing\n")
-    
-    scaler = torch.amp.GradScaler('cuda', enabled=config.use_amp)
-    
-    # Tokenization 监控
-    tok_monitor = TokenizationMonitor()
-    monitor_freq = max(1, config.epochs // 10)
-    
-    # 显存清理函数
-    def clear_cuda_cache():
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
-    
-    # 训练
-    print(f"{'='*70}")
-    print("TRAINING START")
-    print(f"{'='*70}")
-    if config.gradient_checkpoint:
-        print("⚡ Gradient Checkpointing: ENABLED (saves ~40% VRAM)")
-    print("")
-    
-    best_val = 0.0
-    clear_cuda_cache()  # 训练前清理
-    
-    try:
-        for epoch in range(1, config.epochs + 1):
-            start = time.time()
-            
-            train_loss, train_acc, perf_stats = train_epoch(
-                model, train_loader, optimizer, device, scaler,
-                config.gradient_clip, config.accum_steps, config.use_amp
-            )
-            
-            val_loss, val_acc = evaluate(model, val_loader, device, config.use_amp)
-            scheduler.step()
-            
-            # Token 监控
-            tok_stats = None
-            if epoch % monitor_freq == 0 or epoch == 1:
-                sample = next(iter(val_loader))[0].to(device)
-                tok_stats = tok_monitor.analyze_batch(model, sample, epoch)
-            
-            # 记录
-            metrics = EpochMetrics(
-                epoch=epoch,
-                train_loss=train_loss,
-                train_acc=train_acc,
-                val_loss=val_loss,
-                val_acc=val_acc,
-                lr=optimizer.param_groups[0]['lr'],
-                time=time.time() - start,
-                tokens=tok_stats,
-            )
-            exp_mgr.log_epoch(metrics)
-            
-            # 显示性能统计（每 5 轮或第一轮）
-            if epoch == 1 or epoch % 5 == 0:
-                print(f"  📊 Perf: {perf_stats['throughput']:.1f} samples/s, "
-                      f"mem={perf_stats['cuda_mem_peak_gb']:.2f}GB")
-            
-            # 保存最佳
-            if val_acc > best_val:
-                best_val = val_acc
-                exp_mgr.save_checkpoint(model, optimizer, "best", val_acc=val_acc, epoch=epoch)
-                print(f"✓ Best saved: {val_acc:.2f}%\n")
-    
-    except KeyboardInterrupt:
-        print("\n⚠️  Interrupted\n")
-    
-    # 测试
-    print(f"{'='*70}")
-    print("TESTING")
+    # 打印模型信息
+    params = sum(p.numel() for p in model.parameters())
+    print(f"\n{'='*70}")
+    print(f"Model: NextGenerationFractalViT")
+    print(f"Tokenizer: StreamingFractalTokenizerV2 (Gumbel-Softmax)")
+    print(f"FFN Type: {config.ffn_type}")
+    print(f"Parameters: {params:,}")
+    print(f"Gradient Checkpoint: {config.gradient_checkpoint}")
     print(f"{'='*70}\n")
     
-    ckpt = torch.load(exp_mgr.ckpt_dir / "best.pth")
+    # 数据加载
+    train_loader, val_loader, test_loader = create_dataloaders(spec, config)
+    
+    # 优化器
+    optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    
+    # 学习率调度
+    warmup = min(args.warmup_epochs, config.epochs // 2)
+    warmup_sch = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup)
+    cosine_sch = CosineAnnealingLR(optimizer, T_max=config.epochs - warmup, eta_min=config.learning_rate * 0.01)
+    scheduler = SequentialLR(optimizer, [warmup_sch, cosine_sch], milestones=[warmup])
+    
+    scaler = create_grad_scaler(config.use_amp)
+    
+    # CUDA 优化
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    
+    # 训练
+    print("="*70)
+    print("TRAINING START")
+    print("="*70 + "\n")
+    
+    best_val = 0.0
+    exp_dir = PROJECT_ROOT / "experiments" / f"fractal_vit_{time.strftime('%Y%m%d_%H%M%S')}"
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    (exp_dir / "checkpoints").mkdir(exist_ok=True)
+    (exp_dir / "logs").mkdir(exist_ok=True)
+    
+    # 保存配置
+    with open(exp_dir / "logs" / "config.json", 'w') as f:
+        json.dump(asdict(config), f, indent=2)
+    
+    history = []
+    
+    for epoch in range(1, config.epochs + 1):
+        start = time.time()
+        
+        train_loss, train_acc, perf_stats = train_epoch(
+            model, train_loader, optimizer, device, scaler, config,
+            profile=(epoch == 1)
+        )
+        
+        val_loss, val_acc = evaluate(model, val_loader, device, config.use_amp)
+        
+        scheduler.step()
+        
+        epoch_time = time.time() - start
+        
+        # 记录历史
+        history.append({
+            'epoch': epoch,
+            'train_loss': train_loss,
+            'train_acc': train_acc,
+            'val_loss': val_loss,
+            'val_acc': val_acc,
+            'lr': optimizer.param_groups[0]['lr'],
+            'time': epoch_time,
+        })
+        
+        print(f"\nEpoch {epoch}/{config.epochs}:")
+        print(f"  Train: loss={train_loss:.4f}, acc={train_acc:.2f}%")
+        print(f"  Val:   loss={val_loss:.4f}, acc={val_acc:.2f}%")
+        print(f"  Time:  {epoch_time:.1f}s, Throughput: {perf_stats['throughput']:.1f} samples/s")
+        
+        if epoch == 1:
+            data_pct = perf_stats['avg_data_time'] / perf_stats['avg_batch_time'] * 100 if perf_stats['avg_batch_time'] > 0 else 0
+            fwd_pct = perf_stats['avg_forward_time'] / perf_stats['avg_batch_time'] * 100 if perf_stats['avg_batch_time'] > 0 else 0
+            print(f"  Perf:  data={data_pct:.1f}%, fwd={fwd_pct:.1f}%, mem={perf_stats['cuda_mem_peak_gb']:.2f}GB")
+        
+        # 保存最佳
+        if val_acc > best_val:
+            best_val = val_acc
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_acc': val_acc,
+                'config': asdict(config),
+            }, exp_dir / "checkpoints" / "best.pth")
+            print(f"  [*] Best model saved: {val_acc:.2f}%")
+    
+    # 保存训练历史
+    with open(exp_dir / "training_history.json", 'w') as f:
+        json.dump(history, f, indent=2)
+    
+    # 测试
+    print("\n" + "="*70)
+    print("TESTING")
+    print("="*70 + "\n")
+    
+    ckpt = torch.load(exp_dir / "checkpoints" / "best.pth", weights_only=True)
     model.load_state_dict(ckpt['model_state_dict'])
     
     test_loss, test_acc = evaluate(model, test_loader, device, config.use_amp)
-    tok_report = tok_monitor.get_report()
     
-    exp_mgr.log_final(test_loss, test_acc, tok_report)
-    print(f"✓ Results: {exp_mgr.log_dir}\n")
+    print(f"Test: loss={test_loss:.4f}, acc={test_acc:.2f}%")
+    print(f"\n[OK] Results saved to: {exp_dir}")
+    
+    # 保存最终结果
+    with open(exp_dir / "results.json", 'w') as f:
+        json.dump({
+            'best_val_acc': best_val,
+            'test_acc': test_acc,
+            'test_loss': test_loss,
+            'total_epochs': config.epochs,
+        }, f, indent=2)
 
 
 if __name__ == "__main__":
-    # Multiprocessing 已在顶部强制设置为 spawn
     main()
