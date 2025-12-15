@@ -1,9 +1,14 @@
+import warnings
 import torch
 import pytest
-from vit_pytorch.fractal_vit import NextGenerationFractalViT, EnhancedFractalTokenProcessor
-from vit_pytorch.fractal_curve_tokenizer import FractalHilbertTokenizer
+from vit_pytorch.fractal_vit import NextGenerationFractalViT
+from vit_pytorch._deprecated.token_processor import EnhancedFractalTokenProcessor
+from vit_pytorch._deprecated.fractal_curve_tokenizer import FractalHilbertTokenizer
 from vit_pytorch.positional import AdvancedFractalPositionEmbedding
 from vit_pytorch.transformer import EnhancedFractalTransformer
+
+# 忽略废弃警告
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 @pytest.fixture
 def sample_image():

@@ -1,7 +1,9 @@
 import torch
 import pytest
 
-from vit_pytorch.fractal_curve_tokenizer import FractalHilbertTokenizer
+import warnings
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+from vit_pytorch._deprecated.fractal_curve_tokenizer import FractalHilbertTokenizer
 from vit_pytorch.fractal_vit import SimpleFractalViT
 
 

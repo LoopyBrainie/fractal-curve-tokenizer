@@ -194,7 +194,7 @@ def create_model(
         
         # 如果需要 CNN 但还没初始化
         if config.use_cnn and model.tokenizer.cnn_encoder is None:
-            from vit_pytorch.fractal_curve_tokenizer import MiniCNN, LearnableSplitDecision
+            from vit_pytorch._deprecated.fractal_curve_tokenizer import MiniCNN, LearnableSplitDecision
             model.tokenizer.cnn_encoder = MiniCNN(in_channels=3, hidden_dim=16, out_dim=32).to(device)
             model.tokenizer.split_decision = LearnableSplitDecision(
                 patch_features=6, cnn_features=32, hidden_dim=64
