@@ -4,6 +4,9 @@
 This module implements a hierarchical image tokenizer based on fractal 
 partitioning and Hilbert curve traversal. It supports learnable split 
 decisions using reinforcement learning (REINFORCE algorithm).
+
+.. deprecated:: 0.4.0
+    此模块已废弃。请使用 StreamingFractalTokenizer 替代。
 """
 
 from __future__ import annotations
@@ -18,15 +21,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .constants import (
+# 使用父包的导入
+from vit_pytorch.constants import (
     DEFAULT_MAX_LEVEL,
     EXTRA_DEPTH_CAP,
     LOGITS_CLAMP_MAX,
     LOGITS_CLAMP_MIN,
 )
-from .hilbert import HilbertCurve, get_quadrant_order
-from .tokenization import BaseTokenizer, TokenSequence, TokenizerOutput
-from .utils import sanitize_tensor
+from vit_pytorch.hilbert import HilbertCurve, get_quadrant_order
+from vit_pytorch.tokenization import BaseTokenizer, TokenSequence, TokenizerOutput
+from vit_pytorch.utils import sanitize_tensor
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +150,12 @@ class LearnableSplitDecision(nn.Module):
 
 class FractalHilbertTokenizer(BaseTokenizer):
     """基于分形 Hilbert 曲线的图像 Tokenizer。
+    
+    .. deprecated:: 0.4.0
+        推荐使用 :class:`StreamingFractalTokenizer`，其将分割决策与特征处理
+        统一为单次前向，消除 CPU 瓶颈和特征重复计算。
+        使用 ``NextGenerationFractalViT(tokenizer_type='streaming')`` 启用。
+        此类将在 v1.0 中移除。
     
     该 Tokenizer 使用自适应分形分割将图像递归分解为多尺度 tokens，
     并按 Hilbert 曲线顺序遍历以保持空间局部性。

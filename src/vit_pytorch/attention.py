@@ -1,13 +1,48 @@
 # -*- coding: utf-8 -*-
-"""Hilbert-aware multi-scale attention module.
+"""
+Hilbert 感知多尺度注意力模块
 
-This module implements HilbertAwareMultiScaleAttention, which encodes
-hierarchical depth and Hilbert path relationships to modulate attention weights.
+数学形式化
+============
 
-Supports three bias computation modes:
-- 'original': Full neural network computation (high memory, accurate)
-- 'low_rank': Low-rank factorization (recommended, memory efficient)
-- 'hierarchical': Layer-wise computation (interpretable, moderate memory)
+标准多头注意力:
+    Attention(Q, K, V) = softmax(QK^T / √d_k) · V
+
+Hilbert 感知注意力:
+    HilbertAttn(Q, K, V) = softmax(QK^T / √d_k · σ_scale + B_hilbert + B_level) · V
+
+偏置项
+------
+1. Low-Rank Hilbert Bias (低秩分解):
+   B_hilbert[i,j] = φ(path_i)^T · ψ(path_j)
+   其中 φ, ψ: R^d → R^r 是可学习线性投影
+   复杂度: O(N·r) vs 原始 O(N²)
+
+2. Hierarchical Hilbert Bias (分层计算):
+   B_hilbert[i,j] = Σ_{ℓ=1}^L b^(ℓ)(q_i^(ℓ), q_j^(ℓ))
+   利用四叉树层级结构，各层独立计算
+
+3. Level Bias (相对层级偏置):
+   B_level[i,j] = Embedding(clamp(d_i - d_j + L, 0, 2L))
+
+4. Level Scaling (层级缩放):
+   σ_scale(d) = LevelScaleEmb(d)
+   深层 token 使用较小缩放
+
+类对照表
+----------
++-------------------------------+------------------------------------------+
+| 类                             | 数学定义                                   |
++===============================+==========================================+
+| LowRankHilbertBias            | B = ΦΨ^T, Φ,Ψ ∈ R^{N × r × H}           |
+| HierarchicalHilbertBias       | B = Σ_ℓ MLP_ℓ(same, diff, q_i, q_j)      |
+| HilbertAwareMultiScaleAttention| Attn + B_hilbert + B_level              |
++-------------------------------+------------------------------------------+
+
+bias_mode 选项:
+- 'original': 全连接网络（高显存，精确）
+- 'low_rank': 低秩分解（推荐，显存友好）
+- 'hierarchical': 分层计算（可解释性强）
 """
 
 from __future__ import annotations

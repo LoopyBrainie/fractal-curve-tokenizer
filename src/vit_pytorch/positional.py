@@ -1,3 +1,42 @@
+# -*- coding: utf-8 -*-
+"""
+分形位置编码模块
+
+数学形式化
+============
+
+分形位置编码结合深度和路径信息:
+
+    E_pos(i) = Fusion(E_depth(d_i) + E_path(i))
+
+深度编码 (Depth Embedding):
+    E_depth: Z → R^D
+    E_depth(d) = Embedding(d), d ∈ {0, 1, ..., L_max}
+
+路径编码 (Path Embedding):
+    对 token i，其从根到叶的路径为 (q_i^(1), ..., q_i^(d_i))
+    其中 q_i^(j) ∈ {0, 1, 2, 3} 是第 j 层的象限索引
+    
+    E_path(i) = Σ_{j=1}^{d_i} QuadrantEmb(j, q_i^(j))
+    
+    QuadrantEmb: [L_max × 4, D] 的可学习嵌入表
+
+融合网络:
+    Fusion(x) = Linear(LayerNorm(x))
+
+注意力偏置:
+    B_level[i,j] = LevelAttnBias[d_i, d_j]
+    可学习的 [L_max+1, L_max+1] 偏置矩阵
+
+类对照表
+----------
++--------------------------------+-------------------------------+
+| 方法                            | 数学定义                        |
++================================+===============================+
+| forward(levels_info)           | E_pos: L → R^{N × D}         |
+| get_attention_bias(depths)     | B_level: Z^N → R^{N × N}     |
++--------------------------------+-------------------------------+
+"""
 from __future__ import annotations
 
 from typing import Optional
