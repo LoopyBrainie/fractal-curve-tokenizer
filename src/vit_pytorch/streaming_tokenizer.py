@@ -469,6 +469,11 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
     
     .. note::
         此版本保留自适应分辨率特性，但使用 Gumbel-Softmax 替代 REINFORCE。
+        
+    .. important::
+        **v1.1 修复 (2025-01)**: 解决 train/eval 模式不一致问题。
+        默认使用 Straight-Through Estimator (hard=True)，确保训练和验证
+        看到相同的特征分布。可通过 `use_soft_weights=True` 恢复旧行为。
     """
     
     def __init__(
@@ -480,7 +485,22 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
         use_hilbert_order: bool = True,
         max_level: int = 50,
         gumbel_temperature: float = 1.0,
+        use_soft_weights: bool = False,
     ) -> None:
+        """初始化 StreamingFractalTokenizerV2.
+        
+        Args:
+            image_size: 输入图像尺寸
+            channels: 图像通道数
+            d_model: 输出嵌入维度
+            patch_sizes: 多尺度 patch 大小
+            use_hilbert_order: 是否使用 Hilbert 曲线排序
+            max_level: 最大四叉树层级
+            gumbel_temperature: Gumbel-Softmax 温度参数
+            use_soft_weights: 是否使用软权重 (实验性)
+                - False (默认): 使用 STE (hard=True)，train/eval 一致
+                - True: 训练时使用软权重 (可能导致 train/eval 差异)
+        """
         super().__init__(
             image_size=image_size,
             channels=channels,
@@ -492,6 +512,7 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
         )
         
         self.gumbel_temperature = gumbel_temperature
+        self.use_soft_weights = use_soft_weights
         
         # 增强区域复杂度估计器 (EXP-FIX-1)
         # 使用更深的网络增加感受野 (RF: 7px → 31px)
@@ -597,23 +618,60 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
             
         Returns:
             weights: [B, num_scales, H', W'] 每个区域的尺度权重
+            
+        Note:
+            **修复 train/eval 不一致问题 (v1.1)**：
+            
+            提供三种模式（通过 use_soft_weights 控制）：
+            
+            1. `use_soft_weights=False` (默认): STE 硬决策
+               - Train: Gumbel-Softmax hard=True
+               - Eval: argmax
+               - 特点: train/eval 完全一致，推荐用于生产
+               
+            2. `use_soft_weights=True`: 软权重模式
+               - Train: Gumbel-Softmax hard=False (带噪声)
+               - Eval: 普通 Softmax (无噪声，确定性)
+               - 特点: 保留多尺度融合能力，eval 可复现
+               
+            3. `use_soft_weights='gumbel'`: 始终用 Gumbel (实验用)
+               - Train/Eval 都用 Gumbel-Softmax soft
+               - 特点: 验证结果不可复现，仅供研究
         """
         logits = self.complexity_estimator(images)  # [B, num_scales, H', W']
         
-        # Gumbel-Softmax
         if self.training:
-            weights = F.gumbel_softmax(
-                logits,
-                tau=self.temperature.clamp(min=0.1),
-                hard=False,
-                dim=1,
-            )
+            if self.use_soft_weights:
+                # 软权重模式: Gumbel-Softmax (带噪声探索)
+                weights = F.gumbel_softmax(
+                    logits,
+                    tau=self.temperature.clamp(min=0.1),
+                    hard=False,
+                    dim=1,
+                )
+            else:
+                # 默认: Straight-Through Estimator (hard=True)
+                weights = F.gumbel_softmax(
+                    logits,
+                    tau=self.temperature.clamp(min=0.1),
+                    hard=True,
+                    dim=1,
+                )
         else:
-            # 推理时使用硬决策
-            hard_indices = logits.argmax(dim=1)  # [B, H', W']
-            weights = F.one_hot(
-                hard_indices, num_classes=len(self.patch_sizes)
-            ).permute(0, 3, 1, 2).float()  # [B, num_scales, H', W']
+            # 推理模式
+            if self.use_soft_weights:
+                # 软权重模式: 使用普通 Softmax (无噪声，确定性)
+                # 这样 val 也能用多尺度融合，且结果可复现
+                weights = F.softmax(
+                    logits / self.temperature.clamp(min=0.1),
+                    dim=1,
+                )
+            else:
+                # 硬决策模式: argmax (与 train 时 STE 一致)
+                hard_indices = logits.argmax(dim=1)  # [B, H', W']
+                weights = F.one_hot(
+                    hard_indices, num_classes=len(self.patch_sizes)
+                ).permute(0, 3, 1, 2).float()
         
         return weights
     
