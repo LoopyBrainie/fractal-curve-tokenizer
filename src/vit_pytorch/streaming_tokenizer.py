@@ -622,27 +622,18 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
         Note:
             **修复 train/eval 不一致问题 (v1.1)**：
             
-            提供三种模式（通过 use_soft_weights 控制）：
+            默认使用 Straight-Through Estimator (STE):
+            - 前向传播: 硬决策 (one-hot) - train 和 eval 一致
+            - 反向传播: 软梯度 (通过 Gumbel-Softmax)
             
-            1. `use_soft_weights=False` (默认): STE 硬决策
-               - Train: Gumbel-Softmax hard=True
-               - Eval: argmax
-               - 特点: train/eval 完全一致，推荐用于生产
-               
-            2. `use_soft_weights=True`: 软权重模式
-               - Train: Gumbel-Softmax hard=False (带噪声)
-               - Eval: 普通 Softmax (无噪声，确定性)
-               - 特点: 保留多尺度融合能力，eval 可复现
-               
-            3. `use_soft_weights='gumbel'`: 始终用 Gumbel (实验用)
-               - Train/Eval 都用 Gumbel-Softmax soft
-               - 特点: 验证结果不可复现，仅供研究
+            如果 `use_soft_weights=True`，则使用旧的软权重模式（可能
+            导致 train/eval 差异，仅供实验对比）。
         """
         logits = self.complexity_estimator(images)  # [B, num_scales, H', W']
         
         if self.training:
             if self.use_soft_weights:
-                # 软权重模式: Gumbel-Softmax (带噪声探索)
+                # 实验模式: 软权重 (可能导致 train/eval 差异)
                 weights = F.gumbel_softmax(
                     logits,
                     tau=self.temperature.clamp(min=0.1),
@@ -651,27 +642,19 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
                 )
             else:
                 # 默认: Straight-Through Estimator (hard=True)
+                # 前向: argmax 硬决策，反向: 软梯度
                 weights = F.gumbel_softmax(
                     logits,
                     tau=self.temperature.clamp(min=0.1),
-                    hard=True,
+                    hard=True,  # 关键修复: 保持 train/eval 一致
                     dim=1,
                 )
         else:
-            # 推理模式
-            if self.use_soft_weights:
-                # 软权重模式: 使用普通 Softmax (无噪声，确定性)
-                # 这样 val 也能用多尺度融合，且结果可复现
-                weights = F.softmax(
-                    logits / self.temperature.clamp(min=0.1),
-                    dim=1,
-                )
-            else:
-                # 硬决策模式: argmax (与 train 时 STE 一致)
-                hard_indices = logits.argmax(dim=1)  # [B, H', W']
-                weights = F.one_hot(
-                    hard_indices, num_classes=len(self.patch_sizes)
-                ).permute(0, 3, 1, 2).float()
+            # 推理时使用 argmax (与训练时的硬决策一致)
+            hard_indices = logits.argmax(dim=1)  # [B, H', W']
+            weights = F.one_hot(
+                hard_indices, num_classes=len(self.patch_sizes)
+            ).permute(0, 3, 1, 2).float()  # [B, num_scales, H', W']
         
         return weights
     
