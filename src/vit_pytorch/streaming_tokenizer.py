@@ -306,7 +306,9 @@ class StreamingFractalTokenizer(BaseTokenizer):
         grid_w: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """创建与原 tokenizer 兼容的 levels_info.
+        """创建与原 tokenizer 兼容的 levels_info (EXP-FIX-3 增强版).
+        
+        生成丰富的路径信息，用于位置编码和注意力偏置。
         
         Args:
             batch_size: 批次大小
@@ -317,7 +319,9 @@ class StreamingFractalTokenizer(BaseTokenizer):
             device: 设备
             
         Returns:
-            levels_info: [B, num_tokens, info_len] 包含深度和路径信息
+            levels_info: [B, num_tokens, info_len] 包含深度和完整路径信息
+            - info[:, :, 0]: 深度 (scale_level)
+            - info[:, :, 1:]: 四叉树路径 (每层象限索引 0-3)
         """
         # 信息长度：depth + 最多 max_level 个路径节点
         info_len = min(self.max_level + 1, 16)  # 限制最大长度
@@ -330,24 +334,54 @@ class StreamingFractalTokenizer(BaseTokenizer):
         # 设置深度（第0列）
         levels_info[:, :, 0] = scale_level
         
-        # 生成简化的路径信息
-        # 对于网格中的每个位置，计算其 Hilbert 路径
-        if self.use_hilbert_order:
-            grid_size = max(grid_h, grid_w)
-            n = 1
-            while n < grid_size:
-                n *= 2
+        # EXP-FIX-3: 生成完整的四叉树路径信息
+        grid_size = max(grid_h, grid_w)
+        n = 1
+        while n < grid_size:
+            n *= 2
+        
+        # 预计算每个 token 的路径
+        for token_idx in range(min(num_tokens, grid_h * grid_w)):
+            if self.use_hilbert_order:
+                # 使用 Hilbert 距离恢复坐标
+                x, y = HilbertCurve.d_to_xy(n, token_idx % (n * n))
+            else:
+                # 光栅顺序
+                y = token_idx // grid_w
+                x = token_idx % grid_w
             
-            for token_idx in range(num_tokens):
-                if token_idx < grid_h * grid_w:
-                    # 从 token 索引恢复网格坐标
-                    # 如果使用 Hilbert 顺序，token_idx 对应 Hilbert 距离
-                    if n >= 2:
-                        x, y = HilbertCurve.d_to_xy(n, token_idx % (n * n))
-                        # 简化路径：使用象限索引
-                        quadrant = (1 if x >= n // 2 else 0) + (2 if y >= n // 2 else 0)
-                        if info_len > 1:
-                            levels_info[:, token_idx, 1] = quadrant
+            # 确保坐标在有效范围内
+            x = min(x, grid_w - 1)
+            y = min(y, grid_h - 1)
+            
+            # 计算四叉树路径 (从根到叶)
+            # 每一层将空间划分为 4 个象限:
+            # 0 = 左上, 1 = 右上, 2 = 左下, 3 = 右下
+            current_size = n
+            current_x, current_y = x, y
+            
+            # 计算需要的路径深度（基于网格大小，而非 scale_level）
+            max_depth = min(info_len - 1, int(math.log2(max(n, 2))))
+            
+            for depth in range(1, max_depth + 1):
+                if current_size <= 1:
+                    break
+                    
+                half = current_size // 2
+                if half == 0:
+                    break
+                
+                # 计算当前层的象限
+                qx = 1 if current_x >= half else 0
+                qy = 2 if current_y >= half else 0
+                quadrant = qx + qy  # 0-3
+                
+                levels_info[:, token_idx, depth] = quadrant
+                
+                # 更新到下一层的局部坐标
+                current_x = current_x % half
+                current_y = current_y % half
+                current_size = half
         
         return levels_info
     
@@ -459,17 +493,98 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
         
         self.gumbel_temperature = gumbel_temperature
         
-        # 区域复杂度估计器
+        # 增强区域复杂度估计器 (EXP-FIX-1)
+        # 使用更深的网络增加感受野 (RF: 7px → 31px)
+        # 添加空洞卷积进一步扩展感受野
         self.complexity_estimator = nn.Sequential(
+            # 第1层: 3x3 conv, RF=3px
             nn.Conv2d(channels, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            
+            # 第2层: 3x3 conv, RF=5px
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            
+            # 第3层: 3x3 空洞卷积 dilation=2, RF=9px
+            nn.Conv2d(64, 64, kernel_size=3, padding=2, dilation=2),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            
+            # 第4层: 3x3 空洞卷积 dilation=4, RF=17px
+            nn.Conv2d(64, 64, kernel_size=3, padding=4, dilation=4),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            
+            # 第5层: 3x3 空洞卷积 dilation=8, RF=33px (超过 patch size)
+            nn.Conv2d(64, 32, kernel_size=3, padding=8, dilation=8),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            
+            # 下采样 + 输出
             nn.Conv2d(32, 32, kernel_size=3, padding=1, stride=2),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Conv2d(32, len(patch_sizes), kernel_size=1),
         )
         
-        # 可学习温度参数
+        # 温度退火配置 (EXP-FIX-2)
+        self.tau_init = gumbel_temperature
+        self.tau_min = 0.5
+        self.tau_max = 5.0
+        self._current_tau = gumbel_temperature
+        
+        # 保持可学习温度参数（可选）
         self.temperature = nn.Parameter(torch.tensor(gumbel_temperature))
+    
+    def set_temperature(self, tau: float) -> None:
+        """设置当前 Gumbel-Softmax 温度 (用于温度退火调度).
+        
+        Args:
+            tau: 目标温度值，会被 clamp 到 [tau_min, tau_max]
+        """
+        self._current_tau = max(self.tau_min, min(self.tau_max, tau))
+        self.temperature.data.fill_(self._current_tau)
+    
+    def get_temperature(self) -> float:
+        """获取当前温度值."""
+        return self._current_tau
+    
+    def anneal_temperature(
+        self,
+        current_epoch: int,
+        total_epochs: int,
+        schedule: str = "linear",
+    ) -> float:
+        """温度退火调度 (EXP-FIX-2).
+        
+        从 τ_init 线性/指数退火到 τ_min。
+        
+        Args:
+            current_epoch: 当前 epoch (1-indexed)
+            total_epochs: 总 epoch 数
+            schedule: 退火方式 ("linear", "exponential", "cosine")
+            
+        Returns:
+            更新后的温度值
+        """
+        progress = min(1.0, current_epoch / max(1, total_epochs))
+        
+        if schedule == "linear":
+            # 线性退火: τ = τ_max - (τ_max - τ_min) * progress
+            new_tau = self.tau_max - (self.tau_max - self.tau_min) * progress
+        elif schedule == "exponential":
+            # 指数退火: τ = τ_max * (τ_min / τ_max)^progress
+            new_tau = self.tau_max * (self.tau_min / self.tau_max) ** progress
+        elif schedule == "cosine":
+            # 余弦退火: τ = τ_min + 0.5 * (τ_max - τ_min) * (1 + cos(π * progress))
+            import math
+            new_tau = self.tau_min + 0.5 * (self.tau_max - self.tau_min) * (1 + math.cos(math.pi * progress))
+        else:
+            new_tau = self.tau_init
+        
+        self.set_temperature(new_tau)
+        return new_tau
         
     def _compute_scale_weights(
         self,
@@ -579,10 +694,19 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
                 hilbert_idx = F.pad(hilbert_idx, (0, num_tokens - valid_len), value=0)
             dominant_scales = dominant_scales.gather(1, hilbert_idx.unsqueeze(0).expand(B, -1))
         
-        # 创建 levels_info
-        info_len = min(self.max_level + 1, 16)
-        levels_info = torch.zeros(B, num_tokens, info_len, dtype=torch.long, device=device)
+        # 创建 levels_info (复用父类方法生成完整路径)
+        # 使用主要尺度（最小 patch size 对应的 level）
+        primary_level = self.scale_to_level[min_ps]
+        levels_info = self._create_levels_info(
+            batch_size=B,
+            num_tokens=num_tokens,
+            scale_level=primary_level,
+            grid_h=grid_h,
+            grid_w=grid_w,
+            device=device,
+        )
         
+        # 更新每个 token 的实际 scale level
         for scale_idx, ps in enumerate(self.patch_sizes):
             level = self.scale_to_level[ps]
             mask = (dominant_scales == scale_idx)
