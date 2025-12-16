@@ -53,6 +53,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset, SubsetRandomSampler
 from torchvision import datasets, transforms
+from torchvision.transforms import functional as TF
 from tqdm import tqdm
 
 # AMP 兼容层
@@ -114,15 +115,136 @@ class TrainingConfig:
     weight_decay: float
     dropout: float
     emb_dropout: float
+    drop_path: float
+    label_smoothing: float
     gradient_clip: float
     use_amp: bool
     accum_steps: int
     warmup_epochs: int
     gradient_checkpoint: bool
     
+    # 早停
+    patience: int
+    min_delta: float
+    
+    # Mixup/CutMix
+    mixup_alpha: float
+    cutmix_alpha: float
+    mixup_prob: float
+    
     # 系统
     seed: int
     device: str
+
+
+# ============================================================================
+# Mixup/CutMix 实现
+# ============================================================================
+
+class MixupCutmix:
+    """Mixup 和 CutMix 数据增强
+    
+    参考: 
+    - Mixup: https://arxiv.org/abs/1710.09412
+    - CutMix: https://arxiv.org/abs/1905.04899
+    """
+    
+    def __init__(
+        self,
+        mixup_alpha: float = 0.8,
+        cutmix_alpha: float = 1.0,
+        prob: float = 0.5,
+        num_classes: int = 10,
+        label_smoothing: float = 0.0,
+    ):
+        self.mixup_alpha = mixup_alpha
+        self.cutmix_alpha = cutmix_alpha
+        self.prob = prob
+        self.num_classes = num_classes
+        self.label_smoothing = label_smoothing
+    
+    def __call__(
+        self, 
+        images: torch.Tensor, 
+        labels: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """应用 Mixup 或 CutMix
+        
+        Args:
+            images: [B, C, H, W] 图像张量
+            labels: [B] 标签张量
+            
+        Returns:
+            mixed_images: 混合后的图像
+            mixed_labels: 混合后的 one-hot 标签 [B, num_classes]
+        """
+        batch_size = images.size(0)
+        device = images.device
+        
+        # 转换为 one-hot 并应用 label smoothing
+        labels_one_hot = F.one_hot(labels, self.num_classes).float()
+        if self.label_smoothing > 0:
+            labels_one_hot = labels_one_hot * (1 - self.label_smoothing) + self.label_smoothing / self.num_classes
+        
+        # 随机决定是否应用增强
+        if random.random() > self.prob:
+            return images, labels_one_hot
+        
+        # 随机选择 Mixup 或 CutMix
+        use_cutmix = random.random() > 0.5 and self.cutmix_alpha > 0
+        
+        if use_cutmix:
+            lam = np.random.beta(self.cutmix_alpha, self.cutmix_alpha)
+        else:
+            lam = np.random.beta(self.mixup_alpha, self.mixup_alpha) if self.mixup_alpha > 0 else 1.0
+        
+        # 随机打乱索引
+        index = torch.randperm(batch_size, device=device)
+        
+        if use_cutmix:
+            # CutMix: 随机裁剪区域
+            _, _, H, W = images.shape
+            cut_h = int(H * np.sqrt(1 - lam))
+            cut_w = int(W * np.sqrt(1 - lam))
+            
+            cx = random.randint(0, W)
+            cy = random.randint(0, H)
+            
+            x1 = max(0, cx - cut_w // 2)
+            x2 = min(W, cx + cut_w // 2)
+            y1 = max(0, cy - cut_h // 2)
+            y2 = min(H, cy + cut_h // 2)
+            
+            mixed_images = images.clone()
+            mixed_images[:, :, y1:y2, x1:x2] = images[index, :, y1:y2, x1:x2]
+            
+            # 重新计算 lambda 基于实际裁剪区域
+            lam = 1 - (x2 - x1) * (y2 - y1) / (W * H)
+        else:
+            # Mixup: 线性混合
+            mixed_images = lam * images + (1 - lam) * images[index]
+        
+        # 混合标签
+        mixed_labels = lam * labels_one_hot + (1 - lam) * labels_one_hot[index]
+        
+        return mixed_images, mixed_labels
+
+
+def mixup_criterion(
+    outputs: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """计算 Mixup/CutMix 的交叉熵损失
+    
+    Args:
+        outputs: [B, C] 模型输出 logits
+        targets: [B, C] one-hot 或 soft 标签
+        
+    Returns:
+        损失标量
+    """
+    log_probs = F.log_softmax(outputs, dim=1)
+    return -(targets * log_probs).sum(dim=1).mean()
 
 
 # ============================================================================
@@ -404,16 +526,20 @@ def create_dataloaders(
         train_tf = transforms.Compose([
             transforms.RandomHorizontalFlip(),
             transforms.RandomCrop(64, padding=8),
+            transforms.RandAugment(num_ops=2, magnitude=9),  # Phase 2: RandAugment
             transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
             transforms.ToTensor(),
             transforms.Normalize(spec.mean, spec.std),
+            transforms.RandomErasing(p=0.25),  # Cutout-like augmentation
         ])
     else:
         train_tf = transforms.Compose([
             transforms.RandomHorizontalFlip(),
             transforms.RandomCrop(spec.image_size, padding=4),
+            transforms.RandAugment(num_ops=2, magnitude=9),  # Phase 2: RandAugment
             transforms.ToTensor(),
             transforms.Normalize(spec.mean, spec.std),
+            transforms.RandomErasing(p=0.25),  # Cutout-like augmentation
         ])
     
     test_tf = transforms.Compose([
@@ -537,6 +663,8 @@ def train_epoch(
     device: torch.device,
     scaler: GradScaler,
     config: TrainingConfig,
+    mixup_fn: Optional[MixupCutmix] = None,
+    num_classes: int = 10,
     profile: bool = False,
 ) -> Tuple[float, float, Dict[str, float]]:
     """训练一个 epoch"""
@@ -546,6 +674,7 @@ def train_epoch(
     
     batch_times, data_times, forward_times = [], [], []
     cuda_mem_peak = 0.0
+    use_mixup = mixup_fn is not None
     
     data_iter = CudaPrefetcher(loader, device) if device.type == 'cuda' else loader
     pbar = tqdm(data_iter, desc="Train", total=len(loader))
@@ -561,10 +690,19 @@ def train_epoch(
             imgs = imgs.to(device)
             labels = labels.to(device)
         
+        # 应用 Mixup/CutMix
+        mixed_labels: Optional[torch.Tensor] = None
+        if use_mixup and mixup_fn is not None:
+            imgs, mixed_labels = mixup_fn(imgs, labels)
+        
         forward_start = time.time()
         with get_amp_context(device, config.use_amp):
             outs, _ = model(imgs, return_aux_info=True)
-            loss = F.cross_entropy(outs, labels) / config.accum_steps
+            if use_mixup and mixed_labels is not None:
+                # 使用混合标签的交叉熵
+                loss = mixup_criterion(outs, mixed_labels) / config.accum_steps
+            else:
+                loss = F.cross_entropy(outs, labels, label_smoothing=config.label_smoothing) / config.accum_steps
         
         forward_time = time.time() - forward_start
         forward_times.append(forward_time)
@@ -672,13 +810,33 @@ def main():
     # 训练
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--weight-decay", type=float, default=0.05,
+                       help="Weight decay (default: 0.05, increased for regularization)")
+    parser.add_argument("--dropout", type=float, default=0.3,
+                       help="Dropout rate (default: 0.3, increased for regularization)")
     parser.add_argument("--emb-dropout", type=float, default=0.1)
+    parser.add_argument("--drop-path", type=float, default=0.2,
+                       help="Drop path (stochastic depth) rate")
+    parser.add_argument("--label-smoothing", type=float, default=0.1,
+                       help="Label smoothing factor (default: 0.1)")
     parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--warmup-epochs", type=int, default=10)
     parser.add_argument("--use-amp", action="store_true")
     parser.add_argument("--accum-steps", type=int, default=1)
+    
+    # 早停
+    parser.add_argument("--patience", type=int, default=10,
+                       help="Early stopping patience (epochs without improvement)")
+    parser.add_argument("--min-delta", type=float, default=0.001,
+                       help="Minimum improvement for early stopping")
+    
+    # Mixup/CutMix
+    parser.add_argument("--mixup-alpha", type=float, default=0.8,
+                       help="Mixup alpha (default: 0.8, 0 to disable)")
+    parser.add_argument("--cutmix-alpha", type=float, default=1.0,
+                       help="CutMix alpha (default: 1.0, 0 to disable)")
+    parser.add_argument("--mixup-prob", type=float, default=0.5,
+                       help="Probability of applying Mixup/CutMix (default: 0.5)")
     
     # 系统
     parser.add_argument("--seed", type=int, default=42)
@@ -732,11 +890,18 @@ def main():
         weight_decay=args.weight_decay,
         dropout=args.dropout,
         emb_dropout=args.emb_dropout,
+        drop_path=args.drop_path,
+        label_smoothing=args.label_smoothing,
         gradient_clip=args.gradient_clip,
         use_amp=args.use_amp,
         accum_steps=args.accum_steps,
         warmup_epochs=args.warmup_epochs,
         gradient_checkpoint=args.gradient_checkpoint,
+        patience=args.patience,
+        min_delta=args.min_delta,
+        mixup_alpha=args.mixup_alpha,
+        cutmix_alpha=args.cutmix_alpha,
+        mixup_prob=args.mixup_prob,
         seed=args.seed,
         device=str(device),
     )
@@ -794,12 +959,28 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     
+    # 创建 Mixup/CutMix 增强器
+    use_mixup = config.mixup_alpha > 0 or config.cutmix_alpha > 0
+    mixup_fn = None
+    if use_mixup:
+        mixup_fn = MixupCutmix(
+            mixup_alpha=config.mixup_alpha,
+            cutmix_alpha=config.cutmix_alpha,
+            prob=config.mixup_prob,
+            num_classes=spec.num_classes,
+            label_smoothing=config.label_smoothing,
+        )
+    
     # 训练
     print("="*70)
     print("TRAINING START")
     print("="*70 + "\n")
     
     best_val = 0.0
+    best_val_loss = float('inf')
+    patience_counter = 0
+    early_stopped = False
+    
     exp_dir = PROJECT_ROOT / "experiments" / f"fractal_vit_{time.strftime('%Y%m%d_%H%M%S')}"
     exp_dir.mkdir(parents=True, exist_ok=True)
     (exp_dir / "checkpoints").mkdir(exist_ok=True)
@@ -811,11 +992,18 @@ def main():
     
     history = []
     
+    print(f"[INFO] Early stopping: patience={config.patience}, min_delta={config.min_delta}")
+    print(f"[INFO] Regularization: dropout={config.dropout}, weight_decay={config.weight_decay}")
+    print(f"[INFO] Label smoothing: {config.label_smoothing}")
+    print(f"[INFO] Mixup/CutMix: alpha={config.mixup_alpha}/{config.cutmix_alpha}, prob={config.mixup_prob}\n")
+    
     for epoch in range(1, config.epochs + 1):
         start = time.time()
         
         train_loss, train_acc, perf_stats = train_epoch(
             model, train_loader, optimizer, device, scaler, config,
+            mixup_fn=mixup_fn,
+            num_classes=spec.num_classes,
             profile=(epoch == 1)
         )
         
@@ -823,10 +1011,19 @@ def main():
         
         scheduler.step()
         
+        # 温度退火 (EXP-FIX-2)
+        current_tau = None
+        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'anneal_temperature'):
+            current_tau = model.tokenizer.anneal_temperature(
+                current_epoch=epoch,
+                total_epochs=config.epochs,
+                schedule="cosine",
+            )
+        
         epoch_time = time.time() - start
         
         # 记录历史
-        history.append({
+        history_entry = {
             'epoch': epoch,
             'train_loss': train_loss,
             'train_acc': train_acc,
@@ -834,12 +1031,16 @@ def main():
             'val_acc': val_acc,
             'lr': optimizer.param_groups[0]['lr'],
             'time': epoch_time,
-        })
+        }
+        if current_tau is not None:
+            history_entry['gumbel_tau'] = current_tau
+        history.append(history_entry)
         
         print(f"\nEpoch {epoch}/{config.epochs}:")
         print(f"  Train: loss={train_loss:.4f}, acc={train_acc:.2f}%")
         print(f"  Val:   loss={val_loss:.4f}, acc={val_acc:.2f}%")
-        print(f"  Time:  {epoch_time:.1f}s, Throughput: {perf_stats['throughput']:.1f} samples/s")
+        tau_str = f", τ={current_tau:.3f}" if current_tau is not None else ""
+        print(f"  Time:  {epoch_time:.1f}s, Throughput: {perf_stats['throughput']:.1f} samples/s{tau_str}")
         
         if epoch == 1:
             data_pct = perf_stats['avg_data_time'] / perf_stats['avg_batch_time'] * 100 if perf_stats['avg_batch_time'] > 0 else 0
@@ -847,16 +1048,27 @@ def main():
             print(f"  Perf:  data={data_pct:.1f}%, fwd={fwd_pct:.1f}%, mem={perf_stats['cuda_mem_peak_gb']:.2f}GB")
         
         # 保存最佳
-        if val_acc > best_val:
+        if val_acc > best_val + config.min_delta:
             best_val = val_acc
+            best_val_loss = val_loss
+            patience_counter = 0
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_acc': val_acc,
+                'val_loss': val_loss,
                 'config': asdict(config),
             }, exp_dir / "checkpoints" / "best.pth")
             print(f"  [*] Best model saved: {val_acc:.2f}%")
+        else:
+            patience_counter += 1
+            print(f"  [!] No improvement ({patience_counter}/{config.patience})")
+            if patience_counter >= config.patience:
+                print(f"\n[EARLY STOPPING] No improvement for {config.patience} epochs.")
+                print(f"[EARLY STOPPING] Best val acc: {best_val:.2f}% at epoch {epoch - patience_counter}")
+                early_stopped = True
+                break
     
     # 保存训练历史
     with open(exp_dir / "training_history.json", 'w') as f:
@@ -873,6 +1085,8 @@ def main():
     test_loss, test_acc = evaluate(model, test_loader, device, config.use_amp)
     
     print(f"Test: loss={test_loss:.4f}, acc={test_acc:.2f}%")
+    if early_stopped:
+        print(f"[*] Training stopped early at epoch {epoch}/{config.epochs}")
     print(f"\n[OK] Results saved to: {exp_dir}")
     
     # 保存最终结果
@@ -881,7 +1095,9 @@ def main():
             'best_val_acc': best_val,
             'test_acc': test_acc,
             'test_loss': test_loss,
-            'total_epochs': config.epochs,
+            'total_epochs': epoch if early_stopped else config.epochs,
+            'early_stopped': early_stopped,
+            'best_epoch': epoch - patience_counter if early_stopped else epoch,
         }, f, indent=2)
 
 
