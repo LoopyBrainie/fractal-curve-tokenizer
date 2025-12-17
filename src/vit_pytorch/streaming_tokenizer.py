@@ -742,6 +742,34 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
         
         # 保持可学习温度参数（可选）
         self.temperature = nn.Parameter(torch.tensor(gumbel_temperature))
+        
+        # ========== 深度探索优先 Warmup (v2.2) ==========
+        # 在训练初期对小尺度（深层级）添加正偏置，引导模型探索细粒度特征
+        #
+        # 数学形式:
+        #   logits' = logits + scale_bias
+        #   scale_bias[s] = bias_strength * (1 - s / (S-1))  # 小尺度偏置大
+        #
+        # 其中 s ∈ [0, S-1] 是尺度索引，s=0 对应最小 patch（最深层级）
+        #
+        # 调度策略:
+        #   bias_strength = max_bias * (1 - progress)^decay_power
+        #   warmup 期间保持较高偏置，之后快速衰减
+        #
+        # 效果:
+        #   - 训练初期: 模型更倾向于选择小 patch，学习细粒度特征
+        #   - 训练后期: 偏置消失，模型自主学习最优尺度选择
+        self._depth_bias_max = 2.0      # 最大偏置强度
+        self._depth_bias_decay = 2.0    # 衰减指数 (>1 快速衰减)
+        self._depth_bias_warmup = 0.2   # warmup 占比 (前 20% 保持高偏置)
+        self._current_depth_bias = self._depth_bias_max
+        
+        # 预计算尺度偏置权重 (小尺度 = 大权重)
+        # patch_sizes 从小到大排列，所以 index 0 = 最小 patch = 最深层级
+        self.register_buffer(
+            '_scale_bias_weights',
+            torch.linspace(1.0, 0.0, self.num_scales)  # [1.0, 0.67, 0.33, 0.0] for 4 scales
+        )
     
     @classmethod
     def from_config(
@@ -793,6 +821,69 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
         """获取当前温度值."""
         return self._current_tau
     
+    def set_depth_bias(
+        self,
+        bias_strength: float,
+        max_bias: Optional[float] = None,
+        decay_power: Optional[float] = None,
+        warmup_ratio: Optional[float] = None,
+    ) -> None:
+        """设置深度探索偏置参数.
+        
+        Args:
+            bias_strength: 当前偏置强度
+            max_bias: 可选，更新最大偏置值
+            decay_power: 可选，更新衰减指数
+            warmup_ratio: 可选，更新 warmup 占比
+        """
+        self._current_depth_bias = max(0.0, bias_strength)
+        if max_bias is not None:
+            self._depth_bias_max = max_bias
+        if decay_power is not None:
+            self._depth_bias_decay = decay_power
+        if warmup_ratio is not None:
+            self._depth_bias_warmup = warmup_ratio
+    
+    def get_depth_bias(self) -> float:
+        """获取当前深度偏置强度."""
+        return self._current_depth_bias
+    
+    def anneal_depth_bias(
+        self,
+        current_epoch: int,
+        total_epochs: int,
+    ) -> float:
+        """深度偏置退火调度.
+        
+        在 warmup 期间保持高偏置，之后快速衰减。
+        
+        调度公式:
+            if progress < warmup_ratio:
+                bias = max_bias  # warmup 期间保持最大偏置
+            else:
+                adjusted_progress = (progress - warmup) / (1 - warmup)
+                bias = max_bias * (1 - adjusted_progress)^decay_power
+        
+        Args:
+            current_epoch: 当前 epoch (1-indexed)
+            total_epochs: 总 epoch 数
+            
+        Returns:
+            更新后的偏置强度
+        """
+        progress = min(1.0, current_epoch / max(1, total_epochs))
+        
+        if progress < self._depth_bias_warmup:
+            # Warmup 期间: 保持最大偏置
+            new_bias = self._depth_bias_max
+        else:
+            # Warmup 后: 快速衰减
+            adjusted_progress = (progress - self._depth_bias_warmup) / (1.0 - self._depth_bias_warmup)
+            new_bias = self._depth_bias_max * ((1.0 - adjusted_progress) ** self._depth_bias_decay)
+        
+        self._current_depth_bias = new_bias
+        return new_bias
+    
     def anneal_temperature(
         self,
         current_epoch: int,
@@ -802,6 +893,7 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
         """温度退火调度 (EXP-FIX-2).
         
         从 τ_init 线性/指数退火到 τ_min。
+        同时更新深度偏置 (v2.2)。
         
         Args:
             current_epoch: 当前 epoch (1-indexed)
@@ -827,6 +919,10 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
             new_tau = self.tau_init
         
         self.set_temperature(new_tau)
+        
+        # 同步更新深度偏置 (v2.2)
+        self.anneal_depth_bias(current_epoch, total_epochs)
+        
         return new_tau
         
     def _compute_scale_weights(
@@ -837,12 +933,17 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
         """基于 Encoder 特征计算每个区域的尺度权重.
         
         **v2.0 重构**: 使用语义特征而非原始像素
+        **v2.2 新增**: 深度探索优先 warmup 偏置
         
         数学形式:
             F_aligned = {Upsample(F_s, target_size) | s ∈ scales}
             F_concat = Concat(F_aligned, dim=1)  # [B, S*D, H', W']
             logits = ComplexityHead(F_concat)     # [B, S, H', W']
-            π = Gumbel-Softmax(logits, τ)        # [B, S, H', W']
+            
+            # v2.2: 添加深度偏置
+            logits' = logits + depth_bias * scale_bias_weights
+            
+            π = Gumbel-Softmax(logits', τ)       # [B, S, H', W']
         
         Args:
             features_dict: {patch_size: (features [B,D,H,W], (grid_h, grid_w))}
@@ -856,6 +957,10 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
             默认使用 Straight-Through Estimator (STE):
             - 前向传播: 硬决策 (one-hot) - train 和 eval 一致
             - 反向传播: 软梯度 (通过 Gumbel-Softmax)
+            
+            **深度探索优先 (v2.2)**：
+            训练初期对小尺度添加正偏置，引导模型探索细粒度特征。
+            偏置随训练进度衰减，最终由模型自主决策。
         """
         # 1. 将所有尺度的特征对齐到目标大小
         aligned_features = []
@@ -884,7 +989,14 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
         # 3. 通过轻量级头预测尺度 logits
         logits = self.complexity_head(concat_features)  # [B, num_scales, H', W']
         
-        # 4. Gumbel-Softmax 转换为权重
+        # 4. 应用深度探索偏置 (v2.2)
+        # 仅在训练时应用，推理时不添加偏置
+        if self.training and self._current_depth_bias > 0.01:
+            # scale_bias_weights: [S] -> [1, S, 1, 1] for broadcasting
+            bias = self._current_depth_bias * self._scale_bias_weights.view(1, -1, 1, 1)
+            logits = logits + bias
+        
+        # 5. Gumbel-Softmax 转换为权重
         if self.training:
             if self.use_soft_weights:
                 # 实验模式: 软权重 (可能导致 train/eval 差异)

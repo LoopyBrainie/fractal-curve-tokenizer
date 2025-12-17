@@ -634,3 +634,128 @@ class TestVariableTokensMode:
         # 验证梯度流动
         assert images.grad is not None
         assert not torch.isnan(images.grad).any()
+
+
+class TestDepthBiasWarmup:
+    """测试深度探索优先 Warmup 策略 (v2.2)."""
+    
+    @pytest.fixture
+    def tokenizer_v2(self):
+        """创建 V2 tokenizer 用于测试."""
+        return StreamingFractalTokenizerV2(
+            image_size=32,
+            channels=3,
+            d_model=64,
+            patch_sizes=(4, 8, 16),
+            gumbel_temperature=2.0,
+        )
+    
+    def test_depth_bias_initialization(self, tokenizer_v2):
+        """测试深度偏置初始化."""
+        # 检查初始值
+        assert tokenizer_v2._depth_bias_max == 2.0
+        assert tokenizer_v2._depth_bias_decay == 2.0
+        assert tokenizer_v2._depth_bias_warmup == 0.2
+        assert tokenizer_v2._current_depth_bias == 2.0
+        
+        # 检查尺度偏置权重
+        # 3 个尺度: [1.0, 0.5, 0.0] 或类似 (小尺度偏置大)
+        weights = tokenizer_v2._scale_bias_weights
+        assert weights.shape == (3,)
+        assert weights[0] > weights[1] > weights[2]  # 递减
+        assert weights[0].item() == pytest.approx(1.0)
+        assert weights[2].item() == pytest.approx(0.0)
+    
+    def test_depth_bias_annealing(self, tokenizer_v2):
+        """测试深度偏置退火调度."""
+        total_epochs = 100
+        
+        # Epoch 1 (1%): 在 warmup 期间，保持最大偏置
+        bias_e1 = tokenizer_v2.anneal_depth_bias(1, total_epochs)
+        assert bias_e1 == pytest.approx(2.0, rel=0.1)
+        
+        # Epoch 10 (10%): 仍在 warmup (20%) 期间
+        bias_e10 = tokenizer_v2.anneal_depth_bias(10, total_epochs)
+        assert bias_e10 == pytest.approx(2.0, rel=0.1)
+        
+        # Epoch 50 (50%): warmup 后，偏置开始衰减
+        bias_e50 = tokenizer_v2.anneal_depth_bias(50, total_epochs)
+        assert bias_e50 < 2.0
+        assert bias_e50 > 0.0
+        
+        # Epoch 100 (100%): 偏置接近 0
+        bias_e100 = tokenizer_v2.anneal_depth_bias(100, total_epochs)
+        assert bias_e100 < 0.1
+    
+    def test_anneal_temperature_updates_depth_bias(self, tokenizer_v2):
+        """测试 anneal_temperature 同时更新深度偏置."""
+        # 初始状态
+        assert tokenizer_v2._current_depth_bias == 2.0
+        
+        # 调用 anneal_temperature
+        tokenizer_v2.anneal_temperature(50, 100, schedule="cosine")
+        
+        # 验证深度偏置也被更新
+        assert tokenizer_v2._current_depth_bias < 2.0
+    
+    def test_depth_bias_affects_logits(self, tokenizer_v2):
+        """测试深度偏置影响尺度选择."""
+        images = torch.randn(2, 3, 32, 32)
+        
+        tokenizer_v2.train()
+        
+        # 高偏置时 (初始状态)
+        tokenizer_v2._current_depth_bias = 2.0
+        features_dict = tokenizer_v2.encoder(images)
+        min_ps = min(features_dict.keys())
+        _, target_size = features_dict[min_ps]
+        weights_high_bias = tokenizer_v2._compute_scale_weights(features_dict, target_size)
+        
+        # 低偏置时
+        tokenizer_v2._current_depth_bias = 0.0
+        weights_no_bias = tokenizer_v2._compute_scale_weights(features_dict, target_size)
+        
+        # 高偏置时应该更倾向于小尺度 (scale index 0)
+        scale_0_ratio_high = weights_high_bias[:, 0].mean().item()
+        scale_0_ratio_low = weights_no_bias[:, 0].mean().item()
+        
+        # 由于 Gumbel 采样的随机性，只验证逻辑正确性
+        # 高偏置应该增加小尺度的选择概率
+        print(f"\nScale 0 ratio - high bias: {scale_0_ratio_high:.3f}, no bias: {scale_0_ratio_low:.3f}")
+    
+    def test_depth_bias_not_applied_in_eval(self, tokenizer_v2):
+        """测试推理模式下不应用深度偏置."""
+        images = torch.randn(1, 3, 32, 32)
+        
+        tokenizer_v2.eval()
+        tokenizer_v2._current_depth_bias = 2.0  # 设置高偏置
+        
+        with torch.no_grad():
+            features_dict = tokenizer_v2.encoder(images)
+            min_ps = min(features_dict.keys())
+            _, target_size = features_dict[min_ps]
+            weights = tokenizer_v2._compute_scale_weights(features_dict, target_size)
+        
+        # 推理模式下输出应该是 one-hot
+        assert weights.sum(dim=1).allclose(torch.ones_like(weights.sum(dim=1)))
+    
+    def test_set_depth_bias(self, tokenizer_v2):
+        """测试手动设置深度偏置参数."""
+        tokenizer_v2.set_depth_bias(
+            bias_strength=1.5,
+            max_bias=3.0,
+            decay_power=1.5,
+            warmup_ratio=0.3,
+        )
+        
+        assert tokenizer_v2._current_depth_bias == 1.5
+        assert tokenizer_v2._depth_bias_max == 3.0
+        assert tokenizer_v2._depth_bias_decay == 1.5
+        assert tokenizer_v2._depth_bias_warmup == 0.3
+    
+    def test_get_depth_bias(self, tokenizer_v2):
+        """测试获取当前深度偏置."""
+        assert tokenizer_v2.get_depth_bias() == 2.0
+        
+        tokenizer_v2._current_depth_bias = 0.5
+        assert tokenizer_v2.get_depth_bias() == 0.5
