@@ -75,6 +75,199 @@ DATASETS = {
 
 
 # ============================================================================
+# 数据集下载功能
+# ============================================================================
+
+def download_with_progress(url: str, dest: Path, desc: str = "Downloading") -> bool:
+    """带进度条的下载函数"""
+    import urllib.request
+    
+    try:
+        # 获取文件大小
+        with urllib.request.urlopen(url, timeout=30) as response:
+            total_size = int(response.headers.get('Content-Length', 0))
+        
+        # 下载
+        downloaded = 0
+        block_size = 8192
+        
+        with urllib.request.urlopen(url, timeout=30) as response:
+            with open(dest, 'wb') as f:
+                with tqdm(total=total_size, unit='B', unit_scale=True, desc=desc) as pbar:
+                    while True:
+                        buffer = response.read(block_size)
+                        if not buffer:
+                            break
+                        f.write(buffer)
+                        downloaded += len(buffer)
+                        pbar.update(len(buffer))
+        
+        return True
+    except Exception as e:
+        print(f"\n[ERROR] Download failed: {e}")
+        if dest.exists():
+            dest.unlink()
+        return False
+
+
+def download_tiny_imagenet(data_root: Path) -> bool:
+    """下载并设置 Tiny ImageNet
+    
+    数据集信息:
+    - 200 类，每类 500 张训练图像
+    - 训练集: 100,000 张 64x64 图像
+    - 验证集: 10,000 张图像
+    """
+    import shutil
+    import zipfile
+    
+    target_dir = data_root / "tiny-imagenet-200"
+    
+    # 检查是否已存在
+    if (target_dir / "train").exists() and (target_dir / "val").exists():
+        train_classes = len(list((target_dir / "train").iterdir()))
+        val_has_classes = any((target_dir / "val").iterdir())
+        if train_classes >= 200 and val_has_classes:
+            print(f"[OK] Tiny ImageNet already exists at {target_dir}")
+            return True
+    
+    print("\n" + "="*60)
+    print("Downloading Tiny ImageNet Dataset")
+    print("="*60)
+    print(f"  Target: {target_dir}")
+    print(f"  Size: ~237MB")
+    print("="*60 + "\n")
+    
+    zip_path = data_root / "tiny-imagenet-200.zip"
+    
+    # 检查已缓存的 zip 是否有效
+    if zip_path.exists():
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                if zf.testzip() is not None:
+                    raise zipfile.BadZipFile("Corrupted zip file")
+                if len(zf.namelist()) < 100:
+                    raise zipfile.BadZipFile("Incomplete zip file")
+            print(f"[OK] Using cached zip: {zip_path}")
+        except (zipfile.BadZipFile, Exception) as e:
+            print(f"[WARN] Cached zip is invalid: {e}")
+            print("[*] Removing corrupted file and re-downloading...")
+            zip_path.unlink()
+    
+    # 尝试多个下载源
+    urls = [
+        "http://cs231n.stanford.edu/tiny-imagenet-200.zip",
+        "https://image-net.org/data/tiny-imagenet-200.zip",
+    ]
+    
+    if not zip_path.exists():
+        download_success = False
+        for i, url in enumerate(urls):
+            print(f"[{i+1}/{len(urls)}] Trying: {url}")
+            if download_with_progress(url, zip_path, "Tiny ImageNet"):
+                try:
+                    with zipfile.ZipFile(zip_path, 'r') as zf:
+                        if zf.testzip() is not None:
+                            raise zipfile.BadZipFile("Downloaded file is corrupted")
+                    download_success = True
+                    print("[OK] Download complete and verified")
+                    break
+                except zipfile.BadZipFile as e:
+                    print(f"[WARN] Downloaded file is invalid: {e}")
+                    if zip_path.exists():
+                        zip_path.unlink()
+            print(f"[WARN] Failed, trying next source...")
+        
+        if not download_success:
+            print("\n[ERROR] All download sources failed.")
+            print("Please download manually from:")
+            print("  http://cs231n.stanford.edu/tiny-imagenet-200.zip")
+            print(f"And place it at: {zip_path}")
+            return False
+    
+    # 解压
+    print("\nExtracting...")
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            total = len(zf.namelist())
+            with tqdm(total=total, desc="Extracting", unit="files") as pbar:
+                for member in zf.namelist():
+                    zf.extract(member, data_root)
+                    pbar.update(1)
+        print("[OK] Extraction complete")
+    except Exception as e:
+        print(f"[ERROR] Extraction failed: {e}")
+        return False
+    
+    # 组织验证集（原始格式是所有图片在一个文件夹）
+    val_dir = target_dir / "val"
+    val_images_dir = val_dir / "images"
+    
+    if val_images_dir.exists():
+        print("\nOrganizing validation set by class...")
+        val_annotations = val_dir / "val_annotations.txt"
+        
+        if val_annotations.exists():
+            with open(val_annotations, 'r') as f:
+                lines = f.readlines()
+            
+            for line in tqdm(lines, desc="Organizing"):
+                parts = line.strip().split('\t')
+                if len(parts) >= 2:
+                    img_name, class_id = parts[0], parts[1]
+                    class_dir = val_dir / class_id / "images"
+                    class_dir.mkdir(parents=True, exist_ok=True)
+                    src = val_images_dir / img_name
+                    dst = class_dir / img_name
+                    if src.exists() and not dst.exists():
+                        shutil.move(str(src), str(dst))
+            
+            if val_images_dir.exists():
+                shutil.rmtree(val_images_dir)
+            
+            print("[OK] Validation set organized")
+        else:
+            print("[WARN] val_annotations.txt not found")
+    
+    # 验证
+    train_classes = len(list((target_dir / "train").iterdir()))
+    val_classes = len([d for d in (target_dir / "val").iterdir() if d.is_dir()])
+    print(f"\n[OK] Dataset ready:")
+    print(f"  Train classes: {train_classes}")
+    print(f"  Val classes: {val_classes}")
+    
+    # 清理 zip
+    if zip_path.exists():
+        zip_path.unlink()
+        print("[OK] Cleaned up zip file")
+    
+    return True
+
+
+def prepare_dataset(dataset_name: str, data_root: Path) -> bool:
+    """准备数据集，如果需要则自动下载
+    
+    Args:
+        dataset_name: 数据集名称 (cifar10, cifar100, tiny-imagenet)
+        data_root: 数据根目录
+        
+    Returns:
+        bool: 是否准备成功
+    """
+    data_root.mkdir(parents=True, exist_ok=True)
+    
+    if dataset_name in ['cifar10', 'cifar100']:
+        # CIFAR 数据集会在加载时自动下载
+        print(f"[*] {dataset_name.upper()} will be downloaded automatically if needed.")
+        return True
+    elif dataset_name == 'tiny-imagenet':
+        return download_tiny_imagenet(data_root)
+    else:
+        print(f"[ERROR] Unknown dataset: {dataset_name}")
+        return False
+
+
+# ============================================================================
 # Hilbert 曲线可视化
 # ============================================================================
 
@@ -1262,6 +1455,11 @@ def generate_full_report(
     ])
     
     data_root = PROJECT_ROOT / "data"
+    
+    # 自动下载数据集（如果需要）
+    if not prepare_dataset(dataset_name, data_root):
+        raise RuntimeError(f"Failed to prepare dataset: {dataset_name}")
+    
     if dataset_name == 'cifar10':
         test_ds = datasets.CIFAR10(data_root, train=False, download=True, transform=test_tf)
     elif dataset_name == 'cifar100':
@@ -1528,6 +1726,11 @@ def main():
         ])
         
         data_root = PROJECT_ROOT / "data"
+        
+        # 自动下载数据集（如果需要）
+        if not prepare_dataset(args.dataset, data_root):
+            raise RuntimeError(f"Failed to prepare dataset: {args.dataset}")
+        
         if args.dataset == 'cifar10':
             test_ds = datasets.CIFAR10(data_root, train=False, download=True, transform=test_tf)
         elif args.dataset == 'cifar100':
