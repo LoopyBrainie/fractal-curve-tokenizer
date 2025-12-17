@@ -709,7 +709,7 @@ def visualize_adaptive_scale_selection(
     
     # 获取 tokenizer
     tokenizer = model.tokenizer
-    if not hasattr(tokenizer, 'complexity_estimator'):
+    if not hasattr(tokenizer, 'complexity_head'):
         print("[WARN] Tokenizer does not support adaptive scale selection")
         return None
     
@@ -729,9 +729,12 @@ def visualize_adaptive_scale_selection(
     with torch.no_grad():
         images_device = images.to(device)
         
-        # 获取尺度权重
-        logits = tokenizer.complexity_estimator(images_device)  # [B, n_scales, H', W']
-        scale_indices = logits.argmax(dim=1)  # [B, H', W']
+        # 获取尺度权重 (新 API: 通过 encoder 和 _compute_scale_weights)
+        features_dict = tokenizer.encoder(images_device)
+        min_ps = min(features_dict.keys())
+        _, target_size = features_dict[min_ps]
+        scale_weights = tokenizer._compute_scale_weights(features_dict, target_size)
+        scale_indices = scale_weights.argmax(dim=1)  # [B, H', W']
         
         # 获取预测
         outputs, _ = model(images_device, return_aux_info=True)
@@ -858,7 +861,7 @@ def visualize_scale_distribution(
     model.eval()
     tokenizer = model.tokenizer
     
-    if not hasattr(tokenizer, 'complexity_estimator'):
+    if not hasattr(tokenizer, 'complexity_head'):
         print("[WARN] Tokenizer does not support adaptive scale selection")
         return None
     
@@ -874,8 +877,12 @@ def visualize_scale_distribution(
                 break
             
             images = images.to(device)
-            logits = tokenizer.complexity_estimator(images)
-            scale_indices = logits.argmax(dim=1)  # [B, H', W']
+            # 新 API: 通过 encoder 和 _compute_scale_weights
+            features_dict = tokenizer.encoder(images)
+            min_ps = min(features_dict.keys())
+            _, target_size = features_dict[min_ps]
+            scale_weights = tokenizer._compute_scale_weights(features_dict, target_size)
+            scale_indices = scale_weights.argmax(dim=1)  # [B, H', W']
             
             for s in range(n_scales):
                 scale_counts[s] += (scale_indices == s).sum().item()
@@ -945,7 +952,7 @@ def visualize_scale_by_complexity(
     model.eval()
     tokenizer = model.tokenizer
     
-    if not hasattr(tokenizer, 'complexity_estimator'):
+    if not hasattr(tokenizer, 'complexity_head'):
         print("[WARN] Tokenizer does not support adaptive scale selection")
         return None
     
@@ -958,9 +965,12 @@ def visualize_scale_by_complexity(
     with torch.no_grad():
         images_device = images.to(device)
         
-        # 获取尺度 logits（复杂度估计）
-        logits = tokenizer.complexity_estimator(images_device)  # [B, n_scales, H', W']
-        scale_indices = logits.argmax(dim=1)  # [B, H', W']
+        # 获取尺度 logits（新 API: 通过 encoder 和 _compute_scale_weights）
+        features_dict = tokenizer.encoder(images_device)
+        min_ps = min(features_dict.keys())
+        _, target_size = features_dict[min_ps]
+        scale_weights = tokenizer._compute_scale_weights(features_dict, target_size)
+        scale_indices = scale_weights.argmax(dim=1)  # [B, H', W']
         
         # 计算图像梯度（边缘检测）作为复杂度参考
         gray = images_device.mean(dim=1, keepdim=True)  # [B, 1, H, W]
@@ -1064,7 +1074,11 @@ def load_model_and_config(
     checkpoint_path: Path,
     device: torch.device,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
-    """加载模型和配置"""
+    """加载模型和配置
+    
+    支持加载旧版检查点(使用 complexity_estimator)和新版检查点(使用 complexity_head)。
+    对于旧版检查点，会尝试转换键名以保持兼容性。
+    """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = ckpt.get('config', {})
     
@@ -1088,9 +1102,41 @@ def load_model_and_config(
         ffn_type=config.get('ffn_type', 'swiglu_level'),
         tokenizer_type="streaming_v2",
         num_scales=config.get('num_scales', 3),
+        drop_path_rate=config.get('drop_path', 0.0),
     ).to(device)
     
-    model.load_state_dict(ckpt['model_state_dict'])
+    # 处理旧版检查点的键名映射
+    state_dict = ckpt['model_state_dict']
+    new_state_dict = {}
+    renamed_keys = []
+    
+    for key, value in state_dict.items():
+        new_key = key
+        # 旧版: complexity_estimator -> 新版: complexity_head (结构不同，无法直接映射)
+        # 旧版: depth_selector -> 新版: 已移除
+        if 'complexity_estimator' in key or 'depth_selector' in key:
+            # 这些键在新架构中不存在，跳过
+            renamed_keys.append(key)
+            continue
+        new_state_dict[new_key] = value
+    
+    if renamed_keys:
+        print(f"[WARN] Checkpoint uses old architecture. Skipping {len(renamed_keys)} incompatible keys:")
+        for k in renamed_keys[:5]:  # 只显示前5个
+            print(f"       - {k}")
+        if len(renamed_keys) > 5:
+            print(f"       ... and {len(renamed_keys) - 5} more")
+        print("[WARN] Scale selection visualization will not work for this checkpoint.")
+    
+    # 使用 strict=False 加载，允许新键未匹配
+    missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
+    
+    if missing:
+        # 过滤掉预期缺失的键（新架构的 complexity_head）
+        truly_missing = [k for k in missing if 'complexity_head' not in k]
+        if truly_missing:
+            print(f"[WARN] Missing keys: {truly_missing[:5]}")
+    
     model.eval()
     
     return model, config
@@ -1542,7 +1588,7 @@ def generate_full_report(
     
     # 6. 混合 Level 分割可视化
     print("[6/8] Visualizing adaptive scale selection...")
-    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'complexity_estimator'):
+    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'complexity_head'):
         visualize_adaptive_scale_selection(
             model, sample_imgs[:8], device,
             class_names=dataset_info.get('classes'),
