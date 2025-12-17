@@ -322,8 +322,7 @@ class TestStreamingFractalTokenizerV2:
         assert output_train.sequences[0].tokens.shape == output_eval.sequences[0].tokens.shape
     
     def test_complexity_estimator(self, tokenizer_v2):
-<<<<<<< HEAD
-        """测试复杂度估计器."""
+        """测试复杂度估计器 (语义级, 基于 Encoder 特征)."""
         images = torch.randn(2, 3, 32, 32)  # 使用 batch_size=2 避免 BatchNorm 问题
         
         # 获取 encoder 特征
@@ -340,19 +339,6 @@ class TestStreamingFractalTokenizerV2:
             
             # 计算尺度权重
             scale_weights = tokenizer_v2._compute_scale_weights(features_dict, target_size)
-=======
-        """测试复杂度估计器 (语义级, 基于 Encoder 特征)."""
-        images = torch.randn(1, 3, 32, 32)
-        
-        # 新 API: 需要先提取 Encoder 特征，再计算尺度权重
-        features_dict = tokenizer_v2.encoder(images)
-        min_ps = min(features_dict.keys())
-        _, (grid_h, grid_w) = features_dict[min_ps]
-        target_size = (grid_h, grid_w)
-        
-        # 访问内部方法
-        scale_weights = tokenizer_v2._compute_scale_weights(features_dict, target_size)
->>>>>>> wip/save-20251217T211733Z
         
         # 权重应该在 [0, 1] 范围
         assert scale_weights.shape[1] == len(tokenizer_v2.patch_sizes)
@@ -427,15 +413,11 @@ class TestIntegration:
         assert isinstance(output_v2, TokenizerOutput)
         
         # 都应该有 levels 元数据
-<<<<<<< HEAD
         assert output_v1.sequences[0].get_levels() is not None
         assert output_v2.sequences[0].get_levels() is not None
         
         # 输出维度应该相同
         assert output_v1.sequences[0].tokens.shape[1] == output_v2.sequences[0].tokens.shape[1]
-=======
-        assert output_legacy.sequences[0].get_levels() is not None
-        assert output_streaming.sequences[0].get_levels() is not None
 
 
 class TestVariableTokensMode:
@@ -652,5 +634,3 @@ class TestVariableTokensMode:
         # 验证梯度流动
         assert images.grad is not None
         assert not torch.isnan(images.grad).any()
-
->>>>>>> wip/save-20251217T211733Z
