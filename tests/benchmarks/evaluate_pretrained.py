@@ -34,7 +34,7 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from vit_pytorch.fractal_vit import NextGenerationFractalViT, SimpleFractalViT
+from vit_pytorch.fractal_vit import NextGenerationFractalViT
 
 # Optional visualization imports
 try:
@@ -186,40 +186,22 @@ def load_checkpoint(
     # Infer mlp_dim from saved weights
     mlp_dim = infer_mlp_dim_from_state_dict(state_dict, dim)
     
-    if use_simple and not force_next_gen:
-        model = SimpleFractalViT(
-            image_size=image_size,
-            num_classes=num_classes,
-            dim=dim,
-            depth=depth,
-            heads=heads,
-            mlp_dim=mlp_dim,
-            pool=pool,
-            channels=channels,
-            dim_head=dim_head,
-            dropout=dropout,
-            emb_dropout=emb_dropout,
-            max_level=max_level,
-        )
-        model_type = "SimpleFractalViT"
-    else:
-        learnable_split = not args.get('no_learnable_split', False)
-        model = NextGenerationFractalViT(
-            image_size=image_size,
-            num_classes=num_classes,
-            dim=dim,
-            depth=depth,
-            heads=heads,
-            mlp_dim=mlp_dim,
-            pool=pool,
-            channels=channels,
-            dim_head=dim_head,
-            dropout=dropout,
-            emb_dropout=emb_dropout,
-            max_level=max_level,
-            learnable_split=learnable_split,
-        )
-        model_type = "NextGenerationFractalViT"
+    # Note: SimpleFractalViT has been removed, use NextGenerationFractalViT instead
+    model = NextGenerationFractalViT(
+        image_size=image_size,
+        num_classes=num_classes,
+        dim=dim,
+        depth=depth,
+        heads=heads,
+        mlp_dim=mlp_dim,
+        pool=pool,
+        channels=channels,
+        dim_head=dim_head,
+        dropout=dropout,
+        emb_dropout=emb_dropout,
+        max_level=max_level,
+    )
+    model_type = "NextGenerationFractalViT"
     
     # Load weights
     model.load_state_dict(state_dict)

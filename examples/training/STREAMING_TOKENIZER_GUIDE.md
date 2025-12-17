@@ -28,9 +28,9 @@
 ### Python API
 
 ```python
-from vit_pytorch import NextGenerationFractalViT, SimpleFractalViT
+from vit_pytorch import NextGenerationFractalViT
 
-# 方法 1: 使用 NextGenerationFractalViT
+# 使用 NextGenerationFractalViT
 model = NextGenerationFractalViT(
     image_size=32,
     num_classes=10,
@@ -39,17 +39,9 @@ model = NextGenerationFractalViT(
     heads=8,
     mlp_dim=512,
     # === Streaming Tokenizer 参数 ===
-    tokenizer_type="streaming",  # 或 "streaming_v2"
-    num_scales=3,                # 多尺度层数
-    streaming_tau=1.0,           # Gumbel-Softmax 温度 (仅 v2)
-)
-
-# 方法 2: 使用 SimpleFractalViT (简化版)
-model = SimpleFractalViT(
-    image_size=32,
-    num_classes=10,
-    dim=256,
-    tokenizer_type="streaming",
+    tokenizer_type="streaming_v2",  # 默认，使用 Gumbel-Softmax
+    num_scales=3,                   # 多尺度层数
+    streaming_tau=1.0,              # Gumbel-Softmax 温度
 )
 
 # 前向传播

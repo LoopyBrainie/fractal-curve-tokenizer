@@ -27,10 +27,10 @@ from torch.utils.data import DataLoader, TensorDataset
 
 # Handle import paths
 try:
-    from vit_pytorch import SimpleFractalViT, NextGenerationFractalViT
+    from vit_pytorch import NextGenerationFractalViT
 except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'src'))
-    from vit_pytorch import SimpleFractalViT, NextGenerationFractalViT
+    from vit_pytorch import NextGenerationFractalViT
 
 from .benchmark_metrics import (
     ConvergenceMetrics,
@@ -442,31 +442,18 @@ def create_model_copy(model_name: str, template: nn.Module) -> nn.Module:
     DEFAULT_MLP_DIM = 1024
     DEFAULT_CHANNELS = 3
     
-    if model_name == 'SimpleFractalViT':
-        enhanced = template.enhanced_model
-        num_classes = enhanced.num_classes
-        return SimpleFractalViT(
-            image_size=enhanced.image_size,
-            num_classes=num_classes,
-            dim=enhanced.dim,
-            depth=DEFAULT_DEPTH,
-            heads=DEFAULT_HEADS,
-            mlp_dim=DEFAULT_MLP_DIM,
-            channels=DEFAULT_CHANNELS,
-            max_level=enhanced.max_level,
-        )
-    else:  # NextGenerationFractalViT
-        num_classes = template.num_classes
-        return NextGenerationFractalViT(
-            image_size=template.image_size,
-            num_classes=num_classes,
-            dim=template.dim,
-            depth=DEFAULT_DEPTH,
-            heads=DEFAULT_HEADS,
-            mlp_dim=DEFAULT_MLP_DIM,
-            channels=DEFAULT_CHANNELS,
-            max_level=template.max_level,
-        )
+    # All models now use NextGenerationFractalViT
+    num_classes = template.num_classes
+    return NextGenerationFractalViT(
+        image_size=template.image_size,
+        num_classes=num_classes,
+        dim=template.dim,
+        depth=DEFAULT_DEPTH,
+        heads=DEFAULT_HEADS,
+        mlp_dim=DEFAULT_MLP_DIM,
+        channels=DEFAULT_CHANNELS,
+        max_level=template.max_level,
+    )
 
 
 def aggregate_metrics(run_metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -521,17 +508,8 @@ def run_convergence_benchmark(
     print(f"Epochs: {num_epochs}")
     print(f"Runs: {num_runs}")
     
+    # Note: SimpleFractalViT has been removed, using only NextGenerationFractalViT
     models = {
-        'SimpleFractalViT': SimpleFractalViT(
-            image_size=image_size,
-            num_classes=num_classes,
-            dim=64,
-            depth=4,
-            heads=4,
-            mlp_dim=256,
-            channels=3,
-            max_level=2,
-        ),
         'NextGenerationFractalViT': NextGenerationFractalViT(
             image_size=image_size,
             num_classes=num_classes,

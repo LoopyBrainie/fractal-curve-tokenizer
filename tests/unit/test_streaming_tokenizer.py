@@ -257,16 +257,33 @@ class TestStreamingFractalTokenizerV2:
     
     def test_complexity_estimator(self, tokenizer_v2):
         """测试复杂度估计器."""
-        images = torch.randn(1, 3, 32, 32)
+        images = torch.randn(2, 3, 32, 32)  # 使用 batch_size=2 避免 BatchNorm 问题
         
-        # 访问内部方法
-        scale_weights = tokenizer_v2._compute_scale_weights(images)
+        # 获取 encoder 特征
+        tokenizer_v2.eval()  # 使用 eval 模式
+        with torch.no_grad():
+            features_dict = tokenizer_v2.encoder(images)
+            
+            # 获取最小尺度的特征图大小作为目标大小
+            min_ps = tokenizer_v2.patch_sizes[0]
+            if min_ps in features_dict:
+                target_size = features_dict[min_ps][1]  # (grid_h, grid_w)
+            else:
+                target_size = (8, 8)  # 默认
+            
+            # 计算尺度权重
+            scale_weights = tokenizer_v2._compute_scale_weights(features_dict, target_size)
         
-        # 权重应该在 [0, 1] 范围，且沿尺度维度求和为 1
+        # 权重应该在 [0, 1] 范围
         assert scale_weights.shape[1] == len(tokenizer_v2.patch_sizes)
         assert scale_weights.min() >= 0
-        # 对于 Gumbel-Softmax（非硬模式），权重和接近 1
-        assert torch.allclose(scale_weights.sum(dim=1), torch.ones_like(scale_weights.sum(dim=1)), atol=0.1)
+        # 由于使用 STE (hard=True)，权重应该是 one-hot
+        # 沿尺度维度求和应该为 1
+        assert torch.allclose(
+            scale_weights.sum(dim=1), 
+            torch.ones_like(scale_weights.sum(dim=1)), 
+            atol=0.01
+        )
 
 
 class TestIntegration:
@@ -302,34 +319,36 @@ class TestIntegration:
         assert levels_padded.shape[0] == B
         assert levels_padded.shape[1] == S
     
-    def test_compare_output_structure_with_legacy(self):
-        """验证输出结构与原 Tokenizer 兼容."""
-        from vit_pytorch import FractalHilbertTokenizer
-        
-        # 原 tokenizer
-        legacy_tokenizer = FractalHilbertTokenizer(
-            min_patch_size=(4, 4),
-            max_level=10,
-            learnable_split=False,
-        )
-        
-        # 新 tokenizer
-        streaming_tokenizer = StreamingFractalTokenizer(
+    def test_v1_and_v2_output_structure_compatible(self):
+        """验证 V1 和 V2 tokenizer 的输出结构兼容."""
+        # V1 tokenizer
+        streaming_v1 = StreamingFractalTokenizer(
             image_size=32,
             channels=3,
-            d_model=48,  # 3 * 4 * 4 = 48 (匹配原 tokenizer 输出维度)
+            d_model=64,
+            patch_sizes=(4,),
+        )
+        
+        # V2 tokenizer
+        streaming_v2 = StreamingFractalTokenizerV2(
+            image_size=32,
+            channels=3,
+            d_model=64,
             patch_sizes=(4,),
         )
         
         images = torch.randn(1, 3, 32, 32)
         
         # 两个 tokenizer 都应该产生 TokenizerOutput
-        output_legacy = legacy_tokenizer.tokenize(images)
-        output_streaming = streaming_tokenizer.tokenize(images)
+        output_v1 = streaming_v1.tokenize(images)
+        output_v2 = streaming_v2.tokenize(images)
         
-        assert isinstance(output_legacy, TokenizerOutput)
-        assert isinstance(output_streaming, TokenizerOutput)
+        assert isinstance(output_v1, TokenizerOutput)
+        assert isinstance(output_v2, TokenizerOutput)
         
         # 都应该有 levels 元数据
-        assert output_legacy.sequences[0].get_levels() is not None
-        assert output_streaming.sequences[0].get_levels() is not None
+        assert output_v1.sequences[0].get_levels() is not None
+        assert output_v2.sequences[0].get_levels() is not None
+        
+        # 输出维度应该相同
+        assert output_v1.sequences[0].tokens.shape[1] == output_v2.sequences[0].tokens.shape[1]

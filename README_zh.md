@@ -97,7 +97,7 @@ Fractal Curve Tokenizer 为 Vision Transformers 引入了一种新颖的图像�
 * **高效注意力**: 低秩 Hilbert 偏置将显存从 $O(N^2)$ 降低到 $O(N \cdot r)$。
 * **现代 FFN**: SwiGLU 带可选的层级自适应处理。
 * **强健正则化**: 集成 DropPath（随机深度）和熵正则化。
-* **灵活架构**: 支持 `NextGenerationFractalViT`（全功能）和 `SimpleFractalViT`（轻量级）。
+* **灵活架构**: 支持 `NextGenerationFractalViT`，具备流式 tokenizer 和自适应分割功能。
 
 ## 安装
 
@@ -311,7 +311,7 @@ fractal-curve-tokenizer/
 
 | 层级 | 模块 | 描述 |
 |------|------|------|
-| **L4** 应用层 | `fractal_vit.py` | `NextGenerationFractalViT`, `SimpleFractalViT` |
+| **L4** 应用层 | `fractal_vit.py` | `NextGenerationFractalViT` |
 | **L3** 管道层 | `streaming_tokenizer.py` | 多尺度分词 + Hilbert 重排序 |
 | | `transformer.py` | 层级感知 Transformer 块 |
 | **L2** 组件层 | `attention.py` | Hilbert 偏置 + 低秩分解 |
