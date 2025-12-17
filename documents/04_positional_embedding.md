@@ -13,8 +13,19 @@ $$E_{depth}: \mathbb{Z} \to \mathbb{R}^D$$
 $$E_{depth}(d) = \text{Embedding}(d), \quad d \in \{0, 1, \ldots, L_{max}\}$$
 
 ### 路径编码 (Path Embedding)
-对 token $i$，其从根到叶的路径为 $(q_i^{(1)}, \ldots, q_i^{(d_i)})$，
-其中 $q_i^{(j)} \in \{0, 1, 2, 3\}$ 是第 $j$ 层的象限索引。
+
+#### 1. 路径生成 (Vectorized Path Generation)
+将 2D 坐标 $(x, y)$ 转换为四叉树路径 $(q_1, \ldots, q_d)$。
+利用向量化位运算实现高效计算：
+
+$$q_\ell = \text{bit}(x, d-\ell) + 2 \times \text{bit}(y, d-\ell)$$
+
+其中 $\text{bit}(v, k) = (v \gg k) \& 1$ 表示取第 $k$ 位。
+- $q_\ell \in \{0, 1, 2, 3\}$: 0=左上, 1=右上, 2=左下, 3=右下
+- 计算复杂度: $O(D)$ (并行)，优于传统循环的 $O(N \times D)$
+
+#### 2. 嵌入查找
+对 token $i$，其路径为 $(q_i^{(1)}, \ldots, q_i^{(d_i)})$。
 
 $$E_{path}(i) = \sum_{j=1}^{d_i} \text{QuadrantEmb}(j, q_i^{(j)})$$
 
