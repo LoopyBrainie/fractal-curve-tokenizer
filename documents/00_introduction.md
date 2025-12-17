@@ -32,7 +32,7 @@ $$I \xrightarrow{T} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{Transform
 
 | 层级 | 模块 | 对应文件 | 核心功能 |
 | :--- | :--- | :--- | :--- |
-| **Layer 4** | 应用层 | `fractal_vit.py` | `NextGenerationFractalViT`, `SimpleFractalViT` |
+| **Layer 4** | 应用层 | `fractal_vit.py` | `NextGenerationFractalViT` |
 | **Layer 3** | 管道层 | `streaming_tokenizer.py` | `StreamingFractalTokenizer`, V2 |
 | | | `transformer.py` | `EnhancedFractalTransformer` |
 | **Layer 2** | 组件层 | `attention.py` | `HilbertAwareMultiScaleAttention` |
@@ -42,8 +42,6 @@ $$I \xrightarrow{T} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{Transform
 | | | `tokenization.py` | `BaseTokenizer`, `TokenizerOutput` |
 | | | `constants.py` | 超参数默认值 |
 | | | `utils.py` | 工具函数 |
-| **废弃** | _deprecated/ | `fractal_curve_tokenizer.py` | BFS + REINFORCE (v1.0 移除) |
-| | | `token_processor.py` | 已集成 (v1.0 移除) |
 
 ## 1.4 阅读指南
 建议按以下顺序阅读文档：

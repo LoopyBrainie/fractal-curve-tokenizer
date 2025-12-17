@@ -7,7 +7,6 @@ classDiagram
     nn_Module <|-- BaseTokenizer
     nn_Module <|-- BaseTokenProcessor
     nn_Module <|-- NextGenerationFractalViT
-    nn_Module <|-- SimpleFractalViT
     
     BaseTokenizer <|-- StreamingFractalTokenizer
     BaseTokenizer <|-- StreamingFractalTokenizerV2
@@ -62,7 +61,7 @@ classDiagram
    │   ├── QKV Projection
    │   ├── Dot Product + Scale
    │   ├── Level Scaling
-   │   ├── Hilbert Bias (Low-Rank)
+   │   ├── Hilbert Bias (LCA)
    │   ├── Level Bias
    │   └── Softmax + Output
    ├── DropPath + Residual
@@ -103,8 +102,8 @@ classDiagram
 | `lr` | 5e-4 | 1e-3 | 学习率 |
 | `weight_decay` | 0.05 | 0.05 | 权重衰减 |
 | `tokenizer_type` | streaming_v2 | streaming_v2 | Tokenizer 类型 |
-| `bias_mode` | low_rank | low_rank | Hilbert Bias 模式 |
-| `rank` | 32 | 64 | Low-Rank 秩 |
+| `bias_mode` | lca | lca | Hilbert Bias 模式 |
+| `rank` | 32 | 64 | Low-Rank 秩 (仅 low_rank 模式) |
 | `ffn_type` | swiglu_level | swiglu_level | FFN 类型 |
 
 ## D. API 快速参考
@@ -122,7 +121,7 @@ model = NextGenerationFractalViT(
     heads=6,
     mlp_dim=768,
     tokenizer_type='streaming_v2',  # 推荐
-    bias_mode='low_rank',           # 推荐
+    bias_mode='lca',                # 推荐 (参数量最少)
     ffn_type='swiglu_level',        # 推荐
 )
 ```
@@ -164,7 +163,7 @@ from vit_pytorch import (
 )
 
 # 注意力
-attn = HilbertAwareMultiScaleAttention(dim=384, heads=6, bias_mode='low_rank')
+attn = HilbertAwareMultiScaleAttention(dim=384, heads=6, bias_mode='lca')
 
 # FFN
 ffn = SwiGLUFFN(dim=384, hidden_dim=512)
@@ -180,7 +179,6 @@ pos_emb = AdvancedFractalPositionEmbedding(dim=384, max_level=50)
 from vit_pytorch import (
     # 模型
     NextGenerationFractalViT,
-    SimpleFractalViT,
     # Tokenizer
     StreamingFractalTokenizer,
     StreamingFractalTokenizerV2,

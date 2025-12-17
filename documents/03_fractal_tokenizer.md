@@ -53,12 +53,28 @@ class MultiScalePatchEncoder(nn.Module):
 
 ## 3.3 核心类：HilbertIndexer
 
-预计算 Hilbert 曲线索引，用于特征重排序。
+预计算 Hilbert 曲线索引，用于特征重排序。支持标准 Hilbert 曲线和 Pseudo-Hilbert 曲线（针对非正方形图像）。
 
 ### 数学定义
-$$H: \text{Grid}_{h \times w} \to \text{Seq}_{n}$$
 
-将 2D 网格按 Hilbert 曲线顺序展平为 1D 序列。
+#### 1. 标准 Hilbert 曲线 (Standard Hilbert)
+当 $H = W = 2^k$ 时，使用标准 Hilbert 曲线映射：
+$$H: [0, n^2) \leftrightarrow [0, n) \times [0, n)$$
+
+#### 2. Pseudo-Hilbert 曲线 (Pseudo-Hilbert)
+针对任意 $H \times W$ 矩形，采用递归分割策略 (Zhang & Kamata, 2007)：
+
+$$PH_{H,W}: [0, H \times W) \to [0, H) \times [0, W)$$
+
+**递归定义**:
+1. 若 $H = W = 2^k$: 使用标准 Hilbert 曲线。
+2. 若 $H > W$: 将矩形水平分割为上下两部分，递归处理并连接。
+3. 若 $W > H$: 将矩形垂直分割为左右两部分，递归处理并连接。
+4. 若 $H = W$ 且 $H \neq 2^k$: 任意分割后递归。
+
+**性质**:
+- **局部性保持**: $\|p_i - p_{i+1}\|_2 \le C \approx 1.5\sqrt{2}$
+- **自适应性**: 无需 Padding 即可处理任意尺寸图像
 
 ### 接口
 ```python
@@ -68,9 +84,11 @@ def get_hilbert_order(grid_size: int) -> torch.Tensor:
     """返回索引张量，将光栅顺序映射到 Hilbert 顺序。"""
 ```
 
-### 特点
-- 使用 `@lru_cache` 缓存，避免重复计算
-- 调用 `HilbertCurve.d_to_xy()` 进行坐标转换
+### 缓存机制 (HilbertPathCache)
+为了提高效率，系统实现了 `HilbertPathCache` 类，统一管理路径计算和缓存：
+- **缓存键**: `(grid_h, grid_w, max_depth)`
+- **缓存内容**: `hilbert_to_raster` 映射和 `quadtree_paths`
+- **策略**: LRU 缓存，避免重复计算
 
 ---
 
@@ -106,35 +124,47 @@ def get_hilbert_order(grid_size: int) -> torch.Tensor:
 
 ### 数学定义
 
-**尺度分数计算**:
-$$\pi_{ij} = \text{softmax}(\text{ScoreNet}(F_{ij}) / \tau)$$
+**1. 语义级复杂度估计 (Semantic Complexity Estimation)**:
+不再使用原始像素，而是复用 Encoder 的多尺度特征，消除冗余计算并增强语义感知。
 
-**Gumbel-Softmax (训练时)**:
+$$\pi_{i,j} = \text{Softmax}(\text{ComplexityHead}(\text{Concat}_s[\text{Upsample}(F_s)]))_{i,j} / \tau$$
+
+其中 `ComplexityHead` 是轻量级卷积网络。
+
+**2. Gumbel-Softmax (训练时)**:
 $$\hat{\pi}_k = \frac{\exp((\log \pi_k + g_k) / \tau)}{\sum_l \exp((\log \pi_l + g_l) / \tau)}$$
 
-其中 $g_k \sim \text{Gumbel}(0, 1)$
+其中 $g_k \sim \text{Gumbel}(0, 1)$。
 
-**硬选择 (推理时)**:
-$$s^* = \arg\max_s \pi_s$$
+**3. 两种模式**:
+- **固定 Token 模式 (variable_tokens=False)**:
+  特征加权融合：$T_{final} = \sum_s \hat{\pi}_s \cdot F_s$
+  Token 数量固定为 $N = (H/p_{min}) \times (W/p_{min})$。
+
+- **可变 Token 模式 (variable_tokens=True)**:
+  直接映射 Patch=Token。
+  $$s_{ij} = \arg\max_k \pi_{ij}^{(k)}$$
+  $$T_k = \text{PatchEmbed}_{s_k}(P_k)$$
+  Token 数量 $N \in [N_{min}, N_{max}]$ 根据图像内容自适应。
 
 ### 初始化参数
 | 参数 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
 | `image_size` | int | - | 输入图像尺寸 |
-| `dim` | int | - | 输出 token 维度 |
-| `scales` | List[int] | [4, 8, 16] | 可选尺度列表 |
-| `temperature` | float | 1.0 | Gumbel-Softmax 温度 |
-| `in_channels` | int | 3 | 输入通道数 |
+| `d_model` | int | - | 输出 token 维度 |
+| `patch_sizes` | Tuple[int] | (4, 8, 16) | 多尺度 patch 大小 |
+| `gumbel_temperature` | float | 2.0 | Gumbel-Softmax 初始温度 |
+| `variable_tokens` | bool | False | 是否启用可变 Token 数量模式 |
 
 ### tokenize() 方法
 
 **流程**:
 1. **多尺度编码**: 通过 `MultiScalePatchEncoder` 提取多尺度特征
-2. **尺度分数**: 对每个位置计算各尺度的分数
+2. **复杂度估计**: 计算每个位置的尺度 logits
 3. **尺度选择**:
    - 训练: Gumbel-Softmax 软选择
    - 推理: argmax 硬选择
-4. **特征融合**: 加权组合各尺度特征
+4. **特征处理**: 根据模式进行加权融合或直接提取
 5. **Hilbert 重排序**: 按 Hilbert 顺序重排
 
 **输出**: `TokenizerOutput`
@@ -143,12 +173,12 @@ $$s^* = \arg\max_s \pi_s$$
 
 ## 3.6 与旧版 FractalHilbertTokenizer 的对比
 
-| 特性 | 旧版 (BFS + REINFORCE) | 新版 (Streaming) |
+| 特性 | 旧版 (BFS + REINFORCE) | 新版 (Streaming V2) |
 | :--- | :--- | :--- |
-| **分割方式** | 递归四叉树 | 固定网格 |
-| **决策机制** | 策略网络 + 采样 | 卷积 + Gumbel-Softmax |
+| **分割方式** | 递归四叉树 | 卷积金字塔 + 软选择 |
+| **决策机制** | 策略网络 + 采样 | 语义复杂度头 + Gumbel |
 | **可微性** | 不可微，需 REINFORCE | 端到端可微 |
-| **Token 数量** | 变长 | 固定 |
+| **Token 数量** | 变长 | 固定 (默认) 或 变长 (可选) |
 | **GPU 效率** | 低（Python 循环） | 高（全 GPU 执行） |
 | **训练稳定性** | 低（高方差） | 高 |
 
