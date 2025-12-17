@@ -53,12 +53,23 @@ $$B_{level}[i,j] = \text{Embedding}(\text{clamp}(d_i - d_j + L, 0, 2L))$$
 
 **作用**: 编码跨层级关系（如父节点关注子节点）
 
-### 4. Level Scaling (层级缩放)
+### 5. LCA Hilbert Bias (LCA 嵌入，推荐)
 
 **数学定义**:
-$$\sigma_{scale}(d) = \text{LevelScaleEmb}(d)$$
+$$B_{hilbert}[i,j] = \text{LCAEmbed}(\text{LCA}(i, j))$$
 
-**作用**: 深层 token 使用较小缩放，调节注意力分布锐度
+其中 $\text{LCA}(i, j)$ 是 token $i$ 和 $j$ 在四叉树上的最近公共祖先深度。
+
+**定理 (LCA-距离等价性)**:
+对于四叉树编码的两个 token $i, j$:
+$$\text{LCA}(i, j) = \ell \implies \|pos_i - pos_j\|_\infty \le N / 2^\ell$$
+
+其中 $N$ 是网格边长。这意味着 LCA 深度直接编码了空间距离的上界。
+
+**优势**:
+- **参数极少**: 仅需 $L_{max}$ 个参数 (约 50 个)
+- **几何意义明确**: 直接利用分形结构的空间性质
+- **计算高效**: 向量化计算 LCA 深度
 
 ---
 
