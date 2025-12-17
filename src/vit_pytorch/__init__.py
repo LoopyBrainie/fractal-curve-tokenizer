@@ -42,16 +42,39 @@ Layer 1 (基础层):
 """
 
 # === 推荐组件 ===
-from .attention import HilbertAwareMultiScaleAttention
+from .attention import (
+    HilbertAwareMultiScaleAttention,
+    LCAHilbertBias,
+    LowRankHilbertBias,
+    HierarchicalHilbertBias,
+)
 from .feedforward import AdaptiveFractalFeedForward, FFNType, SwiGLUFFN
+from .fractal_config import (
+    FractalConfig,
+    create_fractal_config,
+    BiasMode,
+    AnnealSchedule,
+)
+from .fractal_path import (
+    FractalPathEmbedding,
+    HierarchicalAttentionBias,
+    VectorizedPathEncoder,
+)
 from .fractal_vit import (
     NextGenerationFractalViT,
     SimpleFractalViT,
 )
-from .hilbert import HilbertCurve, get_quadrant_order, hilbert_distance_to_xy, xy_to_hilbert_distance
+from .hilbert import (
+    HilbertCurve,
+    PseudoHilbertCurve,
+    get_quadrant_order,
+    hilbert_distance_to_xy,
+    xy_to_hilbert_distance,
+)
 from .positional import AdvancedFractalPositionEmbedding
 from .streaming_tokenizer import (
     HilbertIndexer,
+    HilbertPathCache,
     MultiScalePatchEncoder,
     StreamingFractalTokenizer,
     StreamingFractalTokenizerV2,
@@ -96,18 +119,31 @@ __all__ = [
     "StreamingFractalTokenizerV2",
     "NextGenerationFractalViT",
     "SimpleFractalViT",
+    # === 配置与路径编码 (v0.6.0+) ===
+    "FractalConfig",
+    "create_fractal_config",
+    "BiasMode",
+    "AnnealSchedule",
+    "FractalPathEmbedding",
+    "HierarchicalAttentionBias",
+    "VectorizedPathEncoder",
     # === 核心组件 ===
     "BaseTokenProcessor",
     "BaseTokenizer",
     "TokenSequence",
     "TokenizerOutput",
     "HilbertCurve",
+    "PseudoHilbertCurve",
     "HilbertIndexer",
+    "HilbertPathCache",
     "MultiScalePatchEncoder",
     # === Transformer 组件 ===
     "EnhancedFractalTransformer",
     "EnhancedFractalTransformerBlock",
     "HilbertAwareMultiScaleAttention",
+    "LCAHilbertBias",
+    "LowRankHilbertBias",
+    "HierarchicalHilbertBias",
     "AdaptiveFractalFeedForward",
     "SwiGLUFFN",
     "FFNType",

@@ -289,14 +289,12 @@ class EnhancedFractalTransformer(nn.Module):
             nn.LayerNorm(dim),
         )
         self.final_norm = nn.LayerNorm(dim)
-        self.depth_selector = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten(), nn.Linear(dim, depth), nn.Sigmoid())
 
     def forward(
         self,
         x: torch.Tensor,
         levels_info: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        use_dynamic_depth: bool = False,
     ) -> torch.Tensor:
         """前向传播。
         
@@ -304,28 +302,18 @@ class EnhancedFractalTransformer(nn.Module):
             x: 输入张量，形状为 [B, S, D]。
             levels_info: 层级信息（可选）。
             attention_mask: 注意力掩码（可选）。
-            use_dynamic_depth: 是否使用动态深度选择。
             
         Returns:
             输出张量，形状为 [B, S, D]。
         """
         batch_size, seq_len, dim = x.shape
 
-        layer_weights = None
-        if use_dynamic_depth:
-            pooled = x.transpose(1, 2)
-            layer_weights = self.depth_selector(pooled)
-
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             if self.use_checkpoint and self.training:
                 # Gradient checkpointing: 重新计算激活值以节省显存
                 x = checkpoint(layer, x, levels_info, attention_mask, use_reentrant=False)
             else:
                 x = layer(x, levels_info, attention_mask)
-
-            if layer_weights is not None:
-                weight = layer_weights[:, i : i + 1].unsqueeze(-1)
-                x = x * weight
 
         if seq_len > 1:
             # 将 attention_mask (B, 1, 1, Seq) 转换为 key_padding_mask (B, Seq)
