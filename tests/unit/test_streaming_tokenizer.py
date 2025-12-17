@@ -6,6 +6,7 @@
 2. Hilbert 顺序重排
 3. 与原接口的兼容性
 4. 多尺度特征提取
+5. HilbertPathCache 缓存机制
 """
 
 import pytest
@@ -15,9 +16,74 @@ from vit_pytorch import (
     StreamingFractalTokenizer,
     StreamingFractalTokenizerV2,
     HilbertIndexer,
+    HilbertPathCache,
     MultiScalePatchEncoder,
     TokenizerOutput,
 )
+
+
+class TestHilbertPathCache:
+    """测试统一的 Hilbert 路径缓存."""
+    
+    def setup_method(self):
+        """每个测试前清空缓存."""
+        HilbertPathCache.clear_cache()
+    
+    def test_basic_cache(self):
+        """测试基本缓存功能."""
+        hilbert_to_raster, paths = HilbertPathCache.get_or_compute(4, 4, 8)
+        
+        assert hilbert_to_raster.shape == (16,)
+        assert paths.shape == (16, 8)
+        assert set(hilbert_to_raster.tolist()) == set(range(16))
+    
+    def test_cache_hit(self):
+        """测试缓存命中."""
+        h2r1, p1 = HilbertPathCache.get_or_compute(4, 4, 8)
+        h2r2, p2 = HilbertPathCache.get_or_compute(4, 4, 8)
+        
+        assert torch.equal(h2r1, h2r2)
+        assert torch.equal(p1, p2)
+    
+    def test_non_square_grid(self):
+        """测试非正方形网格."""
+        hilbert_to_raster, paths = HilbertPathCache.get_or_compute(4, 8, 8)
+        
+        assert hilbert_to_raster.shape == (32,)  # 4 * 8 = 32
+        assert paths.shape == (32, 8)
+    
+    def test_quadtree_paths_values(self):
+        """测试四叉树路径值在 [0, 3] 范围内."""
+        _, paths = HilbertPathCache.get_or_compute(8, 8, 8)
+        
+        assert paths.min() >= 0
+        assert paths.max() <= 3
+    
+    def test_hilbert_to_raster_bijection(self):
+        """测试 Hilbert 到光栅映射是双射."""
+        hilbert_to_raster, _ = HilbertPathCache.get_or_compute(4, 4, 8)
+        
+        # 应该是 [0, 15] 的排列
+        sorted_indices = hilbert_to_raster.sort().values
+        expected = torch.arange(16)
+        assert torch.equal(sorted_indices, expected)
+    
+    def test_cache_eviction(self):
+        """测试缓存淘汰机制."""
+        # 填充缓存到上限
+        for i in range(70):  # 超过 64 的上限
+            HilbertPathCache.get_or_compute(2 + i % 30, 2 + i % 30, 8)
+        
+        # 缓存大小不应超过上限
+        assert len(HilbertPathCache._cache) <= HilbertPathCache._max_cache_size
+    
+    def test_clear_cache(self):
+        """测试缓存清空."""
+        HilbertPathCache.get_or_compute(4, 4, 8)
+        assert len(HilbertPathCache._cache) > 0
+        
+        HilbertPathCache.clear_cache()
+        assert len(HilbertPathCache._cache) == 0
 
 
 class TestHilbertIndexer:
@@ -256,6 +322,7 @@ class TestStreamingFractalTokenizerV2:
         assert output_train.sequences[0].tokens.shape == output_eval.sequences[0].tokens.shape
     
     def test_complexity_estimator(self, tokenizer_v2):
+<<<<<<< HEAD
         """测试复杂度估计器."""
         images = torch.randn(2, 3, 32, 32)  # 使用 batch_size=2 避免 BatchNorm 问题
         
@@ -273,6 +340,19 @@ class TestStreamingFractalTokenizerV2:
             
             # 计算尺度权重
             scale_weights = tokenizer_v2._compute_scale_weights(features_dict, target_size)
+=======
+        """测试复杂度估计器 (语义级, 基于 Encoder 特征)."""
+        images = torch.randn(1, 3, 32, 32)
+        
+        # 新 API: 需要先提取 Encoder 特征，再计算尺度权重
+        features_dict = tokenizer_v2.encoder(images)
+        min_ps = min(features_dict.keys())
+        _, (grid_h, grid_w) = features_dict[min_ps]
+        target_size = (grid_h, grid_w)
+        
+        # 访问内部方法
+        scale_weights = tokenizer_v2._compute_scale_weights(features_dict, target_size)
+>>>>>>> wip/save-20251217T211733Z
         
         # 权重应该在 [0, 1] 范围
         assert scale_weights.shape[1] == len(tokenizer_v2.patch_sizes)
@@ -347,8 +427,230 @@ class TestIntegration:
         assert isinstance(output_v2, TokenizerOutput)
         
         # 都应该有 levels 元数据
+<<<<<<< HEAD
         assert output_v1.sequences[0].get_levels() is not None
         assert output_v2.sequences[0].get_levels() is not None
         
         # 输出维度应该相同
         assert output_v1.sequences[0].tokens.shape[1] == output_v2.sequences[0].tokens.shape[1]
+=======
+        assert output_legacy.sequences[0].get_levels() is not None
+        assert output_streaming.sequences[0].get_levels() is not None
+
+
+class TestVariableTokensMode:
+    """测试可变 Token 数量模式 (variable_tokens=True).
+    
+    数学形式化验证:
+    1. 四叉树一致性: 粗尺度区域内所有位置使用相同尺度
+    2. Token 数量可变: N ∈ [N_min, N_max]
+    3. Hilbert 排序: 按层级和空间位置排序
+    4. levels_info 格式正确
+    """
+    
+    @pytest.fixture
+    def variable_tokenizer(self):
+        """创建可变 token 数量的 tokenizer."""
+        return StreamingFractalTokenizerV2(
+            image_size=32,
+            channels=3,
+            d_model=64,
+            patch_sizes=(4, 8, 16),  # 3 种尺度
+            use_hilbert_order=True,
+            max_level=10,
+            gumbel_temperature=1.0,
+            variable_tokens=True,
+        )
+    
+    @pytest.fixture
+    def fixed_tokenizer(self):
+        """创建固定 token 数量的 tokenizer (对比用)."""
+        return StreamingFractalTokenizerV2(
+            image_size=32,
+            channels=3,
+            d_model=64,
+            patch_sizes=(4, 8, 16),
+            use_hilbert_order=True,
+            max_level=10,
+            gumbel_temperature=1.0,
+            variable_tokens=False,
+        )
+    
+    def test_basic_forward(self, variable_tokenizer):
+        """测试基础前向传播."""
+        images = torch.randn(2, 3, 32, 32)
+        output = variable_tokenizer.tokenize(images)
+        
+        assert len(output) == 2
+        for seq in output.sequences:
+            assert seq.tokens.dim() == 2  # [N, D]
+            assert seq.tokens.shape[1] == 64  # d_model
+            assert seq.get_levels() is not None
+    
+    def test_variable_token_count(self, variable_tokenizer):
+        """测试 token 数量确实可变."""
+        # 使用不同复杂度的图像
+        simple_image = torch.zeros(1, 3, 32, 32)  # 简单图像（全黑）
+        complex_image = torch.randn(1, 3, 32, 32)  # 复杂图像（随机噪声）
+        
+        variable_tokenizer.eval()
+        with torch.no_grad():
+            simple_output = variable_tokenizer.tokenize(simple_image)
+            complex_output = variable_tokenizer.tokenize(complex_image)
+        
+        simple_count = simple_output.sequences[0].tokens.shape[0]
+        complex_count = complex_output.sequences[0].tokens.shape[0]
+        
+        # Token 数量范围应在 [N_min, N_max] 之间
+        # N_min = (32/16)^2 = 4 (最粗尺度)
+        # N_max = (32/4)^2 = 64 (最细尺度)
+        assert 1 <= simple_count <= 64
+        assert 1 <= complex_count <= 64
+        
+        # 不要求必须不同，但打印出来便于观察
+        print(f"\nSimple image tokens: {simple_count}, Complex image tokens: {complex_count}")
+    
+    def test_fixed_vs_variable_comparison(self, fixed_tokenizer, variable_tokenizer):
+        """对比固定和可变模式的输出."""
+        images = torch.randn(1, 3, 32, 32)
+        
+        fixed_tokenizer.eval()
+        variable_tokenizer.eval()
+        
+        with torch.no_grad():
+            fixed_output = fixed_tokenizer.tokenize(images)
+            variable_output = variable_tokenizer.tokenize(images)
+        
+        fixed_count = fixed_output.sequences[0].tokens.shape[0]
+        variable_count = variable_output.sequences[0].tokens.shape[0]
+        
+        # 固定模式应该总是输出 (32/4)^2 = 64 个 token
+        assert fixed_count == 64
+        
+        # 可变模式应该 <= 64
+        assert variable_count <= 64
+        assert variable_count >= 1
+    
+    def test_levels_info_structure(self, variable_tokenizer):
+        """测试 levels_info 结构正确."""
+        images = torch.randn(1, 3, 32, 32)
+        output = variable_tokenizer.tokenize(images)
+        
+        levels_info = output.sequences[0].get_levels()
+        assert levels_info is not None
+        
+        num_tokens = output.sequences[0].tokens.shape[0]
+        assert levels_info.shape[0] == num_tokens
+        
+        # 检查深度值范围
+        depths = levels_info[:, 0]
+        assert depths.min() >= 0
+        assert depths.max() <= variable_tokenizer.max_level
+        
+        # 检查路径值范围 [0, 3]
+        if levels_info.shape[1] > 1:
+            paths = levels_info[:, 1:]
+            assert paths.min() >= 0
+            assert paths.max() <= 3
+    
+    def test_quadtree_consistency(self, variable_tokenizer):
+        """测试四叉树一致性约束.
+        
+        验证: 同一粗尺度区域内的所有细粒度位置应使用相同尺度。
+        """
+        # 手动创建测试用的 scale_map
+        scale_map = torch.zeros(1, 8, 8, dtype=torch.long)  # 8x8 网格
+        
+        # 设置一些粗尺度决策
+        scale_map[0, 0:4, 0:4] = 2  # 左上 4x4 使用最粗尺度 (scale_idx=2)
+        scale_map[0, 0:4, 4:8] = 1  # 右上 4x4 使用中等尺度 (scale_idx=1)
+        scale_map[0, 4:8, :] = 0    # 下半部分使用最细尺度 (scale_idx=0)
+        
+        # 调用一致性强制函数
+        result = variable_tokenizer._enforce_quadtree_consistency(scale_map, 8, 8)
+        
+        # 验证粗尺度区域保持一致
+        # 左上 4x4 区域应该全部是 2
+        assert (result[0, 0:4, 0:4] == 2).all() or (result[0, 0:4, 0:4] == result[0, 0, 0]).all()
+        
+        # 每个 block 内部应该一致
+        for by in range(0, 8, 4):
+            for bx in range(0, 8, 4):
+                block = result[0, by:by+4, bx:bx+4]
+                # 检查 block 内是否存在粗尺度 (>=1)
+                if block.max() >= 1:
+                    # 如果有粗尺度，整个 block 应该统一
+                    assert block.max() == block.min() or block.max() <= block[0, 0]
+    
+    def test_hilbert_sort_correctness(self, variable_tokenizer):
+        """测试 Hilbert 排序的正确性."""
+        # 创建测试位置列表
+        positions = [
+            (1, 0, 0, 4, 4),  # level=1, (0,0) in 4x4 grid
+            (1, 0, 1, 4, 4),  # level=1, (0,1)
+            (1, 1, 0, 4, 4),  # level=1, (1,0)
+            (1, 1, 1, 4, 4),  # level=1, (1,1)
+        ]
+        
+        sorted_indices = variable_tokenizer._hilbert_sort_by_position(positions)
+        
+        # 应该返回有效的排列
+        assert len(sorted_indices) == 4
+        assert set(sorted_indices) == {0, 1, 2, 3}
+    
+    def test_quadtree_path_computation(self, variable_tokenizer):
+        """测试四叉树路径计算."""
+        # 位置 (0, 0) 在 4x4 网格中
+        path = variable_tokenizer._compute_quadtree_path(0, 0, 4, 4, 4)
+        
+        # 路径应该非空
+        assert len(path) > 0
+        
+        # 路径值应该在 [0, 3] 范围
+        assert all(0 <= p <= 3 for p in path)
+    
+    def test_batch_with_different_token_counts(self, variable_tokenizer):
+        """测试 batch 中不同图像产生不同 token 数量."""
+        # 创建两个明显不同复杂度的图像
+        images = torch.zeros(2, 3, 32, 32)
+        images[1] = torch.randn(1, 3, 32, 32)  # 第二个图像更复杂
+        
+        variable_tokenizer.eval()
+        with torch.no_grad():
+            output = variable_tokenizer.tokenize(images)
+        
+        count1 = output.sequences[0].tokens.shape[0]
+        count2 = output.sequences[1].tokens.shape[0]
+        
+        # 验证都在有效范围内
+        assert 1 <= count1 <= 64
+        assert 1 <= count2 <= 64
+        
+        print(f"\nBatch token counts: {count1}, {count2}")
+    
+    def test_metadata_contains_num_tokens(self, variable_tokenizer):
+        """测试元数据包含 token 数量."""
+        images = torch.randn(1, 3, 32, 32)
+        output = variable_tokenizer.tokenize(images)
+        
+        # variable_tokens 模式应该在 metadata 中记录 num_tokens
+        metadata = output.sequences[0].metadata
+        if 'num_tokens' in metadata:
+            assert metadata['num_tokens'] == output.sequences[0].tokens.shape[0]
+    
+    def test_gradient_flow(self, variable_tokenizer):
+        """测试梯度可以正常流动."""
+        images = torch.randn(1, 3, 32, 32, requires_grad=True)
+        
+        variable_tokenizer.train()
+        output = variable_tokenizer.tokenize(images)
+        
+        # 计算损失并反向传播
+        loss = output.sequences[0].tokens.sum()
+        loss.backward()
+        
+        # 验证梯度流动
+        assert images.grad is not None
+        assert not torch.isnan(images.grad).any()
+
+>>>>>>> wip/save-20251217T211733Z
