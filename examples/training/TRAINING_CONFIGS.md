@@ -1,28 +1,15 @@
 # Training Configuration Examples
 
-## 🚀 核心优化：预计算 Tokenization
+## 🚀 核心优化：Streaming Tokenizer
 
-**问题**：原始训练存在 GPU 空转问题，因为 Tokenization（BFS 分割）在 `model.forward()` 中执行，是 CPU-bound 操作。
+**当前架构 (v0.5.0+)**：使用 `StreamingFractalTokenizerV2`，具有以下特性：
 
-**解决方案**：使用 `--pretokenize` 将 tokenization 移到 DataLoader workers，让 GPU 持续满载计算。
-
-```bash
-# 推荐：启用预计算模式
-uv run python examples/training/train_fractal_vit.py \
-    --dataset tiny-imagenet \
-    --pretokenize \
-    --use-amp \
-    ...
-```
-
-**性能对比**：
-
-| 模式 | GPU 利用率 | 吞吐量 | 说明 |
-|------|-----------|--------|------|
-| 普通模式 | ~30-50% | ~80-120 samples/s | GPU 等待 CPU tokenization |
-| **预计算模式** | ~90-95% | ~200-300 samples/s | GPU 持续计算 |
-
-> ⚠️ **注意**：预计算模式下 `learnable_split` 不会更新。如需训练 tokenizer 策略，使用普通模式。
+| 特性 | 说明 |
+|------|------|
+| **Gumbel-Softmax** | 可微分尺度选择，端到端训练 |
+| **全 GPU 执行** | 消除 CPU 瓶颈 |
+| **自适应多尺度** | 根据区域复杂度选择 patch 大小 |
+| **温度退火** | 训练过程中自动调整 Gumbel τ |
 
 ---
 
@@ -30,16 +17,12 @@ uv run python examples/training/train_fractal_vit.py \
 
 **Hardware Specs:**
 - GPU: RTX 4070 Laptop (8GB VRAM, Ampere architecture)
-- Shared Memory: 8GB
-- CPU Workers: 12 available
+- CPU Workers: 自动检测
 
 **Dataset Setup:**
-Tiny ImageNet will be **automatically downloaded** (~237 MB) on first run. The script will:
-1. Download `tiny-imagenet-200.zip` from Stanford
-2. Extract and organize the dataset structure
-3. Reorganize validation set for PyTorch ImageFolder compatibility
+Tiny ImageNet 将在首次运行时 **自动下载** (~237 MB)。
 
-**Recommended Configuration (Memory Safe + 预计算优化):**
+**推荐配置 (生产训练):**
 
 ```bash
 uv run python examples/training/train_fractal_vit.py \
@@ -50,78 +33,95 @@ uv run python examples/training/train_fractal_vit.py \
     --warmup-epochs 10 \
     --lr 8e-4 \
     --weight-decay 0.05 \
-    --dropout 0.15 \
-    --emb-dropout 0.15 \
+    --dropout 0.3 \
+    --drop-path 0.2 \
+    --label-smoothing 0.1 \
     --gradient-clip 1.0 \
     --use-amp \
-    --pretokenize \
     --ffn-type swiglu_level \
     --dim 224 \
     --depth 9 \
     --heads 8 \
     --dim-head 28 \
-    --max-level 3 \
-    --pool cls
+    --max-level 4 \
+    --num-scales 3 \
+    --pool cls \
+    --patience 15
 ```
 
 **Expected Performance:**
-- Training Time: ~4-6 hours (预计算模式更快)
-- Throughput: ~200-300 images/sec
+- Training Time: ~4-6 hours
+- Throughput: ~150-250 images/sec
 - Peak VRAM: ~6.5GB (safe for 8GB card)
 - Parameters: ~5.8M
-- Expected Final Accuracy: 42-48% (top-1), 68-73% (top-5)
+- Expected Accuracy: 35-45% (top-1)
 
 **Key Optimizations:**
-- ✅ **预计算 Tokenization**: 消除 GPU 空转，提升 2-3x 吞吐量
 - ✅ **TF32 Auto-enabled**: ~8× matrix multiplication speedup
 - ✅ **Mixed Precision (AMP)**: 30-40% faster training
-- ✅ **Optimal Batch Size**: 64 maximizes GPU utilization without OOM
-- ✅ **8 Workers**: Good balance for 8GB shm-size (avoids deadlock)
-- ✅ **SwiGLU FFN**: -5.8% parameters vs GELU, better convergence
-- ✅ **10 Warmup Epochs**: Stabilizes training on larger model
-- ✅ **智能环境检测**: 自动推荐 workers 数量
+- ✅ **Optimal Batch Size**: 64 maximizes GPU utilization
+- ✅ **8 Workers**: Good balance for shared memory
+- ✅ **SwiGLU FFN**: -5.8% parameters vs GELU
+- ✅ **Early Stopping**: patience=15 防止过拟合
+- ✅ **Label Smoothing**: 0.1 正则化
 
 ---
 
 ## Alternative Configurations
 
-### 🔬 Feasibility Validation (Quick Test)
-
-**Purpose**: Quickly validate Fractal ViT works correctly before long training runs.
+### 🔬 快速验证 (Quick Test)
 
 ```bash
 uv run python examples/training/train_fractal_vit.py \
     --quick-test \
     --dataset cifar10 \
-    --pretokenize \
     --use-amp
 ```
 
-Or with more control:
+**Expected:**
+- Time: ~2-5 minutes
+- Accuracy: 验证模型正常学习
+
+### CIFAR-10 标准训练 (30 min)
 
 ```bash
 uv run python examples/training/train_fractal_vit.py \
     --dataset cifar10 \
-    --epochs 20 \
-    --batch-size 64 \
-    --num-workers 4 \
-    --warmup-epochs 3 \
+    --epochs 100 \
+    --batch-size 128 \
+    --num-workers 8 \
+    --warmup-epochs 10 \
+    --lr 5e-4 \
+    --dropout 0.2 \
+    --drop-path 0.1 \
     --use-amp \
-    --pretokenize \
-    --gradient-checkpoint \
     --ffn-type swiglu_level \
-    --dim 128 \
-    --depth 6 \
-    --heads 4 \
-    --dim-head 32 \
-    --max-level 3
+    --dim 192 \
+    --depth 8 \
+    --patience 10
 ```
 
-**Expected:**
-- Time: ~5-10 minutes on RTX 4070
-- VRAM: ~2.5GB (with gradient checkpoint)
-- Accuracy: 60-70% (validates model is learning)
-- Parameters: ~1.5M
+**Expected:** 85-90% accuracy in ~30 minutes
+
+### CIFAR-100 训练 (1 hour)
+
+```bash
+uv run python examples/training/train_fractal_vit.py \
+    --dataset cifar100 \
+    --epochs 150 \
+    --batch-size 128 \
+    --num-workers 8 \
+    --warmup-epochs 15 \
+    --lr 5e-4 \
+    --dropout 0.3 \
+    --drop-path 0.2 \
+    --label-smoothing 0.1 \
+    --use-amp \
+    --ffn-type swiglu_level \
+    --patience 20
+```
+
+**Expected:** 70-75% accuracy
 
 ### Memory-Constrained (4-5GB VRAM)
 
@@ -133,12 +133,10 @@ uv run python examples/training/train_fractal_vit.py \
     --accum-steps 2 \
     --num-workers 6 \
     --use-amp \
-    --pretokenize \
     --gradient-checkpoint \
     --ffn-type swiglu_level \
     --dim 160 \
     --depth 8 \
-    --heads 8 \
     --warmup-epochs 10
 ```
 
@@ -152,202 +150,103 @@ uv run python examples/training/train_fractal_vit.py \
     --accum-steps 4 \
     --num-workers 4 \
     --use-amp \
-    --pretokenize \
     --gradient-checkpoint \
     --ffn-type swiglu \
     --dim 128 \
     --depth 6 \
-    --heads 4 \
     --max-level 2
 ```
 
-**Expected:** ~3GB VRAM, 65-70% accuracy on CIFAR-100
-
-### Speed-Focused (4 hours, ~40% accuracy)
-
-```bash
-uv run python examples/training/train_fractal_vit.py \
-    --dataset tiny-imagenet \
-    --epochs 60 \
-    --batch-size 64 \
-    --num-workers 10 \
-    --warmup-epochs 8 \
-    --lr 1e-3 \
-    --use-amp \
-    --pretokenize \
-    --ffn-type swiglu \
-    --dim 192 \
-    --depth 8 \
-    --max-level 3
-```
-
-### High-End GPU (12-16GB VRAM, 8 hours, higher accuracy)
+### High-End GPU (12-16GB VRAM)
 
 ```bash
 uv run python examples/training/train_fractal_vit.py \
     --dataset tiny-imagenet \
     --epochs 150 \
-    --batch-size 96 \
-    --num-workers 8 \
+    --batch-size 128 \
+    --num-workers 12 \
     --warmup-epochs 15 \
     --lr 6e-4 \
     --weight-decay 0.08 \
-    --dropout 0.2 \
-    --emb-dropout 0.2 \
+    --dropout 0.3 \
+    --drop-path 0.25 \
     --use-amp \
-    --pretokenize \
     --ffn-type swiglu_level \
     --dim 320 \
     --depth 12 \
     --heads 10 \
-    --max-level 4
+    --max-level 4 \
+    --num-scales 4
 ```
 
 ---
 
-## CIFAR-100 Quick Benchmark (30 min)
-
-```bash
-uv run python examples/training/train_fractal_vit.py \
-    --dataset cifar100 \
-    --epochs 100 \
-    --batch-size 128 \
-    --num-workers 8 \
-    --warmup-epochs 10 \
-    --use-amp \
-    --pretokenize \
-    --ffn-type swiglu_level
-```
-
-**Expected:** 70-75% accuracy in ~25-30 minutes
-
----
-
-## 新增参数说明
+## 参数说明
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--pretokenize` | 预计算 tokenization，消除 GPU 空转 | False |
+| `--dataset` | 数据集 (cifar10, cifar100, tiny-imagenet) | cifar10 |
 | `--quick-test` | 快速测试模式（3 epochs, 256 samples） | False |
 | `--num-workers` | DataLoader workers（留空则自动检测） | 自动 |
 | `--gradient-checkpoint` | 梯度检查点，节省 VRAM | False |
+| `--ffn-type` | FFN 类型 (gelu, swiglu, swiglu_level) | swiglu_level |
+| `--num-scales` | 多尺度层数 | 3 |
+| `--patience` | 早停耐心值 | 10 |
+| `--drop-path` | Stochastic Depth rate | 0.2 |
+| `--label-smoothing` | 标签平滑 | 0.1 |
+| `--mixup-alpha` | Mixup alpha (0 禁用) | 0.8 |
+| `--cutmix-alpha` | CutMix alpha (0 禁用) | 1.0 |
 
 ---
 
 ## Tips for RTX 4070 Laptop
 
-1. **Power Management**: Ensure laptop is plugged in and set to "High Performance" mode
-2. **Cooling**: Good ventilation is critical for sustained performance
-3. **Background Tasks**: Close unnecessary applications to free RAM
-4. **Monitoring**: Use `nvidia-smi -l 1` in another terminal to monitor GPU usage
-5. **TF32**: Automatically enabled for Ampere GPUs, provides ~8× speedup for matmul
-6. **预计算模式**: 使用 `--pretokenize` 可显著提升 GPU 利用率
+1. **Power Management**: 确保接入电源，设置为高性能模式
+2. **Cooling**: 良好散热对持续性能至关重要
+3. **TF32**: Ampere 架构自动启用，提供 ~8× matmul 加速
+4. **监控**: 使用 `nvidia-smi -l 1` 监控 GPU 使用率
 
 **Check GPU Before Training:**
 ```bash
-# Verify TF32 support
 uv run python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}'); print(f'GPU: {torch.cuda.get_device_name(0)}'); print(f'Compute: {torch.cuda.get_device_capability(0)}')"
-```
-
-Expected output:
-```
-CUDA: True
-GPU: NVIDIA GeForce RTX 4070 Laptop GPU
-Compute: (8, 9)  # Ampere architecture
 ```
 
 ---
 
 ## Troubleshooting
 
-### GPU 空转 / 训练速度慢
+### Out of Memory (OOM)
 
-**症状**: GPU 利用率低（<50%），吞吐量不到 100 samples/s
-
-**解决方案**: 
-```bash
-# 启用预计算模式
---pretokenize
-
-# 增加 workers（但不要超过 shm 限制）
---num-workers 8  # 8GB shm
---num-workers 4  # 4GB shm
-```
-
-### Tiny ImageNet Download Issues
-
-**Problem: "File is not a zip file" or corrupted download**
-
-Solution:
-```bash
-# Remove corrupted files
-rm -f /app/data/tiny-imagenet-200.zip
-rm -rf /app/data/tiny-imagenet-200
-
-# Re-run training (will automatically re-download)
-uv run python examples/training/train_fractal_vit.py --dataset tiny-imagenet ...
-```
-
-The script now automatically:
-- Validates file size before extraction
-- Tests zip file integrity
-- Removes corrupted files and re-downloads
-- Shows extraction progress
-
-### Out of Memory (OOM) during training
-
-**Common causes for 8GB RTX 4070 Laptop:**
-- Batch size too large (>64 for Tiny ImageNet)
-- Model too large (dim >224 or depth >9)
-- max_level too high (>3 increases memory exponentially)
-
-**Solutions (try in order):**
+**Solutions (按优先级):**
 
 ```bash
-# Step 1: Reduce batch size (keeps effective batch via accumulation)
---batch-size 32 --accum-steps 2  # Effective batch = 64
+# 1. 减小 batch size + 梯度累积
+--batch-size 32 --accum-steps 2
 
-# Step 2: Reduce model size (most effective)
---dim 192 --depth 8 --heads 8 --dim-head 24 --max-level 3
+# 2. 减小模型尺寸
+--dim 192 --depth 8 --max-level 3
 
-# Step 3: Reduce max fractal level (critical for memory)
---max-level 2  # Reduces tokenization memory significantly
-
-# Step 4: Use gradient checkpointing
+# 3. 启用梯度检查点
 --gradient-checkpoint
 
-# Emergency: Ultra-low memory config
+# 4. 极低内存配置
 --batch-size 16 --accum-steps 4 --dim 128 --depth 6 --max-level 2
 ```
 
-**Memory-safe config for 8GB VRAM:**
+### Tiny ImageNet 下载问题
+
 ```bash
-uv run python examples/training/train_fractal_vit.py \
-    --dataset tiny-imagenet \
-    --batch-size 64 \
-    --dim 224 \
-    --depth 9 \
-    --max-level 3 \
-    --use-amp \
-    --pretokenize \
-    --num-workers 8
+# 删除损坏文件后重新运行
+rm -f data/tiny-imagenet-200.zip
+rm -rf data/tiny-imagenet-200
+uv run python examples/training/train_fractal_vit.py --dataset tiny-imagenet ...
 ```
-
-### 预计算模式兼容性
-
-**问题**: 预计算模式下 tokenizer 策略不会更新
-
-**说明**: 预计算模式将 tokenization 移到 DataLoader，此时 `learnable_split` 的梯度不会传回模型。
-
-**解决方案**:
-- 如需训练 tokenizer 策略，不使用 `--pretokenize`
-- 如只需训练 Transformer，使用 `--pretokenize` 获得最大吞吐量
 
 ---
 
 ## 性能监控
 
-训练时第一个 epoch 会输出性能分解：
+训练第一个 epoch 会输出性能分解：
 
 ```
 Epoch 1/100:
@@ -362,11 +261,12 @@ Epoch 1/100:
 | data | 数据加载占比 | <5% |
 | fwd | 前向传播占比 | 40-60% |
 | mem | VRAM 峰值 | <7GB (8GB 卡) |
-| Throughput | 样本吞吐量 | >200 (预计算) |
+| Throughput | 样本吞吐量 | >150 |
 
 **Expected throughput for RTX 4070 Laptop:**
-| Config | Batch Size | 普通模式 | 预计算模式 | VRAM |
-|--------|------------|----------|------------|------|
-| dim=192, depth=8 | 64 | ~100 samples/s | ~280 samples/s | ~5GB |
-| dim=224, depth=9 | 64 | ~80 samples/s | ~220 samples/s | ~6GB |
-| dim=256, depth=10 | 32 | ~50 samples/s | ~140 samples/s | ~7GB |
+
+| Config | Batch Size | Throughput | VRAM |
+|--------|------------|------------|------|
+| dim=192, depth=8 | 64 | ~250 samples/s | ~5GB |
+| dim=224, depth=9 | 64 | ~180 samples/s | ~6GB |
+| dim=256, depth=10 | 32 | ~100 samples/s | ~7GB |
