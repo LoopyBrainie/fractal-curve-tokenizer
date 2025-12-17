@@ -36,13 +36,15 @@ Hilbert 感知注意力:
 +===============================+==========================================+
 | LowRankHilbertBias            | B = ΦΨ^T, Φ,Ψ ∈ R^{N × r × H}           |
 | HierarchicalHilbertBias       | B = Σ_ℓ MLP_ℓ(same, diff, q_i, q_j)      |
+| LCAHilbertBias                | B[i,j] = LCAEmbed(LCA(i,j))              |
 | HilbertAwareMultiScaleAttention| Attn + B_hilbert + B_level              |
 +-------------------------------+------------------------------------------+
 
 bias_mode 选项:
 - 'original': 全连接网络（高显存，精确）
-- 'low_rank': 低秩分解（推荐，显存友好）
+- 'low_rank': 低秩分解（显存友好，~50K参数）
 - 'hierarchical': 分层计算（可解释性强）
+- 'lca': LCA 嵌入表（推荐，~100参数，显式几何意义）
 """
 
 from __future__ import annotations
@@ -56,8 +58,9 @@ from einops import rearrange
 
 from .constants import HILBERT_BIAS_SCALE, LEVEL_BIAS_SCALE
 from .utils import extract_depths
+from .fractal_path import VectorizedPathEncoder
 
-BiasMode = Literal['original', 'low_rank', 'hierarchical']
+BiasMode = Literal['original', 'low_rank', 'hierarchical', 'lca']
 
 
 class LowRankHilbertBias(nn.Module):
@@ -283,6 +286,147 @@ class HierarchicalHilbertBias(nn.Module):
             return bias
 
 
+class LCAHilbertBias(nn.Module):
+    """基于最近公共祖先 (LCA) 的 Hilbert Bias 实现。
+    
+    数学原理
+    ========
+    利用四叉树编码的核心性质: LCA 深度直接编码空间距离。
+    
+    定理 (LCA-距离等价性):
+        对于四叉树编码的两个 token i, j:
+        LCA(i, j) = ℓ  ⟹  ‖pos_i - pos_j‖_∞ ≤ N / 2^ℓ
+        
+    其中 N 是网格边长，ℓ 是 LCA 深度。
+    
+    偏置公式:
+        B[i,j] = LCAEmbed(LCA(i,j))
+        
+    其中 LCAEmbed: {0,1,...,D} → R^H 是可学习的嵌入表。
+    
+    复杂度分析
+    ==========
+    - 参数量: O((D+1) × H) ≈ 128 (vs Low-Rank ~50K)
+    - 计算量: O(N² × D) 用于 LCA 计算 (可预计算缓存)
+    - 显存: O(N²) 用于偏置矩阵
+    
+    优势
+    ====
+    1. 显式几何意义: LCA 深度 ⟺ 空间距离
+    2. 参数极少: ~100× 少于 Low-Rank
+    3. 无需学习距离: 距离信息由编码结构直接提供
+    4. 可解释性强: 偏置值可直接对应空间邻近程度
+    """
+    
+    def __init__(self, max_depth: int, heads: int) -> None:
+        """初始化 LCA Hilbert Bias。
+        
+        Args:
+            max_depth: 最大四叉树深度 (决定 LCA 取值范围)
+            heads: 注意力头数
+        """
+        super().__init__()
+        self.max_depth = max_depth
+        self.heads = heads
+        
+        # LCA 深度嵌入表: depth ∈ {0, 1, ..., max_depth} → R^heads
+        # 深度 0 表示完全不同的根节点，深度 max_depth 表示相邻或相同
+        self.lca_embedding = nn.Embedding(max_depth + 1, heads)
+        
+        # 初始化: 深度越大（越邻近）偏置越高
+        # 使用对数衰减初始化，符合 Hilbert 曲线的 √ 局部性
+        self._init_weights()
+    
+    def _init_weights(self) -> None:
+        """初始化 LCA 嵌入权重。
+        
+        采用对数衰减初始化:
+            embed[d] ∝ log(1 + d) / log(1 + max_depth)
+            
+        这样深层 (邻近) token 获得更高的初始偏置。
+        """
+        with torch.no_grad():
+            depths = torch.arange(self.max_depth + 1, dtype=torch.float32)
+            # 归一化对数深度: [0, 1]
+            log_depths = torch.log1p(depths) / torch.log1p(
+                torch.tensor(float(self.max_depth))
+            )
+            # 广播到所有 heads，加小随机扰动
+            init_values = log_depths.unsqueeze(1).expand(-1, self.heads)
+            self.lca_embedding.weight.copy_(init_values)
+            # 添加小随机扰动以打破对称性
+            self.lca_embedding.weight.add_(
+                torch.randn_like(self.lca_embedding.weight) * 0.02
+            )
+    
+    def forward(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+        """计算基于 LCA 的 Hilbert Bias。
+        
+        Args:
+            levels_info: 层级信息张量
+                - 旧格式: (S, Info) 其中 Info = [depth, q1, q2, ...]
+                - 新格式: (B, S, Info)
+            
+        Returns:
+            偏置矩阵:
+                - 旧格式: (H, S, S)
+                - 新格式: (B, H, S, S)
+            若输入无效则返回 None
+        """
+        if levels_info.numel() == 0:
+            return None
+        
+        if levels_info.dim() == 2:
+            return self._forward_2d(levels_info)
+        else:
+            return self._forward_3d(levels_info)
+    
+    def _forward_2d(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+        """处理 2D 输入 (S, Info)。"""
+        seq_len, info_dim = levels_info.shape
+        if info_dim <= 1:
+            return None
+        
+        # 提取四叉树路径: (S, Path)
+        paths = levels_info[:, 1:].long()
+        
+        # 计算 LCA 深度矩阵: (S, S)
+        lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
+        
+        # 裁剪到有效范围
+        lca_depths = lca_depths.clamp(0, self.max_depth)
+        
+        # 查表得到偏置: (S, S, H)
+        bias = self.lca_embedding(lca_depths)
+        
+        # 调整形状: (H, S, S)
+        return bias.permute(2, 0, 1)
+    
+    def _forward_3d(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+        """处理 3D 输入 (B, S, Info)。"""
+        batch_size, seq_len, info_dim = levels_info.shape
+        if info_dim <= 1:
+            return None
+        
+        # 提取四叉树路径: (B, S, Path)
+        paths = levels_info[:, :, 1:].long()
+        
+        # 对每个 batch 计算 LCA 深度矩阵
+        # 优化: 如果 batch 中路径相同，可共享计算
+        # 这里采用简单的 batch 循环，后续可优化为向量化
+        all_biases = []
+        for b in range(batch_size):
+            batch_paths = paths[b]  # (S, Path)
+            lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(batch_paths)
+            lca_depths = lca_depths.clamp(0, self.max_depth)
+            bias = self.lca_embedding(lca_depths)  # (S, S, H)
+            all_biases.append(bias)
+        
+        # 堆叠并调整形状: (B, H, S, S)
+        stacked = torch.stack(all_biases, dim=0)  # (B, S, S, H)
+        return stacked.permute(0, 3, 1, 2)
+
+
 class HilbertAwareMultiScaleAttention(nn.Module):
     """Hilbert 曲线感知的多尺度注意力机制。
 
@@ -321,8 +465,9 @@ class HilbertAwareMultiScaleAttention(nn.Module):
             use_level_scaling: 是否使用层级缩放
             bias_mode: Hilbert Bias 计算模式
                 - 'original': 原始全连接网络（高显存，精确）
-                - 'low_rank': 低秩分解（推荐，显存友好）
+                - 'low_rank': 低秩分解（显存友好，~50K参数）
                 - 'hierarchical': 分层计算（可解释性强）
+                - 'lca': LCA 嵌入表（推荐，~100参数，显式几何意义）
             low_rank_r: 低秩分解的秩参数（仅当 bias_mode='low_rank' 时有效）
         """
         super().__init__()
@@ -363,6 +508,12 @@ class HilbertAwareMultiScaleAttention(nn.Module):
             elif bias_mode == 'hierarchical':
                 self.hilbert_bias_network = None
                 self.hilbert_bias_impl = HierarchicalHilbertBias(
+                    max_depth=max_level,
+                    heads=heads,
+                )
+            elif bias_mode == 'lca':
+                self.hilbert_bias_network = None
+                self.hilbert_bias_impl = LCAHilbertBias(
                     max_depth=max_level,
                     heads=heads,
                 )

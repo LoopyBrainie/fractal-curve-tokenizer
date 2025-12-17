@@ -90,7 +90,6 @@ class NextGenerationFractalViT(nn.Module):
         dim: 模型维度
         pool: 池化策略 ('cls', 'mean' 或其他)
         max_level: 最大递归层级
-        use_dynamic_depth: 是否使用动态深度
         tokenizer: 图像 tokenizer
         token_processor: token 处理器
         pos_embedding: 位置编码
@@ -118,8 +117,8 @@ class NextGenerationFractalViT(nn.Module):
         use_hilbert_encoding: bool = True,
         use_spatial_encoding: bool = True,
         use_feature_enhancement: bool = True,
-        use_dynamic_depth: bool = False,
         use_checkpoint: bool = False,
+        drop_path_rate: float = 0.0,
         ffn_type: FFNType = 'swiglu_level',
         tokenizer: Optional[BaseTokenizer] = None,
         token_processor: Optional[BaseTokenProcessor] = None,
@@ -150,7 +149,6 @@ class NextGenerationFractalViT(nn.Module):
             use_hilbert_encoding: 是否使用 Hilbert 编码
             use_spatial_encoding: 是否使用空间编码
             use_feature_enhancement: 是否使用特征增强
-            use_dynamic_depth: 是否使用动态深度
             ffn_type: FFN 变体 ('gelu', 'swiglu', 'swiglu_level')
             tokenizer: 自定义 tokenizer（可选，若提供则忽略 tokenizer_type）
             token_processor: 自定义 token 处理器（可选）
@@ -169,7 +167,6 @@ class NextGenerationFractalViT(nn.Module):
         self.dim = dim
         self.pool = pool
         self.max_level = max_level
-        self.use_dynamic_depth = use_dynamic_depth
         self.use_checkpoint = use_checkpoint
         self.ffn_type = ffn_type
         
@@ -272,6 +269,7 @@ class NextGenerationFractalViT(nn.Module):
             mlp_dim=mlp_dim,
             dropout=dropout,
             max_level=max_level,
+            drop_path_rate=drop_path_rate,
             ffn_type=ffn_type,
             use_checkpoint=use_checkpoint,
         )
@@ -605,7 +603,7 @@ class NextGenerationFractalViT(nn.Module):
         )
 
         # 4. Transformer 处理
-        x = self.transformer(x, padded_levels, attn_mask, self.use_dynamic_depth)
+        x = self.transformer(x, padded_levels, attn_mask)
 
         # 5. 池化
         pooled = self._apply_pooling(x, key_padding_mask)
@@ -838,7 +836,6 @@ class SimpleFractalViT(nn.Module):
             use_hilbert_encoding=True,
             use_spatial_encoding=True,
             use_feature_enhancement=False,
-            use_dynamic_depth=False,
             # === ARCH-P1: 传递 tokenizer_type 参数 ===
             tokenizer_type=tokenizer_type,
             num_scales=num_scales,

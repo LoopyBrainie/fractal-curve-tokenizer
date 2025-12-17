@@ -283,14 +283,14 @@ class TestGradientFlow:
         loss = output.sum()
         loss.backward()
         
-        # 验证复杂度估计器有梯度
+        # 验证复杂度头有梯度（重构后使用 complexity_head 替代 complexity_estimator）
         has_gradient = False
-        for param in model.tokenizer.complexity_estimator.parameters():
+        for param in model.tokenizer.complexity_head.parameters():
             if param.grad is not None:
                 has_gradient = True
                 break
         
-        assert has_gradient, "Complexity estimator should receive gradients"
+        assert has_gradient, "Complexity head should receive gradients"
 
 
 class TestSimpleFractalViT:
