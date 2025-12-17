@@ -226,10 +226,7 @@ class TestGradientFlow:
         loss = output.sum()
         loss.backward()
         
-<<<<<<< HEAD
-=======
         # 验证复杂度头有梯度（重构后使用 complexity_head 替代 complexity_estimator）
->>>>>>> wip/save-20251217T211733Z
         has_gradient = False
         for param in model.tokenizer.complexity_head.parameters():
             if param.grad is not None:
@@ -237,34 +234,6 @@ class TestGradientFlow:
                 break
         
         assert has_gradient, "Complexity head should receive gradients"
-<<<<<<< HEAD
-=======
-
-
-class TestSimpleFractalViT:
-    """测试 SimpleFractalViT 的 tokenizer_type 支持."""
-
-    def test_simple_fractal_vit_with_streaming(self) -> None:
-        """测试 SimpleFractalViT 使用 streaming tokenizer."""
-        model = SimpleFractalViT(
-            image_size=32,
-            num_classes=10,
-            dim=64,
-            depth=2,
-            heads=2,
-            mlp_dim=128,
-            min_patch_size=(4, 4),
-            max_level=5,
-            tokenizer_type="streaming",
-        )
-        
-        assert model.tokenizer_type == "streaming"
-        
-        x = torch.randn(2, 3, 32, 32)
-        output = model(x)
-        
-        assert output.shape == (2, 10)
->>>>>>> wip/save-20251217T211733Z
 
 
 class TestOutputConsistency:
