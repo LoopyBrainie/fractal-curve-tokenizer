@@ -1012,14 +1012,18 @@ def main():
         
         scheduler.step()
         
-        # 温度退火 (EXP-FIX-2)
+        # 温度退火 + 深度偏置调度 (v2.2)
         current_tau = None
+        current_depth_bias = None
         if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'anneal_temperature'):
             current_tau = model.tokenizer.anneal_temperature(
                 current_epoch=epoch,
                 total_epochs=config.epochs,
                 schedule="cosine",
             )
+            # 深度偏置会在 anneal_temperature 中自动更新
+            if hasattr(model.tokenizer, 'get_depth_bias'):
+                current_depth_bias = model.tokenizer.get_depth_bias()
         
         epoch_time = time.time() - start
         
@@ -1035,13 +1039,16 @@ def main():
         }
         if current_tau is not None:
             history_entry['gumbel_tau'] = current_tau
+        if current_depth_bias is not None:
+            history_entry['depth_bias'] = current_depth_bias
         history.append(history_entry)
         
         print(f"\nEpoch {epoch}/{config.epochs}:")
         print(f"  Train: loss={train_loss:.4f}, acc={train_acc:.2f}%")
         print(f"  Val:   loss={val_loss:.4f}, acc={val_acc:.2f}%")
         tau_str = f", τ={current_tau:.3f}" if current_tau is not None else ""
-        print(f"  Time:  {epoch_time:.1f}s, Throughput: {perf_stats['throughput']:.1f} samples/s{tau_str}")
+        bias_str = f", bias={current_depth_bias:.2f}" if current_depth_bias is not None else ""
+        print(f"  Time:  {epoch_time:.1f}s, Throughput: {perf_stats['throughput']:.1f} samples/s{tau_str}{bias_str}")
         
         if epoch == 1:
             data_pct = perf_stats['avg_data_time'] / perf_stats['avg_batch_time'] * 100 if perf_stats['avg_batch_time'] > 0 else 0
