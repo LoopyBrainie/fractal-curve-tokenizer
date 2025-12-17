@@ -50,8 +50,9 @@ fractal-curve-tokenizer/
 │       ├── features.py             # Token 特征计算
 │       ├── constants.py            # [配置] 全局常量与超参数
 │       ├── utils.py                # 通用工具函数
-│       ├── fractal_config.py       # 统一配置管理
-│       └── fractal_path.py         # 四叉树路径编码
+│       └── _deprecated/            # 废弃模块 (v1.0 移除)
+│           ├── fractal_curve_tokenizer.py  # 旧版 BFS + REINFORCE
+│           └── token_processor.py          # 旧版 Token 处理器
 ├── examples/
 │   └── training/
 │       └── train_fractal_vit.py    # 完整的训练脚本
@@ -67,5 +68,6 @@ fractal-curve-tokenizer/
 
 | tokenizer_type | 实现类 | 特点 | 状态 |
 | :--- | :--- | :--- | :--- |
+| `legacy` | `FractalHilbertTokenizer` | BFS + REINFORCE | ⚠️ 废弃 |
 | `streaming` | `StreamingFractalTokenizer` | 固定多尺度卷积 | ✅ 稳定 |
 | `streaming_v2` | `StreamingFractalTokenizerV2` | Gumbel-Softmax 自适应 | ✅ 推荐 |

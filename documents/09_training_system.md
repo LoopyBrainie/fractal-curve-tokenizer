@@ -31,7 +31,9 @@
 
 ### build_model() 函数
 
-根据参数实例化 `NextGenerationFractalViT` 模型。
+根据参数实例化模型：
+- GPU: `NextGenerationFractalViT`
+- CPU: `SimpleFractalViT` (自动减小规模)
 
 ### 关键命令行参数
 
@@ -57,15 +59,23 @@ def train_one_epoch(model, dataloader, optimizer, criterion):
         # 1. 前向传播
         with autocast():
             outputs = model(images)
-            loss = criterion(outputs, labels)
+            loss_cls = criterion(outputs, labels)
         
-        # 2. 反向传播
+        # 2. 辅助损失 (仅 Legacy Tokenizer)
+        if model.tokenizer_type == 'legacy':
+            reward = -loss_cls.detach()
+            loss_aux = model.get_tokenizer_loss(reward)
+            total_loss = loss_cls + loss_aux
+        else:
+            total_loss = loss_cls
+        
+        # 3. 反向传播
         optimizer.zero_grad()
-        scaler.scale(loss).backward()
+        scaler.scale(total_loss).backward()
         scaler.step(optimizer)
         scaler.update()
         
-        # 3. 清理缓存
+        # 4. 清理缓存
         model.clear_tokenizer_cache()
 ```
 
@@ -131,20 +141,45 @@ torch.save(checkpoint, 'best.pth')
 
 ---
 
-## 9.6 使用示例
+## 9.6 REINFORCE 训练 (仅 Legacy Tokenizer)
+
+### 策略梯度损失
+
+$$\mathcal{L}_{policy} = -\frac{1}{N} \sum_{i=1}^N (R_i - b) \cdot \log \pi(a_i|s_i)$$
+
+其中：
+- $R_i$: 奖励信号 (Reward) = $-\mathcal{L}_{CE}$
+- $b$: 基线 (Baseline) = EMA of rewards
+- $\pi(a|s)$: 策略网络输出
+
+### 熵正则化
+
+$$\mathcal{L}_{entropy} = -\sum \pi(a|s) \log \pi(a|s)$$
+
+鼓励策略保持随机性，防止过早收敛。
+
+### 总辅助损失
+
+$$\mathcal{L}_{aux} = \mathcal{L}_{policy} - \lambda \cdot \mathcal{L}_{entropy}$$
+
+---
+
+## 9.7 使用示例
 
 ```bash
 # 使用推荐配置训练
 python examples/training/train_fractal_vit.py \
     --dataset cifar10 \
     --tokenizer-type streaming_v2 \
-    --bias-mode lca \
+    --bias-mode low_rank \
     --ffn-type swiglu_level \
     --epochs 100 \
     --batch-size 64 \
     --lr 5e-4
 
-# 使用 V1 Tokenizer (固定尺度)
+# 使用 Legacy Tokenizer (不推荐)
 python examples/training/train_fractal_vit.py \
     --dataset cifar10 \
-    --tokenizer-type streaming \
+    --tokenizer-type legacy \
+    --epochs 100
+```

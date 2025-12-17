@@ -96,6 +96,15 @@ uv run pytest tests/ --cov=vit_pytorch --cov-report=html
 
 ---
 
+## 10.5 废弃模块测试
+
+废弃模块的测试位于 `tests/unit/test_deprecated.py`：
+- ✅ 延迟导入正确性
+- ✅ DeprecationWarning 发出
+- ✅ 功能完整性（向后兼容）
+
+---
+
 ## 10.6 测试状态
 
 | 测试类别 | 数量 | 状态 |

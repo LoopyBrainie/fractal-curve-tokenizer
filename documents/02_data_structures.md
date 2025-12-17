@@ -22,6 +22,7 @@
 *   **属性**：
     *   `sequences`: `List[TokenSequence]`，包含 Batch 中每个样本的 `TokenSequence`
 *   **方法**：
+    *   `to_legacy()`: 转换为旧版格式（兼容性）
     *   `tokens_list()` / `levels_list()`: 辅助提取方法
 
 ### BaseTokenizer / BaseTokenProcessor
@@ -80,21 +81,11 @@ $$\text{depths} = \text{clamp}(L_{:,:,0}, 0, L_{max})$$
 ## 2.4 streaming_tokenizer.py - 核心数据结构
 
 ### HilbertIndexer
-用于预计算 Hilbert/Pseudo-Hilbert 曲线索引的工具类。
+用于预计算 Hilbert 曲线索引的工具类。
 
 *   **方法**：
     *   `get_hilbert_order(grid_size)`: 返回从光栅顺序到 Hilbert 顺序的索引映射
-    *   `get_hilbert_order_rect(grid_h, grid_w)`: 支持矩形网格
 *   **特点**：使用 `@lru_cache` 缓存避免重复计算
-
-### HilbertPathCache
-统一的 Hilbert 路径预计算缓存，存储两种映射：
-
-*   `hilbert_to_raster`: Hilbert 索引 → 光栅索引
-*   `quadtree_paths`: Hilbert 索引 → 四叉树路径
-
-**数学定义**：
-$$\text{quadtree\_path}[d, \ell] = q_\ell = \text{bit}(x, k-\ell) + 2 \times \text{bit}(y, k-\ell)$$
 
 ### MultiScalePatchEncoder
 多尺度卷积金字塔，核心数据结构。

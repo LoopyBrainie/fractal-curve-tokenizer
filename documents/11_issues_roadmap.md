@@ -1,6 +1,6 @@
 # 第十一章：项目改进历史
 
-> **最后更新**: 2025年12月19日 | **状态**: ✅ 持续更新
+> **最后更新**: 2025年12月18日 | **状态**: ✅ 持续更新
 
 ## 11.1 快速概览
 
@@ -32,12 +32,12 @@
 
 **结果**: 训练完全端到端可微，消除 Python 循环瓶颈，20 个单元测试通过
 
-### ARCH-P1: 废弃模块移除 (2025-12) ✅
+### ARCH-P1: 废弃模块隔离 (2025-12) ✅
 
 **操作**:
-- 已完全移除 `FractalHilbertTokenizer` 和 `EnhancedFractalTokenProcessor`
-- 已删除 `_deprecated/` 目录
-- 统一使用 Streaming Tokenizer 架构
+- 将 `FractalHilbertTokenizer` 移至 `_deprecated/`
+- 将 `EnhancedFractalTokenProcessor` 移至 `_deprecated/`
+- 实现 `__getattr__` 延迟导入 + DeprecationWarning
 
 ---
 
@@ -77,7 +77,7 @@
 
 | 项目 | 描述 | 状态 |
 |------|------|------|
-| P3-1 | 模块拆分并清理 (废弃模块已完全移除) | ✅ 2025-12-07 |
+| P3-1 | 模块拆分 (token_processor → _deprecated) | ✅ 2025-12-07 |
 | P3-2 | 工具函数统一 (extract_depths, normalize_levels_info) | ✅ 2025-12-07 |
 | P3-3 | 常量提取到 constants.py | ✅ 2025-12-08 |
 
@@ -164,7 +164,7 @@
 
 ```
 Layer 4 (应用层):
-    fractal_vit.py          NextGenerationFractalViT
+    fractal_vit.py          NextGenerationFractalViT, SimpleFractalViT
 
 Layer 3 (管道层):
     streaming_tokenizer.py  StreamingFractalTokenizer, V2
@@ -180,6 +180,10 @@ Layer 1 (基础层):
     tokenization.py         BaseTokenizer, TokenizerOutput
     constants.py            超参数默认值
     utils.py                工具函数
+
+废弃模块 (_deprecated/):
+    fractal_curve_tokenizer.py  BFS + REINFORCE (v1.0 移除)
+    token_processor.py          功能已集成 (v1.0 移除)
 ```
 
 ---
@@ -279,45 +283,12 @@ Layer 1 (基础层):
 
 ---
 
-## 11.15 新增归档 (2025-12-19)
-
-### CRITICAL-6: 硬编码魔法数字配置化 ✅
-
-**完成日期**: 2025-12-17
-
-**问题**: `min_patch_size=4`, `num_scales=3` 等魔法数字散落在多个文件中
-
-**解决**: 新增 `FractalConfig` 类统一管理，自动推导 $(s, p) \to (d, n, \{p_i\})$
-
-### PERF-P1-3: 可变 Token 数量 ✅
-
-**完成日期**: 2025-12-17
-
-**替代方案**: 动态 Token 剪枝 → Patch=Token 直接映射
-
-**实现**: `StreamingFractalTokenizerV2(variable_tokens=True)`，Token 数量范围 $[16, 256]$ (64×64 图像)
-
-### ARCH-P2-3: 任意分辨率 Pseudo-Hilbert ✅
-
-**完成日期**: 2025-12-19
-
-**问题**: Hilbert 曲线要求 $n = 2^k$，限制图像尺寸
-
-**解决**: 
-- 实现 `PseudoHilbertCurve` 类 (Zhang & Kamata 2007)
-- 混合策略阈值 $\rho^* = 4/3$
-- 69 个单元测试全部通过
-
----
-
-## 11.16 进度摘要
+## 11.15 进度摘要
 
 | 类别 | 完成 | 总数 | 状态 |
 |------|------|------|------|
-| CRITICAL | 6 | 7 | 86% |
-| ARCH | 8 | 9 | 89% |
+| CRITICAL | 5 | 7 | 71% |
+| ARCH | 7 | 8 | 88% |
 | PERF-P0 | 4 | 4 | ✅ 100% |
-| PERF-P1 | 3 | 3 | ✅ 100% |
-| PERF-P2 | 0 | 3 | 待研究 |
-| P3 | 0 | 2 | 按需 |
-| **总计** | **21** | **28** | **75%** |
+| PERF-P1 | 2 | 3 | 67% |
+| **总计** | **18** | **27** | **67%** |

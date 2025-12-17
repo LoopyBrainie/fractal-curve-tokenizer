@@ -7,9 +7,10 @@
 $$I \xrightarrow{\text{Tokenize}} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{CLS}} [c; T'] \xrightarrow{\text{Transformer}} X' \xrightarrow{\text{Pool}} z \xrightarrow{\text{MLP}} \hat{y}$$
 
 **损失函数**:
-$$\mathcal{L} = \mathcal{L}_{CE}(y, \hat{y})$$
+$$\mathcal{L} = \mathcal{L}_{CE}(y, \hat{y}) + \lambda \cdot \mathcal{L}_{aux}$$
 
-Streaming Tokenizer 实现端到端可微，无需额外辅助损失。
+- Legacy Tokenizer: $\mathcal{L}_{aux} = \mathcal{L}_{REINFORCE}$ (策略梯度)
+- Streaming Tokenizer: $\mathcal{L}_{aux} = 0$ (端到端可微)
 
 ---
 
@@ -17,6 +18,7 @@ Streaming Tokenizer 实现端到端可微，无需额外辅助损失。
 
 | tokenizer_type | 实现类 | 特点 | 状态 |
 | :--- | :--- | :--- | :--- |
+| `legacy` | `FractalHilbertTokenizer` | BFS + REINFORCE | ⚠️ 废弃 |
 | `streaming` | `StreamingFractalTokenizer` | 固定多尺度 | ✅ 稳定 |
 | `streaming_v2` | `StreamingFractalTokenizerV2` | Gumbel-Softmax | ✅ 推荐 |
 
@@ -109,15 +111,37 @@ logits = self.mlp_head(pooled)  # (B, num_classes)
 
 ---
 
-## 8.4 辅助方法
+## 8.4 SimpleFractalViT
 
-### get_tokenizer_loss()
+简化版模型，用于快速实验和调试。
 
-用于获取 tokenizer 的辅助损失。对于 Streaming Tokenizer，返回零损失。
+### 与 NextGenerationFractalViT 的区别
 
-**输入**: `reward` (可选参数，为了接口兼容性保留)
+| 特性 | NextGeneration | Simple |
+| :--- | :--- | :--- |
+| 层级自适应 | ✅ | ❌ |
+| Hilbert Bias | ✅ 可选 | ❌ |
+| 动态深度 | ✅ 可选 | ❌ |
+| 全局注意力 | ✅ | ❌ |
+| 参数量 | 较大 | 较小 |
 
-**输出**: `torch.tensor(0.0)` (对于 streaming tokenizer)
+---
+
+## 8.5 辅助方法
+
+### get_tokenizer_loss() (仅 Legacy Tokenizer)
+
+用于训练阶段的策略更新。
+
+**输入**: `reward` (通常是 `-CrossEntropyLoss`)
+
+**计算流程**:
+1. **堆叠**: 将所有 Log Probs 堆叠为张量
+2. **优势计算**: `advantage = reward - baseline`
+3. **策略梯度**: `policy_loss = -advantage * log_probs.mean()`
+4. **熵正则化**: `loss -= coef * entropy`
+
+**输出**: `aux_loss` (标量)
 
 ### clear_tokenizer_cache()
 
@@ -125,7 +149,7 @@ logits = self.mlp_head(pooled)  # (B, num_classes)
 
 ---
 
-## 8.5 使用示例
+## 8.6 使用示例
 
 ```python
 from vit_pytorch import NextGenerationFractalViT
@@ -148,7 +172,7 @@ logits = model(images)  # (2, 1000)
 
 ---
 
-## 8.6 架构图
+## 8.7 架构图
 
 ```
 Input Image (B, C, H, W)
