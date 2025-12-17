@@ -97,7 +97,7 @@ Demonstrates how the model adaptively selects different patch sizes based on reg
 * **Efficient Attention**: Low-rank Hilbert bias reduces memory from $O(N^2)$ to $O(N \cdot r)$.
 * **Modern FFN**: SwiGLU with optional level adaptation for layer-aware processing.
 * **Robust Regularization**: Integrated DropPath (Stochastic Depth) and entropy regularization.
-* **Flexible Architecture**: Supports both `NextGenerationFractalViT` (full features) and `SimpleFractalViT` (lightweight).
+* **Flexible Architecture**: Supports `NextGenerationFractalViT` with streaming tokenizers and adaptive splitting.
 
 ## Installation
 
@@ -311,7 +311,7 @@ fractal-curve-tokenizer/
 
 | Layer | Module | Description |
 |-------|--------|-------------|
-| **L4** Application | `fractal_vit.py` | `NextGenerationFractalViT`, `SimpleFractalViT` |
+| **L4** Application | `fractal_vit.py` | `NextGenerationFractalViT` |
 | **L3** Pipeline | `streaming_tokenizer.py` | Multi-scale tokenization with Hilbert reorder |
 | | `transformer.py` | Level-aware transformer blocks |
 | **L2** Component | `attention.py` | Hilbert bias with low-rank decomposition |

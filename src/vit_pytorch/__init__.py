@@ -19,7 +19,7 @@ Fractal Curve ViT - 分形曲线视觉 Transformer
 模块层级
 ---------
 Layer 4 (应用层):
-    fractal_vit.py          NextGenerationFractalViT, SimpleFractalViT
+    fractal_vit.py          NextGenerationFractalViT
 
 Layer 3 (管道层):
     streaming_tokenizer.py  StreamingFractalTokenizer, V2
@@ -31,14 +31,10 @@ Layer 2 (组件层):
     positional.py           AdvancedFractalPositionEmbedding
 
 Layer 1 (基础层):
-    hilbert.py              HilbertCurve (H: d ↔ (x,y))
+    hilbert.py              HilbertCurve, PseudoHilbertCurve
     tokenization.py         BaseTokenizer, TokenizerOutput
     constants.py            超参数默认值
     utils.py                工具函数
-
-废弃模块 (_deprecated/):
-    fractal_curve_tokenizer.py  BFS + REINFORCE (v1.0 移除)
-    token_processor.py          功能已集成 (v1.0 移除)
 """
 
 # === 推荐组件 ===
@@ -60,10 +56,7 @@ from .fractal_path import (
     HierarchicalAttentionBias,
     VectorizedPathEncoder,
 )
-from .fractal_vit import (
-    NextGenerationFractalViT,
-    SimpleFractalViT,
-)
+from .fractal_vit import NextGenerationFractalViT
 from .hilbert import (
     HilbertCurve,
     PseudoHilbertCurve,
@@ -84,42 +77,12 @@ from .transformer import EnhancedFractalTransformer, EnhancedFractalTransformerB
 from .utils import extract_depths, normalize_levels_info
 
 
-# === 废弃模块的延迟导入 ===
-def __getattr__(name: str):
-    """延迟导入废弃模块，并发出警告。"""
-    import warnings
-    
-    deprecated_map = {
-        "FractalHilbertTokenizer": "fractal_curve_tokenizer",
-        "EnhancedFractalTokenProcessor": "token_processor",
-        "LearnableSplitDecision": "fractal_curve_tokenizer",
-        "MiniCNN": "fractal_curve_tokenizer",
-        "PatchInfo": "fractal_curve_tokenizer",
-    }
-    
-    if name in deprecated_map:
-        warnings.warn(
-            f"'{name}' 已废弃，将在 v1.0 移除。"
-            f"请使用 StreamingFractalTokenizer 替代。"
-            f"详见 docs/MATHEMATICAL_FORMALIZATION.md",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        module_name = deprecated_map[name]
-        from importlib import import_module
-        module = import_module(f"vit_pytorch._deprecated.{module_name}")
-        return getattr(module, name)
-    
-    raise AttributeError(f"module 'vit_pytorch' has no attribute '{name}'")
-
-
 __all__ = [
-    # === 推荐使用 (v0.5.0+) ===
+    # === 主要模型 ===
     "StreamingFractalTokenizer",
     "StreamingFractalTokenizerV2",
     "NextGenerationFractalViT",
-    "SimpleFractalViT",
-    # === 配置与路径编码 (v0.6.0+) ===
+    # === 配置与路径编码 ===
     "FractalConfig",
     "create_fractal_config",
     "BiasMode",
@@ -155,7 +118,4 @@ __all__ = [
     "get_quadrant_order",
     "hilbert_distance_to_xy",
     "xy_to_hilbert_distance",
-    # === 废弃 (v1.0 移除，通过 __getattr__ 延迟导入) ===
-    # 这些仍然可以通过 from vit_pytorch import FractalHilbertTokenizer 访问
-    # 但会发出 DeprecationWarning
 ]

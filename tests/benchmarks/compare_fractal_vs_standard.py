@@ -27,10 +27,10 @@ from torch.utils.data import DataLoader, TensorDataset
 
 # Handle import paths
 try:
-    from vit_pytorch import SimpleFractalViT, NextGenerationFractalViT
+    from vit_pytorch import NextGenerationFractalViT
 except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'src'))
-    from vit_pytorch import SimpleFractalViT, NextGenerationFractalViT
+    from vit_pytorch import NextGenerationFractalViT
 
 from .benchmark_metrics import (
     ComputationalMetrics,
@@ -154,16 +154,6 @@ def create_comparison_models(
             dim=dim,
             depth=depth,
             heads=heads,
-        ),
-        'SimpleFractalViT': SimpleFractalViT(
-            image_size=image_size,
-            num_classes=num_classes,
-            dim=dim,
-            depth=depth,
-            heads=heads,
-            mlp_dim=dim * 4,
-            channels=3,
-            max_level=3,
         ),
         'NextGenerationFractalViT': NextGenerationFractalViT(
             image_size=image_size,
@@ -354,19 +344,6 @@ def create_model_copy(name: str, model: nn.Module) -> nn.Module:
             dim=model.dim,
             depth=model.depth,
             heads=model.heads,
-        )
-    elif name == 'SimpleFractalViT':
-        enhanced = model.enhanced_model
-        num_classes = enhanced.num_classes
-        return SimpleFractalViT(
-            image_size=enhanced.image_size,
-            num_classes=num_classes,
-            dim=enhanced.dim,
-            depth=DEFAULT_DEPTH,
-            heads=DEFAULT_HEADS,
-            mlp_dim=DEFAULT_MLP_DIM,
-            channels=DEFAULT_CHANNELS,
-            max_level=enhanced.max_level,
         )
     else:  # NextGenerationFractalViT
         num_classes = model.num_classes
@@ -594,9 +571,9 @@ def compute_comparison_summary(results: Dict[str, Any]) -> ComparisonSummary:
             key=lambda k: conv[k]['epochs_to_convergence']
         )
     
-    if 'StandardViT' in perf and 'SimpleFractalViT' in perf:
+    if 'StandardViT' in perf and 'NextGenerationFractalViT' in perf:
         std_time = perf['StandardViT']['forward_pass_time_ms']
-        fractal_time = perf['SimpleFractalViT']['forward_pass_time_ms']
+        fractal_time = perf['NextGenerationFractalViT']['forward_pass_time_ms']
         if fractal_time > 0:
             summary.fractal_vs_standard_speedup = std_time / fractal_time
     

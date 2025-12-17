@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 import pytest
 
-from vit_pytorch.fractal_vit import NextGenerationFractalViT, SimpleFractalViT
+from vit_pytorch.fractal_vit import NextGenerationFractalViT
 from vit_pytorch.tokenization import BaseTokenProcessor, BaseTokenizer, TokenSequence, TokenizerOutput
 
 
@@ -59,11 +59,11 @@ class DummyPositional(nn.Module):
 
 
 def test_vit_uses_custom_components() -> None:
+    """测试 NextGenerationFractalViT 使用自定义组件."""
     dim = 16
     batch_size = 2
 
     tokenizer = DummyTokenizer(token_dim=dim)
-    processor = DummyProcessor()
     positional = DummyPositional(dim=dim)
 
     model = NextGenerationFractalViT(
@@ -76,7 +76,6 @@ def test_vit_uses_custom_components() -> None:
         min_patch_size=(4, 4),
         max_level=3,
         tokenizer=tokenizer,
-        token_processor=processor,
         position_embedding=positional,
     )
 
@@ -85,13 +84,13 @@ def test_vit_uses_custom_components() -> None:
 
     assert outputs.shape == (batch_size, 4)
     assert tokenizer.called
-    assert processor.called
     assert positional.called
 
 
-def test_simple_vit_single_training_step_updates_parameters() -> None:
+def test_next_gen_vit_single_training_step_updates_parameters() -> None:
+    """测试 NextGenerationFractalViT 单步训练更新参数."""
     torch.manual_seed(42)
-    model = SimpleFractalViT(
+    model = NextGenerationFractalViT(
         image_size=32,
         num_classes=5,
         dim=64,
@@ -118,8 +117,6 @@ def test_simple_vit_single_training_step_updates_parameters() -> None:
     # Handle auxiliary loss
     if hasattr(model, "get_tokenizer_loss"):
         aux_loss = model.get_tokenizer_loss()
-    elif hasattr(model, "enhanced_model"):
-        aux_loss = model.enhanced_model.get_tokenizer_loss()
     else:
         aux_loss = torch.tensor(0.0, device=inputs.device)
 
