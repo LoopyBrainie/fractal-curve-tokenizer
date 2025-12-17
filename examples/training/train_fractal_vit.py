@@ -919,6 +919,7 @@ def main():
         dim_head=config.dim_head,
         dropout=config.dropout,
         emb_dropout=config.emb_dropout,
+        drop_path_rate=config.drop_path,  # ✅ 关键修复: 传递 DropPath 参数
         min_patch_size=(4, 4),
         max_level=config.max_level,
         use_checkpoint=config.gradient_checkpoint,
