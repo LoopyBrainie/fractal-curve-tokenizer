@@ -1,6 +1,6 @@
 # 第四章：位置编码 (positional.py)
 
-本章解析 `AdvancedFractalPositionEmbedding`，它解决了在分形网格中定义位置的问题。
+本章解析 `FractalPositionEmbedding`，它解决了在分形网格中定义位置的问题。
 
 ## 4.1 数学形式化
 
@@ -41,7 +41,7 @@ $\text{Fusion}(x) = \text{Dropout}(\text{GELU}(\text{LayerNorm}(\text{Linear}(x)
 
 ---
 
-## 4.2 类：AdvancedFractalPositionEmbedding
+## 4.2 类：FractalPositionEmbedding
 
 ### 初始化参数
 

@@ -16,8 +16,8 @@ graph TD
     C -->|ComplexityHead| D[语义级尺度选择];
     D -->|Gumbel-Softmax + Depth Bias| E[尺度权重];
     E -->|Hilbert 重排序| F[Token 序列 B×N×D];
-    F -->|位置编码| G[AdvancedFractalPositionEmbedding];
-    G -->|深度+路径编码| H[EnhancedFractalTransformer];
+    F -->|位置编码| G[FractalPositionEmbedding];
+    G -->|深度+路径编码| H[FractalTransformer];
     H -->|LCA/Hilbert 感知注意力| I[Pooling & Head];
     I --> J[分类结果];
 ```
@@ -35,12 +35,12 @@ $$I \xrightarrow{T} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{Transform
 
 | 层级          | 模块  | 对应文件                     | 核心功能                                                    |
 |:----------- |:--- |:------------------------ |:------------------------------------------------------- |
-| **Layer 4** | 应用层 | `fractal_vit.py`         | `NextGenerationFractalViT`                              |
+| **Layer 4** | 应用层 | `fractal_vit.py`         | `FractalCurveViT`                              |
 | **Layer 3** | 管道层 | `streaming_tokenizer.py` | `StreamingFractalTokenizerV2` (推荐)                      |
-|             |     | `transformer.py`         | `EnhancedFractalTransformer`                            |
+|             |     | `transformer.py`         | `FractalTransformer`                                    |
 | **Layer 2** | 组件层 | `attention.py`           | `HilbertAwareMultiScaleAttention`, **`LCAHilbertBias`** |
 |             |     | `feedforward.py`         | `SwiGLUFFN`, `AdaptiveFractalFeedForward`               |
-|             |     | `positional.py`          | `AdvancedFractalPositionEmbedding`                      |
+|             |     | `positional.py`          | `FractalPositionEmbedding`                              |
 | **Layer 1** | 基础层 | `hilbert.py`             | `HilbertCurve`, `PseudoHilbertCurve`                    |
 |             |     | `fractal_config.py`      | **`FractalConfig`** (统一配置)                              |
 |             |     | `fractal_path.py`        | `VectorizedPathEncoder`                                 |
@@ -72,7 +72,7 @@ $$I \xrightarrow{T} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{Transform
 ## 1.6 快速开始
 
 ```python
-from vit_pytorch import NextGenerationFractalViT
+from vit_pytorch import FractalCurveViT
 from vit_pytorch.fractal_config import FractalConfig
 
 # 方式 1: 使用 FractalConfig (推荐)
@@ -80,7 +80,7 @@ config = FractalConfig(image_size=64, min_patch_size=4)
 # 自动推导: max_depth=4, num_scales=5, patch_sizes=(4,8,16,32,64)
 
 # 方式 2: 直接创建模型
-model = NextGenerationFractalViT(
+model = FractalCurveViT(
     image_size=64,
     num_classes=200,
     dim=256,

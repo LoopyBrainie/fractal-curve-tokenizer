@@ -92,7 +92,7 @@ uv run pytest tests/ --cov=vit_pytorch --cov-report=html
 
 与标准 ViT 的公平对比：
 
-- **对比对象**: `NextGenerationFractalViT` vs `StandardViT`
+- **对比对象**: `FractalCurveViT` vs `StandardViT`
 - **指标**: 参数量、显存占用、推理延迟、吞吐量
 
 ### 综合性能基准 (`benchmark_fractal_vit.py`)

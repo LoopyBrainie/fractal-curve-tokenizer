@@ -179,11 +179,11 @@ BiasMode = Literal['low_rank', 'lca', 'hierarchical', 'none']
 ### 使用示例
 
 ```python
-from vit_pytorch import FractalConfig, NextGenerationFractalViT
+from vit_pytorch import FractalConfig, FractalCurveViT
 
 # 使用默认配置（LCA 模式）
 config = FractalConfig()
-model = NextGenerationFractalViT(config=config)
+model = FractalCurveViT(config=config)
 
 # 自定义配置
 config = FractalConfig(

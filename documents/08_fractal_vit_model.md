@@ -1,6 +1,6 @@
 # 第八章：完整 ViT 模型 (fractal_vit.py)
 
-本章详尽描述了数据在 `NextGenerationFractalViT` 模型中的完整流动过程。
+本章详尽描述了数据在 `FractalCurveViT` 模型中的完整流动过程。
 
 ## 8.1 数学形式化
 
@@ -22,7 +22,7 @@ Streaming Tokenizer 实现端到端可微，无需额外辅助损失。
 
 ---
 
-## 8.3 核心类：NextGenerationFractalViT
+## 8.3 核心类：FractalCurveViT
 
 ### 初始化参数
 
@@ -139,7 +139,7 @@ logits = self.mlp_head(pooled)  # (B, num_classes)
 ### 推荐：使用 FractalConfig
 
 ```python
-from vit_pytorch import FractalConfig, NextGenerationFractalViT
+from vit_pytorch import FractalConfig, FractalCurveViT
 
 # 使用统一配置对象（推荐）
 config = FractalConfig(
@@ -148,7 +148,7 @@ config = FractalConfig(
     hilbert_bias_mode='lca',  # 默认值，可省略
 )
 
-model = NextGenerationFractalViT(
+model = FractalCurveViT(
     image_size=224,
     num_classes=1000,
     dim=config.d_model,
@@ -166,9 +166,9 @@ logits = model(images)  # (2, 1000)
 ### 直接参数传递
 
 ```python
-from vit_pytorch import NextGenerationFractalViT
+from vit_pytorch import FractalCurveViT
 
-model = NextGenerationFractalViT(
+model = FractalCurveViT(
     image_size=224,
     num_classes=1000,
     dim=384,
@@ -210,8 +210,7 @@ Input Image (B, C, H, W)
         │
         ▼
 ┌─────────────────────────────┐
-│ AdvancedFractalPosition     │
-│ Embedding                   │
+│ FractalPositionEmbedding    │
 │ - Depth Embedding           │
 │ - Path Embedding            │
 │ - Fusion Network            │
@@ -222,7 +221,7 @@ Input Image (B, C, H, W)
         │
         ▼
 ┌─────────────────────────────┐
-│ EnhancedFractalTransformer  │
+│ FractalTransformer          │
 │ - Level-Aware LayerNorm     │
 │ - HilbertAwareAttention     │
 │ - SwiGLU FFN                │

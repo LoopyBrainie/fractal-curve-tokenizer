@@ -31,7 +31,7 @@
 
 ### build_model() 函数
 
-根据参数实例化 `NextGenerationFractalViT` 模型。
+根据参数实例化 `FractalCurveViT` 模型。
 
 ### 关键命令行参数
 

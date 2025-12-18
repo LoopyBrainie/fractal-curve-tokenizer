@@ -1,6 +1,6 @@
 # 第七章：Transformer 编码器 (transformer.py)
 
-本章详细描述了 `EnhancedFractalTransformer` 及其构建块的数据处理逻辑。
+本章详细描述了 `FractalTransformer` 及其构建块的数据处理逻辑。
 
 ## 7.1 数学形式化
 
@@ -17,7 +17,7 @@ $\text{LevelNorm}(x, d) = \gamma_d \cdot \frac{x - \mu}{\sigma} + \beta_d$
 
 ---
 
-## 7.2 核心类：EnhancedFractalTransformer
+## 7.2 核心类：FractalTransformer
 
 ### 初始化参数
 
@@ -78,7 +78,7 @@ x = self.final_norm(x)
 
 ---
 
-## 7.3 核心组件：EnhancedFractalTransformerBlock
+## 7.3 核心组件：FractalTransformerBlock
 
 这是单个 Transformer 层的实现。
 
@@ -183,9 +183,9 @@ def _apply_level_aware_norm(self, x, levels_info, gamma, beta, default_norm):
 ## 7.6 使用示例
 
 ```python
-from vit_pytorch import EnhancedFractalTransformer
+from vit_pytorch import FractalTransformer
 
-transformer = EnhancedFractalTransformer(
+transformer = FractalTransformer(
     dim=384,
     depth=6,
     heads=6,
@@ -213,7 +213,7 @@ Input (B, S, D)
     │
     ▼
 ┌───────────────────────────────────────┐
-│  EnhancedFractalTransformerBlock × N  │
+│  FractalTransformerBlock × N          │
 │  ┌─────────────────────────────────┐  │
 │  │ Level-Aware LayerNorm          │  │
 │  │        ↓                        │  │

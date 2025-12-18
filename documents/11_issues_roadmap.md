@@ -181,16 +181,16 @@
 
 ```
 Layer 4 (应用层):
-    fractal_vit.py          NextGenerationFractalViT
+    fractal_vit.py          FractalCurveViT
 
 Layer 3 (管道层):
     streaming_tokenizer.py  StreamingFractalTokenizer, V2
-    transformer.py          EnhancedFractalTransformer
+    transformer.py          FractalTransformer
 
 Layer 2 (组件层):
     attention.py            HilbertAwareMultiScaleAttention
     feedforward.py          SwiGLUFFN, AdaptiveFractalFeedForward
-    positional.py           AdvancedFractalPositionEmbedding
+    positional.py           FractalPositionEmbedding
 
 Layer 1 (基础层):
     hilbert.py              HilbertCurve (H: d ↔ (x,y))

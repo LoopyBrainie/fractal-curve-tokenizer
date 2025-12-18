@@ -6,21 +6,21 @@
 classDiagram
     nn_Module <|-- BaseTokenizer
     nn_Module <|-- BaseTokenProcessor
-    nn_Module <|-- NextGenerationFractalViT
+    nn_Module <|-- FractalCurveViT
 
     BaseTokenizer <|-- StreamingFractalTokenizer
     BaseTokenizer <|-- StreamingFractalTokenizerV2
 
-    NextGenerationFractalViT *-- StreamingFractalTokenizerV2
-    NextGenerationFractalViT *-- AdvancedFractalPositionEmbedding
-    NextGenerationFractalViT *-- EnhancedFractalTransformer
+    FractalCurveViT *-- StreamingFractalTokenizerV2
+    FractalCurveViT *-- FractalPositionEmbedding
+    FractalCurveViT *-- FractalTransformer
 
-    EnhancedFractalTransformer *-- EnhancedFractalTransformerBlock
-    EnhancedFractalTransformerBlock *-- HilbertAwareMultiScaleAttention
-    EnhancedFractalTransformerBlock *-- AdaptiveFractalFeedForward
+    FractalTransformer *-- FractalTransformerBlock
+    FractalTransformerBlock *-- HilbertAwareMultiScaleAttention
+    FractalTransformerBlock *-- AdaptiveFractalFeedForward
 
-    HilbertAwareMultiScaleAttention *-- LowRankHilbertBias
     HilbertAwareMultiScaleAttention *-- LCAHilbertBias
+    HilbertAwareMultiScaleAttention *-- LowRankHilbertBias
     AdaptiveFractalFeedForward *-- SwiGLUFFN
 ```
 
@@ -30,7 +30,7 @@ classDiagram
 1. Input Image (B, C, H, W)
         │
         ▼
-2. StreamingFractalTokenizer
+2. StreamingFractalTokenizerV2
    ├── MultiScalePatchEncoder (卷积金字塔)
    ├── Scale Selection (V2: Gumbel-Softmax)
    └── HilbertIndexer (Hilbert 重排序)
@@ -47,7 +47,7 @@ classDiagram
    └── mask: (B, S_max)
         │
         ▼
-5. Position Embedding
+5. FractalPositionEmbedding
    ├── Depth Embedding
    ├── Path Embedding
    └── Fusion Network
@@ -56,7 +56,7 @@ classDiagram
 6. Add CLS Token → (B, S_max + 1, D)
         │
         ▼
-7. Transformer Encoder
+7. FractalTransformer (FractalTransformerBlock × N)
    ├── Level-Aware LayerNorm
    ├── HilbertAwareMultiScaleAttention
    │   ├── QKV Projection
@@ -112,9 +112,9 @@ classDiagram
 ### 模型初始化
 
 ```python
-from vit_pytorch import NextGenerationFractalViT
+from vit_pytorch import FractalCurveViT
 
-model = NextGenerationFractalViT(
+model = FractalCurveViT(
     image_size=224,
     num_classes=1000,
     dim=384,
@@ -160,7 +160,7 @@ output = tokenizer.tokenize(images)
 from vit_pytorch import (
     HilbertAwareMultiScaleAttention,
     SwiGLUFFN,
-    AdvancedFractalPositionEmbedding,
+    FractalPositionEmbedding,
 )
 
 # 注意力
@@ -170,7 +170,7 @@ attn = HilbertAwareMultiScaleAttention(dim=384, heads=6, bias_mode='lca')
 ffn = SwiGLUFFN(dim=384, hidden_dim=512)
 
 # 位置编码
-pos_emb = AdvancedFractalPositionEmbedding(dim=384, max_level=50)
+pos_emb = FractalPositionEmbedding(dim=384, max_level=50)
 ```
 
 ## E. 常用导入
@@ -181,18 +181,18 @@ from vit_pytorch import (
     # 配置
     FractalConfig,
     # 模型
-    NextGenerationFractalViT,
+    FractalCurveViT,
     # Tokenizer
     StreamingFractalTokenizer,
     StreamingFractalTokenizerV2,
     # 组件
-    EnhancedFractalTransformer,
+    FractalTransformer,
     HilbertAwareMultiScaleAttention,
     LCAHilbertBias,           # 推荐默认
     LowRankHilbertBias,       # 大模型选项
     AdaptiveFractalFeedForward,
     SwiGLUFFN,
-    AdvancedFractalPositionEmbedding,
+    FractalPositionEmbedding,
     # 基础
     HilbertCurve,
     TokenizerOutput,
