@@ -296,38 +296,73 @@ Layer 1 (基础层):
 
 ---
 
-## 11.15 新增归档 (2025-12-19)
+## 11.15 STABILITY 稳定性修复 (2025-12-18)
 
-### CRITICAL-6: 硬编码魔法数字配置化 ✅
+本轮系统性审查了全项目代码的数学形式化，识别并修复了潜在的 NaN/Inf 风险、梯度问题和架构冗余。
 
-**完成日期**: 2025-12-17
+### STAB-1: Gumbel 温度下界 (P0) ✅
 
-**问题**: `min_patch_size=4`, `num_scales=3` 等魔法数字散落在多个文件中
+**位置**: `streaming_tokenizer.py#L1214`
 
-**解决**: 新增 `FractalConfig` 类统一管理，自动推导 $(s, p) \to (d, n, \{p_i\})$
+**问题**: `tau.clamp(min=0.1)` 在温度退火后期可能导致梯度爆炸
 
-### PERF-P1-3: 可变 Token 数量 ✅
+**修复**: `min=0.3`，梯度放大从 10× 降至 3.3×
 
-**完成日期**: 2025-12-17
+### STAB-3: Attention 缩放因子初始化 Bug (P1) ✅
 
-**替代方案**: 动态 Token 剪枝 → Patch=Token 直接映射
+**位置**: `attention.py#L526`
 
-**实现**: `StreamingFractalTokenizerV2(variable_tokens=True)`，Token 数量范围 $[16, 256]$ (64×64 图像)
+**问题**: 两次初始化导致 `level_scale_embedding` 为 N(0, 0.1) 而非预期的 N(1.0, 0.1)
 
-### ARCH-P2-3: 任意分辨率 Pseudo-Hilbert ✅
+**修复**: `nn.init.normal_(weight, mean=1.0, std=0.1)` + softplus 约束 scale_weights
 
-**完成日期**: 2025-12-19
+### STAB-4: 位置编码深度累加溢出 (P1) ✅
 
-**问题**: Hilbert 曲线要求 $n = 2^k$，限制图像尺寸
+**位置**: `positional.py#L138`
 
-**解决**: 
-- 实现 `PseudoHilbertCurve` 类 (Zhang & Kamata 2007)
-- 混合策略阈值 $\rho^* = 4/3$
-- 69 个单元测试全部通过
+**问题**: 深层 token 的路径嵌入范数过大 (∝ √d)
+
+**修复**: `path_final = sum / √(path_count)`
+
+### STAB-5: Residual 权重无约束 (P1) ✅
+
+**位置**: `transformer.py#L128`
+
+**问题**: 无约束权重可能导致 $(1+w)^L$ 梯度放大
+
+**修复 (方案 B)**: 层级感知 Embedding + sigmoid*2 约束 ∈ [0, 2]
+
+### STAB-2: 手动 LayerNorm (P3) 🟢 降级
+
+**分析**: `eps=1e-5` 是 PyTorch 默认值，原分析有误，非阻塞问题
+
+### STAB-6: SwiGLU 门控饱和 (P2) ❌ 关闭
+
+**分析**: 数值验证证明 SiLU 在负区域梯度优于 GELU，原分析有误
 
 ---
 
-## 11.16 进度摘要
+## 11.16 ARCH 架构优化 (2025-12-18)
+
+### ARCH-R1: 删除冗余全局注意力 (P2) ✅
+
+**位置**: `transformer.py#L313` (已删除)
+
+**分析**: 相对贡献仅 0.66%，注意力熵 99.1%，Hilbert Bias 已保留 78.9% 全局权重
+
+### ARCH-R2: Level Aggregator 层级感知 (P2) ✅
+
+**位置**: `transformer.py#L314-L333`
+
+**问题**: 原实现命名为 "level_aggregator" 但未使用层级信息
+
+**修复**: 
+- `_level_aggregator_scale = Embedding(max_level+1, dim)`
+- 每层级独立 D 维缩放: $x' = x + 0.2 \cdot (r \odot \sigma(s_\ell))$
+
+---
+
+## 11.17 进度摘要
 
 | 类别 | 完成 | 总数 | 状态 |
 |------|------|------|------|
@@ -336,5 +371,6 @@ Layer 1 (基础层):
 | PERF-P0 | 4 | 4 | ✅ 100% |
 | PERF-P1 | 3 | 3 | ✅ 100% |
 | PERF-P2 | 0 | 3 | 待研究 |
+| **STABILITY** | **4** | **6** | 🟢 67% (P0/P1 完成) |
 | P3 | 0 | 2 | 按需 |
-| **总计** | **21** | **28** | **75%** |
+| **总计** | **25** | **34** | **74%** |
