@@ -965,10 +965,22 @@ def visualize_scale_by_complexity(
     with torch.no_grad():
         images_device = images.to(device)
         
-        # 获取尺度 logits（新 API: 通过 encoder 和 _compute_scale_weights）
+        # 获取尺度 logits（新 API: 通过 encoder 和 complexity_head）
         features_dict = tokenizer.encoder(images_device)
         min_ps = min(features_dict.keys())
-        _, target_size = features_dict[min_ps]
+        base_feat, target_size = features_dict[min_ps]
+        
+        # 手动计算 logits（用于可视化）
+        aligned_features = []
+        for ps in tokenizer.patch_sizes:
+            if ps in features_dict:
+                feat, _ = features_dict[ps]
+                if feat.shape[-2:] != target_size:
+                    feat = F.interpolate(feat, size=target_size, mode='bilinear', align_corners=False)
+                aligned_features.append(feat)
+        concat_features = torch.cat(aligned_features, dim=1)
+        logits = tokenizer.complexity_head(concat_features)  # [B, n_scales, H', W']
+        
         scale_weights = tokenizer._compute_scale_weights(features_dict, target_size)
         scale_indices = scale_weights.argmax(dim=1)  # [B, H', W']
         
@@ -1078,6 +1090,8 @@ def load_model_and_config(
     
     支持加载旧版检查点(使用 complexity_estimator)和新版检查点(使用 complexity_head)。
     对于旧版检查点，会尝试转换键名以保持兼容性。
+    
+    与 train_fractal_vit.py 保持完全一致的模型创建方式。
     """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = ckpt.get('config', {})
@@ -1086,6 +1100,7 @@ def load_model_and_config(
     dataset_name = config.get('dataset', 'cifar10')
     dataset_info = DATASETS.get(dataset_name, DATASETS['cifar10'])
     
+    # 与 train_fractal_vit.py 完全对齐的模型创建
     model = NextGenerationFractalViT(
         image_size=max(dataset_info['image_size'], 32),
         num_classes=dataset_info['num_classes'],
@@ -1098,12 +1113,28 @@ def load_model_and_config(
         dim_head=config.get('dim_head', 32),
         dropout=config.get('dropout', 0.1),
         emb_dropout=config.get('emb_dropout', 0.1),
+        drop_path_rate=config.get('drop_path', 0.0),
+        min_patch_size=(4, 4),
         max_level=config.get('max_level', 4),
+        use_checkpoint=config.get('gradient_checkpoint', False),
         ffn_type=config.get('ffn_type', 'swiglu_level'),
         tokenizer_type="streaming_v2",
         num_scales=config.get('num_scales', 3),
-        drop_path_rate=config.get('drop_path', 0.0),
+        streaming_tau=config.get('gumbel_tau_init', 2.0),
     ).to(device)
+    
+    # 配置 Tokenizer 的深度偏置预热参数 (与训练脚本一致)
+    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'set_depth_bias'):
+        model.tokenizer.set_depth_bias(
+            bias_strength=config.get('depth_bias_max', 2.0),
+            max_bias=config.get('depth_bias_max', 2.0),
+            decay_power=config.get('depth_bias_decay', 2.0),
+            warmup_ratio=config.get('depth_bias_warmup', 0.2),
+        )
+        # 同步 Gumbel 温度范围
+        if hasattr(model.tokenizer, 'tau_min'):
+            model.tokenizer.tau_min = config.get('gumbel_tau_min', 0.5)
+            model.tokenizer.tau_max = config.get('gumbel_tau_max', 5.0)
     
     # 处理旧版检查点的键名映射
     state_dict = ckpt['model_state_dict']
@@ -1203,6 +1234,120 @@ def evaluate_model(
         'labels': all_labels,
         'probabilities': all_probs,
     }
+
+
+@torch.no_grad()
+def check_train_eval_consistency(
+    model: nn.Module,
+    sample_images: torch.Tensor,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """检查模型在 train/eval 模式下的一致性
+    
+    与 train_fractal_vit.py 中的 verify_train_eval_consistency 保持一致。
+    
+    Args:
+        model: 模型
+        sample_images: 样本图像 [B, C, H, W]
+        device: 计算设备
+        
+    Returns:
+        一致性报告字典
+    """
+    report = {
+        'passed': True,
+        'checks': {},
+        'warnings': [],
+    }
+    
+    imgs = sample_images.to(device)
+    
+    # 检查 1: 深度偏置衰减
+    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_depth_bias'):
+        depth_bias = model.tokenizer.get_depth_bias()
+        bias_check = {
+            'current_value': depth_bias,
+            'threshold': 0.01,
+            'passed': depth_bias <= 0.01,
+        }
+        report['checks']['depth_bias_decayed'] = bias_check
+        
+        if not bias_check['passed']:
+            report['warnings'].append(
+                f"⚠️ 深度偏置未完全衰减 ({depth_bias:.4f} > 0.01)"
+            )
+            report['passed'] = False
+        else:
+            print(f"  ✓ 深度偏置已衰减: {depth_bias:.6f} (< 0.01)")
+    
+    # 检查 2: train/eval 输出差异
+    model.eval()
+    out_eval, _ = model(imgs, return_aux_info=True)
+    
+    model.train()
+    out_train, _ = model(imgs, return_aux_info=True)
+    model.eval()  # 恢复 eval 模式
+    
+    # 计算输出差异
+    output_diff = (out_eval - out_train).abs()
+    max_diff = output_diff.max().item()
+    mean_diff = output_diff.mean().item()
+    
+    output_check = {
+        'max_diff': max_diff,
+        'mean_diff': mean_diff,
+        'threshold': 0.1,
+        'passed': max_diff < 0.1,
+    }
+    report['checks']['output_consistency'] = output_check
+    
+    if output_check['passed']:
+        print(f"  ✓ 输出一致性: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+    else:
+        report['warnings'].append(
+            f"⚠️ train/eval 输出差异较大 (max={max_diff:.4f})"
+        )
+        print(f"  ⚠ 输出差异: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+    
+    # 检查 3: 尺度选择稳定性
+    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'compute_scale_distribution'):
+        dist1 = model.tokenizer.compute_scale_distribution(imgs)
+        dist2 = model.tokenizer.compute_scale_distribution(imgs)
+        
+        scale_stable = all(
+            abs(dist1['scale_ratios'][ps] - dist2['scale_ratios'][ps]) < 0.001
+            for ps in dist1['scale_ratios']
+        )
+        
+        stability_check = {
+            'run1': dist1['scale_ratios'],
+            'run2': dist2['scale_ratios'],
+            'passed': scale_stable,
+        }
+        report['checks']['scale_stability'] = stability_check
+        
+        if scale_stable:
+            print(f"  ✓ 尺度选择稳定 (eval 模式下确定性)")
+        else:
+            report['warnings'].append("⚠️ 尺度选择不稳定")
+            report['passed'] = False
+    
+    # 检查 4: 训练状态信息
+    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_training_stats'):
+        stats = model.tokenizer.get_training_stats()
+        report['training_stats'] = stats
+        print(f"  ✓ Gumbel τ={stats['gumbel_tau']:.4f}, use_soft_weights={stats['use_soft_weights']}")
+    
+    # 总结
+    print()
+    if report['passed']:
+        print("  ✅ 一致性检查通过: 模型可正确用于推理")
+    else:
+        print("  ❌ 一致性检查警告:")
+        for w in report['warnings']:
+            print(f"     {w}")
+    
+    return report
 
 
 def visualize_confusion_matrix(
@@ -1489,6 +1634,12 @@ def generate_full_report(
     model, config = load_model_and_config(checkpoint_path, device)
     print(f"      Config: dim={config.get('dim')}, depth={config.get('depth')}, "
           f"heads={config.get('heads')}")
+    print(f"      FFN: {config.get('ffn_type', 'swiglu_level')}, "
+          f"Scales: {config.get('num_scales', 3)}")
+    print(f"      Gumbel τ: init={config.get('gumbel_tau_init', 2.0)}, "
+          f"min={config.get('gumbel_tau_min', 0.5)}, max={config.get('gumbel_tau_max', 5.0)}")
+    print(f"      Depth Bias: max={config.get('depth_bias_max', 2.0)}, "
+          f"decay={config.get('depth_bias_decay', 2.0)}, warmup={config.get('depth_bias_warmup', 0.2)}")
     
     # 2. 准备数据
     print("[2/6] Loading test data...")
@@ -1612,6 +1763,24 @@ def generate_full_report(
     else:
         print("      [SKIP] Tokenizer does not support adaptive scale selection")
     
+    # 6.5. Train/Eval 一致性检查
+    print("[6.5/8] Checking train/eval consistency...")
+    consistency_report = check_train_eval_consistency(model, sample_imgs[:4], device)
+    
+    # 保存一致性报告
+    with open(output_dir / "consistency_report.json", 'w') as f:
+        # 转换不可序列化的类型
+        serializable_report = {}
+        for k, v in consistency_report.items():
+            if isinstance(v, dict):
+                serializable_report[k] = {
+                    str(kk): (float(vv) if isinstance(vv, (np.floating, float)) else vv)
+                    for kk, vv in v.items()
+                }
+            else:
+                serializable_report[k] = v
+        json.dump(serializable_report, f, indent=2, default=str)
+    
     # 7. 评估可视化
     print("[7/8] Generating evaluation visualizations...")
     
@@ -1639,6 +1808,16 @@ def generate_full_report(
     # 8. 保存结果
     print("[8/8] Saving report...")
     
+    # 获取 tokenizer 状态
+    tokenizer_stats = {}
+    if hasattr(model, 'tokenizer'):
+        if hasattr(model.tokenizer, 'get_training_stats'):
+            tokenizer_stats = model.tokenizer.get_training_stats()
+        if hasattr(model.tokenizer, 'get_depth_bias'):
+            tokenizer_stats['depth_bias'] = model.tokenizer.get_depth_bias()
+        if hasattr(model.tokenizer, 'get_temperature'):
+            tokenizer_stats['gumbel_tau'] = model.tokenizer.get_temperature()
+    
     # 保存结果
     report = {
         'checkpoint': str(checkpoint_path),
@@ -1647,10 +1826,12 @@ def generate_full_report(
         'loss': results['loss'],
         'config': config,
         'per_class_accuracy': results['per_class_accuracy'],
+        'consistency_passed': consistency_report.get('passed', None),
+        'tokenizer_stats': tokenizer_stats,
     }
     
     with open(output_dir / "evaluation_report.json", 'w') as f:
-        json.dump(report, f, indent=2)
+        json.dump(report, f, indent=2, default=str)
     
     print(f"\n{'='*70}")
     print("REPORT COMPLETE")
@@ -1660,12 +1841,13 @@ def generate_full_report(
     print(f"  - hilbert_locality.png")
     print(f"  - hilbert_on_image.png")
     print(f"  - multi_scale_tokenization.png")
-    print(f"  - adaptive_scale_selection.png  [NEW]")
-    print(f"  - scale_distribution.png        [NEW]")
-    print(f"  - scale_by_complexity.png       [NEW]")
+    print(f"  - adaptive_scale_selection.png")
+    print(f"  - scale_distribution.png")
+    print(f"  - scale_by_complexity.png")
     print(f"  - confusion_matrix.png")
     print(f"  - per_class_accuracy.png")
     print(f"  - sample_predictions.png")
+    print(f"  - consistency_report.json       [NEW]")
     print(f"  - evaluation_report.json")
     print(f"{'='*70}\n")
     

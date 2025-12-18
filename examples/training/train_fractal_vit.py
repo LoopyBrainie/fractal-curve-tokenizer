@@ -43,7 +43,6 @@ import zipfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.request import urlretrieve
 
 import numpy as np
 import torch
@@ -51,9 +50,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader, Dataset, SubsetRandomSampler
+from torch.utils.data import DataLoader, SubsetRandomSampler
 from torchvision import datasets, transforms
-from torchvision.transforms import functional as TF
 from tqdm import tqdm
 
 # AMP 兼容层
@@ -108,6 +106,21 @@ class TrainingConfig:
     num_scales: int
     pool: str
     ffn_type: str
+    hilbert_bias_mode: str
+    
+    # Gumbel-Softmax 配置
+    gumbel_tau_init: float
+    gumbel_tau_min: float
+    gumbel_tau_max: float
+    
+    # Tokenizer 配置
+    variable_tokens: bool
+    use_soft_weights: bool
+    
+    # 深度偏置预热
+    depth_bias_max: float
+    depth_bias_decay: float
+    depth_bias_warmup: float
     
     # 训练
     epochs: int
@@ -777,6 +790,128 @@ def evaluate(
     return total_loss / len(loader), 100.0 * correct / total
 
 
+@torch.no_grad()
+def verify_train_eval_consistency(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    config: TrainingConfig,
+) -> Dict[str, Any]:
+    """验证模型在 train/eval 模式下的输出一致性.
+    
+    关键检查:
+    1. 深度偏置是否已衰减 (应接近 0)
+    2. train/eval 输出差异是否在可接受范围内
+    3. 尺度选择是否稳定
+    
+    Returns:
+        一致性报告字典
+    """
+    report = {
+        'passed': True,
+        'checks': {},
+        'warnings': [],
+    }
+    
+    # 获取一个 batch 用于测试
+    sample_batch = next(iter(loader))
+    imgs = sample_batch[0][:4].to(device)  # 只用 4 张图
+    
+    # 检查 1: 深度偏置衰减
+    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_depth_bias'):
+        depth_bias = model.tokenizer.get_depth_bias()
+        bias_check = {
+            'current_value': depth_bias,
+            'threshold': 0.01,
+            'passed': depth_bias <= 0.01,
+        }
+        report['checks']['depth_bias_decayed'] = bias_check
+        
+        if not bias_check['passed']:
+            report['warnings'].append(
+                f"⚠️ 深度偏置未完全衰减 ({depth_bias:.4f} > 0.01)，"
+                "可能导致 train/eval 不一致"
+            )
+            report['passed'] = False
+        else:
+            print(f"  ✓ 深度偏置已衰减: {depth_bias:.6f} (< 0.01)")
+    
+    # 检查 2: train/eval 输出差异
+    model.eval()
+    with get_amp_context(device, config.use_amp):
+        out_eval, aux_eval = model(imgs, return_aux_info=True)
+    
+    model.train()
+    with get_amp_context(device, config.use_amp):
+        out_train, aux_train = model(imgs, return_aux_info=True)
+    model.eval()  # 恢复 eval 模式
+    
+    # 计算输出差异
+    output_diff = (out_eval - out_train).abs()
+    max_diff = output_diff.max().item()
+    mean_diff = output_diff.mean().item()
+    
+    # Gumbel noise 会导致 train 模式有随机性，所以我们检查的是量级
+    # 如果 hard=True 且 depth_bias=0，理论上应该完全一致
+    output_check = {
+        'max_diff': max_diff,
+        'mean_diff': mean_diff,
+        'threshold': 0.1,  # logits 差异阈值
+        'passed': max_diff < 0.1,
+    }
+    report['checks']['output_consistency'] = output_check
+    
+    if output_check['passed']:
+        print(f"  ✓ 输出一致性: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+    else:
+        report['warnings'].append(
+            f"⚠️ train/eval 输出差异较大 (max={max_diff:.4f})，"
+            "可能由 Gumbel 噪声或 depth_bias 导致"
+        )
+        print(f"  ⚠ 输出差异: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+    
+    # 检查 3: 尺度选择稳定性 (多次推理应产生相同结果)
+    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'compute_scale_distribution'):
+        dist1 = model.tokenizer.compute_scale_distribution(imgs)
+        dist2 = model.tokenizer.compute_scale_distribution(imgs)
+        
+        # 比较两次的尺度比例
+        scale_stable = all(
+            abs(dist1['scale_ratios'][ps] - dist2['scale_ratios'][ps]) < 0.001
+            for ps in dist1['scale_ratios']
+        )
+        
+        stability_check = {
+            'run1': dist1['scale_ratios'],
+            'run2': dist2['scale_ratios'],
+            'passed': scale_stable,
+        }
+        report['checks']['scale_stability'] = stability_check
+        
+        if scale_stable:
+            print(f"  ✓ 尺度选择稳定 (eval 模式下确定性)")
+        else:
+            report['warnings'].append("⚠️ 尺度选择不稳定，可能存在随机性")
+            report['passed'] = False
+    
+    # 检查 4: 训练状态信息
+    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_training_stats'):
+        stats = model.tokenizer.get_training_stats()
+        report['training_stats'] = stats
+        print(f"  ✓ Gumbel τ={stats['gumbel_tau']:.4f}, use_soft_weights={stats['use_soft_weights']}")
+    
+    # 总结
+    print()
+    if report['passed']:
+        print("  ✅ 一致性检查通过: 训练成果可正确体现在推理中")
+    else:
+        print("  ❌ 一致性检查警告:")
+        for w in report['warnings']:
+            print(f"     {w}")
+    
+    return report
+
+
 # ============================================================================
 # 主函数
 # ============================================================================
@@ -804,8 +939,33 @@ def main():
     parser.add_argument("--pool", type=str, default="cls", choices=["cls", "mean"])
     parser.add_argument("--ffn-type", type=str, default="swiglu_level",
                        choices=["gelu", "swiglu", "swiglu_level"])
+    parser.add_argument("--hilbert-bias-mode", type=str, default="lca",
+                       choices=["lca", "low_rank", "hierarchical"],
+                       help="Hilbert bias mode (lca recommended, ~100 params)")
     parser.add_argument("--gradient-checkpoint", action="store_true",
                        help="Enable gradient checkpointing to save memory")
+    
+    # Gumbel-Softmax 配置
+    parser.add_argument("--gumbel-tau-init", type=float, default=2.0,
+                       help="Initial Gumbel-Softmax temperature")
+    parser.add_argument("--gumbel-tau-min", type=float, default=0.5,
+                       help="Minimum temperature for annealing")
+    parser.add_argument("--gumbel-tau-max", type=float, default=5.0,
+                       help="Maximum temperature for annealing")
+    
+    # Tokenizer 配置
+    parser.add_argument("--variable-tokens", action="store_true",
+                       help="Enable variable token count mode")
+    parser.add_argument("--use-soft-weights", action="store_true",
+                       help="Use soft weights in Gumbel-Softmax (may cause train/eval mismatch)")
+    
+    # 深度偏置预热 v2.2
+    parser.add_argument("--depth-bias-max", type=float, default=2.0,
+                       help="Maximum depth bias strength for warmup")
+    parser.add_argument("--depth-bias-decay", type=float, default=2.0,
+                       help="Depth bias decay power (>1 for faster decay)")
+    parser.add_argument("--depth-bias-warmup", type=float, default=0.2,
+                       help="Depth bias warmup ratio (fraction of total epochs)")
     
     # 训练
     parser.add_argument("--epochs", type=int, default=50)
@@ -885,6 +1045,19 @@ def main():
         num_scales=args.num_scales,
         pool=args.pool,
         ffn_type=args.ffn_type,
+        hilbert_bias_mode=args.hilbert_bias_mode,
+        # Gumbel-Softmax 配置
+        gumbel_tau_init=args.gumbel_tau_init,
+        gumbel_tau_min=args.gumbel_tau_min,
+        gumbel_tau_max=args.gumbel_tau_max,
+        # Tokenizer 配置
+        variable_tokens=args.variable_tokens,
+        use_soft_weights=args.use_soft_weights,
+        # 深度偏置预热 v2.2
+        depth_bias_max=args.depth_bias_max,
+        depth_bias_decay=args.depth_bias_decay,
+        depth_bias_warmup=args.depth_bias_warmup,
+        # 训练配置
         epochs=args.epochs,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
@@ -906,7 +1079,7 @@ def main():
         device=str(device),
     )
     
-    # 创建模型 - 仅使用 streaming_v2
+    # 创建模型
     model = NextGenerationFractalViT(
         image_size=max(spec.image_size, 32),
         num_classes=spec.num_classes,
@@ -919,16 +1092,29 @@ def main():
         dim_head=config.dim_head,
         dropout=config.dropout,
         emb_dropout=config.emb_dropout,
-        drop_path_rate=config.drop_path,  # ✅ 关键修复: 传递 DropPath 参数
+        drop_path_rate=config.drop_path,
         min_patch_size=(4, 4),
         max_level=config.max_level,
         use_checkpoint=config.gradient_checkpoint,
-        ffn_type=config.ffn_type,
-        # 固定使用 streaming_v2
+        ffn_type=config.ffn_type,  # type: ignore[arg-type]
+        # 使用 streaming_v2 并传递 Gumbel 参数
         tokenizer_type="streaming_v2",
         num_scales=config.num_scales,
-        streaming_tau=1.0,
+        streaming_tau=config.gumbel_tau_init,
     ).to(device)
+    
+    # 配置 Tokenizer 的深度偏置预热参数
+    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'set_depth_bias'):
+        model.tokenizer.set_depth_bias(
+            bias_strength=config.depth_bias_max,
+            max_bias=config.depth_bias_max,
+            decay_power=config.depth_bias_decay,
+            warmup_ratio=config.depth_bias_warmup,
+        )
+        # 同步 Gumbel 温度范围
+        if hasattr(model.tokenizer, 'tau_min'):
+            model.tokenizer.tau_min = config.gumbel_tau_min
+            model.tokenizer.tau_max = config.gumbel_tau_max
     
     # 打印模型信息
     params = sum(p.numel() for p in model.parameters())
@@ -936,6 +1122,9 @@ def main():
     print(f"Model: NextGenerationFractalViT")
     print(f"Tokenizer: StreamingFractalTokenizerV2 (Gumbel-Softmax)")
     print(f"FFN Type: {config.ffn_type}")
+    print(f"Hilbert Bias: {config.hilbert_bias_mode}")
+    print(f"Gumbel τ: init={config.gumbel_tau_init}, min={config.gumbel_tau_min}, max={config.gumbel_tau_max}")
+    print(f"Depth Bias: max={config.depth_bias_max}, decay={config.depth_bias_decay}, warmup={config.depth_bias_warmup}")
     print(f"Parameters: {params:,}")
     print(f"Gradient Checkpoint: {config.gradient_checkpoint}")
     print(f"{'='*70}\n")
@@ -978,7 +1167,6 @@ def main():
     print("="*70 + "\n")
     
     best_val = 0.0
-    best_val_loss = float('inf')
     patience_counter = 0
     early_stopped = False
     
@@ -1025,6 +1213,20 @@ def main():
             if hasattr(model.tokenizer, 'get_depth_bias'):
                 current_depth_bias = model.tokenizer.get_depth_bias()
         
+        # 获取详细训练状态 (关键追踪参数)
+        training_stats = None
+        scale_distribution = None
+        if hasattr(model, 'tokenizer'):
+            if hasattr(model.tokenizer, 'get_training_stats'):
+                training_stats = model.tokenizer.get_training_stats()
+            
+            # 每 10 个 epoch 或最后一个 epoch 计算尺度分布
+            if hasattr(model.tokenizer, 'compute_scale_distribution') and (epoch % 10 == 0 or epoch == config.epochs):
+                # 使用 val_loader 的一个 batch 计算尺度分布
+                sample_batch = next(iter(val_loader))
+                sample_imgs = sample_batch[0][:8].to(device)  # 只用 8 张图
+                scale_distribution = model.tokenizer.compute_scale_distribution(sample_imgs)
+        
         epoch_time = time.time() - start
         
         # 记录历史
@@ -1041,14 +1243,30 @@ def main():
             history_entry['gumbel_tau'] = current_tau
         if current_depth_bias is not None:
             history_entry['depth_bias'] = current_depth_bias
+            history_entry['depth_bias_active'] = current_depth_bias > 0.01
+        if training_stats is not None:
+            history_entry['training_stats'] = training_stats
+        if scale_distribution is not None:
+            history_entry['scale_distribution'] = scale_distribution
         history.append(history_entry)
         
         print(f"\nEpoch {epoch}/{config.epochs}:")
         print(f"  Train: loss={train_loss:.4f}, acc={train_acc:.2f}%")
         print(f"  Val:   loss={val_loss:.4f}, acc={val_acc:.2f}%")
         tau_str = f", τ={current_tau:.3f}" if current_tau is not None else ""
-        bias_str = f", bias={current_depth_bias:.2f}" if current_depth_bias is not None else ""
-        print(f"  Time:  {epoch_time:.1f}s, Throughput: {perf_stats['throughput']:.1f} samples/s{tau_str}{bias_str}")
+        bias_str = f", bias={current_depth_bias:.3f}" if current_depth_bias is not None else ""
+        bias_active = " [ACTIVE]" if (current_depth_bias is not None and current_depth_bias > 0.01) else ""
+        print(f"  Time:  {epoch_time:.1f}s, Throughput: {perf_stats['throughput']:.1f} samples/s{tau_str}{bias_str}{bias_active}")
+        
+        # 显示尺度分布 (每 10 epoch)
+        if scale_distribution is not None:
+            ratios = scale_distribution['scale_ratios']
+            entropy = scale_distribution['entropy']
+            max_entropy = scale_distribution['max_entropy']
+            dominant = scale_distribution['dominant_scale']
+            ratio_str = ", ".join([f"p{ps}:{r*100:.1f}%" for ps, r in ratios.items()])
+            print(f"  Scales: {ratio_str}")
+            print(f"  Entropy: {entropy:.3f}/{max_entropy:.3f} ({entropy/max_entropy*100:.1f}%), Dominant: {dominant}px")
         
         if epoch == 1:
             data_pct = perf_stats['avg_data_time'] / perf_stats['avg_batch_time'] * 100 if perf_stats['avg_batch_time'] > 0 else 0
@@ -1058,7 +1276,6 @@ def main():
         # 保存最佳
         if val_acc > best_val + config.min_delta:
             best_val = val_acc
-            best_val_loss = val_loss
             patience_counter = 0
             torch.save({
                 'epoch': epoch,
@@ -1082,6 +1299,17 @@ def main():
     with open(exp_dir / "training_history.json", 'w') as f:
         json.dump(history, f, indent=2)
     
+    # ========== Train/Eval 一致性验证 ==========
+    print("\n" + "="*70)
+    print("TRAIN/EVAL CONSISTENCY CHECK")
+    print("="*70 + "\n")
+    
+    consistency_report = verify_train_eval_consistency(model, val_loader, device, config)
+    
+    # 保存一致性报告
+    with open(exp_dir / "logs" / "consistency_report.json", 'w') as f:
+        json.dump(consistency_report, f, indent=2)
+    
     # 测试
     print("\n" + "="*70)
     print("TESTING")
@@ -1098,6 +1326,14 @@ def main():
     print(f"\n[OK] Results saved to: {exp_dir}")
     
     # 保存最终结果
+    final_depth_bias = None
+    final_tau = None
+    if hasattr(model, 'tokenizer'):
+        if hasattr(model.tokenizer, 'get_depth_bias'):
+            final_depth_bias = model.tokenizer.get_depth_bias()
+        if hasattr(model.tokenizer, 'get_temperature'):
+            final_tau = model.tokenizer.get_temperature()
+    
     with open(exp_dir / "results.json", 'w') as f:
         json.dump({
             'best_val_acc': best_val,
@@ -1106,6 +1342,10 @@ def main():
             'total_epochs': epoch if early_stopped else config.epochs,
             'early_stopped': early_stopped,
             'best_epoch': epoch - patience_counter if early_stopped else epoch,
+            'consistency_passed': consistency_report.get('passed', None),
+            'final_depth_bias': final_depth_bias,
+            'final_gumbel_tau': final_tau,
+            'depth_bias_decayed': final_depth_bias is not None and final_depth_bias <= 0.01,
         }, f, indent=2)
 
 
