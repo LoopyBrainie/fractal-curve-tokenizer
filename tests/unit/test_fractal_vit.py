@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Unit tests for NextGenerationFractalViT.
+"""Unit tests for FractalCurveViT.
 
 测试流式 Tokenizer (streaming/streaming_v2) 下的核心功能：
 1. 自适应 tokenization 能力
@@ -10,8 +10,8 @@
 
 import torch
 import pytest
-from vit_pytorch.fractal_vit import NextGenerationFractalViT
-from vit_pytorch.positional import AdvancedFractalPositionEmbedding
+from vit_pytorch.fractal_vit import FractalCurveViT
+from vit_pytorch.positional import FractalPositionEmbedding
 
 
 @pytest.fixture
@@ -24,8 +24,8 @@ def sample_image():
 
 @pytest.fixture
 def fractal_vit():
-    """Create a NextGenerationFractalViT model with streaming_v2 tokenizer."""
-    return NextGenerationFractalViT(
+    """Create a FractalCurveViT model with streaming_v2 tokenizer."""
+    return FractalCurveViT(
         image_size=32,
         num_classes=10,
         dim=64,
@@ -39,8 +39,8 @@ def fractal_vit():
     )
 
 
-class TestNextGenerationFractalViT:
-    """Tests for NextGenerationFractalViT with streaming tokenizers."""
+class TestFractalCurveViT:
+    """Tests for FractalCurveViT with streaming tokenizers."""
 
     def test_forward_pass_basic(self, fractal_vit, sample_image):
         """Test basic forward pass."""
@@ -85,7 +85,7 @@ class TestNextGenerationFractalViT:
 
     def test_streaming_tokenizer_type(self):
         """Test streaming tokenizer is correctly instantiated."""
-        model = NextGenerationFractalViT(
+        model = FractalCurveViT(
             image_size=32,
             num_classes=10,
             dim=64,
@@ -105,7 +105,7 @@ class TestNextGenerationFractalViT:
 
     def test_streaming_v2_tokenizer_type(self):
         """Test streaming_v2 tokenizer is correctly instantiated."""
-        model = NextGenerationFractalViT(
+        model = FractalCurveViT(
             image_size=32,
             num_classes=10,
             dim=64,
@@ -133,7 +133,7 @@ class TestNextGenerationFractalViT:
 
     def test_gradient_flow(self):
         """Test gradients flow correctly through the model."""
-        model = NextGenerationFractalViT(
+        model = FractalCurveViT(
             image_size=32,
             num_classes=10,
             dim=64,
@@ -155,8 +155,8 @@ class TestNextGenerationFractalViT:
         assert not torch.isnan(x.grad).any()
 
     def test_default_tokenizer_type(self):
-        """Test NextGenerationFractalViT defaults to streaming_v2."""
-        model = NextGenerationFractalViT(
+        """Test FractalCurveViT defaults to streaming_v2."""
+        model = FractalCurveViT(
             image_size=32,
             num_classes=10,
             dim=64,
@@ -168,11 +168,11 @@ class TestNextGenerationFractalViT:
         assert model.tokenizer_type == "streaming_v2"
 
     def test_different_image_sizes(self):
-        """Test NextGenerationFractalViT handles different image sizes."""
+        """Test FractalCurveViT handles different image sizes."""
         sizes = [(32, 32), (64, 64), (48, 48)]
         
         for h, w in sizes:
-            model = NextGenerationFractalViT(
+            model = FractalCurveViT(
                 image_size=(h, w),
                 num_classes=5,
                 dim=64,
@@ -191,13 +191,13 @@ class TestNextGenerationFractalViT:
 
 
 class TestPositionalEmbedding:
-    """Tests for AdvancedFractalPositionEmbedding."""
+    """Tests for FractalPositionEmbedding."""
 
     def test_positional_embedding_logic(self):
-        """Test the AdvancedFractalPositionEmbedding logic."""
+        """Test the FractalPositionEmbedding logic."""
         dim = 64
         max_level = 5
-        pos_emb = AdvancedFractalPositionEmbedding(dim=dim, max_level=max_level)
+        pos_emb = FractalPositionEmbedding(dim=dim, max_level=max_level)
         
         # Create dummy levels info: (Batch=2, Seq=3, Info=5)
         levels_info = torch.tensor([

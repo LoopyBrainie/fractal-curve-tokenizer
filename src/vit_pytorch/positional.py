@@ -47,7 +47,7 @@ import torch.nn as nn
 from .constants import EMBEDDING_INIT_STD, HILBERT_BIAS_SCALE
 
 
-class AdvancedFractalPositionEmbedding(nn.Module):
+class FractalPositionEmbedding(nn.Module):
     """
     高级分形位置编码，完全对齐增强tokenizer
     支持动态层级、Hilbert路径编码和多尺度空间感知

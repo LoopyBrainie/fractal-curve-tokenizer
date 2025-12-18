@@ -27,10 +27,10 @@ from torch.utils.data import DataLoader, TensorDataset
 
 # Handle import paths
 try:
-    from vit_pytorch import NextGenerationFractalViT
+    from vit_pytorch import FractalCurveViT
 except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'src'))
-    from vit_pytorch import NextGenerationFractalViT
+    from vit_pytorch import FractalCurveViT
 
 from .benchmark_metrics import (
     ConvergenceMetrics,
@@ -442,9 +442,9 @@ def create_model_copy(model_name: str, template: nn.Module) -> nn.Module:
     DEFAULT_MLP_DIM = 1024
     DEFAULT_CHANNELS = 3
     
-    # All models now use NextGenerationFractalViT
+    # All models now use FractalCurveViT
     num_classes = template.num_classes
-    return NextGenerationFractalViT(
+    return FractalCurveViT(
         image_size=template.image_size,
         num_classes=num_classes,
         dim=template.dim,
@@ -508,9 +508,9 @@ def run_convergence_benchmark(
     print(f"Epochs: {num_epochs}")
     print(f"Runs: {num_runs}")
     
-    # Note: SimpleFractalViT has been removed, using only NextGenerationFractalViT
+    # Note: SimpleFractalViT has been removed, using only FractalCurveViT
     models = {
-        'NextGenerationFractalViT': NextGenerationFractalViT(
+        'FractalCurveViT': FractalCurveViT(
             image_size=image_size,
             num_classes=num_classes,
             dim=64,

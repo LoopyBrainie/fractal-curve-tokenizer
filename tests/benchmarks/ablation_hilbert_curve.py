@@ -70,7 +70,7 @@ from torch.utils.data import DataLoader, Subset
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from vit_pytorch import NextGenerationFractalViT
+from vit_pytorch import FractalCurveViT
 
 # Optional: torchvision for CIFAR-10
 try:
@@ -286,7 +286,7 @@ def create_model(config: ExperimentConfig, num_classes: int = 10) -> nn.Module:
         num_classes: 分类类别数
     
     Returns:
-        配置好的 NextGenerationFractalViT 模型
+        配置好的 FractalCurveViT 模型
     """
     # 确定 tokenizer 类型
     if config.adaptive_scale:
@@ -295,7 +295,7 @@ def create_model(config: ExperimentConfig, num_classes: int = 10) -> nn.Module:
         tokenizer_type = 'streaming'  # Fixed scale streaming
     
     # 创建模型
-    model = NextGenerationFractalViT(
+    model = FractalCurveViT(
         image_size=32,  # CIFAR-10
         num_classes=num_classes,
         dim=config.dim,

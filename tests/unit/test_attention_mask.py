@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from vit_pytorch import NextGenerationFractalViT
+from vit_pytorch import FractalCurveViT
 from vit_pytorch.utils import create_attention_mask
 
 
@@ -13,7 +13,7 @@ class TestAttentionMaskEffectiveness:
     @pytest.fixture
     def model(self):
         """创建测试模型"""
-        return NextGenerationFractalViT(
+        return FractalCurveViT(
             image_size=32,
             num_classes=10,
             dim=64,
@@ -156,9 +156,9 @@ class TestGlobalAttentionMask:
 
     def test_transformer_uses_mask(self):
         """验证 transformer 正确使用 attention mask"""
-        from vit_pytorch.transformer import EnhancedFractalTransformer
+        from vit_pytorch.transformer import FractalTransformer
         
-        transformer = EnhancedFractalTransformer(
+        transformer = FractalTransformer(
             dim=64,
             depth=2,
             heads=4,

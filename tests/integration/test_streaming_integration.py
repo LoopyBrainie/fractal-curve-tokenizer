@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ARCH-P1 集成测试: StreamingFractalTokenizer 与 NextGenerationFractalViT 的集成.
+"""ARCH-P1 集成测试: StreamingFractalTokenizer 与 FractalCurveViT 的集成.
 
 测试目标：
 1. 验证 tokenizer_type 参数正确选择 tokenizer
@@ -13,7 +13,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vit_pytorch import NextGenerationFractalViT
+from vit_pytorch import FractalCurveViT
 from vit_pytorch.streaming_tokenizer import (
     StreamingFractalTokenizer,
     StreamingFractalTokenizerV2,
@@ -25,7 +25,7 @@ class TestTokenizerTypeSelection:
 
     def test_streaming_tokenizer_selection(self) -> None:
         """测试 streaming tokenizer 被正确选择."""
-        model = NextGenerationFractalViT(
+        model = FractalCurveViT(
             image_size=32,
             num_classes=10,
             dim=64,
@@ -44,7 +44,7 @@ class TestTokenizerTypeSelection:
 
     def test_streaming_v2_tokenizer_selection(self) -> None:
         """测试 streaming_v2 tokenizer 被正确选择."""
-        model = NextGenerationFractalViT(
+        model = FractalCurveViT(
             image_size=32,
             num_classes=10,
             dim=64,
@@ -64,7 +64,7 @@ class TestTokenizerTypeSelection:
 
     def test_default_tokenizer_is_streaming_v2(self) -> None:
         """测试默认 tokenizer 是 streaming_v2."""
-        model = NextGenerationFractalViT(
+        model = FractalCurveViT(
             image_size=32,
             num_classes=10,
             dim=64,
@@ -89,7 +89,7 @@ class TestForwardPass:
 
     def test_streaming_forward(self, batch_input: torch.Tensor) -> None:
         """测试 streaming tokenizer 的前向传播."""
-        model = NextGenerationFractalViT(
+        model = FractalCurveViT(
             image_size=32,
             num_classes=10,
             dim=64,
@@ -109,7 +109,7 @@ class TestForwardPass:
 
     def test_streaming_v2_forward(self, batch_input: torch.Tensor) -> None:
         """测试 streaming_v2 tokenizer 的前向传播."""
-        model = NextGenerationFractalViT(
+        model = FractalCurveViT(
             image_size=32,
             num_classes=10,
             dim=64,
@@ -133,7 +133,7 @@ class TestTokenizerLoss:
 
     def test_streaming_tokenizer_loss_is_zero(self) -> None:
         """测试 streaming tokenizer 返回零损失."""
-        model = NextGenerationFractalViT(
+        model = FractalCurveViT(
             image_size=32,
             num_classes=10,
             dim=64,
@@ -154,7 +154,7 @@ class TestTokenizerLoss:
 
     def test_streaming_v2_tokenizer_loss_is_zero(self) -> None:
         """测试 streaming_v2 tokenizer 返回零损失."""
-        model = NextGenerationFractalViT(
+        model = FractalCurveViT(
             image_size=32,
             num_classes=10,
             dim=64,
@@ -179,7 +179,7 @@ class TestGradientFlow:
 
     def test_streaming_gradient_flows(self) -> None:
         """测试 streaming tokenizer 的梯度正确流动."""
-        model = NextGenerationFractalViT(
+        model = FractalCurveViT(
             image_size=32,
             num_classes=10,
             dim=64,
@@ -209,7 +209,7 @@ class TestGradientFlow:
 
     def test_streaming_v2_gumbel_softmax_gradient(self) -> None:
         """测试 streaming_v2 的 Gumbel-Softmax 梯度流动."""
-        model = NextGenerationFractalViT(
+        model = FractalCurveViT(
             image_size=32,
             num_classes=10,
             dim=64,
@@ -241,7 +241,7 @@ class TestOutputConsistency:
 
     def test_aux_info_with_streaming(self) -> None:
         """测试 streaming tokenizer 的辅助信息输出."""
-        model = NextGenerationFractalViT(
+        model = FractalCurveViT(
             image_size=32,
             num_classes=10,
             dim=64,
@@ -262,7 +262,7 @@ class TestOutputConsistency:
 
     def test_features_with_streaming(self) -> None:
         """测试 streaming tokenizer 的特征输出."""
-        model = NextGenerationFractalViT(
+        model = FractalCurveViT(
             image_size=32,
             num_classes=10,
             dim=64,

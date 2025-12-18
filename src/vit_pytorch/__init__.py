@@ -19,16 +19,16 @@ Fractal Curve ViT - 分形曲线视觉 Transformer
 模块层级
 ---------
 Layer 4 (应用层):
-    fractal_vit.py          NextGenerationFractalViT
+    fractal_vit.py          FractalCurveViT
 
 Layer 3 (管道层):
     streaming_tokenizer.py  StreamingFractalTokenizer, V2
-    transformer.py          EnhancedFractalTransformer
+    transformer.py          FractalTransformer
 
 Layer 2 (组件层):
     attention.py            HilbertAwareMultiScaleAttention
     feedforward.py          SwiGLUFFN, AdaptiveFractalFeedForward
-    positional.py           AdvancedFractalPositionEmbedding
+    positional.py           FractalPositionEmbedding
 
 Layer 1 (基础层):
     hilbert.py              HilbertCurve, PseudoHilbertCurve
@@ -56,7 +56,7 @@ from .fractal_path import (
     HierarchicalAttentionBias,
     VectorizedPathEncoder,
 )
-from .fractal_vit import NextGenerationFractalViT
+from .fractal_vit import FractalCurveViT
 from .hilbert import (
     HilbertCurve,
     PseudoHilbertCurve,
@@ -64,7 +64,7 @@ from .hilbert import (
     hilbert_distance_to_xy,
     xy_to_hilbert_distance,
 )
-from .positional import AdvancedFractalPositionEmbedding
+from .positional import FractalPositionEmbedding
 from .streaming_tokenizer import (
     HilbertIndexer,
     HilbertPathCache,
@@ -73,7 +73,7 @@ from .streaming_tokenizer import (
     StreamingFractalTokenizerV2,
 )
 from .tokenization import BaseTokenizer, BaseTokenProcessor, TokenSequence, TokenizerOutput
-from .transformer import EnhancedFractalTransformer, EnhancedFractalTransformerBlock
+from .transformer import FractalTransformer, FractalTransformerBlock
 from .utils import extract_depths, normalize_levels_info
 
 
@@ -81,7 +81,7 @@ __all__ = [
     # === 主要模型 ===
     "StreamingFractalTokenizer",
     "StreamingFractalTokenizerV2",
-    "NextGenerationFractalViT",
+    "FractalCurveViT",
     # === 配置与路径编码 ===
     "FractalConfig",
     "create_fractal_config",
@@ -101,8 +101,8 @@ __all__ = [
     "HilbertPathCache",
     "MultiScalePatchEncoder",
     # === Transformer 组件 ===
-    "EnhancedFractalTransformer",
-    "EnhancedFractalTransformerBlock",
+    "FractalTransformer",
+    "FractalTransformerBlock",
     "HilbertAwareMultiScaleAttention",
     "LCAHilbertBias",
     "LowRankHilbertBias",
@@ -111,11 +111,24 @@ __all__ = [
     "SwiGLUFFN",
     "FFNType",
     # === 位置编码 ===
-    "AdvancedFractalPositionEmbedding",
+    "FractalPositionEmbedding",
     # === 工具函数 ===
     "extract_depths",
     "normalize_levels_info",
     "get_quadrant_order",
     "hilbert_distance_to_xy",
     "xy_to_hilbert_distance",
+    # === 向后兼容别名 (Backward Compatibility) ===
+    "EnhancedFractalTransformer",
+    "EnhancedFractalTransformerBlock",
+    "AdvancedFractalPositionEmbedding",
+    "NextGenerationFractalViT",
 ]
+
+# === 向后兼容别名 (Backward Compatibility) ===
+# 旧类名映射到新类名，保证 API 兼容性
+# 计划于 v2.0 版本移除
+EnhancedFractalTransformer = FractalTransformer
+EnhancedFractalTransformerBlock = FractalTransformerBlock
+AdvancedFractalPositionEmbedding = FractalPositionEmbedding
+NextGenerationFractalViT = FractalCurveViT

@@ -27,10 +27,10 @@ from torch.utils.data import DataLoader, TensorDataset
 
 # Handle import paths
 try:
-    from vit_pytorch import NextGenerationFractalViT
+    from vit_pytorch import FractalCurveViT
 except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'src'))
-    from vit_pytorch import NextGenerationFractalViT
+    from vit_pytorch import FractalCurveViT
 
 from .benchmark_metrics import (
     ComputationalMetrics,
@@ -155,7 +155,7 @@ def create_comparison_models(
             depth=depth,
             heads=heads,
         ),
-        'NextGenerationFractalViT': NextGenerationFractalViT(
+        'FractalCurveViT': FractalCurveViT(
             image_size=image_size,
             num_classes=num_classes,
             dim=dim,
@@ -345,9 +345,9 @@ def create_model_copy(name: str, model: nn.Module) -> nn.Module:
             depth=model.depth,
             heads=model.heads,
         )
-    else:  # NextGenerationFractalViT
+    else:  # FractalCurveViT
         num_classes = model.num_classes
-        return NextGenerationFractalViT(
+        return FractalCurveViT(
             image_size=model.image_size,
             num_classes=num_classes,
             dim=model.dim,
@@ -571,9 +571,9 @@ def compute_comparison_summary(results: Dict[str, Any]) -> ComparisonSummary:
             key=lambda k: conv[k]['epochs_to_convergence']
         )
     
-    if 'StandardViT' in perf and 'NextGenerationFractalViT' in perf:
+    if 'StandardViT' in perf and 'FractalCurveViT' in perf:
         std_time = perf['StandardViT']['forward_pass_time_ms']
-        fractal_time = perf['NextGenerationFractalViT']['forward_pass_time_ms']
+        fractal_time = perf['FractalCurveViT']['forward_pass_time_ms']
         if fractal_time > 0:
             summary.fractal_vs_standard_speedup = std_time / fractal_time
     

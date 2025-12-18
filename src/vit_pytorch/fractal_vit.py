@@ -41,10 +41,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .positional import AdvancedFractalPositionEmbedding
+from .positional import FractalPositionEmbedding
 from .streaming_tokenizer import StreamingFractalTokenizer, StreamingFractalTokenizerV2
 from .tokenization import BaseTokenizer, TokenizerOutput
-from .transformer import EnhancedFractalTransformer, FFNType
+from .transformer import FractalTransformer, FFNType
 from .utils import pair
 
 
@@ -52,8 +52,8 @@ from .utils import pair
 TokenizerType = Literal["streaming", "streaming_v2"]
 
 
-class NextGenerationFractalViT(nn.Module):
-    """下一代分形视觉 Transformer。
+class FractalCurveViT(nn.Module):
+    """分形曲线视觉 Transformer。
     
     核心特性：
     - 可学习的分割决策网络（6特征输入）
@@ -97,13 +97,13 @@ class NextGenerationFractalViT(nn.Module):
         drop_path_rate: float = 0.0,
         ffn_type: FFNType = 'swiglu_level',
         tokenizer: Optional[BaseTokenizer] = None,
-        position_embedding: Optional[AdvancedFractalPositionEmbedding] = None,
+        position_embedding: Optional[FractalPositionEmbedding] = None,
         # Streaming Tokenizer 配置
         tokenizer_type: TokenizerType = "streaming_v2",
         num_scales: int = 4,
         streaming_tau: float = 1.0,
     ) -> None:
-        """初始化 NextGenerationFractalViT。
+        """初始化 FractalCurveViT。
         
         Args:
             image_size: 输入图像尺寸（整数或 (H, W) 元组）
@@ -183,7 +183,7 @@ class NextGenerationFractalViT(nn.Module):
 
         # 高级分形位置编码
         if position_embedding is None:
-            position_embedding = AdvancedFractalPositionEmbedding(
+            position_embedding = FractalPositionEmbedding(
                 dim=dim,
                 max_level=max_level,
                 max_seq_len=10000,
@@ -198,8 +198,8 @@ class NextGenerationFractalViT(nn.Module):
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
         self.dropout = nn.Dropout(emb_dropout)
 
-        # 增强的分形Transformer
-        self.transformer = EnhancedFractalTransformer(
+        # 分形Transformer
+        self.transformer = FractalTransformer(
             dim=dim,
             depth=depth,
             heads=heads,
@@ -603,4 +603,5 @@ class NextGenerationFractalViT(nn.Module):
 
 
 # 保持向后兼容性的别名
-EnhancedFractalViT = NextGenerationFractalViT
+EnhancedFractalViT = FractalCurveViT
+NextGenerationFractalViT = FractalCurveViT

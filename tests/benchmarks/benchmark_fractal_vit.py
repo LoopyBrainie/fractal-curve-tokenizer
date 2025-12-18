@@ -24,10 +24,10 @@ import torch.nn as nn
 
 # Handle import paths
 try:
-    from vit_pytorch import NextGenerationFractalViT
+    from vit_pytorch import FractalCurveViT
 except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'src'))
-    from vit_pytorch import NextGenerationFractalViT
+    from vit_pytorch import FractalCurveViT
 
 from .benchmark_metrics import (
     TokenizationMetrics,
@@ -193,11 +193,11 @@ def benchmark_simple_fractal_vit(
     warmup_runs: int = 3,
     device: Optional[torch.device] = None
 ) -> Tuple[ComputationalMetrics, Dict[str, Any]]:
-    """Benchmark NextGenerationFractalViT performance (legacy function name)."""
+    """Benchmark FractalCurveViT performance (legacy function name)."""
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    model = NextGenerationFractalViT(
+    model = FractalCurveViT(
         image_size=image_size,
         num_classes=10,
         dim=64,
@@ -219,11 +219,11 @@ def benchmark_next_gen_fractal_vit(
     warmup_runs: int = 3,
     device: Optional[torch.device] = None
 ) -> Tuple[ComputationalMetrics, Dict[str, Any]]:
-    """Benchmark NextGenerationFractalViT performance."""
+    """Benchmark FractalCurveViT performance."""
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    model = NextGenerationFractalViT(
+    model = FractalCurveViT(
         image_size=image_size,
         num_classes=10,
         dim=64,
@@ -325,7 +325,7 @@ def run_tokenization_benchmark_suite(
         for batch_size in batch_sizes:
             print(f"Benchmarking: image_size={image_size}, batch_size={batch_size}")
             
-            model = NextGenerationFractalViT(
+            model = FractalCurveViT(
                 image_size=image_size,
                 num_classes=10,
                 dim=64,
@@ -379,8 +379,8 @@ def run_model_benchmark_suite(
         'models': {}
     }
     
-    # Note: SimpleFractalViT has been removed, using only NextGenerationFractalViT
-    for model_type in ['NextGenerationFractalViT']:
+    # Note: SimpleFractalViT has been removed, using only FractalCurveViT
+    for model_type in ['FractalCurveViT']:
         results['models'][model_type] = []
         
         for batch_size in batch_sizes:

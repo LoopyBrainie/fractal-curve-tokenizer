@@ -45,7 +45,7 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from vit_pytorch import NextGenerationFractalViT
+from vit_pytorch import FractalCurveViT
 from vit_pytorch.hilbert import HilbertCurve
 from vit_pytorch.streaming_tokenizer import HilbertIndexer, StreamingFractalTokenizerV2
 
@@ -694,7 +694,7 @@ def visualize_adaptive_scale_selection(
     展示每个区域选择的尺度/level，用不同颜色区分。
     
     Args:
-        model: 训练好的 NextGenerationFractalViT 模型
+        model: 训练好的 FractalCurveViT 模型
         images: [B, C, H, W] 输入图像
         device: 计算设备
         class_names: 类别名称
@@ -1101,7 +1101,7 @@ def load_model_and_config(
     dataset_info = DATASETS.get(dataset_name, DATASETS['cifar10'])
     
     # 与 train_fractal_vit.py 完全对齐的模型创建
-    model = NextGenerationFractalViT(
+    model = FractalCurveViT(
         image_size=max(dataset_info['image_size'], 32),
         num_classes=dataset_info['num_classes'],
         dim=config.get('dim', 192),

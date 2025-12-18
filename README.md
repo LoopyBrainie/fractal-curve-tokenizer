@@ -8,9 +8,9 @@ A Vision Transformer (ViT) with **Hilbert curve tokenization** and **adaptive mu
 
 ```python
 import torch
-from vit_pytorch import NextGenerationFractalViT
+from vit_pytorch import FractalCurveViT
 
-model = NextGenerationFractalViT(
+model = FractalCurveViT(
     image_size=224,
     num_classes=1000,
     dim=384,
@@ -35,13 +35,13 @@ Image (B, C, H, W)
        │
        ▼
 ┌──────────────────────────────┐
-│  AdvancedFractalPosition     │  Depth + Path Embedding
-│  Embedding                   │
+│  FractalPositionEmbedding     │  Depth + Path Embedding
+│                               │
 └──────────────────────────────┘
        │
        ▼
 ┌──────────────────────────────┐
-│  EnhancedFractalTransformer  │
+│  FractalTransformer           │
 │  ├─ HilbertAwareAttention    │  LCA Bias (recommended)
 │  └─ SwiGLU FFN               │
 └──────────────────────────────┘
@@ -181,12 +181,12 @@ LCA bias is most parameter-efficient with explicit geometric meaning.
 
 | Layer  | Module                   | Key Class                              |
 | ------ | ------------------------ | -------------------------------------- |
-| **L4** | `fractal_vit.py`         | `NextGenerationFractalViT`             |
+| **L4** | `fractal_vit.py`         | `FractalCurveViT`             |
 | **L3** | `streaming_tokenizer.py` | `StreamingFractalTokenizerV2`          |
-|        | `transformer.py`         | `EnhancedFractalTransformer`           |
+|        | `transformer.py`         | `FractalTransformer`                   |
 | **L2** | `attention.py`           | `LCAHilbertBias`, `LowRankHilbertBias` |
 |        | `feedforward.py`         | `SwiGLUFFN`                            |
-|        | `positional.py`          | `AdvancedFractalPositionEmbedding`     |
+|        | `positional.py`          | `FractalPositionEmbedding`             |
 | **L1** | `hilbert.py`             | `HilbertCurve`, `PseudoHilbertCurve`   |
 
 ## Configuration Options

@@ -79,7 +79,7 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from vit_pytorch import NextGenerationFractalViT
+from vit_pytorch import FractalCurveViT
 
 
 # ============================================================================
@@ -1166,7 +1166,7 @@ def main():
     )
     
     # 创建模型
-    model = NextGenerationFractalViT(
+    model = FractalCurveViT(
         image_size=max(spec.image_size, 32),
         num_classes=spec.num_classes,
         dim=config.dim,
@@ -1205,7 +1205,7 @@ def main():
     # 打印模型信息
     params = sum(p.numel() for p in model.parameters())
     print(f"\n{'='*70}")
-    print(f"Model: NextGenerationFractalViT")
+    print(f"Model: FractalCurveViT")
     print(f"Tokenizer: StreamingFractalTokenizerV2 (Gumbel-Softmax)")
     print(f"FFN Type: {config.ffn_type}")
     print(f"Hilbert Bias: {config.hilbert_bias_mode}")

@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 import pytest
 
-from vit_pytorch.fractal_vit import NextGenerationFractalViT
+from vit_pytorch.fractal_vit import FractalCurveViT
 from vit_pytorch.tokenization import BaseTokenProcessor, BaseTokenizer, TokenSequence, TokenizerOutput
 
 
@@ -20,7 +20,7 @@ class DummyTokenizer(BaseTokenizer):
         for _ in range(images.shape[0]):
             tokens = torch.full((self.tokens_per_image, self.token_dim), 0.5, device=images.device)
             # Create dummy levels with enough columns to satisfy max_info_len check if needed
-            # But NextGenerationFractalViT handles variable lengths.
+            # But FractalCurveViT handles variable lengths.
             # Let's give it 2 columns (depth, path)
             levels = torch.zeros(self.tokens_per_image, 2, dtype=torch.long, device=images.device)
             batch.append(TokenSequence(tokens=tokens, metadata={"levels": levels}))
@@ -48,7 +48,7 @@ class DummyPositional(nn.Module):
         if levels_info.numel() == 0:
             return torch.zeros(0, self.dim, device=levels_info.device)
         
-        # levels_info shape is (Batch, Seq, Info) from NextGenerationFractalViT
+        # levels_info shape is (Batch, Seq, Info) from FractalCurveViT
         # We need to return (Batch, Seq, Dim) matching the expected shape
         if levels_info.dim() == 3:
             # Shape: (B, Seq, Info) -> return (B, Seq, Dim)
@@ -59,14 +59,14 @@ class DummyPositional(nn.Module):
 
 
 def test_vit_uses_custom_components() -> None:
-    """测试 NextGenerationFractalViT 使用自定义组件."""
+    """测试 FractalCurveViT 使用自定义组件."""
     dim = 16
     batch_size = 2
 
     tokenizer = DummyTokenizer(token_dim=dim)
     positional = DummyPositional(dim=dim)
 
-    model = NextGenerationFractalViT(
+    model = FractalCurveViT(
         image_size=32,
         num_classes=4,
         dim=dim,
@@ -88,9 +88,9 @@ def test_vit_uses_custom_components() -> None:
 
 
 def test_next_gen_vit_single_training_step_updates_parameters() -> None:
-    """测试 NextGenerationFractalViT 单步训练更新参数."""
+    """测试 FractalCurveViT 单步训练更新参数."""
     torch.manual_seed(42)
-    model = NextGenerationFractalViT(
+    model = FractalCurveViT(
         image_size=32,
         num_classes=5,
         dim=64,

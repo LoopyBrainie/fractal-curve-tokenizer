@@ -29,8 +29,8 @@ DropPath (Stochastic Depth):
 | 类                                | 数学定义                           |
 +==================================+==================================+
 | DropPath                         | x → x * mask / keep_prob         |
-| EnhancedFractalTransformerBlock  | x → Attn + FFN + GlobalCtx       |
-| EnhancedFractalTransformer       | 堆叠 depth 个 TransformerBlock   |
+| FractalTransformerBlock          | x → Attn + FFN + GlobalCtx       |
+| FractalTransformer               | 堆叠 depth 个 TransformerBlock   |
 +----------------------------------+----------------------------------+
 """
 
@@ -78,7 +78,7 @@ class DropPath(nn.Module):
         return x * random_tensor
 
 
-class EnhancedFractalTransformerBlock(nn.Module):
+class FractalTransformerBlock(nn.Module):
     """Hierarchically aware transformer block extracted for reuse.
     
     This block combines Hilbert-aware attention with adaptive feed-forward,
@@ -249,10 +249,10 @@ class EnhancedFractalTransformerBlock(nn.Module):
         return x
 
 
-class EnhancedFractalTransformer(nn.Module):
+class FractalTransformer(nn.Module):
     """High-level transformer stack coordinating block execution.
     
-    This module stacks multiple EnhancedFractalTransformerBlock layers,
+    This module stacks multiple FractalTransformerBlock layers,
     adding global context attention and level aggregation for enhanced
     hierarchical processing.
     
@@ -296,7 +296,7 @@ class EnhancedFractalTransformer(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                EnhancedFractalTransformerBlock(
+                FractalTransformerBlock(
                     dim=dim,
                     heads=heads,
                     dim_head=dim_head,

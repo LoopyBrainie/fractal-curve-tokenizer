@@ -8,9 +8,9 @@
 
 ```python
 import torch
-from vit_pytorch import NextGenerationFractalViT
+from vit_pytorch import FractalCurveViT
 
-model = NextGenerationFractalViT(
+model = FractalCurveViT(
     image_size=224,
     num_classes=1000,
     dim=384,
@@ -35,13 +35,13 @@ logits = model(img)  # (1, 1000)
        │
        ▼
 ┌──────────────────────────────┐
-│  AdvancedFractalPosition     │  深度 + 路径编码
-│  Embedding                   │
+│  FractalPositionEmbedding     │  深度 + 路径编码
+│                               │
 └──────────────────────────────┘
        │
        ▼
 ┌──────────────────────────────┐
-│  EnhancedFractalTransformer  │
+│  FractalTransformer           │
 │  ├─ HilbertAwareAttention    │  LCA 偏置 (推荐)
 │  └─ SwiGLU FFN               │
 └──────────────────────────────┘
@@ -181,12 +181,12 @@ LCA 偏置参数最少，且具有明确的几何意义。
 
 | 层级     | 模块                       | 核心类                                    |
 | ------ | ------------------------ | -------------------------------------- |
-| **L4** | `fractal_vit.py`         | `NextGenerationFractalViT`             |
+| **L4** | `fractal_vit.py`         | `FractalCurveViT`             |
 | **L3** | `streaming_tokenizer.py` | `StreamingFractalTokenizerV2`          |
-|        | `transformer.py`         | `EnhancedFractalTransformer`           |
+|        | `transformer.py`         | `FractalTransformer`                   |
 | **L2** | `attention.py`           | `LCAHilbertBias`, `LowRankHilbertBias` |
 |        | `feedforward.py`         | `SwiGLUFFN`                            |
-|        | `positional.py`          | `AdvancedFractalPositionEmbedding`     |
+|        | `positional.py`          | `FractalPositionEmbedding`             |
 | **L1** | `hilbert.py`             | `HilbertCurve`, `PseudoHilbertCurve`   |
 
 ## 配置选项

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""System integration tests for NextGenerationFractalViT.
+"""System integration tests for FractalCurveViT.
 
 测试整个系统的端到端功能：
 1. 模型初始化与设备移动
@@ -10,7 +10,7 @@
 
 import torch
 import pytest
-from vit_pytorch import NextGenerationFractalViT
+from vit_pytorch import FractalCurveViT
 
 
 def _device_parametrization():
@@ -24,11 +24,11 @@ def _device_parametrization():
 @torch.no_grad()
 @pytest.mark.parametrize("device", _device_parametrization())
 def test_next_gen_fractal_vit_forward_pass(device: str) -> None:
-    """测试 NextGenerationFractalViT 的基础前向传播."""
+    """测试 FractalCurveViT 的基础前向传播."""
     batch, channels, height, width = 2, 3, 64, 64  # 使用 2 的幂次
     images = torch.randn(batch, channels, height, width, device=device)
 
-    model = NextGenerationFractalViT(
+    model = FractalCurveViT(
         image_size=(height, width),
         num_classes=10,
         dim=192,
@@ -49,11 +49,11 @@ def test_next_gen_fractal_vit_forward_pass(device: str) -> None:
 @torch.no_grad()
 @pytest.mark.parametrize("device", _device_parametrization())
 def test_next_gen_fractal_vit_handles_varied_sizes(device: str) -> None:
-    """测试 NextGenerationFractalViT 处理不同图像尺寸."""
+    """测试 FractalCurveViT 处理不同图像尺寸."""
     sizes = [(32, 32), (64, 64), (128, 128)]  # 使用 2 的幂次
 
     for height, width in sizes:
-        model = NextGenerationFractalViT(
+        model = FractalCurveViT(
             image_size=(height, width),
             num_classes=5,
             dim=128,
@@ -116,7 +116,7 @@ def test_streaming_v2_tokenizer_device_consistency(device: str) -> None:
 @torch.no_grad()
 def test_batch_size_independence() -> None:
     """测试不同批次大小的独立性."""
-    model = NextGenerationFractalViT(
+    model = FractalCurveViT(
         image_size=32,
         num_classes=10,
         dim=64,
@@ -142,7 +142,7 @@ def test_batch_size_independence() -> None:
 @torch.no_grad()
 def test_deterministic_eval_mode() -> None:
     """测试 eval 模式下的确定性."""
-    model = NextGenerationFractalViT(
+    model = FractalCurveViT(
         image_size=32,
         num_classes=10,
         dim=64,
