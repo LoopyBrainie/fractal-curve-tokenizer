@@ -124,11 +124,16 @@ class HilbertPathCache:
     2. Hilbert 索引 → 四叉树路径 (用于 levels_info)
     
     使用类级别缓存，所有实例共享。
+    支持设备感知缓存，避免重复的 .to(device) 调用，
+    从而支持 CUDA graphs 优化。
     """
     
-    # 类级别缓存
+    # 类级别缓存 (CPU 版本，作为源)
     _cache: Dict[_HilbertCacheKey, Tuple[torch.Tensor, torch.Tensor]] = {}
+    # 设备感知缓存: (key, device_str) -> (tensor, tensor)
+    _device_cache: Dict[Tuple[_HilbertCacheKey, str], Tuple[torch.Tensor, torch.Tensor]] = {}
     _max_cache_size: int = 64
+    _max_device_cache_size: int = 256  # 设备缓存可以更大
     
     @classmethod
     def get_or_compute(
@@ -136,6 +141,7 @@ class HilbertPathCache:
         grid_h: int,
         grid_w: int,
         max_depth: int,
+        device: Optional[torch.device] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """获取或计算 Hilbert 缓存.
         
@@ -143,6 +149,7 @@ class HilbertPathCache:
             grid_h: 网格高度
             grid_w: 网格宽度
             max_depth: 四叉树最大深度 (用于路径计算)
+            device: 目标设备 (可选，指定后返回该设备上的张量)
             
         Returns:
             hilbert_to_raster: [N] Hilbert 索引到光栅索引的映射
@@ -150,14 +157,50 @@ class HilbertPathCache:
         """
         key = _HilbertCacheKey(grid_h, grid_w, max_depth)
         
+        # 如果指定了设备，尝试从设备缓存获取
+        if device is not None:
+            device_str = str(device)
+            device_key = (key, device_str)
+            
+            if device_key in cls._device_cache:
+                return cls._device_cache[device_key]
+        
+        # 确保 CPU 缓存存在
         if key not in cls._cache:
             # 缓存淘汰 (简单 FIFO)
             if len(cls._cache) >= cls._max_cache_size:
                 oldest_key = next(iter(cls._cache))
                 del cls._cache[oldest_key]
+                # 清理相关设备缓存
+                cls._device_cache = {
+                    k: v for k, v in cls._device_cache.items() 
+                    if k[0] != oldest_key
+                }
             
-            # 计算并缓存
+            # 计算并缓存 (CPU 版本)
             cls._cache[key] = cls._compute(grid_h, grid_w, max_depth)
+        
+        # 如果不需要特定设备，返回 CPU 版本
+        if device is None:
+            return cls._cache[key]
+        
+        # 创建设备版本并缓存
+        device_str = str(device)
+        device_key = (key, device_str)
+        
+        if device_key not in cls._device_cache:
+            # 设备缓存淘汰
+            if len(cls._device_cache) >= cls._max_device_cache_size:
+                oldest_device_key = next(iter(cls._device_cache))
+                del cls._device_cache[oldest_device_key]
+            
+            cpu_h2r, cpu_paths = cls._cache[key]
+            cls._device_cache[device_key] = (
+                cpu_h2r.to(device, non_blocking=True),
+                cpu_paths.to(device, non_blocking=True),
+            )
+        
+        return cls._device_cache[device_key]
         
         return cls._cache[key]
     
@@ -219,18 +262,24 @@ class HilbertPathCache:
     def clear_cache(cls) -> None:
         """清空缓存 (用于测试或内存管理)"""
         cls._cache.clear()
+        cls._device_cache.clear()
 
 
 class HilbertIndexer:
     """预计算 Hilbert/Pseudo-Hilbert 曲线索引，用于特征重排序.
     
     对于给定的网格大小，生成从光栅顺序到 Hilbert 顺序的映射。
-    使用 LRU 缓存避免重复计算。
+    支持设备感知缓存，避免重复 .to(device) 调用。
     
     支持任意尺寸网格:
     - 2^k × 2^k: 使用标准 Hilbert 曲线
     - 其他尺寸: 使用混合策略 (Hilbert+Padding 或 Pseudo-Hilbert)
     """
+    
+    # 设备感知缓存
+    _device_cache: Dict[Tuple[int, str], torch.Tensor] = {}
+    _rect_device_cache: Dict[Tuple[int, int, str], torch.Tensor] = {}
+    _max_cache_size: int = 128
     
     @staticmethod
     @_dynamo_safe_lru_cache(maxsize=64)
@@ -253,6 +302,30 @@ class HilbertIndexer:
         positions = [y * grid_size + x for x, y in scan_points]
         
         return torch.tensor(positions, dtype=torch.long)
+    
+    @classmethod
+    def get_hilbert_order_on_device(cls, grid_size: int, device: torch.device) -> torch.Tensor:
+        """获取指定设备上的 Hilbert 顺序索引 (支持 CUDA graphs).
+        
+        Args:
+            grid_size: 网格边长
+            device: 目标设备
+            
+        Returns:
+            indices: 在指定设备上的索引张量
+        """
+        device_str = str(device)
+        cache_key = (grid_size, device_str)
+        
+        if cache_key not in cls._device_cache:
+            if len(cls._device_cache) >= cls._max_cache_size:
+                oldest_key = next(iter(cls._device_cache))
+                del cls._device_cache[oldest_key]
+            
+            cpu_tensor = cls.get_hilbert_order(grid_size)
+            cls._device_cache[cache_key] = cpu_tensor.to(device, non_blocking=True)
+        
+        return cls._device_cache[cache_key]
     
     @staticmethod
     @_dynamo_safe_lru_cache(maxsize=64)
@@ -277,6 +350,37 @@ class HilbertIndexer:
         
         return torch.tensor(positions, dtype=torch.long)
     
+    @classmethod
+    def get_hilbert_order_rect_on_device(cls, grid_h: int, grid_w: int, device: torch.device) -> torch.Tensor:
+        """获取指定设备上的矩形网格 Hilbert 顺序索引 (支持 CUDA graphs).
+        
+        Args:
+            grid_h: 网格高度
+            grid_w: 网格宽度
+            device: 目标设备
+            
+        Returns:
+            indices: 在指定设备上的索引张量
+        """
+        device_str = str(device)
+        cache_key = (grid_h, grid_w, device_str)
+        
+        if cache_key not in cls._rect_device_cache:
+            if len(cls._rect_device_cache) >= cls._max_cache_size:
+                oldest_key = next(iter(cls._rect_device_cache))
+                del cls._rect_device_cache[oldest_key]
+            
+            cpu_tensor = cls.get_hilbert_order_rect(grid_h, grid_w)
+            cls._rect_device_cache[cache_key] = cpu_tensor.to(device, non_blocking=True)
+        
+        return cls._rect_device_cache[cache_key]
+    
+    @classmethod
+    def clear_device_cache(cls) -> None:
+        """清空设备缓存"""
+        cls._device_cache.clear()
+        cls._rect_device_cache.clear()
+    
     @staticmethod
     def reorder_to_hilbert(
         features: torch.Tensor,
@@ -285,7 +389,7 @@ class HilbertIndexer:
     ) -> torch.Tensor:
         """将特征从光栅顺序重排为 Hilbert 顺序.
         
-        使用 HilbertPathCache 统一缓存，避免重复计算。
+        使用设备感知缓存，支持 CUDA graphs。
         
         Args:
             features: [B, D, H, W] 的特征图
@@ -306,15 +410,14 @@ class HilbertIndexer:
         if grid_size <= 1:
             return flat.transpose(1, 2)  # [B, H*W, D]
         
-        # 使用统一缓存获取 Hilbert 索引
+        # 使用设备感知缓存获取 Hilbert 索引
         hilbert_to_raster, _ = HilbertPathCache.get_or_compute(
-            grid_h=H, grid_w=W, max_depth=8
+            grid_h=H, grid_w=W, max_depth=8, device=device
         )
-        hilbert_indices = hilbert_to_raster.to(device)
         
         # 使用索引重排
         # flat: [B, D, H*W], indices: [H*W]
-        reordered = flat.index_select(2, hilbert_indices)  # [B, D, H*W]
+        reordered = flat.index_select(2, hilbert_to_raster)  # [B, D, H*W]
         
         return reordered.transpose(1, 2)  # [B, H*W, D]
 
@@ -517,12 +620,12 @@ class StreamingFractalTokenizer(BaseTokenizer):
         actual_tokens = min(num_tokens, grid_h * grid_w)
         
         if self.use_hilbert_order:
-            # 使用统一缓存获取四叉树路径
+            # 使用设备感知缓存获取四叉树路径
             _, quadtree_paths = HilbertPathCache.get_or_compute(
-                grid_h=grid_h, grid_w=grid_w, max_depth=max_depth
+                grid_h=grid_h, grid_w=grid_w, max_depth=max_depth, device=device
             )
-            # quadtree_paths: [N, max_depth]
-            paths = quadtree_paths[:actual_tokens].to(device)
+            # quadtree_paths: [N, max_depth]，已在正确设备上
+            paths = quadtree_paths[:actual_tokens]
             
             # 填充路径 (广播到 batch)
             path_len = min(paths.shape[1], max_depth)
@@ -1238,7 +1341,8 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
         dominant_scales = weights_flat.argmax(dim=1)
         
         if self.use_hilbert_order:
-            hilbert_idx = HilbertIndexer.get_hilbert_order(max(grid_h, grid_w)).to(device)
+            # 使用设备感知缓存
+            hilbert_idx = HilbertIndexer.get_hilbert_order_on_device(max(grid_h, grid_w), device)
             valid_len = min(len(hilbert_idx), dominant_scales.shape[1])
             hilbert_idx = hilbert_idx[:valid_len]
             if valid_len < num_tokens:
