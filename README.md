@@ -2,339 +2,285 @@
 
 [English](README.md) | [中文](README_zh.md)
 
-A next-generation Vision Transformer (ViT) architecture that leverages fractal geometry and Hilbert curves for adaptive, multi-scale image tokenization.
+A Vision Transformer (ViT) with **Hilbert curve tokenization** and **adaptive multi-scale patch selection**.
 
-## Overview
-
-Fractal Curve Tokenizer introduces a novel approach to image tokenization in Vision Transformers. Instead of dividing images into a fixed grid of patches, it uses **Hilbert curve traversal** to preserve 2D spatial locality when flattening tokens into a 1D sequence.
-
-**Key innovations:**
-
-* **Streaming Fractal Tokenizer**: End-to-end differentiable tokenization using multi-scale convolution pyramid and Gumbel-Softmax scale selection (V2).
-* **Hilbert Curve Traversal**: Preserves 2D spatial locality using space-filling curves with proven locality properties.
-* **Low-Rank Hilbert Attention Bias**: Efficient $O(N \cdot r)$ attention bias computation instead of $O(N^2)$.
-* **SwiGLU FFN**: Modern feed-forward architecture with gated linear units (LLaMA/PaLM style).
-* **Advanced Positional Embedding**: Encodes hierarchical depth and quadrant path history.
-
-## Architecture
-
-```
-Input Image (B, C, H, W)
-        │
-        ▼
-┌─────────────────────────────┐
-│ StreamingFractalTokenizerV2 │  ← Multi-scale ConvPyramid + Gumbel-Softmax
-│ - MultiScalePatchEncoder    │
-│ - Hilbert Reordering        │
-└─────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────┐
-│ AdvancedFractalPosition     │  ← Depth + Path Embedding + Fusion
-│ Embedding                   │
-└─────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────┐
-│ EnhancedFractalTransformer  │  ← Level-Aware LayerNorm
-│ - HilbertAwareAttention     │  ← Low-Rank Hilbert Bias
-│ - SwiGLU FFN                │  ← Gate * Value projection
-│ - DropPath                  │
-└─────────────────────────────┘
-        │
-        ▼
-    MLP Head → Logits
-```
-
-## Visualizations
-
-The following visualizations demonstrate the core concepts of Hilbert curve tokenization.
-
-### Hilbert Curve Orders
-
-Comparison of Hilbert curves at different orders, showing how the space-filling pattern scales:
-
-![Hilbert Order Comparison](workspace/visualizations/fractal_curves/hilbert_order_comparison.png)
-
-### Locality Preservation
-
-Demonstrates how Hilbert curves preserve 2D spatial locality in 1D sequences:
-
-![Locality Preservation](workspace/visualizations/fractal_curves/hilbert_locality.png)
-
-### Quadtree Structure
-
-Visualization of the recursive quadtree decomposition with Hilbert traversal order:
-
-![Quadtree Structure](workspace/visualizations/fractal_curves/quadtree_structure.png)
-
-### 2D to 1D Mapping
-
-How 2D grid positions are mapped to a 1D token sequence via Hilbert curve:
-
-![2D to 1D Mapping](workspace/visualizations/fractal_curves/2d_to_1d_mapping.png)
-
-### Multi-Scale Hierarchy
-
-Visualization of multi-scale patch extraction at different resolutions:
-
-![Multi-Scale Hierarchy](workspace/visualizations/fractal_curves/multiscale_hierarchy.png)
-
-### Mixed-Level Adaptive Tokenization
-
-Demonstrates how the model adaptively selects different patch sizes based on region complexity:
-
-![Mixed-Level Segmentation](workspace/visualizations/fractal_curves/mixed_level_segmentation.png)
-
-### Hilbert Curve Growth Animation
-
-![Hilbert Growth](workspace/visualizations/fractal_curves/hilbert_growth.gif)
-
-## Features
-
-* **End-to-End Differentiable**: No REINFORCE required - fully differentiable with Gumbel-Softmax.
-* **Spatial Locality Preservation**: Hilbert curves maintain 2D neighborhood relationships in 1D.
-* **Efficient Attention**: Low-rank Hilbert bias reduces memory from $O(N^2)$ to $O(N \cdot r)$.
-* **Modern FFN**: SwiGLU with optional level adaptation for layer-aware processing.
-* **Robust Regularization**: Integrated DropPath (Stochastic Depth) and entropy regularization.
-* **Flexible Architecture**: Supports `NextGenerationFractalViT` with streaming tokenizers and adaptive splitting.
-
-## Installation
-
-Ensure you have uv and PyTorch installed.
-
-```bash
-# Clone the repository
-git clone https://github.com/LoopyBrainie/fractal-curve-tokenizer.git
-cd fractal-curve-tokenizer
-
-# Install dependencies (recommended: uv)
-uv sync
-
-# Or with pip
-pip install -e .
-```
-
-## Usage
-
-### Basic Inference
+## Quick Start
 
 ```python
 import torch
 from vit_pytorch import NextGenerationFractalViT
 
-# Initialize model with recommended settings
 model = NextGenerationFractalViT(
     image_size=224,
     num_classes=1000,
     dim=384,
     depth=6,
     heads=6,
-    mlp_dim=768,
-    tokenizer_type='streaming_v2',  # Recommended: Gumbel-Softmax
-    bias_mode='low_rank',           # Recommended: Memory efficient
-    ffn_type='swiglu_level',        # Recommended: SwiGLU + Level Adaptation
 )
 
-# Forward pass
 img = torch.randn(1, 3, 224, 224)
 logits = model(img)  # (1, 1000)
 ```
 
-### Tokenizer Types
+## Architecture
 
-| Type | Class | Description | Status |
-|------|-------|-------------|--------|
-| `streaming_v2` | `StreamingFractalTokenizerV2` | Gumbel-Softmax adaptive scale | ✅ **Recommended** |
-| `streaming` | `StreamingFractalTokenizer` | Fixed multi-scale convolution | ✅ Stable |
-| `legacy` | `FractalHilbertTokenizer` | BFS + REINFORCE | ⚠️ Deprecated |
-
-### Standalone Tokenizer
-
-```python
-from vit_pytorch import StreamingFractalTokenizerV2
-
-tokenizer = StreamingFractalTokenizerV2(
-    image_size=224,
-    dim=384,
-    scales=[4, 8, 16],
-    temperature=1.0,
-)
-
-images = torch.randn(2, 3, 224, 224)
-output = tokenizer.tokenize(images)
-
-# Access tokens and levels
-tokens = output.sequences[0].tokens      # (N, 384)
-levels = output.sequences[0].get_levels() # (N, info_len)
+```
+Image (B, C, H, W)
+       │
+       ▼
+┌──────────────────────────────┐
+│  StreamingFractalTokenizerV2 │  Multi-scale Conv + Gumbel-Softmax
+│  └─ Hilbert Reordering       │
+└──────────────────────────────┘
+       │
+       ▼
+┌──────────────────────────────┐
+│  AdvancedFractalPosition     │  Depth + Path Embedding
+│  Embedding                   │
+└──────────────────────────────┘
+       │
+       ▼
+┌──────────────────────────────┐
+│  EnhancedFractalTransformer  │
+│  ├─ HilbertAwareAttention    │  LCA Bias (recommended)
+│  └─ SwiGLU FFN               │
+└──────────────────────────────┘
+       │
+       ▼
+   MLP Head → Logits
 ```
 
-### Training
+## Data Flow
 
-The project includes a comprehensive training script at `examples/training/train_fractal_vit.py`.
+$$I \xrightarrow{\text{Tokenizer}} (T, L) \xrightarrow{E_{\text{pos}}} T' \xrightarrow{\text{Transformer}} z \xrightarrow{\text{MLP}} \hat{y}$$
 
-#### Quick Start
+| Symbol    | Shape                | Description                       |
+| --------- | -------------------- | --------------------------------- |
+| $I$       | `(B, C, H, W)`       | Input image                       |
+| $T$       | `(B, N, D)`          | Token embeddings                  |
+| $L$       | `(B, N, depth+path)` | Level info: depth + quadrant path |
+| $\hat{y}$ | `(B, classes)`       | Output logits                     |
+
+## Visualizations
+
+### Hilbert Curve Basics
+
+<table>
+<tr>
+<td width="50%">
+
+**Curve Orders (1-5)**
+
+![Order Comparison](workspace/visualizations/fractal_curves/hilbert_order_comparison.png)
+
+</td>
+<td width="50%">
+
+**Curve Growth Animation**
+
+![Hilbert Growth](workspace/visualizations/fractal_curves/hilbert_growth.gif)
+
+</td>
+</tr>
+</table>
+
+### Locality Preservation
+
+Hilbert curves map 2D grids to 1D sequences while **preserving spatial locality**.
+
+![Locality](workspace/visualizations/fractal_curves/hilbert_locality.png)
+
+### Hierarchical Structure
+
+<table>
+<tr>
+<td width="50%">
+
+**Quadtree Decomposition**
+
+![Quadtree](workspace/visualizations/fractal_curves/quadtree_structure.png)
+
+</td>
+<td width="50%">
+
+**2D → 1D Mapping**
+
+![2D to 1D](workspace/visualizations/fractal_curves/2d_to_1d_mapping.png)
+
+</td>
+</tr>
+</table>
+
+### Multi-Scale Tokenization
+
+<table>
+<tr>
+<td width="50%">
+
+**Scale Hierarchy**
+
+![Multi-Scale](workspace/visualizations/fractal_curves/multiscale_hierarchy.png)
+
+</td>
+<td width="50%">
+
+**Adaptive Segmentation**
+
+![Mixed-Level](workspace/visualizations/fractal_curves/mixed_level_segmentation.png)
+
+</td>
+</tr>
+</table>
+
+### Advanced Components
+
+<table>
+<tr>
+<td width="50%">
+
+**LCA Attention Bias**
+
+![LCA Bias](workspace/visualizations/fractal_curves/lca_bias_matrix.png)
+
+LCA (Lowest Common Ancestor) depth encodes hierarchical distance.
+
+</td>
+<td width="50%">
+
+**Gumbel-Softmax Scale Selection**
+
+![Gumbel](workspace/visualizations/fractal_curves/gumbel_softmax_decision.png)
+
+Differentiable discrete scale selection with temperature annealing.
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+**Depth Bias Warmup**
+
+![Depth Bias](workspace/visualizations/fractal_curves/depth_bias_warmup.png)
+
+Progressive decay encourages fine-grained exploration early in training.
+
+</td>
+<td width="50%">
+
+**Attention Bias Comparison**
+
+![Bias Comparison](workspace/visualizations/fractal_curves/attention_bias_comparison.png)
+
+LCA bias is most parameter-efficient with explicit geometric meaning.
+
+</td>
+</tr>
+</table>
+
+## Module Reference
+
+| Layer  | Module                   | Key Class                              |
+| ------ | ------------------------ | -------------------------------------- |
+| **L4** | `fractal_vit.py`         | `NextGenerationFractalViT`             |
+| **L3** | `streaming_tokenizer.py` | `StreamingFractalTokenizerV2`          |
+|        | `transformer.py`         | `EnhancedFractalTransformer`           |
+| **L2** | `attention.py`           | `LCAHilbertBias`, `LowRankHilbertBias` |
+|        | `feedforward.py`         | `SwiGLUFFN`                            |
+|        | `positional.py`          | `AdvancedFractalPositionEmbedding`     |
+| **L1** | `hilbert.py`             | `HilbertCurve`, `PseudoHilbertCurve`   |
+
+## Configuration Options
+
+### Tokenizer
+
+| Type           | Description                                    |
+| -------------- | ---------------------------------------------- |
+| `streaming_v2` | **Recommended.** Gumbel-Softmax adaptive scale |
+| `streaming`    | Fixed multi-scale convolution                  |
+
+### Attention Bias
+
+| Mode           | Params | Description                          |
+| -------------- | ------ | ------------------------------------ |
+| `lca`          | ~100   | **Recommended.** LCA embedding table |
+| `low_rank`     | ~50K   | Low-rank decomposition               |
+| `hierarchical` | ~5K    | Per-level bias                       |
+| `original`     | ~N²    | Full bias matrix                     |
+
+### FFN Type
+
+| Type           | Description                            |
+| -------------- | -------------------------------------- |
+| `swiglu_level` | **Default.** SwiGLU + level adaptation |
+| `swiglu`       | SwiGLU only                            |
+| `gelu`         | Standard GELU FFN                      |
+
+## Installation
 
 ```bash
-# CIFAR-10 with recommended settings
+git clone https://github.com/LoopyBrainie/fractal-curve-tokenizer.git
+cd fractal-curve-tokenizer
+uv sync  # or: pip install -e .
+```
+
+## Training
+
+```bash
+# CIFAR-10 with default settings
 uv run python examples/training/train_fractal_vit.py \
     --dataset cifar10 \
-    --tokenizer-type streaming_v2 \
-    --bias-mode low_rank \
-    --ffn-type swiglu_level \
     --epochs 50
 
-# Quick test (5 epochs, 512 samples)
-uv run python examples/training/train_fractal_vit.py --quick-test --use-amp
+# Quick test
+uv run python examples/training/train_fractal_vit.py --quick-test
 ```
 
-#### Key Training Parameters
+### Key Arguments
 
-| Argument | Default | Description |
-| :--- | :--- | :--- |
-| `--tokenizer-type` | `streaming_v2` | Tokenizer: `streaming_v2`, `streaming`, `legacy` |
-| `--bias-mode` | `low_rank` | Hilbert bias: `low_rank`, `hierarchical`, `original` |
-| `--ffn-type` | `swiglu_level` | FFN type: `swiglu_level`, `swiglu`, `gelu` |
-| `--dataset` | `cifar10` | Dataset: `cifar10`, `cifar100`, `mnist`, `tiny-imagenet` |
-| `--epochs` | `50` | Number of training epochs |
-| `--batch-size` | `64` | Training batch size |
-| `--lr` | `5e-4` | Initial learning rate |
-| `--dim` | `192` | Model embedding dimension |
-| `--depth` | `8` | Transformer depth (layers) |
-| `--heads` | `8` | Number of attention heads |
-| `--use-amp` | `False` | Enable mixed precision training |
+| Argument           | Default        | Options                                         |
+| ------------------ | -------------- | ----------------------------------------------- |
+| `--tokenizer-type` | `streaming_v2` | `streaming_v2`, `streaming`                     |
+| `--bias-mode`      | `lca`          | `lca`, `low_rank`, `hierarchical`               |
+| `--ffn-type`       | `swiglu_level` | `swiglu_level`, `swiglu`, `gelu`                |
+| `--dataset`        | `cifar10`      | `cifar10`, `cifar100`, `mnist`, `tiny-imagenet` |
 
-#### FFN Architecture Selection
-
-| FFN Type | Parameters | Speed | Use Case |
-|----------|-----------|-------|----------|
-| `gelu` | Baseline | 1.0x | Legacy comparison |
-| `swiglu` | -12% | 1.15x | Lightweight inference |
-| `swiglu_level` | -6% | 1.10x | **Default, best accuracy** |
-
-#### Supported Datasets
-
-| Dataset | Auto-Download | Classes | Image Size |
-|---------|--------------|---------|------------|
-| `cifar10` | ✅ | 10 | 32×32 |
-| `cifar100` | ✅ | 100 | 32×32 |
-| `mnist` | ✅ | 10 | 28×28 |
-| `tiny-imagenet` | ❌ Manual | 200 | 64×64 |
-
-#### Training Output
-
-```
-experiments/
-└── fractal_vit_20251214_142110/
-    ├── checkpoints/
-    │   └── best.pth              # Best model weights
-    ├── logs/
-    │   ├── config.json           # Training configuration
-    │   └── metrics.json          # Per-epoch metrics
-    └── visualizations/           # Training curves
-```
-
-## Benchmarking
-
-### Model Performance
+## Evaluation & Visualization
 
 ```bash
-uv run python -m tests.benchmarks.benchmark_fractal_vit
-```
+# Evaluate trained model
+uv run python examples/training/evaluate_and_visualize.py \
+    --checkpoint experiments/.../checkpoints/best.pth
 
-### Compare with Standard ViT
-
-```bash
-uv run python -m tests.benchmarks.compare_fractal_vs_standard \
-    --output-dir benchmark_results \
-    --image-size 64 \
-    --num-epochs 20
-```
-
-### Evaluate Pretrained Model
-
-```bash
-uv run python -m tests.benchmarks.evaluate_pretrained \
-    --checkpoint experiments/.../checkpoints/best.pth \
-    --visualize
+# Generate all visualizations
+uv run python examples/training/visualize_fractal_curves.py --all
 ```
 
 ## Testing
 
 ```bash
-# Run all tests
-uv run pytest
-
-# Unit tests only
-uv run pytest tests/unit
-
-# Integration tests only
-uv run pytest tests/integration
+uv run pytest              # All tests
+uv run pytest tests/unit   # Unit tests only
 ```
-
-**Test Status**: 120 passed, 1 skipped
 
 ## Project Structure
 
-```text
-fractal-curve-tokenizer/
-├── src/
-│   └── vit_pytorch/
-│       ├── __init__.py             # Package entry with exports
-│       ├── fractal_vit.py          # Main model definitions
-│       ├── streaming_tokenizer.py  # StreamingFractalTokenizer V1/V2
-│       ├── transformer.py          # Transformer with level-aware norm
-│       ├── attention.py            # Hilbert-aware attention + Low-Rank Bias
-│       ├── feedforward.py          # SwiGLU FFN + Level Adaptation
-│       ├── positional.py           # Depth + Path positional embedding
-│       ├── hilbert.py              # Hilbert curve d ↔ (x,y) mapping
-│       ├── tokenization.py         # Base classes and data structures
-│       ├── constants.py            # Hyperparameter defaults
-│       ├── features.py             # Token feature computation
-│       ├── utils.py                # Utility functions
-│       └── _deprecated/            # Deprecated modules (v1.0 removal)
-│           ├── fractal_curve_tokenizer.py  # Legacy BFS + REINFORCE
-│           └── token_processor.py          # Legacy token processor
-├── examples/
-│   └── training/
-│       └── train_fractal_vit.py    # Training script
-├── tests/
-│   ├── unit/                       # Unit tests
-│   ├── integration/                # Integration tests
-│   └── benchmarks/                 # Performance benchmarks
-├── documents/                      # Project documentation
-├── experiments/                    # Training outputs (gitignored)
-└── workspace/                      # Local data/models (gitignored)
 ```
+src/vit_pytorch/
+├── fractal_vit.py          # Main model
+├── streaming_tokenizer.py  # Tokenizer V1/V2
+├── transformer.py          # Transformer blocks
+├── attention.py            # Hilbert-aware attention
+├── feedforward.py          # SwiGLU FFN
+├── positional.py           # Position embedding
+├── hilbert.py              # Hilbert curve algorithms
+└── tokenization.py         # Base classes
 
-## Module Hierarchy
-
-| Layer | Module | Description |
-|-------|--------|-------------|
-| **L4** Application | `fractal_vit.py` | `NextGenerationFractalViT` |
-| **L3** Pipeline | `streaming_tokenizer.py` | Multi-scale tokenization with Hilbert reorder |
-| | `transformer.py` | Level-aware transformer blocks |
-| **L2** Component | `attention.py` | Hilbert bias with low-rank decomposition |
-| | `feedforward.py` | SwiGLU + Level adaptation |
-| | `positional.py` | Depth + Path embedding |
-| **L1** Foundation | `hilbert.py` | Space-filling curve algorithms |
-| | `tokenization.py` | Base classes, `TokenizerOutput` |
-| | `constants.py` | Default hyperparameters |
-
-## Mathematical Formalization
-
-**Core Pipeline:**
-$$I \xrightarrow{T} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{Transformer}} X' \xrightarrow{\text{Pool}} z \xrightarrow{\text{MLP}} \hat{y}$$
-
-**Hilbert Curve Mapping:**
-$$H: [0, n^2) \leftrightarrow [0, n)^2$$
-
-**Low-Rank Hilbert Bias:**
-$$B_{hilbert}[i,j] = \phi(p_i)^T \cdot \psi(p_j), \quad \phi, \psi: \mathbb{R}^d \to \mathbb{R}^r$$
-
-**SwiGLU FFN:**
-$$\text{SwiGLU}(x) = W_{out} \cdot (\text{Swish}(W_{gate} \cdot x) \odot W_{value} \cdot x)$$
+examples/training/
+├── train_fractal_vit.py           # Training script
+├── evaluate_and_visualize.py      # Evaluation
+└── visualize_fractal_curves.py    # Visualization
+```
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT License - see [LICENSE](LICENSE).
