@@ -32,10 +32,20 @@ from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
+import torch._dynamo
 import torch.nn as nn
 
 from .fractal_config import FractalConfig
 from .hilbert import HilbertCurve
+
+
+# 创建兼容 torch.compile 的缓存装饰器
+def _dynamo_safe_lru_cache(maxsize: int = 128):
+    """LRU 缓存装饰器，兼容 torch.compile."""
+    def decorator(func):
+        cached = lru_cache(maxsize=maxsize)(func)
+        return torch._dynamo.disable(cached)
+    return decorator
 
 
 class VectorizedPathEncoder:
@@ -56,7 +66,7 @@ class VectorizedPathEncoder:
         self.config = config
         self._coord_cache: dict = {}
     
-    @lru_cache(maxsize=16)
+    @_dynamo_safe_lru_cache(maxsize=16)
     def _get_hilbert_coords(self, grid_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """获取 Hilbert 坐标映射 (带缓存).
         

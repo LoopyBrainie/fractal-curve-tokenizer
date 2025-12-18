@@ -64,12 +64,22 @@ from functools import lru_cache
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+import torch._dynamo
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .hilbert import HilbertCurve, PseudoHilbertCurve, _is_power_of_2, _next_power_of_2
 from .tokenization import BaseTokenizer, TokenizerOutput, TokenSequence
 from .fractal_config import FractalConfig
+
+
+# 创建兼容 torch.compile 的缓存装饰器
+def _dynamo_safe_lru_cache(maxsize: int = 128):
+    """LRU 缓存装饰器，兼容 torch.compile."""
+    def decorator(func):
+        cached = lru_cache(maxsize=maxsize)(func)
+        return torch._dynamo.disable(cached)
+    return decorator
 
 
 # ==============================================================================
@@ -223,7 +233,7 @@ class HilbertIndexer:
     """
     
     @staticmethod
-    @lru_cache(maxsize=64)
+    @_dynamo_safe_lru_cache(maxsize=64)
     def get_hilbert_order(grid_size: int) -> torch.Tensor:
         """获取 grid_size × grid_size 正方形网格的 Hilbert 遍历顺序.
         
@@ -245,7 +255,7 @@ class HilbertIndexer:
         return torch.tensor(positions, dtype=torch.long)
     
     @staticmethod
-    @lru_cache(maxsize=64)
+    @_dynamo_safe_lru_cache(maxsize=64)
     def get_hilbert_order_rect(grid_h: int, grid_w: int) -> torch.Tensor:
         """获取 H × W 矩形网格的 Hilbert 遍历顺序.
         

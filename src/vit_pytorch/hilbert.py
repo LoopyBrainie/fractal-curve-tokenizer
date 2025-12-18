@@ -34,10 +34,23 @@ Hilbert 曲线是一种空间填充曲线，提供 2D 网格到 1D 序列的双�
 
 from __future__ import annotations
 
+import functools
 from functools import lru_cache
 from typing import List, Literal, Tuple
 
+import torch._dynamo
+
 Orientation = Literal["up", "right", "down", "left"]
+
+# 创建兼容 torch.compile 的缓存装饰器
+# lru_cache 与 torch.compile 不兼容，需要使用 dynamo.disable 排除这些函数
+def _dynamo_safe_lru_cache(maxsize: int = 128):
+    """LRU 缓存装饰器，兼容 torch.compile."""
+    def decorator(func):
+        cached = lru_cache(maxsize=maxsize)(func)
+        # 使用 dynamo.disable 排除此函数，避免 torch.compile 追踪
+        return torch._dynamo.disable(cached)
+    return decorator
 
 
 class HilbertCurve:
@@ -61,7 +74,7 @@ class HilbertCurve:
     }
 
     @staticmethod
-    @lru_cache(maxsize=1024)
+    @_dynamo_safe_lru_cache(maxsize=1024)
     def xy_to_d(n: int, x: int, y: int) -> int:
         """
         将 2D 坐标转换为 Hilbert 曲线距离
@@ -93,7 +106,7 @@ class HilbertCurve:
         return d
 
     @staticmethod
-    @lru_cache(maxsize=1024)
+    @_dynamo_safe_lru_cache(maxsize=1024)
     def d_to_xy(n: int, d: int) -> Tuple[int, int]:
         """
         将 Hilbert 曲线距离转换为 2D 坐标
@@ -343,7 +356,7 @@ class PseudoHilbertCurve:
     PADDING_RATIO_THRESHOLD: float = 4 / 3
     
     @classmethod
-    @lru_cache(maxsize=256)
+    @_dynamo_safe_lru_cache(maxsize=256)
     def scan(cls, h: int, w: int) -> Tuple[Tuple[int, int], ...]:
         """生成 H × W 矩形的 Pseudo-Hilbert 扫描序列.
         
