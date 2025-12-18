@@ -924,6 +924,108 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
         self.anneal_depth_bias(current_epoch, total_epochs)
         
         return new_tau
+    
+    def get_training_stats(self) -> Dict[str, Any]:
+        """获取当前训练状态统计信息 (用于日志追踪).
+        
+        返回关键参数以便追踪训练/推理一致性:
+        
+        Returns:
+            Dict 包含以下字段:
+            - gumbel_tau: 当前 Gumbel-Softmax 温度
+            - depth_bias: 当前深度偏置强度
+            - depth_bias_active: 偏置是否仍在生效 (> 0.01)
+            - use_soft_weights: 是否使用软权重模式
+            - temperature_param: 可学习温度参数值
+            - tau_range: (tau_min, tau_max) 范围
+            - bias_config: 深度偏置配置
+        """
+        return {
+            'gumbel_tau': self._current_tau,
+            'depth_bias': self._current_depth_bias,
+            'depth_bias_active': self._current_depth_bias > 0.01,
+            'use_soft_weights': self.use_soft_weights,
+            'temperature_param': self.temperature.item(),
+            'tau_range': (self.tau_min, self.tau_max),
+            'bias_config': {
+                'max': self._depth_bias_max,
+                'decay': self._depth_bias_decay,
+                'warmup': self._depth_bias_warmup,
+            },
+        }
+    
+    @torch.no_grad()
+    def compute_scale_distribution(
+        self,
+        images: torch.Tensor,
+    ) -> Dict[str, Any]:
+        """计算尺度选择分布统计 (诊断用).
+        
+        对输入图像计算每个尺度被选择的频率，用于:
+        1. 验证 train/eval 一致性
+        2. 监控尺度选择是否多样化
+        3. 检查深度偏置是否过期
+        
+        Args:
+            images: [B, C, H, W] 输入图像
+            
+        Returns:
+            Dict 包含:
+            - scale_counts: {patch_size: count} 每个尺度的选择次数
+            - scale_ratios: {patch_size: ratio} 每个尺度的选择比例
+            - entropy: 尺度分布熵 (越高越多样化)
+            - dominant_scale: 最常被选择的尺度
+        """
+        was_training = self.training
+        self.eval()  # 使用 eval 模式确保确定性
+        
+        try:
+            # 提取多尺度特征
+            features_dict = self.encoder(images)
+            
+            # 确定目标尺寸
+            min_ps = min(features_dict.keys())
+            _, (grid_h, grid_w) = features_dict[min_ps]
+            target_size = (grid_h, grid_w)
+            
+            # 计算尺度权重
+            scale_weights = self._compute_scale_weights(features_dict, target_size)
+            # scale_weights: [B, num_scales, grid_h, grid_w]
+            
+            # 获取每个位置的尺度决策
+            scale_decisions = scale_weights.argmax(dim=1)  # [B, grid_h, grid_w]
+            
+            # 统计每个尺度的选择次数
+            scale_counts = {}
+            total_positions = scale_decisions.numel()
+            
+            for idx, ps in enumerate(self.patch_sizes):
+                count = (scale_decisions == idx).sum().item()
+                scale_counts[ps] = count
+            
+            # 计算比例
+            scale_ratios = {ps: c / total_positions for ps, c in scale_counts.items()}
+            
+            # 计算熵 (使用 math.log 避免 numpy 依赖)
+            ratios = list(scale_ratios.values())
+            entropy = 0.0
+            for r in ratios:
+                if r > 0:
+                    entropy -= r * math.log(r + 1e-10)
+            
+            # 找到主导尺度
+            dominant_scale = max(scale_counts, key=scale_counts.get)
+            
+            return {
+                'scale_counts': scale_counts,
+                'scale_ratios': scale_ratios,
+                'entropy': entropy,
+                'dominant_scale': dominant_scale,
+                'max_entropy': math.log(len(self.patch_sizes)),  # 均匀分布的熵
+            }
+        finally:
+            if was_training:
+                self.train()
         
     def _compute_scale_weights(
         self,

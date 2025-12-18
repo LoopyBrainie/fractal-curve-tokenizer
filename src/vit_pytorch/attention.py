@@ -427,7 +427,7 @@ class LCAHilbertBias(nn.Module):
         return stacked.permute(0, 3, 1, 2)
 
 
-class HilbertAwareMultiScaleAttention(nn.Module):
+class   HilbertAwareMultiScaleAttention(nn.Module):
     """Hilbert 曲线感知的多尺度注意力机制。
 
     通过编码层级深度和 Hilbert 路径关系来调制注意力权重。
