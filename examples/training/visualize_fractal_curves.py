@@ -1,30 +1,55 @@
 #!/usr/bin/env python3
-"""Fractal Curve 交互式可视化脚本
+"""Fractal Curve ViT 交互式可视化脚本
 
-提供丰富的分形曲线可视化，包括：
+数学形式化
+============
+
+本脚本可视化 Fractal Curve ViT 的核心数学结构：
+
+1. **Hilbert 曲线**:
+   H: [0, n²) ↔ [0, n) × [0, n)
+   局部性: ||p1 - p2||_2 ≤ C · |H⁻¹(p1) - H⁻¹(p2)|^(1/2)
+
+2. **LCA (最低公共祖先) 偏置**:
+   LCA(i, j) = 第一个不同象限的层级 ∈ [0, L]
+   B[i,j] = LCAEmbed(LCA(i,j))
+
+3. **Gumbel-Softmax 尺度选择**:
+   π = Gumbel-Softmax(ComplexityHead(F), τ)
+   训练: hard=True (STE), 推理: argmax
+
+4. **深度偏置预热 (v2.2)**:
+   logits' = logits + bias × scale_weights
+   bias(t) = max_bias × (1 - progress)^decay
+
+可视化功能
+----------
 1. Hilbert 曲线动画生成
-2. 不同阶数的曲线对比
-3. 2D → 1D 映射过程动画
-4. 局部性保持的直观展示
-5. 多尺度 tokenization 可视化
+2. 不同阶数的曲线对比  
+3. LCA 距离矩阵可视化
+4. 四叉树路径与偏置关系
+5. 多尺度 Gumbel-Softmax 决策
+6. 深度偏置衰减曲线
+7. 注意力偏置矩阵可视化
 
 使用示例：
-    # 生成静态可视化
+    # 生成所有可视化
     python visualize_fractal_curves.py --all
     
-    # 生成 GIF 动画
-    python visualize_fractal_curves.py --animate --order 4
+    # 生成 LCA 偏置可视化
+    python visualize_fractal_curves.py --lca-bias
     
-    # 交互式探索 (需要 matplotlib 后端支持)
-    python visualize_fractal_curves.py --interactive
+    # 生成 Gumbel-Softmax 可视化
+    python visualize_fractal_curves.py --gumbel-softmax
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 import warnings
 
 import matplotlib.pyplot as plt
@@ -368,6 +393,653 @@ def visualize_locality_preservation(
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"[OK] Locality visualization saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
+
+
+# ============================================================================
+# 可视化：LCA (最低公共祖先) 偏置矩阵
+# ============================================================================
+
+def compute_quadtree_path(n: int, d: int, max_depth: int) -> List[int]:
+    """计算 Hilbert 索引的四叉树路径.
+    
+    数学定义:
+        path[ℓ] = 第 ℓ 层的象限索引 ∈ {0, 1, 2, 3}
+        
+    对于 n = 2^k，path 长度为 k
+    """
+    path = []
+    x, y = HilbertCurve.d_to_xy(n, d)
+    
+    size = n
+    for _ in range(max_depth):
+        size //= 2
+        if size == 0:
+            break
+        qx = 1 if x >= size else 0
+        qy = 1 if y >= size else 0
+        quadrant = qy * 2 + qx
+        path.append(quadrant)
+        x = x % size
+        y = y % size
+    
+    return path
+
+
+def compute_lca_depth(path_i: List[int], path_j: List[int]) -> int:
+    """计算两条四叉树路径的 LCA 深度.
+    
+    数学定义:
+        LCA(i, j) = min{ℓ : path_i[ℓ] ≠ path_j[ℓ]}
+        若完全相同则返回 len(path)
+    """
+    min_len = min(len(path_i), len(path_j))
+    for l in range(min_len):
+        if path_i[l] != path_j[l]:
+            return l
+    return min_len
+
+
+def visualize_lca_bias_matrix(
+    order: int = 4,
+    save_path: Optional[Path] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """可视化 LCA 偏置矩阵.
+    
+    数学原理:
+        LCA(i, j) = 两个 token 的最低公共祖先深度
+        B[i,j] = LCAEmbed(LCA(i,j))
+        
+    LCA 值越小表示两个 token 在四叉树中越早分开，
+    即它们在空间上相距越远。
+    """
+    n = 2 ** order
+    num_tokens = n * n
+    max_depth = order
+    
+    # 计算所有 token 的四叉树路径
+    paths = []
+    for d in range(num_tokens):
+        path = compute_quadtree_path(n, d, max_depth)
+        paths.append(path)
+    
+    # 计算 LCA 矩阵
+    lca_matrix = np.zeros((num_tokens, num_tokens), dtype=int)
+    for i in range(num_tokens):
+        for j in range(num_tokens):
+            lca_matrix[i, j] = compute_lca_depth(paths[i], paths[j])
+    
+    # 可视化
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    
+    # 1. LCA 矩阵热图
+    ax1 = axes[0]
+    im1 = ax1.imshow(lca_matrix, cmap='viridis', aspect='auto')
+    ax1.set_title(f'LCA Depth Matrix ({n}×{n} = {num_tokens} tokens)', fontsize=12)
+    ax1.set_xlabel('Token j (Hilbert order)')
+    ax1.set_ylabel('Token i (Hilbert order)')
+    cbar1 = plt.colorbar(im1, ax=ax1)
+    cbar1.set_label('LCA Depth')
+    
+    # 2. LCA 分布直方图
+    ax2 = axes[1]
+    unique, counts = np.unique(lca_matrix, return_counts=True)
+    colors = plt.cm.viridis(unique / max(unique))
+    bars = ax2.bar(unique, counts, color=colors, edgecolor='black')
+    ax2.set_xlabel('LCA Depth', fontsize=11)
+    ax2.set_ylabel('Count', fontsize=11)
+    ax2.set_title('Distribution of LCA Depths', fontsize=12)
+    ax2.set_xticks(unique)
+    
+    # 标注
+    for bar, u, c in zip(bars, unique, counts):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                f'{c}', ha='center', va='bottom', fontsize=8)
+    
+    # 3. LCA 与空间距离的关系
+    ax3 = axes[2]
+    
+    # 采样一些 token 对
+    sample_size = min(2000, num_tokens * num_tokens // 4)
+    np.random.seed(42)
+    i_samples = np.random.randint(0, num_tokens, sample_size)
+    j_samples = np.random.randint(0, num_tokens, sample_size)
+    
+    lca_samples = []
+    dist_samples = []
+    for i, j in zip(i_samples, j_samples):
+        xi, yi = HilbertCurve.d_to_xy(n, i)
+        xj, yj = HilbertCurve.d_to_xy(n, j)
+        spatial_dist = np.sqrt((xi - xj)**2 + (yi - yj)**2)
+        lca_samples.append(lca_matrix[i, j])
+        dist_samples.append(spatial_dist)
+    
+    ax3.scatter(lca_samples, dist_samples, alpha=0.3, s=5)
+    ax3.set_xlabel('LCA Depth', fontsize=11)
+    ax3.set_ylabel('Spatial Distance (Euclidean)', fontsize=11)
+    ax3.set_title('LCA Depth vs Spatial Distance', fontsize=12)
+    
+    # 添加趋势线
+    for lca_val in range(max_depth + 1):
+        mask = np.array(lca_samples) == lca_val
+        if mask.sum() > 0:
+            avg_dist = np.mean(np.array(dist_samples)[mask])
+            ax3.scatter([lca_val], [avg_dist], color='red', s=100, 
+                       marker='x', zorder=5, linewidths=2)
+    
+    ax3.scatter([], [], color='red', marker='x', s=100, label='Mean', linewidths=2)
+    ax3.legend()
+    
+    fig.suptitle('LCA (Lowest Common Ancestor) Bias Analysis\n'
+                'B[i,j] = LCAEmbed(LCA(i,j)) captures hierarchical spatial relationships',
+                fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] LCA bias matrix saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
+
+
+# ============================================================================
+# 可视化：Gumbel-Softmax 尺度选择过程
+# ============================================================================
+
+def visualize_gumbel_softmax_decision(
+    save_path: Optional[Path] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """可视化 Gumbel-Softmax 尺度选择机制.
+    
+    数学原理:
+        π_hard = Gumbel-Softmax(logits, τ, hard=True)
+        
+        前向: argmax(logits + Gumbel_noise) → one-hot
+        反向: 软梯度通过 softmax
+        
+    温度 τ 控制决策的"软硬程度"：
+        τ → 0: 接近 argmax (硬决策)
+        τ → ∞: 接近均匀分布 (软决策)
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    
+    # 设置尺度和 logits
+    patch_sizes = [4, 8, 16]
+    num_scales = len(patch_sizes)
+    
+    # 示例 logits (模拟不同复杂度区域)
+    logits_examples = {
+        'High Complexity': np.array([2.0, 0.5, -0.5]),  # 偏向小 patch
+        'Medium Complexity': np.array([0.5, 1.5, 0.5]),  # 偏向中等 patch
+        'Low Complexity': np.array([-0.5, 0.5, 2.0]),   # 偏向大 patch
+    }
+    
+    # 1. 不同温度下的 softmax 分布
+    ax1 = axes[0, 0]
+    temperatures = [0.1, 0.5, 1.0, 2.0, 5.0]
+    logits = np.array([1.5, 1.0, 0.5])  # 示例 logits
+    
+    x_pos = np.arange(num_scales)
+    width = 0.15
+    
+    colors = plt.cm.coolwarm(np.linspace(0.1, 0.9, len(temperatures)))
+    for i, tau in enumerate(temperatures):
+        probs = np.exp(logits / tau)
+        probs = probs / probs.sum()
+        ax1.bar(x_pos + i * width, probs, width, 
+               label=f'τ={tau}', color=colors[i], edgecolor='black')
+    
+    ax1.set_xlabel('Scale (patch size)')
+    ax1.set_ylabel('Probability')
+    ax1.set_title('Temperature Effect on Softmax\n(logits = [1.5, 1.0, 0.5])', fontsize=11)
+    ax1.set_xticks(x_pos + width * 2)
+    ax1.set_xticklabels([f'{ps}×{ps}' for ps in patch_sizes])
+    ax1.legend(fontsize=8)
+    ax1.set_ylim(0, 1)
+    
+    # 2. 温度退火曲线
+    ax2 = axes[0, 1]
+    epochs = np.linspace(0, 1, 100)
+    tau_init, tau_min, tau_max = 2.0, 0.5, 5.0
+    
+    # 不同退火策略
+    tau_linear = tau_max - (tau_max - tau_min) * epochs
+    tau_cosine = tau_min + 0.5 * (tau_max - tau_min) * (1 + np.cos(np.pi * epochs))
+    tau_exp = tau_max * (tau_min / tau_max) ** epochs
+    
+    ax2.plot(epochs, tau_linear, 'b-', linewidth=2, label='Linear')
+    ax2.plot(epochs, tau_cosine, 'r-', linewidth=2, label='Cosine')
+    ax2.plot(epochs, tau_exp, 'g--', linewidth=2, label='Exponential')
+    ax2.axhline(tau_min, color='gray', linestyle=':', label=f'τ_min={tau_min}')
+    ax2.set_xlabel('Training Progress')
+    ax2.set_ylabel('Temperature (τ)')
+    ax2.set_title('Temperature Annealing Schedules', fontsize=11)
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # 3. 不同复杂度区域的决策
+    ax3 = axes[0, 2]
+    
+    tau = 1.0
+    x_pos = np.arange(num_scales)
+    width = 0.25
+    
+    colors_regions = ['#FF6B6B', '#FFD93D', '#4ECDC4']
+    for i, (region, logits) in enumerate(logits_examples.items()):
+        probs = np.exp(logits / tau)
+        probs = probs / probs.sum()
+        ax3.bar(x_pos + i * width, probs, width, 
+               label=region, color=colors_regions[i], edgecolor='black')
+    
+    ax3.set_xlabel('Scale (patch size)')
+    ax3.set_ylabel('Selection Probability')
+    ax3.set_title('Scale Selection by Region Complexity\n(τ=1.0)', fontsize=11)
+    ax3.set_xticks(x_pos + width)
+    ax3.set_xticklabels([f'{ps}×{ps}' for ps in patch_sizes])
+    ax3.legend(fontsize=9)
+    ax3.set_ylim(0, 1)
+    
+    # 4. Gumbel 噪声的影响
+    ax4 = axes[1, 0]
+    
+    np.random.seed(42)
+    n_samples = 1000
+    logits = np.array([1.0, 0.5, 0.3])
+    tau = 0.5
+    
+    selections = []
+    for _ in range(n_samples):
+        gumbel_noise = -np.log(-np.log(np.random.uniform(0, 1, num_scales) + 1e-10) + 1e-10)
+        noisy_logits = logits + gumbel_noise
+        selection = np.argmax(noisy_logits)
+        selections.append(selection)
+    
+    counts = [selections.count(i) for i in range(num_scales)]
+    ax4.bar(range(num_scales), counts, color=colors_regions, edgecolor='black')
+    ax4.set_xlabel('Selected Scale')
+    ax4.set_ylabel('Count')
+    ax4.set_title(f'Gumbel-Softmax Sampling (n={n_samples})\n(logits={logits.tolist()}, τ={tau})', fontsize=11)
+    ax4.set_xticks(range(num_scales))
+    ax4.set_xticklabels([f'{ps}×{ps}' for ps in patch_sizes])
+    
+    # 理论概率
+    probs = np.exp(logits / tau)
+    probs = probs / probs.sum()
+    for i, p in enumerate(probs):
+        ax4.axhline(p * n_samples, color='red', linestyle='--', alpha=0.7)
+    ax4.plot([], [], 'r--', label='Theoretical')
+    ax4.legend()
+    
+    # 5. Train vs Eval 行为对比
+    ax5 = axes[1, 1]
+    
+    logits = np.array([1.2, 0.8, 0.4])
+    
+    # Train (hard=True): 多次采样
+    np.random.seed(123)
+    train_outputs = []
+    for _ in range(5):
+        gumbel = -np.log(-np.log(np.random.uniform(0, 1, num_scales) + 1e-10) + 1e-10)
+        train_out = np.zeros(num_scales)
+        train_out[np.argmax(logits + gumbel)] = 1.0
+        train_outputs.append(train_out)
+    
+    # Eval: argmax (确定性)
+    eval_out = np.zeros(num_scales)
+    eval_out[np.argmax(logits)] = 1.0
+    
+    x = np.arange(num_scales)
+    width = 0.12
+    
+    # 绘制多次 train 采样
+    for i, out in enumerate(train_outputs):
+        ax5.bar(x + i * width, out, width, alpha=0.6, 
+               color='blue', edgecolor='blue', linewidth=0.5)
+    
+    # Eval 结果
+    ax5.bar(x + 5 * width, eval_out, width, 
+           color='green', edgecolor='black', label='Eval (argmax)')
+    
+    ax5.set_xlabel('Scale')
+    ax5.set_ylabel('Output (one-hot)')
+    ax5.set_title('Train (Gumbel) vs Eval (argmax)\n(hard=True ensures consistency)', fontsize=11)
+    ax5.set_xticks(x + 2.5 * width)
+    ax5.set_xticklabels([f'{ps}×{ps}' for ps in patch_sizes])
+    ax5.bar([], [], color='blue', alpha=0.6, label='Train samples')
+    ax5.legend()
+    
+    # 6. STE (Straight-Through Estimator) 说明
+    ax6 = axes[1, 2]
+    ax6.axis('off')
+    
+    ste_text = """
+    Straight-Through Estimator (STE)
+    ================================
+    
+    Forward Pass:
+        output = one_hot(argmax(logits + gumbel))
+        
+    Backward Pass:
+        ∂L/∂logits ≈ ∂L/∂softmax(logits/τ)
+        
+    Key Insight:
+        - Forward: Hard decision (discrete)
+        - Backward: Soft gradient (continuous)
+        
+    Benefits:
+        ✓ Train/Eval consistency (both use argmax)
+        ✓ Gradient flow preserved
+        ✓ Discrete token selection
+        
+    Mathematical Form:
+        y = one_hot(argmax(x)) + softmax(x) - sg(softmax(x))
+        
+    where sg() is stop_gradient
+    """
+    
+    ax6.text(0.05, 0.95, ste_text, transform=ax6.transAxes,
+            fontsize=10, verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='#f0f0f0', alpha=0.8))
+    
+    fig.suptitle('Gumbel-Softmax Adaptive Scale Selection Mechanism',
+                fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] Gumbel-Softmax visualization saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
+
+
+# ============================================================================
+# 可视化：深度偏置预热 (Depth Bias Warmup v2.2)
+# ============================================================================
+
+def visualize_depth_bias_warmup(
+    save_path: Optional[Path] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """可视化深度偏置预热机制 (v2.2).
+    
+    数学原理:
+        在训练初期对小尺度（深层级）添加正偏置，引导模型探索细粒度特征。
+        
+        bias(t) = max_bias × (1 - adjusted_progress)^decay
+        
+        其中:
+            adjusted_progress = (progress - warmup) / (1 - warmup), if progress > warmup
+                              = 0, otherwise
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # 参数设置
+    epochs = np.linspace(0, 1, 100)
+    max_bias = 2.0
+    warmup_ratio = 0.2
+    
+    # 1. 不同衰减指数的偏置曲线
+    ax1 = axes[0, 0]
+    decay_powers = [1.0, 2.0, 3.0, 5.0]
+    colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(decay_powers)))
+    
+    for decay, color in zip(decay_powers, colors):
+        bias_values = []
+        for progress in epochs:
+            if progress < warmup_ratio:
+                bias = max_bias
+            else:
+                adj_progress = (progress - warmup_ratio) / (1 - warmup_ratio)
+                bias = max_bias * ((1 - adj_progress) ** decay)
+            bias_values.append(bias)
+        ax1.plot(epochs, bias_values, color=color, linewidth=2, label=f'decay={decay}')
+    
+    ax1.axvline(warmup_ratio, color='red', linestyle='--', alpha=0.5, label=f'warmup={warmup_ratio}')
+    ax1.axhline(0.01, color='gray', linestyle=':', alpha=0.5, label='threshold=0.01')
+    ax1.set_xlabel('Training Progress')
+    ax1.set_ylabel('Depth Bias Strength')
+    ax1.set_title('Depth Bias Decay Curves\n(different decay powers)', fontsize=11)
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim(0, 1)
+    ax1.set_ylim(0, max_bias * 1.1)
+    
+    # 2. 尺度偏置权重分布
+    ax2 = axes[0, 1]
+    num_scales = 4
+    patch_sizes = [4, 8, 16, 32]
+    scale_weights = np.linspace(1.0, 0.0, num_scales)  # 小尺度权重大
+    
+    bars = ax2.bar(range(num_scales), scale_weights, 
+                  color=plt.cm.Reds(np.linspace(0.8, 0.3, num_scales)),
+                  edgecolor='black')
+    ax2.set_xlabel('Scale Index')
+    ax2.set_ylabel('Bias Weight')
+    ax2.set_title('Scale Bias Weights\n(smaller patch → larger bias)', fontsize=11)
+    ax2.set_xticks(range(num_scales))
+    ax2.set_xticklabels([f'{ps}×{ps}' for ps in patch_sizes])
+    
+    for bar, w in zip(bars, scale_weights):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                f'{w:.2f}', ha='center', fontsize=10)
+    
+    # 3. 训练过程中的实际偏置 (per scale)
+    ax3 = axes[1, 0]
+    
+    decay = 2.0
+    for s_idx, (ps, w) in enumerate(zip(patch_sizes, scale_weights)):
+        effective_bias = []
+        for progress in epochs:
+            if progress < warmup_ratio:
+                bias = max_bias
+            else:
+                adj_progress = (progress - warmup_ratio) / (1 - warmup_ratio)
+                bias = max_bias * ((1 - adj_progress) ** decay)
+            effective_bias.append(bias * w)
+        
+        color = plt.cm.Reds(1 - s_idx / num_scales)
+        ax3.plot(epochs, effective_bias, color=color, linewidth=2, 
+                label=f'{ps}×{ps} (w={w:.2f})')
+    
+    ax3.set_xlabel('Training Progress')
+    ax3.set_ylabel('Effective Bias = bias × weight')
+    ax3.set_title('Effective Bias per Scale\n(decay=2.0)', fontsize=11)
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    ax3.set_xlim(0, 1)
+    
+    # 4. 偏置对 logits 的影响
+    ax4 = axes[1, 1]
+    
+    # 原始 logits (无偏好)
+    original_logits = np.array([0.0, 0.0, 0.0, 0.0])
+    
+    # 不同训练阶段的偏置
+    training_stages = [0.0, 0.1, 0.3, 0.5, 1.0]  # progress
+    colors_stages = plt.cm.coolwarm(np.linspace(0.1, 0.9, len(training_stages)))
+    
+    x_pos = np.arange(num_scales)
+    width = 0.15
+    
+    for i, progress in enumerate(training_stages):
+        if progress < warmup_ratio:
+            bias = max_bias
+        else:
+            adj_progress = (progress - warmup_ratio) / (1 - warmup_ratio)
+            bias = max_bias * ((1 - adj_progress) ** decay)
+        
+        biased_logits = original_logits + bias * scale_weights
+        probs = np.exp(biased_logits)
+        probs = probs / probs.sum()
+        
+        ax4.bar(x_pos + i * width, probs, width, 
+               label=f'p={progress:.1f} (bias={bias:.2f})',
+               color=colors_stages[i], edgecolor='black')
+    
+    ax4.set_xlabel('Scale (patch size)')
+    ax4.set_ylabel('Selection Probability')
+    ax4.set_title('Scale Selection Probability\n(how bias shifts preference)', fontsize=11)
+    ax4.set_xticks(x_pos + width * 2)
+    ax4.set_xticklabels([f'{ps}×{ps}' for ps in patch_sizes])
+    ax4.legend(fontsize=8, loc='upper right')
+    ax4.set_ylim(0, 0.8)
+    
+    fig.suptitle('Depth Bias Warmup (v2.2)\n'
+                'Encourages exploration of fine-grained features early in training',
+                fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] Depth bias warmup saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
+
+
+# ============================================================================
+# 可视化：注意力偏置矩阵对比
+# ============================================================================
+
+def visualize_attention_bias_comparison(
+    order: int = 3,
+    save_path: Optional[Path] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """对比不同 Hilbert Bias 模式的注意力矩阵.
+    
+    四种模式:
+    1. original: 全连接 MLP
+    2. low_rank: 低秩分解 B = ΦΨ^T
+    3. hierarchical: 分层累加
+    4. lca: LCA 嵌入表 (推荐)
+    """
+    n = 2 ** order
+    num_tokens = n * n
+    max_depth = order
+    
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    
+    # 计算四叉树路径
+    paths = []
+    for d in range(num_tokens):
+        path = compute_quadtree_path(n, d, max_depth)
+        paths.append(path)
+    
+    # 1. LCA 偏置矩阵 (真实)
+    ax1 = axes[0, 0]
+    lca_matrix = np.zeros((num_tokens, num_tokens))
+    for i in range(num_tokens):
+        for j in range(num_tokens):
+            lca_matrix[i, j] = compute_lca_depth(paths[i], paths[j])
+    
+    im1 = ax1.imshow(lca_matrix, cmap='viridis')
+    ax1.set_title('LCA Bias (Recommended)\nB[i,j] = LCAEmbed(LCA(i,j))', fontsize=10)
+    ax1.set_xlabel('Token j')
+    ax1.set_ylabel('Token i')
+    plt.colorbar(im1, ax=ax1, label='LCA Depth')
+    
+    # 2. Hilbert 距离偏置
+    ax2 = axes[0, 1]
+    hilbert_dist_matrix = np.zeros((num_tokens, num_tokens))
+    for i in range(num_tokens):
+        for j in range(num_tokens):
+            hilbert_dist_matrix[i, j] = abs(i - j)
+    
+    # 归一化到合理范围
+    hilbert_dist_matrix = np.log1p(hilbert_dist_matrix)
+    
+    im2 = ax2.imshow(hilbert_dist_matrix, cmap='plasma')
+    ax2.set_title('Hilbert Distance\nlog(1 + |i - j|)', fontsize=10)
+    ax2.set_xlabel('Token j')
+    ax2.set_ylabel('Token i')
+    plt.colorbar(im2, ax=ax2, label='log(1 + dist)')
+    
+    # 3. 空间距离偏置
+    ax3 = axes[0, 2]
+    spatial_dist_matrix = np.zeros((num_tokens, num_tokens))
+    for i in range(num_tokens):
+        xi, yi = HilbertCurve.d_to_xy(n, i)
+        for j in range(num_tokens):
+            xj, yj = HilbertCurve.d_to_xy(n, j)
+            spatial_dist_matrix[i, j] = np.sqrt((xi - xj)**2 + (yi - yj)**2)
+    
+    im3 = ax3.imshow(spatial_dist_matrix, cmap='inferno')
+    ax3.set_title('Spatial (Euclidean) Distance\n||p_i - p_j||_2', fontsize=10)
+    ax3.set_xlabel('Token j')
+    ax3.set_ylabel('Token i')
+    plt.colorbar(im3, ax=ax3, label='Distance')
+    
+    # 4. LCA vs Hilbert 距离相关性
+    ax4 = axes[1, 0]
+    
+    # Flatten and sample
+    lca_flat = lca_matrix.flatten()
+    hilbert_flat = hilbert_dist_matrix.flatten()
+    
+    ax4.scatter(lca_flat, hilbert_flat, alpha=0.3, s=5)
+    ax4.set_xlabel('LCA Depth')
+    ax4.set_ylabel('log(1 + Hilbert Distance)')
+    ax4.set_title('LCA vs Hilbert Distance', fontsize=10)
+    
+    # 5. LCA vs 空间距离相关性
+    ax5 = axes[1, 1]
+    spatial_flat = spatial_dist_matrix.flatten()
+    
+    ax5.scatter(lca_flat, spatial_flat, alpha=0.3, s=5, color='orange')
+    ax5.set_xlabel('LCA Depth')
+    ax5.set_ylabel('Spatial Distance')
+    ax5.set_title('LCA vs Spatial Distance', fontsize=10)
+    
+    # 6. 参数量对比
+    ax6 = axes[1, 2]
+    
+    # 估算不同方法的参数量
+    heads = 8
+    rank = 32
+    path_dim = max_depth
+    
+    params = {
+        'original': num_tokens * num_tokens * heads,  # 全矩阵
+        'low_rank': 2 * path_dim * 64 + 64 * rank * heads,  # 两个 MLP
+        'hierarchical': max_depth * (4 * 16 + 16 * heads),  # 每层一个小 MLP
+        'lca': (max_depth + 1) * heads,  # LCA 嵌入表
+    }
+    
+    methods = list(params.keys())
+    values = [params[m] for m in methods]
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4']
+    
+    bars = ax6.bar(methods, values, color=colors, edgecolor='black')
+    ax6.set_ylabel('Parameter Count')
+    ax6.set_title('Parameter Efficiency Comparison', fontsize=10)
+    ax6.set_yscale('log')
+    
+    for bar, v in zip(bars, values):
+        ax6.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                f'{v:,}', ha='center', va='bottom', fontsize=8, rotation=45)
+    
+    fig.suptitle(f'Attention Bias Modes Comparison (Order {order}: {n}×{n} tokens)',
+                fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] Attention bias comparison saved to: {save_path}")
     
     if show:
         plt.show()
@@ -933,68 +1605,86 @@ def visualize_mixed_level_segmentation(
 def generate_all_visualizations(
     output_dir: Path,
     show: bool = False,
+    include_new: bool = True,
 ) -> None:
-    """生成所有可视化"""
+    """生成所有可视化.
+    
+    Args:
+        output_dir: 输出目录
+        show: 是否交互显示
+        include_new: 是否包含新增的高级可视化 (LCA, Gumbel, Depth Bias)
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    total_steps = 11 if include_new else 7
     
     print(f"\n{'='*60}")
     print("Generating Fractal Curve Visualizations")
     print(f"{'='*60}")
     print(f"Output: {output_dir}")
+    print(f"Include advanced visualizations: {include_new}")
     print(f"{'='*60}\n")
     
+    step = 1
+    
     # 1. 阶数对比
-    print("[1/7] Generating order comparison...")
+    print(f"[{step}/{total_steps}] Generating order comparison...")
     visualize_order_comparison(
         orders=[1, 2, 3, 4, 5],
         save_path=output_dir / "hilbert_order_comparison.png",
         show=show,
     )
+    step += 1
     
     # 2. 局部性保持
-    print("[2/7] Generating locality preservation...")
+    print(f"[{step}/{total_steps}] Generating locality preservation...")
     visualize_locality_preservation(
         order=4,
         save_path=output_dir / "hilbert_locality.png",
         show=show,
     )
+    step += 1
     
     # 3. 四叉树结构
-    print("[3/7] Generating quadtree structure...")
+    print(f"[{step}/{total_steps}] Generating quadtree structure...")
     visualize_quadtree_structure(
         max_depth=4,
         save_path=output_dir / "quadtree_structure.png",
         show=show,
     )
+    step += 1
     
     # 4. 2D → 1D 映射
-    print("[4/7] Generating 2D to 1D mapping...")
+    print(f"[{step}/{total_steps}] Generating 2D to 1D mapping...")
     visualize_2d_to_1d_mapping(
         order=3,
         save_path=output_dir / "2d_to_1d_mapping.png",
         show=show,
     )
+    step += 1
     
     # 5. 多尺度层级
-    print("[5/7] Generating multi-scale hierarchy...")
+    print(f"[{step}/{total_steps}] Generating multi-scale hierarchy...")
     visualize_multiscale_hierarchy(
         base_size=64,
         patch_sizes=[4, 8, 16],
         save_path=output_dir / "multiscale_hierarchy.png",
         show=show,
     )
+    step += 1
     
     # 6. 混合尺度分割演示
-    print("[6/7] Generating mixed-level segmentation demo...")
+    print(f"[{step}/{total_steps}] Generating mixed-level segmentation demo...")
     visualize_mixed_level_segmentation(
         base_size=64,
         patch_sizes=[4, 8, 16],
         save_path=output_dir / "mixed_level_segmentation.png",
         show=show,
     )
+    step += 1
     
     # 7. 动画 (可选)
-    print("[7/7] Generating growth animation...")
+    print(f"[{step}/{total_steps}] Generating growth animation...")
     try:
         visualize_hilbert_growth(
             order=4,
@@ -1005,6 +1695,42 @@ def generate_all_visualizations(
     except Exception as e:
         print(f"      [WARN] Animation generation failed: {e}")
         print("      (This may require additional dependencies like Pillow)")
+    step += 1
+    
+    # ========== 新增的高级可视化 ==========
+    if include_new:
+        # 8. LCA 偏置矩阵
+        print(f"[{step}/{total_steps}] Generating LCA bias matrix...")
+        visualize_lca_bias_matrix(
+            order=4,
+            save_path=output_dir / "lca_bias_matrix.png",
+            show=show,
+        )
+        step += 1
+        
+        # 9. Gumbel-Softmax 机制
+        print(f"[{step}/{total_steps}] Generating Gumbel-Softmax decision...")
+        visualize_gumbel_softmax_decision(
+            save_path=output_dir / "gumbel_softmax_decision.png",
+            show=show,
+        )
+        step += 1
+        
+        # 10. 深度偏置预热
+        print(f"[{step}/{total_steps}] Generating depth bias warmup...")
+        visualize_depth_bias_warmup(
+            save_path=output_dir / "depth_bias_warmup.png",
+            show=show,
+        )
+        step += 1
+        
+        # 11. 注意力偏置对比
+        print(f"[{step}/{total_steps}] Generating attention bias comparison...")
+        visualize_attention_bias_comparison(
+            order=3,
+            save_path=output_dir / "attention_bias_comparison.png",
+            show=show,
+        )
     
     print(f"\n{'='*60}")
     print("VISUALIZATION COMPLETE")
@@ -1017,6 +1743,11 @@ def generate_all_visualizations(
     print(f"  - multiscale_hierarchy.png")
     print(f"  - mixed_level_segmentation.png")
     print(f"  - hilbert_growth.gif (if successful)")
+    if include_new:
+        print(f"  - lca_bias_matrix.png")
+        print(f"  - gumbel_softmax_decision.png")
+        print(f"  - depth_bias_warmup.png")
+        print(f"  - attention_bias_comparison.png")
     print(f"{'='*60}\n")
 
 
@@ -1025,9 +1756,26 @@ def generate_all_visualizations(
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Fractal Curve Visualization")
+    parser = argparse.ArgumentParser(
+        description="Fractal Curve Visualization for ViT",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Generate all visualizations (including new advanced ones)
+  python visualize_fractal_curves.py --all
+
+  # Generate only basic visualizations (without LCA, Gumbel, etc.)
+  python visualize_fractal_curves.py --all --no-advanced
+
+  # Generate specific visualization
+  python visualize_fractal_curves.py --lca-bias --order 4 --show
+
+  # Generate multiple specific visualizations
+  python visualize_fractal_curves.py --gumbel --depth-bias --bias-comparison
+        """
+    )
     
-    # 模式
+    # 模式 - 基础
     parser.add_argument("--all", action="store_true",
                        help="Generate all visualizations")
     parser.add_argument("--animate", action="store_true",
@@ -1045,13 +1793,25 @@ def main():
     parser.add_argument("--mixed-level", action="store_true",
                        help="Generate mixed-level (adaptive) segmentation demo")
     
+    # 模式 - 新增高级可视化
+    parser.add_argument("--lca-bias", action="store_true",
+                       help="Generate LCA bias matrix visualization")
+    parser.add_argument("--gumbel", action="store_true",
+                       help="Generate Gumbel-Softmax decision visualization")
+    parser.add_argument("--depth-bias", action="store_true",
+                       help="Generate depth bias warmup visualization")
+    parser.add_argument("--bias-comparison", action="store_true",
+                       help="Generate attention bias modes comparison")
+    
     # 参数
     parser.add_argument("--order", type=int, default=4,
-                       help="Hilbert curve order")
+                       help="Hilbert curve order (default: 4)")
     parser.add_argument("--output-dir", type=str, default=None,
                        help="Output directory")
     parser.add_argument("--show", action="store_true",
                        help="Show plots interactively")
+    parser.add_argument("--no-advanced", action="store_true",
+                       help="Exclude advanced visualizations when using --all")
     
     args = parser.parse_args()
     
@@ -1063,14 +1823,23 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # 如果没有指定任何选项，默认生成所有
-    if not any([args.all, args.animate, args.comparison, args.locality, 
-                args.quadtree, args.mapping, args.multiscale, args.mixed_level]):
+    all_options = [
+        args.all, args.animate, args.comparison, args.locality, 
+        args.quadtree, args.mapping, args.multiscale, args.mixed_level,
+        args.lca_bias, args.gumbel, args.depth_bias, args.bias_comparison
+    ]
+    if not any(all_options):
         args.all = True
     
     if args.all:
-        generate_all_visualizations(output_dir, show=args.show)
+        generate_all_visualizations(
+            output_dir, 
+            show=args.show,
+            include_new=not args.no_advanced
+        )
         return
     
+    # 基础可视化
     if args.animate:
         visualize_hilbert_growth(
             order=args.order,
@@ -1114,6 +1883,33 @@ def main():
             base_size=64,
             patch_sizes=[4, 8, 16],
             save_path=output_dir / "mixed_level_segmentation.png",
+            show=args.show,
+        )
+    
+    # 新增高级可视化
+    if args.lca_bias:
+        visualize_lca_bias_matrix(
+            order=args.order,
+            save_path=output_dir / f"lca_bias_matrix_order{args.order}.png",
+            show=args.show,
+        )
+    
+    if args.gumbel:
+        visualize_gumbel_softmax_decision(
+            save_path=output_dir / "gumbel_softmax_decision.png",
+            show=args.show,
+        )
+    
+    if args.depth_bias:
+        visualize_depth_bias_warmup(
+            save_path=output_dir / "depth_bias_warmup.png",
+            show=args.show,
+        )
+    
+    if args.bias_comparison:
+        visualize_attention_bias_comparison(
+            order=min(args.order, 4),
+            save_path=output_dir / f"attention_bias_comparison_order{min(args.order, 4)}.png",
             show=args.show,
         )
 
