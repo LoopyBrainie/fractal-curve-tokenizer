@@ -66,7 +66,7 @@
 
 | 项目 | 描述 | 状态 |
 |------|------|------|
-| P2-1 | 测试覆盖增强 (+39 用例) | ✅ 2025-12-03 |
+| P2-1 | 测试覆盖增强 (283+ 用例) | ✅ 2025-12-19 |
 | P2-2 | 数据增强策略 (MNIST/CIFAR/ImageNet) | ✅ 2025-12-05 |
 | P2-3 | 类型注解补全 | ✅ 2025-12-08 |
 | P2-4 | 模块文档字符串数学形式化 | ✅ 2025-12-14 |
@@ -95,9 +95,26 @@
 
 **问题**: Low-Rank Bias 约 50K 参数，未充分利用四叉树 LCA 距离
 
-**解决**: 实现 `LCAHilbertBias`，参数量降至 ~36（99.9% 减少）
+**解决**: 实现 `LCAHilbertBias`，参数量降至 ~100（99.8% 减少）
 
 **公式**: $B_{ij} = \text{LCAEmbed}(\text{LCA}(i, j))$
+
+**配置默认值**: `FractalConfig.hilbert_bias_mode = 'lca'`
+
+### PERF-P0-5: Depth Bias Warmup v2.2 (2025-12-19) ✅
+
+**问题**: 多尺度分割中细粒度 patch 初期难以学习
+
+**解决**: 实现深度偏置预热机制
+
+**公式**: $\text{logits}'_{i,j,s} = \text{logits}_{i,j,s} + \beta(t) \cdot e^{-\lambda s}$
+
+**API**:
+- `set_depth_bias(value)`: 手动设置偏置强度
+- `anneal_depth_bias(progress)`: 自动根据训练进度退火
+- `get_depth_bias()`: 获取当前偏置强度
+
+**默认参数**: $\beta_{max}=2.0$, $\lambda=2.0$, warmup=0.2
 
 ### PERF-P0-3/P0-4: REINFORCE 问题 (2025-12-18) ✅
 

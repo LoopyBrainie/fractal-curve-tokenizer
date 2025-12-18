@@ -7,19 +7,20 @@ classDiagram
     nn_Module <|-- BaseTokenizer
     nn_Module <|-- BaseTokenProcessor
     nn_Module <|-- NextGenerationFractalViT
-    
+
     BaseTokenizer <|-- StreamingFractalTokenizer
     BaseTokenizer <|-- StreamingFractalTokenizerV2
-    
+
     NextGenerationFractalViT *-- StreamingFractalTokenizerV2
     NextGenerationFractalViT *-- AdvancedFractalPositionEmbedding
     NextGenerationFractalViT *-- EnhancedFractalTransformer
-    
+
     EnhancedFractalTransformer *-- EnhancedFractalTransformerBlock
     EnhancedFractalTransformerBlock *-- HilbertAwareMultiScaleAttention
     EnhancedFractalTransformerBlock *-- AdaptiveFractalFeedForward
-    
+
     HilbertAwareMultiScaleAttention *-- LowRankHilbertBias
+    HilbertAwareMultiScaleAttention *-- LCAHilbertBias
     AdaptiveFractalFeedForward *-- SwiGLUFFN
 ```
 
@@ -89,22 +90,22 @@ classDiagram
 
 ## C. 超参数参考表
 
-| 参数名 | 推荐值 (CIFAR10) | 推荐值 (ImageNet) | 说明 |
-| :--- | :--- | :--- | :--- |
-| `dim` | 192 | 512 | Embedding 维度 |
-| `depth` | 9 | 12 | Transformer 层数 |
-| `heads` | 6 | 8 | Attention 头数 |
-| `mlp_dim` | 384 | 2048 | FFN 隐藏层维度 |
-| `patch_size` | 4 | 16 | 基础 Patch 尺寸 |
-| `scales` | [4, 8] | [8, 16, 32] | 多尺度配置 |
-| `dropout` | 0.1 | 0.1 | Dropout 比率 |
-| `drop_path` | 0.1 | 0.2 | DropPath 比率 |
-| `lr` | 5e-4 | 1e-3 | 学习率 |
-| `weight_decay` | 0.05 | 0.05 | 权重衰减 |
-| `tokenizer_type` | streaming_v2 | streaming_v2 | Tokenizer 类型 |
-| `bias_mode` | lca | lca | Hilbert Bias 模式 |
-| `rank` | 32 | 64 | Low-Rank 秩 (仅 low_rank 模式) |
-| `ffn_type` | swiglu_level | swiglu_level | FFN 类型 |
+| 参数名              | 推荐值 (CIFAR10) | 推荐值 (ImageNet) | 说明                         |
+|:---------------- |:------------- |:-------------- |:-------------------------- |
+| `dim`            | 192           | 512            | Embedding 维度               |
+| `depth`          | 9             | 12             | Transformer 层数             |
+| `heads`          | 6             | 8              | Attention 头数               |
+| `mlp_dim`        | 384           | 2048           | FFN 隐藏层维度                  |
+| `patch_size`     | 4             | 16             | 基础 Patch 尺寸                |
+| `scales`         | [4, 8]        | [8, 16, 32]    | 多尺度配置                      |
+| `dropout`        | 0.1           | 0.1            | Dropout 比率                 |
+| `drop_path`      | 0.1           | 0.2            | DropPath 比率                |
+| `lr`             | 5e-4          | 1e-3           | 学习率                        |
+| `weight_decay`   | 0.05          | 0.05           | 权重衰减                       |
+| `tokenizer_type` | streaming_v2  | streaming_v2   | Tokenizer 类型               |
+| `bias_mode`      | lca           | lca            | Hilbert Bias 模式            |
+| `rank`           | 32            | 64             | Low-Rank 秩 (仅 low_rank 模式) |
+| `ffn_type`       | swiglu_level  | swiglu_level   | FFN 类型                     |
 
 ## D. API 快速参考
 
@@ -177,6 +178,8 @@ pos_emb = AdvancedFractalPositionEmbedding(dim=384, max_level=50)
 ```python
 # 推荐导入 (v0.5.0+)
 from vit_pytorch import (
+    # 配置
+    FractalConfig,
     # 模型
     NextGenerationFractalViT,
     # Tokenizer
@@ -185,6 +188,8 @@ from vit_pytorch import (
     # 组件
     EnhancedFractalTransformer,
     HilbertAwareMultiScaleAttention,
+    LCAHilbertBias,           # 推荐默认
+    LowRankHilbertBias,       # 大模型选项
     AdaptiveFractalFeedForward,
     SwiGLUFFN,
     AdvancedFractalPositionEmbedding,
@@ -200,17 +205,18 @@ from vit_pytorch import (
 
 ## F. 数学符号表
 
-| 符号 | 含义 |
-| :--- | :--- |
-| $I$ | 输入图像 $\in \mathbb{R}^{B \times C \times H \times W}$ |
-| $T$ | Token 嵌入 $\in \mathbb{R}^{B \times N \times D}$ |
-| $L$ | 层级信息 $\in \mathbb{Z}^{B \times N}$ |
-| $E_{pos}$ | 位置编码函数 |
-| $E_{depth}$ | 深度嵌入 |
-| $E_{path}$ | 路径嵌入 |
-| $B_{hilbert}$ | Hilbert 偏置矩阵 |
-| $B_{level}$ | 层级偏置矩阵 |
-| $\phi, \psi$ | Low-Rank 编码器 |
-| $\sigma_{scale}$ | 层级缩放因子 |
-| $\text{SwiGLU}$ | $W_{out}(\text{Swish}(W_g x) \odot W_v x)$ |
-| $H$ | Hilbert 曲线映射 $[0, n^2) \leftrightarrow [0, n)^2$ |
+| 符号                | 含义                                                   |
+|:----------------- |:---------------------------------------------------- |
+| $I$               | 输入图像 $\in \mathbb{R}^{B \times C \times H \times W}$ |
+| $T$               | Token 嵌入 $\in \mathbb{R}^{B \times N \times D}$      |
+| $L$               | 层级信息 $\in \mathbb{Z}^{B \times N}$                   |
+| $E_{pos}$         | 位置编码函数                                               |
+| $E_{depth}$       | 深度嵌入                                                 |
+| $E_{path}$        | 路径嵌入                                                 |
+| $B_{hilbert}$     | Hilbert 偏置矩阵                                         |
+| $B_{level}$       | 层级偏置矩阵                                               |
+| $\phi, \psi$      | Low-Rank 编码器                                         |
+| $\text{LCA}(i,j)$ | 最低公共祖先深度                                             |
+| $\sigma_{scale}$  | 层级缩放因子                                               |
+| $\text{SwiGLU}$   | $W_{out}(\text{Swish}(W_g x) \odot W_v x)$           |
+| $H$               | Hilbert 曲线映射 $[0, n^2) \leftrightarrow [0, n)^2$     |
