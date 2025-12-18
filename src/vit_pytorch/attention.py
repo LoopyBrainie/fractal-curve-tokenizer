@@ -450,7 +450,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         max_level: int = 50,
         use_hilbert_bias: bool = True,
         use_level_scaling: bool = True,
-        bias_mode: BiasMode = 'low_rank',
+        bias_mode: BiasMode = 'lca',
         low_rank_r: int = 32,
     ) -> None:
         """初始化 HilbertAwareMultiScaleAttention。
