@@ -33,6 +33,11 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:512,expandab
 os.environ.setdefault('OMP_NUM_THREADS', '4')
 os.environ.setdefault('MKL_NUM_THREADS', '4')
 
+# 抑制 torch.compile 的符号形状警告
+import warnings
+warnings.filterwarnings('ignore', message='.*is not in var_ranges.*')
+warnings.filterwarnings('ignore', message='.*defaulting to unknown range.*')
+
 import argparse
 import json
 import multiprocessing
@@ -1177,10 +1182,26 @@ def main():
         print("[OK] Using channels-last memory format")
     
     # torch.compile 编译优化 (PyTorch 2.0+)
+    # 注意: mode='reduce-overhead' 使用 CUDA graphs，但不兼容动态缓存操作
+    # 使用 mode='default' 更稳定，编译时间更短
     if config.compile_model:
         try:
-            model = torch.compile(model, mode='reduce-overhead')
-            print("[OK] Model compiled with torch.compile")
+            # mode='default': 平衡编译时间和运行时性能
+            # fullgraph=False: 允许部分图回退到 eager 模式
+            # dynamic=True: 支持动态形状
+            import torch._dynamo
+            import logging
+            # 抑制 symbolic_shapes 警告
+            logging.getLogger('torch.fx.experimental.symbolic_shapes').setLevel(logging.ERROR)
+            logging.getLogger('torch._dynamo').setLevel(logging.ERROR)
+            
+            model = torch.compile(
+                model, 
+                mode='default',
+                fullgraph=False,
+                dynamic=False,  # 固定输入尺寸时设为 False 更快
+            )
+            print("[OK] Model compiled with torch.compile (mode=default)")
         except Exception as e:
             print(f"[WARN] torch.compile failed: {e}")
     
@@ -1199,7 +1220,32 @@ def main():
     # 训练
     print("="*70)
     print("TRAINING START")
-    print("="*70 + "\n")
+    print("="*70)
+    
+    if config.compile_model:
+        print("[INFO] First batch will be slow due to JIT compilation (1-3 minutes)...")
+    
+    print()
+    
+    # 编译预热: 在正式训练前触发 JIT 编译
+    if config.compile_model:
+        print("[INFO] Warming up compiled model...")
+        try:
+            warmup_batch = next(iter(train_loader))
+            if isinstance(warmup_batch, (list, tuple)):
+                warmup_imgs = warmup_batch[0][:2].to(device)  # 只用2个样本
+            else:
+                warmup_imgs = warmup_batch[:2].to(device)
+            if config.channels_last:
+                warmup_imgs = warmup_imgs.to(memory_format=torch.channels_last)
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(enabled=config.use_amp):
+                    _ = model(warmup_imgs)
+            del warmup_imgs
+            torch.cuda.empty_cache()
+            print("[OK] Compilation complete!")
+        except Exception as e:
+            print(f"[WARN] Warmup failed: {e}")
     
     best_val = 0.0
     patience_counter = 0
