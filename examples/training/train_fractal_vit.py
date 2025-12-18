@@ -207,6 +207,10 @@ class MixupCutmix:
         batch_size = images.size(0)
         device = images.device
         
+        # 检查 label 范围，防止越界
+        assert labels.min() >= 0, f"Label 包含负值: min={labels.min().item()}"
+        assert labels.max() < self.num_classes, f"Label 越界: max={labels.max().item()} >= {self.num_classes}"
+        
         # 转换为 one-hot 并应用 label smoothing
         labels_one_hot = F.one_hot(labels, self.num_classes).float()
         if self.label_smoothing > 0:
@@ -269,8 +273,24 @@ def mixup_criterion(
     Returns:
         损失标量
     """
+    # 检查 logits 是否包含 NaN/Inf
+    if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+        raise ValueError(f"Logits 包含 NaN/Inf: nan={torch.isnan(outputs).sum()}, inf={torch.isinf(outputs).sum()}")
+    
+    # 数值稳定的 log_softmax
     log_probs = F.log_softmax(outputs, dim=1)
-    return -(targets * log_probs).sum(dim=1).mean()
+    
+    # 确保 targets 归一化且非负
+    targets = targets.clamp(min=0)
+    targets = targets / (targets.sum(dim=1, keepdim=True) + 1e-8)
+    
+    loss = -(targets * log_probs).sum(dim=1).mean()
+    
+    # 检查 loss 是否为 NaN
+    if torch.isnan(loss):
+        raise ValueError("Loss 为 NaN，可能是 logits 过大或标签问题")
+    
+    return loss
 
 
 # ============================================================================
@@ -701,6 +721,7 @@ def train_epoch(
     batch_times, data_times, forward_times = [], [], []
     cuda_mem_peak = 0.0
     use_mixup = mixup_fn is not None
+    nan_count = 0  # NaN 计数器
     
     data_iter = CudaPrefetcher(loader, device) if device.type == 'cuda' else loader
     pbar = tqdm(data_iter, desc="Train", total=len(loader))
@@ -716,6 +737,11 @@ def train_epoch(
             imgs = imgs.to(device)
             labels = labels.to(device)
         
+        # 检查 label 范围
+        if labels.min() < 0 or labels.max() >= num_classes:
+            print(f"\n[WARN] Label 范围异常: min={labels.min().item()}, max={labels.max().item()}, num_classes={num_classes}")
+            continue
+        
         # 应用 Mixup/CutMix
         mixed_labels: Optional[torch.Tensor] = None
         if use_mixup and mixup_fn is not None:
@@ -724,11 +750,34 @@ def train_epoch(
         forward_start = time.time()
         with get_amp_context(device, config.use_amp):
             outs, _ = model(imgs, return_aux_info=True)
+            
+            # 检查 logits 范围，防止爆炸
+            if torch.isnan(outs).any() or torch.isinf(outs).any():
+                nan_count += 1
+                if nan_count <= 3:
+                    print(f"\n[WARN] Logits 包含 NaN/Inf (batch {i}), 跳过此 batch")
+                if nan_count > 10:
+                    raise RuntimeError(f"连续出现 {nan_count} 次 NaN，训练终止")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            
             if use_mixup and mixed_labels is not None:
                 # 使用混合标签的交叉熵
                 loss = mixup_criterion(outs, mixed_labels) / config.accum_steps
             else:
                 loss = F.cross_entropy(outs, labels, label_smoothing=config.label_smoothing) / config.accum_steps
+        
+        # 检查 loss 是否为 NaN
+        if torch.isnan(loss) or torch.isinf(loss):
+            nan_count += 1
+            if nan_count <= 3:
+                print(f"\n[WARN] Loss 为 NaN/Inf (batch {i}), 跳过此 batch")
+            if nan_count > 10:
+                raise RuntimeError(f"连续出现 {nan_count} 次 NaN loss，训练终止")
+            optimizer.zero_grad(set_to_none=True)
+            continue
+        
+        nan_count = 0  # 重置计数器
         
         forward_time = time.time() - forward_start
         forward_times.append(forward_time)
@@ -785,6 +834,7 @@ def evaluate(
     """评估"""
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
+    nan_batches = 0
     
     for batch in tqdm(loader, desc="Eval"):
         imgs, labels = batch
@@ -793,14 +843,31 @@ def evaluate(
         
         with get_amp_context(device, use_amp):
             outs, _ = model(imgs, return_aux_info=True)
+            
+            # 检查 logits 是否有问题
+            if torch.isnan(outs).any() or torch.isinf(outs).any():
+                nan_batches += 1
+                continue
+            
             loss = F.cross_entropy(outs, labels)
         
-        total_loss += loss.item()
+        if not (torch.isnan(loss) or torch.isinf(loss)):
+            total_loss += loss.item()
+        else:
+            nan_batches += 1
+            continue
+            
         _, pred = outs.max(1)
         total += labels.size(0)
         correct += pred.eq(labels).sum().item()
     
-    return total_loss / len(loader), 100.0 * correct / total
+    if nan_batches > 0:
+        print(f"[WARN] 评估时跳过 {nan_batches} 个包含 NaN 的 batch")
+    
+    if total == 0:
+        return float('inf'), 0.0
+    
+    return total_loss / max(len(loader) - nan_batches, 1), 100.0 * correct / total
 
 
 @torch.no_grad()
