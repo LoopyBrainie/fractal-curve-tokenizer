@@ -51,6 +51,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch._dynamo
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
@@ -58,6 +59,11 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from torchvision import datasets, transforms
 from tqdm import tqdm
+
+import logging
+# 抑制 torch.compile 的符号形状警告
+logging.getLogger('torch.fx.experimental.symbolic_shapes').setLevel(logging.ERROR)
+logging.getLogger('torch._dynamo').setLevel(logging.ERROR)
 
 # AMP 兼容层
 try:
@@ -1186,15 +1192,6 @@ def main():
     # 使用 mode='default' 更稳定，编译时间更短
     if config.compile_model:
         try:
-            # mode='default': 平衡编译时间和运行时性能
-            # fullgraph=False: 允许部分图回退到 eager 模式
-            # dynamic=True: 支持动态形状
-            import torch._dynamo
-            import logging
-            # 抑制 symbolic_shapes 警告
-            logging.getLogger('torch.fx.experimental.symbolic_shapes').setLevel(logging.ERROR)
-            logging.getLogger('torch._dynamo').setLevel(logging.ERROR)
-            
             model = torch.compile(
                 model, 
                 mode='default',
