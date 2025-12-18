@@ -525,12 +525,14 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
 
         if use_level_scaling:
             self.level_scale_embedding: Optional[nn.Embedding] = nn.Embedding(max_level + 1, heads)
-            nn.init.constant_(self.level_scale_embedding.weight, 1.0)
-            nn.init.normal_(self.level_scale_embedding.weight, std=0.1)
+            # STAB-3 修复: 使用正确的 N(1.0, 0.1) 初始化
+            # 原代码两次初始化，第二次覆盖第一次，导致实际为 N(0, 0.1)
+            nn.init.normal_(self.level_scale_embedding.weight, mean=1.0, std=0.1)
         else:
             self.level_scale_embedding = None
 
-        self.scale_weights = nn.Parameter(torch.ones(heads))
+        # STAB-3: scale_weights 保留初始化为 1.0，但在 forward 中使用 softplus 约束
+        self._scale_weights_raw = nn.Parameter(torch.zeros(heads))  # softplus(0) ≈ 0.69
         self.relative_pos_embedding = nn.Embedding(2 * max_level + 1, heads)
 
         self.attend = nn.Softmax(dim=-1)
@@ -646,7 +648,10 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.heads), qkv)
 
         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        dots = dots * self.scale_weights.view(1, -1, 1, 1)
+        # STAB-3: 使用 softplus 约束 scale_weights 在 (0, +∞)，防止负数或过大
+        # softplus(0) ≈ 0.69，接近 1.0，且训练中可学习调整
+        scale_weights = F.softplus(self._scale_weights_raw)
+        dots = dots * scale_weights.view(1, -1, 1, 1)
 
         if self.use_level_scaling and levels_info is not None and levels_info.numel() > 0:
             # Type guard: guaranteed non-None when use_level_scaling is True

@@ -1212,12 +1212,16 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
             logits = logits + bias
         
         # 5. Gumbel-Softmax 转换为权重
+        # STAB-1 修复: τ_min 从 0.1 提高到 0.3
+        # 数学依据: ∂π̂/∂logits = π̂(1-π̂)/τ，当 τ=0.1 时梯度放大 10×
+        # τ=0.3 时梯度放大控制在 3.3× 以内，同时保持 78%+ 的主导尺度概率
+        tau_min = 0.3  # 原值 0.1，梯度不稳定
         if self.training:
             if self.use_soft_weights:
                 # 实验模式: 软权重 (可能导致 train/eval 差异)
                 weights = F.gumbel_softmax(
                     logits,
-                    tau=self.temperature.clamp(min=0.1),
+                    tau=self.temperature.clamp(min=tau_min),
                     hard=False,
                     dim=1,
                 )
@@ -1226,7 +1230,7 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
                 # 前向: argmax 硬决策，反向: 软梯度
                 weights = F.gumbel_softmax(
                     logits,
-                    tau=self.temperature.clamp(min=0.1),
+                    tau=self.temperature.clamp(min=tau_min),
                     hard=True,  # 关键修复: 保持 train/eval 一致
                     dim=1,
                 )

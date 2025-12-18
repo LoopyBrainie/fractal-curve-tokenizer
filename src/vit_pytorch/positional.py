@@ -138,9 +138,11 @@ class AdvancedFractalPositionEmbedding(nn.Module):
         seq_indices = torch.arange(path_len, device=device)
         mask = seq_indices < depths.unsqueeze(-1) # (..., path_len)
         
-        # 应用掩码并求和: (..., dim)
-        # 这实现了 "Level 1 Emb + Level 2 Emb + ..." 的逻辑
-        path_final = (path_embs * mask.unsqueeze(-1)).sum(dim=-2)
+        # STAB-4 修复: 按深度归一化，防止深层 token 的 ||E_path|| ∝ √d 导致范数失衡
+        # 原公式: E_path = Σ E_j → ||E_path|| ∝ √d (深层 token 范数过大)
+        # 修复后: E_path = (Σ E_j) / √d → ||E_path|| ≈ const (范数一致)
+        path_count = mask.sum(dim=-1, keepdim=True).clamp(min=1).float()
+        path_final = (path_embs * mask.unsqueeze(-1)).sum(dim=-2) / torch.sqrt(path_count)
         
         # 3. 融合
         # 直接相加，保留层级和位置信息

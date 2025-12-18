@@ -45,11 +45,19 @@ Orientation = Literal["up", "right", "down", "left"]
 # 创建兼容 torch.compile 的缓存装饰器
 # lru_cache 与 torch.compile 不兼容，需要使用 dynamo.disable 排除这些函数
 def _dynamo_safe_lru_cache(maxsize: int = 128):
-    """LRU 缓存装饰器，兼容 torch.compile."""
+    """LRU 缓存装饰器，兼容 torch.compile.
+    
+    使用 dynamo.disable 排除缓存函数，避免 torch.compile 追踪，
+    同时保留 cache_clear 和 cache_info 方法供外部调用。
+    """
     def decorator(func):
         cached = lru_cache(maxsize=maxsize)(func)
         # 使用 dynamo.disable 排除此函数，避免 torch.compile 追踪
-        return torch._dynamo.disable(cached)
+        wrapped = torch._dynamo.disable(cached)
+        # 保留 lru_cache 的 cache_clear 和 cache_info 方法
+        wrapped.cache_clear = cached.cache_clear
+        wrapped.cache_info = cached.cache_info
+        return wrapped
     return decorator
 
 

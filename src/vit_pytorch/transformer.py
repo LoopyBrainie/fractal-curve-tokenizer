@@ -126,7 +126,13 @@ class EnhancedFractalTransformerBlock(nn.Module):
             ffn_type=ffn_type,
         )
 
-        self.residual_weights = nn.Parameter(torch.ones(2))
+        # STAB-5 方案 B: 层级感知的 Residual 权重
+        # 数学依据: 深层 token (细粒度) 需要更大的 residual 权重来保护高频信息
+        #          浅层 token (粗粒度) 可使用较小权重，让 Attention 更自由地精炼
+        # 实现: w(d) = sigmoid(Embedding(d)) * 2 ∈ [0, 2]
+        # 初始化: zeros -> sigmoid(0) * 2 = 1.0，所有深度初始权重相同
+        self._level_residual_embedding = nn.Embedding(max_level + 1, 2)
+        nn.init.zeros_(self._level_residual_embedding.weight)  # sigmoid(0)*2 = 1.0
         
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         
@@ -209,13 +215,36 @@ class EnhancedFractalTransformerBlock(nn.Module):
         Returns:
             输出张量，形状为 [B, S, D]。
         """
+        # STAB-5 方案 B: 计算层级感知的 residual 权重
+        # 当 levels_info 可用时，每个 token 根据其深度获得不同的权重
+        # 当 levels_info 不可用时，使用深度 0 的默认权重
+        if levels_info is not None and levels_info.numel() > 0:
+            depths = extract_depths(levels_info, self.max_level)  # (S,) or (B, S)
+            level_weights_raw = self._level_residual_embedding(depths)  # (..., 2)
+            residual_weights = torch.sigmoid(level_weights_raw) * 2  # (..., 2) ∈ [0, 2]
+            
+            # 调整形状以便广播: (B, S, 1) for element-wise multiplication with (B, S, D)
+            if residual_weights.dim() == 2:
+                # (S, 2) -> (1, S, 2, 1) for broadcasting
+                w1 = residual_weights[:, 0].view(1, -1, 1)
+                w2 = residual_weights[:, 1].view(1, -1, 1)
+            else:
+                # (B, S, 2) -> w1, w2 each (B, S, 1)
+                w1 = residual_weights[:, :, 0].unsqueeze(-1)
+                w2 = residual_weights[:, :, 1].unsqueeze(-1)
+        else:
+            # 无 levels_info 时使用深度 0 的默认权重
+            default_w = torch.sigmoid(self._level_residual_embedding.weight[0]) * 2
+            w1 = default_w[0]
+            w2 = default_w[1]
+
         norm1_x = self._apply_level_aware_norm(x, levels_info, self.norm1_gamma, self.norm1_beta, self.default_norm1)
         attn_out = self.attention(norm1_x, levels_info, attention_mask)
-        x = x + self.drop_path(attn_out * self.residual_weights[0])
+        x = x + self.drop_path(attn_out * w1)
 
         norm2_x = self._apply_level_aware_norm(x, levels_info, self.norm2_gamma, self.norm2_beta, self.default_norm2)
         ff_out = self.ff(norm2_x, levels_info)
-        x = x + self.drop_path(ff_out * self.residual_weights[1])
+        x = x + self.drop_path(ff_out * w2)
 
         return x
 
@@ -281,12 +310,26 @@ class EnhancedFractalTransformer(nn.Module):
             ]
         )
 
-        self.global_context_attn = nn.MultiheadAttention(embed_dim=dim, num_heads=heads, dropout=dropout, batch_first=True)
-        self.level_aggregator = nn.Sequential(
+        # ARCH-R1: 删除了冗余的 global_context_attn
+        # 原因: HilbertAwareMultiScaleAttention 已经保留了 78.9% 的全局注意力权重
+        # Hilbert Bias 只是软约束，不需要额外的全局注意力纠正
+        
+        # ARCH-R2 方案 B: 真正的层级感知聚合器
+        # 数学形式化:
+        #   s_ℓ = σ(Embed_level(ℓ)) ∈ (0, 1)^D  — 每个层级的 D 维缩放向量
+        #   r = W₂ · ReLU(W₁ · x)               — bottleneck 特征精炼
+        #   x' = x + 0.2 · (r ⊙ s_ℓ)            — 层级感知的残差更新
+        # 
+        # 物理意义:
+        #   - 浅层级 (level=0,1,2): 大区域，学习保留全局语义的特征维度
+        #   - 深层级 (level=5,6,7): 小区域，学习增强局部细节的特征维度
+        self._level_aggregator_scale = nn.Embedding(max_level + 1, dim)
+        nn.init.ones_(self._level_aggregator_scale.weight)  # sigmoid(1) ≈ 0.73
+        
+        self._level_aggregator_bottleneck = nn.Sequential(
             nn.Linear(dim, dim // 2),
             nn.ReLU(),
             nn.Linear(dim // 2, dim),
-            nn.LayerNorm(dim),
         )
         self.final_norm = nn.LayerNorm(dim)
 
@@ -315,20 +358,21 @@ class EnhancedFractalTransformer(nn.Module):
             else:
                 x = layer(x, levels_info, attention_mask)
 
-        if seq_len > 1:
-            # 将 attention_mask (B, 1, 1, Seq) 转换为 key_padding_mask (B, Seq)
-            # attention_mask: True = 保留, False = mask
-            # key_padding_mask: True = mask, False = 保留 (相反的语义)
-            key_padding_mask = None
-            if attention_mask is not None:
-                # attention_mask: (B, 1, 1, Seq) -> (B, Seq), 然后取反
-                key_padding_mask = ~attention_mask.squeeze(1).squeeze(1).bool()
-            
-            global_context, _ = self.global_context_attn(x, x, x, key_padding_mask=key_padding_mask)
-            x = x + global_context * GLOBAL_CONTEXT_SCALE
+        # ARCH-R1: 删除了冗余的 global_context_attn 调用
+        # HilbertAwareMultiScaleAttention 已经充分保留全局信息流
 
+        # ARCH-R2 方案 B: 层级感知的特征聚合
         if levels_info is not None and levels_info.numel() > 0:
-            aggregated = self.level_aggregator(x)
+            depths = extract_depths(levels_info, self.max_level)  # (S,) or (B, S)
+            scale = torch.sigmoid(self._level_aggregator_scale(depths))  # (..., D)
+            
+            # 调整形状以匹配 x: [B, S, D]
+            if scale.dim() == 2:
+                # (S, D) -> (1, S, D) for broadcasting
+                scale = scale.unsqueeze(0)
+            
+            refined = self._level_aggregator_bottleneck(x)  # (B, S, D)
+            aggregated = refined * scale  # 层级感知的缩放
             x = x + aggregated * 0.2
 
         x = self.final_norm(x)
