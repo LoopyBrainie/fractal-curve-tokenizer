@@ -135,6 +135,8 @@ class TrainingConfig:
     accum_steps: int
     warmup_epochs: int
     gradient_checkpoint: bool
+    compile_model: bool
+    channels_last: bool
     
     # 早停
     patience: int
@@ -944,6 +946,10 @@ def main():
                        help="Hilbert bias mode (lca recommended, ~100 params)")
     parser.add_argument("--gradient-checkpoint", action="store_true",
                        help="Enable gradient checkpointing to save memory")
+    parser.add_argument("--compile", action="store_true",
+                       help="Use torch.compile for faster training (PyTorch 2.0+)")
+    parser.add_argument("--channels-last", action="store_true",
+                       help="Use channels-last memory format for faster convolutions")
     
     # Gumbel-Softmax 配置
     parser.add_argument("--gumbel-tau-init", type=float, default=2.0,
@@ -1070,6 +1076,8 @@ def main():
         accum_steps=args.accum_steps,
         warmup_epochs=args.warmup_epochs,
         gradient_checkpoint=args.gradient_checkpoint,
+        compile_model=getattr(args, 'compile', False),
+        channels_last=getattr(args, 'channels_last', False),
         patience=args.patience,
         min_delta=args.min_delta,
         mixup_alpha=args.mixup_alpha,
@@ -1127,13 +1135,27 @@ def main():
     print(f"Depth Bias: max={config.depth_bias_max}, decay={config.depth_bias_decay}, warmup={config.depth_bias_warmup}")
     print(f"Parameters: {params:,}")
     print(f"Gradient Checkpoint: {config.gradient_checkpoint}")
+    print(f"Compile Model: {config.compile_model}")
+    print(f"Channels Last: {config.channels_last}")
     print(f"{'='*70}\n")
     
     # 数据加载
     train_loader, val_loader, test_loader = create_dataloaders(spec, config)
     
-    # 优化器
-    optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    # 优化器 (使用 fused 版本加速)
+    use_fused = device.type == 'cuda' and hasattr(torch.optim.AdamW, 'fused')
+    try:
+        optimizer = AdamW(
+            model.parameters(), 
+            lr=config.learning_rate, 
+            weight_decay=config.weight_decay,
+            fused=use_fused
+        )
+        if use_fused:
+            print("[OK] Using fused AdamW optimizer")
+    except TypeError:
+        # 旧版本 PyTorch 不支持 fused 参数
+        optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     
     # 学习率调度
     warmup = min(args.warmup_epochs, config.epochs // 2)
@@ -1148,6 +1170,19 @@ def main():
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+    
+    # Channels Last 内存格式 (卷积加速)
+    if config.channels_last and device.type == 'cuda':
+        model = model.to(memory_format=torch.channels_last)
+        print("[OK] Using channels-last memory format")
+    
+    # torch.compile 编译优化 (PyTorch 2.0+)
+    if config.compile_model:
+        try:
+            model = torch.compile(model, mode='reduce-overhead')
+            print("[OK] Model compiled with torch.compile")
+        except Exception as e:
+            print(f"[WARN] torch.compile failed: {e}")
     
     # 创建 Mixup/CutMix 增强器
     use_mixup = config.mixup_alpha > 0 or config.cutmix_alpha > 0
