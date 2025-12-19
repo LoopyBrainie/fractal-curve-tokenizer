@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -53,24 +54,42 @@ from vit_pytorch.streaming_tokenizer import HilbertIndexer, StreamingFractalToke
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False
 
-# 数据集配置
-DATASETS = {
-    "cifar10": {
-        "num_classes": 10, "image_size": 32, "channels": 3,
-        "mean": (0.4914, 0.4822, 0.4465), "std": (0.2470, 0.2435, 0.2616),
-        "classes": ['airplane', 'automobile', 'bird', 'cat', 'deer', 
-                   'dog', 'frog', 'horse', 'ship', 'truck']
-    },
-    "cifar100": {
-        "num_classes": 100, "image_size": 32, "channels": 3,
-        "mean": (0.5071, 0.4865, 0.4409), "std": (0.2673, 0.2564, 0.2762),
-        "classes": None
-    },
-    "tiny-imagenet": {
-        "num_classes": 200, "image_size": 64, "channels": 3,
-        "mean": (0.485, 0.456, 0.406), "std": (0.229, 0.224, 0.225),
-        "classes": None
-    },
+# ============================================================================
+# 数据类
+# ============================================================================
+
+@dataclass
+class DatasetSpec:
+    """数据集规格 (与 train_fractal_vit.py 对齐)"""
+    name: str
+    num_classes: int
+    image_size: int
+    channels: int
+    mean: tuple
+    std: tuple
+    classes: Optional[List[str]] = None
+
+
+# 数据集配置 (与 train_fractal_vit.py 对齐)
+DATASETS: Dict[str, DatasetSpec] = {
+    "cifar10": DatasetSpec(
+        "CIFAR10", 10, 32, 3, 
+        (0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616),
+        ['airplane', 'automobile', 'bird', 'cat', 'deer', 
+         'dog', 'frog', 'horse', 'ship', 'truck']
+    ),
+    "cifar100": DatasetSpec(
+        "CIFAR100", 100, 32, 3, 
+        (0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762)
+    ),
+    "mnist": DatasetSpec(
+        "MNIST", 10, 28, 1, 
+        (0.1307,), (0.3081,)
+    ),
+    "tiny-imagenet": DatasetSpec(
+        "TinyImageNet", 200, 64, 3, 
+        (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+    ),
 }
 
 
@@ -248,7 +267,7 @@ def prepare_dataset(dataset_name: str, data_root: Path) -> bool:
     """准备数据集，如果需要则自动下载
     
     Args:
-        dataset_name: 数据集名称 (cifar10, cifar100, tiny-imagenet)
+        dataset_name: 数据集名称 (cifar10, cifar100, mnist, tiny-imagenet)
         data_root: 数据根目录
         
     Returns:
@@ -256,8 +275,8 @@ def prepare_dataset(dataset_name: str, data_root: Path) -> bool:
     """
     data_root.mkdir(parents=True, exist_ok=True)
     
-    if dataset_name in ['cifar10', 'cifar100']:
-        # CIFAR 数据集会在加载时自动下载
+    if dataset_name in ['cifar10', 'cifar100', 'mnist']:
+        # CIFAR/MNIST 数据集会在加载时自动下载
         print(f"[*] {dataset_name.upper()} will be downloaded automatically if needed.")
         return True
     elif dataset_name == 'tiny-imagenet':
@@ -1098,18 +1117,18 @@ def load_model_and_config(
     
     # 从配置重建模型
     dataset_name = config.get('dataset', 'cifar10')
-    dataset_info = DATASETS.get(dataset_name, DATASETS['cifar10'])
+    spec = DATASETS.get(dataset_name, DATASETS['cifar10'])
     
     # 与 train_fractal_vit.py 完全对齐的模型创建
     model = FractalCurveViT(
-        image_size=max(dataset_info['image_size'], 32),
-        num_classes=dataset_info['num_classes'],
+        image_size=max(spec.image_size, 32),
+        num_classes=spec.num_classes,
         dim=config.get('dim', 192),
         depth=config.get('depth', 8),
         heads=config.get('heads', 8),
         mlp_dim=config.get('mlp_dim', 384),
         pool=config.get('pool', 'cls'),
-        channels=dataset_info['channels'],
+        channels=spec.channels,
         dim_head=config.get('dim_head', 32),
         dropout=config.get('dropout', 0.1),
         emb_dropout=config.get('emb_dropout', 0.1),
@@ -1643,12 +1662,12 @@ def generate_full_report(
     
     # 2. 准备数据
     print("[2/6] Loading test data...")
-    dataset_info = DATASETS.get(dataset_name, DATASETS['cifar10'])
+    spec = DATASETS.get(dataset_name, DATASETS['cifar10'])
     
     test_tf = transforms.Compose([
-        transforms.Resize(max(dataset_info['image_size'], 32)),
+        transforms.Resize(max(spec.image_size, 32)),
         transforms.ToTensor(),
-        transforms.Normalize(dataset_info['mean'], dataset_info['std']),
+        transforms.Normalize(spec.mean, spec.std),
     ])
     
     data_root = PROJECT_ROOT / "data"
@@ -1661,6 +1680,8 @@ def generate_full_report(
         test_ds = datasets.CIFAR10(data_root, train=False, download=True, transform=test_tf)
     elif dataset_name == 'cifar100':
         test_ds = datasets.CIFAR100(data_root, train=False, download=True, transform=test_tf)
+    elif dataset_name == 'mnist':
+        test_ds = datasets.MNIST(data_root, train=False, download=True, transform=test_tf)
     elif dataset_name == 'tiny-imagenet':
         train_dir = data_root / "tiny-imagenet-200" / "train"
         test_dir = data_root / "tiny-imagenet-200" / "val"
@@ -1696,8 +1717,8 @@ def generate_full_report(
     print("[3/6] Evaluating model...")
     results = evaluate_model(
         model, test_loader, device,
-        num_classes=dataset_info['num_classes'],
-        class_names=dataset_info.get('classes'),
+        num_classes=spec.num_classes,
+        class_names=spec.classes,
     )
     
     print(f"      Accuracy: {results['accuracy']:.2f}%")
@@ -1867,7 +1888,8 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None,
                        help="Output directory for visualizations")
     parser.add_argument("--dataset", type=str, default="cifar10",
-                       choices=["cifar10", "cifar100", "tiny-imagenet"])
+                       choices=["cifar10", "cifar100", "mnist", "tiny-imagenet"],
+                       help="Dataset to use for evaluation")
     
     # 可视化选项
     parser.add_argument("--visualize-hilbert", action="store_true",
@@ -1945,12 +1967,12 @@ def main():
         print("\n[*] Generating adaptive scale selection visualizations...")
         
         model, config = load_model_and_config(checkpoint_path, device)
-        dataset_info = DATASETS.get(args.dataset, DATASETS['cifar10'])
+        spec = DATASETS.get(args.dataset, DATASETS['cifar10'])
         
         test_tf = transforms.Compose([
-            transforms.Resize(max(dataset_info['image_size'], 32)),
+            transforms.Resize(max(spec.image_size, 32)),
             transforms.ToTensor(),
-            transforms.Normalize(dataset_info['mean'], dataset_info['std']),
+            transforms.Normalize(spec.mean, spec.std),
         ])
         
         data_root = PROJECT_ROOT / "data"
@@ -1963,16 +1985,20 @@ def main():
             test_ds = datasets.CIFAR10(data_root, train=False, download=True, transform=test_tf)
         elif args.dataset == 'cifar100':
             test_ds = datasets.CIFAR100(data_root, train=False, download=True, transform=test_tf)
-        else:
+        elif args.dataset == 'mnist':
+            test_ds = datasets.MNIST(data_root, train=False, download=True, transform=test_tf)
+        elif args.dataset == 'tiny-imagenet':
             test_dir = data_root / "tiny-imagenet-200" / "val"
             test_ds = datasets.ImageFolder(str(test_dir), transform=test_tf)
+        else:
+            raise ValueError(f"Unknown dataset: {args.dataset}")
         
         test_loader = DataLoader(test_ds, batch_size=args.n_samples, shuffle=True, num_workers=2)
         sample_imgs, sample_labels = next(iter(test_loader))
         
         visualize_adaptive_scale_selection(
             model, sample_imgs, device,
-            class_names=dataset_info.get('classes'),
+            class_names=spec.classes,
             labels=sample_labels,
             save_path=output_dir / "adaptive_scale_selection.png",
             show=args.show,
