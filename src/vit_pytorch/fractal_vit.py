@@ -254,63 +254,72 @@ class FractalCurveViT(nn.Module):
             nn.Linear(dim // 2, 6),
         )
 
+    # 禁用 torch.compile 以支持可变长度 tokens
+    @torch._dynamo.disable
     def _prepare_tokens(
         self, img: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, List[int], List[torch.Tensor]]:
         """准备 tokens 和进行 padding。
         
         数学形式化：
-            T, L = S(I) where N = (H/p) × (W/p) is fixed
+            T, L = S(I) where N varies per image in variable_tokens mode
         
         Args:
             img: 输入图像 [B, C, H, W]
             
         Returns:
             (padded_tokens, padded_levels, lengths, levels_list):
-            - padded_tokens: tokens [B, N, Dim]
-            - padded_levels: 层级信息 [B, N, InfoDim]
-            - lengths: 每个样本的 token 数量 (固定)
+            - padded_tokens: tokens [B, MaxN, Dim] (padded)
+            - padded_levels: 层级信息 [B, MaxN, InfoDim]
+            - lengths: 每个样本的实际 token 数量
             - levels_list: 原始层级列表（用于辅助输出）
         """
         batch_size = img.shape[0]
         device = img.device
 
         # Streaming tokenizer 直接输出 D-dim embeddings
-        # N = (H/p) × (W/p) 是固定的，无需 padding
         token_output = self.tokenizer.tokenize(img)
         
         # 使用 TokenizerOutput 的标准方法获取数据
-        tokens_list = token_output.tokens_list()   # List[Tensor[N, D]]
-        levels_raw = token_output.levels_list()    # List[Tensor[N, info_len]]
+        tokens_list = token_output.tokens_list()   # List[Tensor[N_i, D]]
+        levels_raw = token_output.levels_list()    # List[Tensor[N_i, info_len]]
         
-        # 转换为 batched tensors
-        tokens_stacked = torch.stack(tokens_list, dim=0)  # [B, N, D]
-        N = tokens_stacked.shape[1]
+        # 获取每个样本的实际 token 数量
+        lengths = [t.shape[0] for t in tokens_list]
+        max_len = max(lengths)
+        
+        # 使用 pad_sequence 处理可变长度 tokens
+        # pad_sequence 默认 batch_first=False，需要转置
+        padded_tokens = torch.nn.utils.rnn.pad_sequence(
+            tokens_list, batch_first=True, padding_value=0.0
+        )  # [B, MaxN, D]
         
         # 构建 level info
+        info_dim = self.max_level + 4
         if levels_raw[0].dim() == 1:
-            # 如果是 1D，需要扩展
+            # 如果是 1D，需要扩展并 padding
             padded_levels = torch.zeros(
-                batch_size, N, self.max_level + 4,
+                batch_size, max_len, info_dim,
                 dtype=torch.long, device=device
             )
             for i, lv in enumerate(levels_raw):
-                padded_levels[i, :, 0] = lv
+                n = lv.shape[0]
+                padded_levels[i, :n, 0] = lv
         else:
-            # 已经是 2D [N, info_len]
-            levels_stacked = torch.stack(levels_raw, dim=0)  # [B, N, info_len]
-            info_len = levels_stacked.shape[2]
-            if info_len < self.max_level + 4:
-                pad_size = self.max_level + 4 - info_len
-                padding = torch.zeros(batch_size, N, pad_size, dtype=torch.long, device=device)
-                padded_levels = torch.cat([levels_stacked, padding], dim=2)
-            else:
-                padded_levels = levels_stacked[:, :, :self.max_level + 4]
+            # 已经是 2D [N_i, info_len]，需要 padding
+            padded_levels = torch.zeros(
+                batch_size, max_len, info_dim,
+                dtype=torch.long, device=device
+            )
+            for i, lv in enumerate(levels_raw):
+                n = lv.shape[0]
+                info_len = lv.shape[1]
+                copy_len = min(info_len, info_dim)
+                padded_levels[i, :n, :copy_len] = lv[:, :copy_len]
         
-        lengths = [N] * batch_size
         levels_list = levels_raw
         
-        return tokens_stacked, padded_levels, lengths, levels_list
+        return padded_tokens, padded_levels, lengths, levels_list
 
     def _apply_position_and_cls(
         self,
