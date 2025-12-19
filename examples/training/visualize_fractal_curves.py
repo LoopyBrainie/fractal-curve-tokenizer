@@ -1339,110 +1339,305 @@ def visualize_multiscale_hierarchy(
 # 可视化：混合尺度（Mixed Level）分割演示
 # ============================================================================
 
+def _simulate_gumbel_softmax(
+    logits: np.ndarray, 
+    tau: float, 
+    hard: bool = True,
+    seed: int = 42,
+) -> np.ndarray:
+    """模拟 Gumbel-Softmax 采样过程.
+    
+    数学形式:
+        g_i ~ Gumbel(0, 1)  # Gumbel 噪声
+        y_i = softmax((logits_i + g_i) / τ)  # 软采样
+        
+        if hard:
+            z = one_hot(argmax(y))  # 硬决策
+            return z - y.detach() + y  # STE 梯度
+    
+    Args:
+        logits: [H, W, num_scales] 尺度 logits
+        tau: Gumbel-Softmax 温度
+        hard: 是否使用硬采样 (STE)
+        seed: 随机种子
+        
+    Returns:
+        weights: [H, W, num_scales] 尺度权重 (soft) 或 one-hot (hard)
+    """
+    np.random.seed(seed)
+    
+    # 添加 Gumbel 噪声: g = -log(-log(u)), u ~ Uniform(0, 1)
+    u = np.random.uniform(0.001, 0.999, logits.shape)
+    gumbel_noise = -np.log(-np.log(u))
+    
+    # 带噪声的 softmax
+    noisy_logits = (logits + gumbel_noise) / tau
+    # 数值稳定的 softmax
+    exp_logits = np.exp(noisy_logits - np.max(noisy_logits, axis=-1, keepdims=True))
+    soft_weights = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
+    
+    if hard:
+        # Straight-Through Estimator: 前向 argmax，反向软梯度
+        hard_indices = np.argmax(soft_weights, axis=-1)
+        hard_weights = np.eye(logits.shape[-1])[hard_indices]
+        return hard_weights
+    else:
+        return soft_weights
+
+
+def _compute_semantic_logits(
+    img: np.ndarray,
+    grid_h: int,
+    grid_w: int,
+    min_ps: int,
+    num_scales: int,
+    depth_bias: float = 0.0,
+) -> np.ndarray:
+    """模拟语义级复杂度估计 (ComplexityHead).
+    
+    数学形式:
+        F_concat = Concat_{s}[Upsample(F_s, target_size)]  # 多尺度特征拼接
+        logits = ComplexityHead(F_concat)                   # 轻量级预测头
+        logits' = logits + depth_bias * scale_bias_weights  # 深度偏置
+    
+    这里用图像梯度作为"语义特征"的代理:
+        - 高梯度区域 → 更可能选择小 patch (深层级)
+        - 低梯度区域 → 更可能选择大 patch (浅层级)
+    
+    Args:
+        img: [H, W, 3] 输入图像
+        grid_h, grid_w: 决策网格大小
+        min_ps: 最小 patch size
+        num_scales: 尺度数量
+        depth_bias: 深度探索偏置强度
+        
+    Returns:
+        logits: [grid_h, grid_w, num_scales] 尺度 logits
+    """
+    # 1. 计算图像梯度作为"语义复杂度"代理
+    gray = np.mean(img, axis=2)
+    
+    # Sobel 梯度
+    gy = np.zeros_like(gray)
+    gx = np.zeros_like(gray)
+    gy[1:-1, :] = gray[2:, :] - gray[:-2, :]
+    gx[:, 1:-1] = gray[:, 2:] - gray[:, :-2]
+    gradient_magnitude = np.sqrt(gx**2 + gy**2)
+    
+    # 2. 下采样到网格级别
+    complexity_grid = np.zeros((grid_h, grid_w))
+    for i in range(grid_h):
+        for j in range(grid_w):
+            region = gradient_magnitude[i*min_ps:(i+1)*min_ps, j*min_ps:(j+1)*min_ps]
+            complexity_grid[i, j] = np.mean(region)
+    
+    # 归一化到 [0, 1]
+    if complexity_grid.max() > complexity_grid.min():
+        complexity_grid = (complexity_grid - complexity_grid.min()) / (complexity_grid.max() - complexity_grid.min())
+    
+    # 3. 转换为尺度 logits
+    # 高复杂度 → 偏好小 patch (index 0)
+    # 低复杂度 → 偏好大 patch (index num_scales-1)
+    logits = np.zeros((grid_h, grid_w, num_scales))
+    
+    for s in range(num_scales):
+        # 尺度权重: 小 patch (s=0) 在高复杂度区域有更高 logit
+        # 使用线性插值: scale_preference[s] = 1 - s / (num_scales - 1)
+        scale_preference = 1.0 - s / (num_scales - 1) if num_scales > 1 else 0.5
+        # logit = complexity * scale_preference - (1 - complexity) * (1 - scale_preference)
+        logits[:, :, s] = complexity_grid * scale_preference * 3.0 - (1 - complexity_grid) * (1 - scale_preference) * 3.0
+    
+    # 4. 添加深度偏置 (v2.2 特性)
+    # scale_bias_weights[s] = 1 - s / (num_scales - 1)，小尺度偏置大
+    if depth_bias > 0.01:
+        scale_bias_weights = np.linspace(1.0, 0.0, num_scales)
+        logits = logits + depth_bias * scale_bias_weights
+    
+    return logits
+
+
+def _enforce_quadtree_consistency(
+    scale_map: np.ndarray,
+    patch_sizes: List[int],
+    min_ps: int,
+) -> np.ndarray:
+    """强制四叉树一致性约束（与 StreamingFractalTokenizerV2 对齐）.
+    
+    数学约束:
+        若 scale_map[i,j] = k (选择尺度 k)
+        则 Block(i,j,k) 内所有位置必须为 k
+    
+    这确保了**没有重叠**：每个像素区域只被一个 token 覆盖。
+    
+    Args:
+        scale_map: [grid_h, grid_w] 每个位置的尺度索引
+        patch_sizes: 多尺度 patch 大小列表
+        min_ps: 最小 patch size
+        
+    Returns:
+        一致性约束后的 scale_map（无重叠的四叉树分割）
+    """
+    result = scale_map.copy()
+    grid_h, grid_w = scale_map.shape
+    num_scales = len(patch_sizes)
+    
+    # 从粗尺度到细尺度遍历（跳过最细尺度）
+    for scale_idx in range(num_scales - 1, 0, -1):
+        ps = patch_sizes[scale_idx]
+        block_size = ps // min_ps
+        
+        if block_size <= 1:
+            continue
+        
+        # 遍历每个 block
+        for by in range(0, grid_h, block_size):
+            for bx in range(0, grid_w, block_size):
+                by_end = min(by + block_size, grid_h)
+                bx_end = min(bx + block_size, grid_w)
+                
+                block = result[by:by_end, bx:bx_end]
+                
+                # 如果 block 内有任何位置选择了当前粗尺度或更粗，整个 block 统一
+                block_max = block.max()
+                if block_max >= scale_idx:
+                    result[by:by_end, bx:bx_end] = block_max
+    
+    return result
+
+
 def visualize_mixed_level_segmentation(
     base_size: int = 128,
     patch_sizes: List[int] = [4, 8, 16],
+    gumbel_tau: float = 2.0,
+    depth_bias: float = 0.0,
     save_path: Optional[Path] = None,
     show: bool = True,
 ) -> plt.Figure:
-    """可视化混合尺度分割的概念演示
+    """可视化混合尺度分割的概念演示（贴合项目数学形式化）.
     
-    模拟模型如何根据区域复杂度自适应选择不同的 patch 大小：
-    - 高复杂度区域 → 小 patch（精细分割）
-    - 低复杂度区域 → 大 patch（粗糙分割）
+    模拟 StreamingFractalTokenizerV2 的尺度选择机制：
     
-    这是一个概念演示，不需要实际模型，使用合成数据展示原理。
+    **核心数学形式**:
+    
+    1. **语义级复杂度估计** (v2.0):
+       .. math::
+           \\text{logits} = \\text{ComplexityHead}(\\text{Concat}_s[\\text{Upsample}(F_s)])
+       
+       这里用图像梯度作为语义特征的代理。
+    
+    2. **深度偏置 Warmup** (v2.2):
+       .. math::
+           \\text{logits}' = \\text{logits} + \\text{depth\\_bias} \\cdot \\text{scale\\_bias\\_weights}
+       
+       其中 scale_bias_weights = [1.0, 0.67, 0.33, 0.0] for 4 scales
+    
+    3. **Gumbel-Softmax 选择** (hard=True, STE):
+       .. math::
+           g_i \\sim \\text{Gumbel}(0, 1)
+           \\\\
+           \\pi_i = \\text{softmax}((\\text{logits}'_i + g_i) / \\tau)
+           \\\\
+           z = \\text{one\\_hot}(\\arg\\max \\pi)  \\quad \\text{(forward)}
+    
+    Args:
+        base_size: 模拟图像大小
+        patch_sizes: 多尺度 patch 大小 (从小到大排列)
+        gumbel_tau: Gumbel-Softmax 温度 τ (高温→均匀分布，低温→确定性)
+        depth_bias: 深度探索偏置强度 (>0 偏好小 patch)
+        save_path: 保存路径
+        show: 是否显示
+        
+    Returns:
+        matplotlib Figure 对象
+    
+    Note:
+        温度退火调度: τ 从 τ_max (5.0) 线性退火到 τ_min (0.5)
+        深度偏置调度: bias 从 max_bias (2.0) 快速衰减到 0
     """
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    
+    num_scales = len(patch_sizes)
+    scale_colors = ['#FF6B6B', '#45B7D1', '#96CEB4'][:num_scales]  # 红、蓝、绿
+    scale_labels = [f'{ps}×{ps}' for ps in patch_sizes]
     
     # ===== 创建模拟图像（带复杂度变化）=====
     np.random.seed(42)
     
-    # 创建复杂度图 (0=简单, 1=复杂)
-    complexity_map = np.zeros((base_size, base_size))
-    
-    # 中心区域高复杂度
+    # 创建合成图像：中心和左上角有高频细节
+    img = np.zeros((base_size, base_size, 3))
     center = base_size // 2
+    
     for i in range(base_size):
         for j in range(base_size):
             dist = np.sqrt((i - center)**2 + (j - center)**2)
+            
             if dist < base_size // 4:
-                complexity_map[i, j] = 0.9  # 高复杂度
-            elif dist < base_size // 2:
-                complexity_map[i, j] = 0.5  # 中等复杂度
-            else:
-                complexity_map[i, j] = 0.2  # 低复杂度
-    
-    # 左上角添加高复杂度区域
-    complexity_map[:base_size//4, :base_size//4] = 0.85
-    
-    # 创建合成图像（基于复杂度添加细节）
-    img = np.zeros((base_size, base_size, 3))
-    for i in range(base_size):
-        for j in range(base_size):
-            if complexity_map[i, j] > 0.7:
-                # 高频细节（棋盘格）
+                # 中心区域: 高频棋盘格
                 img[i, j] = [(i + j) % 2 * 0.8 + 0.1] * 3
-            elif complexity_map[i, j] > 0.4:
-                # 中频细节（条纹）
+            elif dist < base_size // 2:
+                # 过渡区域: 中频条纹
                 img[i, j] = [(i % 4 < 2) * 0.5 + 0.3] * 3
             else:
-                # 低频（平滑）
-                img[i, j] = [0.7, 0.8, 0.9]  # 浅蓝色背景
+                # 边缘区域: 低频平滑
+                img[i, j] = [0.7, 0.8, 0.9]
+            
+            # 左上角: 高频细节
+            if i < base_size // 4 and j < base_size // 4:
+                img[i, j] = [(i + j) % 2 * 0.7 + 0.2] * 3
     
     # ===== 1. 原始图像 =====
     ax1 = axes[0, 0]
     ax1.imshow(img)
-    ax1.set_title('Synthetic Image\n(with varying complexity)', fontsize=11)
+    ax1.set_title('Synthetic Image\n(varying complexity regions)', fontsize=11)
     ax1.axis('off')
     
-    # ===== 2. 复杂度热力图 =====
-    ax2 = axes[0, 1]
-    im = ax2.imshow(complexity_map, cmap='hot', vmin=0, vmax=1)
-    ax2.set_title('Complexity Map\n(simulated edge density)', fontsize=11)
-    ax2.axis('off')
-    plt.colorbar(im, ax=ax2, fraction=0.046, label='Complexity')
-    
-    # ===== 3. 尺度选择 =====
-    # 根据复杂度分配尺度：高复杂度→小patch，低复杂度→大patch
-    scale_colors = ['#FF6B6B', '#45B7D1', '#96CEB4']  # 红(4)、蓝(8)、绿(16)
-    scale_labels = [f'{ps}×{ps}' for ps in patch_sizes]
-    
-    # 使用最小的 patch size 来划分决策网格
+    # ===== 计算语义级 logits 和 Gumbel-Softmax 选择 =====
     min_ps = min(patch_sizes)
     grid_h, grid_w = base_size // min_ps, base_size // min_ps
     
-    # 为每个网格位置计算平均复杂度并选择尺度
-    scale_map = np.zeros((grid_h, grid_w), dtype=int)
-    for i in range(grid_h):
-        for j in range(grid_w):
-            region = complexity_map[i*min_ps:(i+1)*min_ps, j*min_ps:(j+1)*min_ps]
-            avg_complexity = np.mean(region)
-            
-            # 根据复杂度选择尺度
-            if avg_complexity > 0.6:
-                scale_map[i, j] = 0  # 最细 (4×4)
-            elif avg_complexity > 0.35:
-                scale_map[i, j] = 1  # 中等 (8×8)
-            else:
-                scale_map[i, j] = 2  # 最粗 (16×16)
+    # 计算语义级 logits (模拟 ComplexityHead)
+    logits = _compute_semantic_logits(img, grid_h, grid_w, min_ps, num_scales, depth_bias)
     
+    # Gumbel-Softmax 软权重 (用于可视化概率分布)
+    soft_weights = _simulate_gumbel_softmax(logits, gumbel_tau, hard=False, seed=42)
+    
+    # Gumbel-Softmax 硬决策 (用于最终尺度选择)
+    hard_weights = _simulate_gumbel_softmax(logits, gumbel_tau, hard=True, seed=42)
+    scale_map_raw = np.argmax(hard_weights, axis=-1)  # [grid_h, grid_w]
+    
+    # ===== 应用四叉树一致性约束（与实际实现对齐）=====
+    # 这确保了没有重叠：每个像素区域只被一个 token 覆盖
+    scale_map = _enforce_quadtree_consistency(scale_map_raw, patch_sizes, min_ps)
+    
+    # ===== 2. Gumbel-Softmax 概率分布 =====
+    ax2 = axes[0, 1]
+    # 显示最细尺度 (index 0) 的选择概率
+    prob_fine = soft_weights[:, :, 0]
+    im = ax2.imshow(prob_fine, cmap='hot', vmin=0, vmax=1,
+                   extent=[0, base_size, base_size, 0])
+    ax2.set_title(f'Gumbel-Softmax P(fine scale)\n'
+                 f'τ={gumbel_tau:.1f}, depth_bias={depth_bias:.1f}', fontsize=11)
+    ax2.axis('off')
+    cbar = plt.colorbar(im, ax=ax2, fraction=0.046)
+    cbar.set_label(f'P(patch={patch_sizes[0]}×{patch_sizes[0]})', fontsize=9)
+    
+    # ===== 3. 硬决策尺度选择 =====
     ax3 = axes[0, 2]
     scale_img = np.zeros((grid_h, grid_w, 3))
-    for s in range(len(patch_sizes)):
+    for s in range(num_scales):
         mask = scale_map == s
         color = np.array(plt.cm.colors.hex2color(scale_colors[s]))
         scale_img[mask] = color
     
-    ax3.imshow(scale_img, interpolation='nearest', 
-                extent=[0, base_size, base_size, 0])
-    ax3.set_title('Scale Selection\n(based on complexity)', fontsize=11)
+    ax3.imshow(scale_img, interpolation='nearest',
+               extent=[0, base_size, base_size, 0])
+    ax3.set_title('Scale Selection (hard=True, STE)\nz = one_hot(argmax π)', fontsize=11)
     ax3.axis('off')
     
-    # 添加图例
-    legend_patches = [mpatches.Patch(color=scale_colors[i], 
-                                    label=f'{scale_labels[i]} (Scale {i+1})')
-                    for i in range(len(patch_sizes))]
+    # 图例
+    legend_patches = [mpatches.Patch(color=scale_colors[i],
+                                    label=f'{scale_labels[i]} (scale {i})')
+                     for i in range(num_scales)]
     ax3.legend(handles=legend_patches, loc='upper right', fontsize=8)
     
     # ===== 4. 混合分割叠加 =====
@@ -1454,137 +1649,147 @@ def visualize_mixed_level_segmentation(
         for j in range(grid_w):
             scale = scale_map[i, j]
             ps = patch_sizes[scale]
-            
-            # 只在 patch 边界绘制
             x0, y0 = j * min_ps, i * min_ps
             
-            # 检查是否是该尺度 patch 的左上角
-            if scale == 0:  # 4×4, 每个格子都画
-                rect = Rectangle((x0, y0), min_ps, min_ps, 
-                                fill=False, edgecolor=scale_colors[0], 
+            # 根据尺度决定是否绘制 (只在对齐边界绘制)
+            if scale == 0:  # 最细尺度: 每个格子都画
+                rect = Rectangle((x0, y0), min_ps, min_ps,
+                                fill=False, edgecolor=scale_colors[0],
                                 linewidth=1.5, alpha=0.8)
                 ax4.add_patch(rect)
-            elif scale == 1:  # 8×8
-                if i % 2 == 0 and j % 2 == 0:
-                    rect = Rectangle((x0, y0), min_ps * 2, min_ps * 2, 
-                                    fill=False, edgecolor=scale_colors[1], 
+            elif scale == 1 and num_scales > 1:  # 中等尺度
+                ratio = patch_sizes[1] // min_ps
+                if i % ratio == 0 and j % ratio == 0:
+                    rect = Rectangle((x0, y0), min_ps * ratio, min_ps * ratio,
+                                    fill=False, edgecolor=scale_colors[1],
                                     linewidth=2, alpha=0.8)
                     ax4.add_patch(rect)
-            else:  # 16×16
-                if i % 4 == 0 and j % 4 == 0:
-                    rect = Rectangle((x0, y0), min_ps * 4, min_ps * 4, 
-                                    fill=False, edgecolor=scale_colors[2], 
+            elif scale == 2 and num_scales > 2:  # 最粗尺度
+                ratio = patch_sizes[2] // min_ps
+                if i % ratio == 0 and j % ratio == 0:
+                    rect = Rectangle((x0, y0), min_ps * ratio, min_ps * ratio,
+                                    fill=False, edgecolor=scale_colors[2],
                                     linewidth=2.5, alpha=0.8)
                     ax4.add_patch(rect)
     
     ax4.set_xlim(0, base_size)
     ax4.set_ylim(base_size, 0)
-    ax4.set_title('Mixed-Level Segmentation\n(adaptive patches)', fontsize=11)
+    ax4.set_title('Mixed-Level Segmentation\n(adaptive patch boundaries)', fontsize=11)
     ax4.axis('off')
     
-    # ===== 5. Hilbert 遍历路径 - 展示不同尺度的像素区域大小 =====
-    # 核心：每个 token 位置用方块大小表示其尺度（patch_size）
+    # ===== 5. Hilbert 遍历路径 (Variable Token 模式, 默认) =====
+    # 关键：在 variable_tokens=True 模式下，一个 patch = 一个 token
+    # Token 数量可变：N ∈ [N_min, N_max]
     ax5 = axes[1, 1]
     ax5.imshow(img, alpha=0.3)
     
-    # 使用最细网格的 Hilbert 路径
+    # 收集所有唯一的 patch（一个 patch = 一个 token）
+    # 需要强制四叉树一致性：粗尺度区域内所有位置使用相同尺度
+    unique_patches = []  # (patch_row, patch_col, scale, ps)
+    visited = set()
+    
+    for i in range(grid_h):
+        for j in range(grid_w):
+            scale = scale_map[i, j]
+            ps = patch_sizes[scale]
+            # 计算该位置所属的 patch 左上角
+            patch_row = (i * min_ps // ps) * ps
+            patch_col = (j * min_ps // ps) * ps
+            patch_key = (patch_row, patch_col, scale)
+            
+            if patch_key not in visited:
+                visited.add(patch_key)
+                # 计算 patch 中心用于 Hilbert 排序
+                cx = patch_col + ps // 2
+                cy = patch_row + ps // 2
+                unique_patches.append((patch_row, patch_col, scale, ps, cx, cy))
+    
+    # 按 Hilbert 顺序排序这些 patch
+    # 使用 patch 中心点的 Hilbert 距离作为排序键
     n = 1
-    while n < grid_h:
+    while n * min_ps < base_size:
         n *= 2
     
-    # 按 Hilbert 顺序收集点，并绘制表示尺度的矩形
-    hilbert_order = []
-    for d in range(n * n):
-        x, y = HilbertCurve.d_to_xy(n, d)
-        if x < grid_w and y < grid_h:
-            scale = scale_map[y, x]
-            ps = patch_sizes[scale]
-            # 像素坐标
-            px = x * min_ps
-            py = y * min_ps
-            # 中心点（用于连线）
-            cx = px + min_ps // 2
-            cy = py + min_ps // 2
-            hilbert_order.append((cx, cy, px, py, scale, ps))
+    def get_hilbert_distance(cx, cy):
+        """计算像素坐标对应的 Hilbert 距离"""
+        gx, gy = cx // min_ps, cy // min_ps
+        gx = min(gx, n - 1)
+        gy = min(gy, n - 1)
+        return HilbertCurve.xy_to_d(n, gx, gy)
     
-    # 先画 Hilbert 连线（深色，更明显）
-    if len(hilbert_order) > 1:
-        for i in range(len(hilbert_order) - 1):
-            cx1, cy1 = hilbert_order[i][0], hilbert_order[i][1]
-            cx2, cy2 = hilbert_order[i+1][0], hilbert_order[i+1][1]
-            ax5.plot([cx1, cx2], [cy1, cy2], 
-                    color='#2C3E50', linewidth=1.2, alpha=0.85, zorder=1)
+    sorted_patches = sorted(unique_patches, key=lambda p: get_hilbert_distance(p[4], p[5]))
     
-    # 绘制每个 token 的覆盖区域（用方块大小表示尺度）
-    # 为避免重叠，只在每个 patch 的"起始位置"绘制
-    drawn_patches = set()
-    for idx, (cx, cy, px, py, scale, ps) in enumerate(hilbert_order):
-        # 计算这个 token 对应的 patch 左上角（按其尺度对齐）
-        patch_row = (py // ps) * ps
-        patch_col = (px // ps) * ps
-        patch_key = (patch_row, patch_col, scale)
+    # 绘制 Hilbert 连线（连接 patch 中心）
+    if len(sorted_patches) > 1:
+        for i in range(len(sorted_patches) - 1):
+            cx1, cy1 = sorted_patches[i][4], sorted_patches[i][5]
+            cx2, cy2 = sorted_patches[i+1][4], sorted_patches[i+1][5]
+            ax5.plot([cx1, cx2], [cy1, cy2],
+                    color='#2C3E50', linewidth=1.5, alpha=0.9, zorder=1)
+    
+    # 绘制每个 token（一个 patch = 一个 token）
+    for token_idx, (patch_row, patch_col, scale, ps, cx, cy) in enumerate(sorted_patches):
+        # 绘制 patch 区域
+        rect = Rectangle((patch_col, patch_row), ps, ps,
+                        facecolor=scale_colors[scale], alpha=0.5,
+                        edgecolor=scale_colors[scale], linewidth=2,
+                        zorder=2)
+        ax5.add_patch(rect)
         
-        if patch_key not in drawn_patches:
-            drawn_patches.add(patch_key)
-            
-            # 绘制 patch 区域（填充+边框）
-            rect = Rectangle((patch_col, patch_row), ps, ps,
-                            facecolor=scale_colors[scale], alpha=0.4,
-                            edgecolor=scale_colors[scale], linewidth=2,
-                            zorder=2)
-            ax5.add_patch(rect)
-            
-            # 在 patch 中心标注序号（表示 Hilbert 遍历顺序）
-            token_idx = len(drawn_patches)
-            if ps >= 8:  # 只在较大的 patch 中显示序号
-                ax5.text(patch_col + ps/2, patch_row + ps/2, 
-                        str(token_idx), ha='center', va='center',
-                        fontsize=7 if ps >= 16 else 5, fontweight='bold',
-                        color='white', zorder=3)
+        # 在 patch 中心标注 token 序号
+        ax5.text(cx, cy, str(token_idx + 1),
+                ha='center', va='center',
+                fontsize=8 if ps >= 12 else 6, fontweight='bold',
+                color='white', zorder=3,
+                bbox=dict(boxstyle='circle,pad=0.15', facecolor=scale_colors[scale], 
+                         edgecolor='white', linewidth=0.5, alpha=0.8))
     
     ax5.set_xlim(0, base_size)
     ax5.set_ylim(base_size, 0)
-    ax5.set_title(f'Hilbert Traversal with Variable Patch Sizes\n'
-                 f'(box size = patch size, {len(drawn_patches)} tokens)', fontsize=11)
-    
-    # 图例
-    legend_patches = [mpatches.Patch(color=scale_colors[i], alpha=0.5,
-                                     label=f'{patch_sizes[i]}×{patch_sizes[i]} px')
-                     for i in range(len(patch_sizes))]
-    ax5.legend(handles=legend_patches, loc='upper right', fontsize=8)
+    ax5.set_title(f'Variable Token Mode (default): {len(sorted_patches)} tokens\n'
+                 f'(1 patch = 1 token, Hilbert ordered)',
+                 fontsize=10)
+    ax5.legend(handles=[mpatches.Patch(color=c, alpha=0.5, label=f'{ps}×{ps}')
+                       for c, ps in zip(scale_colors, patch_sizes)],
+              loc='upper right', fontsize=8)
     ax5.axis('off')
     
-    # ===== 6. Token 数量对比 =====
+    # ===== 6. Token 数量与温度效应对比 =====
     ax6 = axes[1, 2]
     
-    # 计算各种方案的 token 数
-    fixed_tokens = [(base_size // ps) ** 2 for ps in patch_sizes]
+    # 计算不同温度下的尺度分布
+    temps = [5.0, 2.0, 0.5]
+    temp_distributions = []
+    for tau in temps:
+        hw = _simulate_gumbel_softmax(logits, tau, hard=True, seed=42)
+        sm = np.argmax(hw, axis=-1)
+        dist = [np.sum(sm == s) / sm.size for s in range(num_scales)]
+        temp_distributions.append(dist)
     
-    # 混合尺度 token 数估算
-    mixed_tokens = 0
-    for scale_idx, ps in enumerate(patch_sizes):
-        count = np.sum(scale_map == scale_idx)
-        tokens_per_region = (ps // min_ps) ** 2
-        mixed_tokens += count // tokens_per_region
+    x = np.arange(num_scales)
+    width = 0.25
     
-    labels = [f'Fixed {ps}×{ps}' for ps in patch_sizes] + ['Mixed Level']
-    values = fixed_tokens + [mixed_tokens]
-    colors = scale_colors + ['#FFD93D']  # 黄色表示混合
+    for i, (tau, dist) in enumerate(zip(temps, temp_distributions)):
+        offset = (i - 1) * width
+        bars = ax6.bar(x + offset, dist, width, label=f'τ={tau}',
+                      color=plt.cm.Blues(0.3 + i * 0.25), edgecolor='black')
     
-    bars = ax6.bar(labels, values, color=colors, edgecolor='black', linewidth=1)
-    ax6.set_ylabel('Number of Tokens', fontsize=10)
-    ax6.set_title('Token Count Comparison', fontsize=11)
+    ax6.set_xlabel('Scale Index', fontsize=10)
+    ax6.set_ylabel('Selection Ratio', fontsize=10)
+    ax6.set_title('Temperature Annealing Effect\n(τ: 5.0 → 0.5)', fontsize=11)
+    ax6.set_xticks(x)
+    ax6.set_xticklabels([f'{ps}×{ps}' for ps in patch_sizes])
+    ax6.legend(title='Gumbel τ', fontsize=8)
+    ax6.set_ylim(0, 1)
     
-    # 在柱状图上标注数值
-    for bar, val in zip(bars, values):
-        ax6.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-                str(int(val)), ha='center', va='bottom', fontsize=9)
+    # 添加数学公式注释
+    ax6.text(0.02, 0.98, r'$\pi = \mathrm{softmax}(\frac{\mathrm{logits} + g}{\tau})$',
+            transform=ax6.transAxes, fontsize=9, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
-    ax6.set_ylim(0, max(values) * 1.15)
-    plt.setp(ax6.get_xticklabels(), rotation=15, ha='right')
-    
-    fig.suptitle(f'Mixed-Level (Adaptive) Tokenization Demo\n'
-                f'Image Size: {base_size}×{base_size}, Patch Sizes: {patch_sizes}', 
+    fig.suptitle(f'StreamingFractalTokenizerV2: Gumbel-Softmax Scale Selection\n'
+                f'Image: {base_size}×{base_size}, Patches: {patch_sizes}, '
+                f'τ={gumbel_tau:.1f}, depth_bias={depth_bias:.1f}',
                 fontsize=14, fontweight='bold')
     plt.tight_layout()
     

@@ -1140,6 +1140,9 @@ def load_model_and_config(
         tokenizer_type="streaming_v2",
         num_scales=config.get('num_scales', 3),
         streaming_tau=config.get('gumbel_tau_init', 2.0),
+        # V2 Tokenizer 配置 (与训练脚本对齐)
+        variable_tokens=config.get('variable_tokens', True),
+        use_soft_weights=config.get('use_soft_weights', False),
     ).to(device)
     
     # 配置 Tokenizer 的深度偏置预热参数 (与训练脚本一致)
@@ -1155,20 +1158,30 @@ def load_model_and_config(
             model.tokenizer.tau_min = config.get('gumbel_tau_min', 0.5)
             model.tokenizer.tau_max = config.get('gumbel_tau_max', 5.0)
     
-    # 处理旧版检查点的键名映射
+    # 处理检查点的键名映射
     state_dict = ckpt['model_state_dict']
     new_state_dict = {}
     renamed_keys = []
+    compiled_prefix_stripped = False
     
     for key, value in state_dict.items():
         new_key = key
+        
+        # 处理 torch.compile 生成的 _orig_mod. 前缀
+        if new_key.startswith('_orig_mod.'):
+            new_key = new_key[len('_orig_mod.'):]
+            compiled_prefix_stripped = True
+        
         # 旧版: complexity_estimator -> 新版: complexity_head (结构不同，无法直接映射)
         # 旧版: depth_selector -> 新版: 已移除
-        if 'complexity_estimator' in key or 'depth_selector' in key:
+        if 'complexity_estimator' in new_key or 'depth_selector' in new_key:
             # 这些键在新架构中不存在，跳过
             renamed_keys.append(key)
             continue
         new_state_dict[new_key] = value
+    
+    if compiled_prefix_stripped:
+        print(f"[INFO] Stripped '_orig_mod.' prefix from torch.compile checkpoint ({len(state_dict)} keys)")
     
     if renamed_keys:
         print(f"[WARN] Checkpoint uses old architecture. Skipping {len(renamed_keys)} incompatible keys:")
@@ -1763,7 +1776,7 @@ def generate_full_report(
     if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'complexity_head'):
         visualize_adaptive_scale_selection(
             model, sample_imgs[:8], device,
-            class_names=dataset_info.get('classes'),
+            class_names=spec.classes,
             labels=sample_labels[:8],
             save_path=output_dir / "adaptive_scale_selection.png",
             show=show,
@@ -1807,7 +1820,7 @@ def generate_full_report(
     
     visualize_confusion_matrix(
         results['confusion_matrix'],
-        class_names=dataset_info.get('classes'),
+        class_names=spec.classes,
         save_path=output_dir / "confusion_matrix.png",
         show=show,
     )
@@ -1820,7 +1833,7 @@ def generate_full_report(
     
     visualize_sample_predictions(
         model, test_loader, device,
-        class_names=dataset_info.get('classes'),
+        class_names=spec.classes,
         n_samples=16,
         save_path=output_dir / "sample_predictions.png",
         show=show,

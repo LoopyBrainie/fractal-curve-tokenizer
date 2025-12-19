@@ -1038,8 +1038,10 @@ def main():
                        help="Maximum temperature for annealing")
     
     # Tokenizer 配置
-    parser.add_argument("--variable-tokens", action="store_true",
-                       help="Enable variable token count mode")
+    parser.add_argument("--variable-tokens", action="store_true", default=True,
+                       help="Enable variable token count mode (default: True)")
+    parser.add_argument("--no-variable-tokens", action="store_false", dest="variable_tokens",
+                       help="Disable variable token count mode (use fixed tokens)")
     parser.add_argument("--use-soft-weights", action="store_true",
                        help="Use soft weights in Gumbel-Softmax (may cause train/eval mismatch)")
     
@@ -1187,6 +1189,9 @@ def main():
         tokenizer_type="streaming_v2",
         num_scales=config.num_scales,
         streaming_tau=config.gumbel_tau_init,
+        # V2 Tokenizer 配置
+        variable_tokens=config.variable_tokens,
+        use_soft_weights=config.use_soft_weights,
     ).to(device)
     
     # 配置 Tokenizer 的深度偏置预热参数
