@@ -8,11 +8,7 @@ Streaming Fractal Tokenizer - 统一架构实现
 Tokenization 过程:
     T: R^{B × C × H × W} → (T ∈ R^{B × N × D}, L ∈ Z^{B × N})
 
-模式 1 (固定 Token 数量, variable_tokens=False):
-    N = (H/p_min) × (W/p_min) 是固定的 token 数量
-    所有尺度特征加权融合后输出
-
-模式 2 (可变 Token 数量, variable_tokens=True):
+模式 1 (可变 Token 数量, variable_tokens=True, 默认):
     N ∈ [N_min, N_max] 根据图像内容自适应
     Patch = Token: 分割决策直接产生 token
     
@@ -21,6 +17,10 @@ Tokenization 过程:
         2. 四叉树一致性: s_{i'j'} = s_{ij}, ∀(i',j') ∈ Block(i,j,s)
         3. Token 提取: T_k = PatchEmbed_{s_k}(P_k)
         4. Hilbert 排序: T = HilbertSort(T, paths)
+
+模式 2 (固定 Token 数量, variable_tokens=False):
+    N = (H/p_min) × (W/p_min) 是固定的 token 数量
+    所有尺度特征加权融合后输出
 
 核心组件
 --------
@@ -778,7 +778,7 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
         gumbel_tau_min: float = 0.5,
         gumbel_tau_max: float = 5.0,
         use_soft_weights: bool = False,
-        variable_tokens: bool = False,
+        variable_tokens: bool = True,  # 默认启用可变 token 模式
     ) -> None:
         """初始化 StreamingFractalTokenizerV2.
         
@@ -796,8 +796,8 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
                 - False (默认): 使用 STE (hard=True)，train/eval 一致
                 - True: 训练时使用软权重 (可能导致 train/eval 差异)
             variable_tokens: 是否启用可变 Token 数量模式
-                - False (默认): 固定 token 数量，特征加权融合
-                - True: Patch=Token 直接映射，token 数量可变
+                - True (默认): Patch=Token 直接映射，token 数量可变
+                - False: 固定 token 数量，特征加权融合
         
         See Also:
             from_config: 从 FractalConfig 创建实例 (推荐)
@@ -1248,8 +1248,8 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
         
         根据 variable_tokens 参数选择不同的 tokenization 策略:
         
-        - variable_tokens=False (默认): 固定 token 数量，加权融合
-        - variable_tokens=True: Patch=Token 直接映射，可变数量
+        - variable_tokens=True (默认): Patch=Token 直接映射，可变数量
+        - variable_tokens=False: 固定 token 数量，加权融合
         
         **v2.0 重构**: 执行流程改变
         

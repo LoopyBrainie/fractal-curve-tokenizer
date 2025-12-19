@@ -102,6 +102,9 @@ class FractalCurveViT(nn.Module):
         tokenizer_type: TokenizerType = "streaming_v2",
         num_scales: int = 4,
         streaming_tau: float = 1.0,
+        # V2 Tokenizer 配置 (variable_tokens 模式)
+        variable_tokens: bool = True,
+        use_soft_weights: bool = False,
     ) -> None:
         """初始化 FractalCurveViT。
         
@@ -129,6 +132,12 @@ class FractalCurveViT(nn.Module):
                 - "streaming_v2": StreamingFractalTokenizerV2 (Gumbel-Softmax, 推荐)
             num_scales: 多尺度金字塔层数
             streaming_tau: [streaming_v2] Gumbel-Softmax 温度参数
+            variable_tokens: [streaming_v2] 是否启用可变 Token 数量模式
+                - True (默认): Patch=Token 直接映射，token 数量可变
+                - False: 固定 token 数量，使用加权融合
+            use_soft_weights: [streaming_v2] 是否使用软权重
+                - False (默认): 使用 Straight-Through Estimator (STE)
+                - True: 使用软权重（可能导致 train/eval 不一致）
         """
         super().__init__()
 
@@ -169,6 +178,8 @@ class FractalCurveViT(nn.Module):
                 patch_sizes=patch_sizes_tuple,
                 max_level=max_level,
                 gumbel_temperature=streaming_tau,
+                variable_tokens=variable_tokens,
+                use_soft_weights=use_soft_weights,
             )
         else:
             raise ValueError(f"Unknown tokenizer_type: {tokenizer_type}")

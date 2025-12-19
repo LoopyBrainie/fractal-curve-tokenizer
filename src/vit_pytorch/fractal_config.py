@@ -109,7 +109,7 @@ class FractalConfig:
     low_rank_r: int = 32
     
     # ========== Tokenizer 配置 ==========
-    variable_tokens: bool = False
+    variable_tokens: bool = True  # 默认启用可变 token 模式 (Patch=Token)
     use_soft_weights: bool = False
     
     # ========== 推导参数 (自动计算) ==========
