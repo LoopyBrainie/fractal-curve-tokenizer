@@ -1398,6 +1398,8 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
         3. Token 提取: 直接从对应尺度的特征图提取
         4. Hilbert 排序: 按四叉树路径进行 Hilbert 排序
         
+        **v2.3 优化**: 使用向量化操作替代 Python 循环，GPU 友好
+        
         优势:
             - Token 数量自适应 (N ∈ [N_min, N_max])
             - 无冗余计算 (不生成不需要的细粒度 token)
@@ -1406,87 +1408,152 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
         # 1. 获取硬尺度决策
         scale_map = scale_weights.argmax(dim=1)  # [B, grid_h, grid_w]
         
-        # 2. 强制四叉树一致性
-        scale_map = self._enforce_quadtree_consistency(scale_map, grid_h, grid_w)
+        # 2. 强制四叉树一致性 (向量化)
+        scale_map = self._enforce_quadtree_consistency_vectorized(scale_map, grid_h, grid_w)
         
-        # 3. 按尺度提取 token
+        # 3. 向量化 token 提取 (带 padding)
+        return self._extract_tokens_vectorized(
+            features_dict, scale_map, B, grid_h, grid_w, device
+        )
+    
+    def _enforce_quadtree_consistency_vectorized(
+        self,
+        scale_map: torch.Tensor,
+        grid_h: int,
+        grid_w: int,
+    ) -> torch.Tensor:
+        """向量化的四叉树一致性约束.
+        
+        使用 max pooling + upsampling 替代 Python 循环。
+        
+        数学约束:
+            若 Block(i,j) 内存在粗尺度选择，整个 Block 使用该粗尺度
+        """
+        B = scale_map.shape[0]
+        result = scale_map.float()  # 转为 float 以便使用 max_pool2d
+        min_ps = min(self.patch_sizes)
+        
+        # 从粗尺度到细尺度处理
+        for scale_idx in range(len(self.patch_sizes) - 1, 0, -1):
+            ps = self.patch_sizes[scale_idx]
+            block_size = ps // min_ps
+            
+            if block_size <= 1:
+                continue
+            
+            # 使用 max_pool + upsample 实现 block 内最大值传播
+            # 1. Max pool: 每个 block 取最大尺度索引
+            pooled = F.max_pool2d(
+                result.unsqueeze(1),  # [B, 1, H, W]
+                kernel_size=block_size,
+                stride=block_size,
+                padding=0,
+            )  # [B, 1, H//bs, W//bs]
+            
+            # 2. Upsample: 扩展回原始尺寸
+            upsampled = F.interpolate(
+                pooled,
+                size=(grid_h, grid_w),
+                mode='nearest',
+            ).squeeze(1)  # [B, H, W]
+            
+            # 3. 只在粗尺度区域应用
+            coarse_mask = (upsampled >= scale_idx)
+            result = torch.where(coarse_mask, upsampled, result)
+        
+        return result.long()
+    
+    def _extract_tokens_vectorized(
+        self,
+        features_dict: Dict[int, Tuple[torch.Tensor, Tuple[int, int]]],
+        scale_map: torch.Tensor,
+        B: int,
+        grid_h: int,
+        grid_w: int,
+        device: torch.device,
+    ) -> TokenizerOutput:
+        """向量化的 token 提取 (使用 padding 统一序列长度).
+        
+        策略:
+            1. 所有尺度特征上采样到最细网格
+            2. 根据 scale_map 选择对应尺度的特征
+            3. 使用 Hilbert 重排
+            4. 生成 mask 标记有效 token
+        
+        这样避免了逐样本处理，实现 batch 级并行。
+        """
+        min_ps = min(self.patch_sizes)
+        
+        # 1. 上采样所有尺度到最细网格，构建特征金字塔
+        # 形状: [B, num_scales, D, grid_h, grid_w]
+        D = features_dict[min_ps][0].shape[1]
+        all_features = torch.zeros(B, len(self.patch_sizes), D, grid_h, grid_w, device=device)
+        
+        for scale_idx, ps in enumerate(self.patch_sizes):
+            if ps not in features_dict:
+                continue
+            feat, (fh, fw) = features_dict[ps]  # [B, D, fh, fw]
+            
+            if fh != grid_h or fw != grid_w:
+                # 最近邻上采样保持离散特征
+                feat = F.interpolate(
+                    feat,
+                    size=(grid_h, grid_w),
+                    mode='nearest',
+                )
+            all_features[:, scale_idx] = feat
+        
+        # 2. 根据 scale_map 选择特征 (向量化 gather)
+        # scale_map: [B, grid_h, grid_w] -> [B, 1, 1, grid_h, grid_w]
+        scale_idx_expanded = scale_map.unsqueeze(1).unsqueeze(2).expand(-1, 1, D, -1, -1)
+        # 选择: [B, D, grid_h, grid_w]
+        selected_features = torch.gather(
+            all_features, 
+            dim=1, 
+            index=scale_idx_expanded
+        ).squeeze(1)
+        
+        # 3. Hilbert 重排
+        if self.use_hilbert_order:
+            tokens = HilbertIndexer.reorder_to_hilbert(selected_features, grid_h, grid_w)
+        else:
+            tokens = selected_features.flatten(2).transpose(1, 2)  # [B, N, D]
+        
+        num_tokens = tokens.shape[1]
+        
+        # 4. 应用特征融合
+        tokens = self.feature_fusion(tokens)
+        
+        # 5. 构建 levels_info (向量化)
+        # 获取每个位置的层级
+        scale_to_level_tensor = torch.tensor(
+            [self.scale_to_level[ps] for ps in self.patch_sizes],
+            device=device,
+            dtype=torch.long
+        )
+        levels_map = scale_to_level_tensor[scale_map]  # [B, grid_h, grid_w]
+        
+        # Hilbert 重排 levels
+        if self.use_hilbert_order:
+            hilbert_idx = HilbertIndexer.get_hilbert_order_on_device(max(grid_h, grid_w), device)
+            valid_len = min(len(hilbert_idx), grid_h * grid_w)
+            levels_flat = levels_map.flatten(1)  # [B, grid_h * grid_w]
+            levels_reordered = levels_flat[:, hilbert_idx[:valid_len]]
+        else:
+            levels_reordered = levels_map.flatten(1)
+        
+        # 6. 构建 levels_info: [B, N, info_len]
+        info_len = min(self.max_level + 1, 16)
+        levels_info = torch.zeros(B, num_tokens, info_len, dtype=torch.long, device=device)
+        levels_info[:, :, 0] = levels_reordered
+        
+        # 7. 拆分为 B 个独立的 TokenSequence (兼容现有接口)
         sequences = []
-        
         for b in range(B):
-            tokens_list = []
-            levels_list = []
-            positions_list = []  # (scale_idx, y, x) 用于 Hilbert 排序
-            
-            sample_scale_map = scale_map[b]  # [grid_h, grid_w]
-            
-            for scale_idx, ps in enumerate(self.patch_sizes):
-                if ps not in features_dict:
-                    continue
-                    
-                feat, (fh, fw) = features_dict[ps]  # [B, D, fh, fw]
-                level = self.scale_to_level[ps]
-                
-                # 计算当前尺度相对于最细网格的比例
-                scale_ratio = ps // min(self.patch_sizes)
-                
-                # 找到选择当前尺度的区域 (在最细网格上)
-                # 需要检查整个 block 是否都选择了当前尺度
-                for fy in range(fh):
-                    for fx in range(fw):
-                        # 对应的最细网格区域
-                        gy_start = fy * scale_ratio
-                        gx_start = fx * scale_ratio
-                        
-                        # 检查该 block 是否选择了当前尺度
-                        block = sample_scale_map[
-                            gy_start:gy_start + scale_ratio,
-                            gx_start:gx_start + scale_ratio
-                        ]
-                        
-                        # 如果 block 内所有位置都选择了当前尺度
-                        if (block == scale_idx).all():
-                            token = feat[b, :, fy, fx]  # [D]
-                            tokens_list.append(token)
-                            levels_list.append(level)
-                            positions_list.append((level, fy, fx, fh, fw))
-            
-            # 4. 创建 levels_info
-            num_tokens = len(tokens_list)
-            
-            if num_tokens == 0:
-                # 回退：至少输出一个 token
-                min_ps = min(features_dict.keys())
-                feat, _ = features_dict[min_ps]
-                tokens_list.append(feat[b, :, 0, 0])
-                levels_list.append(self.scale_to_level[min_ps])
-                positions_list.append((self.scale_to_level[min_ps], 0, 0, 1, 1))
-                num_tokens = 1
-            
-            # 5. Hilbert 排序
-            if self.use_hilbert_order and num_tokens > 1:
-                sorted_indices = self._hilbert_sort_by_position(positions_list)
-                tokens_list = [tokens_list[i] for i in sorted_indices]
-                levels_list = [levels_list[i] for i in sorted_indices]
-                positions_list = [positions_list[i] for i in sorted_indices]
-            
-            # 6. 构建 token 张量和 levels_info
-            tokens = torch.stack(tokens_list)  # [N, D]
-            tokens = self.feature_fusion(tokens)  # 应用特征融合
-            
-            # 构建 levels_info: [N, info_len]
-            info_len = min(self.max_level + 1, 16)
-            levels_info = torch.zeros(num_tokens, info_len, dtype=torch.long, device=device)
-            
-            for i, (level, fy, fx, fh, fw) in enumerate(positions_list):
-                levels_info[i, 0] = level
-                # 填充四叉树路径
-                path = self._compute_quadtree_path(fy, fx, fh, fw, info_len - 1)
-                levels_info[i, 1:1+len(path)] = torch.tensor(path, device=device)
-            
             seq = TokenSequence(
-                tokens=tokens,
+                tokens=tokens[b],  # [N, D]
                 metadata={
-                    "levels": levels_info,
+                    "levels": levels_info[b],  # [N, info_len]
                     "num_tokens": num_tokens,
                 },
             )
