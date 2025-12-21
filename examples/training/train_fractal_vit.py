@@ -1038,10 +1038,10 @@ def main():
                        help="Maximum temperature for annealing")
     
     # Tokenizer 配置
-    parser.add_argument("--variable-tokens", action="store_true", default=True,
-                       help="Enable variable token count mode (default: True)")
+    parser.add_argument("--variable-tokens", action="store_true", default=False,
+                       help="Enable variable token count mode (experimental)")
     parser.add_argument("--no-variable-tokens", action="store_false", dest="variable_tokens",
-                       help="Disable variable token count mode (use fixed tokens)")
+                       help="Disable variable token count mode (default, recommended)")
     parser.add_argument("--use-soft-weights", action="store_true",
                        help="Use soft weights in Gumbel-Softmax (may cause train/eval mismatch)")
     
@@ -1056,12 +1056,12 @@ def main():
     # 训练
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.05,
-                       help="Weight decay (default: 0.05, increased for regularization)")
-    parser.add_argument("--dropout", type=float, default=0.3,
-                       help="Dropout rate (default: 0.3, increased for regularization)")
+    parser.add_argument("--weight-decay", type=float, default=0.03,
+                       help="Weight decay (default: 0.03)")
+    parser.add_argument("--dropout", type=float, default=0.1,
+                       help="Dropout rate (default: 0.1)")
     parser.add_argument("--emb-dropout", type=float, default=0.1)
-    parser.add_argument("--drop-path", type=float, default=0.2,
+    parser.add_argument("--drop-path", type=float, default=0.1,
                        help="Drop path (stochastic depth) rate")
     parser.add_argument("--label-smoothing", type=float, default=0.1,
                        help="Label smoothing factor (default: 0.1)")
@@ -1077,8 +1077,8 @@ def main():
                        help="Minimum improvement for early stopping")
     
     # Mixup/CutMix
-    parser.add_argument("--mixup-alpha", type=float, default=0.8,
-                       help="Mixup alpha (default: 0.8, 0 to disable)")
+    parser.add_argument("--mixup-alpha", type=float, default=0.4,
+                       help="Mixup alpha (default: 0.4, 0 to disable)")
     parser.add_argument("--cutmix-alpha", type=float, default=1.0,
                        help="CutMix alpha (default: 1.0, 0 to disable)")
     parser.add_argument("--mixup-prob", type=float, default=0.5,
@@ -1125,7 +1125,7 @@ def main():
         dim=args.dim,
         depth=args.depth,
         heads=args.heads,
-        mlp_dim=args.dim * 2,
+        mlp_dim=args.dim * 4,
         dim_head=args.dim_head,
         max_level=args.max_level,
         num_scales=args.num_scales,
@@ -1308,7 +1308,7 @@ def main():
             if config.channels_last:
                 warmup_imgs = warmup_imgs.to(memory_format=torch.channels_last)
             with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=config.use_amp):
+                with get_amp_context(device, config.use_amp):
                     _ = model(warmup_imgs)
             del warmup_imgs
             torch.cuda.empty_cache()
