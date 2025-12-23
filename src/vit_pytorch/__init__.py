@@ -50,6 +50,7 @@ from .fractal_config import (
     create_fractal_config,
     BiasMode,
     AnnealSchedule,
+    TokenizerType,
 )
 from .fractal_path import (
     FractalPathEmbedding,
@@ -66,11 +67,13 @@ from .hilbert import (
 )
 from .positional import FractalPositionEmbedding
 from .streaming_tokenizer import (
+    CrossScaleAttention,
     HilbertIndexer,
     HilbertPathCache,
     MultiScalePatchEncoder,
     StreamingFractalTokenizer,
     StreamingFractalTokenizerV2,
+    StreamingFractalTokenizerV3,
 )
 from .tokenization import BaseTokenizer, BaseTokenProcessor, TokenSequence, TokenizerOutput
 from .transformer import FractalTransformer, FractalTransformerBlock
@@ -81,12 +84,15 @@ __all__ = [
     # === 主要模型 ===
     "StreamingFractalTokenizer",
     "StreamingFractalTokenizerV2",
+    "StreamingFractalTokenizerV3",
+    "CrossScaleAttention",
     "FractalCurveViT",
     # === 配置与路径编码 ===
     "FractalConfig",
     "create_fractal_config",
     "BiasMode",
     "AnnealSchedule",
+    "TokenizerType",
     "FractalPathEmbedding",
     "HierarchicalAttentionBias",
     "VectorizedPathEncoder",

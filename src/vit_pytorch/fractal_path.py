@@ -159,29 +159,36 @@ class VectorizedPathEncoder:
         
         共同祖先深度 = 最长公共前缀长度
         
+        支持 2D 和 3D 输入:
+        - 2D: [N, D] → [N, N]
+        - 3D: [B, N, D] → [B, N, N] (批量向量化)
+        
+        数学定义:
+            LCA(i, j) = max{k : p_i[1:k] = p_j[1:k]}
+                      = sum_{d=1}^{D} prod_{k=1}^{d} 1[p_i[k] = p_j[k]]
+        
         Args:
-            paths: [N, D] 四叉树路径
+            paths: [N, D] 或 [B, N, D] 四叉树路径
             
         Returns:
-            common_depth: [N, N] 共同祖先深度矩阵
+            common_depth: [N, N] 或 [B, N, N] 共同祖先深度矩阵
         """
-        N, D = paths.shape
-        
-        # 扩展为 [N, 1, D] 和 [1, N, D]
-        paths_i = paths.unsqueeze(1)  # [N, 1, D]
-        paths_j = paths.unsqueeze(0)  # [1, N, D]
-        
-        # 比较每一层是否相同
-        match = (paths_i == paths_j)  # [N, N, D]
-        
-        # 累积匹配 (前缀): 一旦不匹配，后续都为 False
-        # cumprod 将 True/False 视为 1/0
-        cumulative_match = match.cumprod(dim=-1)  # [N, N, D]
-        
-        # 共同前缀长度 = 累积匹配的和
-        common_depth = cumulative_match.sum(dim=-1)  # [N, N]
-        
-        return common_depth
+        if paths.dim() == 2:
+            # 2D: [N, D] → [N, N]
+            N, D = paths.shape
+            paths_i = paths.unsqueeze(1)  # [N, 1, D]
+            paths_j = paths.unsqueeze(0)  # [1, N, D]
+            match = (paths_i == paths_j)  # [N, N, D]
+            cumulative_match = match.cumprod(dim=-1)  # [N, N, D]
+            return cumulative_match.sum(dim=-1)  # [N, N]
+        else:
+            # 3D: [B, N, D] → [B, N, N] (批量向量化)
+            B, N, D = paths.shape
+            paths_i = paths.unsqueeze(2)  # [B, N, 1, D]
+            paths_j = paths.unsqueeze(1)  # [B, 1, N, D]
+            match = (paths_i == paths_j)  # [B, N, N, D]
+            cumulative_match = match.cumprod(dim=-1)  # [B, N, N, D]
+            return cumulative_match.sum(dim=-1)  # [B, N, N]
 
 
 class FractalPathEmbedding(nn.Module):

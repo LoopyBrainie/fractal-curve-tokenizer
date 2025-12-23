@@ -26,10 +26,13 @@ Tokenizer 选项
 +---------------+-------------------------------+------------------+
 | tokenizer_type| 实现                           | 特点              |
 +===============+===============================+==================+
-| streaming     | StreamingFractalTokenizer     | 固定多尺度        |
+| streaming_v3  | StreamingFractalTokenizerV3   | Cross-Scale      |
+|               |                               | Attention (推荐) |
 +---------------+-------------------------------+------------------+
 | streaming_v2  | StreamingFractalTokenizerV2   | Gumbel-Softmax   |
-|               |                               | 推荐              |
+|               |                               | (已弃用)          |
++---------------+-------------------------------+------------------+
+| streaming     | StreamingFractalTokenizer     | 固定多尺度        |
 +---------------+-------------------------------+------------------+
 """
 
@@ -42,7 +45,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .positional import FractalPositionEmbedding
-from .streaming_tokenizer import StreamingFractalTokenizer, StreamingFractalTokenizerV2
+from .streaming_tokenizer import (
+    StreamingFractalTokenizer,
+    StreamingFractalTokenizerV2,
+    StreamingFractalTokenizerV3,
+)
 from .tokenization import BaseTokenizer, TokenizerOutput
 from .transformer import FractalTransformer, FFNType
 from .utils import pair
@@ -180,6 +187,16 @@ class FractalCurveViT(nn.Module):
                 gumbel_temperature=streaming_tau,
                 variable_tokens=variable_tokens,
                 use_soft_weights=use_soft_weights,
+            )
+        elif tokenizer_type == "streaming_v3":
+            base_ps = min_patch_size[0]
+            patch_sizes_tuple = tuple(base_ps * (2 ** i) for i in range(num_scales))
+            tokenizer = StreamingFractalTokenizerV3(
+                image_size=self.image_size,
+                channels=channels,
+                d_model=dim,
+                patch_sizes=patch_sizes_tuple,
+                max_level=max_level,
             )
         else:
             raise ValueError(f"Unknown tokenizer_type: {tokenizer_type}")

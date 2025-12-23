@@ -41,10 +41,9 @@ Hilbert 感知注意力:
 +-------------------------------+------------------------------------------+
 
 bias_mode 选项:
-- 'original': 全连接网络（高显存，精确）
+- 'lca': LCA 嵌入表（推荐，~100参数，显式几何意义）
 - 'low_rank': 低秩分解（显存友好，~50K参数）
 - 'hierarchical': 分层计算（可解释性强）
-- 'lca': LCA 嵌入表（推荐，~100参数，显式几何意义）
 """
 
 from __future__ import annotations
@@ -60,7 +59,7 @@ from .constants import HILBERT_BIAS_SCALE, LEVEL_BIAS_SCALE
 from .utils import extract_depths
 from .fractal_path import VectorizedPathEncoder
 
-BiasMode = Literal['original', 'low_rank', 'hierarchical', 'lca']
+BiasMode = Literal['lca', 'low_rank', 'hierarchical']
 
 
 class LowRankHilbertBias(nn.Module):
@@ -403,7 +402,14 @@ class LCAHilbertBias(nn.Module):
         return bias.permute(2, 0, 1)
     
     def _forward_3d(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
-        """处理 3D 输入 (B, S, Info)。"""
+        """处理 3D 输入 (B, S, Info)，使用批量向量化计算。
+        
+        数学形式:
+            LCA[b,i,j] = sum_d prod_{k<=d} 1[p_i[k] = p_j[k]]
+            Bias[b,i,j] = Embedding(LCA[b,i,j])
+        
+        复杂度: O(B·N²·D) 但无 Python 循环开销
+        """
         batch_size, seq_len, info_dim = levels_info.shape
         if info_dim <= 1:
             return None
@@ -411,20 +417,15 @@ class LCAHilbertBias(nn.Module):
         # 提取四叉树路径: (B, S, Path)
         paths = levels_info[:, :, 1:].long()
         
-        # 对每个 batch 计算 LCA 深度矩阵
-        # 优化: 如果 batch 中路径相同，可共享计算
-        # 这里采用简单的 batch 循环，后续可优化为向量化
-        all_biases = []
-        for b in range(batch_size):
-            batch_paths = paths[b]  # (S, Path)
-            lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(batch_paths)
-            lca_depths = lca_depths.clamp(0, self.max_depth)
-            bias = self.lca_embedding(lca_depths)  # (S, S, H)
-            all_biases.append(bias)
+        # 批量向量化计算 LCA 深度: (B, S, S)
+        lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
+        lca_depths = lca_depths.clamp(0, self.max_depth)
         
-        # 堆叠并调整形状: (B, H, S, S)
-        stacked = torch.stack(all_biases, dim=0)  # (B, S, S, H)
-        return stacked.permute(0, 3, 1, 2)
+        # 批量嵌入: (B, S, S, H)
+        bias = self.lca_embedding(lca_depths)
+        
+        # 调整形状: (B, H, S, S)
+        return bias.permute(0, 3, 1, 2)
 
 
 class   HilbertAwareMultiScaleAttention(nn.Module):
@@ -486,16 +487,12 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
 
         # 根据 bias_mode 初始化对应的实现
         if use_hilbert_bias:
-            if bias_mode == 'original':
-                self.hilbert_bias_network: Optional[nn.Sequential] = nn.Sequential(
-                    nn.Linear(2, 64),
-                    nn.ReLU(),
-                    nn.Linear(64, heads),
-                    nn.Tanh(),
+            if bias_mode == 'lca':
+                self.hilbert_bias_impl: Optional[nn.Module] = LCAHilbertBias(
+                    max_depth=max_level,
+                    heads=heads,
                 )
-                self.hilbert_bias_impl: Optional[nn.Module] = None
             elif bias_mode == 'low_rank':
-                self.hilbert_bias_network = None
                 # 路径维度需要足够大以容纳实际的 levels_info
                 # 实际路径维度 = max_info_len - 1 ≈ max_level + log2(image_size/min_patch) + 3
                 # 使用 max_level + 16 作为安全的默认值
@@ -506,21 +503,13 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                     heads=heads,
                 )
             elif bias_mode == 'hierarchical':
-                self.hilbert_bias_network = None
                 self.hilbert_bias_impl = HierarchicalHilbertBias(
                     max_depth=max_level,
                     heads=heads,
                 )
-            elif bias_mode == 'lca':
-                self.hilbert_bias_network = None
-                self.hilbert_bias_impl = LCAHilbertBias(
-                    max_depth=max_level,
-                    heads=heads,
-                )
             else:
-                raise ValueError(f"Unknown bias_mode: {bias_mode}")
+                raise ValueError(f"Unknown bias_mode: {bias_mode}. Valid: 'lca', 'low_rank', 'hierarchical'")
         else:
-            self.hilbert_bias_network = None
             self.hilbert_bias_impl = None
 
         if use_level_scaling:
@@ -543,9 +532,9 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         """计算基于 Hilbert 路径的注意力偏置。
         
         根据 bias_mode 调用不同的实现：
-        - 'original': 使用原始的全连接网络
-        - 'low_rank': 使用低秩分解
-        - 'hierarchical': 使用分层计算
+        - 'lca': LCA 嵌入表（推荐）
+        - 'low_rank': 低秩分解
+        - 'hierarchical': 分层计算
         
         Args:
             levels_info: 层级信息张量，形状为 (Seq, Info) 或 (Batch, Seq, Info)
@@ -556,47 +545,10 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         if not self.use_hilbert_bias or levels_info.numel() == 0:
             return None
 
-        # 使用新的优化实现（low_rank 或 hierarchical）
         if self.hilbert_bias_impl is not None:
             return self.hilbert_bias_impl(levels_info)
         
-        # 原始实现（original mode）
-        assert self.hilbert_bias_network is not None
-
-        device = levels_info.device
-
-        if levels_info.dim() == 2:
-            # Old behavior: (Seq, Info)
-            seq_len = levels_info.shape[0]
-            if levels_info.shape[1] <= 1:
-                return None
-            paths = levels_info[:, 1:].float() # (S, Path)
-            path_i = paths.unsqueeze(1) # (S, 1, Path)
-            path_j = paths.unsqueeze(0) # (1, S, Path)
-            
-            path_dist = torch.norm(path_i - path_j, dim=2)
-            path_sim = F.cosine_similarity(path_i, path_j, dim=2, eps=1e-6)
-            path_features = torch.stack([path_dist, path_sim], dim=-1) # (S, S, 2)
-            
-            bias = self.hilbert_bias_network(path_features) # (S, S, H)
-            return bias.permute(2, 0, 1) # (H, S, S)
-        else:
-            # New behavior: (Batch, Seq, Info)
-            batch_size, seq_len, info_dim = levels_info.shape
-            if info_dim <= 1:
-                return None
-            
-            paths = levels_info[:, :, 1:].float() # (B, S, Path)
-            path_i = paths.unsqueeze(2) # (B, S, 1, Path)
-            path_j = paths.unsqueeze(1) # (B, 1, S, Path)
-            
-            path_dist = torch.norm(path_i - path_j, dim=3) # (B, S, S)
-            path_sim = F.cosine_similarity(path_i, path_j, dim=3, eps=1e-6) # (B, S, S)
-            
-            path_features = torch.stack([path_dist, path_sim], dim=-1) # (B, S, S, 2)
-            
-            bias = self.hilbert_bias_network(path_features) # (B, S, S, H)
-            return bias.permute(0, 3, 1, 2) # (B, H, S, S)
+        return None
 
     def _compute_level_bias(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
         """计算基于层级差异的相对位置偏置。

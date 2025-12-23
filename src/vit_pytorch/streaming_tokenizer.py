@@ -61,7 +61,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch._dynamo
@@ -201,8 +201,6 @@ class HilbertPathCache:
             )
         
         return cls._device_cache[device_key]
-        
-        return cls._cache[key]
     
     @classmethod
     def _compute(
@@ -1697,3 +1695,430 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
                 path.append(quadrant)
         
         return path
+
+
+# ==============================================================================
+# CrossScaleAttention: 可微分的多尺度特征融合
+# ==============================================================================
+#
+# 数学形式化:
+#   对于每个空间位置 i (在最细网格上):
+#
+#   1. Query 生成 (Position-aware):
+#      Q_i = W_Q · F_min[i] + PE_i
+#
+#   2. Key 生成 (Scale-aware):
+#      K_{i,s} = W_K · F_s[h_s(i)] + ScaleEmb_s
+#
+#   3. Value 生成:
+#      V_{i,s} = W_V · F_s[h_s(i)]
+#
+#   4. Cross-Scale Attention:
+#      α_{i,s} = softmax(Q_i · K_{i,s} / √d)
+#      Token_i = Σ_s α_{i,s} · V_{i,s}
+#
+# 优势:
+#   - 完全可微分 (无 STE 近似)
+#   - 自然的空间平滑性 (相邻位置 Query 相似)
+#   - 尺度自适应 (根据内容选择最佳尺度组合)
+#
+# ==============================================================================
+
+
+class CrossScaleAttention(nn.Module):
+    """Cross-Scale Attention for adaptive multi-scale feature fusion.
+    
+    数学形式化
+    ==========
+    
+    对于最细网格上的每个位置 i:
+    
+    1. Query (来自最细尺度特征 + 位置编码):
+       Q_i = W_Q · F_min[i] + PE_i
+       
+    2. Key (来自各尺度特征 + 尺度嵌入):
+       K_{i,s} = W_K · F_s[h_s(i)] + ScaleEmb_s
+       
+    3. Value (来自各尺度特征):
+       V_{i,s} = W_V · F_s[h_s(i)]
+       
+    4. Attention 权重:
+       α_{i,s} = softmax(Q_i · K_{i,s} / √d_k)
+       
+    5. 输出 Token:
+       Token_i = Σ_s α_{i,s} · V_{i,s}
+    
+    Args:
+        d_model: 特征维度
+        num_scales: 尺度数量
+        num_heads: 注意力头数 (默认 1，因为是跨尺度而非跨位置)
+        dropout: Dropout 概率
+    """
+    
+    def __init__(
+        self,
+        d_model: int = 256,
+        num_scales: int = 3,
+        num_heads: int = 1,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        
+        self.d_model = d_model
+        self.num_scales = num_scales
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.scale = math.sqrt(self.d_k)
+        
+        # Query 投影 (仅用于最细尺度特征)
+        self.w_q = nn.Linear(d_model, d_model)
+        
+        # Key 投影 (用于所有尺度)
+        self.w_k = nn.Linear(d_model, d_model)
+        
+        # Value 投影 (用于所有尺度)
+        self.w_v = nn.Linear(d_model, d_model)
+        
+        # 尺度嵌入 (添加到 Key 中)
+        self.scale_embedding = nn.Embedding(num_scales, d_model)
+        
+        # 输出投影
+        self.w_o = nn.Linear(d_model, d_model)
+        
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+        
+        # 用于诊断的尺度分布记录
+        self._last_scale_weights: Optional[torch.Tensor] = None
+        
+    def forward(
+        self,
+        features_dict: Dict[int, Tuple[torch.Tensor, Tuple[int, int]]],
+        patch_sizes: Tuple[int, ...],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Cross-Scale Attention 前向传播.
+        
+        Args:
+            features_dict: {patch_size: (features [B, D, H_s, W_s], (grid_h, grid_w))}
+            patch_sizes: 从小到大排列的 patch 尺寸元组
+            
+        Returns:
+            tokens: [B, N, D] 融合后的 token 序列 (光栅顺序)
+            scale_weights: [B, S, N] 每个位置的尺度权重 (用于诊断)
+        """
+        # 确定基础网格 (最细尺度)
+        min_ps = min(patch_sizes)
+        base_features, (grid_h, grid_w) = features_dict[min_ps]
+        B, D, H, W = base_features.shape
+        N = H * W
+        device = base_features.device
+        
+        # 1. Query: 来自最细尺度特征 [B, N, D]
+        q = base_features.flatten(2).transpose(1, 2)  # [B, N, D]
+        q = self.w_q(q)  # [B, N, D]
+        
+        # 2. 构建各尺度的 Key 和 Value
+        # 形状: [B, S, N, D]
+        S = len(patch_sizes)
+        all_keys = torch.zeros(B, S, N, D, device=device)
+        all_values = torch.zeros(B, S, N, D, device=device)
+        
+        for scale_idx, ps in enumerate(patch_sizes):
+            if ps not in features_dict:
+                continue
+                
+            feat, (fh, fw) = features_dict[ps]  # [B, D, fh, fw]
+            
+            # 上采样到最细网格尺寸
+            if fh != H or fw != W:
+                feat = F.interpolate(
+                    feat,
+                    size=(H, W),
+                    mode='bilinear',
+                    align_corners=False,
+                )
+            
+            # Flatten: [B, N, D]
+            feat_flat = feat.flatten(2).transpose(1, 2)
+            
+            # Key: 特征 + 尺度嵌入
+            scale_emb = self.scale_embedding(
+                torch.tensor([scale_idx], device=device)
+            ).unsqueeze(0)  # [1, 1, D]
+            k = self.w_k(feat_flat) + scale_emb  # [B, N, D]
+            
+            # Value: 特征投影
+            v = self.w_v(feat_flat)  # [B, N, D]
+            
+            all_keys[:, scale_idx] = k
+            all_values[:, scale_idx] = v
+        
+        # 3. 计算 Cross-Scale Attention 权重
+        # Q: [B, N, D], K: [B, S, N, D]
+        # 对于每个位置 i，计算 Q_i 与 K_{i,s} 的点积
+        
+        # 扩展 Q: [B, 1, N, D]
+        q_expanded = q.unsqueeze(1)
+        
+        # 点积: [B, S, N]
+        # 使用 einsum 计算每个位置与其对应尺度特征的点积
+        attn_scores = torch.einsum('bnd,bsnd->bsn', q, all_keys) / self.scale
+        
+        # Softmax over scales: [B, S, N]
+        attn_weights = F.softmax(attn_scores, dim=1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # 保存用于诊断
+        self._last_scale_weights = attn_weights.detach()
+        
+        # 4. 加权融合 Value
+        # attn_weights: [B, S, N], all_values: [B, S, N, D]
+        # 输出: [B, N, D]
+        output = torch.einsum('bsn,bsnd->bnd', attn_weights, all_values)
+        
+        # 5. 输出投影
+        output = self.w_o(output)
+        
+        return output, attn_weights
+    
+    @torch.no_grad()
+    def get_scale_distribution(self) -> Optional[Dict[str, float]]:
+        """获取最近一次前向的尺度分布统计.
+        
+        Returns:
+            Dict 包含每个尺度的平均使用比例，或 None 如果尚未调用 forward
+        """
+        if self._last_scale_weights is None:
+            return None
+        
+        # _last_scale_weights: [B, S, N]
+        avg_weights = self._last_scale_weights.mean(dim=(0, 2))  # [S]
+        
+        return {
+            f"scale_{i}": avg_weights[i].item()
+            for i in range(self.num_scales)
+        }
+
+
+class StreamingFractalTokenizerV3(StreamingFractalTokenizer):
+    """Phase 3: Cross-Scale Attention Tokenizer.
+    
+    使用可微分的 Cross-Scale Attention 替代 Gumbel-Softmax 进行多尺度融合。
+    
+    数学形式化
+    ==========
+    
+    与 V2 (Gumbel-Softmax) 的对比:
+    
+    V2 (STE 模式):
+        s_i = argmax_s π_{i,s}              # 硬选择
+        Token_i = F_{s_i}[h_{s_i}(i)]       # 离散提取
+        ∂L/∂π_k = 0, k ≠ argmax             # 梯度稀疏
+    
+    V3 (Cross-Scale Attention):
+        α_{i,s} = softmax(Q_i · K_{i,s} / √d)  # 软选择
+        Token_i = Σ_s α_{i,s} · V_{i,s}        # 可微融合
+        ∂L/∂F_s ≠ 0, ∀s                        # 梯度密集
+    
+    优势:
+        1. 完全可微分 - 无 STE 近似误差
+        2. 自然空间平滑 - 相邻位置 Query 相似
+        3. 训练稳定 - 无温度退火敏感性
+        4. 代码简洁 - 移除 Gumbel/四叉树/variable_tokens
+    
+    Args:
+        image_size: 输入图像尺寸
+        channels: 图像通道数
+        d_model: 输出嵌入维度
+        patch_sizes: 多尺度 patch 大小 (从小到大排列)
+        use_hilbert_order: 是否使用 Hilbert 曲线排序
+        max_level: 最大四叉树层级 (用于 levels_info 兼容)
+        cross_scale_heads: Cross-Scale Attention 头数
+        cross_scale_dropout: Cross-Scale Attention dropout
+    """
+    
+    def __init__(
+        self,
+        image_size: Union[int, Tuple[int, int]] = 224,
+        channels: int = 3,
+        d_model: int = 256,
+        patch_sizes: Tuple[int, ...] = (4, 8, 16),
+        use_hilbert_order: bool = True,
+        max_level: int = 50,
+        cross_scale_heads: int = 1,
+        cross_scale_dropout: float = 0.0,
+    ) -> None:
+        super().__init__(
+            image_size=image_size,
+            channels=channels,
+            d_model=d_model,
+            patch_sizes=patch_sizes,
+            primary_scale=None,
+            use_hilbert_order=use_hilbert_order,
+            max_level=max_level,
+        )
+        
+        self.num_scales = len(patch_sizes)
+        
+        # Cross-Scale Attention 模块
+        self.cross_scale_attention = CrossScaleAttention(
+            d_model=d_model,
+            num_scales=self.num_scales,
+            num_heads=cross_scale_heads,
+            dropout=cross_scale_dropout,
+        )
+    
+    @classmethod
+    def from_config(
+        cls,
+        config: FractalConfig,
+        channels: int = 3,
+        d_model: int = 256,
+    ) -> "StreamingFractalTokenizerV3":
+        """从 FractalConfig 创建 Tokenizer 实例.
+        
+        Args:
+            config: FractalConfig 实例
+            channels: 图像通道数
+            d_model: 输出嵌入维度
+            
+        Returns:
+            StreamingFractalTokenizerV3 实例
+        """
+        return cls(
+            image_size=config.image_size,
+            channels=channels,
+            d_model=d_model,
+            patch_sizes=config.patch_sizes,
+            use_hilbert_order=True,
+            max_level=config.max_depth,
+        )
+    
+    def tokenize(self, images: torch.Tensor) -> TokenizerOutput:
+        """Cross-Scale Attention tokenization.
+        
+        流程:
+            1. MultiScalePatchEncoder → {F_s}
+            2. CrossScaleAttention → 融合 tokens
+            3. HilbertReorder → 排序
+            4. FeatureFusion → 最终 tokens
+        """
+        if images.dim() != 4:
+            raise ValueError(
+                f"StreamingFractalTokenizerV3.tokenize expects 4D input [B, C, H, W], "
+                f"got {images.dim()}D tensor."
+            )
+        
+        B, C, H, W = images.shape
+        device = images.device
+        
+        # 1. 提取多尺度特征
+        features_dict = self.encoder(images)
+        
+        if not features_dict:
+            raise ValueError(
+                f"No valid scales for image size ({H}, {W}). "
+                f"Minimum patch size is {min(self.patch_sizes)}."
+            )
+        
+        # 2. Cross-Scale Attention 融合
+        # tokens: [B, N, D], scale_weights: [B, S, N]
+        tokens, scale_weights = self.cross_scale_attention(
+            features_dict, self.patch_sizes
+        )
+        
+        # 获取网格尺寸
+        min_ps = min(self.patch_sizes)
+        _, (grid_h, grid_w) = features_dict[min_ps]
+        
+        # 3. Hilbert 重排
+        if self.use_hilbert_order:
+            # 需要先 reshape 成 [B, D, H, W] 再重排
+            tokens_2d = tokens.transpose(1, 2).view(B, -1, grid_h, grid_w)
+            tokens = HilbertIndexer.reorder_to_hilbert(tokens_2d, grid_h, grid_w)
+            
+            # 同步重排 scale_weights 用于 levels_info
+            hilbert_idx = HilbertIndexer.get_hilbert_order_on_device(
+                max(grid_h, grid_w), device
+            )
+            valid_len = min(len(hilbert_idx), grid_h * grid_w)
+            scale_weights = scale_weights[:, :, hilbert_idx[:valid_len]]
+        
+        num_tokens = tokens.shape[1]
+        
+        # 4. 特征融合
+        tokens = self.feature_fusion(tokens)
+        
+        # 5. 创建 levels_info (使用主导尺度)
+        # 根据每个位置的最大 attention 权重确定主导尺度
+        dominant_scales = scale_weights.argmax(dim=1)  # [B, N]
+        
+        # 转换尺度索引为层级
+        scale_to_level_tensor = torch.tensor(
+            [self.scale_to_level[ps] for ps in self.patch_sizes],
+            device=device,
+            dtype=torch.long
+        )
+        levels = scale_to_level_tensor[dominant_scales]  # [B, N]
+        
+        # 创建 levels_info
+        info_len = min(self.max_level + 1, 16)
+        levels_info = torch.zeros(B, num_tokens, info_len, dtype=torch.long, device=device)
+        levels_info[:, :, 0] = levels
+        
+        # 填充四叉树路径
+        if self.use_hilbert_order:
+            _, quadtree_paths = HilbertPathCache.get_or_compute(
+                grid_h=grid_h, grid_w=grid_w, max_depth=info_len - 1, device=device
+            )
+            actual_tokens = min(num_tokens, quadtree_paths.shape[0])
+            path_len = min(quadtree_paths.shape[1], info_len - 1)
+            levels_info[:, :actual_tokens, 1:path_len+1] = quadtree_paths[:actual_tokens, :path_len].unsqueeze(0).expand(B, -1, -1)
+        
+        # 6. 构建输出
+        sequences = []
+        for b in range(B):
+            seq = TokenSequence(
+                tokens=tokens[b],
+                metadata={
+                    "levels": levels_info[b],
+                    "scale_weights": scale_weights[b].transpose(0, 1),  # [N, S]
+                },
+            )
+            sequences.append(seq)
+        
+        return TokenizerOutput(sequences)
+    
+    @torch.no_grad()
+    def get_scale_distribution(self) -> Optional[Dict[str, float]]:
+        """获取最近一次前向的尺度分布统计.
+        
+        Returns:
+            Dict 包含每个尺度的平均使用比例
+        """
+        return self.cross_scale_attention.get_scale_distribution()
+    
+    def get_training_stats(self) -> Dict[str, Any]:
+        """获取训练状态统计信息.
+        
+        与 V2 兼容的接口，但不再包含 Gumbel 相关统计。
+        """
+        scale_dist = self.get_scale_distribution()
+        
+        stats = {
+            'tokenizer_version': 'v3',
+            'fusion_method': 'cross_scale_attention',
+            'num_scales': self.num_scales,
+        }
+        
+        if scale_dist:
+            stats['scale_distribution'] = scale_dist
+            
+            # 计算尺度分布熵
+            import math
+            probs = list(scale_dist.values())
+            entropy = -sum(p * math.log(p + 1e-10) for p in probs)
+            stats['scale_entropy'] = entropy
+            stats['max_entropy'] = math.log(self.num_scales)
+        
+        return stats

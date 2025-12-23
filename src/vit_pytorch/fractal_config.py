@@ -27,10 +27,10 @@ Hilbert 曲线策略 (自动选择):
     - padding_ratio < 4/3: 使用 Hilbert + Padding
     - padding_ratio ≥ 4/3: 使用 Pseudo-Hilbert 递归细分
 
-Gumbel-Softmax 温度退火:
-    τ(t) = τ_max - (τ_max - τ_min) × (t / T)           # linear
-    τ(t) = τ_max × (τ_min / τ_max)^{t/T}               # exponential
-    τ(t) = τ_min + 0.5(τ_max - τ_min)(1 + cos(πt/T))   # cosine
+Tokenizer 类型:
+    - 'streaming_v1': 基础单尺度 tokenizer
+    - 'streaming_v2': Gumbel-Softmax 自适应 (已弃用)
+    - 'streaming_v3': Cross-Scale Attention 自适应 (推荐)
 
 Hilbert Bias 模式:
     - 'lca': LCA 嵌入 (~36 参数，推荐)
@@ -47,7 +47,7 @@ Hilbert Bias 模式:
     → grid_size=12 (自动使用 Pseudo-Hilbert)
     
     # 使用配置
-    tokenizer = StreamingFractalTokenizerV2.from_config(config)
+    tokenizer = StreamingFractalTokenizerV3.from_config(config)
 """
 
 from __future__ import annotations
@@ -60,6 +60,7 @@ from typing import Literal, Tuple
 # 类型别名
 BiasMode = Literal['original', 'low_rank', 'hierarchical', 'lca']
 AnnealSchedule = Literal['linear', 'exponential', 'cosine']
+TokenizerType = Literal['streaming_v1', 'streaming_v2', 'streaming_v3']
 
 
 @dataclass
@@ -76,19 +77,23 @@ class FractalConfig:
         grid_size: 最细网格的边长 = image_size / min_patch_size
         num_tokens: 最细网格的 token 数量 = grid_size²
         
-    Gumbel-Softmax 配置:
+    Tokenizer 配置:
+        tokenizer_type: tokenizer 类型
+            - 'streaming_v3': Cross-Scale Attention (推荐，默认)
+            - 'streaming_v2': Gumbel-Softmax (已弃用)
+            - 'streaming_v1': 单尺度基础版
+        
+    Gumbel-Softmax 配置 (仅 tokenizer_type='streaming_v2' 时有效):
         gumbel_tau_init: 初始温度，控制探索程度
         gumbel_tau_min: 温度下界，过低会导致梯度消失
         gumbel_tau_max: 温度上界
         gumbel_anneal_schedule: 退火策略 ('linear', 'exponential', 'cosine')
+        variable_tokens: 是否启用可变 token 数量
+        use_soft_weights: 是否使用软权重 (实验性)
         
     Hilbert Bias 配置:
         hilbert_bias_mode: 偏置计算模式
         low_rank_r: 低秩分解的秩 (仅 bias_mode='low_rank' 时有效)
-        
-    Tokenizer 配置:
-        variable_tokens: 是否启用可变 token 数量
-        use_soft_weights: 是否使用软权重 (实验性)
         
     Hilbert 策略 (自动推导):
         uses_pseudo_hilbert: 是否使用 Pseudo-Hilbert 曲线
@@ -98,19 +103,20 @@ class FractalConfig:
     image_size: int
     min_patch_size: int = 4
     
-    # ========== Gumbel-Softmax 配置 ==========
+    # ========== Tokenizer 配置 ==========
+    tokenizer_type: TokenizerType = 'streaming_v3'  # 默认使用 Cross-Scale Attention
+    
+    # ========== Gumbel-Softmax 配置 (V2 专用，已弃用) ==========
     gumbel_tau_init: float = 2.0
     gumbel_tau_min: float = 0.5
     gumbel_tau_max: float = 5.0
     gumbel_anneal_schedule: AnnealSchedule = 'cosine'
+    variable_tokens: bool = False  # V2 专用，V3 不使用
+    use_soft_weights: bool = False  # V2 专用，V3 不使用
     
     # ========== Hilbert Bias 配置 ==========
     hilbert_bias_mode: BiasMode = 'lca'
     low_rank_r: int = 32
-    
-    # ========== Tokenizer 配置 ==========
-    variable_tokens: bool = True  # 默认启用可变 token 模式 (Patch=Token)
-    use_soft_weights: bool = False
     
     # ========== 推导参数 (自动计算) ==========
     max_depth: int = field(init=False)
@@ -231,6 +237,19 @@ class FractalConfig:
         is_power_of_2 = self.grid_size > 0 and (self.grid_size & (self.grid_size - 1) == 0)
         grid_note = "" if is_power_of_2 else f" (非 2^k, 使用 {hilbert_strategy})"
         
+        # 根据 tokenizer 类型显示不同信息
+        if self.tokenizer_type == 'streaming_v3':
+            tokenizer_info = f"  tokenizer_type='{self.tokenizer_type}' (Cross-Scale Attention, 推荐)\n"
+        elif self.tokenizer_type == 'streaming_v2':
+            tokenizer_info = (
+                f"  tokenizer_type='{self.tokenizer_type}' (Gumbel-Softmax, 已弃用)\n"
+                f"  tau=[{self.gumbel_tau_min}, {self.gumbel_tau_init}, {self.gumbel_tau_max}], "
+                f"schedule='{self.gumbel_anneal_schedule}'\n"
+                f"  variable_tokens={self.variable_tokens}, use_soft_weights={self.use_soft_weights}\n"
+            )
+        else:
+            tokenizer_info = f"  tokenizer_type='{self.tokenizer_type}' (单尺度)\n"
+        
         return (
             f"FractalConfig(\n"
             f"  # Geometry\n"
@@ -240,13 +259,10 @@ class FractalConfig:
             f"  grid_size={self.grid_size}{grid_note}, num_tokens={self.num_tokens}\n"
             f"  # Hilbert Strategy\n"
             f"  uses_pseudo_hilbert={self.uses_pseudo_hilbert}\n"
-            f"  # Gumbel-Softmax\n"
-            f"  tau=[{self.gumbel_tau_min}, {self.gumbel_tau_init}, {self.gumbel_tau_max}], "
-            f"schedule='{self.gumbel_anneal_schedule}'\n"
+            f"  # Tokenizer\n"
+            f"{tokenizer_info}"
             f"  # Hilbert Bias\n"
             f"  bias_mode='{self.hilbert_bias_mode}', low_rank_r={self.low_rank_r}\n"
-            f"  # Tokenizer\n"
-            f"  variable_tokens={self.variable_tokens}, use_soft_weights={self.use_soft_weights}\n"
             f")"
         )
 
