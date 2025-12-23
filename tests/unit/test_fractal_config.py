@@ -292,9 +292,14 @@ class TestRepr:
         repr_str = repr(config)
         
         assert "# Geometry" in repr_str
-        assert "# Gumbel-Softmax" in repr_str
         assert "# Hilbert Bias" in repr_str
         assert "# Tokenizer" in repr_str
         assert "image_size=64" in repr_str
-        assert "tau=" in repr_str
         assert "bias_mode='lca'" in repr_str
+        
+        # V3 tokenizer 不显示 Gumbel 配置
+        if config.tokenizer_type == 'streaming_v3':
+            assert "Cross-Scale Attention" in repr_str
+        else:
+            assert "# Gumbel-Softmax" in repr_str
+            assert "tau=" in repr_str

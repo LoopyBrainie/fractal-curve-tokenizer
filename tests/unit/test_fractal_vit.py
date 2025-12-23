@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 """Unit tests for FractalCurveViT.
 
-测试流式 Tokenizer (streaming/streaming_v2) 下的核心功能：
+测试流式 Tokenizer (streaming/streaming_v3) 下的核心功能：
 1. 自适应 tokenization 能力
 2. 批处理与变长序列处理
 3. 位置编码逻辑
 4. Transformer 掩码有效性
+
+Note:
+    streaming_v2 已废弃，测试保留用于向后兼容性验证。
 """
 
 import torch
@@ -24,7 +27,7 @@ def sample_image():
 
 @pytest.fixture
 def fractal_vit():
-    """Create a FractalCurveViT model with streaming_v2 tokenizer."""
+    """Create a FractalCurveViT model with streaming_v3 tokenizer."""
     return FractalCurveViT(
         image_size=32,
         num_classes=10,
@@ -34,7 +37,7 @@ def fractal_vit():
         mlp_dim=128,
         min_patch_size=(4, 4),
         max_level=4,
-        tokenizer_type="streaming_v2",
+        tokenizer_type="streaming_v3",
         num_scales=2,
     )
 
@@ -104,19 +107,22 @@ class TestFractalCurveViT:
         assert isinstance(model.tokenizer, StreamingFractalTokenizer)
 
     def test_streaming_v2_tokenizer_type(self):
-        """Test streaming_v2 tokenizer is correctly instantiated."""
-        model = FractalCurveViT(
-            image_size=32,
-            num_classes=10,
-            dim=64,
-            depth=2,
-            heads=2,
-            mlp_dim=128,
-            min_patch_size=(4, 4),
-            max_level=5,
-            tokenizer_type="streaming_v2",
-            num_scales=2,
-        )
+        """Test streaming_v2 tokenizer is correctly instantiated (deprecated)."""
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            model = FractalCurveViT(
+                image_size=32,
+                num_classes=10,
+                dim=64,
+                depth=2,
+                heads=2,
+                mlp_dim=128,
+                min_patch_size=(4, 4),
+                max_level=5,
+                tokenizer_type="streaming_v2",
+                num_scales=2,
+            )
         
         assert model.tokenizer_type == "streaming_v2"
         assert model._is_streaming
@@ -142,7 +148,7 @@ class TestFractalCurveViT:
             mlp_dim=128,
             min_patch_size=(4, 4),
             max_level=4,
-            tokenizer_type="streaming_v2",
+            tokenizer_type="streaming_v3",
         )
         
         x = torch.randn(2, 3, 32, 32, requires_grad=True)
@@ -155,7 +161,7 @@ class TestFractalCurveViT:
         assert not torch.isnan(x.grad).any()
 
     def test_default_tokenizer_type(self):
-        """Test FractalCurveViT defaults to streaming_v2."""
+        """Test FractalCurveViT defaults to streaming_v3."""
         model = FractalCurveViT(
             image_size=32,
             num_classes=10,
@@ -165,7 +171,7 @@ class TestFractalCurveViT:
             mlp_dim=128,
         )
         
-        assert model.tokenizer_type == "streaming_v2"
+        assert model.tokenizer_type == "streaming_v3"
 
     def test_different_image_sizes(self):
         """Test FractalCurveViT handles different image sizes."""

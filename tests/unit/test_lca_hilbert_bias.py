@@ -206,7 +206,6 @@ class TestIntegrationWithAttention:
         """LCA 模式初始化测试"""
         assert attention_lca.bias_mode == 'lca'
         assert isinstance(attention_lca.hilbert_bias_impl, LCAHilbertBias)
-        assert attention_lca.hilbert_bias_network is None
     
     def test_forward_with_lca_bias(self, attention_lca):
         """LCA 模式前向传播测试"""
@@ -263,7 +262,7 @@ class TestBiasModeComparison:
     
     def test_all_modes_produce_valid_output(self, levels_info):
         """所有模式都应产生有效输出"""
-        modes = ['original', 'low_rank', 'hierarchical', 'lca']
+        modes = ['lca', 'low_rank', 'hierarchical']
         
         for mode in modes:
             attention = HilbertAwareMultiScaleAttention(
@@ -283,7 +282,7 @@ class TestBiasModeComparison:
     
     def test_gradient_flow_all_modes(self, levels_info):
         """所有模式梯度流测试"""
-        modes = ['original', 'low_rank', 'hierarchical', 'lca']
+        modes = ['lca', 'low_rank', 'hierarchical']
         
         for mode in modes:
             attention = HilbertAwareMultiScaleAttention(

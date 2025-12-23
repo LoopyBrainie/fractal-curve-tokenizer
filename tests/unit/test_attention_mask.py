@@ -22,7 +22,7 @@ class TestAttentionMaskEffectiveness:
             mlp_dim=128,
             min_patch_size=(4, 4),
             max_level=3,
-            tokenizer_type="streaming_v2",
+            tokenizer_type="streaming_v3",
         )
 
     def test_padding_tokens_masked_in_attention(self, model):
