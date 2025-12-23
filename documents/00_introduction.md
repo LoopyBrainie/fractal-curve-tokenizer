@@ -57,6 +57,7 @@ $$I \xrightarrow{T} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{Transform
 | **深度探索优先 Warmup**       | 训练初期偏向小尺度 (深层级)，后期自主决策         | ✅ v2.2 |
 | **语义级复杂度估计**            | 复用 Encoder 特征，消除 ~75% 冗余 FLOPs | ✅ v2.0 |
 | **SwiGLU + 层级自适应**      | LLaMA 风格 FFN，带层级感知             | ✅ 推荐   |
+| **P0 训练配置优化**          | mlp_dim=4×, dropout=0.1, variable_tokens=False | ✅ v0.7.0 |
 
 ## 1.5 阅读指南
 
@@ -79,16 +80,18 @@ from vit_pytorch.fractal_config import FractalConfig
 config = FractalConfig(image_size=64, min_patch_size=4)
 # 自动推导: max_depth=4, num_scales=5, patch_sizes=(4,8,16,32,64)
 
-# 方式 2: 直接创建模型
+# 方式 2: 直接创建模型 (推荐配置 for Tiny-ImageNet)
 model = FractalCurveViT(
     image_size=64,
     num_classes=200,
     dim=256,
     depth=10,
     heads=8,
-    mlp_dim=512,
+    mlp_dim=1024,                   # 4× dim (P0 修复)
     tokenizer_type='streaming_v2',  # 推荐
     ffn_type='swiglu_level',        # 推荐
+    variable_tokens=False,          # 推荐，训练更稳定
+    dropout=0.1,                    # P0 修复: 0.3→0.1
 )
 
 # 前向传播

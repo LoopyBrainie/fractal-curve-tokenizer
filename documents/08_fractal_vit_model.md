@@ -33,10 +33,11 @@ Streaming Tokenizer 实现端到端可微，无需额外辅助损失。
 | `dim`            | int           | -              | 模型维度                       |
 | `depth`          | int           | 6              | Transformer 层数             |
 | `heads`          | int           | 8              | 注意力头数                      |
-| `mlp_dim`        | int           | -              | FFN 隐藏层维度                  |
+| `mlp_dim`        | int           | dim × 4        | FFN 隐藏层维度 (P0 修复: 2×→4×)   |
 | `pool`           | str           | 'cls'          | 池化策略                       |
-| `dropout`        | float         | 0.1            | Dropout 比率                 |
+| `dropout`        | float         | 0.1            | Dropout 比率 (P0 修复: 0.3→0.1) |
 | `tokenizer_type` | str           | 'streaming_v2' | Tokenizer 类型               |
+| `variable_tokens`| bool          | False          | 可变 Token 模式 (P0 修复: True→False) |
 | `bias_mode`      | str           | 'lca'          | Hilbert Bias 模式 (推荐 'lca') |
 | `ffn_type`       | str           | 'swiglu_level' | FFN 类型                     |
 | `config`         | FractalConfig | None           | 统一配置对象 (优先级高于单独参数)         |

@@ -149,15 +149,17 @@ $\hat{\pi}_k = \frac{\exp((\log \pi_k + g_k) / \tau)}{\sum_l \exp((\log \pi_l + 
 
 **3. 两种模式**:
 
-- **固定 Token 模式 (variable_tokens=False)**:
+- **固定 Token 模式 (variable_tokens=False, ✅ 推荐默认)**:
   特征加权融合：$T_{final} = \sum_s \hat{\pi}_s \cdot F_s$
   Token 数量固定为 $N = (H/p_{min}) \times (W/p_{min})$。
+  梯度流动平滑，训练更稳定。
 
-- **可变 Token 模式 (variable_tokens=True)**:
+- **可变 Token 模式 (variable_tokens=True, 实验性)**:
   直接映射 Patch=Token。
   $s_{ij} = \arg\max_k \pi_{ij}^{(k)}$
   $T_k = \text{PatchEmbed}_{s_k}(P_k)$
-  Token 数量  $N \in [N_{min}, N_{max}]$根据图像内容自适应。
+  Token 数量 $N \in [N_{min}, N_{max}]$ 根据图像内容自适应。
+  ⚠️ 使用 STE，可能存在梯度偏置问题。
 
 **4. Depth Bias Warmup (v2.2 新特性)**:
 
@@ -181,7 +183,7 @@ $\text{logits}'_{i,j,s} = \text{logits}_{i,j,s} + \beta(t) \cdot w_{scale}(s)$
 | `d_model`            | int        | -          | 输出 token 维度         |
 | `patch_sizes`        | Tuple[int] | (4, 8, 16) | 多尺度 patch 大小        |
 | `gumbel_temperature` | float      | 2.0        | Gumbel-Softmax 初始温度 |
-| `variable_tokens`    | bool       | False      | 是否启用可变 Token 数量模式   |
+| `variable_tokens`    | bool       | False      | 是否启用可变 Token 数量模式 (推荐 False)   |
 | `_depth_bias_max`    | float      | 2.0        | 深度偏置最大强度 (v2.2)     |
 | `_depth_bias_decay`  | float      | 2.0        | 深度衰减系数 λ (v2.2)     |
 | `_depth_bias_warmup` | float      | 0.2        | 预热阶段占比 (v2.2)       |

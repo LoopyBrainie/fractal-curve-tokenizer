@@ -181,18 +181,32 @@ torch.save(checkpoint, 'best.pth')
 
 ---
 
-## 9.8 使用示例
+## 9.8 P0 训练配置修复 (2025-12-23)
+
+> **重要**: 以下参数默认值已针对 Tiny-ImageNet 优化，预期提升准确率 5-8%。
+
+| 参数 | 旧默认值 | 新默认值 | 影响 |
+|------|----------|----------|------|
+| `mlp_dim` | `dim * 2` | `dim * 4` | FFN 容量提升 +3-5% |
+| `dropout` | 0.3 | 0.1 | 减轻过正则化 +2-3% |
+| `drop_path` | 0.2 | 0.1 | 减轻过正则化 +1-2% |
+| `mixup_alpha` | 0.8 | 0.4 | 适配小图像 +1-2% |
+| `weight_decay` | 0.05 | 0.03 | 适配模型规模 +0.5-1% |
+| `variable_tokens` | True | False | 训练稳定性 |
+
+## 9.9 使用示例
 
 ```bash
 # 使用推荐配置训练 (LCA 模式)
 python examples/training/train_fractal_vit.py \
-    --dataset cifar10 \
+    --dataset tiny-imagenet \
     --tokenizer-type streaming_v2 \
     --bias-mode lca \
     --ffn-type swiglu_level \
     --epochs 100 \
-    --batch-size 64 \
-    --lr 5e-4
+    --batch-size 128 \
+    --lr 1e-4 \
+    --use-amp
 
 # 使用 Low-Rank 模式 (大模型推荐)
 python examples/training/train_fractal_vit.py \

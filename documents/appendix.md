@@ -98,10 +98,10 @@ classDiagram
 | `mlp_dim`        | 384           | 2048           | FFN 隐藏层维度                  |
 | `patch_size`     | 4             | 16             | 基础 Patch 尺寸                |
 | `scales`         | [4, 8]        | [8, 16, 32]    | 多尺度配置                      |
-| `dropout`        | 0.1           | 0.1            | Dropout 比率                 |
-| `drop_path`      | 0.1           | 0.2            | DropPath 比率                |
-| `lr`             | 5e-4          | 1e-3           | 学习率                        |
-| `weight_decay`   | 0.05          | 0.05           | 权重衰减                       |
+| `dropout`        | 0.1           | 0.1            | Dropout 比率 (P0 修复: 0.3→0.1) |
+| `drop_path`      | 0.1           | 0.1            | DropPath 比率 (P0 修复: 0.2→0.1) |
+| `lr`             | 5e-4          | 1e-4           | 学习率                        |
+| `weight_decay`   | 0.03          | 0.03           | 权重衰减 (P0 修复: 0.05→0.03)   |
 | `tokenizer_type` | streaming_v2  | streaming_v2   | Tokenizer 类型               |
 | `bias_mode`      | lca           | lca            | Hilbert Bias 模式            |
 | `rank`           | 32            | 64             | Low-Rank 秩 (仅 low_rank 模式) |
