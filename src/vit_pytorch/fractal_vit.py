@@ -56,7 +56,7 @@ from .utils import pair
 
 
 # Tokenizer 类型定义
-TokenizerType = Literal["streaming", "streaming_v2"]
+TokenizerType = Literal["streaming", "streaming_v2", "streaming_v3"]
 
 
 class FractalCurveViT(nn.Module):
@@ -106,10 +106,10 @@ class FractalCurveViT(nn.Module):
         tokenizer: Optional[BaseTokenizer] = None,
         position_embedding: Optional[FractalPositionEmbedding] = None,
         # Streaming Tokenizer 配置
-        tokenizer_type: TokenizerType = "streaming_v2",
+        tokenizer_type: TokenizerType = "streaming_v3",
         num_scales: int = 4,
         streaming_tau: float = 1.0,
-        # V2 Tokenizer 配置 (variable_tokens 模式)
+        # V2 Tokenizer 配置 (已废弃)
         variable_tokens: bool = True,
         use_soft_weights: bool = False,
     ) -> None:
@@ -176,6 +176,13 @@ class FractalCurveViT(nn.Module):
                 max_level=max_level,
             )
         elif tokenizer_type == "streaming_v2":
+            import warnings
+            warnings.warn(
+                "tokenizer_type='streaming_v2' 已废弃，将在未来版本中移除。"
+                "请使用 tokenizer_type='streaming_v3' (Cross-Scale Attention) 替代。",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             base_ps = min_patch_size[0]
             patch_sizes_tuple = tuple(base_ps * (2 ** i) for i in range(num_scales))
             tokenizer = StreamingFractalTokenizerV2(

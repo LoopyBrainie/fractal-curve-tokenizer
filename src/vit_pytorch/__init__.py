@@ -83,8 +83,8 @@ from .utils import extract_depths, normalize_levels_info
 __all__ = [
     # === 主要模型 ===
     "StreamingFractalTokenizer",
-    "StreamingFractalTokenizerV2",
-    "StreamingFractalTokenizerV3",
+    "StreamingFractalTokenizerV2",  # 已废弃，请使用 V3
+    "StreamingFractalTokenizerV3",  # 推荐
     "CrossScaleAttention",
     "FractalCurveViT",
     # === 配置与路径编码 ===

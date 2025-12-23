@@ -45,7 +45,8 @@ Tokenization 过程:
 | HilbertIndexer            | H: Grid_{h×w} → Seq_{n}                  |
 | MultiScalePatchEncoder    | ConvPyramid: I → {F_s}_{s=1}^S            |
 | StreamingFractalTokenizer | T_v1: I → (T, L), 固定尺度               |
-| StreamingFractalTokenizerV2| T_v2: I → (T, L), Gumbel-Softmax 自适应  |
+| StreamingFractalTokenizerV2| T_v2: I → (T, L), Gumbel-Softmax (已废弃) |
+| StreamingFractalTokenizerV3| T_v3: I → (T, L), Cross-Scale (推荐)    |
 +---------------------------+-------------------------------------------+
 
 与原架构对比
@@ -729,6 +730,11 @@ class StreamingFractalTokenizer(BaseTokenizer):
 class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
     """Phase 2: 带区域自适应分辨率选择的 Tokenizer.
     
+    .. deprecated:: 2025.12
+        StreamingFractalTokenizerV2 已废弃，请使用 StreamingFractalTokenizerV3。
+        V3 使用 Cross-Scale Attention 替代 Gumbel-Softmax，提供更稳定的
+        训练和更好的梯度流。该类将在未来版本中移除。
+    
     在 Phase 1 的基础上添加：
     1. 语义级区域复杂度估计 (基于 Encoder 特征)
     2. 多尺度特征融合
@@ -799,7 +805,18 @@ class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
         
         See Also:
             from_config: 从 FractalConfig 创建实例 (推荐)
+        
+        .. deprecated:: 2025.12
+            请使用 StreamingFractalTokenizerV3 替代。
         """
+        import warnings
+        warnings.warn(
+            "StreamingFractalTokenizerV2 已废弃，将在未来版本中移除。"
+            "请使用 StreamingFractalTokenizerV3 (Cross-Scale Attention) 替代。"
+            "V3 提供更稳定的训练和更好的梯度流。",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         super().__init__(
             image_size=image_size,
             channels=channels,
