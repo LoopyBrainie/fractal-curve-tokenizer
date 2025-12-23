@@ -29,7 +29,7 @@ logits = model(img)  # (1, 1000)
        │
        ▼
 ┌──────────────────────────────┐
-│  StreamingFractalTokenizerV2 │  多尺度卷积 + Gumbel-Softmax
+│  StreamingFractalTokenizerV3 │  多尺度卷积 + Cross-Scale Attention
 │  └─ Hilbert 重排序           │
 └──────────────────────────────┘
        │
@@ -138,6 +138,15 @@ Hilbert 曲线将 2D 网格映射到 1D 序列，同时**保持空间局部性**
 <tr>
 <td width="50%">
 
+**Cross-Scale Attention (V3)**
+
+![Cross-Scale](workspace/visualizations/fractal_curves/cross_scale_attention.png)
+
+通过 softmax 注意力融合，对所有尺度实现密集梯度流。
+
+</td>
+<td width="50%">
+
 **LCA 注意力偏置**
 
 ![LCA 偏置](workspace/visualizations/fractal_curves/lca_bias_matrix.png)
@@ -145,27 +154,9 @@ Hilbert 曲线将 2D 网格映射到 1D 序列，同时**保持空间局部性**
 LCA（最低公共祖先）深度编码层级距离。
 
 </td>
-<td width="50%">
-
-**Gumbel-Softmax 尺度选择**
-
-![Gumbel](workspace/visualizations/fractal_curves/gumbel_softmax_decision.png)
-
-可微分的离散尺度选择，支持温度退火。
-
-</td>
 </tr>
 <tr>
-<td width="50%">
-
-**深度偏置预热**
-
-![深度偏置](workspace/visualizations/fractal_curves/depth_bias_warmup.png)
-
-渐进式衰减，在训练初期鼓励细粒度探索。
-
-</td>
-<td width="50%">
+<td colspan="2">
 
 **注意力偏置对比**
 
@@ -181,10 +172,10 @@ LCA 偏置参数最少，且具有明确的几何意义。
 
 | 层级     | 模块                       | 核心类                                    |
 | ------ | ------------------------ | -------------------------------------- |
-| **L4** | `fractal_vit.py`         | `FractalCurveViT`             |
-| **L3** | `streaming_tokenizer.py` | `StreamingFractalTokenizerV2`          |
+| **L4** | `fractal_vit.py`         | `FractalCurveViT`                      |
+| **L3** | `streaming_tokenizer.py` | `StreamingFractalTokenizerV3` (推荐)    |
 |        | `transformer.py`         | `FractalTransformer`                   |
-| **L2** | `attention.py`           | `LCAHilbertBias`, `LowRankHilbertBias` |
+| **L2** | `attention.py`           | `LCAHilbertBias`, `CrossScaleAttention`|
 |        | `feedforward.py`         | `SwiGLUFFN`                            |
 |        | `positional.py`          | `FractalPositionEmbedding`             |
 | **L1** | `hilbert.py`             | `HilbertCurve`, `PseudoHilbertCurve`   |
@@ -195,7 +186,8 @@ LCA 偏置参数最少，且具有明确的几何意义。
 
 | 类型             | 说明                          |
 | -------------- | --------------------------- |
-| `streaming_v2` | **推荐** Gumbel-Softmax 自适应尺度 |
+| `streaming_v3` | **推荐** Cross-Scale Attention 融合  |
+| `streaming_v2` | ⚠️ 已废弃 Gumbel-Softmax 自适应尺度 |
 | `streaming`    | 固定多尺度卷积                     |
 
 ### 注意力偏置
@@ -237,12 +229,12 @@ uv run python examples/training/train_fractal_vit.py --quick-test
 
 ### 关键参数
 
-| 参数                 | 默认值            | 选项                                              |
-| ------------------ | -------------- | ----------------------------------------------- |
-| `--tokenizer-type` | `streaming_v2` | `streaming_v2`, `streaming`                     |
-| `--bias-mode`      | `lca`          | `lca`, `low_rank`, `hierarchical`               |
-| `--ffn-type`       | `swiglu_level` | `swiglu_level`, `swiglu`, `gelu`                |
-| `--dataset`        | `cifar10`      | `cifar10`, `cifar100`, `mnist`, `tiny-imagenet` |
+| 参数                 | 默认值            | 选项                                                    |
+| ------------------ | -------------- | ----------------------------------------------------- |
+| `--tokenizer-type` | `streaming_v3` | `streaming_v3`, `streaming_v2` (已废弃), `streaming`    |
+| `--bias-mode`      | `lca`          | `lca`, `low_rank`, `hierarchical`                     |
+| `--ffn-type`       | `swiglu_level` | `swiglu_level`, `swiglu`, `gelu`                      |
+| `--dataset`        | `cifar10`      | `cifar10`, `cifar100`, `mnist`, `tiny-imagenet`       |
 
 ## 评估与可视化
 
@@ -280,6 +272,18 @@ examples/training/
 ├── evaluate_and_visualize.py      # 评估
 └── visualize_fractal_curves.py    # 可视化
 ```
+
+## 文档
+
+| 文档 | 说明 |
+| ---- | ---- |
+| [架构概览](documents/00_introduction.md) | 核心概念与设计 |
+| [Hilbert 曲线](documents/01_hilbert_curve.md) | Hilbert 曲线理论 |
+| [分形分词器](documents/03_fractal_tokenizer.md) | Tokenizer 实现 |
+| [训练系统](documents/09_training_system.md) | 训练指南 |
+| [测试与 QA](documents/10_testing_qa.md) | 测试文档 |
+| [改进历史](documents/11_issues_roadmap.md) | 开发变更日志 |
+| [改进计划](IMPROVEMENT_PLAN.md) | 未来路线图 |
 
 ## 许可证
 

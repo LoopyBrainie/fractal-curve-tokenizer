@@ -29,7 +29,7 @@ Image (B, C, H, W)
        │
        ▼
 ┌──────────────────────────────┐
-│  StreamingFractalTokenizerV2 │  Multi-scale Conv + Gumbel-Softmax
+│  StreamingFractalTokenizerV3 │  Multi-scale Conv + Cross-Scale Attention
 │  └─ Hilbert Reordering       │
 └──────────────────────────────┘
        │
@@ -138,6 +138,15 @@ Hilbert curves map 2D grids to 1D sequences while **preserving spatial locality*
 <tr>
 <td width="50%">
 
+**Cross-Scale Attention (V3)**
+
+![Cross-Scale](workspace/visualizations/fractal_curves/cross_scale_attention.png)
+
+Dense gradient flow to all scales via softmax attention fusion.
+
+</td>
+<td width="50%">
+
 **LCA Attention Bias**
 
 ![LCA Bias](workspace/visualizations/fractal_curves/lca_bias_matrix.png)
@@ -145,27 +154,9 @@ Hilbert curves map 2D grids to 1D sequences while **preserving spatial locality*
 LCA (Lowest Common Ancestor) depth encodes hierarchical distance.
 
 </td>
-<td width="50%">
-
-**Gumbel-Softmax Scale Selection**
-
-![Gumbel](workspace/visualizations/fractal_curves/gumbel_softmax_decision.png)
-
-Differentiable discrete scale selection with temperature annealing.
-
-</td>
 </tr>
 <tr>
-<td width="50%">
-
-**Depth Bias Warmup**
-
-![Depth Bias](workspace/visualizations/fractal_curves/depth_bias_warmup.png)
-
-Progressive decay encourages fine-grained exploration early in training.
-
-</td>
-<td width="50%">
+<td colspan="2">
 
 **Attention Bias Comparison**
 
@@ -181,10 +172,10 @@ LCA bias is most parameter-efficient with explicit geometric meaning.
 
 | Layer  | Module                   | Key Class                              |
 | ------ | ------------------------ | -------------------------------------- |
-| **L4** | `fractal_vit.py`         | `FractalCurveViT`             |
-| **L3** | `streaming_tokenizer.py` | `StreamingFractalTokenizerV2`          |
+| **L4** | `fractal_vit.py`         | `FractalCurveViT`                      |
+| **L3** | `streaming_tokenizer.py` | `StreamingFractalTokenizerV3` (recommended) |
 |        | `transformer.py`         | `FractalTransformer`                   |
-| **L2** | `attention.py`           | `LCAHilbertBias`, `LowRankHilbertBias` |
+| **L2** | `attention.py`           | `LCAHilbertBias`, `CrossScaleAttention`|
 |        | `feedforward.py`         | `SwiGLUFFN`                            |
 |        | `positional.py`          | `FractalPositionEmbedding`             |
 | **L1** | `hilbert.py`             | `HilbertCurve`, `PseudoHilbertCurve`   |
@@ -195,7 +186,8 @@ LCA bias is most parameter-efficient with explicit geometric meaning.
 
 | Type           | Description                                    |
 | -------------- | ---------------------------------------------- |
-| `streaming_v2` | **Recommended.** Gumbel-Softmax adaptive scale |
+| `streaming_v3` | **Recommended.** Cross-Scale Attention fusion  |
+| `streaming_v2` | ⚠️ Deprecated. Gumbel-Softmax adaptive scale   |
 | `streaming`    | Fixed multi-scale convolution                  |
 
 ### Attention Bias
@@ -237,12 +229,12 @@ uv run python examples/training/train_fractal_vit.py --quick-test
 
 ### Key Arguments
 
-| Argument           | Default        | Options                                         |
-| ------------------ | -------------- | ----------------------------------------------- |
-| `--tokenizer-type` | `streaming_v2` | `streaming_v2`, `streaming`                     |
-| `--bias-mode`      | `lca`          | `lca`, `low_rank`, `hierarchical`               |
-| `--ffn-type`       | `swiglu_level` | `swiglu_level`, `swiglu`, `gelu`                |
-| `--dataset`        | `cifar10`      | `cifar10`, `cifar100`, `mnist`, `tiny-imagenet` |
+| Argument           | Default        | Options                                              |
+| ------------------ | -------------- | ---------------------------------------------------- |
+| `--tokenizer-type` | `streaming_v3` | `streaming_v3`, `streaming_v2` (deprecated), `streaming` |
+| `--bias-mode`      | `lca`          | `lca`, `low_rank`, `hierarchical`                    |
+| `--ffn-type`       | `swiglu_level` | `swiglu_level`, `swiglu`, `gelu`                     |
+| `--dataset`        | `cifar10`      | `cifar10`, `cifar100`, `mnist`, `tiny-imagenet`      |
 
 ## Evaluation & Visualization
 
@@ -280,6 +272,18 @@ examples/training/
 ├── evaluate_and_visualize.py      # Evaluation
 └── visualize_fractal_curves.py    # Visualization
 ```
+
+## Documentation
+
+| Document | Description |
+| -------- | ----------- |
+| [Architecture Overview](documents/00_introduction.md) | Core concepts and design |
+| [Hilbert Curve](documents/01_hilbert_curve.md) | Hilbert curve theory |
+| [Fractal Tokenizer](documents/03_fractal_tokenizer.md) | Tokenizer implementation |
+| [Training System](documents/09_training_system.md) | Training guide |
+| [Testing & QA](documents/10_testing_qa.md) | Testing documentation |
+| [Improvement History](documents/11_issues_roadmap.md) | Development changelog |
+| [Improvement Plan](IMPROVEMENT_PLAN.md) | Future roadmap |
 
 ## License
 
