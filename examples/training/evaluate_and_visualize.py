@@ -8,6 +8,10 @@
 4. 注意力热力图：可视化模型注意力分布
 5. 特征图可视化：不同层的特征激活
 
+支持 Tokenizer 类型：
+- StreamingFractalTokenizerV3 (Cross-Scale Attention, 推荐)
+- StreamingFractalTokenizerV2 (Gumbel-Softmax, 已弃用)
+
 使用示例：
     # 评估最佳模型
     python evaluate_and_visualize.py --checkpoint experiments/xxx/checkpoints/best.pth
@@ -48,7 +52,11 @@ if str(SRC_PATH) not in sys.path:
 
 from vit_pytorch import FractalCurveViT
 from vit_pytorch.hilbert import HilbertCurve
-from vit_pytorch.streaming_tokenizer import HilbertIndexer, StreamingFractalTokenizerV2
+from vit_pytorch.streaming_tokenizer import (
+    HilbertIndexer,
+    StreamingFractalTokenizerV2,
+    StreamingFractalTokenizerV3,
+)
 
 # 设置中文字体 (可选)
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS']
@@ -1107,8 +1115,10 @@ def load_model_and_config(
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """加载模型和配置
     
-    支持加载旧版检查点(使用 complexity_estimator)和新版检查点(使用 complexity_head)。
-    对于旧版检查点，会尝试转换键名以保持兼容性。
+    支持加载:
+    - V3 (Cross-Scale Attention) 检查点
+    - V2 (Gumbel-Softmax) 检查点
+    - 旧版检查点 (自动转换)
     
     与 train_fractal_vit.py 保持完全一致的模型创建方式。
     """
@@ -1119,8 +1129,18 @@ def load_model_and_config(
     dataset_name = config.get('dataset', 'cifar10')
     spec = DATASETS.get(dataset_name, DATASETS['cifar10'])
     
-    # 与 train_fractal_vit.py 完全对齐的模型创建
-    model = FractalCurveViT(
+    # 获取 tokenizer 类型 (默认 V3，向后兼容 V2)
+    tokenizer_type = config.get('tokenizer_type', 'streaming_v3')
+    
+    # 旧版配置可能没有 tokenizer_type，通过其他字段推断
+    if 'tokenizer_type' not in config:
+        # 如果有 Gumbel 相关配置且没有明确指定 V3，则可能是 V2
+        if config.get('gumbel_tau_init') is not None or config.get('variable_tokens') is not None:
+            tokenizer_type = 'streaming_v2'
+            print(f"[INFO] Detected legacy V2 config, using tokenizer_type='{tokenizer_type}'")
+    
+    # 构建模型参数
+    model_kwargs = dict(
         image_size=max(spec.image_size, 32),
         num_classes=spec.num_classes,
         dim=config.get('dim', 192),
@@ -1137,26 +1157,30 @@ def load_model_and_config(
         max_level=config.get('max_level', 4),
         use_checkpoint=config.get('gradient_checkpoint', False),
         ffn_type=config.get('ffn_type', 'swiglu_level'),
-        tokenizer_type="streaming_v2",
+        tokenizer_type=tokenizer_type,
         num_scales=config.get('num_scales', 3),
-        streaming_tau=config.get('gumbel_tau_init', 2.0),
-        # V2 Tokenizer 配置 (与训练脚本对齐)
-        variable_tokens=config.get('variable_tokens', True),
-        use_soft_weights=config.get('use_soft_weights', False),
-    ).to(device)
+    )
     
-    # 配置 Tokenizer 的深度偏置预热参数 (与训练脚本一致)
-    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'set_depth_bias'):
-        model.tokenizer.set_depth_bias(
-            bias_strength=config.get('depth_bias_max', 2.0),
-            max_bias=config.get('depth_bias_max', 2.0),
-            decay_power=config.get('depth_bias_decay', 2.0),
-            warmup_ratio=config.get('depth_bias_warmup', 0.2),
-        )
-        # 同步 Gumbel 温度范围
-        if hasattr(model.tokenizer, 'tau_min'):
-            model.tokenizer.tau_min = config.get('gumbel_tau_min', 0.5)
-            model.tokenizer.tau_max = config.get('gumbel_tau_max', 5.0)
+    # V2 专用参数
+    if tokenizer_type == 'streaming_v2':
+        model_kwargs['streaming_tau'] = config.get('gumbel_tau_init', 2.0)
+        model_kwargs['variable_tokens'] = config.get('variable_tokens', False)
+        model_kwargs['use_soft_weights'] = config.get('use_soft_weights', False)
+    
+    model = FractalCurveViT(**model_kwargs).to(device)
+    
+    # V2 专用: 配置深度偏置预热参数
+    if tokenizer_type == 'streaming_v2':
+        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'set_depth_bias'):
+            model.tokenizer.set_depth_bias(
+                bias_strength=config.get('depth_bias_max', 2.0),
+                max_bias=config.get('depth_bias_max', 2.0),
+                decay_power=config.get('depth_bias_decay', 2.0),
+                warmup_ratio=config.get('depth_bias_warmup', 0.2),
+            )
+            if hasattr(model.tokenizer, 'tau_min'):
+                model.tokenizer.tau_min = config.get('gumbel_tau_min', 0.5)
+                model.tokenizer.tau_max = config.get('gumbel_tau_max', 5.0)
     
     # 处理检查点的键名映射
     state_dict = ckpt['model_state_dict']
@@ -1364,11 +1388,16 @@ def check_train_eval_consistency(
             report['warnings'].append("⚠️ 尺度选择不稳定")
             report['passed'] = False
     
-    # 检查 4: 训练状态信息
+    # 检查 4: 训练状态信息 (V2 专用)
     if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_training_stats'):
         stats = model.tokenizer.get_training_stats()
         report['training_stats'] = stats
-        print(f"  ✓ Gumbel τ={stats['gumbel_tau']:.4f}, use_soft_weights={stats['use_soft_weights']}")
+        if 'gumbel_tau' in stats:
+            print(f"  ✓ Gumbel τ={stats['gumbel_tau']:.4f}, use_soft_weights={stats.get('use_soft_weights', False)}")
+        else:
+            print(f"  ✓ Tokenizer stats: {list(stats.keys())}")
+    else:
+        print(f"  ✓ Tokenizer: 无额外状态信息")
     
     # 总结
     print()
@@ -1664,14 +1693,24 @@ def generate_full_report(
     # 1. 加载模型
     print("[1/6] Loading model...")
     model, config = load_model_and_config(checkpoint_path, device)
+    
+    tokenizer_type = config.get('tokenizer_type', 'streaming_v3')
+    tokenizer_name = {
+        'streaming_v3': 'StreamingFractalTokenizerV3 (Cross-Scale Attention)',
+        'streaming_v2': 'StreamingFractalTokenizerV2 (Gumbel-Softmax)',
+        'streaming_v1': 'StreamingFractalTokenizer (Basic)',
+    }.get(tokenizer_type, tokenizer_type)
+    
     print(f"      Config: dim={config.get('dim')}, depth={config.get('depth')}, "
           f"heads={config.get('heads')}")
+    print(f"      Tokenizer: {tokenizer_name}")
     print(f"      FFN: {config.get('ffn_type', 'swiglu_level')}, "
           f"Scales: {config.get('num_scales', 3)}")
-    print(f"      Gumbel τ: init={config.get('gumbel_tau_init', 2.0)}, "
-          f"min={config.get('gumbel_tau_min', 0.5)}, max={config.get('gumbel_tau_max', 5.0)}")
-    print(f"      Depth Bias: max={config.get('depth_bias_max', 2.0)}, "
-          f"decay={config.get('depth_bias_decay', 2.0)}, warmup={config.get('depth_bias_warmup', 0.2)}")
+    if tokenizer_type == 'streaming_v2':
+        print(f"      Gumbel τ: init={config.get('gumbel_tau_init', 2.0)}, "
+              f"min={config.get('gumbel_tau_min', 0.5)}, max={config.get('gumbel_tau_max', 5.0)}")
+        print(f"      Depth Bias: max={config.get('depth_bias_max', 2.0)}, "
+              f"decay={config.get('depth_bias_decay', 2.0)}, warmup={config.get('depth_bias_warmup', 0.2)}")
     
     # 2. 准备数据
     print("[2/6] Loading test data...")

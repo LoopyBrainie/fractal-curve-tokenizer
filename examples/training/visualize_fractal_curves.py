@@ -14,13 +14,17 @@
    LCA(i, j) = 第一个不同象限的层级 ∈ [0, L]
    B[i,j] = LCAEmbed(LCA(i,j))
 
-3. **Gumbel-Softmax 尺度选择**:
+3. **Cross-Scale Attention (V3, 推荐)**:
+   α_{i,s} = softmax(Q_i · K_{i,s} / √d)
+   Token_i = Σ_s α_{i,s} · V_{i,s}
+   - 密集梯度流: 所有尺度都收到梯度
+   - 无温度参数: 训练更稳定
+   - 平滑尺度选择: 空间相邻位置自然平滑
+
+4. **Gumbel-Softmax 尺度选择 (V2, 已弃用)**:
    π = Gumbel-Softmax(ComplexityHead(F), τ)
    训练: hard=True (STE), 推理: argmax
-
-4. **深度偏置预热 (v2.2)**:
-   logits' = logits + bias × scale_weights
-   bias(t) = max_bias × (1 - progress)^decay
+   问题: 稀疏梯度，仅选中尺度学习
 
 可视化功能
 ----------
@@ -28,9 +32,8 @@
 2. 不同阶数的曲线对比  
 3. LCA 距离矩阵可视化
 4. 四叉树路径与偏置关系
-5. 多尺度 Gumbel-Softmax 决策
-6. 深度偏置衰减曲线
-7. 注意力偏置矩阵可视化
+5. 多尺度注意力权重 (V3) / Gumbel-Softmax 决策 (V2)
+6. 注意力偏置矩阵可视化
 
 使用示例：
     # 生成所有可视化
@@ -39,8 +42,8 @@
     # 生成 LCA 偏置可视化
     python visualize_fractal_curves.py --lca-bias
     
-    # 生成 Gumbel-Softmax 可视化
-    python visualize_fractal_curves.py --gumbel-softmax
+    # 生成多尺度注意力可视化
+    python visualize_fractal_curves.py --cross-scale-attention
 """
 
 from __future__ import annotations
@@ -551,7 +554,255 @@ def visualize_lca_bias_matrix(
 
 
 # ============================================================================
-# 可视化：Gumbel-Softmax 尺度选择过程
+# 可视化：Cross-Scale Attention 机制 (V3, 推荐)
+# ============================================================================
+
+def visualize_cross_scale_attention(
+    save_path: Optional[Path] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """可视化 Cross-Scale Attention 多尺度融合机制 (V3).
+    
+    数学原理:
+        对于最细网格上的每个位置 i:
+        
+        1. Query (来自最细尺度特征):
+           Q_i = W_Q · F_min[i]
+           
+        2. Key (来自各尺度特征 + 尺度嵌入):
+           K_{i,s} = W_K · F_s[h_s(i)] + ScaleEmb_s
+           
+        3. Value (来自各尺度特征):
+           V_{i,s} = W_V · F_s[h_s(i)]
+           
+        4. Attention 权重:
+           α_{i,s} = softmax(Q_i · K_{i,s} / √d_k)
+           
+        5. 输出 Token:
+           Token_i = Σ_s α_{i,s} · V_{i,s}
+    
+    优势:
+        - 密集梯度流: 所有尺度都收到梯度
+        - 无温度参数: 训练更稳定
+        - 平滑尺度选择: 空间相邻位置自然平滑
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    
+    # 设置尺度
+    patch_sizes = [4, 8, 16]
+    num_scales = len(patch_sizes)
+    
+    # 1. Cross-Scale Attention 架构示意图
+    ax1 = axes[0, 0]
+    ax1.axis('off')
+    
+    arch_text = """
+    Cross-Scale Attention Architecture
+    ===================================
+    
+    Input: Multi-scale features {F_4, F_8, F_16}
+    
+    For each position i in finest grid:
+    
+      Q_i = W_Q * F_4[i]              # Query from finest
+      
+      For each scale s in {4, 8, 16}:
+        K_{i,s} = W_K * F_s[i_s] + SE_s  # Key + Scale Embed
+        V_{i,s} = W_V * F_s[i_s]         # Value
+      
+      attn[i,s] = softmax(Q_i * K_{i,s} / sqrt(d))
+      
+      Token_i = sum_s ( attn[i,s] * V_{i,s} )
+    
+    Output: [B, N, D] fused tokens
+    """
+    
+    ax1.text(0.05, 0.95, arch_text, transform=ax1.transAxes,
+            fontsize=9, verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='#e8f4e8', alpha=0.9))
+    ax1.set_title('Architecture Overview', fontsize=11)
+    
+    # 2. V3 vs V2 对比 - 梯度流
+    ax2 = axes[0, 1]
+    
+    # 模拟梯度流
+    positions = np.arange(5)  # 5 个示例位置
+    scales = np.arange(num_scales)
+    
+    # V2: 只有选中尺度收到梯度
+    v2_gradients = np.zeros((len(positions), num_scales))
+    np.random.seed(42)
+    for i in range(len(positions)):
+        selected = np.random.randint(0, num_scales)
+        v2_gradients[i, selected] = 1.0
+    
+    # V3: 所有尺度都收到加权梯度
+    v3_gradients = np.random.dirichlet(np.ones(num_scales), size=len(positions))
+    
+    # 绘制热图对比
+    im2_left = ax2.imshow(v2_gradients.T, aspect='auto', cmap='Reds', 
+                          extent=[-0.5, 2.3, -0.5, 2.5])
+    im2_right = ax2.imshow(v3_gradients.T, aspect='auto', cmap='Greens',
+                           extent=[2.7, 5.5, -0.5, 2.5])
+    
+    ax2.axvline(2.5, color='black', linewidth=2)
+    ax2.set_xticks([1, 4])
+    ax2.set_xticklabels(['V2 (Gumbel)', 'V3 (Cross-Scale)'])
+    ax2.set_yticks([0, 1, 2])
+    ax2.set_yticklabels([f'{ps}x{ps}' for ps in patch_sizes])
+    ax2.set_ylabel('Scale')
+    ax2.set_title('Gradient Flow: V2 (sparse) vs V3 (dense)', fontsize=11)
+    
+    # 添加说明
+    ax2.text(1, -1.0, 'Only selected scale\nreceives gradient', ha='center', fontsize=8)
+    ax2.text(4, -1.0, 'All scales receive\nweighted gradient', ha='center', fontsize=8)
+    
+    # 3. 尺度注意力权重分布示例
+    ax3 = axes[0, 2]
+    
+    # 模拟不同区域的注意力权重
+    np.random.seed(123)
+    regions = {
+        'Edge (complex)': np.array([0.7, 0.2, 0.1]),     # 偏向细尺度
+        'Texture': np.array([0.3, 0.5, 0.2]),            # 偏向中等尺度
+        'Background (smooth)': np.array([0.1, 0.2, 0.7]), # 偏向粗尺度
+    }
+    
+    x_pos = np.arange(num_scales)
+    width = 0.25
+    colors_regions = ['#FF6B6B', '#FFD93D', '#4ECDC4']
+    
+    for i, (region, weights) in enumerate(regions.items()):
+        ax3.bar(x_pos + i * width, weights, width,
+               label=region, color=colors_regions[i], edgecolor='black')
+    
+    ax3.set_xlabel('Scale (patch size)')
+    ax3.set_ylabel('Attention Weight')
+    ax3.set_title('Scale Attention by Region Type', fontsize=11)
+    ax3.set_xticks(x_pos + width)
+    ax3.set_xticklabels([f'{ps}x{ps}' for ps in patch_sizes])
+    ax3.legend(fontsize=9)
+    ax3.set_ylim(0, 1)
+    
+    # 4. 尺度嵌入 (Scale Embedding) 的作用
+    ax4 = axes[1, 0]
+    
+    # 模拟尺度嵌入向量 (降维到 2D 可视化)
+    np.random.seed(456)
+    d_model = 8  # 简化示例
+    scale_embeddings = np.random.randn(num_scales, d_model)
+    
+    # 使用 PCA 降到 2D
+    from numpy.linalg import svd
+    U, S, Vt = svd(scale_embeddings - scale_embeddings.mean(axis=0), full_matrices=False)
+    scale_2d = U[:, :2] * S[:2]
+    
+    colors_scales = plt.cm.viridis(np.linspace(0.2, 0.8, num_scales))
+    for i, ps in enumerate(patch_sizes):
+        ax4.scatter(scale_2d[i, 0], scale_2d[i, 1], 
+                   s=200, c=[colors_scales[i]], edgecolors='black', linewidths=2,
+                   label=f'{ps}x{ps}', zorder=10)
+        ax4.annotate(f'{ps}x{ps}', (scale_2d[i, 0], scale_2d[i, 1]),
+                    textcoords='offset points', xytext=(10, 10), fontsize=10)
+    
+    ax4.set_xlabel('Principal Component 1')
+    ax4.set_ylabel('Principal Component 2')
+    ax4.set_title('Scale Embedding Visualization\n(learned to distinguish scales)', fontsize=11)
+    ax4.legend(loc='lower right')
+    ax4.grid(True, alpha=0.3)
+    ax4.axhline(0, color='gray', linestyle='--', alpha=0.5)
+    ax4.axvline(0, color='gray', linestyle='--', alpha=0.5)
+    
+    # 5. 空间平滑性示例
+    ax5 = axes[1, 1]
+    
+    # 模拟 8x8 网格上的尺度选择
+    grid_size = 8
+    
+    # V2: 硬选择导致不平滑
+    np.random.seed(789)
+    v2_scale_map = np.random.randint(0, num_scales, (grid_size, grid_size))
+    
+    # V3: 软选择自然平滑
+    # 使用高斯滤波模拟平滑
+    from scipy.ndimage import gaussian_filter
+    v3_weights = np.random.rand(num_scales, grid_size, grid_size)
+    for s in range(num_scales):
+        v3_weights[s] = gaussian_filter(v3_weights[s], sigma=1.5)
+    # Softmax 归一化
+    v3_weights = np.exp(v3_weights * 3)
+    v3_weights = v3_weights / v3_weights.sum(axis=0, keepdims=True)
+    v3_dominant = np.argmax(v3_weights, axis=0)
+    
+    # 左半: V2, 右半: V3
+    combined = np.zeros((grid_size, grid_size * 2 + 1))
+    combined[:, :grid_size] = v2_scale_map
+    combined[:, grid_size+1:] = v3_dominant
+    combined[:, grid_size] = np.nan  # 分隔线
+    
+    cmap = plt.colormaps.get_cmap('viridis').resampled(num_scales)
+    im5 = ax5.imshow(combined, cmap=cmap, vmin=0, vmax=num_scales-1)
+    ax5.axvline(grid_size - 0.5, color='white', linewidth=3)
+    ax5.axvline(grid_size + 0.5, color='white', linewidth=3)
+    ax5.set_xticks([grid_size // 2, grid_size + 1 + grid_size // 2])
+    ax5.set_xticklabels(['V2: Discrete', 'V3: Smooth'])
+    ax5.set_title('Spatial Smoothness of Scale Selection', fontsize=11)
+    
+    cbar = plt.colorbar(im5, ax=ax5, ticks=[0, 1, 2])
+    cbar.set_ticklabels([f'{ps}x{ps}' for ps in patch_sizes])
+    
+    # 6. V3 vs V2 优势总结
+    ax6 = axes[1, 2]
+    ax6.axis('off')
+    
+    comparison_text = """
+    V3 Cross-Scale Attention vs V2 Gumbel-Softmax
+    ===============================================
+    
+    V2 (Gumbel-Softmax, deprecated):
+      - Hard selection: s_i = argmax(logits + Gumbel)
+      - Sparse gradient: only selected scale learns
+      - Temperature scheduling required
+      - STE causes gradient bias
+    
+    V3 (Cross-Scale Attention, recommended):
+      + Soft fusion: Token = sum(alpha_s * V_s)
+      + Dense gradient: all scales learn
+      + No temperature tuning needed
+      + Smooth spatial coherence
+      + Better convergence
+    
+    Mathematical comparison:
+    
+    V2: Token_i = F_{argmax}[i]     (discrete)
+        grad exists only for selected scale
+    
+    V3: Token_i = sum_s alpha_s * V_s  (continuous)
+        grad_s = alpha_s * grad_output  (all scales)
+    """
+    
+    ax6.text(0.05, 0.95, comparison_text, transform=ax6.transAxes,
+            fontsize=9, verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='#f0f8ff', alpha=0.9))
+    ax6.set_title('V3 Advantages Summary', fontsize=11)
+    
+    fig.suptitle('Cross-Scale Attention Mechanism (V3)\n'
+                'Differentiable Multi-Scale Feature Fusion',
+                fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] Cross-Scale Attention visualization saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
+
+
+# ============================================================================
+# 可视化：Gumbel-Softmax 尺度选择过程 (V2, 已弃用)
 # ============================================================================
 
 def visualize_gumbel_softmax_decision(
@@ -922,11 +1173,10 @@ def visualize_attention_bias_comparison(
 ) -> plt.Figure:
     """对比不同 Hilbert Bias 模式的注意力矩阵.
     
-    四种模式:
-    1. original: 全连接 MLP
+    三种模式:
+    1. lca: LCA 嵌入表 (推荐)
     2. low_rank: 低秩分解 B = ΦΨ^T
     3. hierarchical: 分层累加
-    4. lca: LCA 嵌入表 (推荐)
     """
     n = 2 ** order
     num_tokens = n * n
@@ -1014,15 +1264,14 @@ def visualize_attention_bias_comparison(
     path_dim = max_depth
     
     params = {
-        'original': num_tokens * num_tokens * heads,  # 全矩阵
+        'lca': (max_depth + 1) * heads,  # LCA 嵌入表
         'low_rank': 2 * path_dim * 64 + 64 * rank * heads,  # 两个 MLP
         'hierarchical': max_depth * (4 * 16 + 16 * heads),  # 每层一个小 MLP
-        'lca': (max_depth + 1) * heads,  # LCA 嵌入表
     }
     
     methods = list(params.keys())
     values = [params[m] for m in methods]
-    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4']
+    colors = ['#96CEB4', '#4ECDC4', '#45B7D1']
     
     bars = ax6.bar(methods, values, color=colors, edgecolor='black')
     ax6.set_ylabel('Parameter Count')
@@ -1811,23 +2060,30 @@ def generate_all_visualizations(
     output_dir: Path,
     show: bool = False,
     include_new: bool = True,
+    include_v2_deprecated: bool = False,
 ) -> None:
     """生成所有可视化.
     
     Args:
         output_dir: 输出目录
         show: 是否交互显示
-        include_new: 是否包含新增的高级可视化 (LCA, Gumbel, Depth Bias)
+        include_new: 是否包含新增的高级可视化 (LCA, Cross-Scale, etc.)
+        include_v2_deprecated: 是否包含 V2 已弃用的可视化 (Gumbel, Depth Bias)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    total_steps = 11 if include_new else 7
+    total_steps = 7  # 基础可视化
+    if include_new:
+        total_steps += 3  # LCA, Cross-Scale Attention, Bias Comparison
+    if include_v2_deprecated:
+        total_steps += 2  # Gumbel, Depth Bias
     
     print(f"\n{'='*60}")
     print("Generating Fractal Curve Visualizations")
     print(f"{'='*60}")
     print(f"Output: {output_dir}")
     print(f"Include advanced visualizations: {include_new}")
+    print(f"Include V2 deprecated (Gumbel, DepthBias): {include_v2_deprecated}")
     print(f"{'='*60}\n")
     
     step = 1
@@ -1902,7 +2158,7 @@ def generate_all_visualizations(
         print("      (This may require additional dependencies like Pillow)")
     step += 1
     
-    # ========== 新增的高级可视化 ==========
+    # ========== 新增的高级可视化 (V3 推荐) ==========
     if include_new:
         # 8. LCA 偏置矩阵
         print(f"[{step}/{total_steps}] Generating LCA bias matrix...")
@@ -1913,29 +2169,40 @@ def generate_all_visualizations(
         )
         step += 1
         
-        # 9. Gumbel-Softmax 机制
-        print(f"[{step}/{total_steps}] Generating Gumbel-Softmax decision...")
-        visualize_gumbel_softmax_decision(
-            save_path=output_dir / "gumbel_softmax_decision.png",
+        # 9. Cross-Scale Attention 机制 (V3 推荐)
+        print(f"[{step}/{total_steps}] Generating Cross-Scale Attention visualization...")
+        visualize_cross_scale_attention(
+            save_path=output_dir / "cross_scale_attention.png",
             show=show,
         )
         step += 1
         
-        # 10. 深度偏置预热
-        print(f"[{step}/{total_steps}] Generating depth bias warmup...")
-        visualize_depth_bias_warmup(
-            save_path=output_dir / "depth_bias_warmup.png",
-            show=show,
-        )
-        step += 1
-        
-        # 11. 注意力偏置对比
+        # 10. 注意力偏置对比
         print(f"[{step}/{total_steps}] Generating attention bias comparison...")
         visualize_attention_bias_comparison(
             order=3,
             save_path=output_dir / "attention_bias_comparison.png",
             show=show,
         )
+        step += 1
+    
+    # ========== V2 已弃用的可视化 ==========
+    if include_v2_deprecated:
+        # Gumbel-Softmax 机制 (V2, 已弃用)
+        print(f"[{step}/{total_steps}] [V2 deprecated] Generating Gumbel-Softmax decision...")
+        visualize_gumbel_softmax_decision(
+            save_path=output_dir / "gumbel_softmax_decision.png",
+            show=show,
+        )
+        step += 1
+        
+        # 深度偏置预热 (V2, 已弃用)
+        print(f"[{step}/{total_steps}] [V2 deprecated] Generating depth bias warmup...")
+        visualize_depth_bias_warmup(
+            save_path=output_dir / "depth_bias_warmup.png",
+            show=show,
+        )
+        step += 1
     
     print(f"\n{'='*60}")
     print("VISUALIZATION COMPLETE")
@@ -1950,9 +2217,11 @@ def generate_all_visualizations(
     print(f"  - hilbert_growth.gif (if successful)")
     if include_new:
         print(f"  - lca_bias_matrix.png")
-        print(f"  - gumbel_softmax_decision.png")
-        print(f"  - depth_bias_warmup.png")
+        print(f"  - cross_scale_attention.png (V3)")
         print(f"  - attention_bias_comparison.png")
+    if include_v2_deprecated:
+        print(f"  - gumbel_softmax_decision.png (V2 deprecated)")
+        print(f"  - depth_bias_warmup.png (V2 deprecated)")
     print(f"{'='*60}\n")
 
 
@@ -1966,17 +2235,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Generate all visualizations (including new advanced ones)
+  # Generate all visualizations (V3 + basic)
   python visualize_fractal_curves.py --all
 
-  # Generate only basic visualizations (without LCA, Gumbel, etc.)
+  # Generate all including V2 deprecated visualizations
+  python visualize_fractal_curves.py --all --include-v2
+
+  # Generate only basic visualizations (without LCA, Cross-Scale, etc.)
   python visualize_fractal_curves.py --all --no-advanced
 
-  # Generate specific visualization
-  python visualize_fractal_curves.py --lca-bias --order 4 --show
+  # Generate Cross-Scale Attention visualization (V3 recommended)
+  python visualize_fractal_curves.py --cross-scale-attention --show
 
-  # Generate multiple specific visualizations
-  python visualize_fractal_curves.py --gumbel --depth-bias --bias-comparison
+  # Generate V2 deprecated visualizations
+  python visualize_fractal_curves.py --gumbel --depth-bias
         """
     )
     
@@ -2001,10 +2273,12 @@ Examples:
     # 模式 - 新增高级可视化
     parser.add_argument("--lca-bias", action="store_true",
                        help="Generate LCA bias matrix visualization")
+    parser.add_argument("--cross-scale-attention", action="store_true",
+                       help="[V3] Generate Cross-Scale Attention visualization (recommended)")
     parser.add_argument("--gumbel", action="store_true",
-                       help="Generate Gumbel-Softmax decision visualization")
+                       help="[V2] Generate Gumbel-Softmax decision visualization (deprecated)")
     parser.add_argument("--depth-bias", action="store_true",
-                       help="Generate depth bias warmup visualization")
+                       help="[V2] Generate depth bias warmup visualization (deprecated)")
     parser.add_argument("--bias-comparison", action="store_true",
                        help="Generate attention bias modes comparison")
     
@@ -2017,6 +2291,8 @@ Examples:
                        help="Show plots interactively")
     parser.add_argument("--no-advanced", action="store_true",
                        help="Exclude advanced visualizations when using --all")
+    parser.add_argument("--include-v2", action="store_true",
+                       help="Include V2 deprecated visualizations (Gumbel, Depth Bias) when using --all")
     
     args = parser.parse_args()
     
@@ -2031,7 +2307,8 @@ Examples:
     all_options = [
         args.all, args.animate, args.comparison, args.locality, 
         args.quadtree, args.mapping, args.multiscale, args.mixed_level,
-        args.lca_bias, args.gumbel, args.depth_bias, args.bias_comparison
+        args.lca_bias, args.cross_scale_attention, args.gumbel, 
+        args.depth_bias, args.bias_comparison
     ]
     if not any(all_options):
         args.all = True
@@ -2040,7 +2317,8 @@ Examples:
         generate_all_visualizations(
             output_dir, 
             show=args.show,
-            include_new=not args.no_advanced
+            include_new=not args.no_advanced,
+            include_v2_deprecated=args.include_v2,
         )
         return
     
@@ -2096,6 +2374,12 @@ Examples:
         visualize_lca_bias_matrix(
             order=args.order,
             save_path=output_dir / f"lca_bias_matrix_order{args.order}.png",
+            show=args.show,
+        )
+    
+    if args.cross_scale_attention:
+        visualize_cross_scale_attention(
+            save_path=output_dir / "cross_scale_attention.png",
             show=args.show,
         )
     
