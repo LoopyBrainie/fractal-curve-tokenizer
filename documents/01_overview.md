@@ -8,7 +8,7 @@ Fractal Curve Tokenizer 项目代表了 Vision Transformer (ViT) 架构的一次
 
 1. **Hilbert 曲线遍历**：使用 Hilbert 曲线将 2D 网格映射为 1D 序列，保持空间局部性
 2. **多尺度 tokenization**：通过卷积金字塔提取多尺度特征
-3. **端到端可微**：使用 Gumbel-Softmax 实现可微的尺度选择（V2）
+3. **端到端可微**：使用 Cross-Scale Attention 实现可微的多尺度融合（V3 推荐），或 Gumbel-Softmax 尺度选择（V2 废弃）
 
 ## 1.2 Hilbert 曲线简介与空间填充性质
 
@@ -68,4 +68,5 @@ fractal-curve-tokenizer/
 | tokenizer_type | 实现类                           | 特点                 | 状态   |
 |:-------------- |:----------------------------- |:------------------ |:---- |
 | `streaming`    | `StreamingFractalTokenizer`   | 固定多尺度卷积            | ✅ 稳定 |
-| `streaming_v2` | `StreamingFractalTokenizerV2` | Gumbel-Softmax 自适应 | ✅ 推荐 |
+| `streaming_v2` | `StreamingFractalTokenizerV2` | Gumbel-Softmax 自适应 | ⚠️ 废弃 |
+| `streaming_v3` | `StreamingFractalTokenizerV3` | Cross-Scale Attention 多尺度融合 | ✅ **推荐** |

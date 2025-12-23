@@ -118,6 +118,23 @@ $$\text{quadtree\_path}[d, \ell] = q_\ell = \text{bit}(x, k-\ell) + 2 \times \te
   $F_s = \text{Conv}_s(I), \quad s \in \{1, \ldots, S\}$
   每个尺度: `kernel_size = stride = patch_size_s`
 
+### CrossScaleAttention (V3 核心)
+
+跨尺度注意力融合模块，V3 Tokenizer 的核心组件。
+
+* **数学定义**：
+  $$\alpha_{i,s} = \text{softmax}_s\left(\frac{Q_i \cdot K_{i,s}}{\sqrt{d}}\right)$$
+  $$\text{Token}_i = \sum_{s=1}^{S} \alpha_{i,s} \cdot V_{i,s}$$
+  
+* **关键属性**：
+  * `scale_embedding`: 尺度嵌入 $(S, D)$
+  * `to_qkv`: QKV 投影 $(D \to 3D)$
+  * `to_out`: 输出投影 $(D \to D)$
+  
+* **梯度优势**：
+  * 全尺度密集梯度 (vs V2 STE 稀疏梯度)
+  * 无温度参数 (vs V2 Gumbel 温度退火)
+
 ## 2.5 constants.py - 超参数默认值
 
 | 常量                   | 值    | 说明                                 |

@@ -37,7 +37,7 @@
 
 | 参数                 | 默认值            | 说明                         |
 |:------------------ |:-------------- |:-------------------------- |
-| `--tokenizer-type` | `streaming_v2` | Tokenizer 类型               |
+| `--tokenizer-type` | `streaming_v3` | Tokenizer 类型 (✅ V3 推荐)     |
 | `--bias-mode`      | `lca`          | Hilbert Bias 模式 (推荐)       |
 | `--ffn-type`       | `swiglu_level` | FFN 类型                     |
 | `--rank`           | 32             | Low-Rank 秩 (仅 low_rank 模式) |
@@ -100,7 +100,9 @@ scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[5])
 
 ---
 
-## 9.5 Gumbel 温度退火
+## 9.5 温度退火 (⚠️ 仅 V2)
+
+> **注意**: V3 Cross-Scale Attention 无需温度参数和退火调度，以下仅适用于已废弃的 V2。
 
 ### StreamingFractalTokenizerV2 温度调度
 
@@ -122,7 +124,9 @@ for epoch in range(epochs):
 
 ---
 
-## 9.6 Depth Bias 预热 (v2.2)
+## 9.6 Depth Bias 预热 (⚠️ 仅 V2)
+
+> **注意**: V3 Cross-Scale Attention 无需深度偏置调度，以下仅适用于已废弃的 V2。
 
 ### set_depth_bias() / anneal_depth_bias()
 
@@ -197,10 +201,10 @@ torch.save(checkpoint, 'best.pth')
 ## 9.9 使用示例
 
 ```bash
-# 使用推荐配置训练 (LCA 模式)
+# 使用推荐配置训练 (V3 + LCA 模式)
 python examples/training/train_fractal_vit.py \
     --dataset tiny-imagenet \
-    --tokenizer-type streaming_v2 \
+    --tokenizer-type streaming_v3 \
     --bias-mode lca \
     --ffn-type swiglu_level \
     --epochs 100 \
@@ -211,6 +215,7 @@ python examples/training/train_fractal_vit.py \
 # 使用 Low-Rank 模式 (大模型推荐)
 python examples/training/train_fractal_vit.py \
     --dataset imagenet \
+    --tokenizer-type streaming_v3 \
     --bias-mode low_rank \
     --rank 32 \
     --dim 768 \

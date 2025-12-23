@@ -18,7 +18,8 @@ Streaming Tokenizer 实现端到端可微，无需额外辅助损失。
 | tokenizer_type | 实现类                           | 特点             | 状态   |
 |:-------------- |:----------------------------- |:-------------- |:---- |
 | `streaming`    | `StreamingFractalTokenizer`   | 固定多尺度          | ✅ 稳定 |
-| `streaming_v2` | `StreamingFractalTokenizerV2` | Gumbel-Softmax | ✅ 推荐 |
+| `streaming_v2` | `StreamingFractalTokenizerV2` | Gumbel-Softmax | ⚠️ 废弃 |
+| `streaming_v3` | `StreamingFractalTokenizerV3` | Cross-Scale Attention | ✅ **推荐** |
 
 ---
 
@@ -36,7 +37,7 @@ Streaming Tokenizer 实现端到端可微，无需额外辅助损失。
 | `mlp_dim`        | int           | dim × 4        | FFN 隐藏层维度 (P0 修复: 2×→4×)   |
 | `pool`           | str           | 'cls'          | 池化策略                       |
 | `dropout`        | float         | 0.1            | Dropout 比率 (P0 修复: 0.3→0.1) |
-| `tokenizer_type` | str           | 'streaming_v2' | Tokenizer 类型               |
+| `tokenizer_type` | str           | 'streaming_v3' | Tokenizer 类型 (✅ V3 推荐)      |
 | `variable_tokens`| bool          | False          | 可变 Token 模式 (P0 修复: True→False) |
 | `bias_mode`      | str           | 'lca'          | Hilbert Bias 模式 (推荐 'lca') |
 | `ffn_type`       | str           | 'swiglu_level' | FFN 类型                     |
@@ -176,9 +177,9 @@ model = FractalCurveViT(
     depth=6,
     heads=6,
     mlp_dim=768,
-    tokenizer_type='streaming_v2',
-    bias_mode='lca',  # 推荐默认模式
-    ffn_type='swiglu_level',
+    tokenizer_type='streaming_v3',  # ✅ 推荐
+    bias_mode='lca',                # 推荐 (参数量最少)
+    ffn_type='swiglu_level',        # 推荐
 )
 
 images = torch.randn(2, 3, 224, 224)
@@ -194,9 +195,9 @@ Input Image (B, C, H, W)
         │
         ▼
 ┌─────────────────────────────┐
-│ StreamingFractalTokenizerV2 │
+│ StreamingFractalTokenizerV3 │
 │ - MultiScalePatchEncoder    │
-│ - Gumbel-Softmax Selection  │
+│ - CrossScaleAttention       │
 │ - HilbertIndexer            │
 └─────────────────────────────┘
         │

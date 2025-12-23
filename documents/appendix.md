@@ -10,8 +10,9 @@ classDiagram
 
     BaseTokenizer <|-- StreamingFractalTokenizer
     BaseTokenizer <|-- StreamingFractalTokenizerV2
+    BaseTokenizer <|-- StreamingFractalTokenizerV3
 
-    FractalCurveViT *-- StreamingFractalTokenizerV2
+    FractalCurveViT *-- StreamingFractalTokenizerV3
     FractalCurveViT *-- FractalPositionEmbedding
     FractalCurveViT *-- FractalTransformer
 
@@ -22,6 +23,9 @@ classDiagram
     HilbertAwareMultiScaleAttention *-- LCAHilbertBias
     HilbertAwareMultiScaleAttention *-- LowRankHilbertBias
     AdaptiveFractalFeedForward *-- SwiGLUFFN
+    
+    StreamingFractalTokenizerV3 *-- CrossScaleAttention
+    StreamingFractalTokenizerV3 *-- MultiScalePatchEncoder
 ```
 
 ## B. 数据流向图
@@ -30,9 +34,9 @@ classDiagram
 1. Input Image (B, C, H, W)
         │
         ▼
-2. StreamingFractalTokenizerV2
+2. StreamingFractalTokenizerV3
    ├── MultiScalePatchEncoder (卷积金字塔)
-   ├── Scale Selection (V2: Gumbel-Softmax)
+   ├── CrossScaleAttention (V3: 多尺度注意力融合)
    └── HilbertIndexer (Hilbert 重排序)
         │
         ▼
@@ -102,7 +106,7 @@ classDiagram
 | `drop_path`      | 0.1           | 0.1            | DropPath 比率 (P0 修复: 0.2→0.1) |
 | `lr`             | 5e-4          | 1e-4           | 学习率                        |
 | `weight_decay`   | 0.03          | 0.03           | 权重衰减 (P0 修复: 0.05→0.03)   |
-| `tokenizer_type` | streaming_v2  | streaming_v2   | Tokenizer 类型               |
+| `tokenizer_type` | streaming_v3  | streaming_v3   | Tokenizer 类型 (✅ V3 推荐)      |
 | `bias_mode`      | lca           | lca            | Hilbert Bias 模式            |
 | `rank`           | 32            | 64             | Low-Rank 秩 (仅 low_rank 模式) |
 | `ffn_type`       | swiglu_level  | swiglu_level   | FFN 类型                     |
@@ -121,7 +125,7 @@ model = FractalCurveViT(
     depth=6,
     heads=6,
     mlp_dim=768,
-    tokenizer_type='streaming_v2',  # 推荐
+    tokenizer_type='streaming_v3',  # ✅ 推荐 (Cross-Scale Attention)
     bias_mode='lca',                # 推荐 (参数量最少)
     ffn_type='swiglu_level',        # 推荐
 )
@@ -184,7 +188,9 @@ from vit_pytorch import (
     FractalCurveViT,
     # Tokenizer
     StreamingFractalTokenizer,
-    StreamingFractalTokenizerV2,
+    StreamingFractalTokenizerV2,    # ⚠️ 废弃
+    StreamingFractalTokenizerV3,    # ✅ 推荐
+    CrossScaleAttention,            # V3 核心组件
     # 组件
     FractalTransformer,
     HilbertAwareMultiScaleAttention,
@@ -213,6 +219,8 @@ from vit_pytorch import (
 | $E_{pos}$         | 位置编码函数                                               |
 | $E_{depth}$       | 深度嵌入                                                 |
 | $E_{path}$        | 路径嵌入                                                 |
+| $E_{scale}$       | 尺度嵌入 (V3 Cross-Scale Attention)                      |
+| $\alpha_{i,s}$    | 位置 $i$ 对尺度 $s$ 的注意力权重 (V3)                          |
 | $B_{hilbert}$     | Hilbert 偏置矩阵                                         |
 | $B_{level}$       | 层级偏置矩阵                                               |
 | $\phi, \psi$      | Low-Rank 编码器                                         |
@@ -220,3 +228,4 @@ from vit_pytorch import (
 | $\sigma_{scale}$  | 层级缩放因子                                               |
 | $\text{SwiGLU}$   | $W_{out}(\text{Swish}(W_g x) \odot W_v x)$           |
 | $H$               | Hilbert 曲线映射 $[0, n^2) \leftrightarrow [0, n)^2$     |
+| $Q, K, V$         | Query, Key, Value 向量 (注意力机制)                         |

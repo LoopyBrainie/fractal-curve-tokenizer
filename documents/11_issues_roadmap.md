@@ -209,13 +209,14 @@ Layer 4 (应用层):
     fractal_vit.py          FractalCurveViT (默认 V3)
 
 Layer 3 (管道层):
-    streaming_tokenizer.py  StreamingFractalTokenizerV3 (推荐)
+    streaming_tokenizer.py  StreamingFractalTokenizerV3 (✅ 推荐)
                             StreamingFractalTokenizerV2 (⚠️ 废弃)
+                            StreamingFractalTokenizer   (V1 固定尺度)
     transformer.py          FractalTransformer
 
 Layer 2 (组件层):
     attention.py            HilbertAwareMultiScaleAttention
-    cross_scale.py          CrossScaleAttention (V3 专用)
+    streaming_tokenizer.py  CrossScaleAttention (V3 核心)
     feedforward.py          SwiGLUFFN, AdaptiveFractalFeedForward
     positional.py           FractalPositionEmbedding
 
