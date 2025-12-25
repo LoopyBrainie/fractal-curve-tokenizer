@@ -26,11 +26,8 @@ Tokenizer 选项
 +---------------+-------------------------------+------------------+
 | tokenizer_type| 实现                           | 特点              |
 +===============+===============================+==================+
-| streaming_v3  | StreamingFractalTokenizerV3   | Cross-Scale      |
-|               |                               | Attention (推荐) |
-+---------------+-------------------------------+------------------+
-| streaming_v2  | StreamingFractalTokenizerV2   | Gumbel-Softmax   |
-|               |                               | (已弃用)          |
+| streaming_v3  | StreamingFractalTokenizerV3   | Variable Depth   |
+|               |                               | Tokens (推荐)    |
 +---------------+-------------------------------+------------------+
 | streaming     | StreamingFractalTokenizer     | 固定多尺度        |
 +---------------+-------------------------------+------------------+

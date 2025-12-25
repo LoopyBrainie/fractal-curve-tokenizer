@@ -958,6 +958,87 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         
         return entropy
     
+    @torch.no_grad()
+    def compute_scale_distribution(
+        self, 
+        images: torch.Tensor,
+    ) -> Dict[str, Any]:
+        """计算深度分布统计信息.
+        
+        Variable Depth 架构中，"scale" 对应四叉树深度：
+        - depth=0: 最粗尺度 (base_patch_size * 2^max_depth)
+        - depth=max_depth: 最细尺度 (base_patch_size)
+        
+        Args:
+            images: [B, C, H, W] 输入图像
+            
+        Returns:
+            Dict 包含:
+            - scale_ratios: Dict[int, float] 每个深度的 token 比例 (key 为 patch_size)
+            - entropy: float 深度分布熵值
+            - max_entropy: float 最大可能熵值
+            - dominant_scale: int 主导 patch 尺寸
+            - depth_distribution: Dict[int, int] 原始深度计数
+        """
+        # 执行分割以获取统计信息
+        _ = self.tokenize(images)
+        
+        if self._last_split_stats is None:
+            return {
+                'scale_ratios': {},
+                'entropy': 0.0,
+                'max_entropy': 0.0,
+                'dominant_scale': self.base_patch_size,
+                'depth_distribution': {},
+            }
+        
+        import math
+        
+        # 合并所有图像的深度分布
+        total_dist: Dict[int, int] = {}
+        for dist in self._last_split_stats['depth_distributions']:
+            for d, count in dist.items():
+                total_dist[d] = total_dist.get(d, 0) + count
+        
+        total_tokens = sum(total_dist.values())
+        if total_tokens == 0:
+            return {
+                'scale_ratios': {},
+                'entropy': 0.0,
+                'max_entropy': 0.0,
+                'dominant_scale': self.base_patch_size,
+                'depth_distribution': {},
+            }
+        
+        # 将深度转换为 patch_size: depth=d → ps=base_patch_size * 2^(max_depth - d)
+        scale_ratios: Dict[int, float] = {}
+        for depth, count in total_dist.items():
+            ps = self.base_patch_size * (2 ** (self.max_depth - depth))
+            scale_ratios[ps] = count / total_tokens
+        
+        # 计算熵
+        entropy = 0.0
+        for count in total_dist.values():
+            p = count / total_tokens
+            if p > 0:
+                entropy -= p * math.log(p)
+        
+        # 最大熵 (均匀分布)
+        num_depths = self.max_depth + 1
+        max_entropy = math.log(num_depths) if num_depths > 1 else 0.0
+        
+        # 主导尺度 (token 数最多的深度对应的 patch_size)
+        dominant_depth = max(total_dist.keys(), key=lambda d: total_dist[d])
+        dominant_scale = self.base_patch_size * (2 ** (self.max_depth - dominant_depth))
+        
+        return {
+            'scale_ratios': scale_ratios,
+            'entropy': entropy,
+            'max_entropy': max_entropy,
+            'dominant_scale': dominant_scale,
+            'depth_distribution': total_dist,
+        }
+    
     def get_training_stats(self) -> Dict[str, Any]:
         """获取训练状态统计信息."""
         stats = {
