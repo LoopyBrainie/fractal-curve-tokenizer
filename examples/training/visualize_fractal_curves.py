@@ -14,17 +14,15 @@
    LCA(i, j) = 第一个不同象限的层级 ∈ [0, L]
    B[i,j] = LCAEmbed(LCA(i,j))
 
-3. **Cross-Scale Attention (V3, 推荐)**:
-   α_{i,s} = softmax(Q_i · K_{i,s} / √d)
-   Token_i = Σ_s α_{i,s} · V_{i,s}
-   - 密集梯度流: 所有尺度都收到梯度
+3. **Variable Depth Tokens (V3, 推荐)**:
+   Regions = AdaptiveQuadtreeSplit(I)  # 内容自适应分割
+   F = SharedConv(I)                    # 共享特征提取
+   Token_i = Pool(F[R_i]) * σ_d + E_d  # 区域池化 + 深度编码
+   
+   优势:
+   - 密集梯度流: 共享特征提取器所有路径都收到梯度
    - 无温度参数: 训练更稳定
-   - 平滑尺度选择: 空间相邻位置自然平滑
-
-4. **Gumbel-Softmax 尺度选择 (V2, 已弃用)**:
-   π = Gumbel-Softmax(ComplexityHead(F), τ)
-   训练: hard=True (STE), 推理: argmax
-   问题: 稀疏梯度，仅选中尺度学习
+   - 自适应分割: 根据图像内容动态决定分割深度
 
 可视化功能
 ----------
@@ -32,7 +30,7 @@
 2. 不同阶数的曲线对比  
 3. LCA 距离矩阵可视化
 4. 四叉树路径与偏置关系
-5. 多尺度注意力权重 (V3) / Gumbel-Softmax 决策 (V2)
+5. 多尺度深度分布可视化
 6. 注意力偏置矩阵可视化
 
 使用示例：
@@ -42,8 +40,8 @@
     # 生成 LCA 偏置可视化
     python visualize_fractal_curves.py --lca-bias
     
-    # 生成多尺度注意力可视化
-    python visualize_fractal_curves.py --cross-scale-attention
+    # 生成多尺度深度分布可视化
+    python visualize_fractal_curves.py --depth-distribution
 """
 
 from __future__ import annotations
@@ -554,37 +552,37 @@ def visualize_lca_bias_matrix(
 
 
 # ============================================================================
-# 可视化：Cross-Scale Attention 机制 (V3, 推荐)
+# 可视化：Variable Depth Tokens 机制 (V3, 推荐)
 # ============================================================================
 
 def visualize_cross_scale_attention(
     save_path: Optional[Path] = None,
     show: bool = True,
 ) -> plt.Figure:
-    """可视化 Cross-Scale Attention 多尺度融合机制 (V3).
+    """可视化 Variable Depth Tokens 多尺度分词机制 (V3).
     
     数学原理:
-        对于最细网格上的每个位置 i:
-        
-        1. Query (来自最细尺度特征):
-           Q_i = W_Q · F_min[i]
+        1. 内容自适应分割:
+           Regions = AdaptiveQuadtreeSplit(I)
+           - 根据图像内容复杂度决定分割深度
+           - 复杂区域 → 细粒度 patch (4x4)
+           - 平滑区域 → 粗粒度 patch (16x16)
            
-        2. Key (来自各尺度特征 + 尺度嵌入):
-           K_{i,s} = W_K · F_s[h_s(i)] + ScaleEmb_s
+        2. 共享特征提取:
+           F = SharedConv(I)
+           - 单个卷积网络处理所有区域
+           - 所有路径共享梯度
            
-        3. Value (来自各尺度特征):
-           V_{i,s} = W_V · F_s[h_s(i)]
-           
-        4. Attention 权重:
-           α_{i,s} = softmax(Q_i · K_{i,s} / √d_k)
-           
-        5. 输出 Token:
-           Token_i = Σ_s α_{i,s} · V_{i,s}
+        3. 区域池化 + 深度编码:
+           Token_i = Pool(F[R_i]) * σ_d + E_d
+           - Pool: 根据区域大小自适应池化
+           - σ_d: 深度相关缩放因子
+           - E_d: 深度位置编码
     
     优势:
-        - 密集梯度流: 所有尺度都收到梯度
+        - 密集梯度流: 共享特征提取器所有路径都收到梯度
         - 无温度参数: 训练更稳定
-        - 平滑尺度选择: 空间相邻位置自然平滑
+        - 自适应分割: 根据图像内容动态决定分割深度
     """
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     
@@ -592,29 +590,31 @@ def visualize_cross_scale_attention(
     patch_sizes = [4, 8, 16]
     num_scales = len(patch_sizes)
     
-    # 1. Cross-Scale Attention 架构示意图
+    # 1. Variable Depth Tokens 架构示意图
     ax1 = axes[0, 0]
     ax1.axis('off')
     
     arch_text = """
-    Cross-Scale Attention Architecture
-    ===================================
+    Variable Depth Tokens Architecture
+    ====================================
     
-    Input: Multi-scale features {F_4, F_8, F_16}
+    Input: Image I ∈ R^(H×W×C)
     
-    For each position i in finest grid:
+    Step 1: Adaptive Quadtree Split
+      Regions = AdaptiveQuadtreeSplit(I)
+      - Split based on content complexity
+      - Complex → fine patches (4x4)
+      - Smooth → coarse patches (16x16)
     
-      Q_i = W_Q * F_4[i]              # Query from finest
-      
-      For each scale s in {4, 8, 16}:
-        K_{i,s} = W_K * F_s[i_s] + SE_s  # Key + Scale Embed
-        V_{i,s} = W_V * F_s[i_s]         # Value
-      
-      attn[i,s] = softmax(Q_i * K_{i,s} / sqrt(d))
-      
-      Token_i = sum_s ( attn[i,s] * V_{i,s} )
+    Step 2: Shared Feature Extraction  
+      F = SharedConv(I)  # [B, D, H/4, W/4]
+      - Single convnet for all depths
     
-    Output: [B, N, D] fused tokens
+    Step 3: Region Pooling + Depth Encoding
+      For each region R_k at depth d:
+        Token_k = Pool(F[R_k]) * σ_d + E_d
+    
+    Output: Variable-length tokens [B, N_var, D]
     """
     
     ax1.text(0.05, 0.95, arch_text, transform=ax1.transAxes,
@@ -622,178 +622,178 @@ def visualize_cross_scale_attention(
             bbox=dict(boxstyle='round', facecolor='#e8f4e8', alpha=0.9))
     ax1.set_title('Architecture Overview', fontsize=11)
     
-    # 2. V3 vs V2 对比 - 梯度流
+    # 2. 梯度流示意图
     ax2 = axes[0, 1]
     
-    # 模拟梯度流
-    positions = np.arange(5)  # 5 个示例位置
-    scales = np.arange(num_scales)
+    # 模拟梯度流 - 所有区域都共享卷积权重
+    grid_size = 5
+    num_depths = 4  # 深度 0-3
     
-    # V2: 只有选中尺度收到梯度
-    v2_gradients = np.zeros((len(positions), num_scales))
+    # 所有深度的区域都收到梯度 (通过共享卷积)
+    gradient_density = np.ones((grid_size, num_depths)) * 0.8
+    # 添加一些变化来显示不同区域的贡献
     np.random.seed(42)
-    for i in range(len(positions)):
-        selected = np.random.randint(0, num_scales)
-        v2_gradients[i, selected] = 1.0
+    gradient_density += np.random.rand(grid_size, num_depths) * 0.2
     
-    # V3: 所有尺度都收到加权梯度
-    v3_gradients = np.random.dirichlet(np.ones(num_scales), size=len(positions))
+    im2 = ax2.imshow(gradient_density.T, aspect='auto', cmap='Greens',
+                     vmin=0, vmax=1)
     
-    # 绘制热图对比
-    im2_left = ax2.imshow(v2_gradients.T, aspect='auto', cmap='Reds', 
-                          extent=[-0.5, 2.3, -0.5, 2.5])
-    im2_right = ax2.imshow(v3_gradients.T, aspect='auto', cmap='Greens',
-                           extent=[2.7, 5.5, -0.5, 2.5])
-    
-    ax2.axvline(2.5, color='black', linewidth=2)
-    ax2.set_xticks([1, 4])
-    ax2.set_xticklabels(['V2 (Gumbel)', 'V3 (Cross-Scale)'])
-    ax2.set_yticks([0, 1, 2])
-    ax2.set_yticklabels([f'{ps}x{ps}' for ps in patch_sizes])
-    ax2.set_ylabel('Scale')
-    ax2.set_title('Gradient Flow: V2 (sparse) vs V3 (dense)', fontsize=11)
+    ax2.set_xlabel('Region Index')
+    ax2.set_ylabel('Depth Level')
+    ax2.set_yticks(range(num_depths))
+    ax2.set_yticklabels([f'd={d}' for d in range(num_depths)])
+    ax2.set_title('Gradient Flow: All Depths Share Gradients', fontsize=11)
+    plt.colorbar(im2, ax=ax2, label='Gradient Magnitude')
     
     # 添加说明
-    ax2.text(1, -1.0, 'Only selected scale\nreceives gradient', ha='center', fontsize=8)
-    ax2.text(4, -1.0, 'All scales receive\nweighted gradient', ha='center', fontsize=8)
+    ax2.text(2.5, -0.8, 'SharedConv receives gradients\nfrom ALL depth levels', 
+             ha='center', fontsize=9, style='italic')
     
-    # 3. 尺度注意力权重分布示例
+    # 3. 深度分布示例
     ax3 = axes[0, 2]
     
-    # 模拟不同区域的注意力权重
-    np.random.seed(123)
-    regions = {
-        'Edge (complex)': np.array([0.7, 0.2, 0.1]),     # 偏向细尺度
-        'Texture': np.array([0.3, 0.5, 0.2]),            # 偏向中等尺度
-        'Background (smooth)': np.array([0.1, 0.2, 0.7]), # 偏向粗尺度
+    # 模拟不同区域的深度分布
+    region_types = {
+        'Edge (complex)': np.array([0.1, 0.2, 0.3, 0.4]),   # 偏向细粒度
+        'Texture': np.array([0.2, 0.4, 0.3, 0.1]),          # 中等粒度
+        'Background (smooth)': np.array([0.5, 0.3, 0.15, 0.05]), # 偏向粗粒度
     }
     
-    x_pos = np.arange(num_scales)
+    x_pos = np.arange(num_depths)
     width = 0.25
     colors_regions = ['#FF6B6B', '#FFD93D', '#4ECDC4']
     
-    for i, (region, weights) in enumerate(regions.items()):
+    for i, (region, weights) in enumerate(region_types.items()):
         ax3.bar(x_pos + i * width, weights, width,
                label=region, color=colors_regions[i], edgecolor='black')
     
-    ax3.set_xlabel('Scale (patch size)')
-    ax3.set_ylabel('Attention Weight')
-    ax3.set_title('Scale Attention by Region Type', fontsize=11)
+    ax3.set_xlabel('Depth Level')
+    ax3.set_ylabel('Proportion of Tokens')
+    ax3.set_title('Depth Distribution by Region Type', fontsize=11)
     ax3.set_xticks(x_pos + width)
-    ax3.set_xticklabels([f'{ps}x{ps}' for ps in patch_sizes])
+    ax3.set_xticklabels([f'd={d}\n({16//(2**d)}x{16//(2**d)})' for d in range(num_depths)])
     ax3.legend(fontsize=9)
-    ax3.set_ylim(0, 1)
+    ax3.set_ylim(0, 0.6)
     
-    # 4. 尺度嵌入 (Scale Embedding) 的作用
+    # 4. 深度编码 (Depth Encoding) 的作用
     ax4 = axes[1, 0]
     
-    # 模拟尺度嵌入向量 (降维到 2D 可视化)
+    # 模拟深度编码向量 (降维到 2D 可视化)
     np.random.seed(456)
     d_model = 8  # 简化示例
-    scale_embeddings = np.random.randn(num_scales, d_model)
+    depth_embeddings = np.random.randn(num_depths, d_model)
     
     # 使用 PCA 降到 2D
     from numpy.linalg import svd
-    U, S, Vt = svd(scale_embeddings - scale_embeddings.mean(axis=0), full_matrices=False)
-    scale_2d = U[:, :2] * S[:2]
+    U, S, Vt = svd(depth_embeddings - depth_embeddings.mean(axis=0), full_matrices=False)
+    depth_2d = U[:, :2] * S[:2]
     
-    colors_scales = plt.cm.viridis(np.linspace(0.2, 0.8, num_scales))
-    for i, ps in enumerate(patch_sizes):
-        ax4.scatter(scale_2d[i, 0], scale_2d[i, 1], 
-                   s=200, c=[colors_scales[i]], edgecolors='black', linewidths=2,
-                   label=f'{ps}x{ps}', zorder=10)
-        ax4.annotate(f'{ps}x{ps}', (scale_2d[i, 0], scale_2d[i, 1]),
+    colors_depths = plt.cm.viridis(np.linspace(0.2, 0.8, num_depths))
+    for d in range(num_depths):
+        ps = 16 // (2 ** d)
+        ax4.scatter(depth_2d[d, 0], depth_2d[d, 1], 
+                   s=200, c=[colors_depths[d]], edgecolors='black', linewidths=2,
+                   label=f'd={d} ({ps}x{ps})', zorder=10)
+        ax4.annotate(f'd={d}', (depth_2d[d, 0], depth_2d[d, 1]),
                     textcoords='offset points', xytext=(10, 10), fontsize=10)
     
     ax4.set_xlabel('Principal Component 1')
     ax4.set_ylabel('Principal Component 2')
-    ax4.set_title('Scale Embedding Visualization\n(learned to distinguish scales)', fontsize=11)
-    ax4.legend(loc='lower right')
+    ax4.set_title('Depth Embedding Visualization\n(learned to distinguish depths)', fontsize=11)
+    ax4.legend(loc='lower right', fontsize=8)
     ax4.grid(True, alpha=0.3)
     ax4.axhline(0, color='gray', linestyle='--', alpha=0.5)
     ax4.axvline(0, color='gray', linestyle='--', alpha=0.5)
     
-    # 5. 空间平滑性示例
+    # 5. 自适应分割示例
     ax5 = axes[1, 1]
     
-    # 模拟 8x8 网格上的尺度选择
-    grid_size = 8
+    # 模拟 32x32 图像的自适应四叉树分割
+    grid_size = 32
     
-    # V2: 硬选择导致不平滑
+    # 创建示例分割 (复杂区域细分割，平滑区域粗分割)
+    depth_map = np.zeros((grid_size, grid_size))
+    
+    # 模拟：边缘区域 (对角线附近) 细分割
+    for i in range(grid_size):
+        for j in range(grid_size):
+            dist_to_diag = abs(i - j) / grid_size
+            # 越靠近对角线，深度越大 (更细)
+            if dist_to_diag < 0.1:
+                depth_map[i, j] = 3  # 4x4 patches
+            elif dist_to_diag < 0.25:
+                depth_map[i, j] = 2  # 8x8 patches
+            elif dist_to_diag < 0.5:
+                depth_map[i, j] = 1  # 16x16 patches
+            else:
+                depth_map[i, j] = 0  # 32x32 patches (coarsest)
+    
+    # 添加一些噪声来模拟实际情况
     np.random.seed(789)
-    v2_scale_map = np.random.randint(0, num_scales, (grid_size, grid_size))
+    noise = np.random.randint(-1, 2, (grid_size, grid_size))
+    depth_map = np.clip(depth_map + noise * 0.3, 0, 3).astype(int)
     
-    # V3: 软选择自然平滑
-    # 使用高斯滤波模拟平滑
-    from scipy.ndimage import gaussian_filter
-    v3_weights = np.random.rand(num_scales, grid_size, grid_size)
-    for s in range(num_scales):
-        v3_weights[s] = gaussian_filter(v3_weights[s], sigma=1.5)
-    # Softmax 归一化
-    v3_weights = np.exp(v3_weights * 3)
-    v3_weights = v3_weights / v3_weights.sum(axis=0, keepdims=True)
-    v3_dominant = np.argmax(v3_weights, axis=0)
+    cmap = plt.cm.viridis
+    im5 = ax5.imshow(depth_map, cmap=cmap, vmin=0, vmax=3)
+    ax5.set_title('Adaptive Quadtree Depth Map\n(Complex regions → finer patches)', fontsize=11)
+    ax5.set_xlabel('x')
+    ax5.set_ylabel('y')
     
-    # 左半: V2, 右半: V3
-    combined = np.zeros((grid_size, grid_size * 2 + 1))
-    combined[:, :grid_size] = v2_scale_map
-    combined[:, grid_size+1:] = v3_dominant
-    combined[:, grid_size] = np.nan  # 分隔线
+    cbar = plt.colorbar(im5, ax=ax5, ticks=[0, 1, 2, 3])
+    cbar.set_ticklabels(['d=0 (16x16)', 'd=1 (8x8)', 'd=2 (4x4)', 'd=3 (2x2)'])
     
-    cmap = plt.colormaps.get_cmap('viridis').resampled(num_scales)
-    im5 = ax5.imshow(combined, cmap=cmap, vmin=0, vmax=num_scales-1)
-    ax5.axvline(grid_size - 0.5, color='white', linewidth=3)
-    ax5.axvline(grid_size + 0.5, color='white', linewidth=3)
-    ax5.set_xticks([grid_size // 2, grid_size + 1 + grid_size // 2])
-    ax5.set_xticklabels(['V2: Discrete', 'V3: Smooth'])
-    ax5.set_title('Spatial Smoothness of Scale Selection', fontsize=11)
-    
-    cbar = plt.colorbar(im5, ax=ax5, ticks=[0, 1, 2])
-    cbar.set_ticklabels([f'{ps}x{ps}' for ps in patch_sizes])
-    
-    # 6. V3 vs V2 优势总结
+    # 6. Variable Depth Tokens 优势总结
     ax6 = axes[1, 2]
     ax6.axis('off')
     
-    comparison_text = """
-    V3 Cross-Scale Attention vs V2 Gumbel-Softmax
-    ===============================================
+    summary_text = """
+    Variable Depth Tokens (V3) Advantages
+    ======================================
     
-    V2 (Gumbel-Softmax, deprecated):
-      - Hard selection: s_i = argmax(logits + Gumbel)
-      - Sparse gradient: only selected scale learns
-      - Temperature scheduling required
-      - STE causes gradient bias
+    Architecture:
+      - AdaptiveQuadtreeSplit for content-aware segmentation
+      - SharedConv for unified feature extraction
+      - Depth encoding for scale awareness
     
-    V3 (Cross-Scale Attention, recommended):
-      + Soft fusion: Token = sum(alpha_s * V_s)
-      + Dense gradient: all scales learn
-      + No temperature tuning needed
-      + Smooth spatial coherence
-      + Better convergence
+    Key Benefits:
+      ✓ Dense Gradient Flow
+        - All paths share the same convolution
+        - Every depth level contributes to learning
+      
+      ✓ No Temperature Tuning
+        - Deterministic splitting based on complexity
+        - No Gumbel noise or annealing needed
+      
+      ✓ Content Adaptive
+        - Complex regions → fine patches (more tokens)
+        - Smooth regions → coarse patches (fewer tokens)
+      
+      ✓ Efficient Computation
+        - Variable token count adapts to image content
+        - Simpler architecture than attention-based fusion
     
-    Mathematical comparison:
-    
-    V2: Token_i = F_{argmax}[i]     (discrete)
-        grad exists only for selected scale
-    
-    V3: Token_i = sum_s alpha_s * V_s  (continuous)
-        grad_s = alpha_s * grad_output  (all scales)
+    Mathematical Form:
+      Token_k = Pool(F[R_k]) * σ_d + E_d
+      where:
+        F = SharedConv(I)        # shared features
+        R_k = quadtree region    # adaptive split
+        σ_d = depth scale factor # learnable
+        E_d = depth embedding    # position encoding
     """
     
-    ax6.text(0.05, 0.95, comparison_text, transform=ax6.transAxes,
+    ax6.text(0.05, 0.95, summary_text, transform=ax6.transAxes,
             fontsize=9, verticalalignment='top', fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='#f0f8ff', alpha=0.9))
     ax6.set_title('V3 Advantages Summary', fontsize=11)
     
-    fig.suptitle('Cross-Scale Attention Mechanism (V3)\n'
-                'Differentiable Multi-Scale Feature Fusion',
+    fig.suptitle('Variable Depth Tokens Mechanism (V3)\n'
+                'Content-Adaptive Multi-Scale Tokenization',
                 fontsize=14, fontweight='bold')
     plt.tight_layout()
     
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"[OK] Cross-Scale Attention visualization saved to: {save_path}")
+        print(f"[OK] Variable Depth Tokens visualization saved to: {save_path}")
     
     if show:
         plt.show()

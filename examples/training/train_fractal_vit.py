@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Fractal ViT Training Script - V3 Cross-Scale Attention
+"""Fractal ViT Training Script - V3 Variable Depth Tokens
 
 特性：
-1. StreamingFractalTokenizerV3：Cross-Scale Attention 自适应多尺度 (推荐)
+1. StreamingFractalTokenizerV3：Variable Depth Tokens 自适应多尺度 (推荐)
+   - 使用 AdaptiveQuadtreeSplit 进行内容自适应分割
+   - 共享卷积特征提取 + 深度编码
 2. SwiGLU FFN：现代化前馈网络
 3. Hilbert 曲线重排序：保持空间局部性
 4. AMP 混合精度训练
 
 V3 优势：
-- 密集梯度流：所有尺度都收到梯度 (vs V2 仅选中尺度)
+- 密集梯度流：共享特征提取器所有路径都收到梯度
 - 无温度参数：训练更稳定
-- 平滑尺度选择：空间相邻位置自然平滑
+- 自适应分割：根据图像内容动态决定分割深度
+- 深度编码：Token 携带尺度信息
 
 使用示例：
     # CIFAR-10 快速测试
@@ -19,9 +22,8 @@ V3 优势：
     # Tiny ImageNet 完整训练 (推荐配置)
     python train_fractal_vit.py --dataset tiny-imagenet --epochs 100 --dim 256 \
         --depth 8 --heads 8 --dropout 0.1 --drop-path 0.1 --use-amp
-    
-    # 使用旧版 V2 tokenizer (不推荐)
-    python train_fractal_vit.py --tokenizer-type streaming_v2 --use-amp
+
+注意：V2 (Gumbel-Softmax) 已从代码库中完全删除。
 """
 
 from __future__ import annotations
@@ -129,9 +131,9 @@ class TrainingConfig:
     hilbert_bias_mode: str
     
     # Tokenizer 配置
-    tokenizer_type: str  # 'streaming_v3' (推荐) 或 'streaming_v2'
+    tokenizer_type: str  # 'streaming_v3' (Variable Depth, 推荐) 或 'streaming_v1'
     
-    # V2 专用配置 (仅 tokenizer_type='streaming_v2' 时有效)
+    # [已废弃] V2 配置字段 - 保留用于向后兼容，不再有实际效果
     gumbel_tau_init: float
     gumbel_tau_min: float
     gumbel_tau_max: float
@@ -909,9 +911,8 @@ def verify_train_eval_consistency(
     """验证模型在 train/eval 模式下的输出一致性.
     
     关键检查:
-    1. V2: 深度偏置是否已衰减 (应接近 0)
-    2. train/eval 输出差异是否在可接受范围内
-    3. 尺度选择是否稳定
+    1. train/eval 输出差异是否在可接受范围内
+    2. 尺度/深度选择是否稳定
     
     Returns:
         一致性报告字典
@@ -927,27 +928,7 @@ def verify_train_eval_consistency(
     sample_batch = next(iter(loader))
     imgs = sample_batch[0][:4].to(device)  # 只用 4 张图
     
-    # 检查 1: V2 专用 - 深度偏置衰减
-    if config.tokenizer_type == 'streaming_v2':
-        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_depth_bias'):
-            depth_bias = model.tokenizer.get_depth_bias()
-            bias_check = {
-                'current_value': depth_bias,
-                'threshold': 0.01,
-                'passed': depth_bias <= 0.01,
-            }
-            report['checks']['depth_bias_decayed'] = bias_check
-            
-            if not bias_check['passed']:
-                report['warnings'].append(
-                    f"[WARN] 深度偏置未完全衰减 ({depth_bias:.4f} > 0.01)，"
-                    "可能导致 train/eval 不一致"
-                )
-                report['passed'] = False
-            else:
-                print(f"  [OK] 深度偏置已衰减: {depth_bias:.6f} (< 0.01)")
-    
-    # 检查 2: train/eval 输出差异
+    # 检查 1: train/eval 输出差异
     model.eval()
     with get_amp_context(device, config.use_amp):
         out_eval, aux_eval = model(imgs, return_aux_info=True)
@@ -962,9 +943,8 @@ def verify_train_eval_consistency(
     max_diff = output_diff.max().item()
     mean_diff = output_diff.mean().item()
     
-    # V3: 理论上 train/eval 应完全一致 (无 Gumbel 噪声)
-    # V2: 如果 hard=True 且 depth_bias=0，理论上应该完全一致
-    threshold = 0.01 if config.tokenizer_type == 'streaming_v3' else 0.1
+    # V3 Variable Depth: 理论上 train/eval 应完全一致 (确定性分割)
+    threshold = 0.01
     output_check = {
         'max_diff': max_diff,
         'mean_diff': mean_diff,
@@ -976,8 +956,7 @@ def verify_train_eval_consistency(
     if output_check['passed']:
         print(f"  [OK] 输出一致性: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
     else:
-        msg = "可能由 Gumbel 噪声或 depth_bias 导致" if config.tokenizer_type == 'streaming_v2' else "意外的输出差异"
-        report['warnings'].append(f"[WARN] train/eval 输出差异较大 (max={max_diff:.4f})，{msg}")
+        report['warnings'].append(f"[WARN] train/eval 输出差异较大 (max={max_diff:.4f})，意外的输出差异")
         print(f"  [WARN] 输出差异: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
     
     # 检查 3: 尺度选择稳定性 (多次推理应产生相同结果)
@@ -1004,14 +983,8 @@ def verify_train_eval_consistency(
             report['warnings'].append("[WARN] 尺度选择不稳定，可能存在随机性")
             report['passed'] = False
     
-    # 检查 4: V2 专用 - 训练状态信息
-    if config.tokenizer_type == 'streaming_v2':
-        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_training_stats'):
-            stats = model.tokenizer.get_training_stats()
-            report['training_stats'] = stats
-            print(f"  [OK] Gumbel tau={stats['gumbel_tau']:.4f}, use_soft_weights={stats['use_soft_weights']}")
-    else:
-        print(f"  [OK] Tokenizer: {config.tokenizer_type} (无额外状态)")
+    # 打印 Tokenizer 信息
+    print(f"  [OK] Tokenizer: {config.tokenizer_type} (Variable Depth Tokens)")
     
     # 总结
     print()
@@ -1064,29 +1037,28 @@ def main():
     
     # Tokenizer 类型
     parser.add_argument("--tokenizer-type", type=str, default="streaming_v3",
-                       choices=["streaming_v3", "streaming_v2", "streaming_v1"],
-                       help="Tokenizer type: streaming_v3 (Cross-Scale Attention, recommended), "
-                            "streaming_v2 (Gumbel-Softmax, deprecated)")
+                       choices=["streaming_v3", "streaming_v1"],
+                       help="Tokenizer type: streaming_v3 (Variable Depth Tokens, recommended)")
     
-    # V2 专用参数 (仅 --tokenizer-type streaming_v2 时有效)
+    # [已废弃] V2 参数 - 仅保留用于向后兼容，不再有实际效果
     parser.add_argument("--gumbel-tau-init", type=float, default=2.0,
-                       help="[V2 only] Initial Gumbel-Softmax temperature")
+                       help="[DEPRECATED] V2 已移除")
     parser.add_argument("--gumbel-tau-min", type=float, default=0.5,
-                       help="[V2 only] Minimum temperature for annealing")
+                       help="[DEPRECATED] V2 已移除")
     parser.add_argument("--gumbel-tau-max", type=float, default=5.0,
-                       help="[V2 only] Maximum temperature for annealing")
+                       help="[DEPRECATED] V2 已移除")
     parser.add_argument("--variable-tokens", action="store_true", default=False,
-                       help="[V2 only] Enable variable token count mode")
+                       help="[DEPRECATED] V2 已移除")
     parser.add_argument("--no-variable-tokens", action="store_false", dest="variable_tokens",
-                       help="[V2 only] Disable variable token count mode")
+                       help="[DEPRECATED] V2 已移除")
     parser.add_argument("--use-soft-weights", action="store_true",
-                       help="[V2 only] Use soft weights in Gumbel-Softmax")
+                       help="[DEPRECATED] V2 已移除")
     parser.add_argument("--depth-bias-max", type=float, default=2.0,
-                       help="[V2 only] Maximum depth bias strength for warmup")
+                       help="[DEPRECATED] V2 已移除")
     parser.add_argument("--depth-bias-decay", type=float, default=2.0,
-                       help="[V2 only] Depth bias decay power")
+                       help="[DEPRECATED] V2 已移除")
     parser.add_argument("--depth-bias-warmup", type=float, default=0.2,
-                       help="[V2 only] Depth bias warmup ratio")
+                       help="[DEPRECATED] V2 已移除")
     
     # 训练
     parser.add_argument("--epochs", type=int, default=50)
@@ -1140,18 +1112,6 @@ def main():
         args.epochs = 3
         args.subset_size = 256
         print("[*] Quick test mode\n")
-    
-    # V2 废弃警告
-    if args.tokenizer_type == "streaming_v2":
-        import warnings
-        warnings.warn(
-            "\n[DEPRECATED] --tokenizer-type streaming_v2 已废弃，将在未来版本中移除。\n"
-            "请使用 --tokenizer-type streaming_v3 (Cross-Scale Attention，推荐)。\n"
-            "V3 提供更稳定的训练和更好的梯度流。\n",
-            DeprecationWarning,
-            stacklevel=1,
-        )
-        print("[WARN] 使用已废弃的 streaming_v2，建议切换到 streaming_v3")
     
     # 初始化
     set_seed(args.seed)
@@ -1215,8 +1175,8 @@ def main():
     )
     
     # 创建模型
-    # V3: Cross-Scale Attention (推荐)
-    # V2: Gumbel-Softmax (已弃用)
+    # V3: Variable Depth Tokens (推荐)
+    # V1: 基础流式分词器
     model_kwargs = dict(
         image_size=max(spec.image_size, 32),
         num_classes=spec.num_classes,
@@ -1240,32 +1200,12 @@ def main():
         hilbert_bias_mode=config.hilbert_bias_mode,
     )
     
-    # V2 专用参数
-    if config.tokenizer_type == 'streaming_v2':
-        model_kwargs['streaming_tau'] = config.gumbel_tau_init
-        model_kwargs['variable_tokens'] = config.variable_tokens
-        model_kwargs['use_soft_weights'] = config.use_soft_weights
-    
     model = FractalCurveViT(**model_kwargs).to(device)
-    
-    # V2 专用: 配置深度偏置预热参数
-    if config.tokenizer_type == 'streaming_v2':
-        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'set_depth_bias'):
-            model.tokenizer.set_depth_bias(
-                bias_strength=config.depth_bias_max,
-                max_bias=config.depth_bias_max,
-                decay_power=config.depth_bias_decay,
-                warmup_ratio=config.depth_bias_warmup,
-            )
-            if hasattr(model.tokenizer, 'tau_min'):
-                model.tokenizer.tau_min = config.gumbel_tau_min
-                model.tokenizer.tau_max = config.gumbel_tau_max
     
     # 打印模型信息
     params = sum(p.numel() for p in model.parameters())
     tokenizer_name = {
-        'streaming_v3': 'StreamingFractalTokenizerV3 (Cross-Scale Attention)',
-        'streaming_v2': 'StreamingFractalTokenizerV2 (Gumbel-Softmax, deprecated)',
+        'streaming_v3': 'StreamingFractalTokenizerV3 (Variable Depth Tokens)',
         'streaming_v1': 'StreamingFractalTokenizer (Basic)',
     }.get(config.tokenizer_type, config.tokenizer_type)
     
@@ -1274,9 +1214,6 @@ def main():
     print(f"Tokenizer: {tokenizer_name}")
     print(f"FFN Type: {config.ffn_type}")
     print(f"Hilbert Bias: {config.hilbert_bias_mode}")
-    if config.tokenizer_type == 'streaming_v2':
-        print(f"Gumbel τ: init={config.gumbel_tau_init}, min={config.gumbel_tau_min}, max={config.gumbel_tau_max}")
-        print(f"Depth Bias: max={config.depth_bias_max}, decay={config.depth_bias_decay}, warmup={config.depth_bias_warmup}")
     print(f"Parameters: {params:,}")
     print(f"Gradient Checkpoint: {config.gradient_checkpoint}")
     print(f"Compile Model: {config.compile_model}")
@@ -1411,19 +1348,6 @@ def main():
         
         scheduler.step()
         
-        # V2 专用: 温度退火 + 深度偏置调度
-        current_tau = None
-        current_depth_bias = None
-        if config.tokenizer_type == 'streaming_v2':
-            if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'anneal_temperature'):
-                current_tau = model.tokenizer.anneal_temperature(
-                    current_epoch=epoch,
-                    total_epochs=config.epochs,
-                    schedule="cosine",
-                )
-                if hasattr(model.tokenizer, 'get_depth_bias'):
-                    current_depth_bias = model.tokenizer.get_depth_bias()
-        
         # 获取详细训练状态 (关键追踪参数)
         training_stats = None
         scale_distribution = None
@@ -1450,11 +1374,6 @@ def main():
             'lr': optimizer.param_groups[0]['lr'],
             'time': epoch_time,
         }
-        if current_tau is not None:
-            history_entry['gumbel_tau'] = current_tau
-        if current_depth_bias is not None:
-            history_entry['depth_bias'] = current_depth_bias
-            history_entry['depth_bias_active'] = current_depth_bias > 0.01
         if training_stats is not None:
             history_entry['training_stats'] = training_stats
         if scale_distribution is not None:
@@ -1464,10 +1383,7 @@ def main():
         print(f"\nEpoch {epoch}/{config.epochs}:")
         print(f"  Train: loss={train_loss:.4f}, acc={train_acc:.2f}%")
         print(f"  Val:   loss={val_loss:.4f}, acc={val_acc:.2f}%")
-        tau_str = f", τ={current_tau:.3f}" if current_tau is not None else ""
-        bias_str = f", bias={current_depth_bias:.3f}" if current_depth_bias is not None else ""
-        bias_active = " [ACTIVE]" if (current_depth_bias is not None and current_depth_bias > 0.01) else ""
-        print(f"  Time:  {epoch_time:.1f}s, Throughput: {perf_stats['throughput']:.1f} samples/s{tau_str}{bias_str}{bias_active}")
+        print(f"  Time:  {epoch_time:.1f}s, Throughput: {perf_stats['throughput']:.1f} samples/s")
         
         # 显示尺度分布 (每 10 epoch)
         if scale_distribution is not None:
@@ -1536,15 +1452,6 @@ def main():
         print(f"[*] Training stopped early at epoch {epoch}/{config.epochs}")
     print(f"\n[OK] Results saved to: {exp_dir}")
     
-    # 保存最终结果
-    final_depth_bias = None
-    final_tau = None
-    if hasattr(model, 'tokenizer'):
-        if hasattr(model.tokenizer, 'get_depth_bias'):
-            final_depth_bias = model.tokenizer.get_depth_bias()
-        if hasattr(model.tokenizer, 'get_temperature'):
-            final_tau = model.tokenizer.get_temperature()
-    
     with open(exp_dir / "results.json", 'w') as f:
         json.dump({
             'best_val_acc': best_val,
@@ -1554,9 +1461,7 @@ def main():
             'early_stopped': early_stopped,
             'best_epoch': epoch - patience_counter if early_stopped else epoch,
             'consistency_passed': consistency_report.get('passed', None),
-            'final_depth_bias': final_depth_bias,
-            'final_gumbel_tau': final_tau,
-            'depth_bias_decayed': final_depth_bias is not None and final_depth_bias <= 0.01,
+            'tokenizer_type': config.tokenizer_type,
         }, f, indent=2)
 
 

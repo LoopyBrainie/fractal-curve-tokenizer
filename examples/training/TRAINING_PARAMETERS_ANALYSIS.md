@@ -155,47 +155,45 @@ $$P_{aggregator} = (D_{max}+1) \cdot D + D \cdot \frac{D}{2} + \frac{D}{2} \cdot
 
 ---
 
-### 1.3 Tokenizer 参数 (V3 Cross-Scale Attention)
+### 1.3 Tokenizer 参数 (V3 Variable Depth Tokens)
 
-#### MultiScalePatchEncoder
-
-```python
-# streaming_tokenizer.py L380-430
-self.encoders = nn.ModuleDict({
-    f"scale_{ps}": nn.Sequential(
-        nn.Conv2d(channels, d_model // 2, kernel_size=ps, stride=ps),
-        nn.BatchNorm2d(d_model // 2),
-        nn.GELU(),
-        nn.Conv2d(d_model // 2, d_model, kernel_size=1),
-        nn.BatchNorm2d(d_model),
-    )
-    for ps in patch_sizes
-})
-```
-
-对于 $S$ 个尺度 $(p_1, p_2, ..., p_S)$：
-
-$$P_{encoder} = \sum_{i=1}^{S} \left( C \cdot \frac{D}{2} \cdot p_i^2 + \frac{D}{2} \cdot D + 2 \cdot \frac{D}{2} + 2D \right) + S \cdot D$$
-
-简化（以 S=3, patch_sizes=(4,8,16) 为例）：
-$$P_{encoder} \approx 3 \times (3 \times 192 \times 64 + 192 \times 384 + 576) \approx 330K$$
-
-#### CrossScaleAttention
+#### HilbertNativePatchEmbed
 
 ```python
-# streaming_tokenizer.py L1750-1850
-self.w_q = nn.Linear(d_model, d_model)
-self.w_k = nn.Linear(d_model, d_model)
-self.w_v = nn.Linear(d_model, d_model)
-self.scale_embedding = nn.Embedding(num_scales, d_model)
-self.w_o = nn.Linear(d_model, d_model)
+# patch_embed.py L50-100
+# 共享卷积特征提取
+self.conv = nn.Sequential(
+    nn.Conv2d(channels, d_model // 2, kernel_size=3, stride=1, padding=1),
+    nn.BatchNorm2d(d_model // 2),
+    nn.GELU(),
+    nn.Conv2d(d_model // 2, d_model, kernel_size=3, stride=1, padding=1),
+    nn.BatchNorm2d(d_model),
+)
+# 深度编码
+self.depth_embedding = nn.Embedding(max_depth + 1, d_model)
+self.depth_scale = nn.Parameter(torch.ones(max_depth + 1))
 ```
 
-$$P_{csa} = 3D^2 + S \cdot D + D^2 = 4D^2 + SD$$
+参数计算：
 
-#### Feature Fusion
+$$P_{embed} = \underbrace{C \cdot \frac{D}{2} \cdot 9 + \frac{D}{2} \cdot D \cdot 9}_{\text{两层 3x3 Conv}} + \underbrace{2 \cdot \frac{D}{2} + 2D}_{\text{BN}} + \underbrace{(D_{max}+1) \cdot D + (D_{max}+1)}_{\text{Depth Embed}}$$
 
-$$P_{fusion} = D \cdot D + D = D^2 + D$$
+简化（以 D=384, $D_{max}$=4 为例）：
+$$P_{embed} \approx 3 \times 192 \times 9 + 192 \times 384 \times 9 + 576 + 768 + 5 \times 384 + 5 \approx 680K$$
+
+#### AdaptiveQuadtreeSplit
+
+```python
+# adaptive_split.py L100-150
+# 复杂度估计网络
+self.complexity_net = nn.Sequential(
+    nn.Conv2d(d_model, d_model // 4, 3, padding=1),
+    nn.GELU(),
+    nn.Conv2d(d_model // 4, 1, 1),
+)
+```
+
+$$P_{split} = D \cdot \frac{D}{4} \cdot 9 + \frac{D}{4} \cdot 1 = 2.25D^2 + 0.25D$$
 
 ---
 
@@ -586,7 +584,7 @@ python examples/training/train_fractal_vit.py \
 | `--heads` | 8 | $D/d_h = 384/48 = 8$ |
 | `--dim-head` | 48 | 标准配置，每头 48 维 |
 | `--num-scales` | 3 | patch_sizes = (4, 8, 16) |
-| `--tokenizer-type` | streaming_v3 | Cross-Scale Attention (推荐) |
+| `--tokenizer-type` | streaming_v3 | Variable Depth Tokens (推荐) |
 | `--ffn-type` | swiglu_level | SwiGLU + Level Adaptation |
 | `--pool` | cls | CLS token 池化 |
 
@@ -654,11 +652,12 @@ python examples/training/train_fractal_vit.py \
 | 废弃参数 | 替代方案 | 说明 |
 |----------|----------|------|
 | `--max-level` | 自动推导 | 根据 image_size 和 min_patch_size 自动计算，**请勿手动设置** |
-| `--tokenizer-type streaming_v2` | `streaming_v3` | V2 (Gumbel-Softmax) 已废弃，V3 更稳定 |
 | `--gumbel-tau-*` | 无需配置 | V3 无需温度退火 |
-| `--variable-tokens` | 无需配置 | V3 统一使用 Cross-Scale Attention |
+| `--variable-tokens` | 无需配置 | V3 统一使用 Variable Depth Tokens |
 | `--use-soft-weights` | 无需配置 | V3 内置可微分融合 |
 | `--depth-bias-*` | 无需配置 | V3 不需要深度偏置预热 |
+
+> **注意**: V2 (Gumbel-Softmax) 已从代码库中完全删除，`--tokenizer-type streaming_v2` 不再可用。
 
 ---
 
