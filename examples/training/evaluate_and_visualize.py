@@ -1719,8 +1719,10 @@ def visualize_cross_scale_attention(
     with torch.no_grad():
         # 直接调用 tokenizer 获取多尺度信息
         output = tokenizer.tokenize(image.to(device))
-        tokens = output.tokens  # [B, N, D]
-        levels_info = output.levels_info  # [B, N, info_dim] or [N, info_dim]
+        # TokenizerOutput 包含 sequences 列表，每个 TokenSequence 有 tokens 和 metadata
+        seq = output.sequences[0]  # 取第一个 batch
+        tokens = seq.tokens  # [N, D]
+        levels_info = seq.metadata.get('levels', None)  # [N, info_dim]
     
     # 转换图像用于显示
     img_np = image[0].permute(1, 2, 0).cpu().numpy()
@@ -1848,10 +1850,12 @@ def visualize_level_aware_processing(
     # 获取 tokenization 输出
     with torch.no_grad():
         output = model.tokenizer.tokenize(image.to(device))
-        tokens = output.tokens
-        levels_info = output.levels_info
+        # TokenizerOutput 包含 sequences 列表，每个 TokenSequence 有 tokens 和 metadata
+        seq = output.sequences[0]  # 取第一个 batch
+        tokens = seq.tokens  # [N, D]
+        levels_info = seq.metadata.get('levels', None)  # [N, info_dim]
     
-    if levels_info is None or levels_info.numel() == 0:
+    if levels_info is None or (hasattr(levels_info, 'numel') and levels_info.numel() == 0):
         print("[WARN] No levels_info available for visualization")
         return None
     
