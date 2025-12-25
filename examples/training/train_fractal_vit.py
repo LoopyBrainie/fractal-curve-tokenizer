@@ -44,10 +44,11 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:512,expandab
 os.environ.setdefault('OMP_NUM_THREADS', '4')
 os.environ.setdefault('MKL_NUM_THREADS', '4')
 
-# 抑制 torch.compile 的符号形状警告
+# 抑制 torch.compile 的符号形状警告和 checkpoint autocast 废弃警告
 import warnings
 warnings.filterwarnings('ignore', message='.*is not in var_ranges.*')
 warnings.filterwarnings('ignore', message='.*defaulting to unknown range.*')
+warnings.filterwarnings('ignore', message='.*torch.cpu.amp.autocast.*is deprecated.*', category=FutureWarning)
 
 import argparse
 import json
