@@ -45,8 +45,7 @@ Tokenization 过程:
 | HilbertIndexer            | H: Grid_{h×w} → Seq_{n}                  |
 | MultiScalePatchEncoder    | ConvPyramid: I → {F_s}_{s=1}^S            |
 | StreamingFractalTokenizer | T_v1: I → (T, L), 固定尺度               |
-| StreamingFractalTokenizerV2| T_v2: I → (T, L), Gumbel-Softmax (已废弃) |
-| StreamingFractalTokenizerV3| T_v3: I → (T, L), Cross-Scale (推荐)    |
+| StreamingFractalTokenizerV3| T_v3: I → (T, L), Variable Depth (推荐)  |
 +---------------------------+-------------------------------------------+
 
 与原架构对比
@@ -727,1231 +726,43 @@ class StreamingFractalTokenizer(BaseTokenizer):
         return self.tokenize(images)
 
 
-class StreamingFractalTokenizerV2(StreamingFractalTokenizer):
-    """Phase 2: 带区域自适应分辨率选择的 Tokenizer.
-    
-    .. deprecated:: 2025.12
-        StreamingFractalTokenizerV2 已废弃，请使用 StreamingFractalTokenizerV3。
-        V3 使用 Cross-Scale Attention 替代 Gumbel-Softmax，提供更稳定的
-        训练和更好的梯度流。该类将在未来版本中移除。
-    
-    在 Phase 1 的基础上添加：
-    1. 语义级区域复杂度估计 (基于 Encoder 特征)
-    2. 多尺度特征融合
-    3. Gumbel-Softmax 可微分尺度选择
-    
-    .. note::
-        **v2.0 重构 (2025-12)**: 
-        
-        复杂度估计器改为使用 Encoder 特征而非原始像素：
-        - 消除冗余计算 (~75% FLOPs 节省)
-        - 语义感知：基于高级特征判断区域重要性
-        - 更大感受野：继承 Encoder 的感受野
-        
-        数学形式:
-            旧: π = ComplexityNet(I)           # 7层CNN处理原始像素
-            新: π = ComplexityHead(Concat(F_s)) # 轻量头处理Encoder特征
-    
-    .. note::
-        **v2.1 新增 (2025-12)**: variable_tokens 模式
-        
-        当 variable_tokens=True 时，启用 Patch=Token 直接映射：
-        - 分割决策直接产生可变数量的 token
-        - 四叉树一致性约束确保空间连贯性
-        - 每个尺度使用独立的投影层
-        
-        数学形式:
-            s_{ij} = argmax π_{ij}  # 尺度决策
-            T_k = PatchEmbed_{s_k}(P_k)  # 尺度独立投影
-        
-    .. important::
-        **v1.1 修复 (2025-01)**: 解决 train/eval 模式不一致问题。
-        默认使用 Straight-Through Estimator (hard=True)，确保训练和验证
-        看到相同的特征分布。可通过 `use_soft_weights=True` 恢复旧行为。
-    """
-    
-    def __init__(
-        self,
-        image_size: Union[int, Tuple[int, int]] = 224,
-        channels: int = 3,
-        d_model: int = 256,
-        patch_sizes: Tuple[int, ...] = (4, 8, 16),
-        use_hilbert_order: bool = True,
-        max_level: int = 50,
-        gumbel_temperature: float = 2.0,
-        gumbel_tau_min: float = 0.5,
-        gumbel_tau_max: float = 5.0,
-        use_soft_weights: bool = False,
-        variable_tokens: bool = True,  # 默认启用可变 token 模式
-    ) -> None:
-        """初始化 StreamingFractalTokenizerV2.
-        
-        Args:
-            image_size: 输入图像尺寸
-            channels: 图像通道数
-            d_model: 输出嵌入维度
-            patch_sizes: 多尺度 patch 大小 (从小到大排列)
-            use_hilbert_order: 是否使用 Hilbert 曲线排序
-            max_level: 最大四叉树层级
-            gumbel_temperature: Gumbel-Softmax 初始温度
-            gumbel_tau_min: 温度退火下界
-            gumbel_tau_max: 温度退火上界
-            use_soft_weights: 是否使用软权重 (实验性)
-                - False (默认): 使用 STE (hard=True)，train/eval 一致
-                - True: 训练时使用软权重 (可能导致 train/eval 差异)
-            variable_tokens: 是否启用可变 Token 数量模式
-                - True (默认): Patch=Token 直接映射，token 数量可变
-                - False: 固定 token 数量，特征加权融合
-        
-        See Also:
-            from_config: 从 FractalConfig 创建实例 (推荐)
-        
-        .. deprecated:: 2025.12
-            请使用 StreamingFractalTokenizerV3 替代。
-        """
-        import warnings
-        warnings.warn(
-            "StreamingFractalTokenizerV2 已废弃，将在未来版本中移除。"
-            "请使用 StreamingFractalTokenizerV3 (Cross-Scale Attention) 替代。"
-            "V3 提供更稳定的训练和更好的梯度流。",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(
-            image_size=image_size,
-            channels=channels,
-            d_model=d_model,
-            patch_sizes=patch_sizes,
-            primary_scale=None,
-            use_hilbert_order=use_hilbert_order,
-            max_level=max_level,
-        )
-        
-        self.gumbel_temperature = gumbel_temperature
-        self.use_soft_weights = use_soft_weights
-        self.variable_tokens = variable_tokens
-        self.num_scales = len(patch_sizes)
-        
-        # ========== 新架构: 语义级复杂度估计 (CRITICAL-2 修复) ==========
-        # 使用 Encoder 特征而非原始像素，消除冗余计算
-        #
-        # 数学原理:
-        #   π_{i,j} = Softmax(ComplexityHead(Concat_{s}[Upsample(F_s)]))_{i,j}
-        #
-        # 其中 F_s 是 Encoder 在尺度 s 的特征图
-        #
-        # 优势:
-        #   1. 复用 Encoder 已计算的特征 (消除 ~75% 冗余)
-        #   2. 语义感知: 基于高级特征而非低级像素
-        #   3. 更大感受野: 继承 Encoder 的感受野
-        #
-        # 参数量对比:
-        #   旧 (7层CNN): ~180K 参数, ~8M FLOPs
-        #   新 (轻量头): ~10K 参数, ~1M FLOPs
-        
-        self.complexity_head = nn.Sequential(
-            # 输入: 拼接的多尺度特征 [B, S*D, H', W']
-            nn.Conv2d(d_model * self.num_scales, d_model, kernel_size=1),
-            nn.BatchNorm2d(d_model),
-            nn.GELU(),
-            # 空间混合: 3x3 卷积捕捉局部上下文
-            nn.Conv2d(d_model, d_model // 2, kernel_size=3, padding=1),
-            nn.BatchNorm2d(d_model // 2),
-            nn.GELU(),
-            # 输出: 每个位置的尺度 logits
-            nn.Conv2d(d_model // 2, self.num_scales, kernel_size=1),
-        )
-        
-        # 温度退火配置 (从构造参数获取，消除硬编码)
-        self.tau_init = gumbel_temperature
-        self.tau_min = gumbel_tau_min
-        self.tau_max = gumbel_tau_max
-        self._current_tau = gumbel_temperature
-        
-        # 保持可学习温度参数（可选）
-        self.temperature = nn.Parameter(torch.tensor(gumbel_temperature))
-        
-        # ========== 深度探索优先 Warmup (v2.2) ==========
-        # 在训练初期对小尺度（深层级）添加正偏置，引导模型探索细粒度特征
-        #
-        # 数学形式:
-        #   logits' = logits + scale_bias
-        #   scale_bias[s] = bias_strength * (1 - s / (S-1))  # 小尺度偏置大
-        #
-        # 其中 s ∈ [0, S-1] 是尺度索引，s=0 对应最小 patch（最深层级）
-        #
-        # 调度策略:
-        #   bias_strength = max_bias * (1 - progress)^decay_power
-        #   warmup 期间保持较高偏置，之后快速衰减
-        #
-        # 效果:
-        #   - 训练初期: 模型更倾向于选择小 patch，学习细粒度特征
-        #   - 训练后期: 偏置消失，模型自主学习最优尺度选择
-        self._depth_bias_max = 2.0      # 最大偏置强度
-        self._depth_bias_decay = 2.0    # 衰减指数 (>1 快速衰减)
-        self._depth_bias_warmup = 0.2   # warmup 占比 (前 20% 保持高偏置)
-        self._current_depth_bias = self._depth_bias_max
-        
-        # 预计算尺度偏置权重 (小尺度 = 大权重)
-        # patch_sizes 从小到大排列，所以 index 0 = 最小 patch = 最深层级
-        self.register_buffer(
-            '_scale_bias_weights',
-            torch.linspace(1.0, 0.0, self.num_scales)  # [1.0, 0.67, 0.33, 0.0] for 4 scales
-        )
-    
-    @classmethod
-    def from_config(
-        cls,
-        config: FractalConfig,
-        channels: int = 3,
-        d_model: int = 256,
-    ) -> "StreamingFractalTokenizerV2":
-        """从 FractalConfig 创建 Tokenizer 实例 (推荐方式).
-        
-        自动从配置中提取所有必要参数，消除参数不一致的风险。
-        
-        Args:
-            config: FractalConfig 实例
-            channels: 图像通道数
-            d_model: 输出嵌入维度
-            
-        Returns:
-            StreamingFractalTokenizerV2 实例
-            
-        Examples:
-            >>> config = FractalConfig(64, 4, gumbel_tau_init=1.5)
-            >>> tokenizer = StreamingFractalTokenizerV2.from_config(config)
-        """
-        return cls(
-            image_size=config.image_size,
-            channels=channels,
-            d_model=d_model,
-            patch_sizes=config.patch_sizes,
-            use_hilbert_order=True,
-            max_level=config.max_depth,
-            gumbel_temperature=config.gumbel_tau_init,
-            gumbel_tau_min=config.gumbel_tau_min,
-            gumbel_tau_max=config.gumbel_tau_max,
-            use_soft_weights=config.use_soft_weights,
-            variable_tokens=config.variable_tokens,
-        )
-    
-    def set_temperature(self, tau: float) -> None:
-        """设置当前 Gumbel-Softmax 温度 (用于温度退火调度).
-        
-        Args:
-            tau: 目标温度值，会被 clamp 到 [tau_min, tau_max]
-        """
-        self._current_tau = max(self.tau_min, min(self.tau_max, tau))
-        self.temperature.data.fill_(self._current_tau)
-    
-    def get_temperature(self) -> float:
-        """获取当前温度值."""
-        return self._current_tau
-    
-    def set_depth_bias(
-        self,
-        bias_strength: float,
-        max_bias: Optional[float] = None,
-        decay_power: Optional[float] = None,
-        warmup_ratio: Optional[float] = None,
-    ) -> None:
-        """设置深度探索偏置参数.
-        
-        Args:
-            bias_strength: 当前偏置强度
-            max_bias: 可选，更新最大偏置值
-            decay_power: 可选，更新衰减指数
-            warmup_ratio: 可选，更新 warmup 占比
-        """
-        self._current_depth_bias = max(0.0, bias_strength)
-        if max_bias is not None:
-            self._depth_bias_max = max_bias
-        if decay_power is not None:
-            self._depth_bias_decay = decay_power
-        if warmup_ratio is not None:
-            self._depth_bias_warmup = warmup_ratio
-    
-    def get_depth_bias(self) -> float:
-        """获取当前深度偏置强度."""
-        return self._current_depth_bias
-    
-    def anneal_depth_bias(
-        self,
-        current_epoch: int,
-        total_epochs: int,
-    ) -> float:
-        """深度偏置退火调度.
-        
-        在 warmup 期间保持高偏置，之后快速衰减。
-        
-        调度公式:
-            if progress < warmup_ratio:
-                bias = max_bias  # warmup 期间保持最大偏置
-            else:
-                adjusted_progress = (progress - warmup) / (1 - warmup)
-                bias = max_bias * (1 - adjusted_progress)^decay_power
-        
-        Args:
-            current_epoch: 当前 epoch (1-indexed)
-            total_epochs: 总 epoch 数
-            
-        Returns:
-            更新后的偏置强度
-        """
-        progress = min(1.0, current_epoch / max(1, total_epochs))
-        
-        if progress < self._depth_bias_warmup:
-            # Warmup 期间: 保持最大偏置
-            new_bias = self._depth_bias_max
-        else:
-            # Warmup 后: 快速衰减
-            adjusted_progress = (progress - self._depth_bias_warmup) / (1.0 - self._depth_bias_warmup)
-            new_bias = self._depth_bias_max * ((1.0 - adjusted_progress) ** self._depth_bias_decay)
-        
-        self._current_depth_bias = new_bias
-        return new_bias
-    
-    def anneal_temperature(
-        self,
-        current_epoch: int,
-        total_epochs: int,
-        schedule: str = "linear",
-    ) -> float:
-        """温度退火调度 (EXP-FIX-2).
-        
-        从 τ_init 线性/指数退火到 τ_min。
-        同时更新深度偏置 (v2.2)。
-        
-        Args:
-            current_epoch: 当前 epoch (1-indexed)
-            total_epochs: 总 epoch 数
-            schedule: 退火方式 ("linear", "exponential", "cosine")
-            
-        Returns:
-            更新后的温度值
-        """
-        progress = min(1.0, current_epoch / max(1, total_epochs))
-        
-        if schedule == "linear":
-            # 线性退火: τ = τ_max - (τ_max - τ_min) * progress
-            new_tau = self.tau_max - (self.tau_max - self.tau_min) * progress
-        elif schedule == "exponential":
-            # 指数退火: τ = τ_max * (τ_min / τ_max)^progress
-            new_tau = self.tau_max * (self.tau_min / self.tau_max) ** progress
-        elif schedule == "cosine":
-            # 余弦退火: τ = τ_min + 0.5 * (τ_max - τ_min) * (1 + cos(π * progress))
-            import math
-            new_tau = self.tau_min + 0.5 * (self.tau_max - self.tau_min) * (1 + math.cos(math.pi * progress))
-        else:
-            new_tau = self.tau_init
-        
-        self.set_temperature(new_tau)
-        
-        # 同步更新深度偏置 (v2.2)
-        self.anneal_depth_bias(current_epoch, total_epochs)
-        
-        return new_tau
-    
-    def get_training_stats(self) -> Dict[str, Any]:
-        """获取当前训练状态统计信息 (用于日志追踪).
-        
-        返回关键参数以便追踪训练/推理一致性:
-        
-        Returns:
-            Dict 包含以下字段:
-            - gumbel_tau: 当前 Gumbel-Softmax 温度
-            - depth_bias: 当前深度偏置强度
-            - depth_bias_active: 偏置是否仍在生效 (> 0.01)
-            - use_soft_weights: 是否使用软权重模式
-            - temperature_param: 可学习温度参数值
-            - tau_range: (tau_min, tau_max) 范围
-            - bias_config: 深度偏置配置
-        """
-        return {
-            'gumbel_tau': self._current_tau,
-            'depth_bias': self._current_depth_bias,
-            'depth_bias_active': self._current_depth_bias > 0.01,
-            'use_soft_weights': self.use_soft_weights,
-            'temperature_param': self.temperature.item(),
-            'tau_range': (self.tau_min, self.tau_max),
-            'bias_config': {
-                'max': self._depth_bias_max,
-                'decay': self._depth_bias_decay,
-                'warmup': self._depth_bias_warmup,
-            },
-        }
-    
-    @torch.no_grad()
-    def compute_scale_distribution(
-        self,
-        images: torch.Tensor,
-    ) -> Dict[str, Any]:
-        """计算尺度选择分布统计 (诊断用).
-        
-        对输入图像计算每个尺度被选择的频率，用于:
-        1. 验证 train/eval 一致性
-        2. 监控尺度选择是否多样化
-        3. 检查深度偏置是否过期
-        
-        Args:
-            images: [B, C, H, W] 输入图像
-            
-        Returns:
-            Dict 包含:
-            - scale_counts: {patch_size: count} 每个尺度的选择次数
-            - scale_ratios: {patch_size: ratio} 每个尺度的选择比例
-            - entropy: 尺度分布熵 (越高越多样化)
-            - dominant_scale: 最常被选择的尺度
-        """
-        was_training = self.training
-        self.eval()  # 使用 eval 模式确保确定性
-        
-        try:
-            # 提取多尺度特征
-            features_dict = self.encoder(images)
-            
-            # 确定目标尺寸
-            min_ps = min(features_dict.keys())
-            _, (grid_h, grid_w) = features_dict[min_ps]
-            target_size = (grid_h, grid_w)
-            
-            # 计算尺度权重
-            scale_weights = self._compute_scale_weights(features_dict, target_size)
-            # scale_weights: [B, num_scales, grid_h, grid_w]
-            
-            # 获取每个位置的尺度决策
-            scale_decisions = scale_weights.argmax(dim=1)  # [B, grid_h, grid_w]
-            
-            # 统计每个尺度的选择次数
-            scale_counts = {}
-            total_positions = scale_decisions.numel()
-            
-            for idx, ps in enumerate(self.patch_sizes):
-                count = (scale_decisions == idx).sum().item()
-                scale_counts[ps] = count
-            
-            # 计算比例
-            scale_ratios = {ps: c / total_positions for ps, c in scale_counts.items()}
-            
-            # 计算熵 (使用 math.log 避免 numpy 依赖)
-            ratios = list(scale_ratios.values())
-            entropy = 0.0
-            for r in ratios:
-                if r > 0:
-                    entropy -= r * math.log(r + 1e-10)
-            
-            # 找到主导尺度
-            dominant_scale = max(scale_counts, key=scale_counts.get)
-            
-            return {
-                'scale_counts': scale_counts,
-                'scale_ratios': scale_ratios,
-                'entropy': entropy,
-                'dominant_scale': dominant_scale,
-                'max_entropy': math.log(len(self.patch_sizes)),  # 均匀分布的熵
-            }
-        finally:
-            if was_training:
-                self.train()
-        
-    def _compute_scale_weights(
-        self,
-        features_dict: Dict[int, Tuple[torch.Tensor, Tuple[int, int]]],
-        target_size: Tuple[int, int],
-    ) -> torch.Tensor:
-        """基于 Encoder 特征计算每个区域的尺度权重.
-        
-        **v2.0 重构**: 使用语义特征而非原始像素
-        **v2.2 新增**: 深度探索优先 warmup 偏置
-        
-        数学形式:
-            F_aligned = {Upsample(F_s, target_size) | s ∈ scales}
-            F_concat = Concat(F_aligned, dim=1)  # [B, S*D, H', W']
-            logits = ComplexityHead(F_concat)     # [B, S, H', W']
-            
-            # v2.2: 添加深度偏置
-            logits' = logits + depth_bias * scale_bias_weights
-            
-            π = Gumbel-Softmax(logits', τ)       # [B, S, H', W']
-        
-        Args:
-            features_dict: {patch_size: (features [B,D,H,W], (grid_h, grid_w))}
-            target_size: 目标空间尺寸 (H', W')
-            
-        Returns:
-            weights: [B, num_scales, H', W'] 每个区域的尺度权重
-            
-        Note:
-            **修复 train/eval 不一致问题 (v1.1)**：
-            默认使用 Straight-Through Estimator (STE):
-            - 前向传播: 硬决策 (one-hot) - train 和 eval 一致
-            - 反向传播: 软梯度 (通过 Gumbel-Softmax)
-            
-            **深度探索优先 (v2.2)**：
-            训练初期对小尺度添加正偏置，引导模型探索细粒度特征。
-            偏置随训练进度衰减，最终由模型自主决策。
-        """
-        # 1. 将所有尺度的特征对齐到目标大小
-        aligned_features = []
-        for ps in self.patch_sizes:
-            if ps in features_dict:
-                feat, _ = features_dict[ps]
-                if feat.shape[-2:] != target_size:
-                    feat = F.interpolate(
-                        feat,
-                        size=target_size,
-                        mode='bilinear',
-                        align_corners=False,
-                    )
-                aligned_features.append(feat)
-            else:
-                # 如果某个尺度不可用，使用零填充
-                B = next(iter(features_dict.values()))[0].shape[0]
-                D = self.d_model
-                aligned_features.append(
-                    torch.zeros(B, D, *target_size, device=feat.device)
-                )
-        
-        # 2. 拼接多尺度特征 [B, S*D, H', W']
-        concat_features = torch.cat(aligned_features, dim=1)
-        
-        # 3. 通过轻量级头预测尺度 logits
-        logits = self.complexity_head(concat_features)  # [B, num_scales, H', W']
-        
-        # 4. 应用深度探索偏置 (v2.2)
-        # 仅在训练时应用，推理时不添加偏置
-        if self.training and self._current_depth_bias > 0.01:
-            # scale_bias_weights: [S] -> [1, S, 1, 1] for broadcasting
-            bias = self._current_depth_bias * self._scale_bias_weights.view(1, -1, 1, 1)
-            logits = logits + bias
-        
-        # 5. Gumbel-Softmax 转换为权重
-        # STAB-1 修复: τ_min 从 0.1 提高到 0.3
-        # 数学依据: ∂π̂/∂logits = π̂(1-π̂)/τ，当 τ=0.1 时梯度放大 10×
-        # τ=0.3 时梯度放大控制在 3.3× 以内，同时保持 78%+ 的主导尺度概率
-        tau_min = 0.3  # 原值 0.1，梯度不稳定
-        if self.training:
-            if self.use_soft_weights:
-                # 实验模式: 软权重 (可能导致 train/eval 差异)
-                weights = F.gumbel_softmax(
-                    logits,
-                    tau=self.temperature.clamp(min=tau_min),
-                    hard=False,
-                    dim=1,
-                )
-            else:
-                # 默认: Straight-Through Estimator (hard=True)
-                # 前向: argmax 硬决策，反向: 软梯度
-                weights = F.gumbel_softmax(
-                    logits,
-                    tau=self.temperature.clamp(min=tau_min),
-                    hard=True,  # 关键修复: 保持 train/eval 一致
-                    dim=1,
-                )
-        else:
-            # 推理时使用 argmax (与训练时的硬决策一致)
-            hard_indices = logits.argmax(dim=1)  # [B, H', W']
-            weights = F.one_hot(
-                hard_indices, num_classes=len(self.patch_sizes)
-            ).permute(0, 3, 1, 2).float()  # [B, num_scales, H', W']
-        
-        return weights
-    
-    def tokenize(self, images: torch.Tensor) -> TokenizerOutput:
-        """区域自适应 tokenization (语义引导).
-        
-        根据 variable_tokens 参数选择不同的 tokenization 策略:
-        
-        - variable_tokens=True (默认): Patch=Token 直接映射，可变数量
-        - variable_tokens=False: 固定 token 数量，加权融合
-        
-        **v2.0 重构**: 执行流程改变
-        
-        旧流程:
-            1. ComplexityEstimator(原始图像) → 尺度权重
-            2. Encoder(原始图像) → 多尺度特征
-            3. 加权融合
-            
-        新流程:
-            1. Encoder(原始图像) → 多尺度特征
-            2. ComplexityHead(Encoder特征) → 尺度权重 (语义级)
-            3. 根据 variable_tokens 选择:
-               - False: 加权融合
-               - True: 直接按尺度提取 token
-        """
-        if images.dim() != 4:
-            raise ValueError(
-                f"StreamingFractalTokenizerV2.tokenize expects 4D input [B, C, H, W], "
-                f"got {images.dim()}D tensor."
-            )
-        
-        B, C, H, W = images.shape
-        device = images.device
-        
-        # 1. 提取多尺度特征 (Encoder)
-        features_dict = self.encoder(images)
-        
-        # 2. 确定基础网格大小 (使用最小 patch size)
-        min_ps = min(features_dict.keys())
-        base_features, (grid_h, grid_w) = features_dict[min_ps]
-        target_size = (grid_h, grid_w)
-        
-        # 3. 基于 Encoder 特征计算尺度权重 (语义级复杂度)
-        scale_weights = self._compute_scale_weights(features_dict, target_size)
-        # scale_weights: [B, num_scales, grid_h, grid_w]
-        
-        # 4. 根据模式选择 tokenization 策略
-        if self.variable_tokens:
-            return self._tokenize_variable(
-                features_dict, scale_weights, B, grid_h, grid_w, device
-            )
-        else:
-            return self._tokenize_fixed(
-                features_dict, scale_weights, base_features, 
-                B, grid_h, grid_w, min_ps, device
-            )
-    
-    def _tokenize_fixed(
-        self,
-        features_dict: Dict[int, Tuple[torch.Tensor, Tuple[int, int]]],
-        scale_weights: torch.Tensor,
-        base_features: torch.Tensor,
-        B: int,
-        grid_h: int,
-        grid_w: int,
-        min_ps: int,
-        device: torch.device,
-    ) -> TokenizerOutput:
-        """固定 token 数量的 tokenization (加权融合模式).
-        
-        所有尺度特征按权重融合，输出固定数量的 token。
-        """
-        # 加权融合各尺度特征
-        fused_features = torch.zeros_like(base_features)
-        for scale_idx, ps in enumerate(self.patch_sizes):
-            if ps in features_dict:
-                feat, (h, w) = features_dict[ps]
-                # 上采样到基础网格大小
-                if h != grid_h or w != grid_w:
-                    feat = F.interpolate(
-                        feat,
-                        size=(grid_h, grid_w),
-                        mode='bilinear',
-                        align_corners=False,
-                    )
-                # 加权
-                weight = scale_weights[:, scale_idx:scale_idx+1, :, :]
-                fused_features = fused_features + feat * weight
-        
-        # Hilbert 重排
-        if self.use_hilbert_order:
-            tokens = HilbertIndexer.reorder_to_hilbert(fused_features, grid_h, grid_w)
-        else:
-            tokens = fused_features.flatten(2).transpose(1, 2)
-        
-        num_tokens = tokens.shape[1]
-        
-        # 特征融合
-        tokens = self.feature_fusion(tokens)
-        
-        # 创建 levels_info
-        weights_flat = scale_weights.flatten(2)
-        dominant_scales = weights_flat.argmax(dim=1)
-        
-        if self.use_hilbert_order:
-            # 使用设备感知缓存
-            hilbert_idx = HilbertIndexer.get_hilbert_order_on_device(max(grid_h, grid_w), device)
-            valid_len = min(len(hilbert_idx), dominant_scales.shape[1])
-            hilbert_idx = hilbert_idx[:valid_len]
-            if valid_len < num_tokens:
-                hilbert_idx = F.pad(hilbert_idx, (0, num_tokens - valid_len), value=0)
-            dominant_scales = dominant_scales.gather(1, hilbert_idx.unsqueeze(0).expand(B, -1))
-        
-        primary_level = self.scale_to_level[min_ps]
-        levels_info = self._create_levels_info(
-            batch_size=B,
-            num_tokens=num_tokens,
-            scale_level=primary_level,
-            grid_h=grid_h,
-            grid_w=grid_w,
-            device=device,
-        )
-        
-        for scale_idx, ps in enumerate(self.patch_sizes):
-            level = self.scale_to_level[ps]
-            mask = (dominant_scales == scale_idx)
-            levels_info[:, :, 0] = torch.where(mask, level, levels_info[:, :, 0])
-        
-        # 构建输出
-        sequences = []
-        for b in range(B):
-            seq = TokenSequence(
-                tokens=tokens[b],
-                metadata={"levels": levels_info[b]},
-            )
-            sequences.append(seq)
-        
-        return TokenizerOutput(sequences)
-    
-    def _tokenize_variable(
-        self,
-        features_dict: Dict[int, Tuple[torch.Tensor, Tuple[int, int]]],
-        scale_weights: torch.Tensor,
-        B: int,
-        grid_h: int,
-        grid_w: int,
-        device: torch.device,
-    ) -> TokenizerOutput:
-        """可变 token 数量的 tokenization (Patch=Token 直接映射).
-        
-        数学形式化
-        ==========
-        
-        1. 尺度决策: s_{ij} = argmax_k π_{ij}^{(k)}
-        2. 四叉树一致性约束: 确保粗尺度区域内所有位置使用相同尺度
-        3. Token 提取: 直接从对应尺度的特征图提取
-        4. Hilbert 排序: 按四叉树路径进行 Hilbert 排序
-        
-        **v2.3 优化**: 使用向量化操作替代 Python 循环，GPU 友好
-        
-        优势:
-            - Token 数量自适应 (N ∈ [N_min, N_max])
-            - 无冗余计算 (不生成不需要的细粒度 token)
-            - 真正的 Patch = Token 映射
-        """
-        # 1. 获取硬尺度决策
-        scale_map = scale_weights.argmax(dim=1)  # [B, grid_h, grid_w]
-        
-        # 2. 强制四叉树一致性 (向量化)
-        scale_map = self._enforce_quadtree_consistency_vectorized(scale_map, grid_h, grid_w)
-        
-        # 3. 向量化 token 提取 (带 padding)
-        return self._extract_tokens_vectorized(
-            features_dict, scale_map, B, grid_h, grid_w, device
-        )
-    
-    def _enforce_quadtree_consistency_vectorized(
-        self,
-        scale_map: torch.Tensor,
-        grid_h: int,
-        grid_w: int,
-    ) -> torch.Tensor:
-        """向量化的四叉树一致性约束.
-        
-        使用 max pooling + upsampling 替代 Python 循环。
-        
-        数学约束:
-            若 Block(i,j) 内存在粗尺度选择，整个 Block 使用该粗尺度
-        """
-        B = scale_map.shape[0]
-        result = scale_map.float()  # 转为 float 以便使用 max_pool2d
-        min_ps = min(self.patch_sizes)
-        
-        # 从粗尺度到细尺度处理
-        for scale_idx in range(len(self.patch_sizes) - 1, 0, -1):
-            ps = self.patch_sizes[scale_idx]
-            block_size = ps // min_ps
-            
-            if block_size <= 1:
-                continue
-            
-            # 使用 max_pool + upsample 实现 block 内最大值传播
-            # 1. Max pool: 每个 block 取最大尺度索引
-            pooled = F.max_pool2d(
-                result.unsqueeze(1),  # [B, 1, H, W]
-                kernel_size=block_size,
-                stride=block_size,
-                padding=0,
-            )  # [B, 1, H//bs, W//bs]
-            
-            # 2. Upsample: 扩展回原始尺寸
-            upsampled = F.interpolate(
-                pooled,
-                size=(grid_h, grid_w),
-                mode='nearest',
-            ).squeeze(1)  # [B, H, W]
-            
-            # 3. 只在粗尺度区域应用
-            coarse_mask = (upsampled >= scale_idx)
-            result = torch.where(coarse_mask, upsampled, result)
-        
-        return result.long()
-    
-    def _extract_tokens_vectorized(
-        self,
-        features_dict: Dict[int, Tuple[torch.Tensor, Tuple[int, int]]],
-        scale_map: torch.Tensor,
-        B: int,
-        grid_h: int,
-        grid_w: int,
-        device: torch.device,
-    ) -> TokenizerOutput:
-        """向量化的 token 提取 (使用 padding 统一序列长度).
-        
-        策略:
-            1. 所有尺度特征上采样到最细网格
-            2. 根据 scale_map 选择对应尺度的特征
-            3. 使用 Hilbert 重排
-            4. 生成 mask 标记有效 token
-        
-        这样避免了逐样本处理，实现 batch 级并行。
-        """
-        min_ps = min(self.patch_sizes)
-        
-        # 1. 上采样所有尺度到最细网格，构建特征金字塔
-        # 形状: [B, num_scales, D, grid_h, grid_w]
-        D = features_dict[min_ps][0].shape[1]
-        all_features = torch.zeros(B, len(self.patch_sizes), D, grid_h, grid_w, device=device)
-        
-        for scale_idx, ps in enumerate(self.patch_sizes):
-            if ps not in features_dict:
-                continue
-            feat, (fh, fw) = features_dict[ps]  # [B, D, fh, fw]
-            
-            if fh != grid_h or fw != grid_w:
-                # 最近邻上采样保持离散特征
-                feat = F.interpolate(
-                    feat,
-                    size=(grid_h, grid_w),
-                    mode='nearest',
-                )
-            all_features[:, scale_idx] = feat
-        
-        # 2. 根据 scale_map 选择特征 (向量化 gather)
-        # scale_map: [B, grid_h, grid_w] -> [B, 1, 1, grid_h, grid_w]
-        scale_idx_expanded = scale_map.unsqueeze(1).unsqueeze(2).expand(-1, 1, D, -1, -1)
-        # 选择: [B, D, grid_h, grid_w]
-        selected_features = torch.gather(
-            all_features, 
-            dim=1, 
-            index=scale_idx_expanded
-        ).squeeze(1)
-        
-        # 3. Hilbert 重排
-        if self.use_hilbert_order:
-            tokens = HilbertIndexer.reorder_to_hilbert(selected_features, grid_h, grid_w)
-        else:
-            tokens = selected_features.flatten(2).transpose(1, 2)  # [B, N, D]
-        
-        num_tokens = tokens.shape[1]
-        
-        # 4. 应用特征融合
-        tokens = self.feature_fusion(tokens)
-        
-        # 5. 构建 levels_info (向量化)
-        # 获取每个位置的层级
-        scale_to_level_tensor = torch.tensor(
-            [self.scale_to_level[ps] for ps in self.patch_sizes],
-            device=device,
-            dtype=torch.long
-        )
-        levels_map = scale_to_level_tensor[scale_map]  # [B, grid_h, grid_w]
-        
-        # Hilbert 重排 levels
-        if self.use_hilbert_order:
-            hilbert_idx = HilbertIndexer.get_hilbert_order_on_device(max(grid_h, grid_w), device)
-            valid_len = min(len(hilbert_idx), grid_h * grid_w)
-            levels_flat = levels_map.flatten(1)  # [B, grid_h * grid_w]
-            levels_reordered = levels_flat[:, hilbert_idx[:valid_len]]
-        else:
-            levels_reordered = levels_map.flatten(1)
-        
-        # 6. 构建 levels_info: [B, N, info_len]
-        info_len = min(self.max_level + 1, 16)
-        levels_info = torch.zeros(B, num_tokens, info_len, dtype=torch.long, device=device)
-        levels_info[:, :, 0] = levels_reordered
-        
-        # 7. 拆分为 B 个独立的 TokenSequence (兼容现有接口)
-        sequences = []
-        for b in range(B):
-            seq = TokenSequence(
-                tokens=tokens[b],  # [N, D]
-                metadata={
-                    "levels": levels_info[b],  # [N, info_len]
-                    "num_tokens": num_tokens,
-                },
-            )
-            sequences.append(seq)
-        
-        return TokenizerOutput(sequences)
-    
-    def _enforce_quadtree_consistency(
-        self,
-        scale_map: torch.Tensor,
-        grid_h: int,
-        grid_w: int,
-    ) -> torch.Tensor:
-        """强制四叉树一致性约束.
-        
-        数学约束:
-            若 scale_map[i,j] = k (选择尺度 k)
-            则 Block(i,j,k) 内所有位置必须为 k
-            
-        实现: 从粗尺度到细尺度传播决策
-        
-        Args:
-            scale_map: [B, grid_h, grid_w] 每个位置的尺度索引
-            grid_h: 网格高度
-            grid_w: 网格宽度
-            
-        Returns:
-            一致性约束后的 scale_map
-        """
-        B = scale_map.shape[0]
-        result = scale_map.clone()
-        min_ps = min(self.patch_sizes)
-        
-        # 从粗尺度到细尺度遍历 (跳过最细尺度)
-        for scale_idx in range(len(self.patch_sizes) - 1, 0, -1):
-            ps = self.patch_sizes[scale_idx]
-            block_size = ps // min_ps
-            
-            if block_size <= 1:
-                continue
-            
-            # 遍历每个 block
-            for by in range(0, grid_h, block_size):
-                for bx in range(0, grid_w, block_size):
-                    # 获取 block 区域
-                    by_end = min(by + block_size, grid_h)
-                    bx_end = min(bx + block_size, grid_w)
-                    
-                    block = result[:, by:by_end, bx:bx_end]  # [B, bh, bw]
-                    
-                    # 如果 block 内有任何位置选择了当前粗尺度，整个 block 都用该尺度
-                    # 使用多数投票或最大值策略
-                    block_max = block.amax(dim=(-2, -1), keepdim=True)  # [B, 1, 1]
-                    
-                    # 只有当 block 内存在选择粗尺度的位置时才统一
-                    coarse_mask = (block_max >= scale_idx)
-                    if coarse_mask.any():
-                        # 统一为 block 内的最大尺度索引
-                        result[:, by:by_end, bx:bx_end] = torch.where(
-                            coarse_mask.expand_as(block),
-                            block_max.expand_as(block),
-                            block
-                        )
-        
-        return result
-    
-    def _hilbert_sort_by_position(
-        self,
-        positions: List[Tuple[int, int, int, int, int]],
-    ) -> List[int]:
-        """按位置进行 Hilbert 排序.
-        
-        排序键: (level, hilbert_index_at_level)
-        
-        Args:
-            positions: [(level, fy, fx, fh, fw), ...] 位置列表
-            
-        Returns:
-            排序后的索引列表
-        """
-        if len(positions) <= 1:
-            return list(range(len(positions)))
-        
-        # 计算每个 token 的 Hilbert 距离
-        sort_keys = []
-        for i, (level, fy, fx, fh, fw) in enumerate(positions):
-            grid_size = max(fh, fw)
-            # 找到最接近的 2 的幂
-            n = 1
-            while n < grid_size:
-                n *= 2
-            
-            # 计算 Hilbert 距离
-            h_dist = HilbertCurve.xy_to_d(n, fx, fy)
-            
-            # 排序键: 先按层级，再按 Hilbert 距离
-            sort_keys.append((level, h_dist, i))
-        
-        # 排序
-        sort_keys.sort()
-        return [k[2] for k in sort_keys]
-    
-    def _compute_quadtree_path(
-        self,
-        y: int,
-        x: int,
-        grid_h: int,
-        grid_w: int,
-        max_depth: int,
-    ) -> List[int]:
-        """计算位置 (y, x) 的四叉树路径.
-        
-        路径编码: q_l = bit(x, d-l) + 2 * bit(y, d-l)
-        其中 d 是总深度，l 是当前层级
-        
-        Args:
-            y: y 坐标
-            x: x 坐标
-            grid_h: 网格高度
-            grid_w: 网格宽度
-            max_depth: 最大路径深度
-            
-        Returns:
-            四叉树路径 [q_0, q_1, ..., q_{d-1}]
-        """
-        grid_size = max(grid_h, grid_w)
-        n = 1
-        while n < grid_size:
-            n *= 2
-        
-        actual_depth = max(1, int(math.log2(max(n, 2))))
-        path_depth = min(max_depth, actual_depth)
-        
-        path = []
-        for depth in range(path_depth):
-            shift = actual_depth - depth - 1
-            if shift >= 0:
-                qx = (x >> shift) & 1
-                qy = (y >> shift) & 1
-                quadrant = qx + 2 * qy
-                path.append(quadrant)
-        
-        return path
-
-
-# ==============================================================================
-# CrossScaleAttention: 可微分的多尺度特征融合
-# ==============================================================================
-#
-# 数学形式化:
-#   对于每个空间位置 i (在最细网格上):
-#
-#   1. Query 生成 (Position-aware):
-#      Q_i = W_Q · F_min[i] + PE_i
-#
-#   2. Key 生成 (Scale-aware):
-#      K_{i,s} = W_K · F_s[h_s(i)] + ScaleEmb_s
-#
-#   3. Value 生成:
-#      V_{i,s} = W_V · F_s[h_s(i)]
-#
-#   4. Cross-Scale Attention:
-#      α_{i,s} = softmax(Q_i · K_{i,s} / √d)
-#      Token_i = Σ_s α_{i,s} · V_{i,s}
-#
-# 优势:
-#   - 完全可微分 (无 STE 近似)
-#   - 自然的空间平滑性 (相邻位置 Query 相似)
-#   - 尺度自适应 (根据内容选择最佳尺度组合)
-#
-# ==============================================================================
-
-
-class CrossScaleAttention(nn.Module):
-    """Cross-Scale Attention for adaptive multi-scale feature fusion.
+class StreamingFractalTokenizerV3(BaseTokenizer):
+    """Variable Depth Tokenizer with Adaptive Quadtree Splitting.
     
     数学形式化
     ==========
     
-    对于最细网格上的每个位置 i:
+    核心架构变更 (2025-12-25 重构):
     
-    1. Query (来自最细尺度特征 + 位置编码):
-       Q_i = W_Q · F_min[i] + PE_i
-       
-    2. Key (来自各尺度特征 + 尺度嵌入):
-       K_{i,s} = W_K · F_s[h_s(i)] + ScaleEmb_s
-       
-    3. Value (来自各尺度特征):
-       V_{i,s} = W_V · F_s[h_s(i)]
-       
-    4. Attention 权重:
-       α_{i,s} = softmax(Q_i · K_{i,s} / √d_k)
-       
-    5. 输出 Token:
-       Token_i = Σ_s α_{i,s} · V_{i,s}
+    旧架构 (Cross-Scale Attention):
+        F_s = MultiScaleConv(I)           # 多尺度特征
+        α_{i,s} = softmax(Q_i · K_{i,s})  # 学习尺度权重
+        Token_i = Σ_s α_{i,s} · V_{i,s}   # 加权融合
+        问题: α 必然崩塌到单尺度 (信息论必然性)
     
-    Args:
-        d_model: 特征维度
-        num_scales: 尺度数量
-        num_heads: 注意力头数 (默认 1，因为是跨尺度而非跨位置)
-        dropout: Dropout 概率
-    """
+    新架构 (Variable Depth Tokens):
+        Regions = AdaptiveQuadtreeSplit(I)  # 内容自适应分割
+        F = SharedConv(I)                    # 共享特征提取
+        Token_i = Pool(F[R_i]) * σ_d + E_d  # 区域池化 + 深度编码
+        优势: 深度由内容决定，非学习崩塌
     
-    def __init__(
-        self,
-        d_model: int = 256,
-        num_scales: int = 3,
-        num_heads: int = 1,
-        dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-        
-        self.d_model = d_model
-        self.num_scales = num_scales
-        self.num_heads = num_heads
-        self.d_k = d_model // num_heads
-        self.scale = math.sqrt(self.d_k)
-        
-        # Query 投影 (仅用于最细尺度特征)
-        self.w_q = nn.Linear(d_model, d_model)
-        
-        # Key 投影 (用于所有尺度)
-        self.w_k = nn.Linear(d_model, d_model)
-        
-        # Value 投影 (用于所有尺度)
-        self.w_v = nn.Linear(d_model, d_model)
-        
-        # 尺度嵌入 (添加到 Key 中)
-        self.scale_embedding = nn.Embedding(num_scales, d_model)
-        
-        # 输出投影
-        self.w_o = nn.Linear(d_model, d_model)
-        
-        # Dropout
-        self.dropout = nn.Dropout(dropout)
-        
-        # 用于诊断的尺度分布记录
-        self._last_scale_weights: Optional[torch.Tensor] = None
-        
-    def forward(
-        self,
-        features_dict: Dict[int, Tuple[torch.Tensor, Tuple[int, int]]],
-        patch_sizes: Tuple[int, ...],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Cross-Scale Attention 前向传播.
-        
-        Args:
-            features_dict: {patch_size: (features [B, D, H_s, W_s], (grid_h, grid_w))}
-            patch_sizes: 从小到大排列的 patch 尺寸元组
-            
-        Returns:
-            tokens: [B, N, D] 融合后的 token 序列 (光栅顺序)
-            scale_weights: [B, S, N] 每个位置的尺度权重 (用于诊断)
-        """
-        # 确定基础网格 (最细尺度)
-        min_ps = min(patch_sizes)
-        base_features, (grid_h, grid_w) = features_dict[min_ps]
-        B, D, H, W = base_features.shape
-        N = H * W
-        device = base_features.device
-        
-        # 1. Query: 来自最细尺度特征 [B, N, D]
-        q = base_features.flatten(2).transpose(1, 2)  # [B, N, D]
-        q = self.w_q(q)  # [B, N, D]
-        
-        # 2. 构建各尺度的 Key 和 Value
-        # 形状: [B, S, N, D]
-        S = len(patch_sizes)
-        all_keys = torch.zeros(B, S, N, D, device=device)
-        all_values = torch.zeros(B, S, N, D, device=device)
-        
-        for scale_idx, ps in enumerate(patch_sizes):
-            if ps not in features_dict:
-                continue
-                
-            feat, (fh, fw) = features_dict[ps]  # [B, D, fh, fw]
-            
-            # 上采样到最细网格尺寸
-            if fh != H or fw != W:
-                feat = F.interpolate(
-                    feat,
-                    size=(H, W),
-                    mode='bilinear',
-                    align_corners=False,
-                )
-            
-            # Flatten: [B, N, D]
-            feat_flat = feat.flatten(2).transpose(1, 2)
-            
-            # Key: 特征 + 尺度嵌入
-            scale_emb = self.scale_embedding(
-                torch.tensor([scale_idx], device=device)
-            ).unsqueeze(0)  # [1, 1, D]
-            k = self.w_k(feat_flat) + scale_emb  # [B, N, D]
-            
-            # Value: 特征投影
-            v = self.w_v(feat_flat)  # [B, N, D]
-            
-            all_keys[:, scale_idx] = k
-            all_values[:, scale_idx] = v
-        
-        # 3. 计算 Cross-Scale Attention 权重
-        # Q: [B, N, D], K: [B, S, N, D]
-        # 对于每个位置 i，计算 Q_i 与 K_{i,s} 的点积
-        
-        # 扩展 Q: [B, 1, N, D]
-        q_expanded = q.unsqueeze(1)
-        
-        # 点积: [B, S, N]
-        # 使用 einsum 计算每个位置与其对应尺度特征的点积
-        attn_scores = torch.einsum('bnd,bsnd->bsn', q, all_keys) / self.scale
-        
-        # Softmax over scales: [B, S, N]
-        attn_weights = F.softmax(attn_scores, dim=1)
-        attn_weights = self.dropout(attn_weights)
-        
-        # 保存用于诊断
-        self._last_scale_weights = attn_weights.detach()
-        
-        # 4. 加权融合 Value
-        # attn_weights: [B, S, N], all_values: [B, S, N, D]
-        # 输出: [B, N, D]
-        output = torch.einsum('bsn,bsnd->bnd', attn_weights, all_values)
-        
-        # 5. 输出投影
-        output = self.w_o(output)
-        
-        return output, attn_weights
-    
-    @torch.no_grad()
-    def get_scale_distribution(self) -> Optional[Dict[str, float]]:
-        """获取最近一次前向的尺度分布统计.
-        
-        Returns:
-            Dict 包含每个尺度的平均使用比例，或 None 如果尚未调用 forward
-        """
-        if self._last_scale_weights is None:
-            return None
-        
-        # _last_scale_weights: [B, S, N]
-        avg_weights = self._last_scale_weights.mean(dim=(0, 2))  # [S]
-        
-        return {
-            f"scale_{i}": avg_weights[i].item()
-            for i in range(self.num_scales)
-        }
-
-
-class StreamingFractalTokenizerV3(StreamingFractalTokenizer):
-    """Phase 3: Cross-Scale Attention Tokenizer.
-    
-    使用可微分的 Cross-Scale Attention 替代 Gumbel-Softmax 进行多尺度融合。
-    
-    数学形式化
-    ==========
-    
-    与 V2 (Gumbel-Softmax) 的对比:
-    
-    V2 (STE 模式):
-        s_i = argmax_s π_{i,s}              # 硬选择
-        Token_i = F_{s_i}[h_{s_i}(i)]       # 离散提取
-        ∂L/∂π_k = 0, k ≠ argmax             # 梯度稀疏
-    
-    V3 (Cross-Scale Attention):
-        α_{i,s} = softmax(Q_i · K_{i,s} / √d)  # 软选择
-        Token_i = Σ_s α_{i,s} · V_{i,s}        # 可微融合
-        ∂L/∂F_s ≠ 0, ∀s                        # 梯度密集
-    
-    优势:
-        1. 完全可微分 - 无 STE 近似误差
-        2. 自然空间平滑 - 相邻位置 Query 相似
-        3. 训练稳定 - 无温度退火敏感性
-        4. 代码简洁 - 移除 Gumbel/四叉树/variable_tokens
+    满足的数学约束:
+    1. 维度一致性: 所有 region → 相同 dim
+    2. Hilbert 路径一致性: 四叉树路径 = Hilbert 索引前缀
+    3. 尺度等变性: depth_scale 编码尺度信息
+    4. LCA 兼容性: 与现有 LCA bias 无缝工作
     
     Args:
         image_size: 输入图像尺寸
         channels: 图像通道数
         d_model: 输出嵌入维度
-        patch_sizes: 多尺度 patch 大小 (从小到大排列)
+        base_patch_size: 最细粒度 patch 大小
+        max_depth: 最大四叉树深度
         use_hilbert_order: 是否使用 Hilbert 曲线排序
-        max_level: 最大四叉树层级 (用于 levels_info 兼容)
-        cross_scale_heads: Cross-Scale Attention 头数
-        cross_scale_dropout: Cross-Scale Attention dropout
+        split_scheme: 分割方案 ('balanced_greedy' 或 'fixed_budget_dp')
+        target_tokens: 目标 token 数量 (仅 fixed_budget_dp)
+        complexity_alpha: 复杂度函数中方差权重
+        enforce_balance: 是否强制 2:1 平衡约束
     """
     
     def __init__(
@@ -1959,66 +770,97 @@ class StreamingFractalTokenizerV3(StreamingFractalTokenizer):
         image_size: Union[int, Tuple[int, int]] = 224,
         channels: int = 3,
         d_model: int = 256,
-        patch_sizes: Tuple[int, ...] = (4, 8, 16),
+        base_patch_size: int = 4,
+        max_depth: int = 4,
         use_hilbert_order: bool = True,
-        max_level: int = 50,
-        cross_scale_heads: int = 1,
-        cross_scale_dropout: float = 0.0,
+        split_scheme: str = 'balanced_greedy',
+        target_tokens: Optional[int] = None,
+        complexity_alpha: float = 0.5,
+        enforce_balance: bool = True,
     ) -> None:
-        super().__init__(
-            image_size=image_size,
+        super().__init__()
+        
+        if isinstance(image_size, int):
+            image_size = (image_size, image_size)
+        
+        self.image_size = image_size
+        self.channels = channels
+        self.d_model = d_model
+        self.base_patch_size = base_patch_size
+        self.max_depth = max_depth
+        self.use_hilbert_order = use_hilbert_order
+        self.split_scheme = split_scheme
+        
+        # Hilbert-Native Patch Embedding
+        from .patch_embed import HilbertNativePatchEmbed
+        self.patch_embed = HilbertNativePatchEmbed(
             channels=channels,
-            d_model=d_model,
-            patch_sizes=patch_sizes,
-            primary_scale=None,
-            use_hilbert_order=use_hilbert_order,
-            max_level=max_level,
+            dim=d_model,
+            base_patch_size=base_patch_size,
+            max_depth=max_depth,
+            conv_layers=2,
+            use_batch_norm=True,
         )
         
-        self.num_scales = len(patch_sizes)
-        
-        # Cross-Scale Attention 模块
-        self.cross_scale_attention = CrossScaleAttention(
-            d_model=d_model,
-            num_scales=self.num_scales,
-            num_heads=cross_scale_heads,
-            dropout=cross_scale_dropout,
+        # Adaptive Quadtree Splitter
+        from .adaptive_split import (
+            AdaptiveSplitConfig,
+            BalancedGreedySplitter,
+            FixedBudgetDPSplitter,
+            SplitScheme,
         )
+        
+        if split_scheme == 'fixed_budget_dp' or split_scheme == SplitScheme.FIXED_BUDGET_DP:
+            # Scheme C: Fixed budget DP
+            split_config = AdaptiveSplitConfig.scheme_c(
+                token_budget=target_tokens if target_tokens else 64,
+                max_depth=max_depth,
+                alpha=complexity_alpha,
+            )
+            self.splitter = FixedBudgetDPSplitter(split_config)
+        else:
+            # Scheme B: Balanced greedy
+            split_config = AdaptiveSplitConfig.scheme_b(
+                max_depth=max_depth,
+                alpha=complexity_alpha,
+                enforce_balance=enforce_balance,
+                target_tokens=target_tokens,
+            )
+            self.splitter = BalancedGreedySplitter(split_config)
+        
+        # 统计信息
+        self._last_split_stats: Optional[Dict[str, Any]] = None
     
     @classmethod
     def from_config(
         cls,
-        config: FractalConfig,
+        config: "FractalConfig",
         channels: int = 3,
         d_model: int = 256,
     ) -> "StreamingFractalTokenizerV3":
-        """从 FractalConfig 创建 Tokenizer 实例.
-        
-        Args:
-            config: FractalConfig 实例
-            channels: 图像通道数
-            d_model: 输出嵌入维度
-            
-        Returns:
-            StreamingFractalTokenizerV3 实例
-        """
+        """从 FractalConfig 创建 Tokenizer 实例."""
         return cls(
             image_size=config.image_size,
             channels=channels,
             d_model=d_model,
-            patch_sizes=config.patch_sizes,
+            base_patch_size=config.patch_sizes[0] if config.patch_sizes else 4,
+            max_depth=config.max_depth,
             use_hilbert_order=True,
-            max_level=config.max_depth,
         )
     
     def tokenize(self, images: torch.Tensor) -> TokenizerOutput:
-        """Cross-Scale Attention tokenization.
+        """Variable Depth tokenization.
         
         流程:
-            1. MultiScalePatchEncoder → {F_s}
-            2. CrossScaleAttention → 融合 tokens
-            3. HilbertReorder → 排序
-            4. FeatureFusion → 最终 tokens
+            1. AdaptiveQuadtreeSplit → 内容自适应分割
+            2. HilbertNativePatchEmbed → 区域池化 + 深度编码
+            3. HilbertSort → Hilbert 顺序排列
+        
+        Args:
+            images: [B, C, H, W] 输入图像
+            
+        Returns:
+            TokenizerOutput 包含 token 序列和 levels_info
         """
         if images.dim() != 4:
             raise ValueError(
@@ -2029,113 +871,105 @@ class StreamingFractalTokenizerV3(StreamingFractalTokenizer):
         B, C, H, W = images.shape
         device = images.device
         
-        # 1. 提取多尺度特征
-        features_dict = self.encoder(images)
+        # 1. Adaptive Quadtree Splitting
+        split_results = self.splitter.split_batch(images)
         
-        if not features_dict:
-            raise ValueError(
-                f"No valid scales for image size ({H}, {W}). "
-                f"Minimum patch size is {min(self.patch_sizes)}."
-            )
+        # 收集统计信息
+        self._last_split_stats = {
+            'num_tokens': [sr.num_tokens for sr in split_results],
+            'depth_distributions': [sr.depth_distribution for sr in split_results],
+        }
         
-        # 2. Cross-Scale Attention 融合
-        # tokens: [B, N, D], scale_weights: [B, S, N]
-        tokens, scale_weights = self.cross_scale_attention(
-            features_dict, self.patch_sizes
-        )
+        # 2. Hilbert-Native Patch Embedding
+        tokens, levels_info = self.patch_embed(images, split_results)
+        # tokens: [B, N_max, d_model]
+        # levels_info: [B, N_max, max_depth+1]
         
-        # 获取网格尺寸
-        min_ps = min(self.patch_sizes)
-        _, (grid_h, grid_w) = features_dict[min_ps]
-        
-        # 3. Hilbert 重排
-        if self.use_hilbert_order:
-            # 需要先 reshape 成 [B, D, H, W] 再重排
-            tokens_2d = tokens.transpose(1, 2).view(B, -1, grid_h, grid_w)
-            tokens = HilbertIndexer.reorder_to_hilbert(tokens_2d, grid_h, grid_w)
-            
-            # 同步重排 scale_weights 用于 levels_info
-            hilbert_idx = HilbertIndexer.get_hilbert_order_on_device(
-                max(grid_h, grid_w), device
-            )
-            valid_len = min(len(hilbert_idx), grid_h * grid_w)
-            scale_weights = scale_weights[:, :, hilbert_idx[:valid_len]]
-        
-        num_tokens = tokens.shape[1]
-        
-        # 4. 特征融合
-        tokens = self.feature_fusion(tokens)
-        
-        # 5. 创建 levels_info (使用主导尺度)
-        # 根据每个位置的最大 attention 权重确定主导尺度
-        dominant_scales = scale_weights.argmax(dim=1)  # [B, N]
-        
-        # 转换尺度索引为层级
-        scale_to_level_tensor = torch.tensor(
-            [self.scale_to_level[ps] for ps in self.patch_sizes],
-            device=device,
-            dtype=torch.long
-        )
-        levels = scale_to_level_tensor[dominant_scales]  # [B, N]
-        
-        # 创建 levels_info
-        info_len = min(self.max_level + 1, 16)
-        levels_info = torch.zeros(B, num_tokens, info_len, dtype=torch.long, device=device)
-        levels_info[:, :, 0] = levels
-        
-        # 填充四叉树路径
-        if self.use_hilbert_order:
-            _, quadtree_paths = HilbertPathCache.get_or_compute(
-                grid_h=grid_h, grid_w=grid_w, max_depth=info_len - 1, device=device
-            )
-            actual_tokens = min(num_tokens, quadtree_paths.shape[0])
-            path_len = min(quadtree_paths.shape[1], info_len - 1)
-            levels_info[:, :actual_tokens, 1:path_len+1] = quadtree_paths[:actual_tokens, :path_len].unsqueeze(0).expand(B, -1, -1)
-        
-        # 6. 构建输出
+        # 3. 构建输出
         sequences = []
         for b in range(B):
+            num_tokens = split_results[b].num_tokens
             seq = TokenSequence(
-                tokens=tokens[b],
+                tokens=tokens[b, :num_tokens],  # 截断 padding
                 metadata={
-                    "levels": levels_info[b],
-                    "scale_weights": scale_weights[b].transpose(0, 1),  # [N, S]
+                    "levels": levels_info[b, :num_tokens],
+                    "split_stats": {
+                        "num_tokens": num_tokens,
+                        "depth_distribution": split_results[b].depth_distribution,
+                    },
                 },
             )
             sequences.append(seq)
         
         return TokenizerOutput(sequences)
     
+    def forward(self, images: torch.Tensor) -> TokenizerOutput:
+        """前向传播，等价于 tokenize."""
+        return self.tokenize(images)
+    
     @torch.no_grad()
-    def get_scale_distribution(self) -> Optional[Dict[str, float]]:
-        """获取最近一次前向的尺度分布统计.
+    def get_split_stats(self) -> Optional[Dict[str, Any]]:
+        """获取最近一次分割的统计信息.
         
         Returns:
-            Dict 包含每个尺度的平均使用比例
+            Dict 包含:
+            - num_tokens: List[int] 每个图像的 token 数量
+            - depth_distributions: List[Dict[int, int]] 每个图像的深度分布
         """
-        return self.cross_scale_attention.get_scale_distribution()
+        return self._last_split_stats
+    
+    def get_entropy_loss(self) -> Optional[torch.Tensor]:
+        """获取熵正则化损失.
+        
+        注意: Variable Depth 架构不需要熵正则化
+        (深度由内容决定，非学习权重)
+        
+        Returns:
+            None (保持接口兼容)
+        """
+        return None
+    
+    def get_scale_entropy(self) -> Optional[float]:
+        """获取尺度分布熵值.
+        
+        对于 Variable Depth，计算深度分布的熵。
+        """
+        if self._last_split_stats is None:
+            return None
+        
+        import math
+        
+        # 合并所有图像的深度分布
+        total_dist: Dict[int, int] = {}
+        for dist in self._last_split_stats['depth_distributions']:
+            for d, count in dist.items():
+                total_dist[d] = total_dist.get(d, 0) + count
+        
+        total = sum(total_dist.values())
+        if total == 0:
+            return None
+        
+        # 计算熵
+        entropy = 0.0
+        for count in total_dist.values():
+            p = count / total
+            if p > 0:
+                entropy -= p * math.log(p)
+        
+        return entropy
     
     def get_training_stats(self) -> Dict[str, Any]:
-        """获取训练状态统计信息.
-        
-        与 V2 兼容的接口，但不再包含 Gumbel 相关统计。
-        """
-        scale_dist = self.get_scale_distribution()
-        
+        """获取训练状态统计信息."""
         stats = {
-            'tokenizer_version': 'v3',
-            'fusion_method': 'cross_scale_attention',
-            'num_scales': self.num_scales,
+            'tokenizer_version': 'v3_variable_depth',
+            'architecture': 'adaptive_quadtree_split + hilbert_native_embed',
+            'split_scheme': self.split_scheme,
+            'max_depth': self.max_depth,
         }
         
-        if scale_dist:
-            stats['scale_distribution'] = scale_dist
-            
-            # 计算尺度分布熵
-            import math
-            probs = list(scale_dist.values())
-            entropy = -sum(p * math.log(p + 1e-10) for p in probs)
-            stats['scale_entropy'] = entropy
-            stats['max_entropy'] = math.log(self.num_scales)
+        if self._last_split_stats:
+            avg_tokens = sum(self._last_split_stats['num_tokens']) / len(self._last_split_stats['num_tokens'])
+            stats['avg_tokens_per_image'] = avg_tokens
+            stats['depth_entropy'] = self.get_scale_entropy()
         
         return stats

@@ -93,6 +93,8 @@ class FractalTransformerBlock(nn.Module):
         max_level: Maximum hierarchical level.
         drop_path: DropPath rate for stochastic depth.
         ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
+        hilbert_bias_mode: Hilbert Bias mode ('lca', 'low_rank', 'hierarchical').
+        low_rank_r: Rank for low-rank decomposition (only used when hilbert_bias_mode='low_rank').
     """
 
     def __init__(
@@ -105,6 +107,8 @@ class FractalTransformerBlock(nn.Module):
         max_level: int = 50,
         drop_path: float = 0.0,
         ffn_type: FFNType = 'swiglu_level',
+        hilbert_bias_mode: str = 'lca',
+        low_rank_r: int = 32,
     ):
         super().__init__()
         self.dim = dim
@@ -116,6 +120,8 @@ class FractalTransformerBlock(nn.Module):
             dim_head=dim_head,
             dropout=dropout,
             max_level=max_level,
+            bias_mode=hilbert_bias_mode,
+            low_rank_r=low_rank_r,
         )
 
         self.ff = AdaptiveFractalFeedForward(
@@ -126,13 +132,21 @@ class FractalTransformerBlock(nn.Module):
             ffn_type=ffn_type,
         )
 
-        # STAB-5 方案 B: 层级感知的 Residual 权重
+        # STAB-5 方案 B+: 层级感知的 Residual 权重 (P1-2 修复)
         # 数学依据: 深层 token (细粒度) 需要更大的 residual 权重来保护高频信息
         #          浅层 token (粗粒度) 可使用较小权重，让 Attention 更自由地精炼
         # 实现: w(d) = sigmoid(Embedding(d)) * 2 ∈ [0, 2]
-        # 初始化: zeros -> sigmoid(0) * 2 = 1.0，所有深度初始权重相同
+        # 
+        # P1-2 修复: 使用「种子初始化」替代全零初始化
+        # - 原问题: zeros -> sigmoid(0)*2 = 1.0，所有深度初始权重完全相同
+        # - 修复: init[d] = 0.01 * d / max_level，为梯度提供方向暗示
+        # - 效果: w(0) ≈ 1.000, w(max) ≈ 1.005，差异仅 0.5%，近乎中性但有方向性
         self._level_residual_embedding = nn.Embedding(max_level + 1, 2)
-        nn.init.zeros_(self._level_residual_embedding.weight)  # sigmoid(0)*2 = 1.0
+        # 种子初始化: 极小的线性递增偏移
+        with torch.no_grad():
+            for d in range(max_level + 1):
+                seed_value = 0.01 * d / max_level  # 深层略大
+                self._level_residual_embedding.weight[d] = seed_value
         
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         
@@ -176,6 +190,10 @@ class FractalTransformerBlock(nn.Module):
         """
         if levels_info is None or levels_info.numel() == 0:
             return default_norm(x)
+
+        # 验证输入维度
+        if x.dim() != 3:
+            raise ValueError(f"Expected x to be 3D [B, S, D], got {x.dim()}D with shape {x.shape}")
 
         # Vectorized implementation
         batch_size, seq_len, dim = x.shape
@@ -269,6 +287,8 @@ class FractalTransformer(nn.Module):
         drop_path_rate: Maximum DropPath rate (linearly increased).
         ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
         use_checkpoint: Whether to use gradient checkpointing (saves memory).
+        hilbert_bias_mode: Hilbert Bias mode ('lca', 'low_rank', 'hierarchical').
+        low_rank_r: Rank for low-rank decomposition.
     """
 
     def __init__(
@@ -283,6 +303,8 @@ class FractalTransformer(nn.Module):
         drop_path_rate: float = 0.1,
         ffn_type: FFNType = 'swiglu_level',
         use_checkpoint: bool = False,
+        hilbert_bias_mode: str = 'lca',
+        low_rank_r: int = 32,
     ):
         super().__init__()
         self.dim = dim
@@ -290,6 +312,8 @@ class FractalTransformer(nn.Module):
         self.max_level = max_level
         self.ffn_type = ffn_type
         self.use_checkpoint = use_checkpoint
+        self.hilbert_bias_mode = hilbert_bias_mode
+        self.low_rank_r = low_rank_r
 
         # Stochastic depth decay rule
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
@@ -305,6 +329,8 @@ class FractalTransformer(nn.Module):
                     max_level=max_level,
                     drop_path=dpr[i],
                     ffn_type=ffn_type,
+                    hilbert_bias_mode=hilbert_bias_mode,
+                    low_rank_r=low_rank_r,
                 )
                 for i in range(depth)
             ]
@@ -331,6 +357,9 @@ class FractalTransformer(nn.Module):
             nn.ReLU(),
             nn.Linear(dim // 2, dim),
         )
+        # P3-9: 可学习的残差缩放因子 (初始化为 0.2，类似 ReZero)
+        self._aggregator_scale = nn.Parameter(torch.tensor(0.2))
+        
         self.final_norm = nn.LayerNorm(dim)
 
     def forward(
@@ -373,7 +402,7 @@ class FractalTransformer(nn.Module):
             
             refined = self._level_aggregator_bottleneck(x)  # (B, S, D)
             aggregated = refined * scale  # 层级感知的缩放
-            x = x + aggregated * 0.2
+            x = x + aggregated * self._aggregator_scale
 
         x = self.final_norm(x)
         return x

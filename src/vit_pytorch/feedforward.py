@@ -109,18 +109,12 @@ class AdaptiveFractalFeedForward(nn.Module):
     - 'swiglu': SwiGLU FFN (LLaMA-style, lightweight)
     - 'swiglu_level': SwiGLU + Level Adaptation (recommended, best balance)
     
-    Note: `use_feature_gating` is deprecated and ignored when `ffn_type` is 
-    'swiglu' or 'swiglu_level', as SwiGLU already has built-in gating.
-    The Dynamic Activation mechanism has been removed due to ablation results
-    showing it degenerates to near-uniform distribution (entropy > 90%).
-    
     Args:
         dim: Input/output dimension.
         hidden_dim: Hidden layer dimension.
         dropout: Dropout rate.
         max_level: Maximum hierarchical level for embeddings.
         use_level_adaptation: Whether to use level-aware adaptation (only for 'gelu').
-        use_feature_gating: DEPRECATED - ignored for SwiGLU variants.
         ffn_type: FFN variant to use ('gelu', 'swiglu', 'swiglu_level').
     """
 
@@ -131,7 +125,6 @@ class AdaptiveFractalFeedForward(nn.Module):
         dropout: float = 0.0,
         max_level: int = 50,
         use_level_adaptation: bool = True,
-        use_feature_gating: bool = True,
         ffn_type: FFNType = 'swiglu_level',
     ):
         super().__init__()
@@ -140,16 +133,11 @@ class AdaptiveFractalFeedForward(nn.Module):
         self.max_level = max_level
         self.ffn_type = ffn_type
         
-        # For SwiGLU variants, feature_gating is built-in and level_adaptation
-        # is controlled by ffn_type, not the boolean flag
+        # For SwiGLU variants, level_adaptation is controlled by ffn_type
         if ffn_type in ('swiglu', 'swiglu_level'):
             self.use_level_adaptation = (ffn_type == 'swiglu_level')
-            self.use_feature_gating = False  # SwiGLU has built-in gating
-            # 注意：不再对默认参数发出警告，只有在用户显式传入这些参数时
-            # 才需要考虑警告，但由于无法区分，我们静默忽略
         else:
             self.use_level_adaptation = use_level_adaptation
-            self.use_feature_gating = use_feature_gating
 
         self.norm = nn.LayerNorm(dim)
         
@@ -185,42 +173,13 @@ class AdaptiveFractalFeedForward(nn.Module):
                 nn.Linear(adapter_hidden, dim),
                 nn.Dropout(dropout),
             )
-            self.level_mixing_weights: Optional[nn.Parameter] = nn.Parameter(torch.ones(max_level + 1))
+            # P1-1: 初始化为 0，使 sigmoid(0)=0.5 作为中性起点
+            # 语义: α_d = σ(w_d)，50% main FFN + 50% level adapter
+            self.level_mixing_weights: Optional[nn.Parameter] = nn.Parameter(torch.zeros(max_level + 1))
         else:
             self.level_embedding = None
             self.shared_level_adapter = None
             self.level_mixing_weights = None
-        
-        # ========== Feature Gating + Dynamic Activation（仅对 GELU 模式）==========
-        # 注意：消融实验表明 Dynamic Activation 熵 > 90%，接近均匀分布，
-        # 说明模型没有学到有意义的激活选择。保留此代码仅为向后兼容。
-        if self.use_feature_gating:
-            self.feature_gate: Optional[nn.Sequential] = nn.Sequential(
-                nn.Linear(dim, hidden_dim // 4),
-                nn.ReLU(),
-                nn.Linear(hidden_dim // 4, hidden_dim),
-                nn.Sigmoid(),
-            )
-            self.activation_selector: Optional[nn.Sequential] = nn.Sequential(
-                nn.Linear(dim, 3), nn.Softmax(dim=-1)
-            )
-        else:
-            self.feature_gate = None
-            self.activation_selector = None
-
-    def _apply_dynamic_activation(self, x: torch.Tensor, activation_weights: torch.Tensor) -> torch.Tensor:
-        """应用动态加权的激活函数组合（已废弃，仅保留向后兼容）。
-        
-        Warning: 消融实验表明此机制无效（熵 > 90%），建议使用 SwiGLU 变体。
-        """
-        gelu_out = F.gelu(x)
-        relu_out = F.relu(x)
-        swish_out = x * torch.sigmoid(x)
-        return (
-            activation_weights[:, :, 0:1] * gelu_out
-            + activation_weights[:, :, 1:2] * relu_out
-            + activation_weights[:, :, 2:3] * swish_out
-        )
     
     def _apply_level_adaptation(
         self, 
@@ -250,12 +209,15 @@ class AdaptiveFractalFeedForward(nn.Module):
             # (Seq, Info) -> broadcast to batch
             depths = extract_depths(levels_info, self.max_level)
             level_embs = self.level_embedding(depths).unsqueeze(0).expand(batch, -1, -1)
-            mixing_weights = F.softmax(self.level_mixing_weights[depths], dim=0).view(1, seq_len, 1)
+            # P1-1 修复: 使用 sigmoid 替代错误的 softmax(dim=0)
+            # 数学形式: α_d = σ(w_d) ∈ (0,1)，每个深度独立控制 adapter 权重
+            mixing_weights = torch.sigmoid(self.level_mixing_weights[depths]).view(1, seq_len, 1)
         else:
             # (Batch, Seq, Info)
             depths = extract_depths(levels_info, self.max_level)
             level_embs = self.level_embedding(depths)
-            mixing_weights = F.softmax(self.level_mixing_weights[depths], dim=1).unsqueeze(-1)
+            # P1-1 修复: 使用 sigmoid 替代错误的 softmax(dim=1)
+            mixing_weights = torch.sigmoid(self.level_mixing_weights[depths]).unsqueeze(-1)
         
         adapter_input = torch.cat([x_norm, level_embs], dim=-1)
         level_adapted = self.shared_level_adapter(adapter_input)
@@ -286,16 +248,5 @@ class AdaptiveFractalFeedForward(nn.Module):
         # ========== Level Adaptation ==========
         if self.use_level_adaptation and levels_info is not None and levels_info.numel() > 0:
             main_out = self._apply_level_adaptation(x_norm, main_out, levels_info, batch, seq_len)
-
-        # ========== Feature Gating（仅 GELU 模式且启用）==========
-        if self.use_feature_gating and self.feature_gate is not None and self.main_net is not None:
-            assert self.activation_selector is not None
-            gates = self.feature_gate(x_norm)
-            hidden = F.linear(x_norm, self.main_net[0].weight, self.main_net[0].bias)
-            gated_hidden = hidden * gates
-            activation_weights = self.activation_selector(x_norm)
-            activated_hidden = self._apply_dynamic_activation(gated_hidden, activation_weights)
-            main_out = F.linear(activated_hidden, self.main_net[3].weight, self.main_net[3].bias)
-            main_out = self.main_net[4](main_out)
 
         return main_out

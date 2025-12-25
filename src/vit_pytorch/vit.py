@@ -529,7 +529,9 @@ class FractalCurveViT(nn.Module):
         """
         # StreamingFractalTokenizer 使用 Gumbel-Softmax，梯度直接反向传播
         # 无需策略梯度损失
-        return torch.tensor(0.0, device=self.aux_loss_weight.device)
+        # 使用 cls_token 的设备作为参考
+        device = self.cls_token.device if hasattr(self, 'cls_token') else 'cpu'
+        return torch.tensor(0.0, device=device)
     
     def clear_tokenizer_cache(self) -> None:
         """清空 tokenizer 的动作缓存，应在每个 batch 结束后调用"""

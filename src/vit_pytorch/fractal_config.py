@@ -60,7 +60,7 @@ from typing import Literal, Tuple
 # 类型别名
 BiasMode = Literal['original', 'low_rank', 'hierarchical', 'lca']
 AnnealSchedule = Literal['linear', 'exponential', 'cosine']
-TokenizerType = Literal['streaming_v1', 'streaming_v2', 'streaming_v3']
+TokenizerType = Literal['streaming_v1', 'streaming_v3']
 
 
 @dataclass
@@ -79,17 +79,8 @@ class FractalConfig:
         
     Tokenizer 配置:
         tokenizer_type: tokenizer 类型
-            - 'streaming_v3': Cross-Scale Attention (推荐，默认)
-            - 'streaming_v2': Gumbel-Softmax (已弃用)
+            - 'streaming_v3': Variable Depth Tokens (推荐，默认)
             - 'streaming_v1': 单尺度基础版
-        
-    Gumbel-Softmax 配置 (仅 tokenizer_type='streaming_v2' 时有效):
-        gumbel_tau_init: 初始温度，控制探索程度
-        gumbel_tau_min: 温度下界，过低会导致梯度消失
-        gumbel_tau_max: 温度上界
-        gumbel_anneal_schedule: 退火策略 ('linear', 'exponential', 'cosine')
-        variable_tokens: 是否启用可变 token 数量
-        use_soft_weights: 是否使用软权重 (实验性)
         
     Hilbert Bias 配置:
         hilbert_bias_mode: 偏置计算模式
@@ -104,15 +95,7 @@ class FractalConfig:
     min_patch_size: int = 4
     
     # ========== Tokenizer 配置 ==========
-    tokenizer_type: TokenizerType = 'streaming_v3'  # 默认使用 Cross-Scale Attention
-    
-    # ========== Gumbel-Softmax 配置 (V2 专用，已弃用) ==========
-    gumbel_tau_init: float = 2.0
-    gumbel_tau_min: float = 0.5
-    gumbel_tau_max: float = 5.0
-    gumbel_anneal_schedule: AnnealSchedule = 'cosine'
-    variable_tokens: bool = False  # V2 专用，V3 不使用
-    use_soft_weights: bool = False  # V2 专用，V3 不使用
+    tokenizer_type: TokenizerType = 'streaming_v3'  # 默认使用 Variable Depth
     
     # ========== Hilbert Bias 配置 ==========
     hilbert_bias_mode: BiasMode = 'lca'
@@ -146,17 +129,6 @@ class FractalConfig:
         ratio = self.image_size // self.min_patch_size
         if ratio <= 0:
             raise ValueError(f"grid_size = {ratio} 必须为正数")
-        
-        # 验证 Gumbel 参数
-        if self.gumbel_tau_min >= self.gumbel_tau_max:
-            raise ValueError(
-                f"gumbel_tau_min ({self.gumbel_tau_min}) 必须小于 gumbel_tau_max ({self.gumbel_tau_max})"
-            )
-        
-        if not (self.gumbel_tau_min <= self.gumbel_tau_init <= self.gumbel_tau_max):
-            raise ValueError(
-                f"gumbel_tau_init ({self.gumbel_tau_init}) 必须在 [{self.gumbel_tau_min}, {self.gumbel_tau_max}] 范围内"
-            )
         
         # 计算推导参数
         # max_depth 使用 ceil(log2) 以支持非 2^k
@@ -208,30 +180,6 @@ class FractalConfig:
         """获取指定尺度的网格边长."""
         return self.image_size // self.patch_sizes[scale_idx]
     
-    def compute_temperature(self, current_epoch: int, total_epochs: int) -> float:
-        """根据退火策略计算当前温度.
-        
-        Args:
-            current_epoch: 当前 epoch (0-indexed)
-            total_epochs: 总 epoch 数
-            
-        Returns:
-            当前温度值
-        """
-        if total_epochs <= 1:
-            return self.gumbel_tau_init
-        
-        progress = min(current_epoch / (total_epochs - 1), 1.0)
-        
-        if self.gumbel_anneal_schedule == 'linear':
-            return self.gumbel_tau_max - (self.gumbel_tau_max - self.gumbel_tau_min) * progress
-        elif self.gumbel_anneal_schedule == 'exponential':
-            return self.gumbel_tau_max * (self.gumbel_tau_min / self.gumbel_tau_max) ** progress
-        else:  # cosine
-            return self.gumbel_tau_min + 0.5 * (self.gumbel_tau_max - self.gumbel_tau_min) * (
-                1 + math.cos(math.pi * progress)
-            )
-    
     def __repr__(self) -> str:
         hilbert_strategy = "Pseudo-Hilbert" if self.uses_pseudo_hilbert else "Standard Hilbert"
         is_power_of_2 = self.grid_size > 0 and (self.grid_size & (self.grid_size - 1) == 0)
@@ -239,14 +187,7 @@ class FractalConfig:
         
         # 根据 tokenizer 类型显示不同信息
         if self.tokenizer_type == 'streaming_v3':
-            tokenizer_info = f"  tokenizer_type='{self.tokenizer_type}' (Cross-Scale Attention, 推荐)\n"
-        elif self.tokenizer_type == 'streaming_v2':
-            tokenizer_info = (
-                f"  tokenizer_type='{self.tokenizer_type}' (Gumbel-Softmax, 已弃用)\n"
-                f"  tau=[{self.gumbel_tau_min}, {self.gumbel_tau_init}, {self.gumbel_tau_max}], "
-                f"schedule='{self.gumbel_anneal_schedule}'\n"
-                f"  variable_tokens={self.variable_tokens}, use_soft_weights={self.use_soft_weights}\n"
-            )
+            tokenizer_info = f"  tokenizer_type='{self.tokenizer_type}' (Variable Depth, 推荐)\n"
         else:
             tokenizer_info = f"  tokenizer_type='{self.tokenizer_type}' (单尺度)\n"
         

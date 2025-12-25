@@ -48,7 +48,7 @@ bias_mode 选项:
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -106,6 +106,9 @@ class LowRankHilbertBias(nn.Module):
             nn.ReLU(),
             nn.Linear(64, rank * heads),
         )
+        
+        # 截断警告标志，避免重复警告
+        self._truncation_warned = False
     
     def _adjust_path_dim(self, paths: torch.Tensor) -> torch.Tensor:
         """调整路径维度以匹配模型期望的 path_dim。
@@ -115,6 +118,10 @@ class LowRankHilbertBias(nn.Module):
             
         Returns:
             调整后的路径 (..., path_dim)
+            
+        Note:
+            当 actual_dim > path_dim 时会截断深层路径后缀，可能降低 LCA 精度。
+            建议设置 path_dim >= max_level + 16 以避免截断。
         """
         actual_dim = paths.shape[-1]
         if actual_dim == self.path_dim:
@@ -126,6 +133,16 @@ class LowRankHilbertBias(nn.Module):
             return torch.cat([paths, padding], dim=-1)
         else:
             # 截断（保留前 path_dim 个元素）
+            # P1-3 改进: 添加运行时警告
+            if not self._truncation_warned:
+                import warnings
+                warnings.warn(
+                    f"LowRankHilbertBias: 路径维度 {actual_dim} 超出 path_dim={self.path_dim}，"
+                    f"将截断深层路径后缀。这可能降低 LCA 精度。"
+                    f"建议增加 path_dim 或使用 path_dim='auto'。",
+                    UserWarning
+                )
+                self._truncation_warned = True
             return paths[..., :self.path_dim]
     
     def forward(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
@@ -306,7 +323,7 @@ class LCAHilbertBias(nn.Module):
     复杂度分析
     ==========
     - 参数量: O((D+1) × H) ≈ 128 (vs Low-Rank ~50K)
-    - 计算量: O(N² × D) 用于 LCA 计算 (可预计算缓存)
+    - 计算量: O(N² × D) 用于 LCA 计算 (P1-6: 支持缓存避免重复计算)
     - 显存: O(N²) 用于偏置矩阵
     
     优势
@@ -331,6 +348,12 @@ class LCAHilbertBias(nn.Module):
         # LCA 深度嵌入表: depth ∈ {0, 1, ..., max_depth} → R^heads
         # 深度 0 表示完全不同的根节点，深度 max_depth 表示相邻或相同
         self.lca_embedding = nn.Embedding(max_depth + 1, heads)
+        
+        # P1-6 优化: LCA 深度矩阵缓存
+        # 同一个 levels_info 在不同 Transformer 层之间是相同的
+        # 缓存避免重复计算，理论加速 ~6x (6层时)
+        self._lca_cache_key: Optional[Tuple[int, torch.device]] = None  # (data_ptr, device)
+        self._lca_cache_value: Optional[torch.Tensor] = None
         
         # 初始化: 深度越大（越邻近）偏置越高
         # 使用对数衰减初始化，符合 Hilbert 曲线的 √ 局部性
@@ -381,7 +404,10 @@ class LCAHilbertBias(nn.Module):
             return self._forward_3d(levels_info)
     
     def _forward_2d(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
-        """处理 2D 输入 (S, Info)。"""
+        """处理 2D 输入 (S, Info)。
+        
+        注意: 2D 情况通常是单样本，不使用缓存（批量缓存收益低）
+        """
         seq_len, info_dim = levels_info.shape
         if info_dim <= 1:
             return None
@@ -408,6 +434,11 @@ class LCAHilbertBias(nn.Module):
             LCA[b,i,j] = sum_d prod_{k<=d} 1[p_i[k] = p_j[k]]
             Bias[b,i,j] = Embedding(LCA[b,i,j])
         
+        P1-6 优化: LCA 深度矩阵缓存
+            - 同一 batch 的 levels_info 在所有 Transformer 层间共享
+            - 使用 data_ptr 作为缓存键，避免重复计算
+            - 理论加速: 6层时约 6x
+        
         复杂度: O(B·N²·D) 但无 Python 循环开销
         """
         batch_size, seq_len, info_dim = levels_info.shape
@@ -417,15 +448,40 @@ class LCAHilbertBias(nn.Module):
         # 提取四叉树路径: (B, S, Path)
         paths = levels_info[:, :, 1:].long()
         
-        # 批量向量化计算 LCA 深度: (B, S, S)
-        lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
-        lca_depths = lca_depths.clamp(0, self.max_depth)
+        # P1-6: 检查缓存
+        # 使用 (data_ptr, device) 作为缓存键，避免跨设备问题
+        # 同一个 forward pass 中，不同层共享相同的 levels_info 张量
+        cache_key = (levels_info.data_ptr(), levels_info.device)
+        
+        if (self._lca_cache_key is not None and 
+            self._lca_cache_key == cache_key and
+            self._lca_cache_value is not None):
+            # 缓存命中
+            lca_depths = self._lca_cache_value
+        else:
+            # 缓存未命中，计算 LCA
+            lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
+            lca_depths = lca_depths.clamp(0, self.max_depth)
+            # 更新缓存
+            self._lca_cache_key = cache_key
+            self._lca_cache_value = lca_depths
         
         # 批量嵌入: (B, S, S, H)
         bias = self.lca_embedding(lca_depths)
         
         # 调整形状: (B, H, S, S)
         return bias.permute(0, 3, 1, 2)
+    
+    def clear_cache(self) -> None:
+        """清除 LCA 缓存。
+        
+        在以下情况调用:
+        - 开始新的 batch 前
+        - 评估/推理前后
+        - 内存清理时
+        """
+        self._lca_cache_key = None
+        self._lca_cache_value = None
 
 
 class   HilbertAwareMultiScaleAttention(nn.Module):

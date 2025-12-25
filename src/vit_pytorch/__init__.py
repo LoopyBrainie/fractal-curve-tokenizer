@@ -22,7 +22,7 @@ Layer 4 (应用层):
     fractal_vit.py          FractalCurveViT
 
 Layer 3 (管道层):
-    streaming_tokenizer.py  StreamingFractalTokenizer, V2
+    streaming_tokenizer.py  StreamingFractalTokenizer, V3 (推荐)
     transformer.py          FractalTransformer
 
 Layer 2 (组件层):
@@ -57,7 +57,7 @@ from .fractal_path import (
     HierarchicalAttentionBias,
     VectorizedPathEncoder,
 )
-from .fractal_vit import FractalCurveViT
+from .vit import FractalCurveViT
 from .hilbert import (
     HilbertCurve,
     PseudoHilbertCurve,
@@ -67,12 +67,10 @@ from .hilbert import (
 )
 from .positional import FractalPositionEmbedding
 from .streaming_tokenizer import (
-    CrossScaleAttention,
     HilbertIndexer,
     HilbertPathCache,
     MultiScalePatchEncoder,
     StreamingFractalTokenizer,
-    StreamingFractalTokenizerV2,
     StreamingFractalTokenizerV3,
 )
 from .tokenization import BaseTokenizer, BaseTokenProcessor, TokenSequence, TokenizerOutput
@@ -83,9 +81,7 @@ from .utils import extract_depths, normalize_levels_info
 __all__ = [
     # === 主要模型 ===
     "StreamingFractalTokenizer",
-    "StreamingFractalTokenizerV2",  # 已废弃，请使用 V3
-    "StreamingFractalTokenizerV3",  # 推荐
-    "CrossScaleAttention",
+    "StreamingFractalTokenizerV3",  # 推荐: Variable Depth Tokenizer
     "FractalCurveViT",
     # === 配置与路径编码 ===
     "FractalConfig",
@@ -124,17 +120,4 @@ __all__ = [
     "get_quadrant_order",
     "hilbert_distance_to_xy",
     "xy_to_hilbert_distance",
-    # === 向后兼容别名 (Backward Compatibility) ===
-    "EnhancedFractalTransformer",
-    "EnhancedFractalTransformerBlock",
-    "AdvancedFractalPositionEmbedding",
-    "NextGenerationFractalViT",
 ]
-
-# === 向后兼容别名 (Backward Compatibility) ===
-# 旧类名映射到新类名，保证 API 兼容性
-# 计划于 v2.0 版本移除
-EnhancedFractalTransformer = FractalTransformer
-EnhancedFractalTransformerBlock = FractalTransformerBlock
-AdvancedFractalPositionEmbedding = FractalPositionEmbedding
-NextGenerationFractalViT = FractalCurveViT
