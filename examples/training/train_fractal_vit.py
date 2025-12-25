@@ -727,6 +727,7 @@ def train_epoch(
     optimizer.zero_grad(set_to_none=True)
     
     batch_times, data_times, forward_times = [], [], []
+    entropy_losses = []  # P1-5: 收集熵损失用于统计
     cuda_mem_peak = 0.0
     use_mixup = mixup_fn is not None
     nan_count = 0  # NaN 计数器
@@ -771,9 +772,21 @@ def train_epoch(
             
             if use_mixup and mixed_labels is not None:
                 # 使用混合标签的交叉熵
-                loss = mixup_criterion(outs, mixed_labels) / config.accum_steps
+                ce_loss = mixup_criterion(outs, mixed_labels) / config.accum_steps
             else:
-                loss = F.cross_entropy(outs, labels, label_smoothing=config.label_smoothing) / config.accum_steps
+                ce_loss = F.cross_entropy(outs, labels, label_smoothing=config.label_smoothing) / config.accum_steps
+            
+            # P1-5 修复: 收集熵正则化损失
+            # 熵损失鼓励尺度分布多样性，防止 CrossScaleAttention 崩塌到单一尺度
+            entropy_loss = None
+            if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_entropy_loss'):
+                entropy_loss = model.tokenizer.get_entropy_loss()
+            
+            if entropy_loss is not None:
+                loss = ce_loss + entropy_loss / config.accum_steps
+                entropy_losses.append(entropy_loss.item())  # P1-5: 记录熵损失
+            else:
+                loss = ce_loss
         
         # 检查 loss 是否为 NaN
         if torch.isnan(loss) or torch.isinf(loss):
@@ -827,7 +840,15 @@ def train_epoch(
         'avg_forward_time': np.mean(forward_times) if forward_times else 0,
         'throughput': total / sum(batch_times) if batch_times else 0,
         'cuda_mem_peak_gb': cuda_mem_peak,
+        # P1-5: 添加熵统计
+        'avg_entropy_loss': np.mean(entropy_losses) if entropy_losses else None,
     }
+    
+    # P1-5: 获取当前尺度熵值用于监控
+    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_scale_entropy'):
+        scale_entropy = model.tokenizer.get_scale_entropy()
+        if scale_entropy is not None:
+            perf_stats['scale_entropy'] = scale_entropy
     
     return total_loss / len(loader), 100.0 * correct / total, perf_stats
 
@@ -1215,6 +1236,8 @@ def main():
         ffn_type=config.ffn_type,
         tokenizer_type=config.tokenizer_type,
         num_scales=config.num_scales,
+        # Hilbert Bias 配置
+        hilbert_bias_mode=config.hilbert_bias_mode,
     )
     
     # V2 专用参数
