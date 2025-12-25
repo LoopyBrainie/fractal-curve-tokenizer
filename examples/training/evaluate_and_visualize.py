@@ -1655,6 +1655,712 @@ def visualize_attention_maps(
 
 
 # ============================================================================
+# 架构特性可视化 (V3 Cross-Scale Attention, STAB-5, LCA Bias)
+# ============================================================================
+
+def visualize_cross_scale_attention(
+    model: nn.Module,
+    image: torch.Tensor,
+    device: torch.device,
+    save_path: Optional[Path] = None,
+    show: bool = True,
+) -> Optional[plt.Figure]:
+    """可视化 V3 Cross-Scale Attention 的多尺度融合
+    
+    展示每个 token 在不同尺度上的注意力权重分布，
+    体现模型如何自适应地融合不同粒度的信息。
+    
+    Args:
+        model: FractalCurveViT 模型
+        image: [1, C, H, W] 输入图像
+        device: 计算设备
+        save_path: 保存路径
+        show: 是否显示
+        
+    Returns:
+        matplotlib Figure 或 None
+    """
+    model.eval()
+    tokenizer = model.tokenizer
+    
+    # 检查是否是 V3 tokenizer
+    if not isinstance(tokenizer, StreamingFractalTokenizerV3):
+        print("[WARN] Cross-Scale Attention visualization requires StreamingFractalTokenizerV3")
+        return None
+    
+    patch_sizes = tokenizer.patch_sizes
+    n_scales = len(patch_sizes)
+    H, W = image.shape[2], image.shape[3]
+    
+    # 获取 Cross-Scale Attention 权重
+    cross_scale_weights = []
+    
+    def hook_fn(module, input, output):
+        # CrossScaleAttention 模块的 forward 返回 (tokens, levels_info)
+        # 我们需要在 attention 计算后捕获权重
+        if hasattr(module, 'scale_weights'):
+            cross_scale_weights.append(module.scale_weights.detach().cpu())
+    
+    # 注册 hook 到 CrossScaleAttention
+    hooks = []
+    for name, module in tokenizer.named_modules():
+        if 'cross_scale' in name.lower() or 'CrossScaleAttention' in type(module).__name__:
+            # 添加临时属性来存储权重
+            original_forward = module.forward
+            
+            def make_hook_forward(mod, orig_fwd):
+                def hooked_forward(*args, **kwargs):
+                    result = orig_fwd(*args, **kwargs)
+                    return result
+                return hooked_forward
+            
+            hooks.append((module, original_forward))
+    
+    with torch.no_grad():
+        # 直接调用 tokenizer 获取多尺度信息
+        output = tokenizer.tokenize(image.to(device))
+        tokens = output.tokens  # [B, N, D]
+        levels_info = output.levels_info  # [B, N, info_dim] or [N, info_dim]
+    
+    # 转换图像用于显示
+    img_np = image[0].permute(1, 2, 0).cpu().numpy()
+    img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
+    
+    # 创建可视化
+    fig, axes = plt.subplots(2, n_scales + 1, figsize=(4 * (n_scales + 1), 8))
+    
+    # 第一行：原图 + 各尺度的 patch 网格
+    axes[0, 0].imshow(img_np)
+    axes[0, 0].set_title('Original Image', fontsize=11)
+    axes[0, 0].axis('off')
+    
+    scale_colors = plt.cm.Set1(np.linspace(0, 0.8, n_scales))
+    
+    for s, ps in enumerate(patch_sizes):
+        ax = axes[0, s + 1]
+        ax.imshow(img_np)
+        
+        grid_h, grid_w = H // ps, W // ps
+        n_patches = grid_h * grid_w
+        
+        # 绘制网格
+        for i in range(grid_h + 1):
+            ax.axhline(i * ps, color=scale_colors[s], linewidth=1.5, alpha=0.8)
+        for j in range(grid_w + 1):
+            ax.axvline(j * ps, color=scale_colors[s], linewidth=1.5, alpha=0.8)
+        
+        ax.set_title(f'Scale {s+1}: {ps}×{ps}\n{n_patches} patches', fontsize=10)
+        ax.axis('off')
+    
+    # 第二行：Hilbert 曲线遍历 + token 融合示意
+    axes[1, 0].text(0.5, 0.5, 'Cross-Scale\nAttention\nFusion', 
+                   ha='center', va='center', fontsize=12, fontweight='bold',
+                   transform=axes[1, 0].transAxes)
+    axes[1, 0].axis('off')
+    
+    # 为每个尺度绘制 Hilbert 遍历路径
+    for s, ps in enumerate(patch_sizes):
+        ax = axes[1, s + 1]
+        ax.imshow(img_np, alpha=0.3)
+        
+        grid_h, grid_w = H // ps, W // ps
+        grid_size = max(grid_h, grid_w)
+        n = 1
+        while n < grid_size:
+            n *= 2
+        
+        # 生成 Hilbert 路径
+        path_points = []
+        for d in range(n * n):
+            x, y = HilbertCurve.d_to_xy(n, d)
+            if x < grid_w and y < grid_h:
+                cx = x * ps + ps // 2
+                cy = y * ps + ps // 2
+                path_points.append((cx, cy))
+        
+        if len(path_points) > 1:
+            xs = [p[0] for p in path_points]
+            ys = [p[1] for p in path_points]
+            
+            points = np.array([xs, ys]).T.reshape(-1, 1, 2)
+            segments = np.concatenate([points[:-1], points[1:]], axis=1)
+            colors_line = np.linspace(0, 1, len(segments))
+            
+            lc = LineCollection(segments, cmap='plasma', 
+                               norm=plt.Normalize(0, 1), linewidths=2)
+            lc.set_array(colors_line)
+            ax.add_collection(lc)
+            
+            # 标记起点和终点
+            ax.scatter([xs[0]], [ys[0]], color='green', s=80, marker='o', 
+                      zorder=5, label='Start')
+            ax.scatter([xs[-1]], [ys[-1]], color='red', s=80, marker='s', 
+                      zorder=5, label='End')
+        
+        ax.set_xlim(0, W)
+        ax.set_ylim(H, 0)
+        ax.set_title(f'Hilbert Order (Scale {s+1})\n{len(path_points)} tokens', fontsize=10)
+        ax.axis('off')
+    
+    # 添加说明文字
+    fig.text(0.5, 0.02, 
+             'Cross-Scale Attention: Each token attends to corresponding patches across all scales,\n'
+             'enabling adaptive multi-resolution feature fusion via learned attention weights.',
+             ha='center', fontsize=10, style='italic')
+    
+    fig.suptitle('V3 Cross-Scale Attention Tokenization', fontsize=14, fontweight='bold')
+    plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] Cross-scale attention visualization saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
+
+
+def visualize_level_aware_processing(
+    model: nn.Module,
+    image: torch.Tensor,
+    device: torch.device,
+    save_path: Optional[Path] = None,
+    show: bool = True,
+) -> Optional[plt.Figure]:
+    """可视化层级感知处理机制 (STAB-5 + LCA Bias)
+    
+    展示：
+    1. Token 层级深度分布
+    2. Level-aware LayerNorm 的 gamma/beta 参数
+    3. Level-aware 残差权重
+    4. LCA Hilbert Bias 效果
+    
+    Args:
+        model: FractalCurveViT 模型
+        image: [1, C, H, W] 输入图像
+        device: 计算设备
+        save_path: 保存路径
+        show: 是否显示
+    """
+    model.eval()
+    
+    # 获取 tokenization 输出
+    with torch.no_grad():
+        output = model.tokenizer.tokenize(image.to(device))
+        tokens = output.tokens
+        levels_info = output.levels_info
+    
+    if levels_info is None or levels_info.numel() == 0:
+        print("[WARN] No levels_info available for visualization")
+        return None
+    
+    # 提取深度信息
+    from vit_pytorch.utils import extract_depths
+    
+    max_level = model.max_level if hasattr(model, 'max_level') else 50
+    depths = extract_depths(levels_info, max_level)
+    
+    if depths.dim() == 1:
+        depths = depths.cpu().numpy()
+    else:
+        depths = depths[0].cpu().numpy()  # 取第一个 batch
+    
+    n_tokens = len(depths)
+    H, W = image.shape[2], image.shape[3]
+    
+    # 获取 transformer 层的参数
+    layer0 = model.transformer.layers[0]
+    
+    # 提取 level-aware 参数
+    norm1_gamma = layer0.norm1_gamma.weight.detach().cpu().numpy()  # [max_level+1, dim]
+    norm1_beta = layer0.norm1_beta.weight.detach().cpu().numpy()
+    residual_emb = layer0._level_residual_embedding.weight.detach().cpu().numpy()  # [max_level+1, 2]
+    
+    # 计算残差权重
+    residual_weights = 1 / (1 + np.exp(-residual_emb)) * 2  # sigmoid * 2
+    
+    # 转换图像
+    img_np = image[0].permute(1, 2, 0).cpu().numpy()
+    img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
+    
+    # 创建 4 子图布局
+    fig = plt.figure(figsize=(16, 12))
+    gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+    
+    # 1. Token 深度分布直方图
+    ax1 = fig.add_subplot(gs[0, 0])
+    unique_depths, counts = np.unique(depths, return_counts=True)
+    colors = plt.cm.viridis(unique_depths / max(unique_depths.max(), 1))
+    ax1.bar(unique_depths, counts, color=colors, edgecolor='black', alpha=0.8)
+    ax1.set_xlabel('Depth Level', fontsize=10)
+    ax1.set_ylabel('Token Count', fontsize=10)
+    ax1.set_title('Token Depth Distribution', fontsize=11, fontweight='bold')
+    ax1.grid(axis='y', alpha=0.3)
+    
+    # 2. 深度热图（在图像上）
+    ax2 = fig.add_subplot(gs[0, 1])
+    
+    # 重建深度图
+    patch_sizes = model.tokenizer.patch_sizes
+    min_ps = min(patch_sizes)
+    depth_map = np.zeros((H // min_ps, W // min_ps))
+    
+    # 使用 Hilbert 曲线映射
+    grid_h, grid_w = H // min_ps, W // min_ps
+    grid_size = max(grid_h, grid_w)
+    n = 1
+    while n < grid_size:
+        n *= 2
+    
+    for d_idx, depth in enumerate(depths[:grid_h * grid_w]):
+        x, y = HilbertCurve.d_to_xy(n, d_idx)
+        if x < grid_w and y < grid_h:
+            depth_map[y, x] = depth
+    
+    im2 = ax2.imshow(depth_map, cmap='viridis', interpolation='nearest')
+    ax2.set_title('Token Depth Map (Hilbert Order)', fontsize=11, fontweight='bold')
+    plt.colorbar(im2, ax=ax2, shrink=0.8, label='Depth')
+    ax2.axis('off')
+    
+    # 3. Level-aware LayerNorm gamma 参数可视化
+    ax3 = fig.add_subplot(gs[0, 2])
+    
+    # 只显示实际使用的深度范围
+    max_used_depth = int(depths.max()) + 1
+    gamma_mean = norm1_gamma[:max_used_depth].mean(axis=1)
+    gamma_std = norm1_gamma[:max_used_depth].std(axis=1)
+    
+    x_range = np.arange(max_used_depth)
+    ax3.fill_between(x_range, gamma_mean - gamma_std, gamma_mean + gamma_std, 
+                    alpha=0.3, color='blue')
+    ax3.plot(x_range, gamma_mean, 'b-o', markersize=4, label='γ mean')
+    ax3.axhline(1.0, color='gray', linestyle='--', alpha=0.5, label='Identity')
+    ax3.set_xlabel('Depth Level', fontsize=10)
+    ax3.set_ylabel('γ Value', fontsize=10)
+    ax3.set_title('Level-aware LN: γ (Norm1)', fontsize=11, fontweight='bold')
+    ax3.legend(loc='upper right', fontsize=8)
+    ax3.grid(alpha=0.3)
+    
+    # 4. Level-aware 残差权重
+    ax4 = fig.add_subplot(gs[1, 0])
+    
+    x_range = np.arange(max_used_depth)
+    ax4.plot(x_range, residual_weights[:max_used_depth, 0], 'g-o', 
+            markersize=4, label='Attention residual')
+    ax4.plot(x_range, residual_weights[:max_used_depth, 1], 'r-s', 
+            markersize=4, label='FFN residual')
+    ax4.axhline(1.0, color='gray', linestyle='--', alpha=0.5, label='Standard (w=1)')
+    ax4.set_xlabel('Depth Level', fontsize=10)
+    ax4.set_ylabel('Residual Weight', fontsize=10)
+    ax4.set_title('STAB-5: Level-aware Residual Weights', fontsize=11, fontweight='bold')
+    ax4.legend(loc='best', fontsize=8)
+    ax4.grid(alpha=0.3)
+    ax4.set_ylim(0, 2.2)
+    
+    # 5. LCA Hilbert Bias 可视化
+    ax5 = fig.add_subplot(gs[1, 1])
+    
+    # 获取 LCA embedding（如果存在）
+    lca_params = None
+    for name, module in model.named_modules():
+        if hasattr(module, 'lca_embedding'):
+            lca_params = module.lca_embedding.weight.detach().cpu().numpy()
+            break
+    
+    if lca_params is not None:
+        # lca_params: [max_depth+1, heads]
+        im5 = ax5.imshow(lca_params[:max_used_depth].T, cmap='RdBu_r', 
+                        aspect='auto', interpolation='nearest')
+        ax5.set_xlabel('LCA Depth', fontsize=10)
+        ax5.set_ylabel('Attention Head', fontsize=10)
+        ax5.set_title('LCA Hilbert Bias Embedding', fontsize=11, fontweight='bold')
+        plt.colorbar(im5, ax=ax5, shrink=0.8, label='Bias')
+    else:
+        ax5.text(0.5, 0.5, 'LCA Bias\nNot Available', 
+                ha='center', va='center', fontsize=12,
+                transform=ax5.transAxes)
+        ax5.set_title('LCA Hilbert Bias', fontsize=11, fontweight='bold')
+    
+    # 6. 原图 + 深度叠加
+    ax6 = fig.add_subplot(gs[1, 2])
+    ax6.imshow(img_np)
+    
+    # 叠加深度颜色
+    depth_overlay = np.zeros((H, W, 4))
+    cmap = plt.cm.viridis
+    
+    for d_idx, depth in enumerate(depths[:grid_h * grid_w]):
+        x, y = HilbertCurve.d_to_xy(n, d_idx)
+        if x < grid_w and y < grid_h:
+            color = cmap(depth / max(depths.max(), 1))
+            depth_overlay[y*min_ps:(y+1)*min_ps, x*min_ps:(x+1)*min_ps] = (*color[:3], 0.4)
+    
+    ax6.imshow(depth_overlay)
+    ax6.set_title('Depth Overlay on Image', fontsize=11, fontweight='bold')
+    ax6.axis('off')
+    
+    # 7. 架构说明
+    ax7 = fig.add_subplot(gs[2, :])
+    ax7.axis('off')
+    
+    arch_text = """
+╔══════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                           FRACTAL VIT LEVEL-AWARE PROCESSING PIPELINE                            ║
+╠══════════════════════════════════════════════════════════════════════════════════════════════════╣
+║                                                                                                  ║
+║  ┌─────────────────┐     ┌──────────────────────┐     ┌────────────────────┐     ┌────────────┐ ║
+║  │  Multi-Scale    │     │  Cross-Scale         │     │  Level-aware       │     │ Output     │ ║
+║  │  Patch Encoder  │ ──▶ │  Attention (V3)      │ ──▶ │  Transformer       │ ──▶ │ [B,N,D]    │ ║
+║  │  {4×4, 8×8,     │     │  Token_i = Σ_s       │     │  - STAB-5 residual │     │            │ ║
+║  │   16×16, ...}   │     │   α_{i,s} · V_{i,s}  │     │  - Level-aware LN  │     │            │ ║
+║  └─────────────────┘     └──────────────────────┘     │  - LCA Hilbert Bias│     └────────────┘ ║
+║                                                        └────────────────────┘                    ║
+║                                                                                                  ║
+║  Key Innovations:                                                                                ║
+║  • Cross-Scale Attention: Adaptive multi-resolution fusion via learned α_{i,s} weights          ║
+║  • STAB-5: Level-dependent residual weights w(d) = σ(Emb(d)) × 2 ∈ [0, 2]                       ║
+║  • Level-aware LayerNorm: Per-depth γ/β parameters for fine-grained normalization               ║
+║  • LCA Hilbert Bias: Lowest Common Ancestor based attention bias (~408 params/layer)            ║
+║                                                                                                  ║
+╚══════════════════════════════════════════════════════════════════════════════════════════════════╝
+"""
+    ax7.text(0.5, 0.5, arch_text, fontsize=8, fontfamily='monospace',
+            ha='center', va='center', transform=ax7.transAxes,
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    fig.suptitle('Level-Aware Processing Visualization', fontsize=14, fontweight='bold')
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] Level-aware processing visualization saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
+
+
+def visualize_model_architecture_summary(
+    model: nn.Module,
+    save_path: Optional[Path] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """生成模型架构概览图
+    
+    展示：
+    1. 参数量分布（饼图）
+    2. 层级结构图
+    3. 关键超参数表格
+    """
+    # 统计各模块参数量
+    def count_params(module):
+        return sum(p.numel() for p in module.parameters())
+    
+    total_params = count_params(model)
+    
+    modules = {}
+    if hasattr(model, 'tokenizer'):
+        modules['Tokenizer'] = count_params(model.tokenizer)
+    if hasattr(model, 'pos_embedding'):
+        modules['Position Emb'] = count_params(model.pos_embedding)
+    if hasattr(model, 'transformer'):
+        modules['Transformer'] = count_params(model.transformer)
+    if hasattr(model, 'mlp_head'):
+        modules['MLP Head'] = count_params(model.mlp_head)
+    if hasattr(model, 'cls_token'):
+        modules['CLS Token'] = model.cls_token.numel()
+    
+    # 其他参数
+    accounted = sum(modules.values())
+    if total_params > accounted:
+        modules['Other'] = total_params - accounted
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    
+    # 1. 参数量饼图
+    ax1 = axes[0]
+    labels = list(modules.keys())
+    sizes = list(modules.values())
+    colors = plt.cm.Set3(np.linspace(0, 1, len(labels)))
+    
+    wedges, texts, autotexts = ax1.pie(
+        sizes, labels=labels, autopct=lambda pct: f'{pct:.1f}%\n({int(pct/100*total_params/1e6):.1f}M)',
+        colors=colors, startangle=90, textprops={'fontsize': 9}
+    )
+    ax1.set_title(f'Parameter Distribution\nTotal: {total_params/1e6:.2f}M', 
+                 fontsize=12, fontweight='bold')
+    
+    # 2. 层级结构
+    ax2 = axes[1]
+    ax2.axis('off')
+    
+    # 获取配置信息
+    dim = model.dim if hasattr(model, 'dim') else '?'
+    depth = len(model.transformer.layers) if hasattr(model, 'transformer') else '?'
+    heads = model.transformer.layers[0].attention.heads if hasattr(model, 'transformer') else '?'
+    ffn_type = model.ffn_type if hasattr(model, 'ffn_type') else 'swiglu_level'
+    tokenizer_type = model.tokenizer_type if hasattr(model, 'tokenizer_type') else 'streaming_v3'
+    
+    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'patch_sizes'):
+        patch_sizes = model.tokenizer.patch_sizes
+    else:
+        patch_sizes = (4, 8, 16)
+    
+    struct_text = f"""
+┌────────────────────────────────────────┐
+│         FRACTAL CURVE VIT              │
+├────────────────────────────────────────┤
+│                                        │
+│  ┌──────────────────────────────────┐  │
+│  │ Tokenizer: {tokenizer_type:<20} │  │
+│  │ Patch Sizes: {str(patch_sizes):<18} │  │
+│  │ → Multi-Scale Patch Encoder      │  │
+│  │ → Cross-Scale Attention          │  │
+│  │ → Hilbert-ordered Tokens         │  │
+│  └──────────────────────────────────┘  │
+│                  ↓                     │
+│  ┌──────────────────────────────────┐  │
+│  │ Position Embedding               │  │
+│  │ → Fractal Depth + Quadrant       │  │
+│  │ → STAB-4 Path Count Norm         │  │
+│  └──────────────────────────────────┘  │
+│                  ↓                     │
+│  ┌──────────────────────────────────┐  │
+│  │ Transformer: {depth:>3} layers            │  │
+│  │ → HilbertAwareAttention (LCA)    │  │
+│  │ → {ffn_type:<22} FFN    │  │
+│  │ → Level-aware LayerNorm (STAB-5) │  │
+│  │ → Level Residual Weights         │  │
+│  └──────────────────────────────────┘  │
+│                  ↓                     │
+│  ┌──────────────────────────────────┐  │
+│  │ MLP Head                         │  │
+│  │ → LayerNorm + Linear + GELU      │  │
+│  │ → Linear(dim → num_classes)      │  │
+│  └──────────────────────────────────┘  │
+│                                        │
+└────────────────────────────────────────┘
+"""
+    ax2.text(0.5, 0.5, struct_text, fontsize=9, fontfamily='monospace',
+            ha='center', va='center', transform=ax2.transAxes,
+            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3))
+    ax2.set_title('Architecture Overview', fontsize=12, fontweight='bold')
+    
+    # 3. 关键超参数表格
+    ax3 = axes[2]
+    ax3.axis('off')
+    
+    # 获取 Transformer 层参数
+    layer0 = model.transformer.layers[0]
+    attn_params = count_params(layer0.attention)
+    ff_params = count_params(layer0.ff)
+    layer_params = count_params(layer0)
+    
+    config_data = [
+        ['Parameter', 'Value'],
+        ['─' * 20, '─' * 15],
+        ['dim', f'{dim}'],
+        ['depth', f'{depth}'],
+        ['heads', f'{heads}'],
+        ['dim_head', f'{dim // heads if isinstance(dim, int) else "?"}'],
+        ['ffn_type', f'{ffn_type}'],
+        ['tokenizer', f'{tokenizer_type}'],
+        ['num_scales', f'{len(patch_sizes)}'],
+        ['patch_sizes', f'{patch_sizes}'],
+        ['─' * 20, '─' * 15],
+        ['Single Layer', f'{layer_params/1e6:.2f}M'],
+        ['  Attention', f'{attn_params/1e6:.2f}M'],
+        ['  FFN', f'{ff_params/1e6:.2f}M'],
+        ['─' * 20, '─' * 15],
+        ['Total Params', f'{total_params/1e6:.2f}M'],
+    ]
+    
+    table = ax3.table(
+        cellText=config_data,
+        cellLoc='left',
+        loc='center',
+        colWidths=[0.5, 0.4],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 1.5)
+    
+    # 设置表头样式
+    for i in range(2):
+        table[(0, i)].set_facecolor('lightgray')
+        table[(0, i)].set_text_props(fontweight='bold')
+    
+    ax3.set_title('Model Configuration', fontsize=12, fontweight='bold')
+    
+    fig.suptitle('Fractal ViT Architecture Summary', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] Architecture summary saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
+
+
+def visualize_hilbert_vs_raster_attention(
+    model: nn.Module,
+    image: torch.Tensor,
+    device: torch.device,
+    save_path: Optional[Path] = None,
+    show: bool = True,
+) -> Optional[plt.Figure]:
+    """对比 Hilbert 排序与光栅扫描的注意力模式差异
+    
+    展示 Hilbert 曲线如何保持空间局部性，
+    使得注意力矩阵呈现更有结构的模式。
+    """
+    model.eval()
+    H, W = image.shape[2], image.shape[3]
+    
+    # 转换图像
+    img_np = image[0].permute(1, 2, 0).cpu().numpy()
+    img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
+    
+    # 获取最小 patch size
+    if hasattr(model.tokenizer, 'patch_sizes'):
+        min_ps = min(model.tokenizer.patch_sizes)
+    else:
+        min_ps = 4
+    
+    grid_h, grid_w = H // min_ps, W // min_ps
+    n_patches = grid_h * grid_w
+    
+    # 计算 Hilbert 和 Raster 的 2D 距离矩阵
+    grid_size = max(grid_h, grid_w)
+    n = 1
+    while n < grid_size:
+        n *= 2
+    
+    # Hilbert 排序下的 patch 坐标
+    hilbert_coords = []
+    for d in range(n * n):
+        x, y = HilbertCurve.d_to_xy(n, d)
+        if x < grid_w and y < grid_h:
+            hilbert_coords.append((x, y))
+    
+    # 光栅扫描排序下的 patch 坐标
+    raster_coords = [(x, y) for y in range(grid_h) for x in range(grid_w)]
+    
+    n_valid = len(hilbert_coords)
+    
+    # 计算 1D 距离 vs 2D 距离的相关性
+    def compute_distance_matrix(coords):
+        n = len(coords)
+        dist_1d = np.zeros((n, n))
+        dist_2d = np.zeros((n, n))
+        for i in range(n):
+            for j in range(n):
+                dist_1d[i, j] = abs(i - j)
+                dist_2d[i, j] = np.sqrt((coords[i][0] - coords[j][0])**2 + 
+                                       (coords[i][1] - coords[j][1])**2)
+        return dist_1d, dist_2d
+    
+    hilbert_1d, hilbert_2d = compute_distance_matrix(hilbert_coords)
+    raster_1d, raster_2d = compute_distance_matrix(raster_coords)
+    
+    # 计算相关性
+    hilbert_corr = np.corrcoef(hilbert_1d.flatten(), hilbert_2d.flatten())[0, 1]
+    raster_corr = np.corrcoef(raster_1d.flatten(), raster_2d.flatten())[0, 1]
+    
+    # 创建可视化
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # 第一行：Hilbert
+    ax1 = axes[0, 0]
+    ax1.imshow(img_np)
+    # 绘制 Hilbert 路径
+    if len(hilbert_coords) > 1:
+        xs = [c[0] * min_ps + min_ps // 2 for c in hilbert_coords]
+        ys = [c[1] * min_ps + min_ps // 2 for c in hilbert_coords]
+        points = np.array([xs, ys]).T.reshape(-1, 1, 2)
+        segments = np.concatenate([points[:-1], points[1:]], axis=1)
+        lc = LineCollection(segments, cmap='plasma', linewidths=1.5)
+        lc.set_array(np.linspace(0, 1, len(segments)))
+        ax1.add_collection(lc)
+    ax1.set_title('Hilbert Traversal', fontsize=11, fontweight='bold')
+    ax1.axis('off')
+    
+    ax2 = axes[0, 1]
+    im2 = ax2.imshow(hilbert_2d, cmap='hot', aspect='equal')
+    ax2.set_title(f'2D Distance Matrix (Hilbert)\nCorr with 1D: {hilbert_corr:.3f}', 
+                 fontsize=10, fontweight='bold')
+    plt.colorbar(im2, ax=ax2, shrink=0.8)
+    ax2.set_xlabel('Token Index')
+    ax2.set_ylabel('Token Index')
+    
+    ax3 = axes[0, 2]
+    ax3.scatter(hilbert_1d.flatten()[::10], hilbert_2d.flatten()[::10], 
+               alpha=0.3, s=1, c='blue')
+    ax3.set_xlabel('1D Distance (Token Index)')
+    ax3.set_ylabel('2D Distance (Spatial)')
+    ax3.set_title(f'1D vs 2D Distance (Hilbert)\nr = {hilbert_corr:.3f}', 
+                 fontsize=10, fontweight='bold')
+    ax3.grid(alpha=0.3)
+    
+    # 第二行：Raster
+    ax4 = axes[1, 0]
+    ax4.imshow(img_np)
+    # 绘制 Raster 路径
+    if len(raster_coords) > 1:
+        xs = [c[0] * min_ps + min_ps // 2 for c in raster_coords]
+        ys = [c[1] * min_ps + min_ps // 2 for c in raster_coords]
+        points = np.array([xs, ys]).T.reshape(-1, 1, 2)
+        segments = np.concatenate([points[:-1], points[1:]], axis=1)
+        lc = LineCollection(segments, cmap='plasma', linewidths=1.5)
+        lc.set_array(np.linspace(0, 1, len(segments)))
+        ax4.add_collection(lc)
+    ax4.set_title('Raster Traversal', fontsize=11, fontweight='bold')
+    ax4.axis('off')
+    
+    ax5 = axes[1, 1]
+    im5 = ax5.imshow(raster_2d, cmap='hot', aspect='equal')
+    ax5.set_title(f'2D Distance Matrix (Raster)\nCorr with 1D: {raster_corr:.3f}', 
+                 fontsize=10, fontweight='bold')
+    plt.colorbar(im5, ax=ax5, shrink=0.8)
+    ax5.set_xlabel('Token Index')
+    ax5.set_ylabel('Token Index')
+    
+    ax6 = axes[1, 2]
+    ax6.scatter(raster_1d.flatten()[::10], raster_2d.flatten()[::10], 
+               alpha=0.3, s=1, c='red')
+    ax6.set_xlabel('1D Distance (Token Index)')
+    ax6.set_ylabel('2D Distance (Spatial)')
+    ax6.set_title(f'1D vs 2D Distance (Raster)\nr = {raster_corr:.3f}', 
+                 fontsize=10, fontweight='bold')
+    ax6.grid(alpha=0.3)
+    
+    # 添加说明
+    improvement = ((hilbert_corr - raster_corr) / abs(raster_corr) * 100) if raster_corr != 0 else 0
+    fig.text(0.5, 0.02, 
+             f'Hilbert curve achieves {improvement:.1f}% better 1D-2D locality correlation.\n'
+             'This means spatially close tokens remain close in sequence, benefiting local attention.',
+             ha='center', fontsize=11, style='italic',
+             bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+    
+    fig.suptitle('Hilbert vs Raster Scan: Locality Preservation Comparison', 
+                fontsize=14, fontweight='bold')
+    plt.tight_layout(rect=[0, 0.06, 1, 0.95])
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] Hilbert vs Raster comparison saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
+
+
+# ============================================================================
 # 综合可视化报告
 # ============================================================================
 
@@ -1691,7 +2397,7 @@ def generate_full_report(
     print(f"{'='*70}\n")
     
     # 1. 加载模型
-    print("[1/6] Loading model...")
+    print("[1/12] Loading model...")
     model, config = load_model_and_config(checkpoint_path, device)
     
     tokenizer_type = config.get('tokenizer_type', 'streaming_v3')
@@ -1713,7 +2419,7 @@ def generate_full_report(
               f"decay={config.get('depth_bias_decay', 2.0)}, warmup={config.get('depth_bias_warmup', 0.2)}")
     
     # 2. 准备数据
-    print("[2/6] Loading test data...")
+    print("[2/12] Loading test data...")
     spec = DATASETS.get(dataset_name, DATASETS['cifar10'])
     
     test_tf = transforms.Compose([
@@ -1766,7 +2472,7 @@ def generate_full_report(
     test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4)
     
     # 3. 评估模型
-    print("[3/6] Evaluating model...")
+    print("[3/12] Evaluating model...")
     results = evaluate_model(
         model, test_loader, device,
         num_classes=spec.num_classes,
@@ -1777,7 +2483,7 @@ def generate_full_report(
     print(f"      Loss: {results['loss']:.4f}")
     
     # 4. 可视化 Hilbert 曲线
-    print("[4/6] Generating Hilbert curve visualizations...")
+    print("[4/12] Generating Hilbert curve visualizations...")
     visualize_hilbert_curve(
         max_order=5,
         save_path=output_dir / "hilbert_curves.png",
@@ -1791,7 +2497,7 @@ def generate_full_report(
     )
     
     # 5. 在样本图像上可视化
-    print("[5/8] Visualizing tokenization on sample images...")
+    print("[5/12] Visualizing tokenization on sample images...")
     sample_imgs, sample_labels = next(iter(test_loader))
     
     visualize_hilbert_on_image(
@@ -1810,8 +2516,39 @@ def generate_full_report(
             show=show,
         )
     
-    # 6. 混合 Level 分割可视化
-    print("[6/8] Visualizing adaptive scale selection...")
+    # 6. 架构特性可视化 (NEW)
+    print("[6/12] Generating architecture feature visualizations...")
+    
+    # 6.1 模型架构概览
+    visualize_model_architecture_summary(
+        model,
+        save_path=output_dir / "architecture_summary.png",
+        show=show,
+    )
+    
+    # 6.2 Cross-Scale Attention 可视化
+    visualize_cross_scale_attention(
+        model, sample_imgs[0:1], device,
+        save_path=output_dir / "cross_scale_attention.png",
+        show=show,
+    )
+    
+    # 6.3 Level-aware 处理可视化
+    visualize_level_aware_processing(
+        model, sample_imgs[0:1], device,
+        save_path=output_dir / "level_aware_processing.png",
+        show=show,
+    )
+    
+    # 6.4 Hilbert vs Raster 对比
+    visualize_hilbert_vs_raster_attention(
+        model, sample_imgs[0:1], device,
+        save_path=output_dir / "hilbert_vs_raster.png",
+        show=show,
+    )
+    
+    # 7. 混合 Level 分割可视化
+    print("[7/12] Visualizing adaptive scale selection...")
     if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'complexity_head'):
         visualize_adaptive_scale_selection(
             model, sample_imgs[:8], device,
@@ -1836,8 +2573,8 @@ def generate_full_report(
     else:
         print("      [SKIP] Tokenizer does not support adaptive scale selection")
     
-    # 6.5. Train/Eval 一致性检查
-    print("[6.5/8] Checking train/eval consistency...")
+    # 8. Train/Eval 一致性检查
+    print("[8/12] Checking train/eval consistency...")
     consistency_report = check_train_eval_consistency(model, sample_imgs[:4], device)
     
     # 保存一致性报告
@@ -1854,8 +2591,8 @@ def generate_full_report(
                 serializable_report[k] = v
         json.dump(serializable_report, f, indent=2, default=str)
     
-    # 7. 评估可视化
-    print("[7/8] Generating evaluation visualizations...")
+    # 9. 评估可视化
+    print("[9/12] Generating evaluation visualizations...")
     
     visualize_confusion_matrix(
         results['confusion_matrix'],
@@ -1878,8 +2615,16 @@ def generate_full_report(
         show=show,
     )
     
-    # 8. 保存结果
-    print("[8/8] Saving report...")
+    # 10. 注意力可视化
+    print("[10/12] Visualizing attention maps...")
+    visualize_attention_maps(
+        model, sample_imgs[0:1], device,
+        save_path=output_dir / "attention_maps.png",
+        show=show,
+    )
+    
+    # 11. 保存结果
+    print("[11/12] Saving report...")
     
     # 获取 tokenizer 状态
     tokenizer_stats = {}
@@ -1906,21 +2651,35 @@ def generate_full_report(
     with open(output_dir / "evaluation_report.json", 'w') as f:
         json.dump(report, f, indent=2, default=str)
     
+    # 12. 打印报告摘要
+    print("[12/12] Report summary...")
+    
     print(f"\n{'='*70}")
     print("REPORT COMPLETE")
     print(f"{'='*70}")
     print(f"Results saved to: {output_dir}")
+    print(f"\n[Hilbert Curve Visualizations]")
     print(f"  - hilbert_curves.png")
     print(f"  - hilbert_locality.png")
     print(f"  - hilbert_on_image.png")
+    print(f"\n[Tokenization Visualizations]")
     print(f"  - multi_scale_tokenization.png")
+    print(f"  - cross_scale_attention.png        [NEW - V3 CSA]")
+    print(f"\n[Architecture Feature Visualizations]")
+    print(f"  - architecture_summary.png         [NEW - Model Overview]")
+    print(f"  - level_aware_processing.png       [NEW - STAB-5 + LCA]")
+    print(f"  - hilbert_vs_raster.png            [NEW - Locality Comparison]")
+    print(f"  - attention_maps.png               [NEW]")
+    print(f"\n[Adaptive Scale Selection]")
     print(f"  - adaptive_scale_selection.png")
     print(f"  - scale_distribution.png")
     print(f"  - scale_by_complexity.png")
+    print(f"\n[Evaluation Results]")
     print(f"  - confusion_matrix.png")
     print(f"  - per_class_accuracy.png")
     print(f"  - sample_predictions.png")
-    print(f"  - consistency_report.json       [NEW]")
+    print(f"\n[Reports]")
+    print(f"  - consistency_report.json")
     print(f"  - evaluation_report.json")
     print(f"{'='*70}\n")
     
