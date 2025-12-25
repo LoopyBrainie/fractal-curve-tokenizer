@@ -100,54 +100,54 @@ scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[5])
 
 ---
 
-## 9.5 温度退火 (⚠️ 仅 V2)
+## 9.5 V3 训练特性
 
-> **注意**: V3 Cross-Scale Attention 无需温度参数和退火调度，以下仅适用于已废弃的 V2。
+### Variable Depth Tokens 架构
 
-### StreamingFractalTokenizerV2 温度调度
-
-训练过程中逐步降低 Gumbel-Softmax 温度，使尺度选择从软选择逐渐过渡到硬选择：
-
-$\tau(t) = \tau_{max} \cdot \left(\frac{\tau_{min}}{\tau_{max}}\right)^{t/T}$
+V3 采用 **Variable Depth Tokens** 架构，基于内容自适应四叉树分割，无需温度退火或深度偏置调度：
 
 ```python
-# 训练循环中调用
+# V3 训练循环 (简化)
 for epoch in range(epochs):
-    progress = epoch / epochs
-    model.tokenizer.anneal_temperature(progress)  # 自动退火
+    for images, labels in dataloader:
+        output = model(images)
+        loss = criterion(output, labels)
+        
+        # 获取分割统计
+        stats = model.tokenizer.get_training_stats()
+        print(f"Depth entropy: {stats.get('depth_entropy', 0):.3f}")
+        
+        loss.backward()
+        optimizer.step()
 ```
 
-**默认参数**:
+### 诊断方法
 
-- $\tau_{max} = 2.0$ (初始温度)
-- $\tau_{min} = 0.1$ (最终温度)
+```python
+# 获取分割统计
+stats = tokenizer.get_split_stats()
+# {
+#     'num_tokens': [48, 52, ...],  # 每图像 token 数
+#     'depth_distributions': [{0: 4, 1: 16, 2: 28}, ...],  # 深度分布
+# }
+
+# 深度分布熵 (多样性指标)
+entropy = tokenizer.get_scale_entropy()
+```
 
 ---
 
-## 9.6 Depth Bias 预热 (⚠️ 仅 V2)
+## 9.6 历史：温度退火与 Depth Bias (已废弃)
 
-> **注意**: V3 Cross-Scale Attention 无需深度偏置调度，以下仅适用于已废弃的 V2。
+> **重要**: 以下内容仅作历史参考。V2 (Gumbel-Softmax) 已从代码库完全移除，V3 也已从 Cross-Scale Attention 重构为 Variable Depth Tokens 架构。
 
-### set_depth_bias() / anneal_depth_bias()
+### V2 温度调度 (已删除)
 
-在训练初期对细粒度 patch 给予更高的选择偏好，帮助模型学习精细特征：
+V2 使用 Gumbel-Softmax 需要温度退火：$\tau(t) = \tau_{max} \cdot \left(\frac{\tau_{min}}{\tau_{max}}\right)^{t/T}$
 
-$\text{logits}'_{i,j,s} = \text{logits}_{i,j,s} + \beta(t) \cdot e^{-\lambda s}$
+### Depth Bias 预热 (已删除)
 
-```python
-# 方法1: 自动根据进度退火
-for epoch in range(epochs):
-    progress = epoch / epochs
-    model.tokenizer.anneal_depth_bias(progress)  # warmup 阶段后偏置消失
-
-# 方法2: 手动设置
-model.tokenizer.set_depth_bias(1.5)  # 直接设置偏置强度
-```
-
-**默认参数**:
-
-- $\beta_{max} = 2.0$ (最大偏置强度)
-- $\lambda = 2.0$ (深度衰减系数)
+V2 的深度偏置调度：$\text{logits}'_{i,j,s} = \text{logits}_{i,j,s} + \beta(t) \cdot e^{-\lambda s}$
 - warmup = 0.2 (训练前 20% 使用偏置)
 
 ---

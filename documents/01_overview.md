@@ -7,8 +7,8 @@ Fractal Curve Tokenizer 项目代表了 Vision Transformer (ViT) 架构的一次
 本项目的核心创新在于引入了**分形几何**和**Hilbert 曲线**的概念：
 
 1. **Hilbert 曲线遍历**：使用 Hilbert 曲线将 2D 网格映射为 1D 序列，保持空间局部性
-2. **多尺度 tokenization**：通过卷积金字塔提取多尺度特征
-3. **端到端可微**：使用 Cross-Scale Attention 实现可微的多尺度融合（V3 推荐），或 Gumbel-Softmax 尺度选择（V2 废弃）
+2. **多尺度 tokenization**：通过 Variable Depth Tokens 实现内容自适应分割
+3. **端到端可微**：使用自适应四叉树分割 + 区域池化实现可微的多尺度融合 (V3 推荐)
 
 ## 1.2 Hilbert 曲线简介与空间填充性质
 
@@ -39,10 +39,12 @@ fractal-curve-tokenizer/
 ├── src/
 │   └── vit_pytorch/
 │       ├── __init__.py             # 包入口，模块导出
-│       ├── fractal_vit.py          # [核心] 完整模型定义
-│       ├── streaming_tokenizer.py  # [核心] 流式分形 Tokenizer (V1/V2)
+│       ├── vit.py                  # [核心] FractalCurveViT 完整模型
+│       ├── streaming_tokenizer.py  # [核心] 流式分形 Tokenizer (V1/V3)
+│       ├── adaptive_split.py       # [核心] 自适应四叉树分割算法
+│       ├── patch_embed.py          # [核心] Hilbert-Native Patch Embedding
 │       ├── transformer.py          # 增强型 Transformer 编码器
-│       ├── attention.py            # Hilbert 感知多尺度注意力
+│       ├── attention.py            # Hilbert 感知多尺度注意力 (LCA Bias)
 │       ├── positional.py           # 分形位置编码
 │       ├── feedforward.py          # SwiGLU / 自适应前馈网络
 │       ├── hilbert.py              # Hilbert 曲线算法与缓存
@@ -65,8 +67,9 @@ fractal-curve-tokenizer/
 
 ## 1.5 Tokenizer 类型对照表
 
-| tokenizer_type | 实现类                           | 特点                 | 状态   |
-|:-------------- |:----------------------------- |:------------------ |:---- |
-| `streaming`    | `StreamingFractalTokenizer`   | 固定多尺度卷积            | ✅ 稳定 |
-| `streaming_v2` | `StreamingFractalTokenizerV2` | Gumbel-Softmax 自适应 | ⚠️ 废弃 |
-| `streaming_v3` | `StreamingFractalTokenizerV3` | Cross-Scale Attention 多尺度融合 | ✅ **推荐** |
+| tokenizer_type | 实现类                           | 特点                          | 状态   |
+|:-------------- |:----------------------------- |:---------------------------- |:---- |
+| `streaming`    | `StreamingFractalTokenizer`   | 固定多尺度卷积                    | ✅ 稳定 |
+| `streaming_v3` | `StreamingFractalTokenizerV3` | Variable Depth Tokens + 自适应四叉树分割 | ✅ **推荐** |
+
+> **注意**: V2 (Gumbel-Softmax) 已从代码库移除。

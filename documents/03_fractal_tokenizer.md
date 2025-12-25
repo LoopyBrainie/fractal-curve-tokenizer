@@ -6,54 +6,36 @@
 
 ```mermaid
 graph LR
-    A[Image B×C×H×W] --> B[MultiScalePatchEncoder]
-    B --> C[ConvPyramid]
-    C --> D{尺度选择}
-    D -->|V1: 固定| E[直接使用]
-    D -->|V2: Gumbel-Softmax| F[自适应选择 ⚠️废弃]
-    D -->|V3: Cross-Scale Attention| G[注意力融合 ✅推荐]
-    E --> H[HilbertIndexer]
-    F --> H
-    G --> H
-    H --> I[Hilbert 重排序]
-    I --> J[TokenizerOutput]
+    A[Image B×C×H×W] --> B{Tokenizer 选择}
+    B -->|V1| C[FixedPatchEmbed]
+    B -->|V3| D[AdaptiveQuadtreeSplit]
+    D --> E[HilbertNativePatchEmbed]
+    C --> F[HilbertIndexer]
+    E --> F
+    F --> G[Hilbert 重排序]
+    G --> H[TokenizerOutput]
 ```
 
 **数学形式化**:
-$T: \mathbb{R}^{B \times C \times H \times W} \to (\mathbb{R}^{B \times N \times D}, \mathbb{Z}^{B \times N})$
+$$T: \mathbb{R}^{B \times C \times H \times W} \to (\mathbb{R}^{B \times N \times D}, \mathbb{Z}^{B \times N \times (d_{max}+1)})$$
 
-其中 $N = \frac{H}{p} \times \frac{W}{p}$ 是固定的 token 数量。
+其中：
+- $N$ = Token 数量（V1 固定，V3 自适应）
+- $D$ = Token 维度
+- $d_{max}+1$ = 层级信息维度 `[depth, q1, q2, ..., q_d]`
 
 ---
 
-## 3.2 核心类：MultiScalePatchEncoder
+## 3.2 架构演进历史
 
-多尺度卷积金字塔，为每个尺度生成特征图。
+| 版本 | 架构名称 | 核心机制 | 状态 |
+|:-----|:--------|:---------|:-----|
+| V1 | Fixed Multi-Scale | 固定卷积金字塔 | ✅ 稳定 |
+| V2 | Gumbel-Softmax | STE 自适应选择 | ❌ **已删除** |
+| V3 旧 | Cross-Scale Attention | 学习尺度权重 | ❌ **已重构** |
+| V3 新 | **Variable Depth Tokens** | 自适应四叉树分割 | ✅ **推荐** |
 
-### 数学定义
-
-$F_s = \text{Conv}_s(I), \quad s \in \{1, \ldots, S\}$
-
-每个尺度的卷积配置：
-
-- `kernel_size = stride = patch_size_s`
-- 输出维度：`dim`
-
-### 代码结构
-
-```python
-class MultiScalePatchEncoder(nn.Module):
-    def __init__(self, in_channels, dim, scales):
-        # scales: List[int], 如 [4, 8, 16]
-        self.encoders = nn.ModuleList([
-            nn.Conv2d(in_channels, dim, kernel_size=s, stride=s)
-            for s in scales
-        ])
-```
-
-### 输出
-
-- 多个特征图：`List[Tensor]`，每个形状为 `(B, D, H/s, W/s)`
+> **重要**: V2 (Gumbel-Softmax) 已从代码库完全移除。V3 于 2025-12-25 从 Cross-Scale Attention 重构为 Variable Depth Tokens 架构。
 
 ---
 
@@ -63,43 +45,31 @@ class MultiScalePatchEncoder(nn.Module):
 
 ### 数学定义
 
-#### 1. 标准 Hilbert 曲线 (Standard Hilbert)
+**标准 Hilbert 曲线** (当 $H = W = 2^k$):
+$$H: [0, n^2) \leftrightarrow [0, n) \times [0, n)$$
 
-当 $H = W = 2^k$ 时，使用标准 Hilbert 曲线映射：
-$H: [0, n^2) \leftrightarrow [0, n) \times [0, n)$
+**Pseudo-Hilbert 曲线** (任意 $H \times W$ 矩形):
+$$PH_{H,W}: [0, H \times W) \to [0, H) \times [0, W)$$
 
-针对任意 $H \times W$ 矩形，采用递归分割策略 (Zhang & Kamata, 2007)：
-
-$PH_{H,W}: [0, H \times W) \to [0, H) \times [0, W)$
-
-**递归定义**:
-
-1. 若 $H = W = 2^k$: 使用标准 Hilbert 曲线。
-2. 若 $H > W$: 将矩形水平分割为上下两部分，递归处理并连接。
-3. 若 $W > H$: 将矩形垂直分割为左右两部分，递归处理并连接。
-4. 若 $H = W$ 且 $H \neq 2^k$: 任意分割后递归。
+**递归定义** (Zhang & Kamata, 2007):
+1. 若 $H = W = 2^k$: 使用标准 Hilbert 曲线
+2. 若 $H > W$: 水平分割，递归处理并连接
+3. 若 $W > H$: 垂直分割，递归处理并连接
 
 **性质**:
-
 - **局部性保持**: $\|p_i - p_{i+1}\|_2 \le C \approx 1.5\sqrt{2}$
 - **自适应性**: 无需 Padding 即可处理任意尺寸图像
 
-### 接口
-
-```python
-@staticmethod
-@lru_cache(maxsize=64)
-def get_hilbert_order(grid_size: int) -> torch.Tensor:
-    """返回索引张量，将光栅顺序映射到 Hilbert 顺序。"""
-```
-
 ### 缓存机制 (HilbertPathCache)
 
-为了提高效率，系统实现了 `HilbertPathCache` 类，统一管理路径计算和缓存：
-
-- **缓存键**: `(grid_h, grid_w, max_depth)`
-- **缓存内容**: `hilbert_to_raster` 映射和 `quadtree_paths`
-- **策略**: LRU 缓存，避免重复计算
+```python
+class HilbertPathCache:
+    """Device-aware LRU 缓存
+    
+    缓存键: (grid_h, grid_w, max_depth, device)
+    缓存内容: hilbert_to_raster 映射和 quadtree_paths
+    """
+```
 
 ---
 
@@ -121,7 +91,6 @@ def get_hilbert_order(grid_size: int) -> torch.Tensor:
 **输入**: `images` 张量 `(B, C, H, W)`
 
 **流程**:
-
 1. **卷积编码**: 通过 `patch_embed` 卷积层提取特征
 2. **展平**: 将特征图展平为序列
 3. **Hilbert 重排序**: 使用 `HilbertIndexer` 重排序
@@ -131,281 +100,269 @@ def get_hilbert_order(grid_size: int) -> torch.Tensor:
 
 ---
 
-## 3.5 核心类：StreamingFractalTokenizerV2 (推荐)
+## 3.5 核心类：StreamingFractalTokenizerV3 (✅ 推荐)
 
-使用 Gumbel-Softmax 实现端到端可微的尺度选择。
+### 3.5.1 架构概述
 
-### 数学定义
+Variable Depth Tokens (VDT) 架构使用**内容自适应四叉树分割**代替学习权重：
 
-**1. 语义级复杂度估计 (Semantic Complexity Estimation)**:
-不再使用原始像素，而是复用 Encoder 的多尺度特征，消除冗余计算并增强语义感知。
+```python
+旧架构 (Cross-Scale Attention) - 已废弃:
+    F_s = MultiScaleConv(I)           # 多尺度特征
+    α_{i,s} = softmax(Q_i · K_{i,s})  # 学习尺度权重
+    Token_i = Σ_s α_{i,s} · V_{i,s}   # 加权融合
+    问题: α 必然崩塌到单尺度 (信息论必然性)
 
-$\pi_{i,j} = \text{Softmax}(\text{ComplexityHead}(\text{Concat}_s[\text{Upsample}(F_s)]))_{i,j} / \tau$
+新架构 (Variable Depth Tokens) - 当前:
+    Regions = AdaptiveQuadtreeSplit(I)  # 内容自适应分割
+    F = SharedConv(I)                    # 共享特征提取
+    Token_i = Pool(F[R_i]) * σ_d + E_d  # 区域池化 + 深度编码
+    优势: 深度由内容决定，非学习崩塌
+```
 
-其中 `ComplexityHead` 是轻量级卷积网络。
+### 3.5.2 数学约束
 
-**2. Gumbel-Softmax (训练时)**:
-$\hat{\pi}_k = \frac{\exp((\log \pi_k + g_k) / \tau)}{\sum_l \exp((\log \pi_l + g_l) / \tau)}$
+V3 满足四个核心数学约束：
 
-其中 $g_k \sim \text{Gumbel}(0, 1)$。
+| 约束 | 符号 | 描述 |
+|:-----|:-----|:-----|
+| **C1** 维度一致性 | $\text{Embed}(R_i) \in \mathbb{R}^{dim}, \forall i, \forall d_i$ | 不同大小 region → 相同维度 |
+| **C2** Hilbert 路径一致性 | $\text{HilbertPath}(\text{center}(R_i))[:d_i] = \text{QuadtreePath}(R_i)$ | 保持四叉树路径信息 |
+| **C3** 尺度等变性 | $\text{Embed}(R_i) \approx \sigma \cdot \text{Embed}(R_j) + \text{bias}$ | 相同内容不同尺度有数学联系 |
+| **C4** LCA 兼容性 | $\text{LCA\_depth}(\text{path}_i, \text{path}_j)$ 对 Transformer bias 有效 | 与 LCA 偏置协同工作 |
 
-**3. 两种模式**:
+### 3.5.3 初始化参数
 
-- **固定 Token 模式 (variable_tokens=False, ✅ 推荐默认)**:
-  特征加权融合：$T_{final} = \sum_s \hat{\pi}_s \cdot F_s$
-  Token 数量固定为 $N = (H/p_{min}) \times (W/p_{min})$。
-  梯度流动平滑，训练更稳定。
+| 参数                   | 类型         | 默认值              | 说明                  |
+|:-------------------- |:---------- |:---------------- |:------------------- |
+| `image_size`         | int/Tuple  | 224              | 输入图像尺寸              |
+| `channels`           | int        | 3                | 图像通道数               |
+| `d_model`            | int        | 256              | 输出 token 维度         |
+| `base_patch_size`    | int        | 4                | 最细粒度 patch 大小       |
+| `max_depth`          | int        | 4                | 最大四叉树深度             |
+| `use_hilbert_order`  | bool       | True             | 是否使用 Hilbert 排序     |
+| `split_scheme`       | str        | 'balanced_greedy'| 分割方案 (见 3.6 节)      |
+| `target_tokens`      | int/None   | None             | 目标 token 数量         |
+| `complexity_alpha`   | float      | 0.5              | 复杂度函数方差权重          |
+| `enforce_balance`    | bool       | True             | 是否强制 2:1 平衡约束       |
 
-- **可变 Token 模式 (variable_tokens=True, 实验性)**:
-  直接映射 Patch=Token。
-  $s_{ij} = \arg\max_k \pi_{ij}^{(k)}$
-  $T_k = \text{PatchEmbed}_{s_k}(P_k)$
-  Token 数量 $N \in [N_{min}, N_{max}]$ 根据图像内容自适应。
-  ⚠️ 使用 STE，可能存在梯度偏置问题。
-
-**4. Depth Bias Warmup (v2.2 新特性)**:
-
-针对多尺度分割中细粒度 patch 初期难以学习的问题，引入深度偏置预热机制：
-
-$\text{logits}'_{i,j,s} = \text{logits}_{i,j,s} + \beta(t) \cdot w_{scale}(s)$
-
-其中：
-
-- $\beta(t) = \beta_{max} \cdot \max(0, \frac{t_{warmup} - t}{t_{warmup}})$ 为时间衰减的偏置强度
-- $w_{scale}(s) = e^{-\lambda \cdot s}$ 为深度衰减权重，细粒度尺度获得更多偏置
-- 默认参数：$\beta_{max}=2.0$, $\lambda=2.0$, $t_{warmup}=0.2$ (总训练进度的 20%)
-
-这确保模型在训练初期更容易选择细粒度 patch，随着训练进行逐渐让模型自主决策。
-
-### 初始化参数
-
-| 参数                   | 类型         | 默认值        | 说明                  |
-|:-------------------- |:---------- |:---------- |:------------------- |
-| `image_size`         | int        | -          | 输入图像尺寸              |
-| `d_model`            | int        | -          | 输出 token 维度         |
-| `patch_sizes`        | Tuple[int] | (4, 8, 16) | 多尺度 patch 大小        |
-| `gumbel_temperature` | float      | 2.0        | Gumbel-Softmax 初始温度 |
-| `variable_tokens`    | bool       | False      | 是否启用可变 Token 数量模式 (推荐 False)   |
-| `_depth_bias_max`    | float      | 2.0        | 深度偏置最大强度 (v2.2)     |
-| `_depth_bias_decay`  | float      | 2.0        | 深度衰减系数 λ (v2.2)     |
-| `_depth_bias_warmup` | float      | 0.2        | 预热阶段占比 (v2.2)       |
-
-### tokenize() 方法
+### 3.5.4 tokenize() 方法
 
 **流程**:
 
-1. **多尺度编码**: 通过 `MultiScalePatchEncoder` 提取多尺度特征
-2. **复杂度估计**: 计算每个位置的尺度 logits
-3. **尺度选择**:
-   - 训练: Gumbel-Softmax 软选择
-   - 推理: argmax 硬选择
-4. **特征处理**: 根据模式进行加权融合或直接提取
-5. **Hilbert 重排序**: 按 Hilbert 顺序重排
+```
+1. AdaptiveQuadtreeSplit(Image) → List[SplitResult]
+2. HilbertNativePatchEmbed(Image, SplitResults) → (tokens, levels_info)
+3. HilbertSort(tokens) → ordered tokens
+4. Build TokenizerOutput
+```
 
-**输出**: `TokenizerOutput`
+**输入**: `images: Tensor[B, C, H, W]`
+
+**输出**: `TokenizerOutput` 包含:
+- `tokens`: `[B, N, d_model]` Token 嵌入
+- `levels_info`: `[B, N, max_depth+1]` 层级信息 `[depth, q1, q2, ...]`
+- `metadata.split_stats`: 分割统计信息
 
 ---
 
-## 3.6 核心类：StreamingFractalTokenizerV3 (✅ 推荐)
+## 3.6 自适应四叉树分割 (adaptive_split.py)
 
-使用 Cross-Scale Attention 实现密集梯度流的多尺度融合，解决 V2 Gumbel-Softmax STE 的稀疏梯度问题。
+### 3.6.1 核心数学：复杂度函数
 
-### 核心改进 (相比 V2)
-
-| 问题 ID | V2 问题描述 | V3 解决方案 |
-|---------|------------|------------|
-| VT-G1 | STE 非选中尺度无梯度 | Softmax 替代 argmax，全尺度梯度 |
-| VT-G2 | 低温梯度消失 | 无温度参数，无退火调度 |
-| VT-A1 | 四叉树约束过度平滑 | 移除约束，Query 相似性自然平滑 |
-| VT-A2 | 最近邻上采样信息损失 | 双线性上采样 |
-| VT-T1 | 深度偏置固定调度 | 移除深度偏置调度 |
-
-**实验验证**: 输入梯度范数提升 **6.9×**，尺度梯度非零率 **100%**
-
-### 数学定义
-
-**1. Cross-Scale Attention (核心创新)**:
-
-对每个位置 $i$，计算跨尺度注意力权重：
-
-$$\alpha_{i,s} = \text{softmax}_s\left(\frac{Q_i \cdot K_{i,s}}{\sqrt{d}}\right)$$
+**复杂度定义**:
+$$C(R) = \alpha \cdot C_{var}(R) + (1-\alpha) \cdot C_{grad}(R)$$
 
 其中：
-- $Q_i \in \mathbb{R}^{d}$: 位置 $i$ 的 Query 向量（来自最细尺度特征 + Scale Embedding 变换）
-- $K_{i,s} \in \mathbb{R}^{d}$: 尺度 $s$ 在位置 $i$ 的 Key 向量
-- $d$: 嵌入维度
+- $C_{var}(R) = \frac{\text{Var}(R)}{\text{Var}(R) + \sigma_0^2}$ — 归一化方差（纹理敏感）
+- $C_{grad}(R) = \frac{G(R)}{G(R) + g_0^2}$ — 归一化梯度能量（边缘敏感）
+- $\alpha \in [0, 1]$ — 平衡权重（默认 0.5）
 
-**2. 特征融合**:
+**深度相关阈值**:
+$$\tau_d = \tau_0 \cdot \gamma^d$$
 
-$$\text{Token}_i = \sum_{s=1}^{S} \alpha_{i,s} \cdot V_{i,s}$$
+| 参数 | 默认值 | 含义 |
+|:-----|:------|:-----|
+| $\tau_0$ | 0.15 | 根阈值 |
+| $\gamma$ | 0.85 | 衰减因子 |
+| $\sigma_0^2$ | 0.01 | 方差归一化常数 |
+| $g_0^2$ | 0.08 | 梯度归一化常数 |
 
-其中 $V_{i,s}$ 是尺度 $s$ 在位置 $i$ 的 Value 向量。
+### 3.6.2 分割方案
 
-**3. 尺度嵌入 (Scale Embedding)**:
-
-$$E_{scale} = \text{Embedding}(s), \quad s \in \{0, 1, \ldots, S-1\}$$
-
-用于区分不同尺度的语义。
-
-**4. 关键数学性质**:
-
-- **密集梯度**: $\frac{\partial \mathcal{L}}{\partial F_s} \neq 0, \quad \forall s$ （所有尺度都有梯度）
-- **无温度参数**: 避免 Gumbel-Softmax 低温梯度消失问题
-- **端到端可微**: 纯 softmax + 加权求和，无 STE
-
-### CrossScaleAttention 类
+**Scheme B: Balanced Greedy Splitting (推荐)**
 
 ```python
-class CrossScaleAttention(nn.Module):
-    """
-    Cross-Scale Attention: 跨尺度注意力机制
-    
-    数学形式化:
-        α_{i,s} = softmax_s(Q_i · K_{i,s} / √d)
-        Token_i = Σ_s α_{i,s} · V_{i,s}
-    
-    梯度优势:
-        - 全尺度密集梯度 (vs V2 STE 稀疏梯度)
-        - 无温度参数 (vs V2 Gumbel 温度退火)
-    """
-    
-    def __init__(self, dim: int, num_scales: int, ...):
-        self.scale_embedding = nn.Embedding(num_scales, dim)
-        self.to_qkv = nn.Linear(dim, dim * 3)
-        self.to_out = nn.Linear(dim, dim)
+config = AdaptiveSplitConfig.scheme_b(
+    max_depth=4,
+    alpha=0.5,
+    enforce_balance=True,  # 2:1 平衡约束
+    target_tokens=64,      # 软目标
+)
+splitter = BalancedGreedySplitter(config)
 ```
 
-### 初始化参数
+特点：
+- 贪心策略，优先分割高复杂度区域
+- 强制相邻区域深度差 ≤ 1 (2:1 平衡)
+- 适合实时推理
 
-| 参数                   | 类型         | 默认值        | 说明                  |
-|:-------------------- |:---------- |:---------- |:------------------- |
-| `image_size`         | int        | -          | 输入图像尺寸              |
-| `d_model`            | int        | -          | 输出 token 维度         |
-| `patch_sizes`        | Tuple[int] | (4, 8, 16) | 多尺度 patch 大小        |
-| `num_heads`          | int        | 4          | 注意力头数               |
-| `dropout`            | float      | 0.0        | Dropout 比率          |
-
-### tokenize() 方法
-
-**流程**:
-
-1. **多尺度编码**: 通过 `MultiScalePatchEncoder` 提取多尺度特征 $\{F_s\}$
-2. **上采样对齐**: 将所有尺度双线性上采样到最细尺度 $H/p_{min} \times W/p_{min}$
-3. **展平**: 将 2D 特征图展平为 1D 序列
-4. **Cross-Scale Attention**: 计算跨尺度注意力权重并融合
-5. **Hilbert 重排序**: 按 Hilbert 顺序重排
-
-**输出**: `TokenizerOutput`
-
-### 诊断方法：get_scale_distribution()
-
-用于分析尺度分布：
+**Scheme C: Fixed Budget Dynamic Programming**
 
 ```python
-# 获取尺度分布统计
-stats = tokenizer.get_scale_distribution(images)
-# stats = {
-#     'scale_weights': Tensor,    # (B, N, S) 每个位置的尺度权重
-#     'scale_entropy': float,     # 尺度选择熵
-#     'dominant_scale': int,      # 主导尺度索引
+config = AdaptiveSplitConfig.scheme_c(
+    token_budget=64,
+    max_depth=4,
+    alpha=0.5,
+)
+splitter = FixedBudgetDPSplitter(config)
+```
+
+特点：
+- 动态规划全局最优
+- 固定 token 数量
+- 计算开销较大
+
+### 3.6.3 四叉树-Hilbert 同构
+
+**关键定理**:
+$$\text{QuadtreePath}(R) = [q_1, q_2, \ldots, q_d] \iff \text{HilbertSegment}(R) = H|_{[a,b]}$$
+
+四叉象限 $q_i \in \{0, 1, 2, 3\}$ 对应 Hilbert 曲线的连续区间。
+
+---
+
+## 3.7 Hilbert-Native Patch Embedding (patch_embed.py)
+
+### 3.7.1 Region Pooling 方案 (方案 C+)
+
+**公式**:
+$$F = \text{SharedConv}(I) \in \mathbb{R}^{B \times D \times \frac{H}{p} \times \frac{W}{p}}$$
+
+对于深度 $d_i$ 的区域 $R_i$:
+$$t_i = \text{AdaptiveAvgPool2d}(1)(F[:, :, y_1:y_2, x_1:x_2]) \cdot \sigma_{d_i} + E_{depth}(d_i)$$
+
+其中：
+- $\sigma_{d_i}$ — 深度缩放因子（乘法）
+- $E_{depth}(d_i)$ — 深度嵌入向量（加法）
+
+### 3.7.2 参数量分析
+
+| 组件 | 参数量 | 说明 |
+|:-----|:------|:-----|
+| SharedConv | ~12K | $D \times C \times p \times p$ |
+| depth_embed | ~1.3K | $(d_{max}+1) \times D$ |
+| depth_scale | ~5 | $d_{max}+1$ |
+| **总计** | **~14K** | vs 4.2M (Depth-Specific Conv) |
+
+### 3.7.3 深度缩放初始化
+
+```python
+def _init_depth_scale(self) -> None:
+    """σ_d = 1.0 + 0.05 * d / max_depth ∈ [1.0, 1.05]
+    
+    深层 (细粒度): 信息密度高 → 略大权重
+    浅层 (粗粒度): 信息稀释 → 略小权重
+    """
+```
+
+---
+
+## 3.8 使用示例
+
+### 创建 V3 Tokenizer (推荐)
+
+```python
+from vit_pytorch import StreamingFractalTokenizerV3
+
+# 创建 Variable Depth tokenizer
+tokenizer = StreamingFractalTokenizerV3(
+    image_size=224,
+    channels=3,
+    d_model=256,
+    base_patch_size=4,
+    max_depth=4,
+    split_scheme='balanced_greedy',
+    target_tokens=64,
+    complexity_alpha=0.5,
+    enforce_balance=True,
+)
+
+# Tokenize
+images = torch.randn(2, 3, 224, 224)
+output = tokenizer.tokenize(images)
+
+# 输出结构
+print(f"Token 数量: {output.sequences[0].tokens.shape[0]}")
+print(f"Token 维度: {output.sequences[0].tokens.shape[1]}")
+print(f"层级信息: {output.sequences[0].metadata['levels'].shape}")
+
+# 获取分割统计
+stats = tokenizer.get_split_stats()
+print(f"每图像 token 数: {stats['num_tokens']}")
+print(f"深度分布: {stats['depth_distributions']}")
+```
+
+### 诊断方法
+
+```python
+# 训练状态统计
+stats = tokenizer.get_training_stats()
+# {
+#     'tokenizer_version': 'v3_variable_depth',
+#     'architecture': 'adaptive_quadtree_split + hilbert_native_embed',
+#     'split_scheme': 'balanced_greedy',
+#     'max_depth': 4,
+#     'avg_tokens_per_image': 48.5,
+#     'depth_entropy': 1.234,
 # }
-```
 
-### 使用示例
-
-```python
-from vit_pytorch import StreamingFractalTokenizerV3
-
-# 创建 V3 tokenizer (推荐)
-tokenizer = StreamingFractalTokenizerV3(
-    image_size=224,
-    dim=384,
-    scales=[4, 8, 16],
-    num_heads=4,
-)
-
-# Tokenize
-images = torch.randn(2, 3, 224, 224)
-output = tokenizer.tokenize(images)
-
-# 输出结构
-print(output.sequences[0].tokens.shape)  # (N, 384)
-print(output.sequences[0].get_levels().shape)  # (N, Info_Len)
-
-# 获取尺度分布
-stats = tokenizer.get_scale_distribution(images)
-print(f"尺度熵: {stats['scale_entropy']:.3f}")
+# 深度分布熵 (多样性指标)
+entropy = tokenizer.get_scale_entropy()
+print(f"深度熵: {entropy:.3f}")
 ```
 
 ---
 
-## 3.7 V2 与 V3 对比
+## 3.9 V1 vs V3 对比
 
-| 特性 | V2 (Gumbel-Softmax) | V3 (Cross-Scale Attention) |
-|------|---------------------|---------------------------|
-| **决策机制** | Gumbel-Softmax + STE | Softmax 注意力融合 |
-| **梯度流** | 稀疏 (仅选中尺度) | **密集 (全尺度)** |
-| **温度参数** | 需要调度退火 | **无需** |
-| **输入梯度范数** | 1× | **6.9×** |
-| **尺度梯度非零率** | ~20% | **100%** |
-| **训练稳定性** | 需要预热 | **更稳定** |
-| **状态** | ⚠️ 废弃 | ✅ **推荐** |
-
----
-
-## 3.8 与旧版 FractalHilbertTokenizer 的对比
-
-| 特性           | 旧版 (BFS + REINFORCE) | 新版 (Streaming V3) |
-|:------------ |:-------------------- |:----------------- |
-| **分割方式**     | 递归四叉树                | 卷积金字塔 + 注意力融合       |
-| **决策机制**     | 策略网络 + 采样            | Cross-Scale Attention   |
-| **可微性**      | 不可微，需 REINFORCE      | 端到端可微             |
-| **Token 数量** | 变长                   | 固定                 |
-| **GPU 效率**   | 低（Python 循环）         | 高（全 GPU 执行）       |
-| **训练稳定性**    | 低（高方差）               | 高                 |
+| 特性 | V1 (Fixed) | V3 (Variable Depth) |
+|:-----|:-----------|:--------------------|
+| **Token 数量** | 固定 $(H/p)^2$ | 自适应 $\in [N_{min}, N_{max}]$ |
+| **分割方式** | 固定网格 | 内容自适应四叉树 |
+| **深度信息** | 固定 depth=0 | Variable depth ∈ [0, d_max] |
+| **复杂度感知** | 无 | 方差 + 梯度 |
+| **参数量** | ~12K | ~14K |
+| **计算开销** | 低 | 中 |
+| **推荐场景** | 简单任务/基线 | 复杂图像/生产环境 |
 
 ---
 
-## 3.9 使用示例
+## 3.10 与旧版架构对比
 
-```python
-from vit_pytorch import StreamingFractalTokenizerV3
+| 特性           | BFS + REINFORCE (旧) | Gumbel-Softmax (V2, 已删除) | Variable Depth (V3) |
+|:------------ |:------------------- |:-------------------------- |:------------------- |
+| **分割方式**     | 递归四叉树 + 策略采样     | 卷积金字塔 + STE              | 自适应四叉树 + 区域池化   |
+| **可微性**      | 不可微，需 REINFORCE    | 端到端可微 (STE)             | 端到端可微           |
+| **梯度流**      | 高方差                 | 稀疏 (~20% 尺度有梯度)        | 密集 (全区域)        |
+| **温度调度**    | -                    | 需要 Gumbel 温度退火          | 无需              |
+| **Token 数量** | 变长                   | 固定/可变                    | 自适应             |
+| **GPU 效率**   | 低（Python 循环）        | 高                         | 高                |
+| **状态**       | 废弃                   | **已删除**                   | ✅ 推荐            |
 
-# 创建 V3 tokenizer (推荐)
-tokenizer = StreamingFractalTokenizerV3(
-    image_size=224,
-    dim=384,
-    scales=[4, 8, 16],
-    num_heads=4,
-)
+---
 
-# Tokenize
-images = torch.randn(2, 3, 224, 224)
-output = tokenizer.tokenize(images)
+## 3.11 附录：数学符号表
 
-# 输出结构
-print(len(output.sequences))  # 2
-print(output.sequences[0].tokens.shape)  # (N, 384)
-```
-
-### V2 Depth Bias 调度 API (⚠️ 仅 V2)
-
-```python
-# 注意: 以下 API 仅适用于 V2 (已废弃)
-# V3 无需温度/深度偏置调度
-
-# 方法1: 直接设置 depth bias 强度
-tokenizer.set_depth_bias(1.5)  # 手动设置偏置强度
-
-# 方法2: 基于训练进度自动退火
-for epoch in range(100):
-    progress = epoch / 100  # 0.0 -> 1.0
-    tokenizer.anneal_depth_bias(progress)  # 自动根据 warmup 计算
-
-    for batch in dataloader:
-        output = tokenizer.tokenize(batch)
-        # ...
-
-# 获取当前状态
-current_bias = tokenizer.get_depth_bias()
-```
+| 符号 | 含义 |
+|:-----|:-----|
+| $I$ | 输入图像 $\in \mathbb{R}^{B \times C \times H \times W}$ |
+| $R_i$ | 第 $i$ 个区域 (由四叉树分割产生) |
+| $d_i$ | 区域 $R_i$ 的深度 $\in \{0, 1, \ldots, d_{max}\}$ |
+| $q_j$ | 第 $j$ 层四叉象限索引 $\in \{0, 1, 2, 3\}$ |
+| $C(R)$ | 区域复杂度函数 |
+| $\tau_d$ | 深度 $d$ 的分割阈值 |
+| $\sigma_d$ | 深度 $d$ 的缩放因子 |
+| $E_{depth}(d)$ | 深度 $d$ 的嵌入向量 |
+| $F$ | 共享卷积特征图 |
+| $t_i$ | 区域 $R_i$ 的 token 嵌入 |

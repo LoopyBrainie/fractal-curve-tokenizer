@@ -12,14 +12,13 @@
 ```mermaid
 graph TD
     A[原始图像 B×C×H×W] --> B(StreamingFractalTokenizerV3);
-    B -->|多尺度卷积| C{MultiScalePatchEncoder};
-    C -->|CrossScaleAttention| D[多尺度注意力融合];
-    D -->|Query-Scale 相似度| E[尺度权重 α];
-    E -->|Hilbert 重排序| F[Token 序列 B×N×D];
-    F -->|位置编码| G[FractalPositionEmbedding];
-    G -->|深度+路径编码| H[FractalTransformer];
-    H -->|LCA/Hilbert 感知注意力| I[Pooling & Head];
-    I --> J[分类结果];
+    B -->|AdaptiveQuadtreeSplit| C{内容自适应分割};
+    C -->|HilbertNativePatchEmbed| D[区域池化 + 深度编码];
+    D -->|Hilbert 重排序| E[Token 序列 B×N×D];
+    E -->|位置编码| F[FractalPositionEmbedding];
+    F -->|深度+路径编码| G[FractalTransformer];
+    G -->|LCA/Hilbert 感知注意力| H[Pooling & Head];
+    H --> I[分类结果];
 ```
 
 **数学形式化**:
@@ -35,10 +34,12 @@ $$I \xrightarrow{T} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{Transform
 
 | 层级          | 模块  | 对应文件                     | 核心功能                                                    |
 |:----------- |:--- |:------------------------ |:------------------------------------------------------- |
-| **Layer 4** | 应用层 | `fractal_vit.py`         | `FractalCurveViT`                              |
-| **Layer 3** | 管道层 | `streaming_tokenizer.py` | `StreamingFractalTokenizerV3` (✅ 推荐), `StreamingFractalTokenizerV2` (⚠️ 废弃) |
+| **Layer 4** | 应用层 | `vit.py`                 | `FractalCurveViT`                              |
+| **Layer 3** | 管道层 | `streaming_tokenizer.py` | `StreamingFractalTokenizerV3` (✅ 推荐), `StreamingFractalTokenizer` (V1) |
 |             |     | `transformer.py`         | `FractalTransformer`                                    |
 | **Layer 2** | 组件层 | `attention.py`           | `HilbertAwareMultiScaleAttention`, **`LCAHilbertBias`** |
+|             |     | `adaptive_split.py`      | `BalancedGreedySplitter`, `FixedBudgetDPSplitter`       |
+|             |     | `patch_embed.py`         | `HilbertNativePatchEmbed`                               |
 |             |     | `feedforward.py`         | `SwiGLUFFN`, `AdaptiveFractalFeedForward`               |
 |             |     | `positional.py`          | `FractalPositionEmbedding`                              |
 | **Layer 1** | 基础层 | `hilbert.py`             | `HilbertCurve`, `PseudoHilbertCurve`                    |
@@ -48,15 +49,16 @@ $$I \xrightarrow{T} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{Transform
 |             |     | `constants.py`           | 超参数默认值                                                  |
 |             |     | `utils.py`               | 工具函数                                                    |
 
+> **注意**: V2 (Gumbel-Softmax) 已从代码库完全移除。
+
 ## 1.4 核心创新点
 
 | 特性                      | 描述                             | 状态     |
 | ----------------------- | ------------------------------ | ------ |
-| **Cross-Scale Attention (V3)** | 多尺度注意力融合，密集梯度流，输入梯度范数提升 6.9× | ✅ **默认推荐** |
+| **Variable Depth Tokens (V3)** | 自适应四叉树分割 + 区域池化，消除尺度崩塌 | ✅ **默认推荐** |
 | **LCA Hilbert Bias**    | 利用四叉树 LCA 深度编码空间距离，参数量 ~100    | ✅ 默认推荐 |
-| **Gumbel-Softmax 尺度选择 (V2)** | 端到端可微的自适应尺度选择                  | ⚠️ 废弃   |
-| **深度探索优先 Warmup**       | 训练初期偏向小尺度 (深层级)，后期自主决策         | ✅ v2.2 |
-| **语义级复杂度估计**            | 复用 Encoder 特征，消除 ~75% 冗余 FLOPs | ✅ v2.0 |
+| **HilbertNativePatchEmbed** | 共享卷积 + 深度调制，满足 4 大数学约束 | ✅ 新增 |
+| **AdaptiveQuadtreeSplit** | 方差+梯度复杂度估计，贪心/DP 分割方案 | ✅ 新增 |
 | **SwiGLU + 层级自适应**      | LLaMA 风格 FFN，带层级感知             | ✅ 推荐   |
 | **P0 训练配置优化**          | mlp_dim=4×, dropout=0.1, variable_tokens=False | ✅ v0.7.0 |
 
@@ -64,7 +66,7 @@ $$I \xrightarrow{T} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{Transform
 
 建议按以下顺序阅读文档：
 
-1. **03_fractal_tokenizer.md**: 理解 StreamingFractalTokenizerV2 的多尺度 tokenization
+1. **03_fractal_tokenizer.md**: 理解 StreamingFractalTokenizerV3 的 Variable Depth tokenization
 2. **08_fractal_vit_model.md**: 理解宏观架构，数据如何在各个模块间传递
 3. **07_transformer_encoder.md**: 理解核心计算单元
 4. **05_attention_mechanism.md**: 理解 Hilbert 感知注意力和 **LCA Bias (推荐)**
@@ -89,9 +91,8 @@ model = FractalCurveViT(
     depth=10,
     heads=8,
     mlp_dim=1024,                   # 4× dim (P0 修复)
-    tokenizer_type='streaming_v3',  # ✅ 推荐 (Cross-Scale Attention)
+    tokenizer_type='streaming_v3',  # ✅ 推荐 (Variable Depth Tokens)
     ffn_type='swiglu_level',        # 推荐
-    variable_tokens=False,          # 推荐，训练更稳定
     dropout=0.1,                    # P0 修复: 0.3→0.1
 )
 

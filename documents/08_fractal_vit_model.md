@@ -1,4 +1,4 @@
-# 第八章：完整 ViT 模型 (fractal_vit.py)
+# 第八章：完整 ViT 模型 (vit.py)
 
 本章详尽描述了数据在 `FractalCurveViT` 模型中的完整流动过程。
 
@@ -15,11 +15,12 @@ Streaming Tokenizer 实现端到端可微，无需额外辅助损失。
 
 ## 8.2 Tokenizer 类型选项
 
-| tokenizer_type | 实现类                           | 特点             | 状态   |
-|:-------------- |:----------------------------- |:-------------- |:---- |
-| `streaming`    | `StreamingFractalTokenizer`   | 固定多尺度          | ✅ 稳定 |
-| `streaming_v2` | `StreamingFractalTokenizerV2` | Gumbel-Softmax | ⚠️ 废弃 |
-| `streaming_v3` | `StreamingFractalTokenizerV3` | Cross-Scale Attention | ✅ **推荐** |
+| tokenizer_type | 实现类                           | 特点                          | 状态   |
+|:-------------- |:----------------------------- |:---------------------------- |:---- |
+| `streaming`    | `StreamingFractalTokenizer`   | 固定多尺度                       | ✅ 稳定 |
+| `streaming_v3` | `StreamingFractalTokenizerV3` | Variable Depth Tokens + 自适应四叉树 | ✅ **推荐** |
+
+> **注意**: V2 (Gumbel-Softmax) 已从代码库移除。
 
 ---
 
@@ -157,7 +158,7 @@ model = FractalCurveViT(
     depth=6,
     heads=config.num_heads,
     mlp_dim=768,
-    tokenizer_type='streaming_v2',
+    tokenizer_type='streaming_v3',  # ✅ 推荐
     config=config,
 )
 
@@ -196,8 +197,8 @@ Input Image (B, C, H, W)
         ▼
 ┌─────────────────────────────┐
 │ StreamingFractalTokenizerV3 │
-│ - MultiScalePatchEncoder    │
-│ - CrossScaleAttention       │
+│ - AdaptiveQuadtreeSplit     │
+│ - HilbertNativePatchEmbed   │
 │ - HilbertIndexer            │
 └─────────────────────────────┘
         │

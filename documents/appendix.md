@@ -9,7 +9,6 @@ classDiagram
     nn_Module <|-- FractalCurveViT
 
     BaseTokenizer <|-- StreamingFractalTokenizer
-    BaseTokenizer <|-- StreamingFractalTokenizerV2
     BaseTokenizer <|-- StreamingFractalTokenizerV3
 
     FractalCurveViT *-- StreamingFractalTokenizerV3
@@ -24,9 +23,11 @@ classDiagram
     HilbertAwareMultiScaleAttention *-- LowRankHilbertBias
     AdaptiveFractalFeedForward *-- SwiGLUFFN
     
-    StreamingFractalTokenizerV3 *-- CrossScaleAttention
-    StreamingFractalTokenizerV3 *-- MultiScalePatchEncoder
+    StreamingFractalTokenizerV3 *-- HilbertNativePatchEmbed
+    StreamingFractalTokenizerV3 *-- BalancedGreedySplitter
 ```
+
+> **注意**: V2 (Gumbel-Softmax) 已从代码库完全移除。
 
 ## B. 数据流向图
 
@@ -35,14 +36,15 @@ classDiagram
         │
         ▼
 2. StreamingFractalTokenizerV3
-   ├── MultiScalePatchEncoder (卷积金字塔)
-   ├── CrossScaleAttention (V3: 多尺度注意力融合)
+   ├── AdaptiveQuadtreeSplit (内容自适应分割)
+   │   └── BalancedGreedySplitter / FixedBudgetDPSplitter
+   ├── HilbertNativePatchEmbed (区域池化 + 深度编码)
    └── HilbertIndexer (Hilbert 重排序)
         │
         ▼
 3. TokenizerOutput
    ├── tokens: (B, N, D)
-   └── levels: (B, N, Info_Len)
+   └── levels: (B, N, max_depth+1)
         │
         ▼
 4. Batch Padding
@@ -125,7 +127,7 @@ model = FractalCurveViT(
     depth=6,
     heads=6,
     mlp_dim=768,
-    tokenizer_type='streaming_v3',  # ✅ 推荐 (Cross-Scale Attention)
+    tokenizer_type='streaming_v3',  # ✅ 推荐 (Variable Depth Tokens)
     bias_mode='lca',                # 推荐 (参数量最少)
     ffn_type='swiglu_level',        # 推荐
 )
@@ -144,18 +146,19 @@ logits, aux_info = model(images, return_aux_info=True)
 ### Tokenizer 单独使用
 
 ```python
-from vit_pytorch import StreamingFractalTokenizerV2
+from vit_pytorch import StreamingFractalTokenizerV3
 
-tokenizer = StreamingFractalTokenizerV2(
+tokenizer = StreamingFractalTokenizerV3(
     image_size=224,
-    dim=384,
-    scales=[4, 8, 16],
-    temperature=1.0,
+    d_model=384,
+    base_patch_size=4,
+    max_depth=4,
+    split_scheme='balanced_greedy',
 )
 
 output = tokenizer.tokenize(images)
 # output.sequences[i].tokens: (N, D)
-# output.sequences[i].get_levels(): (N, Info_Len)
+# output.sequences[i].metadata['levels']: (N, max_depth+1)
 ```
 
 ### 组件单独使用
@@ -180,17 +183,15 @@ pos_emb = FractalPositionEmbedding(dim=384, max_level=50)
 ## E. 常用导入
 
 ```python
-# 推荐导入 (v0.5.0+)
+# 推荐导入 (v0.7.0+)
 from vit_pytorch import (
     # 配置
     FractalConfig,
     # 模型
     FractalCurveViT,
     # Tokenizer
-    StreamingFractalTokenizer,
-    StreamingFractalTokenizerV2,    # ⚠️ 废弃
-    StreamingFractalTokenizerV3,    # ✅ 推荐
-    CrossScaleAttention,            # V3 核心组件
+    StreamingFractalTokenizer,      # V1 固定尺度
+    StreamingFractalTokenizerV3,    # ✅ 推荐 (Variable Depth)
     # 组件
     FractalTransformer,
     HilbertAwareMultiScaleAttention,
@@ -209,6 +210,8 @@ from vit_pytorch import (
 )
 ```
 
+> **注意**: V2 (Gumbel-Softmax) 已从代码库完全移除。CrossScaleAttention 已被 Variable Depth 架构替代。
+
 ## F. 数学符号表
 
 | 符号                | 含义                                                   |
@@ -219,7 +222,7 @@ from vit_pytorch import (
 | $E_{pos}$         | 位置编码函数                                               |
 | $E_{depth}$       | 深度嵌入                                                 |
 | $E_{path}$        | 路径嵌入                                                 |
-| $E_{scale}$       | 尺度嵌入 (V3 Cross-Scale Attention)                      |
+| $E_{scale}$       | 尺度嵌入 (历史: V3 Cross-Scale Attention，已废弃)          |
 | $\alpha_{i,s}$    | 位置 $i$ 对尺度 $s$ 的注意力权重 (V3)                          |
 | $B_{hilbert}$     | Hilbert 偏置矩阵                                         |
 | $B_{level}$       | 层级偏置矩阵                                               |

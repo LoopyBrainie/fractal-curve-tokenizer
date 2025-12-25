@@ -31,8 +31,9 @@ tests/
 
 - ✅ 不同输入尺寸和 Batch Size 下的输出形状
 - ✅ Hilbert 重排序的正确性
-- ✅ V1 和 V2 的输出一致性
-- ✅ 多尺度特征提取
+- ✅ V1 和 V3 的输出格式验证
+- ✅ Variable Depth Tokens 分割测试
+- ✅ 深度分布验证
 
 ### 模型测试 (`test_fractal_vit.py`)
 
