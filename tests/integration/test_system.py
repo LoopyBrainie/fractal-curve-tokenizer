@@ -95,15 +95,16 @@ def test_streaming_tokenizer_device_consistency(device: str) -> None:
 
 @torch.no_grad()
 @pytest.mark.parametrize("device", _device_parametrization())
-def test_streaming_v2_tokenizer_device_consistency(device: str) -> None:
-    """测试流式 V2 tokenizer 的设备一致性."""
-    from vit_pytorch import StreamingFractalTokenizerV2
+def test_streaming_v3_tokenizer_device_consistency(device: str) -> None:
+    """测试流式 V3 tokenizer 的设备一致性."""
+    from vit_pytorch import StreamingFractalTokenizerV3
     
-    tokenizer = StreamingFractalTokenizerV2(
+    tokenizer = StreamingFractalTokenizerV3(
         image_size=32,
         channels=3,
         d_model=64,
-        patch_sizes=(4, 8),
+        base_patch_size=4,
+        max_depth=3,
     ).to(device)
     
     images = torch.randn(2, 3, 32, 32, device=device)

@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 import pytest
 
-from vit_pytorch.fractal_vit import FractalCurveViT
+from vit_pytorch.vit import FractalCurveViT
 from vit_pytorch.tokenization import BaseTokenProcessor, BaseTokenizer, TokenSequence, TokenizerOutput
 
 

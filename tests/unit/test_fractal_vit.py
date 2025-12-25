@@ -1,19 +1,25 @@
 # -*- coding: utf-8 -*-
 """Unit tests for FractalCurveViT.
 
-测试流式 Tokenizer (streaming/streaming_v3) 下的核心功能：
+数学形式化验证
+==============
+
+FractalCurveViT 完整流水线:
+    I → T(I) → E_pos → Transformer → Pool → MLP → ŷ
+
+测试覆盖:
 1. 自适应 tokenization 能力
 2. 批处理与变长序列处理
 3. 位置编码逻辑
 4. Transformer 掩码有效性
 
 Note:
-    streaming_v2 已废弃，测试保留用于向后兼容性验证。
+    默认使用 streaming_v3 (Variable Depth Tokenizer)
 """
 
 import torch
 import pytest
-from vit_pytorch.fractal_vit import FractalCurveViT
+from vit_pytorch.vit import FractalCurveViT
 from vit_pytorch.positional import FractalPositionEmbedding
 
 
@@ -106,28 +112,25 @@ class TestFractalCurveViT:
         from vit_pytorch.streaming_tokenizer import StreamingFractalTokenizer
         assert isinstance(model.tokenizer, StreamingFractalTokenizer)
 
-    def test_streaming_v2_tokenizer_type(self):
-        """Test streaming_v2 tokenizer is correctly instantiated (deprecated)."""
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            model = FractalCurveViT(
-                image_size=32,
-                num_classes=10,
-                dim=64,
-                depth=2,
-                heads=2,
-                mlp_dim=128,
-                min_patch_size=(4, 4),
-                max_level=5,
-                tokenizer_type="streaming_v2",
-                num_scales=2,
-            )
+    def test_streaming_v3_tokenizer_type(self):
+        """Test streaming_v3 tokenizer is correctly instantiated."""
+        model = FractalCurveViT(
+            image_size=32,
+            num_classes=10,
+            dim=64,
+            depth=2,
+            heads=2,
+            mlp_dim=128,
+            min_patch_size=(4, 4),
+            max_level=5,
+            tokenizer_type="streaming_v3",
+            num_scales=2,
+        )
         
-        assert model.tokenizer_type == "streaming_v2"
+        assert model.tokenizer_type == "streaming_v3"
         assert model._is_streaming
-        from vit_pytorch.streaming_tokenizer import StreamingFractalTokenizerV2
-        assert isinstance(model.tokenizer, StreamingFractalTokenizerV2)
+        from vit_pytorch.streaming_tokenizer import StreamingFractalTokenizerV3
+        assert isinstance(model.tokenizer, StreamingFractalTokenizerV3)
 
     def test_tokenizer_loss_returns_zero(self, fractal_vit, sample_image):
         """Test get_tokenizer_loss() returns zero for streaming tokenizers."""

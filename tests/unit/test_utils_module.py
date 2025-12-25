@@ -1,6 +1,15 @@
+import sys
+from pathlib import Path
+
 import torch
 
-from vit_pytorch.features import compute_token_features
+# 添加 tests 目录到 Python 路径
+_tests_dir = Path(__file__).parent.parent
+if str(_tests_dir) not in sys.path:
+    sys.path.insert(0, str(_tests_dir))
+
+# features.py 已移入测试目录
+from unit.features import compute_token_features
 from vit_pytorch.utils import create_attention_mask
 
 

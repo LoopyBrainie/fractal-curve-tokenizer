@@ -1,12 +1,24 @@
 # -*- coding: utf-8 -*-
-"""Unit tests for StreamingFractalTokenizer.
+"""Unit tests for StreamingFractalTokenizer and StreamingFractalTokenizerV3.
 
-验证流式统一 Tokenizer 的核心功能：
-1. 基础 tokenization 功能
-2. Hilbert 顺序重排
-3. 与原接口的兼容性
-4. 多尺度特征提取
-5. HilbertPathCache 缓存机制
+数学形式化验证
+==============
+
+流式 Tokenizer 将图像映射到变长 token 序列:
+
+    T: I → (tokens, levels_info)
+    
+其中:
+    I ∈ R^{B × C × H × W}      输入图像
+    tokens ∈ R^{B × N × D}     Token 嵌入
+    levels_info ∈ Z^{B × N × L} 层级信息
+
+测试覆盖:
+1. HilbertPathCache - Hilbert 路径缓存机制
+2. HilbertIndexer - Hilbert 索引重排
+3. MultiScalePatchEncoder - 多尺度特征提取
+4. StreamingFractalTokenizer - V1 流式 tokenizer
+5. StreamingFractalTokenizerV3 - V3 Variable Depth tokenizer
 """
 
 import pytest
@@ -14,7 +26,7 @@ import torch
 
 from vit_pytorch import (
     StreamingFractalTokenizer,
-    StreamingFractalTokenizerV2,
+    StreamingFractalTokenizerV3,
     HilbertIndexer,
     HilbertPathCache,
     MultiScalePatchEncoder,
@@ -23,7 +35,13 @@ from vit_pytorch import (
 
 
 class TestHilbertPathCache:
-    """测试统一的 Hilbert 路径缓存."""
+    """测试统一的 Hilbert 路径缓存.
+    
+    数学性质:
+    - Hilbert 曲线: H: [0, n²) → [0, n) × [0, n)
+    - 双射性: H 是一一映射
+    - 局部性: |H(d₁) - H(d₂)|₂ ≤ C·|d₁ - d₂|^(1/2)
+    """
     
     def setup_method(self):
         """每个测试前清空缓存."""
@@ -53,7 +71,11 @@ class TestHilbertPathCache:
         assert paths.shape == (32, 8)
     
     def test_quadtree_paths_values(self):
-        """测试四叉树路径值在 [0, 3] 范围内."""
+        """测试四叉树路径值在 [0, 3] 范围内.
+        
+        四叉树路径: q_l ∈ {0, 1, 2, 3}
+        0=左上, 1=右上, 2=左下, 3=右下
+        """
         _, paths = HilbertPathCache.get_or_compute(8, 8, 8)
         
         assert paths.min() >= 0
@@ -87,13 +109,16 @@ class TestHilbertPathCache:
 
 
 class TestHilbertIndexer:
-    """测试 Hilbert 索引器."""
+    """测试 Hilbert 索引器.
+    
+    功能: 将 2D 特征图按 Hilbert 顺序重排为 1D 序列
+    """
     
     def test_get_hilbert_order_power_of_2(self):
         """测试 2 的幂次网格的 Hilbert 顺序."""
         order = HilbertIndexer.get_hilbert_order(4)
         assert len(order) == 16
-        assert set(order.tolist()) == set(range(16))  # 包含所有索引
+        assert set(order.tolist()) == set(range(16))
     
     def test_get_hilbert_order_small(self):
         """测试小网格."""
@@ -130,7 +155,10 @@ class TestHilbertIndexer:
 
 
 class TestMultiScalePatchEncoder:
-    """测试多尺度编码器."""
+    """测试多尺度编码器.
+    
+    数学: F_s = Conv(I, kernel=s) ∈ R^{B × D × H/s × W/s}
+    """
     
     def test_basic_encoding(self):
         """测试基础编码功能."""
@@ -170,7 +198,13 @@ class TestMultiScalePatchEncoder:
 
 
 class TestStreamingFractalTokenizer:
-    """测试流式 Tokenizer."""
+    """测试流式 Tokenizer V1.
+    
+    数学形式化:
+    - 输入: I ∈ R^{B × C × H × W}
+    - 输出: tokens ∈ R^{B × N × D}, levels_info ∈ Z^{B × N × L}
+    - N = (H/s) × (W/s) 固定 token 数量
+    """
     
     @pytest.fixture
     def tokenizer(self):
@@ -179,7 +213,7 @@ class TestStreamingFractalTokenizer:
             channels=3,
             d_model=64,
             patch_sizes=(4, 8),
-            primary_scale=0,  # 使用 patch_size=4
+            primary_scale=0,
         )
     
     def test_tokenize_basic(self, tokenizer):
@@ -190,10 +224,8 @@ class TestStreamingFractalTokenizer:
         assert isinstance(output, TokenizerOutput)
         assert len(output) == 2
         
-        # 检查每个序列
         for seq in output:
-            # patch_size=4, image=32 → grid=8x8=64 tokens
-            assert seq.tokens.shape == (64, 64)  # (num_tokens, d_model)
+            assert seq.tokens.shape == (64, 64)
             assert seq.get_levels() is not None
     
     def test_tokenize_output_format(self, tokenizer):
@@ -201,19 +233,15 @@ class TestStreamingFractalTokenizer:
         images = torch.randn(1, 3, 32, 32)
         output = tokenizer.tokenize(images)
         
-        # 测试 to_legacy 方法
         legacy = output.to_legacy()
         assert len(legacy.tokens) == 1
         assert len(legacy.levels) == 1
-        
-        # tokens 和 levels 维度匹配
         assert legacy.tokens[0].shape[0] == legacy.levels[0].shape[0]
     
     def test_forward_equals_tokenize(self, tokenizer):
         """测试 forward 和 tokenize 等价."""
         images = torch.randn(1, 3, 32, 32)
         
-        # 使用 eval 模式避免 Dropout 随机性
         tokenizer.eval()
         with torch.no_grad():
             output1 = tokenizer.tokenize(images)
@@ -229,7 +257,6 @@ class TestStreamingFractalTokenizer:
         levels_info = output.sequences[0].get_levels()
         assert levels_info is not None
         
-        # levels_info[:, 0] 是深度
         depths = levels_info[:, 0]
         assert depths.min() >= 0
         assert depths.max() <= tokenizer.max_level
@@ -248,7 +275,7 @@ class TestStreamingFractalTokenizer:
         output = tokenizer.tokenize(images)
         
         assert len(output) == 1
-        assert output.sequences[0].tokens.shape[0] == 64  # 8x8=64
+        assert output.sequences[0].tokens.shape[0] == 64
     
     def test_different_image_sizes(self):
         """测试不同图像尺寸."""
@@ -259,23 +286,19 @@ class TestStreamingFractalTokenizer:
             patch_sizes=(8,),
         )
         
-        # 使用与 image_size 不同的实际输入
         images = torch.randn(1, 3, 48, 48)
         output = tokenizer.tokenize(images)
         
-        # 48/8 = 6, 6x6 = 36 tokens
         assert output.sequences[0].tokens.shape[0] == 36
     
     def test_invalid_input_dimension(self, tokenizer):
         """测试无效输入维度."""
         with pytest.raises(ValueError, match="expects 4D input"):
-            tokenizer.tokenize(torch.randn(3, 32, 32))  # 3D instead of 4D
+            tokenizer.tokenize(torch.randn(3, 32, 32))
     
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_gpu_if_available(self, tokenizer):
-        """测试 GPU 支持（如果可用）."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-        
+        """测试 GPU 支持."""
         tokenizer = tokenizer.cuda()
         images = torch.randn(2, 3, 32, 32).cuda()
         
@@ -284,78 +307,73 @@ class TestStreamingFractalTokenizer:
         assert output.sequences[0].tokens.device.type == 'cuda'
 
 
-class TestStreamingFractalTokenizerV2:
-    """测试带区域自适应的 Tokenizer V2."""
+class TestStreamingFractalTokenizerV3:
+    """测试 V3 Variable Depth Tokenizer.
+    
+    数学形式化:
+    - 自适应分割: R → {R₁, ..., Rₖ} (四叉树)
+    - Variable tokens: N ∈ [N_min, N_max]
+    - 深度调制: t_i = Pool(F[R_i]) · σ_d + E_d
+    """
     
     @pytest.fixture
-    def tokenizer_v2(self):
-        return StreamingFractalTokenizerV2(
+    def tokenizer_v3(self):
+        return StreamingFractalTokenizerV3(
             image_size=32,
             channels=3,
             d_model=64,
-            patch_sizes=(4, 8),
-            gumbel_temperature=1.0,
+            base_patch_size=4,
+            max_depth=4,
         )
     
-    def test_tokenize_basic(self, tokenizer_v2):
-        """测试基础 tokenization."""
+    def test_basic_forward(self, tokenizer_v3):
+        """测试基础前向传播."""
         images = torch.randn(2, 3, 32, 32)
-        output = tokenizer_v2.tokenize(images)
+        output = tokenizer_v3.tokenize(images)
         
         assert isinstance(output, TokenizerOutput)
         assert len(output) == 2
+        
+        for seq in output.sequences:
+            assert seq.tokens.dim() == 2
+            assert seq.tokens.shape[1] == 64
     
-    def test_training_vs_eval_mode(self, tokenizer_v2):
-        """测试训练和推理模式的差异."""
+    def test_levels_info_format(self, tokenizer_v3):
+        """测试 levels_info 格式正确."""
         images = torch.randn(1, 3, 32, 32)
+        output = tokenizer_v3.tokenize(images)
         
-        # 训练模式
-        tokenizer_v2.train()
-        output_train = tokenizer_v2.tokenize(images)
-        
-        # 推理模式
-        tokenizer_v2.eval()
-        with torch.no_grad():
-            output_eval = tokenizer_v2.tokenize(images)
-        
-        # 两种模式都应该产生有效输出
-        assert output_train.sequences[0].tokens.shape == output_eval.sequences[0].tokens.shape
-    
-    def test_complexity_estimator(self, tokenizer_v2):
-        """测试复杂度估计器 (语义级, 基于 Encoder 特征)."""
-        images = torch.randn(2, 3, 32, 32)  # 使用 batch_size=2 避免 BatchNorm 问题
-        
-        # 获取 encoder 特征
-        tokenizer_v2.eval()  # 使用 eval 模式
-        with torch.no_grad():
-            features_dict = tokenizer_v2.encoder(images)
+        levels_info = output.sequences[0].get_levels()
+        if levels_info is not None:
+            num_tokens = output.sequences[0].tokens.shape[0]
+            assert levels_info.shape[0] == num_tokens
             
-            # 获取最小尺度的特征图大小作为目标大小
-            min_ps = tokenizer_v2.patch_sizes[0]
-            if min_ps in features_dict:
-                target_size = features_dict[min_ps][1]  # (grid_h, grid_w)
-            else:
-                target_size = (8, 8)  # 默认
-            
-            # 计算尺度权重
-            scale_weights = tokenizer_v2._compute_scale_weights(features_dict, target_size)
-        
-        # 权重应该在 [0, 1] 范围
-        assert scale_weights.shape[1] == len(tokenizer_v2.patch_sizes)
-        assert scale_weights.min() >= 0
-        # 由于使用 STE (hard=True)，权重应该是 one-hot
-        # 沿尺度维度求和应该为 1
-        assert torch.allclose(
-            scale_weights.sum(dim=1), 
-            torch.ones_like(scale_weights.sum(dim=1)), 
-            atol=0.01
-        )
-
-
-class TestIntegration:
-    """集成测试."""
+            depths = levels_info[:, 0]
+            assert depths.min() >= 0
     
-    def test_streaming_tokenizer_with_transformer_input(self):
+    def test_gradient_flow(self, tokenizer_v3):
+        """测试梯度流动."""
+        images = torch.randn(1, 3, 32, 32, requires_grad=True)
+        
+        tokenizer_v3.train()
+        output = tokenizer_v3.tokenize(images)
+        
+        loss = output.sequences[0].tokens.sum()
+        loss.backward()
+        
+        assert images.grad is not None
+        assert not torch.isnan(images.grad).any()
+    
+    def test_metadata_contains_num_tokens(self, tokenizer_v3):
+        """测试元数据包含 token 数量."""
+        images = torch.randn(1, 3, 32, 32)
+        output = tokenizer_v3.tokenize(images)
+        
+        metadata = output.sequences[0].metadata
+        # num_tokens 在 split_stats 子字典中
+        assert 'split_stats' in metadata
+        assert 'num_tokens' in metadata['split_stats']
+        assert metadata['split_stats']['num_tokens'] == output.sequences[0].tokens.shape[0]
         """测试 Tokenizer 输出可以作为 Transformer 输入."""
         tokenizer = StreamingFractalTokenizer(
             image_size=32,
@@ -367,10 +385,8 @@ class TestIntegration:
         images = torch.randn(2, 3, 32, 32)
         output = tokenizer.tokenize(images)
         
-        # 获取 tokens 和 levels
         legacy = output.to_legacy()
         
-        # Pad 到相同长度（模拟 Transformer 输入准备）
         tokens_padded = torch.nn.utils.rnn.pad_sequence(
             legacy.tokens, batch_first=True
         )
@@ -378,16 +394,14 @@ class TestIntegration:
             legacy.levels, batch_first=True
         )
         
-        # 验证形状
         B, S, D = tokens_padded.shape
         assert B == 2
         assert D == 64
         assert levels_padded.shape[0] == B
         assert levels_padded.shape[1] == S
     
-    def test_v1_and_v2_output_structure_compatible(self):
-        """验证 V1 和 V2 tokenizer 的输出结构兼容."""
-        # V1 tokenizer
+    def test_v1_and_v3_output_structure_compatible(self):
+        """验证 V1 和 V3 tokenizer 的输出结构兼容."""
         streaming_v1 = StreamingFractalTokenizer(
             image_size=32,
             channels=3,
@@ -395,367 +409,24 @@ class TestIntegration:
             patch_sizes=(4,),
         )
         
-        # V2 tokenizer
-        streaming_v2 = StreamingFractalTokenizerV2(
+        streaming_v3 = StreamingFractalTokenizerV3(
             image_size=32,
             channels=3,
             d_model=64,
-            patch_sizes=(4,),
+            base_patch_size=4,
+            max_depth=3,
         )
         
         images = torch.randn(1, 3, 32, 32)
         
-        # 两个 tokenizer 都应该产生 TokenizerOutput
         output_v1 = streaming_v1.tokenize(images)
-        output_v2 = streaming_v2.tokenize(images)
+        output_v3 = streaming_v3.tokenize(images)
         
         assert isinstance(output_v1, TokenizerOutput)
-        assert isinstance(output_v2, TokenizerOutput)
+        assert isinstance(output_v3, TokenizerOutput)
         
-        # 都应该有 levels 元数据
-        assert output_v1.sequences[0].get_levels() is not None
-        assert output_v2.sequences[0].get_levels() is not None
-        
-        # 输出维度应该相同
-        assert output_v1.sequences[0].tokens.shape[1] == output_v2.sequences[0].tokens.shape[1]
+        assert output_v1.sequences[0].tokens.shape[1] == output_v3.sequences[0].tokens.shape[1]
 
 
-class TestVariableTokensMode:
-    """测试可变 Token 数量模式 (variable_tokens=True).
-    
-    数学形式化验证:
-    1. 四叉树一致性: 粗尺度区域内所有位置使用相同尺度
-    2. Token 数量可变: N ∈ [N_min, N_max]
-    3. Hilbert 排序: 按层级和空间位置排序
-    4. levels_info 格式正确
-    """
-    
-    @pytest.fixture
-    def variable_tokenizer(self):
-        """创建可变 token 数量的 tokenizer."""
-        return StreamingFractalTokenizerV2(
-            image_size=32,
-            channels=3,
-            d_model=64,
-            patch_sizes=(4, 8, 16),  # 3 种尺度
-            use_hilbert_order=True,
-            max_level=10,
-            gumbel_temperature=1.0,
-            variable_tokens=True,
-        )
-    
-    @pytest.fixture
-    def fixed_tokenizer(self):
-        """创建固定 token 数量的 tokenizer (对比用)."""
-        return StreamingFractalTokenizerV2(
-            image_size=32,
-            channels=3,
-            d_model=64,
-            patch_sizes=(4, 8, 16),
-            use_hilbert_order=True,
-            max_level=10,
-            gumbel_temperature=1.0,
-            variable_tokens=False,
-        )
-    
-    def test_basic_forward(self, variable_tokenizer):
-        """测试基础前向传播."""
-        images = torch.randn(2, 3, 32, 32)
-        output = variable_tokenizer.tokenize(images)
-        
-        assert len(output) == 2
-        for seq in output.sequences:
-            assert seq.tokens.dim() == 2  # [N, D]
-            assert seq.tokens.shape[1] == 64  # d_model
-            assert seq.get_levels() is not None
-    
-    def test_variable_token_count(self, variable_tokenizer):
-        """测试 token 数量确实可变."""
-        # 使用不同复杂度的图像
-        simple_image = torch.zeros(1, 3, 32, 32)  # 简单图像（全黑）
-        complex_image = torch.randn(1, 3, 32, 32)  # 复杂图像（随机噪声）
-        
-        variable_tokenizer.eval()
-        with torch.no_grad():
-            simple_output = variable_tokenizer.tokenize(simple_image)
-            complex_output = variable_tokenizer.tokenize(complex_image)
-        
-        simple_count = simple_output.sequences[0].tokens.shape[0]
-        complex_count = complex_output.sequences[0].tokens.shape[0]
-        
-        # Token 数量范围应在 [N_min, N_max] 之间
-        # N_min = (32/16)^2 = 4 (最粗尺度)
-        # N_max = (32/4)^2 = 64 (最细尺度)
-        assert 1 <= simple_count <= 64
-        assert 1 <= complex_count <= 64
-        
-        # 不要求必须不同，但打印出来便于观察
-        print(f"\nSimple image tokens: {simple_count}, Complex image tokens: {complex_count}")
-    
-    def test_fixed_vs_variable_comparison(self, fixed_tokenizer, variable_tokenizer):
-        """对比固定和可变模式的输出."""
-        images = torch.randn(1, 3, 32, 32)
-        
-        fixed_tokenizer.eval()
-        variable_tokenizer.eval()
-        
-        with torch.no_grad():
-            fixed_output = fixed_tokenizer.tokenize(images)
-            variable_output = variable_tokenizer.tokenize(images)
-        
-        fixed_count = fixed_output.sequences[0].tokens.shape[0]
-        variable_count = variable_output.sequences[0].tokens.shape[0]
-        
-        # 固定模式应该总是输出 (32/4)^2 = 64 个 token
-        assert fixed_count == 64
-        
-        # 可变模式应该 <= 64
-        assert variable_count <= 64
-        assert variable_count >= 1
-    
-    def test_levels_info_structure(self, variable_tokenizer):
-        """测试 levels_info 结构正确."""
-        images = torch.randn(1, 3, 32, 32)
-        output = variable_tokenizer.tokenize(images)
-        
-        levels_info = output.sequences[0].get_levels()
-        assert levels_info is not None
-        
-        num_tokens = output.sequences[0].tokens.shape[0]
-        assert levels_info.shape[0] == num_tokens
-        
-        # 检查深度值范围
-        depths = levels_info[:, 0]
-        assert depths.min() >= 0
-        assert depths.max() <= variable_tokenizer.max_level
-        
-        # 检查路径值范围 [0, 3]
-        if levels_info.shape[1] > 1:
-            paths = levels_info[:, 1:]
-            assert paths.min() >= 0
-            assert paths.max() <= 3
-    
-    def test_quadtree_consistency(self, variable_tokenizer):
-        """测试四叉树一致性约束.
-        
-        验证: 同一粗尺度区域内的所有细粒度位置应使用相同尺度。
-        """
-        # 手动创建测试用的 scale_map
-        scale_map = torch.zeros(1, 8, 8, dtype=torch.long)  # 8x8 网格
-        
-        # 设置一些粗尺度决策
-        scale_map[0, 0:4, 0:4] = 2  # 左上 4x4 使用最粗尺度 (scale_idx=2)
-        scale_map[0, 0:4, 4:8] = 1  # 右上 4x4 使用中等尺度 (scale_idx=1)
-        scale_map[0, 4:8, :] = 0    # 下半部分使用最细尺度 (scale_idx=0)
-        
-        # 调用一致性强制函数
-        result = variable_tokenizer._enforce_quadtree_consistency(scale_map, 8, 8)
-        
-        # 验证粗尺度区域保持一致
-        # 左上 4x4 区域应该全部是 2
-        assert (result[0, 0:4, 0:4] == 2).all() or (result[0, 0:4, 0:4] == result[0, 0, 0]).all()
-        
-        # 每个 block 内部应该一致
-        for by in range(0, 8, 4):
-            for bx in range(0, 8, 4):
-                block = result[0, by:by+4, bx:bx+4]
-                # 检查 block 内是否存在粗尺度 (>=1)
-                if block.max() >= 1:
-                    # 如果有粗尺度，整个 block 应该统一
-                    assert block.max() == block.min() or block.max() <= block[0, 0]
-    
-    def test_hilbert_sort_correctness(self, variable_tokenizer):
-        """测试 Hilbert 排序的正确性."""
-        # 创建测试位置列表
-        positions = [
-            (1, 0, 0, 4, 4),  # level=1, (0,0) in 4x4 grid
-            (1, 0, 1, 4, 4),  # level=1, (0,1)
-            (1, 1, 0, 4, 4),  # level=1, (1,0)
-            (1, 1, 1, 4, 4),  # level=1, (1,1)
-        ]
-        
-        sorted_indices = variable_tokenizer._hilbert_sort_by_position(positions)
-        
-        # 应该返回有效的排列
-        assert len(sorted_indices) == 4
-        assert set(sorted_indices) == {0, 1, 2, 3}
-    
-    def test_quadtree_path_computation(self, variable_tokenizer):
-        """测试四叉树路径计算."""
-        # 位置 (0, 0) 在 4x4 网格中
-        path = variable_tokenizer._compute_quadtree_path(0, 0, 4, 4, 4)
-        
-        # 路径应该非空
-        assert len(path) > 0
-        
-        # 路径值应该在 [0, 3] 范围
-        assert all(0 <= p <= 3 for p in path)
-    
-    def test_batch_with_different_token_counts(self, variable_tokenizer):
-        """测试 batch 中不同图像产生不同 token 数量."""
-        # 创建两个明显不同复杂度的图像
-        images = torch.zeros(2, 3, 32, 32)
-        images[1] = torch.randn(1, 3, 32, 32)  # 第二个图像更复杂
-        
-        variable_tokenizer.eval()
-        with torch.no_grad():
-            output = variable_tokenizer.tokenize(images)
-        
-        count1 = output.sequences[0].tokens.shape[0]
-        count2 = output.sequences[1].tokens.shape[0]
-        
-        # 验证都在有效范围内
-        assert 1 <= count1 <= 64
-        assert 1 <= count2 <= 64
-        
-        print(f"\nBatch token counts: {count1}, {count2}")
-    
-    def test_metadata_contains_num_tokens(self, variable_tokenizer):
-        """测试元数据包含 token 数量."""
-        images = torch.randn(1, 3, 32, 32)
-        output = variable_tokenizer.tokenize(images)
-        
-        # variable_tokens 模式应该在 metadata 中记录 num_tokens
-        metadata = output.sequences[0].metadata
-        if 'num_tokens' in metadata:
-            assert metadata['num_tokens'] == output.sequences[0].tokens.shape[0]
-    
-    def test_gradient_flow(self, variable_tokenizer):
-        """测试梯度可以正常流动."""
-        images = torch.randn(1, 3, 32, 32, requires_grad=True)
-        
-        variable_tokenizer.train()
-        output = variable_tokenizer.tokenize(images)
-        
-        # 计算损失并反向传播
-        loss = output.sequences[0].tokens.sum()
-        loss.backward()
-        
-        # 验证梯度流动
-        assert images.grad is not None
-        assert not torch.isnan(images.grad).any()
-
-
-class TestDepthBiasWarmup:
-    """测试深度探索优先 Warmup 策略 (v2.2)."""
-    
-    @pytest.fixture
-    def tokenizer_v2(self):
-        """创建 V2 tokenizer 用于测试."""
-        return StreamingFractalTokenizerV2(
-            image_size=32,
-            channels=3,
-            d_model=64,
-            patch_sizes=(4, 8, 16),
-            gumbel_temperature=2.0,
-        )
-    
-    def test_depth_bias_initialization(self, tokenizer_v2):
-        """测试深度偏置初始化."""
-        # 检查初始值
-        assert tokenizer_v2._depth_bias_max == 2.0
-        assert tokenizer_v2._depth_bias_decay == 2.0
-        assert tokenizer_v2._depth_bias_warmup == 0.2
-        assert tokenizer_v2._current_depth_bias == 2.0
-        
-        # 检查尺度偏置权重
-        # 3 个尺度: [1.0, 0.5, 0.0] 或类似 (小尺度偏置大)
-        weights = tokenizer_v2._scale_bias_weights
-        assert weights.shape == (3,)
-        assert weights[0] > weights[1] > weights[2]  # 递减
-        assert weights[0].item() == pytest.approx(1.0)
-        assert weights[2].item() == pytest.approx(0.0)
-    
-    def test_depth_bias_annealing(self, tokenizer_v2):
-        """测试深度偏置退火调度."""
-        total_epochs = 100
-        
-        # Epoch 1 (1%): 在 warmup 期间，保持最大偏置
-        bias_e1 = tokenizer_v2.anneal_depth_bias(1, total_epochs)
-        assert bias_e1 == pytest.approx(2.0, rel=0.1)
-        
-        # Epoch 10 (10%): 仍在 warmup (20%) 期间
-        bias_e10 = tokenizer_v2.anneal_depth_bias(10, total_epochs)
-        assert bias_e10 == pytest.approx(2.0, rel=0.1)
-        
-        # Epoch 50 (50%): warmup 后，偏置开始衰减
-        bias_e50 = tokenizer_v2.anneal_depth_bias(50, total_epochs)
-        assert bias_e50 < 2.0
-        assert bias_e50 > 0.0
-        
-        # Epoch 100 (100%): 偏置接近 0
-        bias_e100 = tokenizer_v2.anneal_depth_bias(100, total_epochs)
-        assert bias_e100 < 0.1
-    
-    def test_anneal_temperature_updates_depth_bias(self, tokenizer_v2):
-        """测试 anneal_temperature 同时更新深度偏置."""
-        # 初始状态
-        assert tokenizer_v2._current_depth_bias == 2.0
-        
-        # 调用 anneal_temperature
-        tokenizer_v2.anneal_temperature(50, 100, schedule="cosine")
-        
-        # 验证深度偏置也被更新
-        assert tokenizer_v2._current_depth_bias < 2.0
-    
-    def test_depth_bias_affects_logits(self, tokenizer_v2):
-        """测试深度偏置影响尺度选择."""
-        images = torch.randn(2, 3, 32, 32)
-        
-        tokenizer_v2.train()
-        
-        # 高偏置时 (初始状态)
-        tokenizer_v2._current_depth_bias = 2.0
-        features_dict = tokenizer_v2.encoder(images)
-        min_ps = min(features_dict.keys())
-        _, target_size = features_dict[min_ps]
-        weights_high_bias = tokenizer_v2._compute_scale_weights(features_dict, target_size)
-        
-        # 低偏置时
-        tokenizer_v2._current_depth_bias = 0.0
-        weights_no_bias = tokenizer_v2._compute_scale_weights(features_dict, target_size)
-        
-        # 高偏置时应该更倾向于小尺度 (scale index 0)
-        scale_0_ratio_high = weights_high_bias[:, 0].mean().item()
-        scale_0_ratio_low = weights_no_bias[:, 0].mean().item()
-        
-        # 由于 Gumbel 采样的随机性，只验证逻辑正确性
-        # 高偏置应该增加小尺度的选择概率
-        print(f"\nScale 0 ratio - high bias: {scale_0_ratio_high:.3f}, no bias: {scale_0_ratio_low:.3f}")
-    
-    def test_depth_bias_not_applied_in_eval(self, tokenizer_v2):
-        """测试推理模式下不应用深度偏置."""
-        images = torch.randn(1, 3, 32, 32)
-        
-        tokenizer_v2.eval()
-        tokenizer_v2._current_depth_bias = 2.0  # 设置高偏置
-        
-        with torch.no_grad():
-            features_dict = tokenizer_v2.encoder(images)
-            min_ps = min(features_dict.keys())
-            _, target_size = features_dict[min_ps]
-            weights = tokenizer_v2._compute_scale_weights(features_dict, target_size)
-        
-        # 推理模式下输出应该是 one-hot
-        assert weights.sum(dim=1).allclose(torch.ones_like(weights.sum(dim=1)))
-    
-    def test_set_depth_bias(self, tokenizer_v2):
-        """测试手动设置深度偏置参数."""
-        tokenizer_v2.set_depth_bias(
-            bias_strength=1.5,
-            max_bias=3.0,
-            decay_power=1.5,
-            warmup_ratio=0.3,
-        )
-        
-        assert tokenizer_v2._current_depth_bias == 1.5
-        assert tokenizer_v2._depth_bias_max == 3.0
-        assert tokenizer_v2._depth_bias_decay == 1.5
-        assert tokenizer_v2._depth_bias_warmup == 0.3
-    
-    def test_get_depth_bias(self, tokenizer_v2):
-        """测试获取当前深度偏置."""
-        assert tokenizer_v2.get_depth_bias() == 2.0
-        
-        tokenizer_v2._current_depth_bias = 0.5
-        assert tokenizer_v2.get_depth_bias() == 0.5
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
