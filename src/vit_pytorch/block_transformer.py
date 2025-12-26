@@ -19,9 +19,28 @@ DropPath (Stochastic Depth):
     训练时: output = x * Bernoulli(1 - drop_prob) / (1 - drop_prob)
     推理时: output = x
 
-全局上下文:
-    global_ctx = mean(x) * GLOBAL_CONTEXT_SCALE
-    x' = x + global_ctx
+层级感知聚合 (ARCH-R2):
+    s_ℓ = σ(Embed_level(ℓ)) — 每个层级的 D 维缩放向量
+    r = W₂ · ReLU(W₁ · x) — bottleneck 特征精炼
+    x' = x + scale · (r ⊙ s_ℓ) — 层级感知的残差更新
+
+注: GLOBAL_CONTEXT_SCALE 已废弃 (ARCH-R1)，全局上下文由 HilbertAwareAttention 隐式处理
+
+复杂度分析
+----------
+FractalTransformerBlock:
+    时间: O(B · N² · D) + O(B · N · D · D_ff)
+          ├─ Attention: O(B · H · N² · d) = O(B · N² · D)  — QK^T 矩阵乘
+          └─ FFN:       O(B · N · D · D_ff)                — 前馈网络
+    空间: O(B · H · N²) + O(B · N · D_ff)
+          ├─ Attention matrix: O(B · H · N²)
+          └─ FFN 中间张量: O(B · N · D_ff)
+
+FractalTransformer (L 层):
+    时间: O(L · B · N² · D)  — 线性堆叠
+    空间: O(B · H · N²)       — 无累积（逐层释放）
+
+其中: B=batch, N=seq_len, D=dim, H=heads, d=dim_head, L=depth
 
 类对照表
 ----------
@@ -45,9 +64,8 @@ from torch.utils.checkpoint import checkpoint
 
 logger = logging.getLogger(__name__)
 
-from .attention import HilbertAwareMultiScaleAttention
-from .constants import GLOBAL_CONTEXT_SCALE
-from .feedforward import AdaptiveFractalFeedForward, FFNType
+from .attn_hilbert_bias import HilbertAwareMultiScaleAttention
+from .ffn_swiglu import AdaptiveFractalFeedForward, FFNType
 from .utils import extract_depths
 
 

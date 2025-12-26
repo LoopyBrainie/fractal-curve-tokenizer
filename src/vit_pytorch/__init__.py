@@ -22,7 +22,7 @@ Layer 4 (应用层):
     fractal_vit.py          FractalCurveViT
 
 Layer 3 (管道层):
-    streaming_tokenizer.py  StreamingFractalTokenizer, V3 (推荐)
+    streaming_tokenizer.py  StreamingFractalTokenizerV3
     transformer.py          FractalTransformer
 
 Layer 2 (组件层):
@@ -38,50 +38,49 @@ Layer 1 (基础层):
 """
 
 # === 推荐组件 ===
-from .attention import (
+from .attn_hilbert_bias import (
     HilbertAwareMultiScaleAttention,
+    HilbertBiasBase,
     LCAHilbertBias,
     LowRankHilbertBias,
     HierarchicalHilbertBias,
 )
-from .feedforward import AdaptiveFractalFeedForward, FFNType, SwiGLUFFN
-from .fractal_config import (
+from .ffn_swiglu import AdaptiveFractalFeedForward, FFNType, SwiGLUFFN
+from .config_fractal import (
     FractalConfig,
     create_fractal_config,
     BiasMode,
     AnnealSchedule,
     TokenizerType,
 )
-from .fractal_path import (
+from .embed_fractal_path import (
     FractalPathEmbedding,
     HierarchicalAttentionBias,
     VectorizedPathEncoder,
 )
-from .vit import FractalCurveViT
-from .hilbert import (
+from .model_fractal_vit import FractalCurveViT
+from .curve_hilbert import (
     HilbertCurve,
     PseudoHilbertCurve,
     get_quadrant_order,
     hilbert_distance_to_xy,
     xy_to_hilbert_distance,
 )
-from .positional import FractalPositionEmbedding
-from .streaming_tokenizer import (
+from .embed_fractal_position import FractalPositionEmbedding
+from .tokenizer_streaming import StreamingFractalTokenizerV3
+from .curve_hilbert_indexer import (
     HilbertIndexer,
     HilbertPathCache,
-    MultiScalePatchEncoder,
-    StreamingFractalTokenizer,
-    StreamingFractalTokenizerV3,
 )
-from .tokenization import BaseTokenizer, BaseTokenProcessor, TokenSequence, TokenizerOutput
-from .transformer import FractalTransformer, FractalTransformerBlock
+from .embed_multiscale_patch import MultiScalePatchEncoder
+from .base_tokenizer import BaseTokenizer, BaseTokenProcessor, TokenSequence, TokenizerOutput
+from .block_transformer import FractalTransformer, FractalTransformerBlock
 from .utils import extract_depths, normalize_levels_info
 
 
 __all__ = [
     # === 主要模型 ===
-    "StreamingFractalTokenizer",
-    "StreamingFractalTokenizerV3",  # 推荐: Variable Depth Tokenizer
+    "StreamingFractalTokenizerV3",  # Variable Depth Tokenizer
     "FractalCurveViT",
     # === 配置与路径编码 ===
     "FractalConfig",
@@ -106,6 +105,7 @@ __all__ = [
     "FractalTransformer",
     "FractalTransformerBlock",
     "HilbertAwareMultiScaleAttention",
+    "HilbertBiasBase",
     "LCAHilbertBias",
     "LowRankHilbertBias",
     "HierarchicalHilbertBias",

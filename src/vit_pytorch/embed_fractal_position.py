@@ -28,6 +28,21 @@
     B_level[i,j] = LevelAttnBias[d_i, d_j]
     可学习的 [L_max+1, L_max+1] 偏置矩阵
 
+复杂度分析
+----------
+forward (位置编码):
+    时间: O(N · L_max · D)
+          ├─ 深度编码:  O(N)            — Embedding lookup
+          ├─ 路径编码:  O(N · L_max · D) — 路径求和 + 归一化
+          └─ 融合网络:  O(N · D · D)     — MLP
+    空间: O(L_max · 4 · D)  — quadrant_embedding 表
+
+get_attention_bias:
+    时间: O(N²)  — 双向索引查表
+    空间: O((L_max+1)² · H)  — level_attention_bias 矩阵
+
+其中: N=seq_len, D=dim, L_max=max_level, H=heads
+
 类对照表
 ----------
 +--------------------------------+-------------------------------+
@@ -154,11 +169,33 @@ class FractalPositionEmbedding(nn.Module):
         """
         计算基于层级的注意力偏置矩阵
         
+        此方法提供与 LCAHilbertBias 互补的层级偏置机制。
+        LCAHilbertBias 基于 Hilbert 路径的 LCA 深度，而此方法直接使用
+        token 深度对构建偏置矩阵。
+        
+        使用示例
+        --------
+        在自定义注意力模块中使用 level_attention_bias::
+        
+            pos_embed = FractalPositionEmbedding(dim=256, max_level=10)
+            
+            # 假设 levels_info 是 tokenizer 输出的层级信息
+            # levels_info[:, 0] 是每个 token 的深度
+            depths = levels_info[:, 0]
+            
+            # 获取 [N, N] 偏置矩阵
+            level_bias = pos_embed.get_attention_bias(depths)
+            
+            # 添加到注意力分数
+            # attn_scores: [B, H, N, N]
+            # level_bias: [N, N] → 广播到 [1, 1, N, N]
+            attn_scores = attn_scores + level_bias.unsqueeze(0).unsqueeze(0) * scale
+        
         Args:
             depths: (N,) 每个 token 的深度值
             
         Returns:
-            (N, N) 注意力偏置矩阵
+            (N, N) 注意力偏置矩阵，其中 bias[i,j] = level_attention_bias[d_i, d_j]
         """
         # 向量化实现，避免双重循环
         depths_clamped = depths.clamp(0, self.max_level).long()  # (N,)

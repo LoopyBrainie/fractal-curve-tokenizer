@@ -38,7 +38,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .hilbert import HilbertCurve
+from .curve_hilbert import HilbertCurve
 
 
 # =============================================================================
@@ -170,6 +170,19 @@ class AdaptiveSplitConfig:
     gradient_method: str = "simple"
     """Gradient computation: 'simple' or 'sobel'"""
     
+    depth_aware_eta: float = 0.0
+    """深度感知归一化衰减系数 η ∈ [0, 1]
+    
+    数学依据:
+        σ₀²(d) = σ₀² · (Area(R) / Area(root))^η
+        
+    - η = 0.0: 禁用 (默认，向后兼容)
+    - η = 0.5: 推荐值，适用于方差与√面积成正比的域
+    - η = 1.0: 方差与面积成正比假设
+    
+    Range: [0.0, 1.0]
+    """
+    
     def __post_init__(self) -> None:
         """自动验证配置."""
         self.validate()
@@ -202,6 +215,138 @@ class AdaptiveSplitConfig:
             token_budget=token_budget,
             **kwargs
         )
+    
+    # =========================================================================
+    # 域适应预设 (Domain Adaptation Presets)
+    # =========================================================================
+    
+    @classmethod
+    def natural_images(cls, **kwargs) -> "AdaptiveSplitConfig":
+        """自然图像预设 (ImageNet, COCO 等).
+        
+        数学依据:
+            σ₀² = 0.01 ← 自然图像局部方差中位数 ~0.014
+            g₀² = 0.08 ← 自然图像梯度能量中位数 ~0.07
+        """
+        defaults = {
+            "sigma_0_sq": 0.01,
+            "g_0_sq": 0.08,
+            "alpha": 0.5,
+            "tau_0": 0.15,
+        }
+        defaults.update(kwargs)
+        return cls(**defaults)
+    
+    @classmethod
+    def medical_images(cls, **kwargs) -> "AdaptiveSplitConfig":
+        """医学图像预设 (CT, MRI, X-Ray 等).
+        
+        数学依据:
+            医学图像特征: 高对比度边缘 + 均匀组织区域
+            σ₀² = 0.005 ← 组织区域方差更低
+            g₀² = 0.15 ← 需更强梯度才触发分割
+            α = 0.3 ← 边缘比纹理更重要
+        """
+        defaults = {
+            "sigma_0_sq": 0.005,
+            "g_0_sq": 0.15,
+            "alpha": 0.3,
+            "tau_0": 0.12,
+        }
+        defaults.update(kwargs)
+        return cls(**defaults)
+    
+    @classmethod
+    def satellite_images(cls, **kwargs) -> "AdaptiveSplitConfig":
+        """遥感/卫星图像预设.
+        
+        数学依据:
+            遥感特征: 大面积均匀区域 + 细小目标
+            σ₀² = 0.02 ← 地表方差更高
+            g₀² = 0.05 ← 小边缘也需分割
+            α = 0.7 ← 纹理比边缘更重要
+        """
+        defaults = {
+            "sigma_0_sq": 0.02,
+            "g_0_sq": 0.05,
+            "alpha": 0.7,
+            "tau_0": 0.18,
+        }
+        defaults.update(kwargs)
+        return cls(**defaults)
+    
+    @classmethod
+    def document_images(cls, **kwargs) -> "AdaptiveSplitConfig":
+        """文档/OCR 图像预设.
+        
+        数学依据:
+            文档特征: 高对比度文字 + 纯色背景
+            σ₀² = 0.001 ← 背景几乎无方差
+            g₀² = 0.02 ← 文字边缘需要细分
+            α = 0.2 ← 边缘主导
+        """
+        defaults = {
+            "sigma_0_sq": 0.001,
+            "g_0_sq": 0.02,
+            "alpha": 0.2,
+            "tau_0": 0.08,
+        }
+        defaults.update(kwargs)
+        return cls(**defaults)
+    
+    @classmethod
+    def estimate_from_dataset(
+        cls, 
+        sample_images: Tensor,
+        percentile: float = 50.0,
+        **kwargs
+    ) -> "AdaptiveSplitConfig":
+        """从数据集样本自动估计参数.
+        
+        数学依据:
+            σ₀² = median(local_variance)
+            g₀² = median(gradient_energy)
+            τ₀ 设置使 percentile% 的图像在根节点不分割
+        
+        Args:
+            sample_images: [N, C, H, W] 样本图像张量 (归一化到 [0,1])
+            percentile: 用于估计阈值的百分位数 (默认 50.0)
+            **kwargs: 覆盖估计的参数
+            
+        Returns:
+            基于数据统计的配置
+        """
+        if sample_images.dim() != 4:
+            raise ValueError(f"Expected 4D tensor [N,C,H,W], got {sample_images.dim()}D")
+        
+        # 转为灰度
+        if sample_images.shape[1] == 3:
+            gray = 0.299 * sample_images[:, 0] + 0.587 * sample_images[:, 1] + 0.114 * sample_images[:, 2]
+        else:
+            gray = sample_images[:, 0]
+        
+        # 计算局部方差 (7x7 窗口)
+        gray_unfold = F.unfold(gray.unsqueeze(1), kernel_size=7, padding=3)
+        local_var = gray_unfold.var(dim=1)
+        sigma_0_sq = float(torch.quantile(local_var.flatten(), percentile / 100.0).item())
+        
+        # 计算梯度能量
+        dx = gray[:, :, 1:] - gray[:, :, :-1]
+        dy = gray[:, 1:, :] - gray[:, :-1, :]
+        grad_energy = dx[:, :-1, :].pow(2) + dy[:, :, :-1].pow(2)
+        g_0_sq = float(torch.quantile(grad_energy.flatten(), percentile / 100.0).item())
+        
+        # 确保最小值
+        sigma_0_sq = max(sigma_0_sq, 1e-6)
+        g_0_sq = max(g_0_sq, 1e-6)
+        
+        defaults = {
+            "sigma_0_sq": sigma_0_sq,
+            "g_0_sq": g_0_sq,
+            "tau_0": 0.15,  # 保持默认，用户可覆盖
+        }
+        defaults.update(kwargs)
+        return cls(**defaults)
 
 
 # =============================================================================
@@ -336,8 +481,25 @@ class IntegralImageCache:
     """
     Cache for integral images enabling O(1) region statistics.
     
+    数学形式化
+    ===========
+    
+    积分图定义:
+        I(x, y) = Σ_{i<x, j<y} f(i, j)
+    
+    区域和查询 (O(1)):
+        Σ_{(i,j)∈R} f(i,j) = I(x₂,y₂) - I(x₁,y₂) - I(x₂,y₁) + I(x₁,y₁)
+    
+    批量支持 (v2):
+        I^{(b)}(x, y) = Σ_{i<x, j<y} f^{(b)}(i, j), b ∈ [0, B)
+        使用 cumsum 进行批量并行计算
+    
+    复杂度:
+        - 构建: O(B × H × W)
+        - 查询: O(1) per region
+    
     Computes and caches:
-    - II: integral of pixel values
+    - II: integral of pixel values [B, H+1, W+1] or [H+1, W+1]
     - II_sq: integral of squared pixel values  
     - II_grad: integral of gradient magnitude squared
     """
@@ -345,88 +507,246 @@ class IntegralImageCache:
     def __init__(self, image: Tensor, gradient_method: str = "simple"):
         """
         Args:
-            image: [C, H, W] or [H, W] tensor, values in [0, 1]
+            image: [B, C, H, W], [C, H, W] or [H, W] tensor, values in [0, 1]
             gradient_method: 'simple' or 'sobel'
         """
+        # 标准化输入维度
+        self.batch_mode = False
         if image.dim() == 2:
+            # [H, W] -> [1, 1, H, W]
+            image = image.unsqueeze(0).unsqueeze(0)
+        elif image.dim() == 3:
+            # [C, H, W] -> [1, C, H, W]
             image = image.unsqueeze(0)
-        
-        self.C, self.H, self.W = image.shape
-        self.device = image.device
-        
-        # Convert to grayscale for complexity computation
-        if self.C == 3:
-            # Standard luminance weights
-            gray = 0.299 * image[0] + 0.587 * image[1] + 0.114 * image[2]
+        elif image.dim() == 4:
+            self.batch_mode = True
         else:
-            gray = image.mean(dim=0)
+            raise ValueError(f"Expected 2D, 3D, or 4D tensor, got {image.dim()}D")
         
-        # Compute integral images
-        self.II = self._compute_integral(gray)
-        self.II_sq = self._compute_integral(gray ** 2)
-        self.II_grad = self._compute_integral(
-            self._compute_gradient_magnitude_sq(gray, gradient_method)
+        self.B, self.C, self.H, self.W = image.shape
+        self.device = image.device
+        self.dtype = image.dtype
+        
+        # 转换为灰度图进行复杂度计算
+        # gray: [B, H, W]
+        if self.C == 3:
+            # 标准亮度权重
+            gray = 0.299 * image[:, 0] + 0.587 * image[:, 1] + 0.114 * image[:, 2]
+        else:
+            gray = image.mean(dim=1)
+        
+        # 计算批量积分图
+        self.II = self._compute_integral_batch(gray)  # [B, H+1, W+1]
+        self.II_sq = self._compute_integral_batch(gray ** 2)
+        self.II_grad = self._compute_integral_batch(
+            self._compute_gradient_magnitude_sq_batch(gray, gradient_method)
         )
     
-    def _compute_integral(self, img: Tensor) -> Tensor:
-        """Compute integral image with padding."""
-        # Pad with zeros for easier boundary handling
+    def _compute_integral_batch(self, img: Tensor) -> Tensor:
+        """计算批量积分图.
+        
+        Args:
+            img: [B, H, W] 或 [H, W]
+            
+        Returns:
+            integral: [B, H+1, W+1] 带 padding 的积分图
+            
+        数学形式化:
+            I^{(b)}(x, y) = Σ_{i<x, j<y} f^{(b)}(i, j)
+            
+        实现:
+            使用两次 cumsum 进行并行计算:
+            1. cumsum(dim=-2): 沿 H 方向累加
+            2. cumsum(dim=-1): 沿 W 方向累加
+        """
+        if img.dim() == 2:
+            img = img.unsqueeze(0)
+        
+        # Pad with zeros: [B, H, W] -> [B, H+1, W+1]
         padded = F.pad(img, (1, 0, 1, 0), value=0)
-        integral = padded.cumsum(dim=0).cumsum(dim=1)
+        
+        # 批量 cumsum: 先沿 H (dim=-2)，再沿 W (dim=-1)
+        integral = padded.cumsum(dim=-2).cumsum(dim=-1)
+        
         return integral
     
-    def _compute_gradient_magnitude_sq(
+    def _compute_gradient_magnitude_sq_batch(
         self, gray: Tensor, method: str
     ) -> Tensor:
-        """Compute squared gradient magnitude."""
-        if method == "simple":
-            # Simple finite differences
-            grad_x = F.pad(gray[:, 1:] - gray[:, :-1], (0, 1), value=0)
-            grad_y = F.pad(gray[1:, :] - gray[:-1, :], (0, 0, 0, 1), value=0)
-        else:  # sobel
-            # Sobel operators
-            sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
-                                   dtype=gray.dtype, device=gray.device)
-            sobel_y = sobel_x.T
+        """计算批量梯度幅值平方.
+        
+        Args:
+            gray: [B, H, W] 灰度图
+            method: 'simple' 或 'sobel'
             
-            gray_4d = gray.unsqueeze(0).unsqueeze(0)
-            grad_x = F.conv2d(gray_4d, sobel_x.view(1, 1, 3, 3), padding=1).squeeze()
-            grad_y = F.conv2d(gray_4d, sobel_y.view(1, 1, 3, 3), padding=1).squeeze()
+        Returns:
+            grad_mag_sq: [B, H, W] 梯度幅值平方
+        """
+        if gray.dim() == 2:
+            gray = gray.unsqueeze(0)
+        
+        B, H, W = gray.shape
+        
+        if method == "simple":
+            # 简单差分，向量化实现
+            grad_x = F.pad(gray[:, :, 1:] - gray[:, :, :-1], (0, 1), value=0)
+            grad_y = F.pad(gray[:, 1:, :] - gray[:, :-1, :], (0, 0, 0, 1), value=0)
+        else:  # sobel
+            # Sobel 算子，使用 conv2d 批量处理
+            sobel_x = torch.tensor(
+                [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                dtype=gray.dtype, device=gray.device
+            ).view(1, 1, 3, 3)
+            sobel_y = sobel_x.transpose(-1, -2)
+            
+            gray_4d = gray.unsqueeze(1)  # [B, 1, H, W]
+            grad_x = F.conv2d(gray_4d, sobel_x, padding=1).squeeze(1)  # [B, H, W]
+            grad_y = F.conv2d(gray_4d, sobel_y, padding=1).squeeze(1)
         
         return grad_x ** 2 + grad_y ** 2
     
-    def query_sum(self, integral: Tensor, region: Region) -> float:
-        """Query sum over region using integral image."""
+    def query_sum(self, integral: Tensor, region: Region, batch_idx: int = 0) -> float:
+        """Query sum over region using integral image.
+        
+        Args:
+            integral: [B, H+1, W+1] 或 [H+1, W+1] 积分图
+            region: 查询区域
+            batch_idx: batch 索引 (批量模式时使用)
+            
+        Returns:
+            区域内像素值之和
+        """
         x1, y1, x2, y2 = region.x1, region.y1, region.x2, region.y2
-        # Note: integral is padded by 1
-        return (
-            integral[y2, x2].item()
-            - integral[y1, x2].item()
-            - integral[y2, x1].item()
-            + integral[y1, x1].item()
-        )
+        
+        # 根据维度选择正确的索引方式
+        if integral.dim() == 3:
+            # 批量模式: [B, H+1, W+1]
+            return (
+                integral[batch_idx, y2, x2].item()
+                - integral[batch_idx, y1, x2].item()
+                - integral[batch_idx, y2, x1].item()
+                + integral[batch_idx, y1, x1].item()
+            )
+        else:
+            # 单图模式: [H+1, W+1]
+            return (
+                integral[y2, x2].item()
+                - integral[y1, x2].item()
+                - integral[y2, x1].item()
+                + integral[y1, x1].item()
+            )
     
-    def compute_variance(self, region: Region) -> float:
+    def query_sum_batch(
+        self, 
+        integral: Tensor, 
+        regions: Tensor
+    ) -> Tensor:
+        """批量查询多个 region 的和.
+        
+        Args:
+            integral: [B, H+1, W+1] 积分图
+            regions: [N, 5] 格式 [batch_idx, x1, y1, x2, y2]
+            
+        Returns:
+            sums: [N] 每个 region 的像素和
+            
+        数学形式化:
+            sum_i = I[b_i, y2_i, x2_i] - I[b_i, y1_i, x2_i] 
+                  - I[b_i, y2_i, x1_i] + I[b_i, y1_i, x1_i]
+        """
+        N = regions.shape[0]
+        device = integral.device
+        
+        # 提取坐标
+        b = regions[:, 0].long()
+        x1 = regions[:, 1].long()
+        y1 = regions[:, 2].long()
+        x2 = regions[:, 3].long()
+        y2 = regions[:, 4].long()
+        
+        # 向量化查询
+        sums = (
+            integral[b, y2, x2]
+            - integral[b, y1, x2]
+            - integral[b, y2, x1]
+            + integral[b, y1, x1]
+        )
+        
+        return sums
+    
+    def compute_variance(self, region: Region, batch_idx: int = 0) -> float:
         """Compute variance of pixel values in region."""
         area = region.area
         if area == 0:
             return 0.0
         
-        sum_val = self.query_sum(self.II, region)
-        sum_sq = self.query_sum(self.II_sq, region)
+        sum_val = self.query_sum(self.II, region, batch_idx)
+        sum_sq = self.query_sum(self.II_sq, region, batch_idx)
         
         mean = sum_val / area
         variance = sum_sq / area - mean ** 2
         return max(0.0, variance)  # Numerical stability
     
-    def compute_gradient_energy(self, region: Region) -> float:
+    def compute_variance_batch(
+        self, 
+        regions: Tensor,
+        areas: Tensor
+    ) -> Tensor:
+        """批量计算多个 region 的方差.
+        
+        Args:
+            regions: [N, 5] 格式 [batch_idx, x1, y1, x2, y2]
+            areas: [N] 每个 region 的面积
+            
+        Returns:
+            variances: [N] 每个 region 的方差
+        """
+        # 避免除零
+        safe_areas = areas.clamp(min=1)
+        
+        sum_val = self.query_sum_batch(self.II, regions)
+        sum_sq = self.query_sum_batch(self.II_sq, regions)
+        
+        mean = sum_val / safe_areas
+        variance = sum_sq / safe_areas - mean ** 2
+        
+        # 数值稳定性: 负方差置零，零面积区域置零
+        variance = variance.clamp(min=0)
+        variance = torch.where(areas > 0, variance, torch.zeros_like(variance))
+        
+        return variance
+    
+    def compute_gradient_energy(self, region: Region, batch_idx: int = 0) -> float:
         """Compute mean squared gradient magnitude in region."""
         area = region.area
         if area == 0:
             return 0.0
         
-        sum_grad = self.query_sum(self.II_grad, region)
+        sum_grad = self.query_sum(self.II_grad, region, batch_idx)
         return sum_grad / area
+    
+    def compute_gradient_energy_batch(
+        self,
+        regions: Tensor,
+        areas: Tensor
+    ) -> Tensor:
+        """批量计算多个 region 的梯度能量.
+        
+        Args:
+            regions: [N, 5] 格式 [batch_idx, x1, y1, x2, y2]
+            areas: [N] 每个 region 的面积
+            
+        Returns:
+            energies: [N] 每个 region 的平均梯度幅值平方
+        """
+        safe_areas = areas.clamp(min=1)
+        sum_grad = self.query_sum_batch(self.II_grad, regions)
+        energy = sum_grad / safe_areas
+        
+        # 零面积区域置零
+        energy = torch.where(areas > 0, energy, torch.zeros_like(energy))
+        
+        return energy
 
 
 # =============================================================================
@@ -437,17 +757,66 @@ class ComplexityEstimator:
     """
     Estimates region complexity for split decisions.
     
-    C(R) = α · C_var(R) + (1-α) · C_grad(R)
+    数学形式化
+    ----------
+    基础公式:
+        C(R) = α · C_var(R) + (1-α) · C_grad(R)
+        
+        其中:
+        - C_var(R) = Var(R) / (Var(R) + σ₀²)
+        - C_grad(R) = G(R) / (G(R) + g₀²)
     
-    where:
-    - C_var(R) = Var(R) / (Var(R) + σ₀²)
-    - C_grad(R) = G(R) / (G(R) + g₀²)
+    深度感知归一化 (可选):
+        σ₀²(d) = σ₀² · (Area(R) / Area(root))^η
+        
+        数学依据: 小区域的方差自然更低，需要相应调整归一化常数。
+        η ∈ [0.5, 1.0] 控制衰减速度:
+        - η = 0: 无深度感知 (原始行为)
+        - η = 0.5: 方差与√面积成正比假设
+        - η = 1.0: 方差与面积成正比假设
     """
     
-    def __init__(self, config: AdaptiveSplitConfig):
+    def __init__(
+        self, 
+        config: AdaptiveSplitConfig,
+        root_area: Optional[int] = None,
+        depth_aware_eta: float = 0.0,
+    ):
+        """初始化复杂度估计器.
+        
+        Args:
+            config: 自适应分割配置
+            root_area: 根区域面积 (用于深度感知归一化)
+            depth_aware_eta: 深度感知衰减系数 η ∈ [0, 1]
+                - 0: 禁用深度感知 (默认，向后兼容)
+                - 0.5: 推荐值，假设方差与√面积成正比
+        """
         self.alpha = config.alpha
         self.sigma_0_sq = config.sigma_0_sq
         self.g_0_sq = config.g_0_sq
+        self.root_area = root_area
+        self.depth_aware_eta = depth_aware_eta
+    
+    def _get_depth_adjusted_params(
+        self, 
+        region: Region
+    ) -> Tuple[float, float]:
+        """获取深度调整后的归一化参数.
+        
+        Args:
+            region: 当前区域
+            
+        Returns:
+            (adjusted_sigma_0_sq, adjusted_g_0_sq)
+        """
+        if self.depth_aware_eta == 0.0 or self.root_area is None:
+            return self.sigma_0_sq, self.g_0_sq
+        
+        # 面积比例因子
+        area_ratio = region.area / self.root_area
+        scale = area_ratio ** self.depth_aware_eta
+        
+        return self.sigma_0_sq * scale, self.g_0_sq * scale
     
     def compute(
         self, 
@@ -458,8 +827,11 @@ class ComplexityEstimator:
         var = cache.compute_variance(region)
         grad = cache.compute_gradient_energy(region)
         
-        c_var = var / (var + self.sigma_0_sq)
-        c_grad = grad / (grad + self.g_0_sq)
+        # 深度感知归一化
+        sigma_0_sq, g_0_sq = self._get_depth_adjusted_params(region)
+        
+        c_var = var / (var + sigma_0_sq)
+        c_grad = grad / (grad + g_0_sq)
         
         return self.alpha * c_var + (1 - self.alpha) * c_grad
     
@@ -531,7 +903,30 @@ class BaseAdaptiveSplitter(ABC):
     def __init__(self, config: AdaptiveSplitConfig):
         self.config = config
         config.validate()
-        self.complexity_estimator = ComplexityEstimator(config)
+        # ComplexityEstimator 将在 split 时初始化（需要 root_area）
+        self._complexity_estimator: Optional[ComplexityEstimator] = None
+    
+    def _get_complexity_estimator(self, root_area: int) -> ComplexityEstimator:
+        """获取或创建复杂度估计器.
+        
+        Args:
+            root_area: 根区域面积 (用于深度感知归一化)
+        """
+        if (self._complexity_estimator is None or 
+            self._complexity_estimator.root_area != root_area):
+            self._complexity_estimator = ComplexityEstimator(
+                self.config,
+                root_area=root_area,
+                depth_aware_eta=self.config.depth_aware_eta,
+            )
+        return self._complexity_estimator
+    
+    @property
+    def complexity_estimator(self) -> ComplexityEstimator:
+        """向后兼容: 返回默认估计器 (无深度感知)."""
+        if self._complexity_estimator is None:
+            self._complexity_estimator = ComplexityEstimator(self.config)
+        return self._complexity_estimator
     
     @abstractmethod
     def split(self, image: Tensor) -> SplitResult:
@@ -592,17 +987,21 @@ class BalancedGreedySplitter(BaseAdaptiveSplitter):
         )
         sorter = HilbertTokenSorter(H)
         
+        # 初始化复杂度估计器 (传入 root_area 用于深度感知归一化)
+        root_area = H * W
+        complexity_estimator = self._get_complexity_estimator(root_area)
+        
         # Step 1: Greedy recursive splitting
         root_region = Region(0, 0, W, H)
-        leaves = self._greedy_split(root_region, 0, [], cache)
+        leaves = self._greedy_split(root_region, 0, [], cache, complexity_estimator)
         
         # Step 2: Enforce 2:1 balance
         if self.config.enforce_balance:
-            leaves = self._enforce_balance(leaves, cache, H)
+            leaves = self._enforce_balance(leaves, cache, H, complexity_estimator)
         
         # Step 3: Apply token count constraint (optional)
         if self.config.target_tokens is not None:
-            leaves = self._apply_token_constraint(leaves, cache, H)
+            leaves = self._apply_token_constraint(leaves, cache, H, complexity_estimator)
         
         # Step 4: Convert to tokens and sort by Hilbert
         tokens = [
@@ -624,14 +1023,15 @@ class BalancedGreedySplitter(BaseAdaptiveSplitter):
         region: Region,
         depth: int,
         path: List[int],
-        cache: IntegralImageCache
+        cache: IntegralImageCache,
+        complexity_estimator: ComplexityEstimator,
     ) -> List[QuadtreeNode]:
         """Recursive greedy splitting."""
         node = QuadtreeNode(
             region=region,
             depth=depth,
             path=path.copy(),
-            complexity=self.complexity_estimator.compute(region, cache)
+            complexity=complexity_estimator.compute(region, cache)
         )
         
         # Termination conditions
@@ -653,7 +1053,7 @@ class BalancedGreedySplitter(BaseAdaptiveSplitter):
         for q in range(4):
             sub_region = region.get_quadrant(q)
             sub_leaves = self._greedy_split(
-                sub_region, depth + 1, path + [q], cache
+                sub_region, depth + 1, path + [q], cache, complexity_estimator
             )
             leaves.extend(sub_leaves)
         
@@ -663,7 +1063,8 @@ class BalancedGreedySplitter(BaseAdaptiveSplitter):
         self,
         leaves: List[QuadtreeNode],
         cache: IntegralImageCache,
-        image_size: int
+        image_size: int,
+        complexity_estimator: ComplexityEstimator,
     ) -> List[QuadtreeNode]:
         """
         Enforce 2:1 balance constraint.
@@ -701,7 +1102,7 @@ class BalancedGreedySplitter(BaseAdaptiveSplitter):
                             region=sub_region,
                             depth=node.depth + 1,
                             path=node.path + [q],
-                            complexity=self.complexity_estimator.compute(
+                            complexity=complexity_estimator.compute(
                                 sub_region, cache
                             )
                         )
@@ -750,7 +1151,8 @@ class BalancedGreedySplitter(BaseAdaptiveSplitter):
         self,
         leaves: List[QuadtreeNode],
         cache: IntegralImageCache,
-        image_size: int
+        image_size: int,
+        complexity_estimator: Optional[ComplexityEstimator] = None,
     ) -> List[QuadtreeNode]:
         """
         Soft constraint to nudge token count toward target.
@@ -809,12 +1211,16 @@ class FixedBudgetDPSplitter(BaseAdaptiveSplitter):
         )
         sorter = HilbertTokenSorter(H)
         
+        # 初始化复杂度估计器 (传入 root_area 用于深度感知归一化)
+        root_area = H * W
+        complexity_estimator = self._get_complexity_estimator(root_area)
+        
         # Step 1: Build complete quadtree
         root_region = Region(0, 0, W, H)
-        root = self._build_complete_tree(root_region, 0, [], cache)
+        root = self._build_complete_tree(root_region, 0, [], cache, complexity_estimator)
         
         # Step 2: Compute importance scores
-        self._compute_importance(root, cache)
+        self._compute_importance(root, cache, complexity_estimator)
         
         # Step 3: DP selection
         budget = self.config.token_budget
@@ -840,14 +1246,15 @@ class FixedBudgetDPSplitter(BaseAdaptiveSplitter):
         region: Region,
         depth: int,
         path: List[int],
-        cache: IntegralImageCache
+        cache: IntegralImageCache,
+        complexity_estimator: ComplexityEstimator,
     ) -> QuadtreeNode:
         """Build complete quadtree to max_depth."""
         node = QuadtreeNode(
             region=region,
             depth=depth,
             path=path.copy(),
-            complexity=self.complexity_estimator.compute(region, cache)
+            complexity=complexity_estimator.compute(region, cache)
         )
         
         min_size = self.config.min_region_size
@@ -862,7 +1269,7 @@ class FixedBudgetDPSplitter(BaseAdaptiveSplitter):
             for q in range(4):
                 sub_region = region.get_quadrant(q)
                 child = self._build_complete_tree(
-                    sub_region, depth + 1, path + [q], cache
+                    sub_region, depth + 1, path + [q], cache, complexity_estimator
                 )
                 node.children.append(child)
         
@@ -871,7 +1278,8 @@ class FixedBudgetDPSplitter(BaseAdaptiveSplitter):
     def _compute_importance(
         self,
         node: QuadtreeNode,
-        cache: IntegralImageCache
+        cache: IntegralImageCache,
+        complexity_estimator: Optional[ComplexityEstimator] = None,
     ) -> None:
         """
         Compute importance score for each node.

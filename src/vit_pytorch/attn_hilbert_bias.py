@@ -48,6 +48,7 @@ bias_mode 选项:
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from typing import Literal, Optional, Tuple
 
 import torch
@@ -56,13 +57,82 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .constants import HILBERT_BIAS_SCALE, LEVEL_BIAS_SCALE
-from .utils import extract_depths
-from .fractal_path import VectorizedPathEncoder
+from .utils import extract_depths, normalize_levels_info
+from .embed_fractal_path import VectorizedPathEncoder
 
 BiasMode = Literal['lca', 'low_rank', 'hierarchical']
 
 
-class LowRankHilbertBias(nn.Module):
+class HilbertBiasBase(ABC, nn.Module):
+    """Hilbert Bias 抽象基类。
+    
+    统一处理 2D/3D levels_info 维度转换，子类只需实现核心计算逻辑。
+    
+    数学形式化
+    ----------
+    输入规范化:
+        L' = normalize(L)  where  L ∈ R^{(S, Info)} → L' ∈ R^{(1, S, Info)}
+                                  L ∈ R^{(B, S, Info)} → L' = L
+    
+    输出形状约定:
+        - 2D 输入 → (H, S, S) 输出
+        - 3D 输入 → (B, H, S, S) 输出
+    
+    设计原则 (P5-8):
+        内部统一使用 3D 格式 (B, S, Info) 处理，避免代码重复
+    """
+    
+    def forward(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+        """计算 Hilbert Bias。
+        
+        自动处理 2D/3D 输入，维护输出形状兼容性。
+        
+        Args:
+            levels_info: 层级信息张量
+                - 2D: (S, Info) 单样本格式
+                - 3D: (B, S, Info) 批量格式
+            
+        Returns:
+            偏置矩阵:
+                - 2D 输入 → (H, S, S)
+                - 3D 输入 → (B, H, S, S)
+            若输入无效则返回 None
+        """
+        if levels_info.numel() == 0:
+            return None
+        
+        # 记录原始维度以决定输出形状
+        was_2d = levels_info.dim() == 2
+        
+        # 统一规范化为 3D: (B, S, Info)
+        levels_info_3d = normalize_levels_info(levels_info)
+        
+        # 调用子类实现的核心计算
+        bias = self._compute_bias_3d(levels_info_3d)
+        
+        if bias is None:
+            return None
+        
+        # 若原始输入为 2D，移除 batch 维度: (B, H, S, S) → (H, S, S)
+        if was_2d:
+            bias = bias.squeeze(0)
+        
+        return bias
+    
+    @abstractmethod
+    def _compute_bias_3d(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+        """核心计算逻辑（子类实现）。
+        
+        Args:
+            levels_info: 规范化后的 3D 张量 (B, S, Info)
+            
+        Returns:
+            偏置矩阵 (B, H, S, S) 或 None
+        """
+        ...
+
+
+class LowRankHilbertBias(HilbertBiasBase):
     """低秩分解的 Hilbert Bias 实现。
     
     使用两个独立的路径编码器，将 O(S²) 的偏置矩阵分解为 O(S×r) 的低秩形式。
@@ -145,59 +215,36 @@ class LowRankHilbertBias(nn.Module):
                 self._truncation_warned = True
             return paths[..., :self.path_dim]
     
-    def forward(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
-        """计算低秩 Hilbert Bias。
+    def _compute_bias_3d(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+        """计算低秩 Hilbert Bias（核心 3D 实现）。
         
         Args:
-            levels_info: (B, S, Info) 层级信息
+            levels_info: (B, S, Info) 规范化后的层级信息
             
         Returns:
             (B, H, S, S) 偏置矩阵，若无效则返回 None
         """
-        if levels_info.numel() == 0:
+        batch_size, seq_len, info_dim = levels_info.shape
+        if info_dim <= 1:
             return None
         
-        if levels_info.dim() == 2:
-            # 旧格式: (S, Info)
-            if levels_info.shape[1] <= 1:
-                return None
-            paths = levels_info[:, 1:].float()  # (S, Path)
-            # 调整路径维度以匹配模型
-            paths = self._adjust_path_dim(paths)
-            
-            # 编码路径
-            phi = self.path_encoder_q(paths)  # (S, rank*H)
-            psi = self.path_encoder_k(paths)  # (S, rank*H)
-            
-            phi = phi.view(-1, self.heads, self.rank)  # (S, H, r)
-            psi = psi.view(-1, self.heads, self.rank)  # (S, H, r)
-            
-            # 低秩矩阵乘法: bias[i,j] = φ[i] · ψ[j]^T
-            bias = torch.einsum('ihr,jhr->hij', phi, psi)  # (H, S, S)
-            return bias
-        else:
-            # 新格式: (B, S, Info)
-            batch_size, seq_len, info_dim = levels_info.shape
-            if info_dim <= 1:
-                return None
-            
-            paths = levels_info[:, :, 1:].float()  # (B, S, Path)
-            # 调整路径维度以匹配模型
-            paths = self._adjust_path_dim(paths)
-            
-            # 编码路径
-            phi = self.path_encoder_q(paths)  # (B, S, rank*H)
-            psi = self.path_encoder_k(paths)  # (B, S, rank*H)
-            
-            phi = phi.view(batch_size, seq_len, self.heads, self.rank)  # (B, S, H, r)
-            psi = psi.view(batch_size, seq_len, self.heads, self.rank)  # (B, S, H, r)
-            
-            # 低秩矩阵乘法
-            bias = torch.einsum('bihr,bjhr->bhij', phi, psi)  # (B, H, S, S)
-            return bias
+        paths = levels_info[:, :, 1:].float()  # (B, S, Path)
+        # 调整路径维度以匹配模型
+        paths = self._adjust_path_dim(paths)
+        
+        # 编码路径
+        phi = self.path_encoder_q(paths)  # (B, S, rank*H)
+        psi = self.path_encoder_k(paths)  # (B, S, rank*H)
+        
+        phi = phi.view(batch_size, seq_len, self.heads, self.rank)  # (B, S, H, r)
+        psi = psi.view(batch_size, seq_len, self.heads, self.rank)  # (B, S, H, r)
+        
+        # 低秩矩阵乘法
+        bias = torch.einsum('bihr,bjhr->bhij', phi, psi)  # (B, H, S, S)
+        return bias
 
 
-class HierarchicalHilbertBias(nn.Module):
+class HierarchicalHilbertBias(HilbertBiasBase):
     """分层计算的 Hilbert Bias 实现。
     
     利用四叉树的层级结构，将偏置分解为各层的贡献之和。
@@ -234,75 +281,44 @@ class HierarchicalHilbertBias(nn.Module):
             for _ in range(max_depth)
         ])
     
-    def forward(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
-        """计算分层 Hilbert Bias。
+    def _compute_bias_3d(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+        """计算分层 Hilbert Bias（核心 3D 实现）。
         
         Args:
-            levels_info: (B, S, Info) 层级信息
+            levels_info: (B, S, Info) 规范化后的层级信息
             
         Returns:
             (B, H, S, S) 偏置矩阵，若无效则返回 None
         """
-        if levels_info.numel() == 0:
+        batch_size, seq_len, info_dim = levels_info.shape
+        if info_dim <= 1:
             return None
         
-        if levels_info.dim() == 2:
-            # 旧格式: (S, Info)
-            if levels_info.shape[1] <= 1:
-                return None
-            paths = levels_info[:, 1:].long()  # (S, Path)
-            seq_len, path_len = paths.shape
+        paths = levels_info[:, :, 1:].long()  # (B, S, Path)
+        path_len = paths.shape[-1]
+        
+        bias = torch.zeros(batch_size, self.heads, seq_len, seq_len, device=paths.device)
+        
+        # 逐层累加偏置
+        for level in range(min(path_len, len(self.layer_nets))):
+            q = paths[:, :, level]  # (B, S)
             
-            bias = torch.zeros(self.heads, seq_len, seq_len, device=paths.device)
+            # 计算特征 (向量化)
+            same_quad = (q.unsqueeze(2) == q.unsqueeze(1)).float()  # (B, S, S)
+            quad_diff = (q.unsqueeze(2) - q.unsqueeze(1)).abs().float()  # (B, S, S)
+            q_i = q.unsqueeze(2).expand(batch_size, seq_len, seq_len).float()  # (B, S, S)
+            q_j = q.unsqueeze(1).expand(batch_size, seq_len, seq_len).float()  # (B, S, S)
             
-            # 逐层累加偏置
-            for level in range(min(path_len, len(self.layer_nets))):
-                q = paths[:, level]  # (S,)
-                
-                # 计算特征
-                same_quad = (q.unsqueeze(0) == q.unsqueeze(1)).float()  # (S, S)
-                quad_diff = (q.unsqueeze(0) - q.unsqueeze(1)).abs().float()  # (S, S)
-                q_i = q.unsqueeze(1).expand(seq_len, seq_len).float()  # (S, S)
-                q_j = q.unsqueeze(0).expand(seq_len, seq_len).float()  # (S, S)
-                
-                context = torch.stack([same_quad, quad_diff, q_i, q_j], dim=-1)  # (S, S, 4)
-                
-                # 通过第 level 层网络
-                layer_bias = self.layer_nets[level](context)  # (S, S, H)
-                bias += layer_bias.permute(2, 0, 1)  # (H, S, S)
+            context = torch.stack([same_quad, quad_diff, q_i, q_j], dim=-1)  # (B, S, S, 4)
             
-            return bias
-        else:
-            # 新格式: (B, S, Info)
-            batch_size, seq_len, info_dim = levels_info.shape
-            if info_dim <= 1:
-                return None
-            
-            paths = levels_info[:, :, 1:].long()  # (B, S, Path)
-            path_len = paths.shape[-1]
-            
-            bias = torch.zeros(batch_size, self.heads, seq_len, seq_len, device=paths.device)
-            
-            # 逐层累加偏置
-            for level in range(min(path_len, len(self.layer_nets))):
-                q = paths[:, :, level]  # (B, S)
-                
-                # 计算特征 (向量化)
-                same_quad = (q.unsqueeze(2) == q.unsqueeze(1)).float()  # (B, S, S)
-                quad_diff = (q.unsqueeze(2) - q.unsqueeze(1)).abs().float()  # (B, S, S)
-                q_i = q.unsqueeze(2).expand(batch_size, seq_len, seq_len).float()  # (B, S, S)
-                q_j = q.unsqueeze(1).expand(batch_size, seq_len, seq_len).float()  # (B, S, S)
-                
-                context = torch.stack([same_quad, quad_diff, q_i, q_j], dim=-1)  # (B, S, S, 4)
-                
-                # 通过第 level 层网络
-                layer_bias = self.layer_nets[level](context)  # (B, S, S, H)
-                bias += layer_bias.permute(0, 3, 1, 2)  # (B, H, S, S)
-            
-            return bias
+            # 通过第 level 层网络
+            layer_bias = self.layer_nets[level](context)  # (B, S, S, H)
+            bias += layer_bias.permute(0, 3, 1, 2)  # (B, H, S, S)
+        
+        return bias
 
 
-class LCAHilbertBias(nn.Module):
+class LCAHilbertBias(HilbertBiasBase):
     """基于最近公共祖先 (LCA) 的 Hilbert Bias 实现。
     
     数学原理
@@ -381,54 +397,8 @@ class LCAHilbertBias(nn.Module):
                 torch.randn_like(self.lca_embedding.weight) * 0.02
             )
     
-    def forward(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
-        """计算基于 LCA 的 Hilbert Bias。
-        
-        Args:
-            levels_info: 层级信息张量
-                - 旧格式: (S, Info) 其中 Info = [depth, q1, q2, ...]
-                - 新格式: (B, S, Info)
-            
-        Returns:
-            偏置矩阵:
-                - 旧格式: (H, S, S)
-                - 新格式: (B, H, S, S)
-            若输入无效则返回 None
-        """
-        if levels_info.numel() == 0:
-            return None
-        
-        if levels_info.dim() == 2:
-            return self._forward_2d(levels_info)
-        else:
-            return self._forward_3d(levels_info)
-    
-    def _forward_2d(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
-        """处理 2D 输入 (S, Info)。
-        
-        注意: 2D 情况通常是单样本，不使用缓存（批量缓存收益低）
-        """
-        seq_len, info_dim = levels_info.shape
-        if info_dim <= 1:
-            return None
-        
-        # 提取四叉树路径: (S, Path)
-        paths = levels_info[:, 1:].long()
-        
-        # 计算 LCA 深度矩阵: (S, S)
-        lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
-        
-        # 裁剪到有效范围
-        lca_depths = lca_depths.clamp(0, self.max_depth)
-        
-        # 查表得到偏置: (S, S, H)
-        bias = self.lca_embedding(lca_depths)
-        
-        # 调整形状: (H, S, S)
-        return bias.permute(2, 0, 1)
-    
-    def _forward_3d(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
-        """处理 3D 输入 (B, S, Info)，使用批量向量化计算。
+    def _compute_bias_3d(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+        """计算基于 LCA 的 Hilbert Bias（核心 3D 实现）。
         
         数学形式:
             LCA[b,i,j] = sum_d prod_{k<=d} 1[p_i[k] = p_j[k]]
@@ -440,6 +410,12 @@ class LCAHilbertBias(nn.Module):
             - 理论加速: 6层时约 6x
         
         复杂度: O(B·N²·D) 但无 Python 循环开销
+        
+        Args:
+            levels_info: (B, S, Info) 规范化后的层级信息
+            
+        Returns:
+            (B, H, S, S) 偏置矩阵，若无效则返回 None
         """
         batch_size, seq_len, info_dim = levels_info.shape
         if info_dim <= 1:

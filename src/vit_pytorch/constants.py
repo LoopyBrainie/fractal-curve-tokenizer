@@ -49,7 +49,7 @@ HILBERT_BIAS_SCALE: float = 0.1
 #: 层级偏置的缩放因子
 LEVEL_BIAS_SCALE: float = 0.05
 
-#: 全局上下文的缩放因子
+#: 全局上下文的缩放因子 [已废弃: ARCH-R1 删除了 global_context_attn]
 GLOBAL_CONTEXT_SCALE: float = 0.1
 
 # ==================== 数值稳定性常量 ====================

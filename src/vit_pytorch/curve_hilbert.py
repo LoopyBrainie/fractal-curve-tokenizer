@@ -82,7 +82,7 @@ class HilbertCurve:
     }
 
     @staticmethod
-    @_dynamo_safe_lru_cache(maxsize=1024)
+    @_dynamo_safe_lru_cache(maxsize=4096)
     def xy_to_d(n: int, x: int, y: int) -> int:
         """
         将 2D 坐标转换为 Hilbert 曲线距离
@@ -114,7 +114,7 @@ class HilbertCurve:
         return d
 
     @staticmethod
-    @_dynamo_safe_lru_cache(maxsize=1024)
+    @_dynamo_safe_lru_cache(maxsize=4096)
     def d_to_xy(n: int, d: int) -> Tuple[int, int]:
         """
         将 Hilbert 曲线距离转换为 2D 坐标

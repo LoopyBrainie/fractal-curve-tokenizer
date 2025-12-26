@@ -35,8 +35,8 @@ import torch
 import torch._dynamo
 import torch.nn as nn
 
-from .fractal_config import FractalConfig
-from .hilbert import HilbertCurve
+from .config_fractal import FractalConfig
+from .curve_hilbert import HilbertCurve
 
 
 # 创建兼容 torch.compile 的缓存装饰器

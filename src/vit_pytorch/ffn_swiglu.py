@@ -15,6 +15,18 @@ SwiGLU FFN (LLaMA/PaLM 风格):
     - Adapter 是小型 MLP
     - [;] 表示拼接
 
+复杂度分析
+----------
+SwiGLUFFN:
+    时间: O(B · N · D · D_ff)  — 3次矩阵乘法 (W_gate, W_value, W_out)
+    空间: O(B · N · D_ff)      — gate/value 中间张量
+    
+AdaptiveFractalFeedForward (with level adaptation):
+    时间: O(B · N · D · D_ff) + O(B · N · D)  — FFN + Level Adapter
+    空间: O(B · N · D_ff) + O(L_max · D)      — 中间张量 + level embedding
+
+其中: B=batch, N=seq_len, D=dim, D_ff=hidden_dim (SwiGLU: 2/3 × hidden_dim)
+
 类对照表
 ----------
 +---------------------------+------------------------------------------+
@@ -116,6 +128,7 @@ class AdaptiveFractalFeedForward(nn.Module):
         max_level: Maximum hierarchical level for embeddings.
         use_level_adaptation: Whether to use level-aware adaptation (only for 'gelu').
         ffn_type: FFN variant to use ('gelu', 'swiglu', 'swiglu_level').
+        bias: Whether to use bias in linear layers (default: False for SwiGLU).
     """
 
     def __init__(
@@ -126,6 +139,7 @@ class AdaptiveFractalFeedForward(nn.Module):
         max_level: int = 50,
         use_level_adaptation: bool = True,
         ffn_type: FFNType = 'swiglu_level',
+        bias: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -148,7 +162,7 @@ class AdaptiveFractalFeedForward(nn.Module):
             # SwiGLU: dim -> swiglu_hidden * 3 线性层 (3 * dim * swiglu_hidden 参数)
             # 为匹配参数量: swiglu_hidden = hidden_dim * 2 / 3
             swiglu_hidden = (hidden_dim * 2) // 3
-            self.swiglu = SwiGLUFFN(dim, swiglu_hidden, dropout)
+            self.swiglu = SwiGLUFFN(dim, swiglu_hidden, dropout, bias=bias)
             self.main_net = None
         else:
             # 原始 GELU FFN

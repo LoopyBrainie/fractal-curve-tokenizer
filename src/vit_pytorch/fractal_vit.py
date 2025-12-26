@@ -26,13 +26,8 @@ Tokenizer 选项
 +---------------+-------------------------------+------------------+
 | tokenizer_type| 实现                           | 特点              |
 +===============+===============================+==================+
-| streaming_v3  | StreamingFractalTokenizerV3   | Cross-Scale      |
-|               |                               | Attention (推荐) |
-+---------------+-------------------------------+------------------+
-| streaming_v2  | StreamingFractalTokenizerV2   | Gumbel-Softmax   |
-|               |                               | (已弃用)          |
-+---------------+-------------------------------+------------------+
-| streaming     | StreamingFractalTokenizer     | 固定多尺度        |
+| streaming_v3  | StreamingFractalTokenizerV3   | Variable Depth   |
+|               |                               | Tokens (推荐)    |
 +---------------+-------------------------------+------------------+
 """
 
@@ -45,17 +40,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .positional import FractalPositionEmbedding
-from .streaming_tokenizer import (
-    StreamingFractalTokenizer,
-    StreamingFractalTokenizerV3,
-)
+from .streaming_tokenizer import StreamingFractalTokenizerV3
 from .tokenization import BaseTokenizer, TokenizerOutput
 from .transformer import FractalTransformer, FFNType
 from .utils import pair
 
 
 # Tokenizer 类型定义
-TokenizerType = Literal["streaming", "streaming_v3"]
+TokenizerType = Literal["streaming_v3"]
 
 
 class FractalCurveViT(nn.Module):
@@ -132,9 +124,7 @@ class FractalCurveViT(nn.Module):
             ffn_type: FFN 变体 ('gelu', 'swiglu', 'swiglu_level')
             tokenizer: 自定义 tokenizer（可选，若提供则忽略 tokenizer_type）
             position_embedding: 自定义位置编码（可选）
-            tokenizer_type: tokenizer 类型选择
-                - "streaming": StreamingFractalTokenizer (固定多尺度)
-                - "streaming_v3": StreamingFractalTokenizerV3 (Variable Depth, 推荐)
+            tokenizer_type: tokenizer 类型 ("streaming_v3" - Variable Depth Tokens)
             num_scales: 多尺度金字塔层数
             hilbert_bias_mode: Hilbert Bias 计算模式
                 - 'lca': LCA 嵌入表（推荐，~40参数，显式几何意义）
@@ -162,17 +152,6 @@ class FractalCurveViT(nn.Module):
         if tokenizer is not None:
             # 用户提供自定义 tokenizer，直接使用
             pass
-        elif tokenizer_type == "streaming":
-            # 构造多尺度 patch_sizes: 从 min_patch_size 起倍增
-            base_ps = min_patch_size[0]
-            patch_sizes_tuple = tuple(base_ps * (2 ** i) for i in range(num_scales))
-            tokenizer = StreamingFractalTokenizer(
-                image_size=self.image_size,
-                channels=channels,
-                d_model=dim,
-                patch_sizes=patch_sizes_tuple,
-                max_level=max_level,
-            )
         elif tokenizer_type == "streaming_v3":
             base_ps = min_patch_size[0]
             max_depth_v3 = num_scales - 1  # num_scales 个尺度对应 max_depth = num_scales - 1
@@ -184,7 +163,7 @@ class FractalCurveViT(nn.Module):
                 max_depth=max_depth_v3,
             )
         else:
-            raise ValueError(f"Unknown tokenizer_type: {tokenizer_type}")
+            raise ValueError(f"Unknown tokenizer_type: {tokenizer_type}. Use 'streaming_v3'.")
 
         # 允许外部访问统一接口
         self.tokenizer = tokenizer
@@ -210,6 +189,18 @@ class FractalCurveViT(nn.Module):
         # CLS token和dropout
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
         self.dropout = nn.Dropout(emb_dropout)
+        
+        # 混合池化选择器 (用于 pool 不是 'cls' 或 'mean' 时)
+        # 输入: [B, D, N]，输出: [B, 2] 表示 (cls_weight, mean_weight)
+        self.pooling_selector = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),  # [B, D, 1]
+            nn.Flatten(),              # [B, D]
+            nn.Linear(dim, 2),
+            nn.Softmax(dim=-1),
+        )
+        
+        # 策略梯度损失权重 (保留接口兼容性，实际值为0因为使用Gumbel-Softmax)
+        self.register_buffer("aux_loss_weight", torch.tensor(0.0))
 
         # 分形Transformer
         self.transformer = FractalTransformer(
@@ -236,6 +227,46 @@ class FractalCurveViT(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(mlp_dim // 2, num_classes),
         )
+        
+        # 权重初始化 - 关键改进，防止类别偏差
+        self._init_weights()
+
+    def _init_weights(self):
+        """初始化权重 - 遵循 ViT 标准初始化"""
+        # CLS token: 使用较小的标准差
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        
+        # 分类头：使用较小的标准差初始化，最后一层更小
+        for module in self.mlp_head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.trunc_normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+        
+        # 最后一层（分类层）使用更小的标准差
+        for module in reversed(list(self.mlp_head.modules())):
+            if isinstance(module, nn.Linear):
+                nn.init.trunc_normal_(module.weight, std=0.01)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                break
+        
+        # Transformer 层权重初始化
+        self._init_transformer_weights()
+    
+    def _init_transformer_weights(self):
+        """初始化 Transformer 层的权重"""
+        for module in self.transformer.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.trunc_normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
 
     # 禁用 torch.compile 以支持可变长度 tokens
     @torch._dynamo.disable

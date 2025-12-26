@@ -1,0 +1,94 @@
+# -*- coding: utf-8 -*-
+"""
+多尺度 Patch 编码器
+
+数学形式化
+============
+
+多尺度卷积金字塔:
+    F_s = Conv_s(I), s ∈ {1, ..., S}
+    每个尺度: kernel_size = stride = patch_size_s
+
+输出:
+    {patch_size: (features [B, D, H/ps, W/ps], grid_shape)}
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Tuple
+
+import torch
+import torch.nn as nn
+
+
+class MultiScalePatchEncoder(nn.Module):
+    """多尺度 Patch 编码器.
+    
+    使用不同大小的卷积核提取多尺度特征，替代 BFS 递归分割。
+    每个尺度独立处理，最后融合。
+    
+    Args:
+        channels: 输入图像通道数
+        d_model: 输出嵌入维度
+        patch_sizes: 支持的 patch 大小列表
+    """
+    
+    def __init__(
+        self,
+        channels: int = 3,
+        d_model: int = 256,
+        patch_sizes: Tuple[int, ...] = (4, 8, 16),
+    ) -> None:
+        super().__init__()
+        self.channels = channels
+        self.d_model = d_model
+        self.patch_sizes = patch_sizes
+        self.num_scales = len(patch_sizes)
+        
+        # 每个尺度的编码器
+        # 使用 Conv2d: kernel_size = stride = patch_size
+        self.encoders = nn.ModuleDict({
+            f"scale_{ps}": nn.Sequential(
+                nn.Conv2d(channels, d_model // 2, kernel_size=ps, stride=ps),
+                nn.BatchNorm2d(d_model // 2),
+                nn.GELU(),
+                nn.Conv2d(d_model // 2, d_model, kernel_size=1),
+                nn.BatchNorm2d(d_model),
+            )
+            for ps in patch_sizes
+        })
+        
+        # 尺度级别嵌入
+        self.scale_embedding = nn.Embedding(self.num_scales, d_model)
+        
+    def forward(
+        self,
+        images: torch.Tensor,
+    ) -> Dict[int, Tuple[torch.Tensor, Tuple[int, int]]]:
+        """提取多尺度特征.
+        
+        Args:
+            images: [B, C, H, W] 输入图像
+            
+        Returns:
+            features_dict: {patch_size: (features, (grid_h, grid_w))}
+                - features: [B, D, grid_h, grid_w]
+        """
+        B, C, H, W = images.shape
+        features_dict = {}
+        
+        for scale_idx, ps in enumerate(self.patch_sizes):
+            # 检查图像是否足够大
+            if H >= ps and W >= ps:
+                feat = self.encoders[f"scale_{ps}"](images)  # [B, D, H/ps, W/ps]
+                grid_h, grid_w = feat.shape[2], feat.shape[3]
+                
+                # 添加尺度嵌入
+                scale_emb = self.scale_embedding(
+                    torch.tensor([scale_idx], device=images.device)
+                )  # [1, D]
+                feat = feat + scale_emb.view(1, -1, 1, 1)
+                
+                features_dict[ps] = (feat, (grid_h, grid_w))
+        
+        return features_dict
