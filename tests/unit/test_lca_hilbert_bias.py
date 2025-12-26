@@ -39,8 +39,9 @@ class TestLCAHilbertBiasBasic:
     def test_parameter_count(self, lca_bias):
         """参数量测试 - 验证参数量极少"""
         num_params = sum(p.numel() for p in lca_bias.parameters())
-        # 参数量 = (max_depth + 1) * heads = 9 * 4 = 36
-        assert num_params == 36
+        # 参数量 = (max_depth + 1) * heads + heads (温度参数) = 9 * 4 + 4 = 40
+        # P6-2: 新增 per-head 可学习温度参数
+        assert num_params == 40
         
         # 与 LowRankHilbertBias 对比
         low_rank = LowRankHilbertBias(path_dim=16, rank=32, heads=4)
@@ -312,7 +313,8 @@ class TestEdgeCases:
     
     def test_single_token(self):
         """单 token 测试"""
-        lca_bias = LCAHilbertBias(max_depth=4, heads=2)
+        # 使用 lca_temperature=None 禁用温度缩放，以便精确验证
+        lca_bias = LCAHilbertBias(max_depth=4, heads=2, lca_temperature=None)
         
         levels_info = torch.randint(0, 4, (1, 5))
         levels_info[0, 0] = 4
@@ -327,7 +329,8 @@ class TestEdgeCases:
     
     def test_max_depth_exceeded(self):
         """超过最大深度测试"""
-        lca_bias = LCAHilbertBias(max_depth=4, heads=2)
+        # 使用 lca_temperature=None 禁用温度缩放，以便验证范围
+        lca_bias = LCAHilbertBias(max_depth=4, heads=2, lca_temperature=None)
         
         # 创建路径长度超过 max_depth 的情况
         levels_info = torch.randint(0, 4, (4, 10))  # 9 层路径
