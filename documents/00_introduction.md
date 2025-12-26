@@ -30,26 +30,26 @@ $$I \xrightarrow{T} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{Transform
 - $T \in \mathbb{R}^{B \times N \times D}$: Token 嵌入
 - $L \in \mathbb{Z}^{B \times N \times \text{Info}}$: 层级信息 (深度 + 四叉树路径)
 
-## 1.3 模块映射 (v0.6.0+)
+## 1.3 模块映射 (v0.8.0+)
 
 | 层级          | 模块  | 对应文件                     | 核心功能                                                    |
 |:----------- |:--- |:------------------------ |:------------------------------------------------------- |
-| **Layer 4** | 应用层 | `vit.py`                 | `FractalCurveViT`                              |
-| **Layer 3** | 管道层 | `streaming_tokenizer.py` | `StreamingFractalTokenizerV3` (✅ 推荐), `StreamingFractalTokenizer` (V1) |
-|             |     | `transformer.py`         | `FractalTransformer`                                    |
-| **Layer 2** | 组件层 | `attention.py`           | `HilbertAwareMultiScaleAttention`, **`LCAHilbertBias`** |
-|             |     | `adaptive_split.py`      | `BalancedGreedySplitter`, `FixedBudgetDPSplitter`       |
-|             |     | `patch_embed.py`         | `HilbertNativePatchEmbed`                               |
-|             |     | `feedforward.py`         | `SwiGLUFFN`, `AdaptiveFractalFeedForward`               |
-|             |     | `positional.py`          | `FractalPositionEmbedding`                              |
-| **Layer 1** | 基础层 | `hilbert.py`             | `HilbertCurve`, `PseudoHilbertCurve`                    |
-|             |     | `fractal_config.py`      | **`FractalConfig`** (统一配置)                              |
-|             |     | `fractal_path.py`        | `VectorizedPathEncoder`                                 |
-|             |     | `tokenization.py`        | `BaseTokenizer`, `TokenizerOutput`                      |
+| **Layer 4** | 应用层 | `model_fractal_vit.py`   | `FractalCurveViT`                                       |
+| **Layer 3** | 管道层 | `tokenizer_streaming.py` | `StreamingFractalTokenizerV3` (✅ 唯一支持)                |
+|             |     | `block_transformer.py`   | `FractalTransformer`                                    |
+| **Layer 2** | 组件层 | `attn_hilbert_bias.py`   | `HilbertAwareMultiScaleAttention`, **`LCAHilbertBias`** |
+|             |     | `split_adaptive.py`      | `BalancedGreedySplitter`, `FixedBudgetDPSplitter`       |
+|             |     | `embed_hilbert_patch.py` | `HilbertNativePatchEmbed` + ROI-Align                   |
+|             |     | `ffn_swiglu.py`          | `SwiGLUFFN`, `AdaptiveFractalFeedForward`               |
+|             |     | `embed_fractal_position.py` | `FractalPositionEmbedding`                           |
+| **Layer 1** | 基础层 | `curve_hilbert.py`       | `HilbertCurve`, `PseudoHilbertCurve`                    |
+|             |     | `config_fractal.py`      | **`FractalConfig`** (统一配置)                              |
+|             |     | `embed_fractal_path.py`  | `VectorizedPathEncoder`                                 |
+|             |     | `base_tokenizer.py`      | `BaseTokenizer`, `TokenizerOutput`                      |
 |             |     | `constants.py`           | 超参数默认值                                                  |
 |             |     | `utils.py`               | 工具函数                                                    |
 
-> **注意**: V2 (Gumbel-Softmax) 已从代码库完全移除。
+> **注意**: V1 (`StreamingFractalTokenizer`) 和 V2 (Gumbel-Softmax) 已从代码库完全移除。当前仅支持 V3。
 
 ## 1.4 核心创新点
 

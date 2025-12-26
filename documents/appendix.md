@@ -108,7 +108,7 @@ classDiagram
 | `drop_path`      | 0.1           | 0.1            | DropPath 比率 (P0 修复: 0.2→0.1) |
 | `lr`             | 5e-4          | 1e-4           | 学习率                        |
 | `weight_decay`   | 0.03          | 0.03           | 权重衰减 (P0 修复: 0.05→0.03)   |
-| `tokenizer_type` | streaming_v3  | streaming_v3   | Tokenizer 类型 (✅ V3 推荐)      |
+| `tokenizer_type` | streaming_v3  | streaming_v3   | Tokenizer 类型 (仅 V3)          |
 | `bias_mode`      | lca           | lca            | Hilbert Bias 模式            |
 | `rank`           | 32            | 64             | Low-Rank 秩 (仅 low_rank 模式) |
 | `ffn_type`       | swiglu_level  | swiglu_level   | FFN 类型                     |
@@ -183,15 +183,14 @@ pos_emb = FractalPositionEmbedding(dim=384, max_level=50)
 ## E. 常用导入
 
 ```python
-# 推荐导入 (v0.7.0+)
+# 推荐导入 (v0.8.0+)
 from vit_pytorch import (
     # 配置
     FractalConfig,
     # 模型
     FractalCurveViT,
     # Tokenizer
-    StreamingFractalTokenizer,      # V1 固定尺度
-    StreamingFractalTokenizerV3,    # ✅ 推荐 (Variable Depth)
+    StreamingFractalTokenizerV3,    # ✅ 唯一支持 (Variable Depth)
     # 组件
     FractalTransformer,
     HilbertAwareMultiScaleAttention,
@@ -210,7 +209,7 @@ from vit_pytorch import (
 )
 ```
 
-> **注意**: V2 (Gumbel-Softmax) 已从代码库完全移除。CrossScaleAttention 已被 Variable Depth 架构替代。
+> **注意**: V1 (`StreamingFractalTokenizer`) 和 V2 (Gumbel-Softmax) 已从代码库完全移除。CrossScaleAttention 已被 Variable Depth 架构替代。
 
 ## F. 数学符号表
 

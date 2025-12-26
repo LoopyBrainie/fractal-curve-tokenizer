@@ -15,12 +15,11 @@ Streaming Tokenizer 实现端到端可微，无需额外辅助损失。
 
 ## 8.2 Tokenizer 类型选项
 
-| tokenizer_type | 实现类                           | 特点                          | 状态   |
-|:-------------- |:----------------------------- |:---------------------------- |:---- |
-| `streaming`    | `StreamingFractalTokenizer`   | 固定多尺度                       | ✅ 稳定 |
-| `streaming_v3` | `StreamingFractalTokenizerV3` | Variable Depth Tokens + 自适应四叉树 | ✅ **推荐** |
+| tokenizer_type   | 实现类                           | 特点                                    | 状态       |
+|:---------------- |:------------------------------- |:--------------------------------------- |:---------- |
+| `streaming_v3`   | `StreamingFractalTokenizerV3`   | Variable Depth Tokens + 自适应四叉树 + ROI-Align | ✅ **唯一选项** |
 
-> **注意**: V2 (Gumbel-Softmax) 已从代码库移除。
+> **注意**: V1 (`StreamingFractalTokenizer`) 和 V2 (Gumbel-Softmax) 已从代码库移除。当前仅支持 V3。
 
 ---
 
@@ -38,7 +37,7 @@ Streaming Tokenizer 实现端到端可微，无需额外辅助损失。
 | `mlp_dim`        | int           | dim × 4        | FFN 隐藏层维度 (P0 修复: 2×→4×)   |
 | `pool`           | str           | 'cls'          | 池化策略                       |
 | `dropout`        | float         | 0.1            | Dropout 比率 (P0 修复: 0.3→0.1) |
-| `tokenizer_type` | str           | 'streaming_v3' | Tokenizer 类型 (✅ V3 推荐)      |
+| `tokenizer_type` | str           | 'streaming_v3' | Tokenizer 类型 (仅 V3)          |
 | `variable_tokens`| bool          | False          | 可变 Token 模式 (P0 修复: True→False) |
 | `bias_mode`      | str           | 'lca'          | Hilbert Bias 模式 (推荐 'lca') |
 | `ffn_type`       | str           | 'swiglu_level' | FFN 类型                     |
@@ -199,7 +198,7 @@ Input Image (B, C, H, W)
 │ StreamingFractalTokenizerV3 │
 │ - AdaptiveQuadtreeSplit     │
 │ - HilbertNativePatchEmbed   │
-│ - HilbertIndexer            │
+│ - ROI-Align Pooling         │
 └─────────────────────────────┘
         │
         ▼

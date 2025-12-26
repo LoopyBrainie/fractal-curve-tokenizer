@@ -1,6 +1,6 @@
 # 第十一章：项目改进历史
 
-> **最后更新**: 2025年12月25日 | **状态**: ✅ 持续更新
+> **最后更新**: 2025年12月27日 | **状态**: ✅ 持续更新
 
 ## 11.1 快速概览
 
@@ -73,6 +73,7 @@
 - 已完全移除 `FractalHilbertTokenizer` 和 `EnhancedFractalTokenProcessor`
 - 已删除 `_deprecated/` 目录
 - 已删除 `StreamingFractalTokenizerV2` (Gumbel-Softmax 架构)
+- 已删除 `StreamingFractalTokenizer` (V1 固定尺度架构) ✅ 2025-12-27
 - 统一使用 Variable Depth Tokens 架构 (V3)
 
 ---
@@ -232,28 +233,27 @@
 
 ```
 Layer 4 (应用层):
-    vit.py                  FractalCurveViT (默认 V3-VD)
+    model_fractal_vit.py    FractalCurveViT (默认 V3-VD)
 
 Layer 3 (管道层):
-    streaming_tokenizer.py  StreamingFractalTokenizerV3 (✅ Variable Depth)
-                            StreamingFractalTokenizer   (V1 固定尺度)
-    transformer.py          FractalTransformer
+    tokenizer_streaming.py  StreamingFractalTokenizerV3 (✅ 唯一支持)
+    block_transformer.py    FractalTransformer
 
 Layer 2 (组件层):
-    attention.py            HilbertAwareMultiScaleAttention
-    patch_embed.py          HilbertNativePatchEmbed (✅ 新增)
-    adaptive_split.py       BalancedGreedySplitter, FixedBudgetDPSplitter (✅ 新增)
-    feedforward.py          SwiGLUFFN, AdaptiveFractalFeedForward
-    positional.py           FractalPositionEmbedding
+    attn_hilbert_bias.py    HilbertAwareMultiScaleAttention, LCAHilbertBias
+    embed_hilbert_patch.py  HilbertNativePatchEmbed (✅ ROI-Align)
+    split_adaptive.py       BalancedGreedySplitter, FixedBudgetDPSplitter
+    ffn_swiglu.py           SwiGLUFFN, AdaptiveFractalFeedForward
+    embed_fractal_position.py  FractalPositionEmbedding
 
 Layer 1 (基础层):
-    hilbert.py              HilbertCurve (H: d ↔ (x,y))
-    tokenization.py         BaseTokenizer, TokenizerOutput
+    curve_hilbert.py        HilbertCurve (H: d ↔ (x,y))
+    base_tokenizer.py       BaseTokenizer, TokenizerOutput
     constants.py            超参数默认值
     utils.py                工具函数
 ```
 
-> **注意**: V2 (Gumbel-Softmax) 已从代码库完全移除。
+> **注意**: V1 (`StreamingFractalTokenizer`) 和 V2 (Gumbel-Softmax) 已从代码库完全移除。当前仅支持 V3 (Variable Depth Tokens)。
 
 ---
 
@@ -350,7 +350,7 @@ Layer 1 (基础层):
 
 ---
 
-**项目状态**: ✅ 生产就绪 | **测试**: 278+ 通过 | **技术债务**: 0 项
+**项目状态**: ✅ 生产就绪 | **测试**: 283+ 通过 | **技术债务**: 0 项 | **Tokenizer**: 仅 V3
 
 ---
 
@@ -469,7 +469,8 @@ $$\text{Effective} = (1 - \text{dropout})^{2L} \times (1 - \text{drop\_path})^L$
 | **P2 代码质量** | **15** | **15** | ✅ **100%** |
 | **P3 维护性** | **18** | **18** | ✅ **100%** |
 | **Variable Depth Tokens** | **3** | **3** | ✅ **100%** |
-| **总计** | **76** | **81** | **94%** |
+| **V1 移除** | **1** | **1** | ✅ **100%** |
+| **总计** | **77** | **82** | **94%** |
 
 ---
 

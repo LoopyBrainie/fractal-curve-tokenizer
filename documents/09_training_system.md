@@ -37,7 +37,7 @@
 
 | 参数                 | 默认值            | 说明                         |
 |:------------------ |:-------------- |:-------------------------- |
-| `--tokenizer-type` | `streaming_v3` | Tokenizer 类型 (✅ V3 推荐)     |
+| `--tokenizer-type` | `streaming_v3` | Tokenizer 类型 (仅 V3)        |
 | `--bias-mode`      | `lca`          | Hilbert Bias 模式 (推荐)       |
 | `--ffn-type`       | `swiglu_level` | FFN 类型                     |
 | `--rank`           | 32             | Low-Rank 秩 (仅 low_rank 模式) |
@@ -221,8 +221,11 @@ python examples/training/train_fractal_vit.py \
     --dim 768 \
     --epochs 300
 
-# 使用 V1 Tokenizer (固定尺度)
+# 使用 CIFAR-10 数据集
 python examples/training/train_fractal_vit.py \
     --dataset cifar10 \
-    --tokenizer-type streaming \
+    --tokenizer-type streaming_v3 \
+    --bias-mode lca
 ```
+
+> **注意**: V1 (`--tokenizer-type streaming`) 已从代码库移除。当前仅支持 `streaming_v3`。
