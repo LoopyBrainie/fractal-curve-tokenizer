@@ -60,6 +60,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         target_tokens: 目标 token 数量 (仅 fixed_budget_dp)
         complexity_alpha: 复杂度函数中方差权重
         enforce_balance: 是否强制 2:1 平衡约束
+        depth_scale_range: (P6-1) 深度缩放范围 (σ_min, σ_max)，默认 (0.5, 2.0)
     """
     
     def __init__(
@@ -74,6 +75,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         target_tokens: Optional[int] = None,
         complexity_alpha: float = 0.5,
         enforce_balance: bool = True,
+        depth_scale_range: Optional[Tuple[float, float]] = (0.5, 2.0),
     ) -> None:
         super().__init__()
         
@@ -88,7 +90,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         self.use_hilbert_order = use_hilbert_order
         self.split_scheme = split_scheme
         
-        # Hilbert-Native Patch Embedding
+        # Hilbert-Native Patch Embedding (P6-1: 支持可学习深度缩放)
         from .embed_hilbert_patch import HilbertNativePatchEmbed
         self.patch_embed = HilbertNativePatchEmbed(
             channels=channels,
@@ -97,6 +99,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             max_depth=max_depth,
             conv_layers=2,
             use_batch_norm=True,
+            depth_scale_range=depth_scale_range,
         )
         
         # Adaptive Quadtree Splitter

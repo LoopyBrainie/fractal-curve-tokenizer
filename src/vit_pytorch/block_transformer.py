@@ -113,6 +113,8 @@ class FractalTransformerBlock(nn.Module):
         ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
         hilbert_bias_mode: Hilbert Bias mode ('lca', 'low_rank', 'hierarchical').
         low_rank_r: Rank for low-rank decomposition (only used when hilbert_bias_mode='low_rank').
+        lca_temperature: (P6-2) LCA bias temperature, default 1.5.
+        learnable_temperature: (P6-2) Whether temperature is learnable.
     """
 
     def __init__(
@@ -127,6 +129,8 @@ class FractalTransformerBlock(nn.Module):
         ffn_type: FFNType = 'swiglu_level',
         hilbert_bias_mode: str = 'lca',
         low_rank_r: int = 32,
+        lca_temperature: Optional[float] = 1.5,
+        learnable_temperature: bool = True,
     ):
         super().__init__()
         self.dim = dim
@@ -140,6 +144,8 @@ class FractalTransformerBlock(nn.Module):
             max_level=max_level,
             bias_mode=hilbert_bias_mode,
             low_rank_r=low_rank_r,
+            lca_temperature=lca_temperature,
+            learnable_temperature=learnable_temperature,
         )
 
         self.ff = AdaptiveFractalFeedForward(
@@ -307,6 +313,8 @@ class FractalTransformer(nn.Module):
         use_checkpoint: Whether to use gradient checkpointing (saves memory).
         hilbert_bias_mode: Hilbert Bias mode ('lca', 'low_rank', 'hierarchical').
         low_rank_r: Rank for low-rank decomposition.
+        lca_temperature: (P6-2) LCA bias temperature, default 1.5.
+        learnable_temperature: (P6-2) Whether temperature is learnable.
     """
 
     def __init__(
@@ -323,6 +331,8 @@ class FractalTransformer(nn.Module):
         use_checkpoint: bool = False,
         hilbert_bias_mode: str = 'lca',
         low_rank_r: int = 32,
+        lca_temperature: Optional[float] = 1.5,
+        learnable_temperature: bool = True,
     ):
         super().__init__()
         self.dim = dim
@@ -349,6 +359,8 @@ class FractalTransformer(nn.Module):
                     ffn_type=ffn_type,
                     hilbert_bias_mode=hilbert_bias_mode,
                     low_rank_r=low_rank_r,
+                    lca_temperature=lca_temperature,
+                    learnable_temperature=learnable_temperature,
                 )
                 for i in range(depth)
             ]

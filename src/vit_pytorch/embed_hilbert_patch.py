@@ -46,9 +46,26 @@ Variable Depth Token 的 Patch Embedding 必须满足 4 个约束:
     - depth_scale: D+1 ≈ 5
     - 总计: ~14K (vs 4.2M for Depth-Specific Conv)
 
+深度缩放范围 (P6-1 改进)
+==========================
+
+数学形式化:
+    σ_d = σ_min + (σ_max - σ_min) · sigmoid(γ_d)
+    
+    其中:
+    - σ_min = 0.5, σ_max = 2.0 (默认)
+    - γ_d 是可学习参数
+    - 动态范围: 4x (vs 原始 1.2x)
+    
+约束验证:
+    【C1 信息保持】σ_min ≥ 0.5 确保浅层至少保留 50% 信息
+    【C2 梯度稳定】σ_max ≤ 2.0 确保梯度放大不超过 2x
+    【C3 区分度】σ_max/σ_min = 4x 提供充足的深度区分能力
+
 Author: GitHub Copilot
 Date: 2025-12-25
 Updated: 2025-12-26 (向量化 ROI-Align 优化)
+Updated: 2025-12-26 (P6-1: depth_scale 可学习化)
 """
 
 from __future__ import annotations
@@ -87,7 +104,10 @@ class HilbertNativePatchEmbed(nn.Module):
         max_depth: 最大四叉树深度
         conv_layers: SharedConv 层数 (1-3)
         use_batch_norm: 是否使用 BatchNorm
-        depth_scale_beta: 深度缩放系数 β，决定 σ_d ∈ [1.0, 1.0+β]，默认 0.2
+        depth_scale_beta: [已废弃] 使用 depth_scale_range 替代
+        depth_scale_range: 深度缩放范围 (σ_min, σ_max)，使用 sigmoid 参数化
+                          默认 (0.5, 2.0) 提供 4x 动态范围
+                          设为 None 使用旧版固定初始化 (向后兼容)
     """
     
     def __init__(
@@ -99,6 +119,7 @@ class HilbertNativePatchEmbed(nn.Module):
         conv_layers: int = 2,
         use_batch_norm: bool = True,
         depth_scale_beta: float = 0.2,
+        depth_scale_range: Optional[Tuple[float, float]] = (0.5, 2.0),
     ) -> None:
         super().__init__()
         
@@ -107,6 +128,7 @@ class HilbertNativePatchEmbed(nn.Module):
         self.base_patch_size = base_patch_size
         self.max_depth = max_depth
         self.depth_scale_beta = depth_scale_beta
+        self.depth_scale_range = depth_scale_range
         
         # =====================================================================
         # SharedConv: 统一的特征提取器
@@ -145,26 +167,76 @@ class HilbertNativePatchEmbed(nn.Module):
         self.depth_embed = nn.Embedding(max_depth + 1, dim)
         
         # 深度缩放: 乘法因子，编码 region 的「信息密度」
-        # 初始化: 深层 (细粒度) 权重略大，浅层 (粗粒度) 权重略小
-        self.depth_scale = nn.Parameter(torch.ones(max_depth + 1))
-        self._init_depth_scale()
+        # P6-1 改进: 使用 sigmoid 参数化，扩展动态范围到 4x
+        if depth_scale_range is not None:
+            # 新版: 可学习 sigmoid 参数化
+            # σ_d = σ_min + (σ_max - σ_min) · sigmoid(γ_d)
+            self._depth_scale_raw = nn.Parameter(torch.zeros(max_depth + 1))
+            self._init_depth_scale_learnable()
+        else:
+            # 旧版: 固定线性初始化 (向后兼容)
+            self._depth_scale_raw = None
+            self._depth_scale_fixed = nn.Parameter(torch.ones(max_depth + 1))
+            self._init_depth_scale_legacy()
         
         # 层归一化 (可选，用于稳定训练)
         self.norm = nn.LayerNorm(dim)
     
-    def _init_depth_scale(self) -> None:
-        """初始化深度缩放因子.
+    def _init_depth_scale_learnable(self) -> None:
+        """初始化可学习深度缩放因子 (P6-1 改进).
         
-        数学依据:
-        - 深层 token 覆盖小区域，信息密度高 → 略大的权重
-        - 浅层 token 覆盖大区域，信息稀释 → 略小的权重
-        
-        初始化: σ_d = 1.0 + β * d / max_depth ∈ [1.0, 1.0+β]
-        默认 β=0.2，范围 [1.0, 1.2]，相比原 β=0.05 提升 4x 区分度
+        数学形式化:
+            σ_d = σ_min + (σ_max - σ_min) · sigmoid(γ_d)
+            
+        初始化策略:
+            保持与旧版语义一致 (1.0 → 1.0+β)，但允许学习到 [σ_min, σ_max]
+            
+        计算:
+            目标 σ_d = 1.0 + β·d/D_max
+            sigmoid(γ_d) = (σ_d - σ_min) / (σ_max - σ_min)
+            γ_d = logit(sigmoid_target)
         """
+        assert self.depth_scale_range is not None
+        sigma_min, sigma_max = self.depth_scale_range
+        
         with torch.no_grad():
             for d in range(self.max_depth + 1):
-                self.depth_scale[d] = 1.0 + self.depth_scale_beta * d / self.max_depth
+                # 目标值: 与旧版初始化一致
+                target_sigma = 1.0 + self.depth_scale_beta * d / self.max_depth
+                # 裁剪到有效范围
+                target_sigma = max(sigma_min + 0.01, min(sigma_max - 0.01, target_sigma))
+                # 计算 sigmoid 目标值
+                sigmoid_target = (target_sigma - sigma_min) / (sigma_max - sigma_min)
+                # 计算 logit (sigmoid 逆函数)
+                self._depth_scale_raw[d] = math.log(sigmoid_target / (1 - sigmoid_target))
+    
+    def _init_depth_scale_legacy(self) -> None:
+        """旧版初始化 (向后兼容).
+        
+        初始化: σ_d = 1.0 + β * d / max_depth ∈ [1.0, 1.0+β]
+        """
+        assert self._depth_scale_fixed is not None
+        with torch.no_grad():
+            for d in range(self.max_depth + 1):
+                self._depth_scale_fixed[d] = 1.0 + self.depth_scale_beta * d / self.max_depth
+    
+    @property
+    def depth_scale(self) -> torch.Tensor:
+        """获取深度缩放因子.
+        
+        P6-1 改进: 使用 sigmoid 参数化确保值在 [σ_min, σ_max] 范围内
+        
+        Returns:
+            shape: (max_depth + 1,) 的缩放因子张量
+        """
+        if self._depth_scale_raw is not None:
+            # 新版: sigmoid 参数化
+            assert self.depth_scale_range is not None
+            sigma_min, sigma_max = self.depth_scale_range
+            return sigma_min + (sigma_max - sigma_min) * torch.sigmoid(self._depth_scale_raw)
+        else:
+            # 旧版: 直接返回固定参数
+            return self._depth_scale_fixed
     
     def forward(
         self,

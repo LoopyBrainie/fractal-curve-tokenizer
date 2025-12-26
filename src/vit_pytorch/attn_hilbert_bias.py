@@ -332,13 +332,27 @@ class LCAHilbertBias(HilbertBiasBase):
     其中 N 是网格边长，ℓ 是 LCA 深度。
     
     偏置公式:
-        B[i,j] = LCAEmbed(LCA(i,j))
+        B[i,j] = τ_h · LCAEmbed(LCA(i,j))
         
-    其中 LCAEmbed: {0,1,...,D} → R^H 是可学习的嵌入表。
+    其中 LCAEmbed: {0,1,...,D} → R^H 是可学习的嵌入表，
+    τ_h 是 per-head 可学习温度参数。
+    
+    P6-2 改进: 可学习温度参数
+    =========================
+    问题: 原始 LCA 偏置范围 [0, 1]，相对 attention logit (σ≈1) 可能偏弱。
+    
+    解决方案: 引入 per-head 可学习温度 τ_h:
+        B'[h,i,j] = τ_h · LCAEmbed(LCA(i,j))
+    
+    数学分析:
+    - 信噪比: SNR = τ · ΔB / σ_logit = τ (当 ΔB=1, σ≈1)
+    - 默认 τ=1.5 提供 1.5σ 的空间先验，对应 e^1.5 ≈ 4.5x 注意力偏好
+    - 使用 softplus 确保 τ > 0: τ_h = softplus(γ_h)
+    - 初始化 γ_h = log(e^1.5 - 1) ≈ 1.176 使 τ_h ≈ 1.5
     
     复杂度分析
     ==========
-    - 参数量: O((D+1) × H) ≈ 128 (vs Low-Rank ~50K)
+    - 参数量: O((D+1) × H + H) ≈ 128 + 8 (vs Low-Rank ~50K)
     - 计算量: O(N² × D) 用于 LCA 计算 (P1-6: 支持缓存避免重复计算)
     - 显存: O(N²) 用于偏置矩阵
     
@@ -348,14 +362,27 @@ class LCAHilbertBias(HilbertBiasBase):
     2. 参数极少: ~100× 少于 Low-Rank
     3. 无需学习距离: 距离信息由编码结构直接提供
     4. 可解释性强: 偏置值可直接对应空间邻近程度
+    5. [P6-2] 自适应强度: 每个 head 可学习最优的空间偏好强度
     """
     
-    def __init__(self, max_depth: int, heads: int) -> None:
+    def __init__(
+        self, 
+        max_depth: int, 
+        heads: int,
+        lca_temperature: Optional[float] = 1.5,
+        learnable_temperature: bool = True,
+    ) -> None:
         """初始化 LCA Hilbert Bias。
         
         Args:
             max_depth: 最大四叉树深度 (决定 LCA 取值范围)
             heads: 注意力头数
+            lca_temperature: LCA 偏置温度参数初始值
+                - None: 不使用温度缩放 (兼容旧版，等效 τ=1)
+                - float: 温度初始值，推荐 1.5
+            learnable_temperature: 是否使温度可学习
+                - True: per-head 可学习温度 (推荐)
+                - False: 固定温度值
         """
         super().__init__()
         self.max_depth = max_depth
@@ -364,6 +391,12 @@ class LCAHilbertBias(HilbertBiasBase):
         # LCA 深度嵌入表: depth ∈ {0, 1, ..., max_depth} → R^heads
         # 深度 0 表示完全不同的根节点，深度 max_depth 表示相邻或相同
         self.lca_embedding = nn.Embedding(max_depth + 1, heads)
+        
+        # P6-2: 可学习温度参数
+        # 数学: τ_h = softplus(γ_h), 初始化使 τ_h ≈ lca_temperature
+        self._lca_temperature_init = lca_temperature
+        self._learnable_temperature = learnable_temperature
+        self._init_temperature(lca_temperature, learnable_temperature)
         
         # P1-6 优化: LCA 深度矩阵缓存
         # 同一个 levels_info 在不同 Transformer 层之间是相同的
@@ -374,6 +407,58 @@ class LCAHilbertBias(HilbertBiasBase):
         # 初始化: 深度越大（越邻近）偏置越高
         # 使用对数衰减初始化，符合 Hilbert 曲线的 √ 局部性
         self._init_weights()
+    
+    def _init_temperature(
+        self, 
+        lca_temperature: Optional[float], 
+        learnable: bool
+    ) -> None:
+        """初始化温度参数。
+        
+        P6-2 数学推导:
+        - 使用 softplus: τ = log(1 + exp(γ))
+        - 求逆: γ = log(exp(τ) - 1)
+        - 对于 τ=1.5: γ = log(e^1.5 - 1) ≈ 1.176
+        
+        Args:
+            lca_temperature: 目标温度值，None 表示禁用
+            learnable: 是否可学习
+        """
+        import math
+        
+        if lca_temperature is None:
+            # 兼容模式: 无温度缩放
+            self._lca_temp_raw: Optional[nn.Parameter] = None
+            self._lca_temp_fixed: Optional[float] = None
+        elif learnable:
+            # 可学习模式: per-head 温度
+            # 反推 softplus 初始值: γ = log(exp(τ) - 1)
+            init_raw = math.log(math.exp(lca_temperature) - 1)
+            self._lca_temp_raw = nn.Parameter(
+                torch.full((self.heads,), init_raw)
+            )
+            self._lca_temp_fixed = None
+        else:
+            # 固定模式
+            self._lca_temp_raw = None
+            self._lca_temp_fixed = lca_temperature
+    
+    @property
+    def lca_temperature(self) -> Optional[torch.Tensor]:
+        """获取当前 LCA 温度值。
+        
+        Returns:
+            (H,) 温度向量，若禁用则返回 None
+        """
+        if self._lca_temp_raw is not None:
+            # 可学习: softplus 确保正值
+            return F.softplus(self._lca_temp_raw)
+        elif self._lca_temp_fixed is not None:
+            # 固定值
+            return torch.tensor(self._lca_temp_fixed)
+        else:
+            # 禁用
+            return None
     
     def _init_weights(self) -> None:
         """初始化 LCA 嵌入权重。
@@ -445,6 +530,14 @@ class LCAHilbertBias(HilbertBiasBase):
         # 批量嵌入: (B, S, S, H)
         bias = self.lca_embedding(lca_depths)
         
+        # P6-2: 应用温度缩放
+        # 数学: B'[h,i,j] = τ_h · B[h,i,j]
+        temperature = self.lca_temperature
+        if temperature is not None:
+            # temperature: (H,) -> (1, 1, 1, H) for broadcasting
+            temp_scale = temperature.to(bias.device).view(1, 1, 1, -1)
+            bias = bias * temp_scale
+        
         # 调整形状: (B, H, S, S)
         return bias.permute(0, 3, 1, 2)
     
@@ -485,6 +578,8 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         use_level_scaling: bool = True,
         bias_mode: BiasMode = 'lca',
         low_rank_r: int = 32,
+        lca_temperature: Optional[float] = 1.5,
+        learnable_temperature: bool = True,
     ) -> None:
         """初始化 HilbertAwareMultiScaleAttention。
         
@@ -502,6 +597,10 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                 - 'hierarchical': 分层计算（可解释性强）
                 - 'lca': LCA 嵌入表（推荐，~100参数，显式几何意义）
             low_rank_r: 低秩分解的秩参数（仅当 bias_mode='low_rank' 时有效）
+            lca_temperature: (P6-2) LCA 偏置温度参数，默认 1.5
+                - None: 不使用温度缩放 (兼容模式)
+                - float: 温度初始值
+            learnable_temperature: (P6-2) 是否使温度可学习
         """
         super().__init__()
         self.heads = heads
@@ -523,6 +622,8 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                 self.hilbert_bias_impl: Optional[nn.Module] = LCAHilbertBias(
                     max_depth=max_level,
                     heads=heads,
+                    lca_temperature=lca_temperature,
+                    learnable_temperature=learnable_temperature,
                 )
             elif bias_mode == 'low_rank':
                 # 路径维度需要足够大以容纳实际的 levels_info

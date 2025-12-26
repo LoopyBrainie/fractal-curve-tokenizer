@@ -102,6 +102,9 @@ class FractalCurveViT(nn.Module):
         # Hilbert Bias 配置
         hilbert_bias_mode: str = 'lca',
         low_rank_r: int = 32,
+        # P6-2: LCA 温度配置
+        lca_temperature: Optional[float] = 1.5,
+        learnable_temperature: bool = True,
     ) -> None:
         """初始化 FractalCurveViT。
         
@@ -131,6 +134,10 @@ class FractalCurveViT(nn.Module):
                 - 'low_rank': 低秩分解（显存友好，~50K参数）
                 - 'hierarchical': 分层计算（可解释性强）
             low_rank_r: 低秩分解的秩参数（仅当 hilbert_bias_mode='low_rank' 时有效）
+            lca_temperature: (P6-2) LCA 偏置温度参数，默认 1.5
+                - None: 不使用温度缩放 (兼容模式)
+                - float: 温度初始值
+            learnable_temperature: (P6-2) 是否使温度可学习
         """
         super().__init__()
 
@@ -147,6 +154,8 @@ class FractalCurveViT(nn.Module):
         self._is_streaming = True  # 现在所有 tokenizer 都是 streaming 模式
         self.hilbert_bias_mode = hilbert_bias_mode
         self.low_rank_r = low_rank_r
+        self.lca_temperature = lca_temperature
+        self.learnable_temperature = learnable_temperature
 
         # === Tokenizer 选择逻辑 ===
         if tokenizer is not None:
@@ -216,6 +225,8 @@ class FractalCurveViT(nn.Module):
             use_checkpoint=use_checkpoint,
             hilbert_bias_mode=hilbert_bias_mode,
             low_rank_r=low_rank_r,
+            lca_temperature=lca_temperature,
+            learnable_temperature=learnable_temperature,
         )
 
         # 分类头
