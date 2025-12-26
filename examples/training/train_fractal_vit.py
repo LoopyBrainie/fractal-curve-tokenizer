@@ -49,6 +49,7 @@ import warnings
 warnings.filterwarnings('ignore', message='.*is not in var_ranges.*')
 warnings.filterwarnings('ignore', message='.*defaulting to unknown range.*')
 warnings.filterwarnings('ignore', message='.*torch.cpu.amp.autocast.*is deprecated.*', category=FutureWarning)
+warnings.filterwarnings('ignore', message='.*The epoch parameter in `scheduler.step\\(\\)`.*', category=UserWarning)
 
 import argparse
 import json
@@ -182,6 +183,13 @@ class TrainingConfig:
     split_gamma: float  # 阈值衰减因子 γ
     enforce_balance: bool  # 是否强制 2:1 平衡约束
     domain_preset: Optional[str]  # 域适应预设
+    
+    # P6-1: 深度缩放参数
+    depth_scale_range: Optional[Tuple[float, float]]  # (σ_min, σ_max)，默认 (0.5, 2.0)
+    
+    # P6-2: LCA 温度参数
+    lca_temperature: Optional[float]  # LCA 偏置温度，默认 1.5
+    learnable_temperature: bool  # 是否可学习温度，默认 True
     
     # 训练
     epochs: int
@@ -1169,6 +1177,22 @@ def main():
                        choices=["natural", "medical", "satellite", "document"],
                        help="Use domain-specific preset for split parameters")
     
+    # P6-1: 深度缩放参数
+    parser.add_argument("--depth-scale-min", type=float, default=0.5,
+                       help="Minimum depth scale σ_min (default: 0.5)")
+    parser.add_argument("--depth-scale-max", type=float, default=2.0,
+                       help="Maximum depth scale σ_max (default: 2.0)")
+    parser.add_argument("--no-learnable-depth-scale", action="store_true",
+                       help="Use fixed depth scale (legacy mode)")
+    
+    # P6-2: LCA 温度参数
+    parser.add_argument("--lca-temperature", type=float, default=1.5,
+                       help="LCA bias temperature τ (default: 1.5, SNR=1.5)")
+    parser.add_argument("--no-lca-temperature", action="store_true",
+                       help="Disable LCA temperature scaling (legacy mode)")
+    parser.add_argument("--fixed-lca-temperature", action="store_true",
+                       help="Use fixed (non-learnable) LCA temperature")
+    
     # 训练
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=5e-4)
@@ -1258,6 +1282,11 @@ def main():
         split_gamma=args.split_gamma,
         enforce_balance=args.enforce_balance,
         domain_preset=args.domain_preset,
+        # P6-1: 深度缩放配置
+        depth_scale_range=(args.depth_scale_min, args.depth_scale_max) if not args.no_learnable_depth_scale else None,
+        # P6-2: LCA 温度配置
+        lca_temperature=None if args.no_lca_temperature else args.lca_temperature,
+        learnable_temperature=not args.fixed_lca_temperature,
         # 训练配置
         epochs=args.epochs,
         learning_rate=args.lr,
@@ -1319,6 +1348,8 @@ def main():
         target_tokens=config.target_tokens,
         complexity_alpha=config.complexity_alpha,
         enforce_balance=config.enforce_balance,
+        # P6-1: 深度缩放配置
+        depth_scale_range=config.depth_scale_range,
     )
     
     # 创建模型 (V3 Variable Depth Tokens)
@@ -1344,6 +1375,9 @@ def main():
         num_scales=config.num_scales,
         # Hilbert Bias 配置
         hilbert_bias_mode=config.hilbert_bias_mode,
+        # P6-2: LCA 温度配置
+        lca_temperature=config.lca_temperature,
+        learnable_temperature=config.learnable_temperature,
     )
     
     model = FractalCurveViT(**model_kwargs).to(device)
@@ -1355,11 +1389,19 @@ def main():
         split_info += f", target={config.target_tokens}"
     tokenizer_name = f'StreamingFractalTokenizerV3 ({split_info})'
     
+    # P6-1/P6-2 信息
+    depth_scale_info = f"range={config.depth_scale_range}" if config.depth_scale_range else "legacy"
+    temp_info = f"τ={config.lca_temperature}" if config.lca_temperature else "disabled"
+    if config.lca_temperature and config.learnable_temperature:
+        temp_info += " (learnable)"
+    
     print(f"\n{'='*70}")
     print(f"Model: FractalCurveViT")
     print(f"Tokenizer: {tokenizer_name}")
     print(f"FFN Type: {config.ffn_type}")
     print(f"Hilbert Bias: {config.hilbert_bias_mode}")
+    print(f"  - Depth Scale (P6-1): {depth_scale_info}")
+    print(f"  - LCA Temperature (P6-2): {temp_info}")
     print(f"Parameters: {params:,}")
     print(f"Gradient Checkpoint: {config.gradient_checkpoint}")
     print(f"Compile Model: {config.compile_model}")

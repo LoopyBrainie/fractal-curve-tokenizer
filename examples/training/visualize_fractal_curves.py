@@ -10,19 +10,19 @@
    H: [0, n²) ↔ [0, n) × [0, n)
    局部性: ||p1 - p2||_2 ≤ C · |H⁻¹(p1) - H⁻¹(p2)|^(1/2)
 
-2. **LCA (最低公共祖先) 偏置**:
+2. **LCA (最低公共祖先) 偏置** (P6-2 改进):
    LCA(i, j) = 第一个不同象限的层级 ∈ [0, L]
-   B[i,j] = LCAEmbed(LCA(i,j))
+   B[i,j] = τ_h · LCAEmbed(LCA(i,j))
+   
+   其中 τ_h 是 per-head 可学习温度参数 (softplus 参数化)
 
 3. **Variable Depth Tokens (V3, 唯一支持)**:
    Regions = AdaptiveQuadtreeSplit(I)  # 内容自适应分割
    F = SharedConv(I)                    # 共享特征提取
    Token_i = Pool(F[R_i]) * σ_d + E_d  # ROI-Align 池化 + 深度编码
    
-   优势:
-   - 密集梯度流: 共享特征提取器所有路径都收到梯度
-   - 无温度参数: 训练更稳定
-   - 自适应分割: 根据图像内容动态决定分割深度
+   P6-1 改进: σ_d = σ_min + (σ_max - σ_min) · sigmoid(γ_d)
+   动态范围从 1.2x 扩展到 4x
 
 注意：V1 和 V2 已从代码库完全移除。
 

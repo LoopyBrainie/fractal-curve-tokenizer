@@ -1153,6 +1153,11 @@ def load_model_and_config(
         ffn_type=config.get('ffn_type', 'swiglu_level'),
         tokenizer_type=tokenizer_type,
         num_scales=config.get('num_scales', 3),
+        # Hilbert Bias 配置
+        hilbert_bias_mode=config.get('hilbert_bias_mode', 'lca'),
+        # P6-2: LCA 温度配置
+        lca_temperature=config.get('lca_temperature', 1.5),
+        learnable_temperature=config.get('learnable_temperature', True),
     )
     
     model = FractalCurveViT(**model_kwargs).to(device)
