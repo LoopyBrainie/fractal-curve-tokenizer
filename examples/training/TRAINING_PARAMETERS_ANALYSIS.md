@@ -1,7 +1,7 @@
 # 🔬 Fractal ViT 训练参数数学形式化分析
 
-> **文档版本**: v2.0 (批判性修订版)  
-> **更新日期**: 2025-12-24  
+> **文档版本**: v2.1 (批判性修订版 + V1 移除)  
+> **更新日期**: 2025-12-27  
 > **目标硬件**: RTX 4070 Laptop (8GB VRAM)  
 > **目标数据集**: Tiny-ImageNet (64×64, 200类, ~100K样本)
 
@@ -584,7 +584,7 @@ python examples/training/train_fractal_vit.py \
 | `--heads` | 8 | $D/d_h = 384/48 = 8$ |
 | `--dim-head` | 48 | 标准配置，每头 48 维 |
 | `--num-scales` | 3 | patch_sizes = (4, 8, 16) |
-| `--tokenizer-type` | streaming_v3 | Variable Depth Tokens (推荐) |
+| `--tokenizer-type` | streaming_v3 | Variable Depth Tokens (唯一支持) |
 | `--ffn-type` | swiglu_level | SwiGLU + Level Adaptation |
 | `--pool` | cls | CLS token 池化 |
 
@@ -656,8 +656,9 @@ python examples/training/train_fractal_vit.py \
 | `--variable-tokens` | 无需配置 | V3 统一使用 Variable Depth Tokens |
 | `--use-soft-weights` | 无需配置 | V3 内置可微分融合 |
 | `--depth-bias-*` | 无需配置 | V3 不需要深度偏置预热 |
+| `--tokenizer-type streaming_v1` | `streaming_v3` | V1 已移除 |
 
-> **注意**: V2 (Gumbel-Softmax) 已从代码库中完全删除，`--tokenizer-type streaming_v2` 不再可用。
+> **注意**: V1 (`StreamingFractalTokenizer`) 和 V2 (Gumbel-Softmax) 已从代码库中完全删除，当前仅支持 `streaming_v3`。
 
 ---
 

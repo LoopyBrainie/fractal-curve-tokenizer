@@ -14,15 +14,17 @@
    LCA(i, j) = 第一个不同象限的层级 ∈ [0, L]
    B[i,j] = LCAEmbed(LCA(i,j))
 
-3. **Variable Depth Tokens (V3, 推荐)**:
+3. **Variable Depth Tokens (V3, 唯一支持)**:
    Regions = AdaptiveQuadtreeSplit(I)  # 内容自适应分割
    F = SharedConv(I)                    # 共享特征提取
-   Token_i = Pool(F[R_i]) * σ_d + E_d  # 区域池化 + 深度编码
+   Token_i = Pool(F[R_i]) * σ_d + E_d  # ROI-Align 池化 + 深度编码
    
    优势:
    - 密集梯度流: 共享特征提取器所有路径都收到梯度
    - 无温度参数: 训练更稳定
    - 自适应分割: 根据图像内容动态决定分割深度
+
+注意：V1 和 V2 已从代码库完全移除。
 
 可视化功能
 ----------
@@ -67,7 +69,7 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from vit_pytorch.hilbert import HilbertCurve
+from vit_pytorch.curve_hilbert import HilbertCurve
 
 # 设置样式
 plt.style.use('default')

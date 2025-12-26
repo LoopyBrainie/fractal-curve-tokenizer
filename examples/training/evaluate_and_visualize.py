@@ -9,7 +9,9 @@
 5. 特征图可视化：不同层的特征激活
 
 支持 Tokenizer 类型：
-- StreamingFractalTokenizerV3 (Variable Depth Tokens, 推荐)
+- StreamingFractalTokenizerV3 (Variable Depth Tokens, 唯一支持)
+
+注意：V1 和 V2 已从代码库完全移除。
 
 使用示例：
     # 评估最佳模型
@@ -50,11 +52,8 @@ if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
 from vit_pytorch import FractalCurveViT
-from vit_pytorch.hilbert import HilbertCurve
-from vit_pytorch.streaming_tokenizer import (
-    HilbertIndexer,
-    StreamingFractalTokenizerV3,
-)
+from vit_pytorch.curve_hilbert import HilbertCurve
+from vit_pytorch.tokenizer_streaming import StreamingFractalTokenizerV3
 
 # 设置中文字体 (可选)
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS']
@@ -2378,9 +2377,9 @@ def generate_full_report(
     model, config = load_model_and_config(checkpoint_path, device)
     
     tokenizer_type = config.get('tokenizer_type', 'streaming_v3')
+    # 注意：当前仅支持 streaming_v3
     tokenizer_name = {
         'streaming_v3': 'StreamingFractalTokenizerV3 (Variable Depth Tokens)',
-        'streaming_v1': 'StreamingFractalTokenizer (Basic)',
     }.get(tokenizer_type, tokenizer_type)
     
     print(f"      Config: dim={config.get('dim')}, depth={config.get('depth')}, "

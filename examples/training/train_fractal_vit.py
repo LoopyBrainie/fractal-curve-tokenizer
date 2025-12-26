@@ -2,9 +2,9 @@
 """Fractal ViT Training Script - V3 Variable Depth Tokens
 
 特性：
-1. StreamingFractalTokenizerV3：Variable Depth Tokens 自适应多尺度 (推荐)
+1. StreamingFractalTokenizerV3：Variable Depth Tokens 自适应多尺度 (唯一支持)
    - 使用 AdaptiveQuadtreeSplit 进行内容自适应分割
-   - 共享卷积特征提取 + 深度编码
+   - 共享卷积特征提取 + 深度编码 + ROI-Align 池化
 2. SwiGLU FFN：现代化前馈网络
 3. Hilbert 曲线重排序：保持空间局部性
 4. AMP 混合精度训练
@@ -23,7 +23,7 @@ V3 优势：
     python train_fractal_vit.py --dataset tiny-imagenet --epochs 100 --dim 256 \
         --depth 8 --heads 8 --dropout 0.1 --drop-path 0.1 --use-amp
 
-注意：V2 (Gumbel-Softmax) 已从代码库中完全删除。
+注意：V1 和 V2 已从代码库中完全删除，当前仅支持 streaming_v3。
 """
 
 from __future__ import annotations
@@ -68,9 +68,49 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader, SubsetRandomSampler
+from torch.utils.data import DataLoader, SubsetRandomSampler, Subset
 from torchvision import datasets, transforms
 from tqdm import tqdm
+
+# 分层采样
+try:
+    from sklearn.model_selection import StratifiedShuffleSplit
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+
+
+def stratified_split(
+    indices: np.ndarray, 
+    labels: np.ndarray, 
+    val_ratio: float, 
+    seed: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """手动实现分层划分 (不依赖 sklearn).
+    
+    确保每个类别在训练/验证集中的比例相同。
+    """
+    np.random.seed(seed)
+    unique_classes = np.unique(labels)
+    train_idx_list = []
+    val_idx_list = []
+    
+    for c in unique_classes:
+        class_indices = indices[labels == c]
+        np.random.shuffle(class_indices)
+        
+        val_count = max(1, int(len(class_indices) * val_ratio))
+        val_idx_list.append(class_indices[:val_count])
+        train_idx_list.append(class_indices[val_count:])
+    
+    train_idx = np.concatenate(train_idx_list)
+    val_idx = np.concatenate(val_idx_list)
+    
+    # 再次打乱
+    np.random.shuffle(train_idx)
+    np.random.shuffle(val_idx)
+    
+    return train_idx, val_idx
 
 import logging
 # 抑制 torch.compile 的符号形状警告
@@ -131,18 +171,17 @@ class TrainingConfig:
     ffn_type: str
     hilbert_bias_mode: str
     
-    # Tokenizer 配置
-    tokenizer_type: str  # 'streaming_v3' (Variable Depth, 推荐) 或 'streaming_v1'
+    # Tokenizer 配置 (V3 Variable Depth Tokens)
+    tokenizer_type: str  # 'streaming_v3' (唯一支持)
     
-    # [已废弃] V2 配置字段 - 保留用于向后兼容，不再有实际效果
-    gumbel_tau_init: float
-    gumbel_tau_min: float
-    gumbel_tau_max: float
-    variable_tokens: bool
-    use_soft_weights: bool
-    depth_bias_max: float
-    depth_bias_decay: float
-    depth_bias_warmup: float
+    # V3 高级分割参数 (Adaptive Quadtree Split)
+    split_scheme: str  # 'balanced_greedy' 或 'fixed_budget_dp'
+    target_tokens: Optional[int]  # 目标 token 数量
+    complexity_alpha: float  # 复杂度函数方差权重 α ∈ [0,1]
+    split_tau0: float  # 根节点阈值 τ₀
+    split_gamma: float  # 阈值衰减因子 γ
+    enforce_balance: bool  # 是否强制 2:1 平衡约束
+    domain_preset: Optional[str]  # 域适应预设
     
     # 训练
     epochs: int
@@ -628,14 +667,42 @@ def create_dataloaders(
     else:
         raise ValueError(f"Unknown dataset: {spec.name}")
     
-    # 划分
-    indices = np.arange(len(train_ds))
-    np.random.shuffle(indices)
+    # 划分 (使用分层采样确保类别平衡)
+    n_samples = len(train_ds)
+    indices = np.arange(n_samples)
+    
+    # 获取所有标签用于分层采样
+    if hasattr(train_ds, 'targets'):
+        all_labels = np.array(train_ds.targets)
+    elif hasattr(train_ds, 'labels'):
+        all_labels = np.array(train_ds.labels)
+    else:
+        # ImageFolder 需要遍历
+        all_labels = np.array([train_ds.samples[i][1] for i in range(n_samples)])
+    
     if config.subset_size:
         indices = indices[:config.subset_size]
+        all_labels = all_labels[:config.subset_size]
     
-    val_size = max(1, int(len(indices) * config.val_split))
-    train_idx, val_idx = indices[val_size:], indices[:val_size]
+    # 分层采样：确保训练/验证集中每个类别比例相同
+    num_classes = len(np.unique(all_labels))
+    if num_classes > 1:
+        if HAS_SKLEARN:
+            val_size = max(1, int(len(indices) * config.val_split))
+            sss = StratifiedShuffleSplit(n_splits=1, test_size=val_size, random_state=config.seed)
+            train_idx, val_idx = next(sss.split(indices, all_labels[indices] if config.subset_size else all_labels))
+            train_idx = indices[train_idx]
+            val_idx = indices[val_idx]
+            print(f"[OK] 使用 sklearn 分层采样划分训练/验证集")
+        else:
+            # 使用手动分层划分
+            train_idx, val_idx = stratified_split(indices, all_labels, config.val_split, config.seed)
+            print(f"[OK] 使用手动分层采样划分训练/验证集 (确保类别平衡)")
+    else:
+        # 单类别数据集 - 简单随机划分
+        np.random.shuffle(indices)
+        val_size = max(1, int(len(indices) * config.val_split))
+        train_idx, val_idx = indices[val_size:], indices[:val_size]
     
     # DataLoader 参数
     mp_context = 'spawn' if config.num_workers > 0 else None
@@ -862,11 +929,29 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     use_amp: bool,
-) -> Tuple[float, float]:
-    """评估"""
+    num_classes: int = 10,
+    return_per_class: bool = False,
+) -> Tuple[float, float, Optional[Dict[str, Any]]]:
+    """评估
+    
+    Args:
+        model: 模型
+        loader: 数据加载器
+        device: 设备
+        use_amp: 是否使用混合精度
+        num_classes: 类别数
+        return_per_class: 是否返回逐类别统计
+        
+    Returns:
+        (loss, accuracy, per_class_stats)
+    """
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
     nan_batches = 0
+    
+    # 逐类别统计
+    class_correct = torch.zeros(num_classes, device=device)
+    class_total = torch.zeros(num_classes, device=device)
     
     for batch in tqdm(loader, desc="Eval"):
         imgs, labels = batch
@@ -892,14 +977,38 @@ def evaluate(
         _, pred = outs.max(1)
         total += labels.size(0)
         correct += pred.eq(labels).sum().item()
+        
+        # 逐类别统计
+        for c in range(num_classes):
+            mask = labels == c
+            class_total[c] += mask.sum()
+            class_correct[c] += (pred[mask] == c).sum()
     
     if nan_batches > 0:
         print(f"[WARN] 评估时跳过 {nan_batches} 个包含 NaN 的 batch")
     
     if total == 0:
-        return float('inf'), 0.0
+        return float('inf'), 0.0, None
     
-    return total_loss / max(len(loader) - nan_batches, 1), 100.0 * correct / total
+    # 计算逐类别准确率
+    per_class_stats = None
+    if return_per_class:
+        class_correct = class_correct.cpu().numpy()
+        class_total = class_total.cpu().numpy()
+        class_acc = np.divide(class_correct, class_total, out=np.zeros_like(class_correct), where=class_total > 0) * 100
+        
+        per_class_stats = {
+            'class_accuracy': class_acc.tolist(),
+            'class_correct': class_correct.tolist(),
+            'class_total': class_total.tolist(),
+            'worst_classes': np.argsort(class_acc)[:10].tolist(),
+            'best_classes': np.argsort(class_acc)[-10:][::-1].tolist(),
+            'accuracy_std': float(np.std(class_acc[class_total > 0])),
+            'accuracy_min': float(np.min(class_acc[class_total > 0])) if np.any(class_total > 0) else 0.0,
+            'accuracy_max': float(np.max(class_acc[class_total > 0])) if np.any(class_total > 0) else 0.0,
+        }
+    
+    return total_loss / max(len(loader) - nan_batches, 1), 100.0 * correct / total, per_class_stats
 
 
 @torch.no_grad()
@@ -1038,28 +1147,27 @@ def main():
     
     # Tokenizer 类型
     parser.add_argument("--tokenizer-type", type=str, default="streaming_v3",
-                       choices=["streaming_v3", "streaming_v1"],
-                       help="Tokenizer type: streaming_v3 (Variable Depth Tokens, recommended)")
+                       choices=["streaming_v3"],
+                       help="Tokenizer type: streaming_v3 (Variable Depth Tokens, only supported)")
     
-    # [已废弃] V2 参数 - 仅保留用于向后兼容，不再有实际效果
-    parser.add_argument("--gumbel-tau-init", type=float, default=2.0,
-                       help="[DEPRECATED] V2 已移除")
-    parser.add_argument("--gumbel-tau-min", type=float, default=0.5,
-                       help="[DEPRECATED] V2 已移除")
-    parser.add_argument("--gumbel-tau-max", type=float, default=5.0,
-                       help="[DEPRECATED] V2 已移除")
-    parser.add_argument("--variable-tokens", action="store_true", default=False,
-                       help="[DEPRECATED] V2 已移除")
-    parser.add_argument("--no-variable-tokens", action="store_false", dest="variable_tokens",
-                       help="[DEPRECATED] V2 已移除")
-    parser.add_argument("--use-soft-weights", action="store_true",
-                       help="[DEPRECATED] V2 已移除")
-    parser.add_argument("--depth-bias-max", type=float, default=2.0,
-                       help="[DEPRECATED] V2 已移除")
-    parser.add_argument("--depth-bias-decay", type=float, default=2.0,
-                       help="[DEPRECATED] V2 已移除")
-    parser.add_argument("--depth-bias-warmup", type=float, default=0.2,
-                       help="[DEPRECATED] V2 已移除")
+    # V3 Tokenizer 高级参数 (Adaptive Quadtree Split)
+    parser.add_argument("--split-scheme", type=str, default="balanced_greedy",
+                       choices=["balanced_greedy", "fixed_budget_dp"],
+                       help="Split scheme: balanced_greedy (Scheme B) or fixed_budget_dp (Scheme C)")
+    parser.add_argument("--target-tokens", type=int, default=None,
+                       help="Target token count per image (None = adaptive)")
+    parser.add_argument("--complexity-alpha", type=float, default=0.5,
+                       help="Complexity function variance weight alpha in [0,1] (0.5 = balanced)")
+    parser.add_argument("--split-tau0", type=float, default=0.15,
+                       help="Root threshold tau_0 for adaptive splitting")
+    parser.add_argument("--split-gamma", type=float, default=0.85,
+                       help="Threshold decay factor gamma in (0,1) per depth")
+    parser.add_argument("--enforce-balance", action="store_true", default=True,
+                       help="Enforce 2:1 balance constraint in balanced_greedy")
+    parser.add_argument("--no-enforce-balance", action="store_false", dest="enforce_balance")
+    parser.add_argument("--domain-preset", type=str, default=None,
+                       choices=["natural", "medical", "satellite", "document"],
+                       help="Use domain-specific preset for split parameters")
     
     # 训练
     parser.add_argument("--epochs", type=int, default=50)
@@ -1140,17 +1248,16 @@ def main():
         pool=args.pool,
         ffn_type=args.ffn_type,
         hilbert_bias_mode=args.hilbert_bias_mode,
-        # Tokenizer 配置
+        # Tokenizer 配置 (V3)
         tokenizer_type=args.tokenizer_type,
-        # V2 专用配置
-        gumbel_tau_init=args.gumbel_tau_init,
-        gumbel_tau_min=args.gumbel_tau_min,
-        gumbel_tau_max=args.gumbel_tau_max,
-        variable_tokens=args.variable_tokens,
-        use_soft_weights=args.use_soft_weights,
-        depth_bias_max=args.depth_bias_max,
-        depth_bias_decay=args.depth_bias_decay,
-        depth_bias_warmup=args.depth_bias_warmup,
+        # V3 高级分割参数
+        split_scheme=args.split_scheme,
+        target_tokens=args.target_tokens,
+        complexity_alpha=args.complexity_alpha,
+        split_tau0=args.split_tau0,
+        split_gamma=args.split_gamma,
+        enforce_balance=args.enforce_balance,
+        domain_preset=args.domain_preset,
         # 训练配置
         epochs=args.epochs,
         learning_rate=args.lr,
@@ -1175,9 +1282,46 @@ def main():
         device=str(device),
     )
     
-    # 创建模型
-    # V3: Variable Depth Tokens (推荐)
-    # V1: 基础流式分词器
+    # 创建自定义 Tokenizer (支持高级分割参数)
+    from vit_pytorch.tokenizer_streaming import StreamingFractalTokenizerV3
+    from vit_pytorch.split_adaptive import AdaptiveSplitConfig, SplitScheme
+    
+    # 域适应预设
+    split_kwargs: Dict[str, Any] = {
+        'max_depth': config.num_scales - 1,
+        'alpha': config.complexity_alpha,
+        'tau_0': config.split_tau0,
+        'gamma': config.split_gamma,
+        'enforce_balance': config.enforce_balance,
+        'target_tokens': config.target_tokens,
+    }
+    
+    if config.domain_preset:
+        preset_map = {
+            'natural': AdaptiveSplitConfig.natural_images,
+            'medical': AdaptiveSplitConfig.medical_images,
+            'satellite': AdaptiveSplitConfig.satellite_images,
+            'document': AdaptiveSplitConfig.document_images,
+        }
+        if config.domain_preset in preset_map:
+            split_config = preset_map[config.domain_preset](**split_kwargs)
+            print(f"[OK] Using domain preset: {config.domain_preset}")
+            print(f"     sigma_0^2={split_config.sigma_0_sq:.4f}, g_0^2={split_config.g_0_sq:.4f}, alpha={split_config.alpha:.2f}")
+    
+    tokenizer = StreamingFractalTokenizerV3(
+        image_size=max(spec.image_size, 32),
+        channels=spec.channels,
+        d_model=config.dim,
+        base_patch_size=4,
+        max_depth=config.num_scales - 1,
+        use_hilbert_order=True,
+        split_scheme=config.split_scheme,
+        target_tokens=config.target_tokens,
+        complexity_alpha=config.complexity_alpha,
+        enforce_balance=config.enforce_balance,
+    )
+    
+    # 创建模型 (V3 Variable Depth Tokens)
     model_kwargs = dict(
         image_size=max(spec.image_size, 32),
         num_classes=spec.num_classes,
@@ -1195,7 +1339,8 @@ def main():
         max_level=config.max_level,
         use_checkpoint=config.gradient_checkpoint,
         ffn_type=config.ffn_type,
-        tokenizer_type=config.tokenizer_type,
+        # 使用自定义 tokenizer (支持高级分割参数)
+        tokenizer=tokenizer,
         num_scales=config.num_scales,
         # Hilbert Bias 配置
         hilbert_bias_mode=config.hilbert_bias_mode,
@@ -1205,10 +1350,10 @@ def main():
     
     # 打印模型信息
     params = sum(p.numel() for p in model.parameters())
-    tokenizer_name = {
-        'streaming_v3': 'StreamingFractalTokenizerV3 (Variable Depth Tokens)',
-        'streaming_v1': 'StreamingFractalTokenizer (Basic)',
-    }.get(config.tokenizer_type, config.tokenizer_type)
+    split_info = f"{config.split_scheme}"
+    if config.target_tokens:
+        split_info += f", target={config.target_tokens}"
+    tokenizer_name = f'StreamingFractalTokenizerV3 ({split_info})'
     
     print(f"\n{'='*70}")
     print(f"Model: FractalCurveViT")
@@ -1345,7 +1490,7 @@ def main():
             profile=(epoch == 1)
         )
         
-        val_loss, val_acc = evaluate(model, val_loader, device, config.use_amp)
+        val_loss, val_acc, _ = evaluate(model, val_loader, device, config.use_amp, spec.num_classes)
         
         scheduler.step()
         
@@ -1446,15 +1591,34 @@ def main():
     ckpt = torch.load(exp_dir / "checkpoints" / "best.pth", weights_only=True)
     model.load_state_dict(ckpt['model_state_dict'])
     
-    test_loss, test_acc = evaluate(model, test_loader, device, config.use_amp)
+    test_loss, test_acc, per_class_stats = evaluate(
+        model, test_loader, device, config.use_amp, 
+        spec.num_classes, return_per_class=True
+    )
     
     print(f"Test: loss={test_loss:.4f}, acc={test_acc:.2f}%")
+    
+    # 逐类别评估诊断
+    if per_class_stats:
+        print(f"\n{'='*70}")
+        print("PER-CLASS ACCURACY ANALYSIS")
+        print(f"{'='*70}")
+        print(f"  Accuracy range: {per_class_stats['accuracy_min']:.1f}% - {per_class_stats['accuracy_max']:.1f}%")
+        print(f"  Accuracy std:   {per_class_stats['accuracy_std']:.1f}%")
+        print(f"  Worst 5 classes: {per_class_stats['worst_classes'][:5]}")
+        print(f"  Best 5 classes:  {per_class_stats['best_classes'][:5]}")
+        
+        # 检测类别不平衡
+        if per_class_stats['accuracy_std'] > 20:
+            print(f"\n  [WARN] 类别不平衡警告: std={per_class_stats['accuracy_std']:.1f}% > 20%")
+            print(f"         请检查数据加载和模型架构")
+    
     if early_stopped:
         print(f"[*] Training stopped early at epoch {epoch}/{config.epochs}")
     print(f"\n[OK] Results saved to: {exp_dir}")
     
     with open(exp_dir / "results.json", 'w') as f:
-        json.dump({
+        results = {
             'best_val_acc': best_val,
             'test_acc': test_acc,
             'test_loss': test_loss,
@@ -1463,7 +1627,16 @@ def main():
             'best_epoch': epoch - patience_counter if early_stopped else epoch,
             'consistency_passed': consistency_report.get('passed', None),
             'tokenizer_type': config.tokenizer_type,
-        }, f, indent=2)
+        }
+        if per_class_stats:
+            results['per_class_stats'] = {
+                'accuracy_std': per_class_stats['accuracy_std'],
+                'accuracy_min': per_class_stats['accuracy_min'],
+                'accuracy_max': per_class_stats['accuracy_max'],
+                'worst_classes': per_class_stats['worst_classes'],
+                'best_classes': per_class_stats['best_classes'],
+            }
+        json.dump(results, f, indent=2)
 
 
 if __name__ == "__main__":
