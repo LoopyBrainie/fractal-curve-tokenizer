@@ -1,7 +1,7 @@
 """Test script for refactored V3 tokenizer with Variable Depth."""
 
 import torch
-from vit_pytorch.streaming_tokenizer import StreamingFractalTokenizerV3
+from vit_pytorch.tokenizer_streaming import StreamingFractalTokenizerV3
 
 
 def test_v3_basic():

@@ -12,15 +12,13 @@ Tokenizer 核心组件测试:
 2. MultiScalePatchEncoder - 多尺度特征提取
    F_s = Conv(I, kernel=s)
    
-3. StreamingFractalTokenizer - 流式 tokenizer
-4. StreamingFractalTokenizerV3 - Variable Depth tokenizer
+3. StreamingFractalTokenizerV3 - Variable Depth tokenizer
 """
 
 import pytest
 import torch
 
 from vit_pytorch import (
-    StreamingFractalTokenizer,
     StreamingFractalTokenizerV3,
     HilbertIndexer,
     MultiScalePatchEncoder,
@@ -106,96 +104,6 @@ class TestMultiScalePatchEncoder:
         
         assert 8 in features_dict
         assert 16 not in features_dict
-
-
-class TestStreamingFractalTokenizer:
-    """测试流式 Tokenizer."""
-    
-    @pytest.fixture
-    def tokenizer(self):
-        return StreamingFractalTokenizer(
-            image_size=32,
-            channels=3,
-            d_model=64,
-            patch_sizes=(4, 8),
-            primary_scale=0,
-        )
-    
-    def test_tokenize_basic(self, tokenizer):
-        """测试基础 tokenization."""
-        images = torch.randn(2, 3, 32, 32)
-        output = tokenizer.tokenize(images)
-        
-        assert isinstance(output, TokenizerOutput)
-        assert len(output) == 2
-        
-        for seq in output:
-            assert seq.tokens.shape == (64, 64)
-            assert seq.get_levels() is not None
-    
-    def test_tokenize_output_format(self, tokenizer):
-        """测试输出格式与原接口兼容."""
-        images = torch.randn(1, 3, 32, 32)
-        output = tokenizer.tokenize(images)
-        
-        legacy = output.to_legacy()
-        assert len(legacy.tokens) == 1
-        assert len(legacy.levels) == 1
-        
-        assert legacy.tokens[0].shape[0] == legacy.levels[0].shape[0]
-    
-    def test_forward_equals_tokenize(self, tokenizer):
-        """测试 forward 和 tokenize 等价."""
-        images = torch.randn(1, 3, 32, 32)
-        
-        tokenizer.eval()
-        with torch.no_grad():
-            output1 = tokenizer.tokenize(images)
-            output2 = tokenizer.forward(images)
-        
-        assert torch.equal(output1.sequences[0].tokens, output2.sequences[0].tokens)
-    
-    def test_levels_info_structure(self, tokenizer):
-        """测试 levels_info 的结构."""
-        images = torch.randn(1, 3, 32, 32)
-        output = tokenizer.tokenize(images)
-        
-        levels_info = output.sequences[0].get_levels()
-        assert levels_info is not None
-        
-        depths = levels_info[:, 0]
-        assert depths.min() >= 0
-        assert depths.max() <= tokenizer.max_level
-    
-    def test_hilbert_order_disabled(self):
-        """测试禁用 Hilbert 顺序."""
-        tokenizer = StreamingFractalTokenizer(
-            image_size=32,
-            channels=3,
-            d_model=64,
-            patch_sizes=(4,),
-            use_hilbert_order=False,
-        )
-        
-        images = torch.randn(1, 3, 32, 32)
-        output = tokenizer.tokenize(images)
-        
-        assert len(output) == 1
-        assert output.sequences[0].tokens.shape[0] == 64
-    
-    def test_different_image_sizes(self):
-        """测试不同图像尺寸."""
-        tokenizer = StreamingFractalTokenizer(
-            image_size=64,
-            channels=3,
-            d_model=64,
-            patch_sizes=(8,),
-        )
-        
-        images = torch.randn(1, 3, 48, 48)
-        output = tokenizer.tokenize(images)
-        
-        assert output.sequences[0].tokens.shape[0] == 36
 
 
 class TestStreamingFractalTokenizerV3:

@@ -18,7 +18,7 @@ from typing import Dict, List
 import sys
 sys.path.insert(0, 'src')
 
-from vit_pytorch.adaptive_split import (
+from vit_pytorch.split_adaptive import (
     AdaptiveSplitConfig,
     SplitScheme,
     Region,

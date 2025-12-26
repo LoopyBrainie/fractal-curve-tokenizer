@@ -19,8 +19,8 @@ Note:
 
 import torch
 import pytest
-from vit_pytorch.vit import FractalCurveViT
-from vit_pytorch.positional import FractalPositionEmbedding
+from vit_pytorch.model_fractal_vit import FractalCurveViT
+from vit_pytorch.embed_fractal_position import FractalPositionEmbedding
 
 
 @pytest.fixture
@@ -103,33 +103,13 @@ class TestFractalCurveViT:
             mlp_dim=128,
             min_patch_size=(4, 4),
             max_level=5,
-            tokenizer_type="streaming",
-            num_scales=2,
-        )
-        
-        assert model.tokenizer_type == "streaming"
-        assert model._is_streaming
-        from vit_pytorch.streaming_tokenizer import StreamingFractalTokenizer
-        assert isinstance(model.tokenizer, StreamingFractalTokenizer)
-
-    def test_streaming_v3_tokenizer_type(self):
-        """Test streaming_v3 tokenizer is correctly instantiated."""
-        model = FractalCurveViT(
-            image_size=32,
-            num_classes=10,
-            dim=64,
-            depth=2,
-            heads=2,
-            mlp_dim=128,
-            min_patch_size=(4, 4),
-            max_level=5,
             tokenizer_type="streaming_v3",
             num_scales=2,
         )
         
         assert model.tokenizer_type == "streaming_v3"
         assert model._is_streaming
-        from vit_pytorch.streaming_tokenizer import StreamingFractalTokenizerV3
+        from vit_pytorch.tokenizer_streaming import StreamingFractalTokenizerV3
         assert isinstance(model.tokenizer, StreamingFractalTokenizerV3)
 
     def test_tokenizer_loss_returns_zero(self, fractal_vit, sample_image):

@@ -2,7 +2,7 @@
 
 import pytest
 
-from vit_pytorch.hilbert import (
+from vit_pytorch.curve_hilbert import (
     HilbertCurve,
     get_quadrant_order,
     hilbert_distance_to_xy,

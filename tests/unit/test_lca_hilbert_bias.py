@@ -12,13 +12,13 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vit_pytorch.attention import (
+from vit_pytorch.attn_hilbert_bias import (
     LCAHilbertBias,
     LowRankHilbertBias,
     HierarchicalHilbertBias,
     HilbertAwareMultiScaleAttention,
 )
-from vit_pytorch.fractal_path import VectorizedPathEncoder
+from vit_pytorch.embed_fractal_path import VectorizedPathEncoder
 
 
 class TestLCAHilbertBiasBasic:

@@ -74,27 +74,6 @@ def test_next_gen_fractal_vit_handles_varied_sizes(device: str) -> None:
 
 @torch.no_grad()
 @pytest.mark.parametrize("device", _device_parametrization())
-def test_streaming_tokenizer_device_consistency(device: str) -> None:
-    """测试流式 tokenizer 的设备一致性."""
-    from vit_pytorch import StreamingFractalTokenizer
-    
-    tokenizer = StreamingFractalTokenizer(
-        image_size=32,
-        channels=3,
-        d_model=64,
-        patch_sizes=(4, 8),
-    ).to(device)
-    
-    images = torch.randn(2, 3, 32, 32, device=device)
-    output = tokenizer.tokenize(images)
-    
-    for seq in output:
-        assert seq.tokens.device.type == device
-        assert seq.get_levels().device.type == device
-
-
-@torch.no_grad()
-@pytest.mark.parametrize("device", _device_parametrization())
 def test_streaming_v3_tokenizer_device_consistency(device: str) -> None:
     """测试流式 V3 tokenizer 的设备一致性."""
     from vit_pytorch import StreamingFractalTokenizerV3

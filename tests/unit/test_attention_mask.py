@@ -156,7 +156,7 @@ class TestGlobalAttentionMask:
 
     def test_transformer_uses_mask(self):
         """验证 transformer 正确使用 attention mask"""
-        from vit_pytorch.transformer import FractalTransformer
+        from vit_pytorch.block_transformer import FractalTransformer
         
         transformer = FractalTransformer(
             dim=64,

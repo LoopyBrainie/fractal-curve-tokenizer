@@ -20,14 +20,14 @@ from typing import Set, Tuple
 import pytest
 import torch
 
-from vit_pytorch.hilbert import (
+from vit_pytorch.curve_hilbert import (
     HilbertCurve,
     PseudoHilbertCurve,
     _is_power_of_2,
     _next_power_of_2,
 )
-from vit_pytorch.streaming_tokenizer import HilbertIndexer, HilbertPathCache
-from vit_pytorch.fractal_config import FractalConfig
+from vit_pytorch.curve_hilbert_indexer import HilbertIndexer, HilbertPathCache
+from vit_pytorch.config_fractal import FractalConfig
 
 
 class TestHelperFunctions:

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""集成测试: StreamingFractalTokenizer 与 FractalCurveViT 的集成.
+"""集成测试: StreamingFractalTokenizerV3 与 FractalCurveViT 的集成.
 
 数学形式化验证
 ==============
@@ -9,8 +9,8 @@
 
 测试目标：
 1. 验证 tokenizer_type 参数正确选择 tokenizer
-2. 验证 streaming tokenizer 路径的前向传播
-3. 验证 get_tokenizer_loss() 在 streaming 模式下返回零
+2. 验证 streaming_v3 tokenizer 路径的前向传播
+3. 验证 get_tokenizer_loss() 返回零
 4. 验证输出形状正确性
 5. 验证梯度正确流动
 """
@@ -19,33 +19,11 @@ import pytest
 import torch
 
 from vit_pytorch import FractalCurveViT
-from vit_pytorch.streaming_tokenizer import (
-    StreamingFractalTokenizer,
-    StreamingFractalTokenizerV3,
-)
+from vit_pytorch.tokenizer_streaming import StreamingFractalTokenizerV3
 
 
 class TestTokenizerTypeSelection:
     """测试 tokenizer_type 参数的选择逻辑."""
-
-    def test_streaming_tokenizer_selection(self) -> None:
-        """测试 streaming tokenizer 被正确选择."""
-        model = FractalCurveViT(
-            image_size=32,
-            num_classes=10,
-            dim=64,
-            depth=2,
-            heads=2,
-            mlp_dim=128,
-            min_patch_size=(4, 4),
-            max_level=5,
-            tokenizer_type="streaming",
-            num_scales=3,
-        )
-        
-        assert model.tokenizer_type == "streaming"
-        assert model._is_streaming
-        assert isinstance(model.tokenizer, StreamingFractalTokenizer)
 
     def test_streaming_v3_tokenizer_selection(self) -> None:
         """测试 streaming_v3 tokenizer 被正确选择."""
@@ -84,32 +62,12 @@ class TestTokenizerTypeSelection:
 
 
 class TestForwardPass:
-    """测试不同 tokenizer_type 的前向传播."""
+    """测试 streaming_v3 tokenizer 的前向传播."""
 
     @pytest.fixture
     def batch_input(self) -> torch.Tensor:
         """创建测试输入."""
         return torch.randn(2, 3, 32, 32)
-
-    def test_streaming_forward(self, batch_input: torch.Tensor) -> None:
-        """测试 streaming tokenizer 的前向传播."""
-        model = FractalCurveViT(
-            image_size=32,
-            num_classes=10,
-            dim=64,
-            depth=2,
-            heads=2,
-            mlp_dim=128,
-            min_patch_size=(4, 4),
-            max_level=5,
-            tokenizer_type="streaming",
-            num_scales=2,
-        )
-        
-        output = model(batch_input)
-        
-        assert output.shape == (2, 10)
-        assert not torch.isnan(output).any()
 
     def test_streaming_v3_forward(self, batch_input: torch.Tensor) -> None:
         """测试 streaming_v3 tokenizer 的前向传播."""
@@ -133,28 +91,7 @@ class TestForwardPass:
 
 
 class TestTokenizerLoss:
-    """测试 get_tokenizer_loss() 在不同 tokenizer 下的行为."""
-
-    def test_streaming_tokenizer_loss_is_zero(self) -> None:
-        """测试 streaming tokenizer 返回零损失."""
-        model = FractalCurveViT(
-            image_size=32,
-            num_classes=10,
-            dim=64,
-            depth=2,
-            heads=2,
-            mlp_dim=128,
-            min_patch_size=(4, 4),
-            max_level=5,
-            tokenizer_type="streaming",
-        )
-        
-        x = torch.randn(2, 3, 32, 32)
-        _ = model(x)
-        
-        loss = model.get_tokenizer_loss(reward=1.0)
-        
-        assert loss.item() == 0.0
+    """测试 get_tokenizer_loss() 的行为."""
 
     def test_streaming_v3_tokenizer_loss_is_zero(self) -> None:
         """测试 streaming_v3 tokenizer 返回零损失."""
@@ -195,7 +132,7 @@ class TestGradientFlow:
             mlp_dim=128,
             min_patch_size=(4, 4),
             max_level=5,
-            tokenizer_type="streaming",
+            tokenizer_type="streaming_v3",
         )
         
         x = torch.randn(2, 3, 32, 32, requires_grad=True)
@@ -214,72 +151,9 @@ class TestGradientFlow:
         
         assert has_gradient, "At least one tokenizer parameter should receive gradients"
 
-    def test_streaming_v3_gradient_flows(self) -> None:
-        """测试 streaming_v3 tokenizer 的梯度正确流动."""
-        model = FractalCurveViT(
-            image_size=32,
-            num_classes=10,
-            dim=64,
-            depth=2,
-            heads=2,
-            mlp_dim=128,
-            min_patch_size=(4, 4),
-            max_level=5,
-            tokenizer_type="streaming_v3",
-        )
-        
-        x = torch.randn(2, 3, 32, 32, requires_grad=True)
-        output = model(x)
-        loss = output.sum()
-        loss.backward()
-        
-        assert x.grad is not None
-        assert not torch.isnan(x.grad).any()
-
 
 class TestOutputConsistency:
     """测试输出一致性和形状正确性."""
-
-    def test_aux_info_with_streaming(self) -> None:
-        """测试 streaming tokenizer 的辅助信息输出."""
-        model = FractalCurveViT(
-            image_size=32,
-            num_classes=10,
-            dim=64,
-            depth=2,
-            heads=2,
-            mlp_dim=128,
-            min_patch_size=(4, 4),
-            max_level=5,
-            tokenizer_type="streaming",
-        )
-        
-        x = torch.randn(2, 3, 32, 32)
-        output, aux_info = model(x, return_aux_info=True)
-        
-        assert output.shape == (2, 10)
-        assert len(aux_info) == 2
-        assert "num_tokens" in aux_info[0]
-
-    def test_features_with_streaming(self) -> None:
-        """测试 streaming tokenizer 的特征输出."""
-        model = FractalCurveViT(
-            image_size=32,
-            num_classes=10,
-            dim=64,
-            depth=2,
-            heads=2,
-            mlp_dim=128,
-            min_patch_size=(4, 4),
-            max_level=5,
-            tokenizer_type="streaming",
-        )
-        
-        x = torch.randn(2, 3, 32, 32)
-        output, features = model(x, return_features=True)
-        
-        assert output.shape == (2, 10)
-        assert len(features) == 2
 
     def test_aux_info_with_streaming_v3(self) -> None:
         """测试 streaming_v3 tokenizer 的辅助信息输出."""
@@ -301,6 +175,26 @@ class TestOutputConsistency:
         assert output.shape == (2, 10)
         assert len(aux_info) == 2
         assert "num_tokens" in aux_info[0]
+
+    def test_features_with_streaming_v3(self) -> None:
+        """测试 streaming_v3 tokenizer 的特征输出."""
+        model = FractalCurveViT(
+            image_size=32,
+            num_classes=10,
+            dim=64,
+            depth=2,
+            heads=2,
+            mlp_dim=128,
+            min_patch_size=(4, 4),
+            max_level=5,
+            tokenizer_type="streaming_v3",
+        )
+        
+        x = torch.randn(2, 3, 32, 32)
+        output, features = model(x, return_features=True)
+        
+        assert output.shape == (2, 10)
+        assert len(features) == 2
 
 
 if __name__ == "__main__":

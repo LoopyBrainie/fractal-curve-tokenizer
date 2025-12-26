@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Unit tests for StreamingFractalTokenizer and StreamingFractalTokenizerV3.
+"""Unit tests for StreamingFractalTokenizerV3.
 
 数学形式化验证
 ==============
@@ -17,15 +17,13 @@
 1. HilbertPathCache - Hilbert 路径缓存机制
 2. HilbertIndexer - Hilbert 索引重排
 3. MultiScalePatchEncoder - 多尺度特征提取
-4. StreamingFractalTokenizer - V1 流式 tokenizer
-5. StreamingFractalTokenizerV3 - V3 Variable Depth tokenizer
+4. StreamingFractalTokenizerV3 - Variable Depth tokenizer
 """
 
 import pytest
 import torch
 
 from vit_pytorch import (
-    StreamingFractalTokenizer,
     StreamingFractalTokenizerV3,
     HilbertIndexer,
     HilbertPathCache,
@@ -197,116 +195,6 @@ class TestMultiScalePatchEncoder:
         assert 16 not in features_dict
 
 
-class TestStreamingFractalTokenizer:
-    """测试流式 Tokenizer V1.
-    
-    数学形式化:
-    - 输入: I ∈ R^{B × C × H × W}
-    - 输出: tokens ∈ R^{B × N × D}, levels_info ∈ Z^{B × N × L}
-    - N = (H/s) × (W/s) 固定 token 数量
-    """
-    
-    @pytest.fixture
-    def tokenizer(self):
-        return StreamingFractalTokenizer(
-            image_size=32,
-            channels=3,
-            d_model=64,
-            patch_sizes=(4, 8),
-            primary_scale=0,
-        )
-    
-    def test_tokenize_basic(self, tokenizer):
-        """测试基础 tokenization."""
-        images = torch.randn(2, 3, 32, 32)
-        output = tokenizer.tokenize(images)
-        
-        assert isinstance(output, TokenizerOutput)
-        assert len(output) == 2
-        
-        for seq in output:
-            assert seq.tokens.shape == (64, 64)
-            assert seq.get_levels() is not None
-    
-    def test_tokenize_output_format(self, tokenizer):
-        """测试输出格式与原接口兼容."""
-        images = torch.randn(1, 3, 32, 32)
-        output = tokenizer.tokenize(images)
-        
-        legacy = output.to_legacy()
-        assert len(legacy.tokens) == 1
-        assert len(legacy.levels) == 1
-        assert legacy.tokens[0].shape[0] == legacy.levels[0].shape[0]
-    
-    def test_forward_equals_tokenize(self, tokenizer):
-        """测试 forward 和 tokenize 等价."""
-        images = torch.randn(1, 3, 32, 32)
-        
-        tokenizer.eval()
-        with torch.no_grad():
-            output1 = tokenizer.tokenize(images)
-            output2 = tokenizer.forward(images)
-        
-        assert torch.equal(output1.sequences[0].tokens, output2.sequences[0].tokens)
-    
-    def test_levels_info_structure(self, tokenizer):
-        """测试 levels_info 的结构."""
-        images = torch.randn(1, 3, 32, 32)
-        output = tokenizer.tokenize(images)
-        
-        levels_info = output.sequences[0].get_levels()
-        assert levels_info is not None
-        
-        depths = levels_info[:, 0]
-        assert depths.min() >= 0
-        assert depths.max() <= tokenizer.max_level
-    
-    def test_hilbert_order_disabled(self):
-        """测试禁用 Hilbert 顺序."""
-        tokenizer = StreamingFractalTokenizer(
-            image_size=32,
-            channels=3,
-            d_model=64,
-            patch_sizes=(4,),
-            use_hilbert_order=False,
-        )
-        
-        images = torch.randn(1, 3, 32, 32)
-        output = tokenizer.tokenize(images)
-        
-        assert len(output) == 1
-        assert output.sequences[0].tokens.shape[0] == 64
-    
-    def test_different_image_sizes(self):
-        """测试不同图像尺寸."""
-        tokenizer = StreamingFractalTokenizer(
-            image_size=64,
-            channels=3,
-            d_model=64,
-            patch_sizes=(8,),
-        )
-        
-        images = torch.randn(1, 3, 48, 48)
-        output = tokenizer.tokenize(images)
-        
-        assert output.sequences[0].tokens.shape[0] == 36
-    
-    def test_invalid_input_dimension(self, tokenizer):
-        """测试无效输入维度."""
-        with pytest.raises(ValueError, match="expects 4D input"):
-            tokenizer.tokenize(torch.randn(3, 32, 32))
-    
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_gpu_if_available(self, tokenizer):
-        """测试 GPU 支持."""
-        tokenizer = tokenizer.cuda()
-        images = torch.randn(2, 3, 32, 32).cuda()
-        
-        output = tokenizer.tokenize(images)
-        
-        assert output.sequences[0].tokens.device.type == 'cuda'
-
-
 class TestStreamingFractalTokenizerV3:
     """测试 V3 Variable Depth Tokenizer.
     
@@ -374,58 +262,6 @@ class TestStreamingFractalTokenizerV3:
         assert 'split_stats' in metadata
         assert 'num_tokens' in metadata['split_stats']
         assert metadata['split_stats']['num_tokens'] == output.sequences[0].tokens.shape[0]
-        """测试 Tokenizer 输出可以作为 Transformer 输入."""
-        tokenizer = StreamingFractalTokenizer(
-            image_size=32,
-            channels=3,
-            d_model=64,
-            patch_sizes=(4,),
-        )
-        
-        images = torch.randn(2, 3, 32, 32)
-        output = tokenizer.tokenize(images)
-        
-        legacy = output.to_legacy()
-        
-        tokens_padded = torch.nn.utils.rnn.pad_sequence(
-            legacy.tokens, batch_first=True
-        )
-        levels_padded = torch.nn.utils.rnn.pad_sequence(
-            legacy.levels, batch_first=True
-        )
-        
-        B, S, D = tokens_padded.shape
-        assert B == 2
-        assert D == 64
-        assert levels_padded.shape[0] == B
-        assert levels_padded.shape[1] == S
-    
-    def test_v1_and_v3_output_structure_compatible(self):
-        """验证 V1 和 V3 tokenizer 的输出结构兼容."""
-        streaming_v1 = StreamingFractalTokenizer(
-            image_size=32,
-            channels=3,
-            d_model=64,
-            patch_sizes=(4,),
-        )
-        
-        streaming_v3 = StreamingFractalTokenizerV3(
-            image_size=32,
-            channels=3,
-            d_model=64,
-            base_patch_size=4,
-            max_depth=3,
-        )
-        
-        images = torch.randn(1, 3, 32, 32)
-        
-        output_v1 = streaming_v1.tokenize(images)
-        output_v3 = streaming_v3.tokenize(images)
-        
-        assert isinstance(output_v1, TokenizerOutput)
-        assert isinstance(output_v3, TokenizerOutput)
-        
-        assert output_v1.sequences[0].tokens.shape[1] == output_v3.sequences[0].tokens.shape[1]
 
 
 if __name__ == "__main__":
