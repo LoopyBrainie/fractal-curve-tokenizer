@@ -1,213 +1,268 @@
-# 第二章：数据流与抽象层
+# Chapter 2: Core Data Structures
 
-本章介绍了项目的基础数据结构和抽象层，它们定义了数据如何在各个模块之间流动。
+## 2.1 Overview
 
-## 2.1 tokenization.py - 基础数据结构
+This chapter defines the fundamental data structures that flow through the Fractal Curve ViT pipeline.
 
-此文件定义了 Tokenizer 与模型其他部分交互的标准协议。
+---
+
+## 2.2 TokenizerOutput
+
+The unified output structure from all tokenizers.
+
+### Definition
+
+```python
+@dataclass
+class TokenizerOutput:
+    sequences: List[TokenSequence]  # Per-image token sequences
+```
 
 ### TokenSequence
 
-单样本 Token 序列容器。
+```python
+@dataclass  
+class TokenSequence:
+    tokens: Tensor           # (N, D) - token embeddings
+    attention_mask: Tensor   # (N,) - valid token mask
+    metadata: Dict[str, Any] # Additional information
+    
+    def get_levels(self) -> Tensor:
+        """Extract levels_info from metadata."""
+        return self.metadata.get('levels', None)
+```
 
-* **属性**：
-  * `tokens`: `torch.Tensor`，形状为 `[N, D]`，Token 特征
-  * `metadata`: `Dict[str, Any]`，存储元数据，最重要的是 `"levels"` 信息
-* **方法**：
-  * `get_levels()`: 获取层级信息张量
-  * `clone()`: 深拷贝序列
+### Access Patterns
 
-### TokenizerOutput
+```python
+# Per-image access
+for seq in output.sequences:
+    tokens = seq.tokens          # (N_i, D)
+    levels = seq.get_levels()    # (N_i, max_depth+1)
+    
+# Batch access (with padding)
+tokens, levels, mask = output.to_batch()  # (B, N_max, D), (B, N_max, Info), (B, N_max)
+```
 
-批量输出容器。
+---
 
-* **属性**：
-  * `sequences`: `List[TokenSequence]`，包含 Batch 中每个样本的 `TokenSequence`
-* **方法**：
-  * `tokens_list()` / `levels_list()`: 辅助提取方法
+## 2.3 levels_info Tensor
 
-### BaseTokenizer / BaseTokenProcessor
+The hierarchical position encoding for each token.
 
-抽象基类，定义了组件的接口规范。
+### Shape
 
-* `BaseTokenizer`: 必须实现 `tokenize(images) -> TokenizerOutput`
-* `BaseTokenProcessor`: 必须实现 `process(batch) -> TokenizerOutput`
+$$L \in \mathbb{Z}^{B \times N \times (d_{max} + 1)}$$
 
-## 2.2 features.py - 特征计算
+### Structure
 
-此模块用于计算 Token 的统计特征，用于特征增强。
+| Index | Content | Range | Description |
+|:------|:--------|:------|:------------|
+| `[:, :, 0]` | Depth | $[0, d_{max}]$ | Quadtree depth of the token |
+| `[:, :, 1:]` | Path | $[0, 3]^{d_{max}}$ | Quadtree path (quadrant indices) |
 
-### TokenFeatures dataclass
+### Quadrant Encoding
 
-封装计算出的 6 维特征：
+```
+Quadrant indices (Hilbert-compatible):
+    
+    ┌─────┬─────┐
+    │  2  │  3  │
+    ├─────┼─────┤
+    │  0  │  1  │
+    └─────┴─────┘
+```
 
-* `stats`: 均值 $\mu$ 和方差 $\sigma^2$
-* `edge`: 边缘密度代理（基于差分）
-* `spatial`: 原始 Patch 的空间尺寸 (H, W)
-* `level`: 当前 Token 所处的递归层级
+### Mathematical Interpretation
 
-**数学定义**:
-$f = [\sigma^2, \mu, \text{edge}, h, w, d] \in \mathbb{R}^6$
+For a token at depth $d$ with path $[q_1, q_2, \ldots, q_d]$:
 
-### compute_token_features() 函数
+$$\text{position}(t) = \sum_{i=1}^{d} q_i \cdot 4^{d-i}$$
 
-* **输入**：Token 张量、层级、Patch 尺寸
-* **输出**：`TokenFeatures` dataclass
+This maps bijectively to a Hilbert curve segment.
 
-## 2.3 utils.py - 工具函数
+### Example
 
-### 基础工具
+```python
+# Token at depth 2, path [1, 3] (bottom-right → top-right)
+levels_info[b, t] = [2, 1, 3, 0, 0, 0]
+#                    ^  ^  ^  ^^^^^^^
+#                    |  |  |  padding (unused)
+#                    |  |  └── q_2 = 3
+#                    |  └───── q_1 = 1
+#                    └──────── depth = 2
+```
 
-* `pair(t)`: 将输入转换为元组 (t, t)
-* `exists(val)`: 检查变量是否不为 None
-* `default(val, d)`: 如果 val 存在则返回 val，否则返回默认值 d
+---
 
-### extract_depths()
+## 2.4 FractalConfig
 
-**功能**：统一从 `levels_info` 提取深度索引。
+Unified configuration dataclass for the entire system.
 
-**数学定义**:
-$\text{depths} = \text{clamp}(L_{:,:,0}, 0, L_{max})$
-
-**逻辑**：
-
-* 自动处理 `(Seq, Info)` 和 `(Batch, Seq, Info)` 两种输入形状
-* 提取第 0 维（深度信息）
-* 执行 `clamp(0, max_level)` 确保索引安全
-
-### normalize_levels_info()
-
-**功能**：规范化 `levels_info` 维度。
-**逻辑**：将 `(Seq, Info)` 自动升维为 `(1, Seq, Info)` 以统一批处理逻辑。
-
-### create_attention_mask()
-
-**功能**：生成层级感知的注意力 Mask。
-**逻辑**：
-
-* 输入层级信息列表
-* 构建 `(B, S, S)` 的 Mask 矩阵
-* **向量化实现**：使用 PyTorch 广播机制
-
-## 2.4 streaming_tokenizer.py - 核心数据结构
-
-### HilbertIndexer
-
-用于预计算 Hilbert/Pseudo-Hilbert 曲线索引的工具类。
-
-* **方法**：
-  * `get_hilbert_order(grid_size)`: 返回从光栅顺序到 Hilbert 顺序的索引映射
-  * `get_hilbert_order_rect(grid_h, grid_w)`: 支持矩形网格
-* **特点**：使用 `@lru_cache` 缓存避免重复计算
-
-### HilbertPathCache
-
-统一的 Hilbert 路径预计算缓存，存储两种映射：
-
-* `hilbert_to_raster`: Hilbert 索引 → 光栅索引
-* `quadtree_paths`: Hilbert 索引 → 四叉树路径
-
-**数学定义**：
-$$\text{quadtree\_path}[d, \ell] = q_\ell = \text{bit}(x, k-\ell) + 2 \times \text{bit}(y, k-\ell)$$
-
-### MultiScalePatchEncoder
-
-多尺度卷积金字塔，核心数据结构。
-
-* **数学定义**：
-  $F_s = \text{Conv}_s(I), \quad s \in \{1, \ldots, S\}$
-  每个尺度: `kernel_size = stride = patch_size_s`
-
-### Variable Depth Tokens 架构 (V3 核心)
-
-Variable Depth Tokens (VDT) 是当前 V3 Tokenizer 的核心架构，取代了已废弃的 CrossScaleAttention。
-
-* **数学定义**：
-  $$C(R) = \alpha \cdot \frac{\text{Var}(R)}{\text{Var}(R) + \sigma_0^2} + (1-\alpha) \cdot \frac{G(R)}{G(R) + g_0^2}$$
-  $$p_{split} = \sigma\left(\frac{C_\theta(R) - \tau_d}{T}\right), \quad z \sim \text{Gumbel-Softmax}(p)$$
-  
-* **关键组件**：
-  * `LearnableSplitter`: 可学习的内容自适应分割器
-  * `BalancedGreedySplitter`: 平衡贪心分割策略
-  * `DPBudgetSplitter`: 动态规划预算分割
-  
-* **架构优势**：
-  * 无尺度崩塌问题 (CrossScaleAttention 存在的数学缺陷)
-  * 真正的内容自适应分辨率
-  * STE + REINFORCE 混合梯度估计
-
-## 2.5 constants.py - 超参数默认值
-
-| 常量                   | 值    | 说明                                 |
-|:-------------------- |:---- |:---------------------------------- |
-| `HILBERT_BIAS_SCALE` | 0.1  | Hilbert 偏置缩放因子 $\lambda_{hilbert}$ |
-| `LEVEL_BIAS_SCALE`   | 0.05 | 层级偏置缩放因子 $\lambda_{level}$         |
-| `EMBEDDING_INIT_STD` | 0.02 | 嵌入初始化标准差 $\sigma_{emb}$            |
-| `DEFAULT_MAX_LEVEL`  | 50   | 默认最大层级 $L_{max}$                   |
-| `DEFAULT_DROPOUT`    | 0.1  | 默认 Dropout 比率                      |
-
-## 2.6 fractal_config.py - 统一配置
-
-### FractalConfig dataclass
-
-项目核心配置类，集中管理所有超参数，提供类型安全和默认值。
+### Definition
 
 ```python
 @dataclass
 class FractalConfig:
-    # 模型维度
+    # Model dimensions
     d_model: int = 384
-    num_heads: int = 8
-
-    # Hilbert 偏置模式 (核心)
-    hilbert_bias_mode: BiasMode = 'lca'  # 推荐默认值
-
-    # LowRank 偏置参数
-    low_rank_dim: int = 16
-
-    # LCA 偏置参数  
-    max_depth: int = 10
-
-    # 层级嵌入
-    max_level: int = 10
-    level_embedding_dim: int = 32
-
-    # Gumbel-Softmax
-    initial_temperature: float = 2.0
-    min_temperature: float = 0.1
-
-    # 正则化
-    dropout: float = 0.1
+    num_heads: int = 6
+    
+    # Tokenizer configuration
+    image_size: int = 224
+    min_patch_size: int = 4
+    max_depth: int = 4
+    
+    # Hilbert bias configuration
+    hilbert_bias_mode: str = 'lca'  # 'lca', 'low_rank', 'hierarchical'
+    low_rank_r: int = 32
+    
+    # Attention parameters
+    lca_temperature: float = 1.5
+    learnable_temperature: bool = True
+    
+    # FFN configuration
+    ffn_type: str = 'swiglu_level'
 ```
 
-**关键参数说明**:
-
-| 参数                  | 类型       | 默认值     | 说明                                          |
-|:------------------- |:-------- |:------- |:------------------------------------------- |
-| `hilbert_bias_mode` | BiasMode | `'lca'` | 偏置模式: `'lca'`/`'low_rank'`/`'hierarchical'` |
-| `low_rank_dim`      | int      | 16      | Low-Rank 投影维度 r                             |
-| `max_depth`         | int      | 10      | LCA 最大深度 $D_{max}$                          |
-
-**BiasMode 类型**:
+### Derived Properties
 
 ```python
-BiasMode = Literal['low_rank', 'lca', 'hierarchical', 'none']
+@property
+def num_scales(self) -> int:
+    """Number of scales in the quadtree."""
+    return self.max_depth + 1
+
+@property
+def patch_sizes(self) -> Tuple[int, ...]:
+    """Available patch sizes from fine to coarse."""
+    return tuple(self.min_patch_size * (2 ** i) for i in range(self.num_scales))
 ```
 
-### 使用示例
+---
+
+## 2.5 AdaptiveSplitConfig
+
+Configuration for content-adaptive quadtree splitting.
+
+### Complexity Function Parameters
+
+| Parameter | Symbol | Default | Description |
+|:----------|:-------|:--------|:------------|
+| `alpha` | $\alpha$ | 0.5 | Variance weight in $[0, 1]$ |
+| `sigma_0_sq` | $\sigma_0^2$ | 0.01 | Variance normalization constant |
+| `g_0_sq` | $g_0^2$ | 0.08 | Gradient normalization constant |
+
+### Threshold Function Parameters
+
+| Parameter | Symbol | Default | Description |
+|:----------|:-------|:--------|:------------|
+| `tau_0` | $\tau_0$ | 0.15 | Root threshold |
+| `gamma` | $\gamma$ | 0.85 | Threshold decay factor |
+| `max_depth` | $d_{max}$ | 4 | Maximum split depth |
+
+### Splitting Scheme
 
 ```python
-from vit_pytorch import FractalConfig, FractalCurveViT
-
-# 使用默认配置（LCA 模式）
-config = FractalConfig()
-model = FractalCurveViT(config=config)
-
-# 自定义配置
-config = FractalConfig(
-    d_model=512,
-    num_heads=8,
-    hilbert_bias_mode='low_rank',  # 使用 Low-Rank 模式
-    low_rank_dim=32,
-)
+class SplitScheme(Enum):
+    BALANCED_GREEDY = "balanced_greedy"  # Scheme B: Greedy with 2:1 balance
+    FIXED_BUDGET_DP = "fixed_budget_dp"  # Scheme C: DP with token budget
+    LEARNABLE = "learnable"              # Scheme L: End-to-end learnable
 ```
+
+---
+
+## 2.6 QuadtreeNode
+
+Internal representation of a quadtree node during splitting.
+
+### Definition
+
+```python
+@dataclass
+class QuadtreeNode:
+    x: int              # Top-left x coordinate
+    y: int              # Top-left y coordinate
+    size: int           # Region size (pixels)
+    depth: int          # Quadtree depth
+    path: List[int]     # Quadrant path from root
+    complexity: float   # Computed complexity C(R)
+    
+    @property
+    def region(self) -> Tuple[int, int, int, int]:
+        """Return (x, y, x+size, y+size) bounding box."""
+        return (self.x, self.y, self.x + self.size, self.y + self.size)
+```
+
+### Invariants
+
+1. **Size constraint**: $\text{size} = \text{image\_size} / 2^{\text{depth}}$
+2. **Path length**: $\text{len(path)} = \text{depth}$
+3. **Alignment**: $(x, y)$ aligned to $\text{size}$-pixel grid
+
+---
+
+## 2.7 HilbertIndex
+
+Mapping between 2D coordinates and Hilbert curve positions.
+
+### Mathematical Definition
+
+$$H: [0, n^2) \leftrightarrow [0, n) \times [0, n)$$
+
+### Implementation
+
+```python
+class HilbertCurve:
+    def __init__(self, order: int):
+        """Initialize Hilbert curve of given order.
+        
+        Args:
+            order: Log2 of grid size (e.g., order=4 → 16×16 grid)
+        """
+        self.order = order
+        self.n = 2 ** order
+        
+    def d2xy(self, d: int) -> Tuple[int, int]:
+        """Convert Hilbert index to (x, y) coordinates."""
+        ...
+        
+    def xy2d(self, x: int, y: int) -> int:
+        """Convert (x, y) coordinates to Hilbert index."""
+        ...
+```
+
+### Locality Property
+
+For any two points $p_1, p_2$:
+
+$$\|p_1 - p_2\|_2 \leq C \cdot |H^{-1}(p_1) - H^{-1}(p_2)|^{1/2}$$
+
+---
+
+## 2.8 Tensor Shape Conventions
+
+### Input/Output Shapes
+
+| Tensor | Shape | Description |
+|:-------|:------|:------------|
+| Image | $(B, C, H, W)$ | Input image batch |
+| Tokens | $(B, N, D)$ | Token embeddings |
+| Levels | $(B, N, d_{max}+1)$ | Level information |
+| Attention Mask | $(B, 1, 1, N)$ | Broadcast-compatible mask |
+| Hilbert Bias | $(B, H, N, N)$ | Per-head attention bias |
+| Logits | $(B, C_{out})$ | Classification output |
+
+### Dimension Notation
+
+| Symbol | Meaning | Typical Value |
+|:-------|:--------|:--------------|
+| $B$ | Batch size | 32 |
+| $C$ | Image channels | 3 |
+| $H, W$ | Image height/width | 224 |
+| $N$ | Number of tokens | 16-196 |
+| $D$ | Model dimension | 384 |
+| $H$ | Number of heads | 6 |
+| $d_{max}$ | Maximum depth | 4 |
+
+> **Next**: [03_fractal_tokenizer.md](03_fractal_tokenizer.md) - Tokenization Pipeline

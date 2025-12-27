@@ -1,176 +1,207 @@
-# 第九章：训练系统 (train_fractal_vit.py)
+# Chapter 9: Training System
 
-本项目包含一个功能完备的训练脚本，支持多种数据集和训练策略。
+## 9.1 Overview
 
-## 9.1 数据集支持
-
-脚本通过 `DatasetSpec` dataclass 统一管理不同数据集的配置。
-
-| 数据集          | 支持  | 自动下载 | 说明           |
-|:------------ |:--- |:---- |:------------ |
-| CIFAR10      | ✅   | ✅    | 10 类，32×32   |
-| CIFAR100     | ✅   | ✅    | 100 类，32×32  |
-| MNIST        | ✅   | ✅    | 10 类，28×28   |
-| TinyImageNet | ✅   | ✅    | 200 类，64×64  |
-| ImageNet     | ✅   | ❌    | 1000 类，需手动下载 |
-| COCO         | ✅   | ❌    | 分类模式         |
-| Caltech256   | ✅   | ❌    | 256 类        |
-
-### 数据增强策略
-
-| 数据集           | 增强策略                                            |
-|:------------- |:----------------------------------------------- |
-| MNIST         | Resize, RandomRotation, Normalize               |
-| CIFAR10/100   | AutoAugment (CIFAR10 policy)                    |
-| ImageNet/COCO | AutoAugment (ImageNet policy)                   |
-| 通用            | RandomCrop, RandomHorizontalFlip, RandomErasing |
+This chapter describes the training infrastructure, including dataset support, optimization strategies, and best practices for training `FractalCurveViT`.
 
 ---
 
-## 9.2 模型构建与配置
+## 9.2 Dataset Support
 
-### build_model() 函数
+### Supported Datasets
 
-根据参数实例化 `FractalCurveViT` 模型。
+| Dataset | Classes | Size | Auto-Download |
+|:--------|:--------|:-----|:--------------|
+| MNIST | 10 | 28×28 | ✓ |
+| CIFAR-10 | 10 | 32×32 | ✓ |
+| CIFAR-100 | 100 | 32×32 | ✓ |
+| Tiny-ImageNet | 200 | 64×64 | ✓ |
+| ImageNet | 1000 | 224×224 | ✗ |
+| COCO | Variable | Variable | ✗ |
+| Caltech-256 | 256 | Variable | ✗ |
 
-### 关键命令行参数
+### Data Augmentation
 
-| 参数                 | 默认值            | 说明                         |
-|:------------------ |:-------------- |:-------------------------- |
-| `--tokenizer-type` | `streaming_v3` | Tokenizer 类型 (仅 V3)        |
-| `--bias-mode`      | `lca`          | Hilbert Bias 模式 (推荐)       |
-| `--ffn-type`       | `swiglu_level` | FFN 类型                     |
-| `--rank`           | 32             | Low-Rank 秩 (仅 low_rank 模式) |
-| `--dim`            | 384            | 模型维度                       |
-| `--depth`          | 6              | Transformer 层数             |
-| `--heads`          | 6              | 注意力头数                      |
+| Dataset | Augmentation Strategy |
+|:--------|:---------------------|
+| MNIST | Resize, RandomRotation, Normalize |
+| CIFAR-10/100 | AutoAugment (CIFAR10 policy) |
+| ImageNet/COCO | AutoAugment (ImageNet policy) |
+| General | RandomCrop, RandomHorizontalFlip, RandomErasing |
 
 ---
 
-## 9.3 训练循环
+## 9.3 Model Configuration
 
-### train_one_epoch()
+### Recommended Hyperparameters
+
+| Parameter | CIFAR-10 | ImageNet | Notes |
+|:----------|:---------|:---------|:------|
+| `dim` | 192 | 512 | Embedding dimension |
+| `depth` | 9 | 12 | Transformer layers |
+| `heads` | 6 | 8 | Attention heads |
+| `mlp_dim` | 384 | 2048 | FFN hidden dim |
+| `patch_size` | 4 | 16 | Base patch size |
+| `dropout` | 0.1 | 0.1 | Dropout rate |
+| `drop_path` | 0.1 | 0.1 | DropPath rate |
+
+### P0 Training Fixes
+
+| Parameter | Old Default | New Default | Impact |
+|:----------|:------------|:------------|:-------|
+| `mlp_dim` | dim × 2 | dim × 4 | +3-5% accuracy |
+| `dropout` | 0.3 | 0.1 | +2-3% accuracy |
+| `drop_path` | 0.2 | 0.1 | +1-2% accuracy |
+| `mixup_alpha` | 0.8 | 0.4 | +1-2% accuracy |
+| `weight_decay` | 0.05 | 0.03 | +0.5-1% accuracy |
+
+---
+
+## 9.4 Training Loop
+
+### Basic Training
 
 ```python
-def train_one_epoch(model, dataloader, optimizer, criterion):
+def train_one_epoch(model, dataloader, optimizer, criterion, scaler):
+    model.train()
+    
     for images, labels in dataloader:
-        # 1. 前向传播
-        with autocast():
+        images = images.cuda()
+        labels = labels.cuda()
+        
+        # Forward pass with mixed precision
+        with torch.cuda.amp.autocast():
             outputs = model(images)
             loss = criterion(outputs, labels)
-
-        # 2. 反向传播
+        
+        # Backward pass
         optimizer.zero_grad()
         scaler.scale(loss).backward()
+        
+        # Gradient clipping
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         scaler.step(optimizer)
         scaler.update()
-
-        # 3. 清理缓存
+        
+        # Clear tokenizer cache
         model.clear_tokenizer_cache()
 ```
 
-### 混合精度训练
-
-使用 `torch.cuda.amp` (或 `torch.amp`) 进行加速：
-
-- `autocast()`: 自动选择精度
-- `GradScaler`: 梯度缩放
-
-### 梯度裁剪
+### Mixed Precision Training
 
 ```python
-torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+from torch.cuda.amp import autocast, GradScaler
+
+scaler = GradScaler()
+
+with autocast():
+    outputs = model(images)
+    loss = criterion(outputs, labels)
+
+scaler.scale(loss).backward()
+scaler.step(optimizer)
+scaler.update()
 ```
 
 ---
 
-## 9.4 学习率调度
+## 9.5 Learning Rate Schedule
 
-采用组合调度策略：
-
-1. **Warmup**: `LinearLR`，前 5 个 Epoch 线性预热
-2. **Cosine Annealing**: `CosineAnnealingLR`，余弦退火衰减
-3. **SequentialLR**: 串联上述两个调度器
+### Warmup + Cosine Annealing
 
 ```python
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+
+# Warmup for first 5 epochs
 warmup = LinearLR(optimizer, start_factor=0.1, total_iters=5)
-cosine = CosineAnnealingLR(optimizer, T_max=epochs-5)
+
+# Cosine annealing for remaining epochs
+cosine = CosineAnnealingLR(optimizer, T_max=epochs - 5)
+
+# Combine schedulers
 scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[5])
 ```
 
+### Schedule Visualization
+
+```
+LR
+ │
+ │     ╱‾‾‾‾‾‾‾‾╲
+ │    ╱          ╲
+ │   ╱            ╲
+ │  ╱              ╲
+ │ ╱                ╲
+ │╱                  ╲
+ └────────────────────── Epoch
+   5    Warmup   Cosine
+```
+
 ---
 
-## 9.5 V3 训练特性
+## 9.6 V3 Training Characteristics
 
-### Variable Depth Tokens 架构
+### Variable Depth Tokens
 
-V3 采用 **Variable Depth Tokens** 架构，基于内容自适应四叉树分割，无需温度退火或深度偏置调度：
+V3 uses content-adaptive quadtree splitting without temperature annealing:
 
 ```python
-# V3 训练循环 (简化)
 for epoch in range(epochs):
     for images, labels in dataloader:
         output = model(images)
         loss = criterion(output, labels)
         
-        # 获取分割统计
-        stats = model.tokenizer.get_training_stats()
-        print(f"Depth entropy: {stats.get('depth_entropy', 0):.3f}")
+        # Optional: Monitor split statistics
+        if epoch % 10 == 0:
+            stats = model.tokenizer.get_split_stats()
+            print(f"Mean tokens: {np.mean(stats['num_tokens']):.1f}")
+            print(f"Depth entropy: {model.tokenizer.get_scale_entropy():.3f}")
         
         loss.backward()
         optimizer.step()
 ```
 
-### 诊断方法
+### Diagnostics
 
 ```python
-# 获取分割统计
+# Split statistics
 stats = tokenizer.get_split_stats()
 # {
-#     'num_tokens': [48, 52, ...],  # 每图像 token 数
-#     'depth_distributions': [{0: 4, 1: 16, 2: 28}, ...],  # 深度分布
+#     'num_tokens': [48, 52, 64, ...],      # Tokens per image
+#     'depth_distributions': [
+#         {0: 1, 1: 4, 2: 16, 3: 27},       # Per-image depth counts
+#         ...
+#     ],
+#     'mean_complexity': 0.42,
 # }
 
-# 深度分布熵 (多样性指标)
-entropy = tokenizer.get_scale_entropy()
+# Depth diversity (higher is better)
+entropy = tokenizer.get_scale_entropy()  # Target: > 1.5
 ```
 
 ---
 
-## 9.6 历史：温度退火与 Depth Bias (已废弃)
+## 9.7 Experiment Management
 
-> **重要**: 以下内容仅作历史参考。V2 (Gumbel-Softmax) 已从代码库完全移除，V3 也已从 Cross-Scale Attention 重构为 Variable Depth Tokens 架构。
-
-### V2 温度调度 (已删除)
-
-V2 使用 Gumbel-Softmax 需要温度退火：$\tau(t) = \tau_{max} \cdot \left(\frac{\tau_{min}}{\tau_{max}}\right)^{t/T}$
-
-### Depth Bias 预热 (已删除)
-
-V2 的深度偏置调度：$\text{logits}'_{i,j,s} = \text{logits}_{i,j,s} + \beta(t) \cdot e^{-\lambda s}$
-- warmup = 0.2 (训练前 20% 使用偏置)
-
----
-
-## 9.7 实验管理
-
-### ExperimentPaths
-
-自动生成带时间戳的实验目录结构：
+### Directory Structure
 
 ```
 experiments/
 └── fractal_vit_simple_20251214_123456/
     ├── checkpoints/
-    │   └── best.pth
+    │   ├── best.pth
+    │   └── last.pth
     ├── logs/
     │   └── training.log
     ├── visualizations/
-    │   └── training_curves.png
+    │   ├── training_curves.png
+    │   └── attention_maps.png
     └── training_history.json
 ```
 
-### Checkpoint 保存
+### Checkpoint Format
 
 ```python
 checkpoint = {
@@ -179,53 +210,77 @@ checkpoint = {
     'optimizer_state_dict': optimizer.state_dict(),
     'scheduler_state_dict': scheduler.state_dict(),
     'best_accuracy': best_acc,
+    'config': config.__dict__,
 }
 torch.save(checkpoint, 'best.pth')
 ```
 
+### Loading Checkpoint
+
+```python
+checkpoint = torch.load('best.pth')
+model.load_state_dict(checkpoint['model_state_dict'])
+optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+start_epoch = checkpoint['epoch'] + 1
+```
+
 ---
 
-## 9.8 P0 训练配置修复 (2025-12-23)
+## 9.8 Training Script
 
-> **重要**: 以下参数默认值已针对 Tiny-ImageNet 优化，预期提升准确率 5-8%。
-
-| 参数 | 旧默认值 | 新默认值 | 影响 |
-|------|----------|----------|------|
-| `mlp_dim` | `dim * 2` | `dim * 4` | FFN 容量提升 +3-5% |
-| `dropout` | 0.3 | 0.1 | 减轻过正则化 +2-3% |
-| `drop_path` | 0.2 | 0.1 | 减轻过正则化 +1-2% |
-| `mixup_alpha` | 0.8 | 0.4 | 适配小图像 +1-2% |
-| `weight_decay` | 0.05 | 0.03 | 适配模型规模 +0.5-1% |
-| `variable_tokens` | True | False | 训练稳定性 |
-
-## 9.9 使用示例
+### Command Line Interface
 
 ```bash
-# 使用推荐配置训练 (V3 + LCA 模式)
 python examples/training/train_fractal_vit.py \
-    --dataset tiny-imagenet \
+    --dataset cifar10 \
+    --image-size 32 \
+    --dim 192 \
+    --depth 9 \
+    --heads 6 \
+    --mlp-dim 384 \
     --tokenizer-type streaming_v3 \
     --bias-mode lca \
     --ffn-type swiglu_level \
     --epochs 100 \
     --batch-size 128 \
-    --lr 1e-4 \
-    --use-amp
-
-# 使用 Low-Rank 模式 (大模型推荐)
-python examples/training/train_fractal_vit.py \
-    --dataset imagenet \
-    --tokenizer-type streaming_v3 \
-    --bias-mode low_rank \
-    --rank 32 \
-    --dim 768 \
-    --epochs 300
-
-# 使用 CIFAR-10 数据集
-python examples/training/train_fractal_vit.py \
-    --dataset cifar10 \
-    --tokenizer-type streaming_v3 \
-    --bias-mode lca
+    --lr 5e-4 \
+    --weight-decay 0.03
 ```
 
-> **注意**: 当前仅支持 `streaming_v3`。V1 (`streaming`) 和 V2 已从代码库完全移除。
+### Key Arguments
+
+| Argument | Default | Description |
+|:---------|:--------|:------------|
+| `--tokenizer-type` | `streaming_v3` | Tokenizer type (V3 only) |
+| `--bias-mode` | `lca` | Hilbert bias mode |
+| `--ffn-type` | `swiglu_level` | FFN type |
+| `--dim` | 384 | Model dimension |
+| `--depth` | 6 | Transformer layers |
+| `--heads` | 6 | Attention heads |
+| `--lr` | 5e-4 | Learning rate |
+| `--weight-decay` | 0.03 | Weight decay |
+
+---
+
+## 9.9 Best Practices
+
+### Memory Optimization
+
+1. **Clear tokenizer cache**: Call `model.clear_tokenizer_cache()` after each batch
+2. **Mixed precision**: Use `torch.cuda.amp` for 2× memory reduction
+3. **Gradient checkpointing**: Enable for large models
+
+### Training Stability
+
+1. **Gradient clipping**: `max_norm=1.0`
+2. **Learning rate warmup**: 5-10 epochs
+3. **Weight decay**: 0.03 for most configurations
+
+### Monitoring
+
+1. **Depth distribution entropy**: Should be > 1.5
+2. **Token count variance**: Some variation is healthy
+3. **Gradient norms**: Watch for explosions
+
+> **Next**: [10_testing_qa.md](10_testing_qa.md) - Testing and QA

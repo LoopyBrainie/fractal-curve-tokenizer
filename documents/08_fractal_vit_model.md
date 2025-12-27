@@ -1,171 +1,253 @@
-# 第八章：完整 ViT 模型 (vit.py)
+# Chapter 8: Complete ViT Model
 
-本章详尽描述了数据在 `FractalCurveViT` 模型中的完整流动过程。
+## 8.1 Overview
 
-## 8.1 数学形式化
+`FractalCurveViT` is the complete Vision Transformer model that integrates all components: tokenization, position encoding, transformer encoder, and classification head.
 
-$I \xrightarrow{\text{Tokenize}} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{CLS}} [c; T'] \xrightarrow{\text{Transformer}} X' \xrightarrow{\text{Pool}} z \xrightarrow{\text{MLP}} \hat{y}$
+---
 
-**损失函数**:
+## 8.2 Mathematical Formulation
+
+### End-to-End Pipeline
+
+$$I \xrightarrow{\text{Tokenize}} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{CLS}} [c; T'] \xrightarrow{\text{Transformer}} X' \xrightarrow{\text{Pool}} z \xrightarrow{\text{MLP}} \hat{y}$$
+
+### Loss Function
+
 $$\mathcal{L} = \mathcal{L}_{CE}(y, \hat{y})$$
 
-Streaming Tokenizer 实现端到端可微，无需额外辅助损失。
+The streaming tokenizer enables end-to-end differentiability without auxiliary losses.
 
 ---
 
-## 8.2 Tokenizer 类型选项
+## 8.3 Class Definition
 
-| tokenizer_type   | 实现类                           | 特点                                    | 状态       |
-|:---------------- |:------------------------------- |:--------------------------------------- |:---------- |
-| `streaming_v3`   | `StreamingFractalTokenizerV3`   | Variable Depth Tokens + 自适应四叉树 + ROI-Align | ✅ **唯一选项** |
+```python
+class FractalCurveViT(nn.Module):
+    def __init__(
+        self,
+        *,
+        image_size: int,
+        num_classes: int,
+        dim: int = 512,
+        depth: int = 6,
+        heads: int = 8,
+        mlp_dim: int = None,  # Default: dim × 4
+        pool: str = 'cls',
+        channels: int = 3,
+        dim_head: int = 64,
+        dropout: float = 0.1,
+        emb_dropout: float = 0.0,
+        tokenizer_type: str = 'streaming_v3',
+        hilbert_bias_mode: str = 'lca',
+        ffn_type: str = 'swiglu_level',
+        low_rank_r: int = 32,
+        lca_temperature: float = 1.5,
+        learnable_temperature: bool = True,
+    ):
+        ...
+```
 
-> **注意**: V1 (`StreamingFractalTokenizer`) 和 V2 (Gumbel-Softmax) 已从代码库移除。当前仅支持 V3。
+### Key Parameters
+
+| Parameter | Type | Default | Description |
+|:----------|:-----|:--------|:------------|
+| `image_size` | int | - | Input image size |
+| `num_classes` | int | - | Number of output classes |
+| `dim` | int | 512 | Model embedding dimension |
+| `depth` | int | 6 | Number of transformer layers |
+| `heads` | int | 8 | Number of attention heads |
+| `mlp_dim` | int | dim × 4 | FFN hidden dimension |
+| `pool` | str | 'cls' | Pooling strategy ('cls' or 'mean') |
+| `dropout` | float | 0.1 | Dropout rate |
+| `tokenizer_type` | str | 'streaming_v3' | Tokenizer type (V3 only) |
+| `hilbert_bias_mode` | str | 'lca' | Attention bias mode |
+| `ffn_type` | str | 'swiglu_level' | FFN type |
 
 ---
 
-## 8.3 核心类：FractalCurveViT
+## 8.4 Forward Pass
 
-### 初始化参数
+### Step-by-Step Data Flow
 
-| 参数               | 类型            | 默认值            | 说明                         |
-|:---------------- |:------------- |:-------------- |:-------------------------- |
-| `image_size`     | int           | -              | 输入图像尺寸                     |
-| `num_classes`    | int           | -              | 分类类别数                      |
-| `dim`            | int           | -              | 模型维度                       |
-| `depth`          | int           | 6              | Transformer 层数             |
-| `heads`          | int           | 8              | 注意力头数                      |
-| `mlp_dim`        | int           | dim × 4        | FFN 隐藏层维度 (P0 修复: 2×→4×)   |
-| `pool`           | str           | 'cls'          | 池化策略                       |
-| `dropout`        | float         | 0.1            | Dropout 比率 (P0 修复: 0.3→0.1) |
-| `tokenizer_type` | str           | 'streaming_v3' | Tokenizer 类型 (仅 V3)          |
-| `variable_tokens`| bool          | False          | 可变 Token 模式 (P0 修复: True→False) |
-| `bias_mode`      | str           | 'lca'          | Hilbert Bias 模式 (推荐 'lca') |
-| `ffn_type`       | str           | 'swiglu_level' | FFN 类型                     |
-| `config`         | FractalConfig | None           | 统一配置对象 (优先级高于单独参数)         |
+```python
+def forward(self, img: Tensor) -> Tensor:
+    """
+    Args:
+        img: (B, C, H, W) - Input images
+    
+    Returns:
+        logits: (B, num_classes) - Classification logits
+    """
+```
 
-### forward(img, ...) 数据流详解
-
-**Step 1: 分形分词 (Tokenization)**
+### Step 1: Tokenization
 
 ```python
 token_output = self.tokenizer.tokenize(img)
-# token_output: TokenizerOutput
-# - sequences: List[TokenSequence]
-# - 每个序列: tokens (N, D), levels (N, Info_Len)
+# token_output.sequences: List[TokenSequence]
+# - each sequence: tokens (N_i, D), levels (N_i, max_depth+1)
 ```
 
-**Step 2: 批次对齐 (Batch Padding)**
+### Step 2: Batch Padding
 
 ```python
-# 提取 tokens 和 levels
+# Extract tokens and levels
 tokens_list = [seq.tokens for seq in token_output.sequences]
 levels_list = [seq.get_levels() for seq in token_output.sequences]
 
-# Padding
-padded_tokens = pad_sequence(tokens_list, batch_first=True)  # (B, S_max, D)
-padded_levels = pad_sequence(levels_list, batch_first=True)  # (B, S_max, Info)
+# Pad to max length
+padded_tokens = pad_sequence(tokens_list, batch_first=True)  # (B, N_max, D)
+padded_levels = pad_sequence(levels_list, batch_first=True)  # (B, N_max, Info)
 
-# 生成 mask
-key_padding_mask = create_padding_mask(lengths)  # (B, S_max)
+# Create padding mask
+lengths = [seq.tokens.shape[0] for seq in token_output.sequences]
+key_padding_mask = create_padding_mask(lengths)  # (B, N_max)
 ```
 
-**Step 3: 位置编码 (Positional Embedding)**
+### Step 3: Position Encoding
 
 ```python
-pos_emb = self.pos_embedding(padded_levels)  # (B, S_max, D)
+pos_emb = self.pos_embedding(padded_levels)  # (B, N_max, D)
 x = padded_tokens + pos_emb
 ```
 
-**Step 4: 添加 CLS Token**
+### Step 4: CLS Token
 
 ```python
+B = x.shape[0]
 cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, D)
-x = torch.cat([cls_tokens, x], dim=1)  # (B, S_max + 1, D)
+x = torch.cat([cls_tokens, x], dim=1)  # (B, N_max+1, D)
 
-# 更新 mask
-cls_levels = torch.zeros(B, 1, Info_Len)
+# Update levels_info for CLS
+cls_levels = torch.zeros(B, 1, padded_levels.shape[-1], device=x.device, dtype=torch.long)
 levels_info = torch.cat([cls_levels, padded_levels], dim=1)
 ```
 
-**Step 5: Dropout**
+### Step 5: Dropout
 
 ```python
 x = self.dropout(x)
 ```
 
-**Step 6: Transformer 编码**
+### Step 6: Transformer
 
 ```python
-attn_mask = ~key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S+1)
-x = self.transformer(x, levels_info, attn_mask)  # (B, S+1, D)
+# Prepare attention mask: True = attend, False = ignore
+attn_mask = ~key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, N+1)
+
+x = self.transformer(x, levels_info, attn_mask)  # (B, N+1, D)
 ```
 
-**Step 7: 池化 (Pooling)**
+### Step 7: Pooling
 
 ```python
 if self.pool == 'cls':
     pooled = x[:, 0]  # (B, D)
 elif self.pool == 'mean':
-    # 忽略 CLS 和 Padding
-    mask = ~key_padding_mask[:, 1:]  # (B, S)
-    pooled = (x[:, 1:] * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True)
+    # Exclude CLS and padded tokens
+    mask = ~key_padding_mask  # (B, N)
+    token_x = x[:, 1:]  # (B, N, D)
+    pooled = (token_x * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True)
 ```
 
-**Step 8: 分类头 (Classification Head)**
+### Step 8: Classification Head
 
 ```python
 logits = self.mlp_head(pooled)  # (B, num_classes)
-# mlp_head: LayerNorm -> Linear -> GELU -> Dropout -> Linear
+
+# mlp_head structure:
+# LayerNorm → Linear(D, D) → GELU → Dropout → Linear(D, num_classes)
 ```
 
 ---
 
-## 8.4 辅助方法
+## 8.5 Auxiliary Methods
 
 ### get_tokenizer_loss()
 
-用于获取 tokenizer 的辅助损失。对于 Streaming Tokenizer，返回零损失。
+Returns auxiliary tokenizer loss (zero for streaming tokenizer).
 
-**输入**: `reward` (可选参数，为了接口兼容性保留)
-
-**输出**: `torch.tensor(0.0)` (对于 streaming tokenizer)
+```python
+def get_tokenizer_loss(self, reward: Optional[Tensor] = None) -> Tensor:
+    return torch.tensor(0.0, device=self.device)
+```
 
 ### clear_tokenizer_cache()
 
-清空 tokenizer 的缓存，防止内存泄漏。
+Clears tokenizer cache to prevent memory leaks during training.
+
+```python
+def clear_tokenizer_cache(self):
+    if hasattr(self.tokenizer, 'clear_cache'):
+        self.tokenizer.clear_cache()
+```
 
 ---
 
-## 8.5 使用示例
+## 8.6 Architecture Diagram
 
-### 推荐：使用 FractalConfig
-
-```python
-from vit_pytorch import FractalConfig, FractalCurveViT
-
-# 使用统一配置对象（推荐）
-config = FractalConfig(
-    d_model=384,
-    num_heads=6,
-    hilbert_bias_mode='lca',  # 默认值，可省略
-)
-
-model = FractalCurveViT(
-    image_size=224,
-    num_classes=1000,
-    dim=config.d_model,
-    depth=6,
-    heads=config.num_heads,
-    mlp_dim=768,
-    tokenizer_type='streaming_v3',  # ✅ 推荐
-    config=config,
-)
-
-images = torch.randn(2, 3, 224, 224)
-logits = model(images)  # (2, 1000)
+```
+Input Image (B, C, H, W)
+        │
+        ▼
+┌─────────────────────────────────┐
+│  StreamingFractalTokenizerV3    │
+│  ├── Complexity Estimation      │
+│  ├── Adaptive Quadtree Split    │
+│  ├── HilbertNativePatchEmbed    │
+│  └── Hilbert Reordering         │
+└─────────────────────────────────┘
+        │
+        ▼
+   (tokens, levels_info)
+        │
+        ▼
+┌─────────────────────────────────┐
+│     FractalPositionEmbedding    │
+│     Depth + Path Encoding       │
+└─────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────┐
+│     Prepend CLS Token           │
+└─────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────┐
+│     FractalTransformer × L      │
+│  ┌────────────────────────────┐ │
+│  │ Level-Aware LayerNorm      │ │
+│  │ HilbertAwareAttention      │ │
+│  │   + LCA Hilbert Bias       │ │
+│  │ DropPath + Residual        │ │
+│  │ Level-Aware LayerNorm      │ │
+│  │ SwiGLU FFN + Level Adapt   │ │
+│  │ DropPath + Residual        │ │
+│  └────────────────────────────┘ │
+│     Level Aggregator            │
+└─────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────┐
+│     Pooling (CLS / Mean)        │
+└─────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────┐
+│     MLP Classification Head     │
+│     LN → Linear → GELU → Linear │
+└─────────────────────────────────┘
+        │
+        ▼
+   Logits (B, num_classes)
 ```
 
-### 直接参数传递
+---
+
+## 8.7 Usage Examples
+
+### Basic Usage
 
 ```python
 from vit_pytorch import FractalCurveViT
@@ -177,68 +259,51 @@ model = FractalCurveViT(
     depth=6,
     heads=6,
     mlp_dim=768,
-    tokenizer_type='streaming_v3',  # ✅ 推荐
-    bias_mode='lca',                # 推荐 (参数量最少)
-    ffn_type='swiglu_level',        # 推荐
+    tokenizer_type='streaming_v3',
+    hilbert_bias_mode='lca',
+    ffn_type='swiglu_level',
 )
 
-images = torch.randn(2, 3, 224, 224)
-logits = model(images)  # (2, 1000)
+images = torch.randn(4, 3, 224, 224)
+logits = model(images)  # (4, 1000)
 ```
 
----
+### With FractalConfig
 
-## 8.6 架构图
+```python
+from vit_pytorch import FractalConfig, FractalCurveViT
 
+config = FractalConfig(
+    d_model=384,
+    num_heads=6,
+    hilbert_bias_mode='lca',
+    max_depth=4,
+)
+
+model = FractalCurveViT(
+    image_size=224,
+    num_classes=1000,
+    dim=config.d_model,
+    heads=config.num_heads,
+    config=config,
+)
 ```
-Input Image (B, C, H, W)
-        │
-        ▼
-┌─────────────────────────────┐
-│ StreamingFractalTokenizerV3 │
-│ - AdaptiveQuadtreeSplit     │
-│ - HilbertNativePatchEmbed   │
-│ - ROI-Align Pooling         │
-└─────────────────────────────┘
-        │
-        ▼
-  TokenizerOutput
-  (tokens, levels)
-        │
-        ▼
-┌─────────────────────────────┐
-│    Batch Padding & Mask     │
-└─────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────┐
-│ FractalPositionEmbedding    │
-│ - Depth Embedding           │
-│ - Path Embedding            │
-│ - Fusion Network            │
-└─────────────────────────────┘
-        │
-        ▼
-    Add CLS Token
-        │
-        ▼
-┌─────────────────────────────┐
-│ FractalTransformer          │
-│ - Level-Aware LayerNorm     │
-│ - HilbertAwareAttention     │
-│ - SwiGLU FFN                │
-│ - DropPath                  │
-└─────────────────────────────┘
-        │
-        ▼
-    Pooling (cls/mean)
-        │
-        ▼
-┌─────────────────────────────┐
-│       MLP Head              │
-│ LN -> Linear -> GELU -> Linear
-└─────────────────────────────┘
-        │
-        ▼
-   Logits (B, num_classes)
+
+### Training Loop Integration
+
+```python
+for images, labels in dataloader:
+    with torch.cuda.amp.autocast():
+        logits = model(images)
+        loss = criterion(logits, labels)
+    
+    optimizer.zero_grad()
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+    
+    # Clear cache to prevent memory accumulation
+    model.clear_tokenizer_cache()
 ```
+
+> **Next**: [09_training_system.md](09_training_system.md) - Training System

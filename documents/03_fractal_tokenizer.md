@@ -1,342 +1,244 @@
-# 第三章：分形 Tokenizer 核心 (tokenizer_streaming.py)
+# Chapter 3: Fractal Tokenizer
 
-> **更新日期**: 2025-12-26
-> **文档版本**: v2.0 (与代码对齐)
+## 3.1 Overview
 
-本章详尽描述了图像数据如何通过流式分形分词器被转化为 Token 序列。这是整个模型的数据入口。
-
-## 3.1 数据流概览
-
-```mermaid
-graph LR
-    A[Image B×C×H×W] --> B[StreamingFractalTokenizerV3]
-    B --> C[AdaptiveQuadtreeSplit]
-    C --> D[HilbertNativePatchEmbed]
-    D --> E[ROI-Align 批量池化]
-    E --> F[深度编码 σ_d + E_d]
-    F --> G[TokenizerOutput]
-```
-
-**数学形式化**:
-$$T: \mathbb{R}^{B \times C \times H \times W} \to (\mathbb{R}^{B \times N \times D}, \mathbb{Z}^{B \times N \times (d_{max}+1)})$$
-
-其中：
-- $N$ = Token 数量（V3 自适应 $\in [N_{min}, N_{max}]$）
-- $D$ = Token 维度
-- $d_{max}+1$ = 层级信息维度 `[depth, q1, q2, ..., q_d]`
+The `StreamingFractalTokenizerV3` implements **Variable Depth Tokenization** via adaptive quadtree splitting and Hilbert curve reordering. This chapter provides a complete mathematical specification.
 
 ---
 
-## 3.2 架构演进历史
+## 3.2 Mathematical Formulation
 
-| 版本 | 架构名称 | 核心机制 | 状态 |
-|:-----|:--------|:---------|:-----|
-| V1 | Fixed Multi-Scale | 固定卷积金字塔 | ❌ **已删除** (2025-12-26) |
-| V2 | Gumbel-Softmax | STE 自适应选择 | ❌ **已删除** |
-| V3 旧 | Cross-Scale Attention | 学习尺度权重 | ❌ **已重构** |
-| V3 新 | **Variable Depth Tokens** | 自适应四叉树分割 | ✅ **唯一推荐** |
+### 3.2.1 Tokenization Pipeline
 
-> **重要**: V1 和 V2 已于 2025-12-26 从代码库完全移除。当前只支持 V3 (Variable Depth Tokens) 架构。
+$$I \xrightarrow{\text{Split}} \{R_i\}_{i=1}^{N} \xrightarrow{\text{Embed}} \{t_i\}_{i=1}^{N} \xrightarrow{\text{Sort}} \{t_{\pi(i)}\}_{i=1}^{N}$$
 
----
+where:
+- $I \in \mathbb{R}^{C \times H \times W}$: Input image
+- $R_i$: Quadtree region (axis-aligned rectangle)
+- $t_i \in \mathbb{R}^D$: Token embedding
+- $\pi$: Hilbert curve permutation
 
-## 3.3 核心类：StreamingFractalTokenizerV3 (✅ 唯一支持)
+### 3.2.2 Complexity Function
 
-### 3.3.1 架构概述
+The splitting decision is based on a normalized complexity measure:
 
-Variable Depth Tokens (VDT) 架构使用**内容自适应四叉树分割**代替学习权重：
+$$C(R) = \alpha \cdot C_{var}(R) + (1 - \alpha) \cdot C_{grad}(R)$$
 
-```python
-旧架构 (Cross-Scale Attention) - 已废弃:
-    F_s = MultiScaleConv(I)           # 多尺度特征
-    α_{i,s} = softmax(Q_i · K_{i,s})  # 学习尺度权重
-    Token_i = Σ_s α_{i,s} · V_{i,s}   # 加权融合
-    问题: α 必然崩塌到单尺度 (信息论必然性)
+where:
 
-新架构 (Variable Depth Tokens) - 当前:
-    Regions = AdaptiveQuadtreeSplit(I)  # 内容自适应分割
-    F = SharedConv(I)                    # 共享特征提取
-    Token_i = Pool(F[R_i]) * σ_d + E_d  # 区域池化 + 深度编码
-    优势: 深度由内容决定，非学习崩塌
-```
+$$C_{var}(R) = \frac{\text{Var}(R)}{\text{Var}(R) + \sigma_0^2}, \quad C_{grad}(R) = \frac{G(R)}{G(R) + g_0^2}$$
 
-### 3.3.2 数学约束
+- $\text{Var}(R)$: Pixel variance within region $R$
+- $G(R)$: Gradient energy (sum of squared gradients)
+- $\alpha \in [0, 1]$: Balance parameter (default: 0.5)
+- $\sigma_0^2, g_0^2$: Normalization constants
 
-V3 满足四个核心数学约束：
+### 3.2.3 Depth-Dependent Threshold
 
-| 约束 | 符号 | 描述 |
-|:-----|:-----|:-----|
-| **C1** 维度一致性 | $\text{Embed}(R_i) \in \mathbb{R}^{dim}, \forall i, \forall d_i$ | 不同大小 region → 相同维度 |
-| **C2** Hilbert 路径一致性 | $\text{HilbertPath}(\text{center}(R_i))[:d_i] = \text{QuadtreePath}(R_i)$ | 保持四叉树路径信息 |
-| **C3** 尺度等变性 | $\text{Embed}(R_i) \approx \sigma \cdot \text{Embed}(R_j) + \text{bias}$ | 相同内容不同尺度有数学联系 |
-| **C4** LCA 兼容性 | $\text{LCA\_depth}(\text{path}_i, \text{path}_j)$ 对 Transformer bias 有效 | 与 LCA 偏置协同工作 |
-
-### 3.3.3 初始化参数
-
-| 参数                   | 类型         | 默认值              | 说明                  |
-|:-------------------- |:---------- |:---------------- |:------------------- |
-| `image_size`         | int/Tuple  | 224              | 输入图像尺寸              |
-| `channels`           | int        | 3                | 图像通道数               |
-| `d_model`            | int        | 256              | 输出 token 维度         |
-| `base_patch_size`    | int        | 4                | 最细粒度 patch 大小       |
-| `max_depth`          | int        | 4                | 最大四叉树深度             |
-| `use_hilbert_order`  | bool       | True             | 是否使用 Hilbert 排序     |
-| `split_scheme`       | str        | 'balanced_greedy'| 分割方案 (见 3.6 节)      |
-| `target_tokens`      | int/None   | None             | 目标 token 数量         |
-| `complexity_alpha`   | float      | 0.5              | 复杂度函数方差权重          |
-| `enforce_balance`    | bool       | True             | 是否强制 2:1 平衡约束       |
-
-### 3.3.4 tokenize() 方法
-
-**流程**:
-
-```
-1. AdaptiveQuadtreeSplit(Image) → List[SplitResult]
-2. HilbertNativePatchEmbed(Image, SplitResults) → (tokens, levels_info)
-3. HilbertSort(tokens) → ordered tokens
-4. Build TokenizerOutput
-```
-
-**输入**: `images: Tensor[B, C, H, W]`
-
-**输出**: `TokenizerOutput` 包含:
-- `tokens`: `[B, N, d_model]` Token 嵌入
-- `levels_info`: `[B, N, max_depth+1]` 层级信息 `[depth, q1, q2, ...]`
-- `metadata.split_stats`: 分割统计信息
-
----
-
-## 3.4 自适应四叉树分割 (split_adaptive.py)
-
-### 3.4.1 核心数学：复杂度函数
-
-**复杂度定义**:
-$$C(R) = \alpha \cdot C_{var}(R) + (1-\alpha) \cdot C_{grad}(R)$$
-
-其中：
-- $C_{var}(R) = \frac{\text{Var}(R)}{\text{Var}(R) + \sigma_0^2}$ — 归一化方差（纹理敏感）
-- $C_{grad}(R) = \frac{G(R)}{G(R) + g_0^2}$ — 归一化梯度能量（边缘敏感）
-- $\alpha \in [0, 1]$ — 平衡权重（默认 0.5）
-
-**深度相关阈值**:
 $$\tau_d = \tau_0 \cdot \gamma^d$$
 
-| 参数 | 默认值 | 含义 |
-|:-----|:------|:-----|
-| $\tau_0$ | 0.15 | 根阈值 |
-| $\gamma$ | 0.85 | 衰减因子 |
-| $\sigma_0^2$ | 0.01 | 方差归一化常数 |
-| $g_0^2$ | 0.08 | 梯度归一化常数 |
+where:
+- $\tau_0$: Root threshold (default: 0.15)
+- $\gamma$: Decay factor (default: 0.85)
+- $d$: Current depth
 
-### 3.4.2 分割方案
-
-**Scheme B: Balanced Greedy Splitting (推荐)**
-
-```python
-config = AdaptiveSplitConfig.scheme_b(
-    max_depth=4,
-    alpha=0.5,
-    enforce_balance=True,  # 2:1 平衡约束
-    target_tokens=64,      # 软目标
-)
-splitter = BalancedGreedySplitter(config)
-```
-
-特点：
-- 贪心策略，优先分割高复杂度区域
-- 强制相邻区域深度差 ≤ 1 (2:1 平衡)
-- 适合实时推理
-
-**Scheme C: Fixed Budget Dynamic Programming**
-
-```python
-config = AdaptiveSplitConfig.scheme_c(
-    token_budget=64,
-    max_depth=4,
-    alpha=0.5,
-)
-splitter = FixedBudgetDPSplitter(config)
-```
-
-特点：
-- 动态规划全局最优
-- 固定 token 数量
-- 计算开销较大
-
-### 3.4.3 四叉树-Hilbert 同构
-
-**关键定理**:
-$$\text{QuadtreePath}(R) = [q_1, q_2, \ldots, q_d] \iff \text{HilbertSegment}(R) = H|_{[a,b]}$$
-
-四叉象限 $q_i \in \{0, 1, 2, 3\}$ 对应 Hilbert 曲线的连续区间。
+**Splitting criterion**:
+$$\text{Split}(R) \iff C(R) > \tau_d \land d < d_{max} \land \text{size}(R) \geq \text{min\_size}$$
 
 ---
 
-## 3.5 Hilbert-Native Patch Embedding (embed_hilbert_patch.py)
+## 3.3 Splitting Schemes
 
-### 3.5.1 Region Pooling 方案 (方案 C+ 向量化版本)
+### 3.3.1 Balanced Greedy Splitting (Scheme B)
 
-**公式**:
-$$F = \text{SharedConv}(I) \in \mathbb{R}^{B \times D \times \frac{H}{p} \times \frac{W}{p}}$$
+**Algorithm**:
 
-对于深度 $d_i$ 的区域 $R_i$:
-$$t_i = \text{AdaptiveAvgPool2d}(1)(F[:, :, y_1:y_2, x_1:x_2]) \cdot \sigma_{d_i} + E_{depth}(d_i)$$
-
-其中：
-- $\sigma_{d_i}$ — 深度缩放因子（乘法）
-- $E_{depth}(d_i)$ — 深度嵌入向量（加法）
-
-### 3.5.2 参数量分析
-
-| 组件 | 参数量 | 说明 |
-|:-----|:------|:-----|
-| SharedConv | ~12K | $D \times C \times p \times p$ |
-| depth_embed | ~1.3K | $(d_{max}+1) \times D$ |
-| depth_scale | ~5 | $d_{max}+1$ |
-| **总计** | **~14K** | vs 4.2M (Depth-Specific Conv) |
-
-### 3.5.3 深度缩放初始化 (depth_scale_beta)
-
-```python
-def _init_depth_scale(self) -> None:
-    """σ_d = 1.0 + β * d / max_depth ∈ [1.0, 1.0+β]
-    
-    默认 β=0.2，范围 [1.0, 1.2]
-    相比原 β=0.05 提升 4x 区分度 (P5-5 优化)
-    
-    深层 (细粒度): 信息密度高 → 略大权重
-    浅层 (粗粒度): 信息稀释 → 略小权重
-    """
 ```
+Input: Image I, config cfg
+Output: Set of leaf regions {R_i}
+
+1. Initialize priority queue Q with root region
+2. While Q is not empty:
+   a. Pop region R with highest complexity
+   b. If Split(R):
+      - Add 4 children to Q
+   c. Else:
+      - Add R to output set
+3. Post-process for 2:1 balance constraint
+```
+
+**2:1 Balance Constraint**: Adjacent regions differ by at most 1 level in depth.
+
+$$\forall R_i, R_j \text{ adjacent}: |d_i - d_j| \leq 1$$
+
+This ensures smooth transitions and is enforced via iterative refinement.
+
+### 3.3.2 Fixed Budget DP Splitting (Scheme C)
+
+**Objective**:
+$$\min_{\{R_i\}} \sum_{i=1}^{N} C(R_i) \quad \text{s.t.} \quad |\{R_i\}| = K$$
+
+**Algorithm**: Dynamic programming on quadtree structure.
+
+```
+Input: Image I, token budget K
+Output: Optimal split with exactly K tokens
+
+1. Compute complexity for all possible regions
+2. DP on quadtree: dp[node][budget] = min complexity
+3. Backtrack to recover optimal split
+```
+
+### 3.3.3 Learnable Splitting (Scheme L)
+
+**End-to-end differentiable splitting** via Gumbel-Softmax:
+
+$$\text{SplitProb}(R) = \sigma(\text{MLP}([C_{var}, C_{grad}, d, \ldots]))$$
+
+Temperature-annealed sampling:
+$$z = \text{GumbelSoftmax}(\log p, \tau(t))$$
+
+where $\tau(t) = \tau_{max} \cdot (\tau_{min}/\tau_{max})^{t/T}$.
 
 ---
 
-## 3.6 使用示例
+## 3.4 Token Embedding
 
-### 创建 V3 Tokenizer
+### 3.4.1 HilbertNativePatchEmbed
+
+Region-to-token embedding satisfying four constraints:
+
+| Constraint | Description | Implementation |
+|:-----------|:------------|:---------------|
+| **C1** | Scale equivariance | Shared conv + adaptive pooling |
+| **C2** | Depth awareness | Learnable depth modulation |
+| **C3** | Hilbert compatibility | Quadtree path preserved |
+| **C4** | Differentiability | ROI-Align for smooth gradients |
+
+**Mathematical formulation**:
+
+$$t_i = \text{Pool}(F[R_i]) \cdot \sigma_d + E_d$$
+
+where:
+- $F$: Shared convolutional features
+- $\text{Pool}$: Adaptive pooling to fixed size
+- $\sigma_d$: Depth-dependent scale (learnable)
+- $E_d$: Depth embedding
+
+### 3.4.2 ROI-Align
+
+For smooth gradient flow across region boundaries:
+
+$$\text{ROIAlign}(F, R) = \text{BilinearInterpolate}(F, \text{SamplePoints}(R))$$
+
+This avoids quantization artifacts from integer rounding.
+
+---
+
+## 3.5 Hilbert Reordering
+
+After splitting and embedding, tokens are sorted by their Hilbert curve index:
+
+$$\pi(i) = \text{argsort}(H^{-1}(\text{center}(R_i)))$$
+
+### Quadtree-Hilbert Isomorphism
+
+$$\text{QuadtreePath}(R) = [q_1, \ldots, q_d] \iff \text{HilbertSegment}(R) = H|_{[a,b]}$$
+
+This ensures that:
+1. Spatially adjacent regions have nearby sequence positions
+2. LCA relationships are preserved for attention bias
+
+---
+
+## 3.6 Implementation
+
+### Class: StreamingFractalTokenizerV3
+
+```python
+class StreamingFractalTokenizerV3(BaseTokenizer):
+    def __init__(
+        self,
+        image_size: int = 224,
+        d_model: int = 384,
+        base_patch_size: int = 4,
+        max_depth: int = 4,
+        split_scheme: str = 'balanced_greedy',
+        config: Optional[AdaptiveSplitConfig] = None,
+    ):
+        ...
+    
+    def tokenize(self, images: Tensor) -> TokenizerOutput:
+        """Convert images to variable-depth tokens."""
+        ...
+```
+
+### Key Methods
+
+| Method | Description |
+|:-------|:------------|
+| `tokenize(images)` | Main entry point |
+| `_compute_complexity(features)` | Compute $C(R)$ for all regions |
+| `_split_regions(complexity)` | Apply splitting scheme |
+| `_embed_regions(features, regions)` | ROI-Align + depth embedding |
+| `_hilbert_sort(tokens, levels)` | Sort by Hilbert index |
+
+---
+
+## 3.7 Diagnostics
+
+### Training Statistics
+
+```python
+stats = tokenizer.get_split_stats()
+# {
+#     'num_tokens': [48, 52, ...],        # Tokens per image
+#     'depth_distributions': [{0: 4, 1: 16, 2: 28}, ...],
+#     'mean_complexity': 0.42,
+# }
+
+entropy = tokenizer.get_scale_entropy()  # Depth distribution entropy
+```
+
+### Depth Distribution
+
+A healthy tokenizer should show diverse depth distributions:
+
+| Metric | Target | Interpretation |
+|:-------|:-------|:---------------|
+| Entropy | > 1.5 | Good diversity |
+| Max depth usage | > 10% | Using fine scales |
+| Min depth usage | > 5% | Using coarse scales |
+
+---
+
+## 3.8 Usage Example
 
 ```python
 from vit_pytorch import StreamingFractalTokenizerV3
-
-# 创建 Variable Depth tokenizer (唯一支持的版本)
-tokenizer = StreamingFractalTokenizerV3(
-    image_size=224,
-    channels=3,
-    d_model=256,
-    base_patch_size=4,
-    max_depth=4,
-    split_scheme='balanced_greedy',
-    target_tokens=64,
-    complexity_alpha=0.5,
-    enforce_balance=True,
-)
-
-# Tokenize
-images = torch.randn(2, 3, 224, 224)
-output = tokenizer.tokenize(images)
-
-# 输出结构
-for i, seq in enumerate(output.sequences):
-    print(f"样本 {i}: {seq.tokens.shape[0]} tokens, 维度 {seq.tokens.shape[1]}")
-    levels = seq.get_levels()
-    if levels is not None:
-        print(f"  层级信息: {levels.shape}")
-
-# 获取分割统计
-stats = tokenizer.get_split_stats()
-print(f"每图像 token 数: {stats['num_tokens']}")
-print(f"深度分布: {stats['depth_distributions']}")
-```
-
-### 域适应预设 (P5-10 新增)
-
-```python
 from vit_pytorch.split_adaptive import AdaptiveSplitConfig
 
-# 自然图像 (ImageNet, COCO 等)
-config = AdaptiveSplitConfig.natural_images()
+# Custom configuration
+config = AdaptiveSplitConfig(
+    alpha=0.5,           # Variance/gradient balance
+    tau_0=0.15,          # Root threshold
+    gamma=0.85,          # Decay factor
+    max_depth=4,         # Maximum depth
+    scheme='balanced_greedy',
+)
 
-# 医学图像 (CT, MRI, X-Ray 等)
-config = AdaptiveSplitConfig.medical_images()
+tokenizer = StreamingFractalTokenizerV3(
+    image_size=224,
+    d_model=384,
+    config=config,
+)
 
-# 遥感/卫星图像
-config = AdaptiveSplitConfig.satellite_images()
+images = torch.randn(4, 3, 224, 224)
+output = tokenizer.tokenize(images)
 
-# 文档/OCR 图像
-config = AdaptiveSplitConfig.document_images()
-
-# 从数据集自动估计
-sample_images = torch.randn(100, 3, 224, 224)  # 归一化到 [0,1]
-config = AdaptiveSplitConfig.estimate_from_dataset(sample_images)
+for i, seq in enumerate(output.sequences):
+    print(f"Image {i}: {seq.tokens.shape[0]} tokens")
+    print(f"  Depths: {seq.get_levels()[:, 0].unique().tolist()}")
 ```
 
-### 诊断方法
-
-```python
-# 训练状态统计
-stats = tokenizer.get_training_stats()
-# {
-#     'tokenizer_version': 'v3_variable_depth',
-#     'architecture': 'adaptive_quadtree_split + hilbert_native_embed',
-#     'split_scheme': 'balanced_greedy',
-#     'max_depth': 4,
-#     'avg_tokens_per_image': 48.5,
-#     'depth_entropy': 1.234,
-# }
-
-# 深度分布熵 (多样性指标)
-entropy = tokenizer.get_scale_entropy()
-print(f"深度熵: {entropy:.3f}")
-```
-
----
-
-## 3.7 复杂度分析
-
-### 3.7.1 时间复杂度
-
-| 组件 | 复杂度 | 说明 |
-|:-----|:-----|:-----|
-| SharedConv | $O(C \cdot H \cdot W)$ | 卷积特征提取 |
-| AdaptiveQuadtreeSplit (Greedy) | $O(N_{max} \cdot \log N_{max})$ | 优先队列贪心 |
-| AdaptiveQuadtreeSplit (DP) | $O(4^{D_{max}} \cdot D_{max})$ | 动态规划 |
-| ROI-Align 池化 | $O(N \cdot D)$ | 1次 GPU kernel 调用 |
-| **总计** | $O(C \cdot H \cdot W) + O(N \cdot D)$ | 线性于图像尺寸 |
-
-### 3.7.2 空间复杂度
-
-| 组件 | 复杂度 | 说明 |
-|:-----|:-----|:-----|
-| 特征图 | $O(D \cdot H' \cdot W')$ | $H' = H/p, W' = W/p$ |
-| Token 序列 | $O(N_{max} \cdot D)$ | 变长 token |
-| **峰值内存** | $O(D \cdot H' \cdot W')$ | 主要由特征图决定 |
-
----
-
-## 3.8 与已废弃架构对比
-
-| 特性           | BFS + REINFORCE (旧) | Gumbel-Softmax (V2, 已删除) | Variable Depth (V3) |
-|:------------ |:------------------- |:-------------------------- |:------------------- |
-| **分割方式**     | 递归四叉树 + 策略采样     | 卷积金字塔 + STE              | 自适应四叉树 + ROI-Align |
-| **可微性**      | 不可微，需 REINFORCE    | 端到端可微 (STE)             | 端到端可微           |
-| **梯度流**      | 高方差                 | 稀疏 (~20% 尺度有梯度)        | 密集 (全区域)        |
-| **Token 数量** | 变长                   | 固定/可变                    | 自适应             |
-| **GPU 效率**   | 低（Python 循环）        | 高                         | 高 (ROI-Align 向量化)    |
-| **状态**       | 废弃                   | **已删除**                   | ✅ 唯一支持        |
-
----
-
-## 3.9 附录：数学符号表
-
-| 符号 | 含义 |
-|:-----|:-----|
-| $I$ | 输入图像 $\in \mathbb{R}^{B \times C \times H \times W}$ |
-| $R_i$ | 第 $i$ 个区域 (由四叉树分割产生) |
-| $d_i$ | 区域 $R_i$ 的深度 $\in \{0, 1, \ldots, d_{max}\}$ |
-| $q_j$ | 第 $j$ 层四叉象限索引 $\in \{0, 1, 2, 3\}$ |
-| $C(R)$ | 区域复杂度函数 |
-| $\tau_d$ | 深度 $d$ 的分割阈值 |
-| $\sigma_d$ | 深度 $d$ 的缩放因子 |
-| $E_{depth}(d)$ | 深度 $d$ 的嵌入向量 |
-| $F$ | 共享卷积特征图 |
-| $t_i$ | 区域 $R_i$ 的 token 嵌入 |
+> **Next**: [04_positional_embedding.md](04_positional_embedding.md) - Position Encoding

@@ -1,74 +1,178 @@
-# 第一章：项目概述与设计理念
+# Chapter 1: System Architecture
 
-## 1.1 核心创新点：分形曲线与 Vision Transformer 的结合
+## 1.1 Overview
 
-Fractal Curve Tokenizer 项目代表了 Vision Transformer (ViT) 架构的一次实验性探索。传统的 ViT 将图像视为固定的 16x16 或 32x32 网格，这种刚性的划分方式忽略了图像内容的内在复杂性差异。
+This chapter describes the complete data flow and module structure of the Fractal Curve ViT architecture.
 
-本项目的核心创新在于引入了**分形几何**和**Hilbert 曲线**的概念：
+### High-Level Pipeline
 
-1. **Hilbert 曲线遍历**：使用 Hilbert 曲线将 2D 网格映射为 1D 序列，保持空间局部性
-2. **多尺度 tokenization**：通过 Variable Depth Tokens 实现内容自适应分割
-3. **端到端可微**：使用自适应四叉树分割 + 区域池化实现可微的多尺度融合 (V3 推荐)
+$$I \xrightarrow{\text{Tokenize}} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{CLS}} [c; T'] \xrightarrow{\text{Transformer}} X' \xrightarrow{\text{Pool}} z \xrightarrow{\text{MLP}} \hat{y}$$
 
-## 1.2 Hilbert 曲线简介与空间填充性质
+where:
+- $I \in \mathbb{R}^{B \times C \times H \times W}$: Input image batch
+- $T \in \mathbb{R}^{B \times N \times D}$: Token embeddings
+- $L \in \mathbb{Z}^{B \times N \times \text{Info}}$: Level information (depth + quadtree path)
+- $X' \in \mathbb{R}^{B \times (N+1) \times D}$: Encoded sequence (with CLS token)
+- $\hat{y} \in \mathbb{R}^{B \times C_{out}}$: Class logits
 
-在将 2D 的 Patch 转换为 1D 的 Token 序列输入 Transformer 时，传统的"光栅扫描"（Raster Scan，即逐行扫描）会破坏空间局部性。
+---
 
-本项目采用了 **Hilbert 曲线**（希尔伯特曲线）作为遍历路径：
+## 1.2 Data Flow Diagram
 
-* **空间局部性保持**：Hilbert 曲线是一种空间填充曲线，它能够极好地保持 2D 空间中的邻近关系
-* **递归自相似性**：Hilbert 曲线的递归构造方式与分形结构完美契合
-* **数学定义**：$H: [0, n^2) \leftrightarrow [0, n)^2$，双向映射
-
-## 1.3 与传统 ViT 的架构对比
-
-| 特性           | 传统 ViT       | Fractal Curve ViT (本项目) |
-|:------------ |:------------ |:----------------------- |
-| **分词方式**     | 固定网格         | 多尺度卷积金字塔                |
-| **Token 数量** | 固定 (如 196 个) | 固定 (取决于最细粒度)            |
-| **序列化顺序**    | 光栅扫描         | Hilbert 曲线遍历            |
-| **位置编码**     | 绝对/相对位置编码    | 深度 + 路径编码               |
-| **注意力偏置**    | 无/相对位置       | Low-Rank Hilbert Bias   |
-| **FFN 类型**   | GELU         | SwiGLU (可选)             |
-| **训练方式**     | 端到端          | 端到端可微 (无 REINFORCE)     |
-
-## 1.4 项目目录结构说明
-
-```text
-fractal-curve-tokenizer/
-├── src/
-│   └── vit_pytorch/
-│       ├── __init__.py                 # 包入口，模块导出
-│       ├── model_fractal_vit.py        # [核心] FractalCurveViT 完整模型
-│       ├── tokenizer_streaming.py      # [核心] 流式分形 Tokenizer (V3)
-│       ├── split_adaptive.py           # [核心] 自适应四叉树分割算法
-│       ├── embed_hilbert_patch.py      # [核心] Hilbert-Native Patch Embedding
-│       ├── block_transformer.py        # 增强型 Transformer 编码器
-│       ├── attn_hilbert_bias.py        # Hilbert 感知多尺度注意力 (LCA Bias)
-│       ├── embed_fractal_position.py   # 分形位置编码
-│       ├── ffn_swiglu.py               # SwiGLU / 自适应前馈网络
-│       ├── curve_hilbert.py            # Hilbert 曲线算法与缓存
-│       ├── data_tokenization.py        # 基础数据结构与抽象基类
-│       ├── data_features.py            # Token 特征计算
-│       ├── constants.py                # [配置] 全局常量与超参数
-│       ├── utils.py                    # 通用工具函数
-│       ├── config_fractal.py           # 统一配置管理
-│       └── embed_fractal_path.py       # 四叉树路径编码
-├── examples/
-│   └── training/
-│       └── train_fractal_vit.py        # 完整的训练脚本
-├── tests/                              # 测试套件
-│   ├── unit/                           # 单元测试
-│   ├── integration/                    # 集成测试
-│   └── benchmarks/                     # 性能基准测试
-├── experiments/                        # 实验输出 (Checkpoints, Logs)
-└── documents/                          # 项目文档
+```
+Input Image (B, C, H, W)
+        │
+        ▼
+┌───────────────────────────────────────────────┐
+│       StreamingFractalTokenizerV3             │
+│  ┌─────────────────────────────────────────┐  │
+│  │ 1. Compute Complexity: C(R)             │  │
+│  │ 2. Adaptive Quadtree Split              │  │
+│  │ 3. Region Pooling via HilbertPatchEmbed │  │
+│  │ 4. Hilbert Curve Reordering             │  │
+│  └─────────────────────────────────────────┘  │
+└───────────────────────────────────────────────┘
+        │
+        ▼
+   (tokens, levels_info)
+        │
+        ▼
+┌───────────────────────────────────────────────┐
+│       FractalPositionEmbedding                │
+│  E_pos(i) = Fusion(E_depth(d_i) + E_path(i))  │
+└───────────────────────────────────────────────┘
+        │
+        ▼
+   T' = T + E_pos
+        │
+        ▼
+┌───────────────────────────────────────────────┐
+│            Add CLS Token                      │
+│       [CLS; T'] → (B, N+1, D)                 │
+└───────────────────────────────────────────────┘
+        │
+        ▼
+┌───────────────────────────────────────────────┐
+│         FractalTransformer × L                │
+│  ┌─────────────────────────────────────────┐  │
+│  │ Level-Aware LayerNorm                   │  │
+│  │ HilbertAwareMultiScaleAttention         │  │
+│  │   + LCA Hilbert Bias                    │  │
+│  │ DropPath + Residual                     │  │
+│  │ Level-Aware LayerNorm                   │  │
+│  │ AdaptiveFractalFeedForward (SwiGLU)     │  │
+│  │ DropPath + Residual                     │  │
+│  └─────────────────────────────────────────┘  │
+└───────────────────────────────────────────────┘
+        │
+        ▼
+┌───────────────────────────────────────────────┐
+│     Pooling: CLS or Mean                      │
+└───────────────────────────────────────────────┘
+        │
+        ▼
+┌───────────────────────────────────────────────┐
+│     MLP Head: LN → Linear → GELU → Linear     │
+└───────────────────────────────────────────────┘
+        │
+        ▼
+   Logits (B, num_classes)
 ```
 
-## 1.5 Tokenizer 类型
+---
 
-| tokenizer_type | 实现类                           | 特点                          | 状态   |
-|:-------------- |:----------------------------- |:---------------------------- |:---- |
-| `streaming_v3` | `StreamingFractalTokenizerV3` | Variable Depth Tokens + 自适应四叉树分割 | ✅ **唯一支持** |
+## 1.3 Module Hierarchy
 
-> **注意**: V1 (`StreamingFractalTokenizer`) 和 V2 (Gumbel-Softmax) 已从代码库完全移除。
+| Layer | Module | File | Core Functionality |
+|:------|:-------|:-----|:-------------------|
+| **L4** | Application | `model_fractal_vit.py` | `FractalCurveViT` |
+| **L3** | Pipeline | `tokenizer_streaming.py` | `StreamingFractalTokenizerV3` |
+|        |          | `block_transformer.py` | `FractalTransformer` |
+| **L2** | Components | `attn_hilbert_bias.py` | `HilbertAwareMultiScaleAttention`, `LCAHilbertBias` |
+|        |            | `split_adaptive.py` | `BalancedGreedySplitter`, `FixedBudgetDPSplitter` |
+|        |            | `embed_hilbert_patch.py` | `HilbertNativePatchEmbed` |
+|        |            | `ffn_swiglu.py` | `SwiGLUFFN`, `AdaptiveFractalFeedForward` |
+|        |            | `embed_fractal_position.py` | `FractalPositionEmbedding` |
+| **L1** | Foundation | `curve_hilbert.py` | `HilbertCurve`, `PseudoHilbertCurve` |
+|        |            | `config_fractal.py` | `FractalConfig` |
+|        |            | `embed_fractal_path.py` | `VectorizedPathEncoder` |
+|        |            | `base_tokenizer.py` | `BaseTokenizer`, `TokenizerOutput` |
+
+---
+
+## 1.4 Key Innovations
+
+### 1.4.1 Variable Depth Tokens (V3)
+
+Unlike fixed-grid tokenization, V3 performs **content-adaptive quadtree splitting**:
+
+$$\text{Split}(R) \iff C(R) > \tau_d$$
+
+where:
+- $C(R) = \alpha \cdot \frac{\text{Var}(R)}{\text{Var}(R) + \sigma_0^2} + (1-\alpha) \cdot \frac{G(R)}{G(R) + g_0^2}$
+- $\tau_d = \tau_0 \cdot \gamma^d$ (depth-dependent threshold)
+
+### 1.4.2 LCA Hilbert Bias
+
+Attention bias derived from quadtree LCA (Lowest Common Ancestor) depth:
+
+$$B[i,j] = \text{LCAEmbed}(\text{LCA}(i, j))$$
+
+This provides explicit geometric meaning with only ~100 learnable parameters.
+
+### 1.4.3 SwiGLU FFN with Level Adaptation
+
+$$\text{SwiGLU}(x) = W_{out} \cdot (\text{Swish}(W_{gate} \cdot x) \odot W_{value} \cdot x)$$
+
+Extended with level-adaptive residual:
+
+$$\text{Output} = (1 - \alpha_d) \cdot \text{FFN}(x) + \alpha_d \cdot \text{Adapter}([x; E_{level}(d)])$$
+
+---
+
+## 1.5 Configuration
+
+### FractalConfig
+
+```python
+from vit_pytorch import FractalConfig
+
+config = FractalConfig(
+    d_model=384,
+    num_heads=6,
+    hilbert_bias_mode='lca',  # 'lca', 'low_rank', 'hierarchical'
+    max_depth=4,
+)
+```
+
+### Model Instantiation
+
+```python
+from vit_pytorch import FractalCurveViT
+
+model = FractalCurveViT(
+    image_size=224,
+    num_classes=1000,
+    dim=384,
+    depth=6,
+    heads=6,
+    mlp_dim=768,
+    tokenizer_type='streaming_v3',
+    bias_mode='lca',
+    ffn_type='swiglu_level',
+)
+```
+
+---
+
+## 1.6 Complexity Analysis
+
+| Operation | Complexity | Notes |
+|:----------|:-----------|:------|
+| Quadtree Split | $O(N \cdot d_{max})$ | N = max tokens |
+| Hilbert Reordering | $O(N \log N)$ | Sort by Hilbert index |
+| LCA Computation | $O(N^2)$ | Cached, amortized $O(1)$ |
+| Attention | $O(N^2 \cdot D)$ | Standard transformer |
+| Total | $O(N^2 \cdot D)$ | Dominated by attention |
+
+> **Next**: [02_data_structures.md](02_data_structures.md) - Core Data Structures

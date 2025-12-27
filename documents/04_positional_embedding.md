@@ -1,140 +1,181 @@
-# 第四章：位置编码 (positional.py)
+# Chapter 4: Positional Embedding
 
-本章解析 `FractalPositionEmbedding`，它解决了在分形网格中定义位置的问题。
+## 4.1 Overview
 
-## 4.1 数学形式化
-
-分形位置编码结合深度和路径信息：
-
-$$E_{pos}(i) = \text{Fusion}(E_{depth}(d_i) + E_{path}(i))$$
-
-### 深度编码 (Depth Embedding)
-
-$$E_{depth}: \mathbb{Z} \to \mathbb{R}^D$$
-$$E_{depth}(d) = \text{Embedding}(d), \quad d \in \{0, 1, \ldots, L_{max}\}$$
-
-### 路径编码 (Path Embedding)
-
-#### 1. 路径生成 (Vectorized Path Generation)
-
-将 2D 坐标 $(x, y)$ 转换为四叉树路径 $(q_1, \ldots, q_d)$。
-利用向量化位运算实现高效计算：
-
-$q_\ell = \text{bit}(x, d-\ell) + 2 \times \text{bit}(y, d-\ell)$
-
-其中 $\text{bit}(v, k) = (v \gg k) \& 1$ 表示取第 $k$ 位。
-
-- $q_\ell \in \{0, 1, 2, 3\}$: 0=左上, 1=右上, 2=左下, 3=右下
-- 计算复杂度: $O(D)$ (并行)，优于传统循环的 $O(N \times D)$
-
-#### 2. 嵌入查找
-
-对 token $i$，其路径为 $(q_i^{(1)}, \ldots, q_i^{(d_i)})$。
-
-$E_{path}(i) = \sum_{j=1}^{d_i} \text{QuadrantEmb}(j, q_i^{(j)})$
-
-其中 `QuadrantEmb` 是 $[L_{max} \times 4, D]$ 的可学习嵌入表。
-
-### 融合网络
-
-$\text{Fusion}(x) = \text{Dropout}(\text{GELU}(\text{LayerNorm}(\text{Linear}(x))))$
+The `FractalPositionEmbedding` encodes token positions using both **depth** and **quadtree path** information, providing a hierarchical position encoding tailored for variable-depth tokenization.
 
 ---
 
-## 4.2 类：FractalPositionEmbedding
+## 4.2 Mathematical Formulation
 
-### 初始化参数
+### 4.2.1 Position Encoding Definition
 
-| 参数                     | 类型   | 默认值   | 说明              |
-|:---------------------- |:---- |:----- |:--------------- |
-| `dim`                  | int  | -     | 嵌入维度            |
-| `max_level`            | int  | 50    | 最大递归深度          |
-| `max_seq_len`          | int  | 10000 | 最大序列长度          |
-| `use_hilbert_encoding` | bool | True  | 是否使用 Hilbert 编码 |
-| `use_spatial_encoding` | bool | True  | 是否使用空间编码        |
+$$E_{pos}(i) = \text{Fusion}(E_{depth}(d_i) + E_{path}(p_i))$$
 
-### forward(levels_info, ...)
+where:
+- $d_i \in [0, d_{max}]$: Depth of token $i$
+- $p_i = [q_1, \ldots, q_d]$: Quadtree path of token $i$
+- $E_{depth}: \mathbb{Z} \to \mathbb{R}^D$: Depth embedding
+- $E_{path}: [0,3]^{d_{max}} \to \mathbb{R}^D$: Path embedding
+- $\text{Fusion}: \mathbb{R}^D \to \mathbb{R}^D$: Fusion network
 
-**输入**: 
+### 4.2.2 Depth Embedding
 
-- `levels_info` 张量
-  - 形状: `(N, Info_Len)` (单序列) 或 `(B, N, Info_Len)` (Batch)
-  - 格式: `[depth, q_1, q_2, ..., q_depth, 0, ...]`
+Learnable embedding indexed by depth:
 
-**流程**:
+$$E_{depth}(d) = W_{depth}[d], \quad W_{depth} \in \mathbb{R}^{(d_{max}+1) \times D}$$
 
-**1. 深度编码**
+### 4.2.3 Path Embedding
 
-```python
-depths = levels_info[..., 0]  # 提取深度
-depth_emb = self.depth_embedding(depths)  # (B, N, D)
-```
+Aggregated quadrant embeddings along the path:
 
-**2. 路径编码**
+$$E_{path}(p) = \sum_{i=1}^{d} W_{level}[i] \odot W_{quad}[q_i]$$
 
-```python
-paths = levels_info[..., 1:]  # 提取路径部分
+where:
+- $W_{level} \in \mathbb{R}^{d_{max} \times D}$: Level-specific weights
+- $W_{quad} \in \mathbb{R}^{4 \times D}$: Quadrant embeddings
 
-# 坐标扁平化：区分不同层级的同一象限
-offsets = torch.arange(path_len) * 4
-flat_indices = paths + offsets
+### 4.2.4 Fusion Network
 
-# 查表
-path_embs = self.quadrant_embedding(flat_indices)  # (B, N, Path_Len, D)
+Two-layer MLP with residual connection:
 
-# 掩码聚合
-mask = index < depth  # 只聚合有效路径
-path_final = (path_embs * mask).sum(dim=-2)  # (B, N, D)
-```
+$$\text{Fusion}(x) = x + \text{MLP}(x)$$
 
-**3. 特征融合**
-
-```python
-combined = depth_emb + path_final
-result = self.fusion_network(combined)
-```
-
-**输出**: `result` 形状 `(B, N, D)`
+where $\text{MLP}(x) = W_2 \cdot \text{GELU}(W_1 \cdot x)$.
 
 ---
 
-## 4.3 辅助方法：get_attention_bias(depths)
+## 4.3 Geometric Interpretation
 
-**功能**: 计算基于层级差的注意力偏置矩阵。
+### 4.3.1 Quadrant Encoding
 
-**数学定义**:
-$B_{level}[i,j] = \text{LevelAttnBias}[d_i, d_j]$
+The quadrant indices encode spatial position within each level:
 
-**逻辑**:
-
-- 输入深度张量 `depths` `(N,)`
-- **向量化实现**: 使用广播机制一次性查表
-- `bias[i, j] = table[d[i], d[j]]`
-
-**用途**: 可选地加到 Attention Logits 中，增强层级感知能力。
-
----
-
-## 4.4 初始化策略
-
-```python
-def _init_parameters(self):
-    nn.init.normal_(self.depth_embedding.weight, std=EMBEDDING_INIT_STD)
-    nn.init.normal_(self.quadrant_embedding.weight, std=EMBEDDING_INIT_STD)
-    nn.init.uniform_(self.level_attention_bias, -HILBERT_BIAS_SCALE, HILBERT_BIAS_SCALE)
+```
+Level 0 (root):     Level 1:              Level 2:
+┌─────────────┐     ┌──────┬──────┐       ┌───┬───┬───┬───┐
+│             │     │  2   │  3   │       │ 2 │ 3 │ 2 │ 3 │
+│      0      │  →  ├──────┼──────┤   →   ├───┼───┼───┼───┤
+│             │     │  0   │  1   │       │ 0 │ 1 │ 0 │ 1 │
+└─────────────┘     └──────┴──────┘       ├───┼───┼───┼───┤
+                                          │ 2 │ 3 │ 2 │ 3 │
+                                          ├───┼───┼───┼───┤
+                                          │ 0 │ 1 │ 0 │ 1 │
+                                          └───┴───┴───┴───┘
 ```
 
-- 嵌入使用正态分布初始化，$\sigma = 0.02$
-- 注意力偏置使用均匀分布初始化
+### 4.3.2 Path Uniqueness
+
+Each quadtree path uniquely identifies a spatial region:
+
+$$\text{Region}([q_1, \ldots, q_d]) = \bigcap_{i=1}^{d} \text{Quadrant}(q_i, i)$$
+
+### 4.3.3 Hilbert Compatibility
+
+The path encoding preserves Hilbert curve locality:
+
+$$|H^{-1}(p_i) - H^{-1}(p_j)| \propto \|E_{path}(p_i) - E_{path}(p_j)\|_2$$
 
 ---
 
-## 4.5 与标准位置编码的对比
+## 4.4 Implementation
 
-| 特性       | 标准 ViT     | 分形位置编码              |
-|:-------- |:---------- |:------------------- |
-| **编码类型** | 1D/2D 绝对位置 | 深度 + 路径             |
-| **层级感知** | 无          | 有 (depth_embedding) |
-| **空间结构** | 网格坐标       | 四叉树路径               |
-| **可学习性** | 部分/全部      | 全部可学习               |
-| **参数量**  | O(N×D)     | O(L×4×D) + O(L×D)   |
+### Class: FractalPositionEmbedding
+
+```python
+class FractalPositionEmbedding(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        max_level: int = 50,
+        use_fusion: bool = True,
+    ):
+        super().__init__()
+        
+        # Depth embedding
+        self.depth_embedding = nn.Embedding(max_level + 1, dim)
+        
+        # Path embedding components
+        self.level_embedding = nn.Embedding(max_level, dim)
+        self.quadrant_embedding = nn.Embedding(4, dim)
+        
+        # Fusion network
+        if use_fusion:
+            self.fusion = nn.Sequential(
+                nn.Linear(dim, dim * 2),
+                nn.GELU(),
+                nn.Linear(dim * 2, dim),
+            )
+        else:
+            self.fusion = nn.Identity()
+```
+
+### Forward Pass
+
+```python
+def forward(self, levels_info: Tensor) -> Tensor:
+    """
+    Args:
+        levels_info: (B, N, max_depth+1) - [depth, q_1, q_2, ..., q_d]
+    
+    Returns:
+        position_embedding: (B, N, D)
+    """
+    depths = levels_info[:, :, 0]  # (B, N)
+    paths = levels_info[:, :, 1:]  # (B, N, max_depth)
+    
+    # Depth embedding
+    depth_emb = self.depth_embedding(depths)  # (B, N, D)
+    
+    # Path embedding
+    path_emb = self._encode_path(paths, depths)  # (B, N, D)
+    
+    # Combine and fuse
+    combined = depth_emb + path_emb
+    return combined + self.fusion(combined)
+```
+
+---
+
+## 4.5 Comparison with Standard Position Embeddings
+
+| Method | Encoding | Hierarchical | Adaptive |
+|:-------|:---------|:-------------|:---------|
+| Sinusoidal | $\sin(pos / 10000^{2i/d})$ | ✗ | ✗ |
+| Learned 1D | $W[pos]$ | ✗ | ✗ |
+| Learned 2D | $W_x[x] + W_y[y]$ | ✗ | ✗ |
+| RoPE | Rotation matrices | ✗ | ✗ |
+| **Fractal** | $E_{depth}(d) + E_{path}(p)$ | ✓ | ✓ |
+
+### Advantages
+
+1. **Depth awareness**: Tokens at different resolutions receive distinct encodings
+2. **Path specificity**: Spatial location encoded via quadtree path
+3. **Variable length**: Works with any number of tokens
+4. **Fusion flexibility**: MLP can learn complex interactions
+
+---
+
+## 4.6 Usage Example
+
+```python
+from vit_pytorch import FractalPositionEmbedding
+
+pos_embedding = FractalPositionEmbedding(
+    dim=384,
+    max_level=50,
+    use_fusion=True,
+)
+
+# levels_info: (B, N, max_depth+1)
+# Format: [depth, q_1, q_2, ..., q_{max_depth}]
+levels_info = torch.zeros(2, 100, 5, dtype=torch.long)
+levels_info[:, :, 0] = 2  # All tokens at depth 2
+levels_info[:, :, 1] = 1  # First quadrant index
+levels_info[:, :, 2] = 3  # Second quadrant index
+
+tokens = torch.randn(2, 100, 384)
+tokens_with_pos = tokens + pos_embedding(levels_info)
+```
+
+> **Next**: [05_attention_mechanism.md](05_attention_mechanism.md) - Hilbert-Aware Attention

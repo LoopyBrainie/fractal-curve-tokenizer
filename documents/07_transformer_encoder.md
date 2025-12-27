@@ -1,186 +1,282 @@
-# 第七章：Transformer 编码器 (transformer.py)
+# Chapter 7: Transformer Encoder
 
-本章详细描述了 `FractalTransformer` 及其构建块的数据处理逻辑。
+## 7.1 Overview
 
-## 7.1 数学形式化
-
-### Transformer Block
-
-$x' = x + \text{DropPath}(\text{Attn}(\text{LN}_1(x)))$
-$x'' = x' + \text{DropPath}(\text{FFN}(\text{LN}_2(x')))$
-
-### 层级感知归一化
-
-$\text{LevelNorm}(x, d) = \gamma_d \cdot \frac{x - \mu}{\sigma} + \beta_d$
-
-其中 $\gamma_d, \beta_d$ 是层级相关的可学习参数。
+The `FractalTransformer` stacks multiple `FractalTransformerBlock` layers with **level-aware normalization**, **Hilbert-aware attention**, and **level aggregation**.
 
 ---
 
-## 7.2 核心类：FractalTransformer
+## 7.2 Mathematical Formulation
 
-### 初始化参数
+### 7.2.1 Transformer Block
 
-| 参数                 | 类型    | 默认值            | 说明                               |
-|:------------------ |:----- |:-------------- |:-------------------------------- |
-| `dim`              | int   | -              | 模型维度                             |
-| `depth`            | int   | -              | Transformer 层数                   |
-| `heads`            | int   | 8              | 注意力头数                            |
-| `dim_head`         | int   | 64             | 每头维度                             |
-| `mlp_dim`          | int   | -              | FFN 隐藏层维度                        |
-| `dropout`          | float | 0.0            | Dropout 比率                       |
-| `drop_path`        | float | 0.0            | DropPath 比率                      |
-| `max_level`        | int   | 50             | 最大层级                             |
-| `use_hilbert_bias` | bool  | True           | 是否使用 Hilbert 偏置                  |
-| `bias_mode`        | str   | 'lca'          | 偏置模式 (lca/low_rank/hierarchical) |
-| `ffn_type`         | str   | 'swiglu_level' | FFN 类型                           |
+$$x' = x + \text{DropPath}(\text{Attn}(\text{LN}_1(x)))$$
+$$x'' = x' + \text{DropPath}(\text{FFN}(\text{LN}_2(x')))$$
 
-### forward(x, levels_info, attention_mask)
+### 7.2.2 Level-Aware Layer Normalization
 
-**输入**:
+$$\text{LevelNorm}(x, d) = \gamma_d \cdot \frac{x - \mu}{\sigma} + \beta_d$$
 
-- `x`: Token 序列 `(B, S, D)`
-- `levels_info`: 层级信息 `(B, S, Info_Len)`
-- `attention_mask`: 注意力掩码 `(B, 1, 1, S)`
+where $\gamma_d, \beta_d \in \mathbb{R}^D$ are depth-dependent learnable parameters.
 
-**流程**:
+### 7.2.3 Level Aggregation
 
-**1. 层堆叠循环**
+$$s_d = \sigma(\text{Embed}_{level}(d)) \in (0, 1)^D$$
+$$r = W_2 \cdot \text{ReLU}(W_1 \cdot x)$$
+$$x' = x + \lambda \cdot (r \odot s_d)$$
 
-```python
-for layer in self.layers:
-    x = layer(x, levels_info, attention_mask)
-```
-
-**2. 层级感知聚合 (ARCH-R2)**
-
-```python
-# 可学习的层级感知聚合器
-# s_ℓ = σ(Embed_level(ℓ)) ∈ (0, 1)^D  — 每个层级的 D 维缩放向量
-# r = W₂ · ReLU(W₁ · x)               — bottleneck 特征精炼
-# x' = x + scale · (r ⊙ s_ℓ)          — 层级感知的残差更新
-depths = extract_depths(levels_info, self.max_level)
-scale = torch.sigmoid(self._level_aggregator_scale(depths))
-refined = self._level_aggregator_bottleneck(x)
-aggregated = refined * scale
-x = x + aggregated * self._aggregator_scale  # 可学习的残差缩放
-```
-
-> **注意 (ARCH-R1)**: 全局上下文注意力已移除，因为 HilbertAwareMultiScaleAttention 已经保留了 78.9% 的全局注意力权重，Hilbert Bias 只是软约束。
-
-**3. 最终归一化**
-
-```python
-x = self.final_norm(x)
-```
-
-**输出**: 编码后的序列 `(B, S, D)`
+where $\lambda$ is a learnable scaling factor.
 
 ---
 
-## 7.3 核心组件：FractalTransformerBlock
+## 7.3 FractalTransformer
 
-这是单个 Transformer 层的实现。
-
-### forward(x, levels_info, attention_mask)
-
-**Step 1: 层级感知归一化 (Norm 1)**
+### Class Definition
 
 ```python
-norm1_x = self._apply_level_aware_norm(
-    x, levels_info, 
-    self.norm1_gamma, self.norm1_beta, 
-    self.default_norm1
-)
+class FractalTransformer(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        depth: int,
+        heads: int = 8,
+        dim_head: int = 64,
+        mlp_dim: int = None,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        max_level: int = 50,
+        use_hilbert_bias: bool = True,
+        bias_mode: str = 'lca',
+        ffn_type: str = 'swiglu_level',
+    ):
+        ...
 ```
 
-**Step 2: 注意力机制**
+### Parameters
+
+| Parameter | Type | Default | Description |
+|:----------|:-----|:--------|:------------|
+| `dim` | int | - | Model dimension |
+| `depth` | int | - | Number of transformer layers |
+| `heads` | int | 8 | Number of attention heads |
+| `dim_head` | int | 64 | Dimension per head |
+| `mlp_dim` | int | dim × 4 | FFN hidden dimension |
+| `dropout` | float | 0.0 | Dropout rate |
+| `drop_path` | float | 0.0 | DropPath rate |
+| `bias_mode` | str | 'lca' | Hilbert bias mode |
+| `ffn_type` | str | 'swiglu_level' | FFN type |
+
+### Forward Pass
 
 ```python
-attn_out = self.attention(norm1_x, levels_info, attention_mask)
-```
-
-组件: `HilbertAwareMultiScaleAttention`
-
-**Step 3: 残差连接 1**
-
-```python
-x = x + self.drop_path(attn_out * self.residual_weights[0])
-```
-
-**Step 4: 层级感知归一化 (Norm 2)**
-
-```python
-norm2_x = self._apply_level_aware_norm(
-    x, levels_info,
-    self.norm2_gamma, self.norm2_beta,
-    self.default_norm2
-)
-```
-
-**Step 5: 前馈网络 (FFN)**
-
-```python
-ff_out = self.ff(norm2_x, levels_info)
-```
-
-组件: `AdaptiveFractalFeedForward` 或 `SwiGLUFFN`
-
-**Step 6: 残差连接 2**
-
-```python
-x = x + self.drop_path(ff_out * self.residual_weights[1])
+def forward(
+    self,
+    x: Tensor,
+    levels_info: Tensor,
+    attention_mask: Optional[Tensor] = None,
+) -> Tensor:
+    """
+    Args:
+        x: (B, N, D) - Input sequence
+        levels_info: (B, N, max_depth+1) - Level information
+        attention_mask: (B, 1, 1, N) - Attention mask
+    
+    Returns:
+        x: (B, N, D) - Encoded sequence
+    """
+    # Layer stack
+    for layer in self.layers:
+        x = layer(x, levels_info, attention_mask)
+    
+    # Level aggregation
+    x = self._apply_level_aggregation(x, levels_info)
+    
+    # Final normalization
+    x = self.final_norm(x)
+    
+    return x
 ```
 
 ---
 
-## 7.4 辅助类：DropPath
+## 7.4 FractalTransformerBlock
 
-实现随机深度 (Stochastic Depth) 正则化。
+### Block Structure
 
-### 数学定义
+```
+Input x
+    │
+    ▼
+┌───────────────────────────┐
+│  Level-Aware LayerNorm 1  │
+└───────────────────────────┘
+    │
+    ▼
+┌───────────────────────────┐
+│ HilbertAwareMultiScaleAttn│
+│   + LCA/LowRank Bias      │
+└───────────────────────────┘
+    │
+    ▼
+┌───────────────────────────┐
+│   DropPath + Residual     │
+│   x = x + drop(attn) × w₁ │
+└───────────────────────────┘
+    │
+    ▼
+┌───────────────────────────┐
+│  Level-Aware LayerNorm 2  │
+└───────────────────────────┘
+    │
+    ▼
+┌───────────────────────────┐
+│ AdaptiveFractalFeedForward│
+│   (SwiGLU + Level Adapt)  │
+└───────────────────────────┘
+    │
+    ▼
+┌───────────────────────────┐
+│   DropPath + Residual     │
+│   x = x + drop(ffn) × w₂  │
+└───────────────────────────┘
+    │
+    ▼
+Output x
+```
 
-训练时：
-$$\text{DropPath}(x) = \begin{cases} 0 & \text{with prob } p \\ \frac{x}{1-p} & \text{otherwise} \end{cases}$$
+### Implementation
 
-推理时：
-$$\text{DropPath}(x) = x$$
-
-### 作用
-
-- 相当于随机减少网络的有效深度
-- 防止深层网络过拟合
-- 可以视为一种 ensemble
+```python
+class FractalTransformerBlock(nn.Module):
+    def forward(
+        self,
+        x: Tensor,
+        levels_info: Tensor,
+        attention_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        # Pre-norm attention
+        norm1_x = self._apply_level_aware_norm(
+            x, levels_info, self.norm1_gamma, self.norm1_beta, self.default_norm1
+        )
+        attn_out = self.attention(norm1_x, levels_info, attention_mask)
+        x = x + self.drop_path(attn_out * self.residual_weights[0])
+        
+        # Pre-norm FFN
+        norm2_x = self._apply_level_aware_norm(
+            x, levels_info, self.norm2_gamma, self.norm2_beta, self.default_norm2
+        )
+        ff_out = self.ff(norm2_x, levels_info)
+        x = x + self.drop_path(ff_out * self.residual_weights[1])
+        
+        return x
+```
 
 ---
 
-## 7.5 层级感知归一化详解
+## 7.5 Level-Aware Layer Normalization
 
-### _apply_level_aware_norm()
+### Implementation
 
 ```python
-def _apply_level_aware_norm(self, x, levels_info, gamma, beta, default_norm):
-    # 1. 提取深度
-    depths = extract_depths(levels_info, self.max_level)
-
-    # 2. 获取层级参数
-    gamma_d = gamma[depths]  # (B, S, D)
-    beta_d = beta[depths]    # (B, S, D)
-
-    # 3. 标准归一化
-    x_norm = default_norm(x)  # LayerNorm
-
-    # 4. 应用层级参数
+def _apply_level_aware_norm(
+    self,
+    x: Tensor,
+    levels_info: Tensor,
+    gamma: nn.Parameter,
+    beta: nn.Parameter,
+    default_norm: nn.LayerNorm,
+) -> Tensor:
+    """
+    Apply depth-dependent layer normalization.
+    
+    Each depth level has its own scale (γ) and shift (β) parameters.
+    """
+    # Extract depths
+    depths = extract_depths(levels_info, self.max_level)  # (B, N)
+    
+    # Get per-token parameters
+    gamma_d = gamma[depths]  # (B, N, D)
+    beta_d = beta[depths]    # (B, N, D)
+    
+    # Standard normalization
+    x_norm = default_norm(x)  # (B, N, D)
+    
+    # Apply depth-specific affine transform
     return x_norm * gamma_d + beta_d
 ```
 
-### 目的
+### Purpose
 
-让不同分辨率的 Token 拥有不同的分布特征，增强层级区分能力。
+Different resolution tokens (depths) have different statistical properties. Level-aware normalization allows the model to learn depth-specific transformations.
 
 ---
 
-## 7.6 使用示例
+## 7.6 DropPath (Stochastic Depth)
+
+### Mathematical Definition
+
+**Training**:
+$$\text{DropPath}(x) = \begin{cases} 0 & \text{with probability } p \\ \frac{x}{1-p} & \text{otherwise} \end{cases}$$
+
+**Inference**:
+$$\text{DropPath}(x) = x$$
+
+### Purpose
+
+1. Regularization via random layer dropping
+2. Reduces effective network depth during training
+3. Acts as implicit ensemble
+
+### Implementation
+
+```python
+class DropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+    
+    def forward(self, x: Tensor) -> Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = x.new_empty(shape).bernoulli_(keep_prob)
+        
+        return x * mask / keep_prob
+```
+
+---
+
+## 7.7 Level Aggregation
+
+After the layer stack, a learnable aggregator combines information across depths:
+
+```python
+def _apply_level_aggregation(self, x: Tensor, levels_info: Tensor) -> Tensor:
+    """
+    Level-aware aggregation (ARCH-R2).
+    
+    Formula:
+        s_d = σ(Embed_level(d))
+        r = W₂ · ReLU(W₁ · x)
+        x' = x + λ · (r ⊙ s_d)
+    """
+    depths = extract_depths(levels_info, self.max_level)
+    
+    # Level-specific scaling
+    scale = torch.sigmoid(self._level_aggregator_scale(depths))  # (B, N, D)
+    
+    # Bottleneck refinement
+    refined = self._level_aggregator_bottleneck(x)  # (B, N, D)
+    
+    # Residual update
+    return x + refined * scale * self._aggregator_scale
+```
+
+---
+
+## 7.8 Usage Example
 
 ```python
 from vit_pytorch import FractalTransformer
@@ -193,50 +289,15 @@ transformer = FractalTransformer(
     mlp_dim=768,
     dropout=0.1,
     drop_path=0.1,
-    bias_mode='low_rank',
+    bias_mode='lca',
     ffn_type='swiglu_level',
 )
 
-x = torch.randn(2, 100, 384)  # (B, S, D)
-levels_info = torch.zeros(2, 100, 10, dtype=torch.long)
+x = torch.randn(2, 100, 384)
+levels_info = torch.zeros(2, 100, 5, dtype=torch.long)
 mask = torch.ones(2, 1, 1, 100, dtype=torch.bool)
 
-out = transformer(x, levels_info, mask)  # (2, 100, 384)
+output = transformer(x, levels_info, mask)  # (2, 100, 384)
 ```
 
----
-
-## 7.7 架构图
-
-```
-Input (B, S, D)
-    │
-    ▼
-┌───────────────────────────────────────┐
-│  FractalTransformerBlock × N          │
-│  ┌─────────────────────────────────┐  │
-│  │ Level-Aware LayerNorm          │  │
-│  │        ↓                        │  │
-│  │ HilbertAwareMultiScaleAttention │  │
-│  │        ↓                        │  │
-│  │ DropPath + Residual             │  │
-│  │        ↓                        │  │
-│  │ Level-Aware LayerNorm          │  │
-│  │        ↓                        │  │
-│  │ AdaptiveFractalFeedForward     │  │
-│  │        ↓                        │  │
-│  │ DropPath + Residual             │  │
-│  └─────────────────────────────────┘  │
-└───────────────────────────────────────┘
-    │
-    ▼
-Level Aggregator (ARCH-R2, 可学习)
-    │
-    ▼
-Final LayerNorm
-    │
-    ▼
-Output (B, S, D)
-```
-
-> **注**: Global Context Attention 已移除 (ARCH-R1)，层级聚合器已升级为可学习版本 (ARCH-R2)。
+> **Next**: [08_fractal_vit_model.md](08_fractal_vit_model.md) - Complete Model
