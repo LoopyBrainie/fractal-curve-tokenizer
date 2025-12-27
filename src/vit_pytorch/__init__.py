@@ -76,6 +76,14 @@ from .embed_multiscale_patch import MultiScalePatchEncoder
 from .base_tokenizer import BaseTokenizer, BaseTokenProcessor, TokenSequence, TokenizerOutput
 from .block_transformer import FractalTransformer, FractalTransformerBlock
 from .utils import extract_depths, normalize_levels_info
+from .split_adaptive import (
+    AdaptiveSplitConfig,
+    TemperatureScheduler,
+    LearnableSplitter,
+    BalancedGreedySplitter,
+    FixedBudgetDPSplitter,
+    SplitScheme,
+)
 
 
 __all__ = [
@@ -120,4 +128,11 @@ __all__ = [
     "get_quadrant_order",
     "hilbert_distance_to_xy",
     "xy_to_hilbert_distance",
+    # === 分割器 (P7/P8) ===
+    "AdaptiveSplitConfig",
+    "TemperatureScheduler",
+    "LearnableSplitter",
+    "BalancedGreedySplitter",
+    "FixedBudgetDPSplitter",
+    "SplitScheme",
 ]
