@@ -175,7 +175,7 @@ LCA 偏置参数最少，且具有明确的几何意义。
 | **L4** | `fractal_vit.py`         | `FractalCurveViT`                      |
 | **L3** | `streaming_tokenizer.py` | `StreamingFractalTokenizerV3` (推荐)    |
 |        | `transformer.py`         | `FractalTransformer`                   |
-| **L2** | `attention.py`           | `LCAHilbertBias`, `CrossScaleAttention`|
+| **L2** | `attention.py`           | `LCAHilbertBias`, `HilbertAwareMultiScaleAttention`|
 |        | `feedforward.py`         | `SwiGLUFFN`                            |
 |        | `positional.py`          | `FractalPositionEmbedding`             |
 | **L1** | `hilbert.py`             | `HilbertCurve`, `PseudoHilbertCurve`   |

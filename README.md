@@ -175,7 +175,7 @@ LCA bias is most parameter-efficient with explicit geometric meaning.
 | **L4** | `fractal_vit.py`         | `FractalCurveViT`                      |
 | **L3** | `streaming_tokenizer.py` | `StreamingFractalTokenizerV3` (recommended) |
 |        | `transformer.py`         | `FractalTransformer`                   |
-| **L2** | `attention.py`           | `LCAHilbertBias`, `CrossScaleAttention`|
+| **L2** | `attention.py`           | `LCAHilbertBias`, `HilbertAwareMultiScaleAttention`|
 |        | `feedforward.py`         | `SwiGLUFFN`                            |
 |        | `positional.py`          | `FractalPositionEmbedding`             |
 | **L1** | `hilbert.py`             | `HilbertCurve`, `PseudoHilbertCurve`   |
