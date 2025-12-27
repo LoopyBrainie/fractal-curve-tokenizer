@@ -52,23 +52,23 @@ for layer in self.layers:
     x = layer(x, levels_info, attention_mask)
 ```
 
-**2. 全局上下文注意力**
+**2. 层级感知聚合 (ARCH-R2)**
 
 ```python
-# 在所有层之后，执行一次标准 MultiheadAttention
-key_padding_mask = ~attention_mask.squeeze(1).squeeze(1)  # 转换 mask
-global_context, _ = self.global_attention(x, x, x, key_padding_mask)
-x = x + global_context * 0.1
+# 可学习的层级感知聚合器
+# s_ℓ = σ(Embed_level(ℓ)) ∈ (0, 1)^D  — 每个层级的 D 维缩放向量
+# r = W₂ · ReLU(W₁ · x)               — bottleneck 特征精炼
+# x' = x + scale · (r ⊙ s_ℓ)          — 层级感知的残差更新
+depths = extract_depths(levels_info, self.max_level)
+scale = torch.sigmoid(self._level_aggregator_scale(depths))
+refined = self._level_aggregator_bottleneck(x)
+aggregated = refined * scale
+x = x + aggregated * self._aggregator_scale  # 可学习的残差缩放
 ```
 
-**3. 层级聚合**
+> **注意 (ARCH-R1)**: 全局上下文注意力已移除，因为 HilbertAwareMultiScaleAttention 已经保留了 78.9% 的全局注意力权重，Hilbert Bias 只是软约束。
 
-```python
-aggregated = self.level_aggregator(x)
-x = x + aggregated * 0.2
-```
-
-**4. 最终归一化**
+**3. 最终归一化**
 
 ```python
 x = self.final_norm(x)
@@ -230,10 +230,7 @@ Input (B, S, D)
 └───────────────────────────────────────┘
     │
     ▼
-Global Context Attention
-    │
-    ▼
-Level Aggregator
+Level Aggregator (ARCH-R2, 可学习)
     │
     ▼
 Final LayerNorm
@@ -241,3 +238,5 @@ Final LayerNorm
     ▼
 Output (B, S, D)
 ```
+
+> **注**: Global Context Attention 已移除 (ARCH-R1)，层级聚合器已升级为可学习版本 (ARCH-R2)。

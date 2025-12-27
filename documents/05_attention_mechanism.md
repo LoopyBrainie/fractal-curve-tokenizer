@@ -180,7 +180,8 @@ return self.to_out(out)
 | `lca`          | ~100 | $O(N^2 \cdot D)$ | ⭐⭐⭐⭐⭐ | ✅ **默认推荐** |
 | `low_rank`     | ~50K | $O(N \cdot r)$   | ⭐⭐    | 大模型可选      |
 | `hierarchical` | ~5K  | $O(N \cdot L)$   | ⭐⭐⭐⭐  | 可解释性场景     |
-| `original`     | ~10K | $O(N^2)$         | ⭐     | 向后兼容       |
+
+> **注意**: `original` 模式已在 P3-4 中移除，以简化代码库。
 
 **推荐**: 对于大多数场景，使用 `lca` 模式（FractalConfig 默认值）。
 

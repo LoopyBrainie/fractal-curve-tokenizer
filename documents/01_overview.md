@@ -38,38 +38,37 @@ Fractal Curve Tokenizer 项目代表了 Vision Transformer (ViT) 架构的一次
 fractal-curve-tokenizer/
 ├── src/
 │   └── vit_pytorch/
-│       ├── __init__.py             # 包入口，模块导出
-│       ├── vit.py                  # [核心] FractalCurveViT 完整模型
-│       ├── streaming_tokenizer.py  # [核心] 流式分形 Tokenizer (V1/V3)
-│       ├── adaptive_split.py       # [核心] 自适应四叉树分割算法
-│       ├── patch_embed.py          # [核心] Hilbert-Native Patch Embedding
-│       ├── transformer.py          # 增强型 Transformer 编码器
-│       ├── attention.py            # Hilbert 感知多尺度注意力 (LCA Bias)
-│       ├── positional.py           # 分形位置编码
-│       ├── feedforward.py          # SwiGLU / 自适应前馈网络
-│       ├── hilbert.py              # Hilbert 曲线算法与缓存
-│       ├── tokenization.py         # 基础数据结构与抽象基类
-│       ├── features.py             # Token 特征计算
-│       ├── constants.py            # [配置] 全局常量与超参数
-│       ├── utils.py                # 通用工具函数
-│       ├── fractal_config.py       # 统一配置管理
-│       └── fractal_path.py         # 四叉树路径编码
+│       ├── __init__.py                 # 包入口，模块导出
+│       ├── model_fractal_vit.py        # [核心] FractalCurveViT 完整模型
+│       ├── tokenizer_streaming.py      # [核心] 流式分形 Tokenizer (V3)
+│       ├── split_adaptive.py           # [核心] 自适应四叉树分割算法
+│       ├── embed_hilbert_patch.py      # [核心] Hilbert-Native Patch Embedding
+│       ├── block_transformer.py        # 增强型 Transformer 编码器
+│       ├── attn_hilbert_bias.py        # Hilbert 感知多尺度注意力 (LCA Bias)
+│       ├── embed_fractal_position.py   # 分形位置编码
+│       ├── ffn_swiglu.py               # SwiGLU / 自适应前馈网络
+│       ├── curve_hilbert.py            # Hilbert 曲线算法与缓存
+│       ├── data_tokenization.py        # 基础数据结构与抽象基类
+│       ├── data_features.py            # Token 特征计算
+│       ├── constants.py                # [配置] 全局常量与超参数
+│       ├── utils.py                    # 通用工具函数
+│       ├── config_fractal.py           # 统一配置管理
+│       └── embed_fractal_path.py       # 四叉树路径编码
 ├── examples/
 │   └── training/
-│       └── train_fractal_vit.py    # 完整的训练脚本
-├── tests/                          # 测试套件
-│   ├── unit/                       # 单元测试
-│   ├── integration/                # 集成测试
-│   └── benchmarks/                 # 性能基准测试
-├── experiments/                    # 实验输出 (Checkpoints, Logs)
-└── documents/                      # 项目文档
+│       └── train_fractal_vit.py        # 完整的训练脚本
+├── tests/                              # 测试套件
+│   ├── unit/                           # 单元测试
+│   ├── integration/                    # 集成测试
+│   └── benchmarks/                     # 性能基准测试
+├── experiments/                        # 实验输出 (Checkpoints, Logs)
+└── documents/                          # 项目文档
 ```
 
-## 1.5 Tokenizer 类型对照表
+## 1.5 Tokenizer 类型
 
 | tokenizer_type | 实现类                           | 特点                          | 状态   |
 |:-------------- |:----------------------------- |:---------------------------- |:---- |
-| `streaming`    | `StreamingFractalTokenizer`   | 固定多尺度卷积                    | ✅ 稳定 |
-| `streaming_v3` | `StreamingFractalTokenizerV3` | Variable Depth Tokens + 自适应四叉树分割 | ✅ **推荐** |
+| `streaming_v3` | `StreamingFractalTokenizerV3` | Variable Depth Tokens + 自适应四叉树分割 | ✅ **唯一支持** |
 
-> **注意**: V2 (Gumbel-Softmax) 已从代码库移除。
+> **注意**: V1 (`StreamingFractalTokenizer`) 和 V2 (Gumbel-Softmax) 已从代码库完全移除。

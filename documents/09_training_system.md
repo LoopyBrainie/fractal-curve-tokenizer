@@ -228,4 +228,4 @@ python examples/training/train_fractal_vit.py \
     --bias-mode lca
 ```
 
-> **注意**: V1 (`--tokenizer-type streaming`) 已从代码库移除。当前仅支持 `streaming_v3`。
+> **注意**: 当前仅支持 `streaming_v3`。V1 (`streaming`) 和 V2 已从代码库完全移除。

@@ -8,7 +8,6 @@ classDiagram
     nn_Module <|-- BaseTokenProcessor
     nn_Module <|-- FractalCurveViT
 
-    BaseTokenizer <|-- StreamingFractalTokenizer
     BaseTokenizer <|-- StreamingFractalTokenizerV3
 
     FractalCurveViT *-- StreamingFractalTokenizerV3
@@ -24,10 +23,15 @@ classDiagram
     AdaptiveFractalFeedForward *-- SwiGLUFFN
     
     StreamingFractalTokenizerV3 *-- HilbertNativePatchEmbed
+    StreamingFractalTokenizerV3 *-- LearnableSplitter
     StreamingFractalTokenizerV3 *-- BalancedGreedySplitter
+    
+    LearnableSplitter *-- ComplexityMLP
+    LearnableSplitter *-- TemperatureScheduler
+    LearnableSplitter *-- SpatialIndex
 ```
 
-> **注意**: V2 (Gumbel-Softmax) 已从代码库完全移除。
+> **注意**: V1 (`StreamingFractalTokenizer`) 和 V2 (Gumbel-Softmax) 已从代码库完全移除。
 
 ## B. 数据流向图
 
@@ -36,8 +40,11 @@ classDiagram
         │
         ▼
 2. StreamingFractalTokenizerV3
-   ├── AdaptiveQuadtreeSplit (内容自适应分割)
-   │   └── BalancedGreedySplitter / FixedBudgetDPSplitter
+   ├── LearnableSplitter (内容自适应分割)
+   │   ├── ComplexityMLP: C(R) = α·Var/(Var+σ₀²) + (1-α)·G/(G+g₀²)
+   │   ├── TemperatureScheduler: T(t) exponential/linear/cosine
+   │   └── SpatialIndex: O(log N + k) 邻居查询
+   ├── BalancedGreedySplitter / DPBudgetSplitter
    ├── HilbertNativePatchEmbed (区域池化 + 深度编码)
    └── HilbertIndexer (Hilbert 重排序)
         │
@@ -79,7 +86,7 @@ classDiagram
    └── DropPath + Residual
         │
         ▼
-8. Global Context Attention
+8. Level Aggregator (ARCH-R2, 可学习)
         │
         ▼
 9. Pooling (cls / mean)
@@ -93,6 +100,8 @@ classDiagram
         ▼
 11. Logits (B, NumClasses)
 ```
+
+> **注**: Global Context Attention 已移除 (ARCH-R1)。
 
 ## C. 超参数参考表
 
@@ -209,7 +218,7 @@ from vit_pytorch import (
 )
 ```
 
-> **注意**: V1 (`StreamingFractalTokenizer`) 和 V2 (Gumbel-Softmax) 已从代码库完全移除。CrossScaleAttention 已被 Variable Depth 架构替代。
+> **注意**: V1 (`StreamingFractalTokenizer`) 和 V2 (Gumbel-Softmax) 已从代码库完全移除。
 
 ## F. 数学符号表
 
@@ -221,8 +230,8 @@ from vit_pytorch import (
 | $E_{pos}$         | 位置编码函数                                               |
 | $E_{depth}$       | 深度嵌入                                                 |
 | $E_{path}$        | 路径嵌入                                                 |
-| $E_{scale}$       | 尺度嵌入 (历史: V3 Cross-Scale Attention，已废弃)          |
-| $\alpha_{i,s}$    | 位置 $i$ 对尺度 $s$ 的注意力权重 (V3)                          |
+| $C(R)$            | 区域复杂度函数 (LearnableSplitter)                        |
+| $p_{split}$       | 分割概率 $= \sigma((C_\theta - \tau_d) / T)$            |
 | $B_{hilbert}$     | Hilbert 偏置矩阵                                         |
 | $B_{level}$       | 层级偏置矩阵                                               |
 | $\phi, \psi$      | Low-Rank 编码器                                         |
@@ -231,3 +240,5 @@ from vit_pytorch import (
 | $\text{SwiGLU}$   | $W_{out}(\text{Swish}(W_g x) \odot W_v x)$           |
 | $H$               | Hilbert 曲线映射 $[0, n^2) \leftrightarrow [0, n)^2$     |
 | $Q, K, V$         | Query, Key, Value 向量 (注意力机制)                         |
+| $T(t)$            | 温度调度函数 (TemperatureScheduler)                       |
+| $\tau_d$          | 深度 $d$ 的分割阈值                                        |

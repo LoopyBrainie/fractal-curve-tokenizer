@@ -118,22 +118,23 @@ $$\text{quadtree\_path}[d, \ell] = q_\ell = \text{bit}(x, k-\ell) + 2 \times \te
   $F_s = \text{Conv}_s(I), \quad s \in \{1, \ldots, S\}$
   每个尺度: `kernel_size = stride = patch_size_s`
 
-### CrossScaleAttention (V3 核心)
+### Variable Depth Tokens 架构 (V3 核心)
 
-跨尺度注意力融合模块，V3 Tokenizer 的核心组件。
+Variable Depth Tokens (VDT) 是当前 V3 Tokenizer 的核心架构，取代了已废弃的 CrossScaleAttention。
 
 * **数学定义**：
-  $$\alpha_{i,s} = \text{softmax}_s\left(\frac{Q_i \cdot K_{i,s}}{\sqrt{d}}\right)$$
-  $$\text{Token}_i = \sum_{s=1}^{S} \alpha_{i,s} \cdot V_{i,s}$$
+  $$C(R) = \alpha \cdot \frac{\text{Var}(R)}{\text{Var}(R) + \sigma_0^2} + (1-\alpha) \cdot \frac{G(R)}{G(R) + g_0^2}$$
+  $$p_{split} = \sigma\left(\frac{C_\theta(R) - \tau_d}{T}\right), \quad z \sim \text{Gumbel-Softmax}(p)$$
   
-* **关键属性**：
-  * `scale_embedding`: 尺度嵌入 $(S, D)$
-  * `to_qkv`: QKV 投影 $(D \to 3D)$
-  * `to_out`: 输出投影 $(D \to D)$
+* **关键组件**：
+  * `LearnableSplitter`: 可学习的内容自适应分割器
+  * `BalancedGreedySplitter`: 平衡贪心分割策略
+  * `DPBudgetSplitter`: 动态规划预算分割
   
-* **梯度优势**：
-  * 全尺度密集梯度 (vs V2 STE 稀疏梯度)
-  * 无温度参数 (vs V2 Gumbel 温度退火)
+* **架构优势**：
+  * 无尺度崩塌问题 (CrossScaleAttention 存在的数学缺陷)
+  * 真正的内容自适应分辨率
+  * STE + REINFORCE 混合梯度估计
 
 ## 2.5 constants.py - 超参数默认值
 
