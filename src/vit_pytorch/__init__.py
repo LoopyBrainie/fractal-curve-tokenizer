@@ -19,7 +19,7 @@ Fractal Curve ViT - 分形曲线视觉 Transformer
 模块层级
 ---------
 Layer 4 (应用层):
-    fractal_vit.py          FractalCurveViT
+    model_fractal_vit.py    FractalCurveViT
 
 Layer 3 (管道层):
     streaming_tokenizer.py  StreamingFractalTokenizerV3
