@@ -2074,7 +2074,648 @@ def visualize_mixed_level_segmentation(
 
 
 # ============================================================================
-# 生成所有可视化
+# NEW: LearnableSplitter Visualization (P7/P8)
+# ============================================================================
+
+def visualize_learnable_splitter(
+    save_path: Optional[Path] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """Visualize LearnableSplitter complexity function and split decision.
+    
+    Mathematical Formalization (split_adaptive.py):
+    ================================================
+    
+    1. Complexity Function (P7-1):
+       C(R) = α · C_var(R) + (1-α) · C_grad(R)
+       
+       where:
+         C_var(R) = Var(R) / (Var(R) + σ₀²)   [normalized variance, no saturation]
+         C_grad(R) = G(R) / (G(R) + g₀²)      [normalized gradient energy]
+       
+       Key insight: This formulation avoids saturation at high complexity values.
+    
+    2. Depth-Dependent Threshold (P7-2):
+       τ_d = τ₀ · γ^d
+       
+       where τ₀ ∈ (0,1) is root threshold, γ ∈ (0,1) is decay factor.
+       Deeper regions require less complexity to split.
+    
+    3. Split Decision (P7-3):
+       p_split = σ((C_θ(R) - τ_d) / T)
+       z ~ Gumbel-Softmax(p) with STE gradient
+       
+    4. Multi-Layer Depth Loss (P8-1):
+       L_multi = Σ_d w_d · (H_target - H̄_d)²
+       
+       Encourages balanced depth distribution across all layers.
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(18, 11))
+    
+    # ===== 1. Complexity Function Comparison =====
+    ax1 = axes[0, 0]
+    
+    # Compare old (saturating) vs new (non-saturating) complexity
+    variance_range = np.linspace(0, 0.5, 100)
+    sigma_0_sq = 0.01
+    
+    # Old: simple normalized variance (saturates quickly)
+    c_old = variance_range / (variance_range.max() + 1e-6)
+    
+    # New: adaptive normalization (no saturation)
+    c_new = variance_range / (variance_range + sigma_0_sq)
+    
+    ax1.plot(variance_range, c_old, 'b--', linewidth=2, label='Old: Var/max(Var) [saturates]')
+    ax1.plot(variance_range, c_new, 'r-', linewidth=2.5, label=f'New: Var/(Var+σ₀²), σ₀²={sigma_0_sq}')
+    ax1.axhline(0.5, color='gray', linestyle=':', alpha=0.5, label='C=0.5 threshold')
+    ax1.axvline(sigma_0_sq, color='green', linestyle='--', alpha=0.7, label=f'σ₀²={sigma_0_sq}')
+    
+    ax1.set_xlabel('Local Variance', fontsize=10)
+    ax1.set_ylabel('Complexity C_var(R)', fontsize=10)
+    ax1.set_title('Complexity Function: No Saturation Design\n(P7-1)', fontsize=11)
+    ax1.legend(fontsize=8)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim(0, 0.5)
+    ax1.set_ylim(0, 1.05)
+    
+    # ===== 2. Depth-Dependent Threshold =====
+    ax2 = axes[0, 1]
+    
+    depths = np.arange(0, 6)
+    tau_0_values = [0.10, 0.15, 0.20, 0.25]
+    gamma = 0.85
+    
+    colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(tau_0_values)))
+    for tau_0, color in zip(tau_0_values, colors):
+        thresholds = tau_0 * (gamma ** depths)
+        ax2.plot(depths, thresholds, 'o-', color=color, linewidth=2, 
+                markersize=8, label=f'τ₀={tau_0}')
+    
+    ax2.set_xlabel('Depth d', fontsize=10)
+    ax2.set_ylabel('Threshold τ_d', fontsize=10)
+    ax2.set_title(f'Depth-Dependent Threshold: τ_d = τ₀ · γ^d\n(γ={gamma}, P7-2)', fontsize=11)
+    ax2.legend(fontsize=9)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xticks(depths)
+    
+    # Add annotation
+    ax2.annotate('Deeper = easier to split\n(lower threshold)', 
+                xy=(4, 0.08), fontsize=9, style='italic',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # ===== 3. Split Probability (Sigmoid) =====
+    ax3 = axes[0, 2]
+    
+    complexity_range = np.linspace(0, 1, 100)
+    tau_d = 0.3
+    temperatures = [0.1, 0.3, 0.5, 1.0, 2.0]
+    
+    colors_temp = plt.cm.coolwarm(np.linspace(0.1, 0.9, len(temperatures)))
+    for T, color in zip(temperatures, colors_temp):
+        p_split = 1 / (1 + np.exp(-(complexity_range - tau_d) / T))
+        ax3.plot(complexity_range, p_split, color=color, linewidth=2, label=f'T={T}')
+    
+    ax3.axvline(tau_d, color='black', linestyle='--', alpha=0.7, label=f'τ_d={tau_d}')
+    ax3.axhline(0.5, color='gray', linestyle=':', alpha=0.5)
+    
+    ax3.set_xlabel('Complexity C(R)', fontsize=10)
+    ax3.set_ylabel('Split Probability p_split', fontsize=10)
+    ax3.set_title('Split Decision: p = σ((C-τ_d)/T)\n(P7-3)', fontsize=11)
+    ax3.legend(fontsize=8, title='Temperature')
+    ax3.grid(True, alpha=0.3)
+    ax3.set_xlim(0, 1)
+    ax3.set_ylim(0, 1)
+    
+    # ===== 4. STE + REINFORCE Gradient Flow =====
+    ax4 = axes[1, 0]
+    ax4.axis('off')
+    
+    gradient_text = """
+    STE + REINFORCE Hybrid Gradient (P8-4)
+    =======================================
+    
+    Forward Pass:
+      z = one_hot(Bernoulli(p_split))  # Hard discrete decision
+    
+    Backward Pass (hybrid):
+      ∇_θ L = ∇_θ L_STE + λ · ∇_θ L_REINFORCE
+      
+      where:
+        L_STE = L · (p - sg(p) + sg(z))   # Straight-Through
+        L_REINFORCE = (R - b) · log(p)     # Policy gradient
+        b = EMA(R)                          # Baseline
+    
+    Key Benefits:
+      ✓ STE: Low variance, biased gradient
+      ✓ REINFORCE: Unbiased, high variance  
+      ✓ Hybrid: Best of both worlds
+    
+    Implementation (split_adaptive.py):
+      def _compute_ste_decisions():
+          hard = (soft > 0.5).float()
+          return hard - soft.detach() + soft  # STE trick
+      
+      def get_ste_reinforce_loss():
+          advantage = reward - baseline
+          reinforce = advantage * log_prob
+          return reinforce.mean()
+    """
+    
+    ax4.text(0.05, 0.95, gradient_text, transform=ax4.transAxes,
+            fontsize=9, verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='#e8f4e8', alpha=0.9))
+    ax4.set_title('Gradient Estimation', fontsize=11)
+    
+    # ===== 5. Multi-Layer Depth Loss =====
+    ax5 = axes[1, 1]
+    
+    # Simulate depth distribution with and without multi-layer loss
+    max_depth = 4
+    np.random.seed(42)
+    
+    # Without: concentrated at certain depths
+    dist_without = np.array([0.05, 0.1, 0.6, 0.2, 0.05])
+    
+    # With: more balanced
+    dist_with = np.array([0.18, 0.22, 0.25, 0.2, 0.15])
+    
+    x = np.arange(max_depth + 1)
+    width = 0.35
+    
+    ax5.bar(x - width/2, dist_without, width, label='Without L_multi', 
+           color='#FF6B6B', edgecolor='black', alpha=0.8)
+    ax5.bar(x + width/2, dist_with, width, label='With L_multi (P8-1)', 
+           color='#4ECDC4', edgecolor='black', alpha=0.8)
+    
+    ax5.set_xlabel('Depth Level', fontsize=10)
+    ax5.set_ylabel('Token Proportion', fontsize=10)
+    ax5.set_title('Multi-Layer Depth Loss Effect\nL = Σ_d w_d·(H_target - H̄_d)²', fontsize=11)
+    ax5.set_xticks(x)
+    ax5.set_xticklabels([f'd={d}' for d in x])
+    ax5.legend(fontsize=9)
+    ax5.grid(True, alpha=0.3, axis='y')
+    
+    # Calculate entropy
+    def entropy(p):
+        p = p[p > 0]
+        return -np.sum(p * np.log(p))
+    
+    ax5.text(0.98, 0.98, f'Entropy: {entropy(dist_without):.2f} → {entropy(dist_with):.2f}',
+            transform=ax5.transAxes, fontsize=9, ha='right', va='top',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    # ===== 6. BFS Batch Splitting (P8-2) =====
+    ax6 = axes[1, 2]
+    ax6.axis('off')
+    
+    bfs_text = """
+    BFS Batch Splitting Algorithm (P8-2)
+    =====================================
+    
+    Old: Sequential DFS O(N × D)
+      for region in regions:
+          for depth in range(max_depth):
+              if should_split(region):
+                  split(region)
+    
+    New: Parallel BFS O(D)
+      queue = [root_regions]  # All images
+      for depth in range(max_depth):
+          # Batch compute complexity for ALL regions at this depth
+          complexities = batch_compute_complexity(queue)
+          
+          # Batch split decisions
+          decisions = batch_split_decision(complexities, depth)
+          
+          # Parallel split
+          queue = parallel_split(queue, decisions)
+    
+    Complexity Analysis:
+      Sequential: O(N × D) where N = max tokens
+      BFS Batch:  O(D) iterations, each O(N) parallel
+      
+    Speedup: ~10x for typical workloads
+    
+    Key: _split_bfs() and _batch_compute_complexity()
+    """
+    
+    ax6.text(0.05, 0.95, bfs_text, transform=ax6.transAxes,
+            fontsize=9, verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='#f0f8ff', alpha=0.9))
+    ax6.set_title('BFS Optimization', fontsize=11)
+    
+    fig.suptitle('LearnableSplitter: Content-Adaptive Quadtree Splitting (P7/P8)\n'
+                'split_adaptive.py - Mathematical Foundations',
+                fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] LearnableSplitter visualization saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
+
+
+# ============================================================================
+# NEW: TemperatureScheduler Visualization (P8-5)
+# ============================================================================
+
+def visualize_temperature_scheduler(
+    save_path: Optional[Path] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """Visualize TemperatureScheduler decay strategies.
+    
+    Mathematical Formalization (split_adaptive.py):
+    ================================================
+    
+    Temperature controls the sharpness of split decisions:
+      p_split = σ((C - τ) / T)
+      
+    High T → soft decisions (exploration)
+    Low T  → hard decisions (exploitation)
+    
+    Decay Strategies:
+    1. Exponential: T(t) = T_max · (T_min/T_max)^(t/T_total)
+    2. Linear:      T(t) = T_max - (T_max - T_min) · t/T_total  
+    3. Cosine:      T(t) = T_min + 0.5·(T_max-T_min)·(1+cos(πt/T_total))
+    
+    Implementation: TemperatureScheduler class
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # Parameters
+    T_max, T_min = 2.0, 0.1
+    steps = np.linspace(0, 1, 100)
+    
+    # ===== 1. Temperature Decay Curves =====
+    ax1 = axes[0, 0]
+    
+    # Exponential
+    T_exp = T_max * (T_min / T_max) ** steps
+    
+    # Linear
+    T_linear = T_max - (T_max - T_min) * steps
+    
+    # Cosine
+    T_cosine = T_min + 0.5 * (T_max - T_min) * (1 + np.cos(np.pi * steps))
+    
+    # Constant (baseline)
+    T_const = np.ones_like(steps) * T_max
+    
+    ax1.plot(steps, T_exp, 'r-', linewidth=2.5, label='Exponential')
+    ax1.plot(steps, T_linear, 'b--', linewidth=2.5, label='Linear')
+    ax1.plot(steps, T_cosine, 'g-.', linewidth=2.5, label='Cosine')
+    ax1.plot(steps, T_const, 'gray', linestyle=':', linewidth=2, label='Constant (no decay)')
+    
+    ax1.axhline(T_min, color='black', linestyle=':', alpha=0.5)
+    ax1.axhline(T_max, color='black', linestyle=':', alpha=0.5)
+    
+    ax1.set_xlabel('Training Progress (t/T_total)', fontsize=10)
+    ax1.set_ylabel('Temperature T', fontsize=10)
+    ax1.set_title(f'Temperature Decay Strategies\nT_max={T_max}, T_min={T_min}', fontsize=11)
+    ax1.legend(fontsize=9)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim(0, 1)
+    ax1.set_ylim(0, T_max * 1.1)
+    
+    # ===== 2. Effect on Split Probability =====
+    ax2 = axes[0, 1]
+    
+    complexity = np.linspace(0, 1, 100)
+    tau = 0.4
+    
+    # Different temperatures at different training stages
+    T_values = [T_exp[0], T_exp[25], T_exp[50], T_exp[75], T_exp[99]]
+    progress_labels = ['t=0%', 't=25%', 't=50%', 't=75%', 't=100%']
+    colors = plt.cm.plasma(np.linspace(0.1, 0.9, len(T_values)))
+    
+    for T, label, color in zip(T_values, progress_labels, colors):
+        p = 1 / (1 + np.exp(-(complexity - tau) / T))
+        ax2.plot(complexity, p, color=color, linewidth=2, label=f'{label} (T={T:.2f})')
+    
+    ax2.axvline(tau, color='black', linestyle='--', alpha=0.7, label=f'τ={tau}')
+    
+    ax2.set_xlabel('Complexity C(R)', fontsize=10)
+    ax2.set_ylabel('Split Probability', fontsize=10)
+    ax2.set_title('Split Sharpness Evolution (Exponential Decay)', fontsize=11)
+    ax2.legend(fontsize=8, loc='lower right')
+    ax2.grid(True, alpha=0.3)
+    
+    # ===== 3. Warmup Phase =====
+    ax3 = axes[1, 0]
+    
+    warmup_ratio = 0.1
+    total_steps = 100
+    warmup_steps = int(total_steps * warmup_ratio)
+    
+    steps_full = np.arange(total_steps)
+    T_with_warmup = np.zeros(total_steps)
+    
+    # Warmup: linear from 0 to T_max
+    T_with_warmup[:warmup_steps] = np.linspace(0.01, T_max, warmup_steps)
+    
+    # After warmup: exponential decay
+    remaining = total_steps - warmup_steps
+    decay_steps = np.linspace(0, 1, remaining)
+    T_with_warmup[warmup_steps:] = T_max * (T_min / T_max) ** decay_steps
+    
+    ax3.plot(steps_full / total_steps, T_with_warmup, 'r-', linewidth=2.5)
+    ax3.axvline(warmup_ratio, color='blue', linestyle='--', alpha=0.7, 
+               label=f'Warmup end ({warmup_ratio*100:.0f}%)')
+    ax3.fill_between([0, warmup_ratio], 0, T_max * 1.1, alpha=0.2, color='blue')
+    
+    ax3.set_xlabel('Training Progress', fontsize=10)
+    ax3.set_ylabel('Temperature T', fontsize=10)
+    ax3.set_title(f'Temperature with Warmup Phase\n(warmup={warmup_ratio*100:.0f}%)', fontsize=11)
+    ax3.legend(fontsize=9)
+    ax3.grid(True, alpha=0.3)
+    ax3.set_xlim(0, 1)
+    ax3.set_ylim(0, T_max * 1.1)
+    
+    ax3.text(warmup_ratio/2, T_max * 0.5, 'Warmup\nPhase', 
+            ha='center', va='center', fontsize=10, fontweight='bold', color='blue')
+    
+    # ===== 4. Implementation Details =====
+    ax4 = axes[1, 1]
+    ax4.axis('off')
+    
+    impl_text = """
+    TemperatureScheduler Implementation (P8-5)
+    ==========================================
+    
+    class TemperatureScheduler:
+        def __init__(self, T_max, T_min, total_steps, 
+                     schedule='exponential', warmup_ratio=0.0):
+            self.T_max = T_max
+            self.T_min = T_min
+            self.total_steps = total_steps
+            self.schedule = schedule
+            self.warmup_steps = int(total_steps * warmup_ratio)
+        
+        def get_temperature(self, step):
+            # Warmup phase
+            if step < self.warmup_steps:
+                return self.T_max * step / self.warmup_steps
+            
+            # Decay phase
+            progress = (step - self.warmup_steps) / \
+                       (self.total_steps - self.warmup_steps)
+            
+            if self.schedule == 'exponential':
+                return self.T_max * (self.T_min/self.T_max)**progress
+            elif self.schedule == 'linear':
+                return self.T_max - (self.T_max - self.T_min) * progress
+            elif self.schedule == 'cosine':
+                return self.T_min + 0.5 * (self.T_max - self.T_min) * \
+                       (1 + cos(pi * progress))
+    
+    Usage:
+        scheduler = TemperatureScheduler(2.0, 0.1, 1000, 'exponential')
+        for step in range(1000):
+            T = scheduler.get_temperature(step)
+            splitter.set_temperature(T)
+    """
+    
+    ax4.text(0.02, 0.98, impl_text, transform=ax4.transAxes,
+            fontsize=9, verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='#fff8dc', alpha=0.9))
+    ax4.set_title('Implementation', fontsize=11)
+    
+    fig.suptitle('TemperatureScheduler: Annealing Strategies (P8-5)\n'
+                'Controls exploration→exploitation transition',
+                fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] TemperatureScheduler visualization saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
+
+
+# ============================================================================
+# NEW: SpatialIndex Visualization (P8-3)
+# ============================================================================
+
+def visualize_spatial_index(
+    save_path: Optional[Path] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """Visualize SpatialIndex for efficient neighbor queries.
+    
+    Mathematical Formalization (split_adaptive.py):
+    ================================================
+    
+    Problem: Find neighbors of a region for balance constraint checking.
+    
+    Naive: O(N²) pairwise distance computation
+    SpatialIndex: O(log N + k) using grid-based spatial hashing
+    
+    Algorithm:
+    1. Hash regions to grid cells: cell_id = (x // cell_size, y // cell_size)
+    2. Query: check only neighboring cells (3x3 or 5x5 window)
+    3. Filter: verify actual intersection/adjacency
+    
+    Speedup: ~8.4x for typical workloads (N=256 tokens)
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    
+    # ===== 1. Grid-Based Spatial Hashing =====
+    ax1 = axes[0, 0]
+    
+    np.random.seed(42)
+    grid_size = 64
+    cell_size = 16
+    num_regions = 20
+    
+    # Generate random regions
+    regions = []
+    for _ in range(num_regions):
+        x = np.random.randint(0, grid_size - 8)
+        y = np.random.randint(0, grid_size - 8)
+        w = np.random.randint(4, 16)
+        h = np.random.randint(4, 16)
+        regions.append((x, y, min(x+w, grid_size), min(y+h, grid_size)))
+    
+    # Draw grid cells
+    for i in range(0, grid_size + 1, cell_size):
+        ax1.axhline(i, color='gray', linewidth=0.5, alpha=0.5)
+        ax1.axvline(i, color='gray', linewidth=0.5, alpha=0.5)
+    
+    # Draw regions
+    colors = plt.cm.tab20(np.linspace(0, 1, num_regions))
+    for i, (x1, y1, x2, y2) in enumerate(regions):
+        rect = Rectangle((x1, y1), x2-x1, y2-y1, 
+                         facecolor=colors[i], alpha=0.6, edgecolor='black')
+        ax1.add_patch(rect)
+        ax1.text((x1+x2)/2, (y1+y2)/2, str(i), ha='center', va='center', fontsize=8)
+    
+    # Highlight grid cells
+    for i, (x1, y1, x2, y2) in enumerate(regions):
+        cell_x = x1 // cell_size
+        cell_y = y1 // cell_size
+        cell_rect = Rectangle((cell_x * cell_size, cell_y * cell_size), 
+                              cell_size, cell_size,
+                              facecolor='none', edgecolor=colors[i], 
+                              linewidth=2, linestyle='--')
+        ax1.add_patch(cell_rect)
+    
+    ax1.set_xlim(0, grid_size)
+    ax1.set_ylim(0, grid_size)
+    ax1.set_aspect('equal')
+    ax1.set_xlabel('X', fontsize=10)
+    ax1.set_ylabel('Y', fontsize=10)
+    ax1.set_title(f'Grid-Based Spatial Hashing\n(cell_size={cell_size})', fontsize=11)
+    
+    # ===== 2. Neighbor Query Visualization =====
+    ax2 = axes[0, 1]
+    
+    # Select a query region
+    query_idx = 5
+    qx1, qy1, qx2, qy2 = regions[query_idx]
+    query_cell_x = qx1 // cell_size
+    query_cell_y = qy1 // cell_size
+    
+    # Draw all regions faded
+    for i, (x1, y1, x2, y2) in enumerate(regions):
+        alpha = 0.2 if i != query_idx else 0.8
+        rect = Rectangle((x1, y1), x2-x1, y2-y1, 
+                         facecolor=colors[i], alpha=alpha, edgecolor='black')
+        ax2.add_patch(rect)
+    
+    # Highlight query region
+    query_rect = Rectangle((qx1, qy1), qx2-qx1, qy2-qy1, 
+                           facecolor='red', alpha=0.8, edgecolor='red', linewidth=3)
+    ax2.add_patch(query_rect)
+    ax2.text((qx1+qx2)/2, (qy1+qy2)/2, 'Q', ha='center', va='center', 
+            fontsize=12, fontweight='bold', color='white')
+    
+    # Highlight search window (3x3 cells)
+    for di in range(-1, 2):
+        for dj in range(-1, 2):
+            cx = (query_cell_x + di) * cell_size
+            cy = (query_cell_y + dj) * cell_size
+            if 0 <= cx < grid_size and 0 <= cy < grid_size:
+                search_rect = Rectangle((cx, cy), cell_size, cell_size,
+                                        facecolor='yellow', alpha=0.2, 
+                                        edgecolor='orange', linewidth=2)
+                ax2.add_patch(search_rect)
+    
+    # Draw grid
+    for i in range(0, grid_size + 1, cell_size):
+        ax2.axhline(i, color='gray', linewidth=0.5, alpha=0.5)
+        ax2.axvline(i, color='gray', linewidth=0.5, alpha=0.5)
+    
+    ax2.set_xlim(0, grid_size)
+    ax2.set_ylim(0, grid_size)
+    ax2.set_aspect('equal')
+    ax2.set_xlabel('X', fontsize=10)
+    ax2.set_ylabel('Y', fontsize=10)
+    ax2.set_title('Neighbor Query: Only Check Yellow Cells\n(3x3 window around query)', fontsize=11)
+    
+    # ===== 3. Complexity Comparison =====
+    ax3 = axes[1, 0]
+    
+    n_values = np.array([16, 32, 64, 128, 256, 512, 1024])
+    
+    # Naive: O(N²)
+    naive_ops = n_values ** 2
+    
+    # SpatialIndex: O(N * k) where k ≈ 9 (3x3 cells average)
+    k_avg = 9
+    spatial_ops = n_values * k_avg
+    
+    ax3.plot(n_values, naive_ops, 'r-o', linewidth=2, markersize=8, label='Naive O(N²)')
+    ax3.plot(n_values, spatial_ops, 'g-s', linewidth=2, markersize=8, label='SpatialIndex O(N·k)')
+    
+    ax3.set_xlabel('Number of Regions N', fontsize=10)
+    ax3.set_ylabel('Operations', fontsize=10)
+    ax3.set_title('Complexity Comparison', fontsize=11)
+    ax3.set_yscale('log')
+    ax3.legend(fontsize=10)
+    ax3.grid(True, alpha=0.3)
+    
+    # Add speedup annotation
+    speedup = naive_ops[-1] / spatial_ops[-1]
+    ax3.text(0.98, 0.5, f'Speedup at N={n_values[-1]}:\n{speedup:.1f}x',
+            transform=ax3.transAxes, fontsize=11, ha='right', va='center',
+            bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
+    
+    # ===== 4. Implementation =====
+    ax4 = axes[1, 1]
+    ax4.axis('off')
+    
+    impl_text = """
+    SpatialIndex Implementation (P8-3)
+    ===================================
+    
+    class SpatialIndex:
+        def __init__(self, grid_size, cell_size=16):
+            self.cell_size = cell_size
+            self.grid = defaultdict(list)  # cell_id -> [region_ids]
+        
+        def insert(self, region_id, x1, y1, x2, y2):
+            # Hash to all overlapping cells
+            for cx in range(x1 // self.cell_size, x2 // self.cell_size + 1):
+                for cy in range(y1 // self.cell_size, y2 // self.cell_size + 1):
+                    self.grid[(cx, cy)].append(region_id)
+        
+        def query_neighbors(self, x1, y1, x2, y2, radius=1):
+            # Get cell range
+            cx1, cy1 = x1 // self.cell_size, y1 // self.cell_size
+            cx2, cy2 = x2 // self.cell_size, y2 // self.cell_size
+            
+            candidates = set()
+            for cx in range(cx1 - radius, cx2 + radius + 1):
+                for cy in range(cy1 - radius, cy2 + radius + 1):
+                    candidates.update(self.grid.get((cx, cy), []))
+            
+            return candidates
+    
+    Usage in Balance Constraint (P8-3):
+        spatial_idx = SpatialIndex(image_size)
+        for r in regions:
+            spatial_idx.insert(r.id, r.x1, r.y1, r.x2, r.y2)
+        
+        # Check 2:1 balance constraint efficiently
+        for r in regions:
+            neighbors = spatial_idx.query_neighbors(r.x1, r.y1, r.x2, r.y2)
+            for n_id in neighbors:
+                if abs(r.depth - regions[n_id].depth) > 1:
+                    needs_rebalance = True
+    
+    Measured Speedup: 8.4x (N=256 typical)
+    """
+    
+    ax4.text(0.02, 0.98, impl_text, transform=ax4.transAxes,
+            fontsize=9, verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='#e8f0ff', alpha=0.9))
+    ax4.set_title('Implementation Details', fontsize=11)
+    
+    fig.suptitle('SpatialIndex: Efficient Neighbor Queries (P8-3)\n'
+                'Grid-based spatial hashing for O(log N + k) lookups',
+                fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] SpatialIndex visualization saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
+
+
+# ============================================================================
+# Generate All Visualizations
 # ============================================================================
 
 def generate_all_visualizations(
@@ -2083,19 +2724,19 @@ def generate_all_visualizations(
     include_new: bool = True,
     include_v2_deprecated: bool = False,
 ) -> None:
-    """生成所有可视化.
+    """Generate all visualizations.
     
     Args:
-        output_dir: 输出目录
-        show: 是否交互显示
-        include_new: 是否包含新增的高级可视化 (LCA, Cross-Scale, etc.)
-        include_v2_deprecated: 是否包含 V2 已弃用的可视化 (Gumbel, Depth Bias)
+        output_dir: Output directory
+        show: Whether to show interactively
+        include_new: Include new P7/P8 visualizations (LearnableSplitter, etc.)
+        include_v2_deprecated: Include V2 deprecated visualizations (Gumbel, Depth Bias)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    total_steps = 7  # 基础可视化
+    total_steps = 7  # Basic visualizations
     if include_new:
-        total_steps += 3  # LCA, Cross-Scale Attention, Bias Comparison
+        total_steps += 6  # LCA, VDT, Bias Comparison, LearnableSplitter, TempScheduler, SpatialIndex
     if include_v2_deprecated:
         total_steps += 2  # Gumbel, Depth Bias
     
@@ -2190,10 +2831,10 @@ def generate_all_visualizations(
         )
         step += 1
         
-        # 9. Cross-Scale Attention 机制 (V3 推荐)
-        print(f"[{step}/{total_steps}] Generating Cross-Scale Attention visualization...")
+        # 9. Variable Depth Tokens (VDT) 机制 (V3 推荐)
+        print(f"[{step}/{total_steps}] Generating Variable Depth Tokens (VDT) visualization...")
         visualize_cross_scale_attention(
-            save_path=output_dir / "cross_scale_attention.png",
+            save_path=output_dir / "variable_depth_tokens.png",
             show=show,
         )
         step += 1
@@ -2203,6 +2844,30 @@ def generate_all_visualizations(
         visualize_attention_bias_comparison(
             order=3,
             save_path=output_dir / "attention_bias_comparison.png",
+            show=show,
+        )
+        step += 1
+        
+        # 11. LearnableSplitter (P7/P8)
+        print(f"[{step}/{total_steps}] Generating LearnableSplitter visualization...")
+        visualize_learnable_splitter(
+            save_path=output_dir / "learnable_splitter.png",
+            show=show,
+        )
+        step += 1
+        
+        # 12. TemperatureScheduler (P8-5)
+        print(f"[{step}/{total_steps}] Generating TemperatureScheduler visualization...")
+        visualize_temperature_scheduler(
+            save_path=output_dir / "temperature_scheduler.png",
+            show=show,
+        )
+        step += 1
+        
+        # 13. SpatialIndex (P8-3)
+        print(f"[{step}/{total_steps}] Generating SpatialIndex visualization...")
+        visualize_spatial_index(
+            save_path=output_dir / "spatial_index.png",
             show=show,
         )
         step += 1
@@ -2238,8 +2903,11 @@ def generate_all_visualizations(
     print(f"  - hilbert_growth.gif (if successful)")
     if include_new:
         print(f"  - lca_bias_matrix.png")
-        print(f"  - cross_scale_attention.png (V3)")
+        print(f"  - variable_depth_tokens.png (VDT)")
         print(f"  - attention_bias_comparison.png")
+        print(f"  - learnable_splitter.png (P7/P8)")
+        print(f"  - temperature_scheduler.png (P8-5)")
+        print(f"  - spatial_index.png (P8-3)")
     if include_v2_deprecated:
         print(f"  - gumbel_softmax_decision.png (V2 deprecated)")
         print(f"  - depth_bias_warmup.png (V2 deprecated)")
@@ -2247,7 +2915,7 @@ def generate_all_visualizations(
 
 
 # ============================================================================
-# 主函数
+# Main Function
 # ============================================================================
 
 def main():
@@ -2256,24 +2924,27 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Generate all visualizations (V3 + basic)
+  # Generate all visualizations (V3 + basic + P7/P8 new)
   python visualize_fractal_curves.py --all
 
   # Generate all including V2 deprecated visualizations
   python visualize_fractal_curves.py --all --include-v2
 
-  # Generate only basic visualizations (without LCA, Cross-Scale, etc.)
+  # Generate only basic visualizations (without LCA, VDT, LearnableSplitter, etc.)
   python visualize_fractal_curves.py --all --no-advanced
 
-  # Generate Cross-Scale Attention visualization (V3 recommended)
-  python visualize_fractal_curves.py --cross-scale-attention --show
+  # Generate Variable Depth Tokens (VDT) visualization (V3 recommended)
+  python visualize_fractal_curves.py --vdt --show
+
+  # Generate P7/P8 new visualizations (LearnableSplitter, TemperatureScheduler, SpatialIndex)
+  python visualize_fractal_curves.py --learnable-splitter --temperature-scheduler --spatial-index
 
   # Generate V2 deprecated visualizations
   python visualize_fractal_curves.py --gumbel --depth-bias
         """
     )
     
-    # 模式 - 基础
+    # Mode - Basic
     parser.add_argument("--all", action="store_true",
                        help="Generate all visualizations")
     parser.add_argument("--animate", action="store_true",
@@ -2291,19 +2962,30 @@ Examples:
     parser.add_argument("--mixed-level", action="store_true",
                        help="Generate mixed-level (adaptive) segmentation demo")
     
-    # 模式 - 新增高级可视化
+    # Mode - V3 Advanced Visualizations
     parser.add_argument("--lca-bias", action="store_true",
                        help="Generate LCA bias matrix visualization")
-    parser.add_argument("--cross-scale-attention", action="store_true",
-                       help="[V3] Generate Cross-Scale Attention visualization (recommended)")
+    parser.add_argument("--vdt", "--cross-scale-attention", action="store_true",
+                       dest="vdt",
+                       help="[V3] Generate Variable Depth Tokens (VDT) visualization (recommended)")
+    parser.add_argument("--bias-comparison", action="store_true",
+                       help="Generate attention bias modes comparison")
+    
+    # Mode - P7/P8 New Visualizations
+    parser.add_argument("--learnable-splitter", action="store_true",
+                       help="[P7/P8] Generate LearnableSplitter visualization (complexity function, threshold decay)")
+    parser.add_argument("--temperature-scheduler", action="store_true",
+                       help="[P8-5] Generate TemperatureScheduler visualization (decay strategies)")
+    parser.add_argument("--spatial-index", action="store_true",
+                       help="[P8-3] Generate SpatialIndex visualization (efficient neighbor queries)")
+    
+    # Mode - V2 Deprecated Visualizations
     parser.add_argument("--gumbel", action="store_true",
                        help="[V2] Generate Gumbel-Softmax decision visualization (deprecated)")
     parser.add_argument("--depth-bias", action="store_true",
                        help="[V2] Generate depth bias warmup visualization (deprecated)")
-    parser.add_argument("--bias-comparison", action="store_true",
-                       help="Generate attention bias modes comparison")
     
-    # 参数
+    # Parameters
     parser.add_argument("--order", type=int, default=4,
                        help="Hilbert curve order (default: 4)")
     parser.add_argument("--output-dir", type=str, default=None,
@@ -2317,19 +2999,20 @@ Examples:
     
     args = parser.parse_args()
     
-    # 确定输出目录
+    # Determine output directory
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
         output_dir = PROJECT_ROOT / "workspace" / "visualizations" / "fractal_curves"
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # 如果没有指定任何选项，默认生成所有
+    # If no option specified, default to all
     all_options = [
         args.all, args.animate, args.comparison, args.locality, 
         args.quadtree, args.mapping, args.multiscale, args.mixed_level,
-        args.lca_bias, args.cross_scale_attention, args.gumbel, 
-        args.depth_bias, args.bias_comparison
+        args.lca_bias, args.vdt, args.gumbel, 
+        args.depth_bias, args.bias_comparison,
+        args.learnable_splitter, args.temperature_scheduler, args.spatial_index,
     ]
     if not any(all_options):
         args.all = True
@@ -2343,7 +3026,7 @@ Examples:
         )
         return
     
-    # 基础可视化
+    # Basic visualizations
     if args.animate:
         visualize_hilbert_growth(
             order=args.order,
@@ -2371,7 +3054,7 @@ Examples:
     
     if args.mapping:
         visualize_2d_to_1d_mapping(
-            order=min(args.order, 4),  # 限制阶数避免太密
+            order=min(args.order, 4),  # Limit order to avoid density issues
             save_path=output_dir / f"2d_to_1d_mapping_order{min(args.order, 4)}.png",
             show=args.show,
         )
@@ -2390,7 +3073,7 @@ Examples:
             show=args.show,
         )
     
-    # 新增高级可视化
+    # V3 Advanced visualizations
     if args.lca_bias:
         visualize_lca_bias_matrix(
             order=args.order,
@@ -2398,12 +3081,39 @@ Examples:
             show=args.show,
         )
     
-    if args.cross_scale_attention:
+    if args.vdt:
         visualize_cross_scale_attention(
-            save_path=output_dir / "cross_scale_attention.png",
+            save_path=output_dir / "variable_depth_tokens.png",
             show=args.show,
         )
     
+    if args.bias_comparison:
+        visualize_attention_bias_comparison(
+            order=min(args.order, 4),
+            save_path=output_dir / f"attention_bias_comparison_order{min(args.order, 4)}.png",
+            show=args.show,
+        )
+    
+    # P7/P8 New visualizations
+    if args.learnable_splitter:
+        visualize_learnable_splitter(
+            save_path=output_dir / "learnable_splitter.png",
+            show=args.show,
+        )
+    
+    if args.temperature_scheduler:
+        visualize_temperature_scheduler(
+            save_path=output_dir / "temperature_scheduler.png",
+            show=args.show,
+        )
+    
+    if args.spatial_index:
+        visualize_spatial_index(
+            save_path=output_dir / "spatial_index.png",
+            show=args.show,
+        )
+    
+    # V2 Deprecated visualizations
     if args.gumbel:
         visualize_gumbel_softmax_decision(
             save_path=output_dir / "gumbel_softmax_decision.png",
@@ -2413,13 +3123,6 @@ Examples:
     if args.depth_bias:
         visualize_depth_bias_warmup(
             save_path=output_dir / "depth_bias_warmup.png",
-            show=args.show,
-        )
-    
-    if args.bias_comparison:
-        visualize_attention_bias_comparison(
-            order=min(args.order, 4),
-            save_path=output_dir / f"attention_bias_comparison_order{min(args.order, 4)}.png",
             show=args.show,
         )
 

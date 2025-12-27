@@ -226,7 +226,7 @@ $$P_{pos} = (D_{max}+5) \cdot D + D^2$$
 ### 1.5 MLP Head 参数
 
 ```python
-# fractal_vit.py L255-262
+# model_fractal_vit.py L255-262
 self.mlp_head = nn.Sequential(
     nn.LayerNorm(dim),
     nn.Linear(dim, mlp_dim // 2),
