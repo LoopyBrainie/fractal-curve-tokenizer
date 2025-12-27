@@ -191,6 +191,16 @@ class TrainingConfig:
     lca_temperature: Optional[float]  # LCA 偏置温度，默认 1.5
     learnable_temperature: bool  # 是否可学习温度，默认 True
     
+    # P7-6: 可学习分割器训练参数
+    lambda_splitter_entropy: float  # 熵损失权重，鼓励尺度多样性
+    lambda_splitter_budget: float  # 预算约束权重
+    splitter_token_budget: int  # 目标 token 数预算
+    
+    # P7-7: 温度退火调度参数
+    splitter_temp_start: float  # 起始温度 T_start
+    splitter_temp_end: float  # 终止温度 T_end
+    splitter_temp_warmup: int  # Warmup epoch 数 (固定 T_start)
+    
     # 训练
     epochs: int
     learning_rate: float
@@ -860,11 +870,23 @@ def train_epoch(
             if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_entropy_loss'):
                 entropy_loss = model.tokenizer.get_entropy_loss()
             
+            # P7-6: 可学习分割器辅助损失
+            # 通过可微分路径优化分割策略：熵正则化 + 预算约束 + 阈值正则化
+            splitter_loss = None
+            if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_learnable_split_loss'):
+                splitter_loss = model.tokenizer.get_learnable_split_loss(
+                    lambda_entropy=config.lambda_splitter_entropy,
+                    lambda_budget=config.lambda_splitter_budget,
+                    target_tokens=config.splitter_token_budget,
+                )
+            
+            # 组合损失
+            loss = ce_loss
             if entropy_loss is not None:
-                loss = ce_loss + entropy_loss / config.accum_steps
+                loss = loss + entropy_loss / config.accum_steps
                 entropy_losses.append(entropy_loss.item())  # P1-5: 记录熵损失
-            else:
-                loss = ce_loss
+            if splitter_loss is not None:
+                loss = loss + splitter_loss / config.accum_steps
         
         # 检查 loss 是否为 NaN
         if torch.isnan(loss) or torch.isinf(loss):
@@ -1193,6 +1215,22 @@ def main():
     parser.add_argument("--fixed-lca-temperature", action="store_true",
                        help="Use fixed (non-learnable) LCA temperature")
     
+    # P7-6: 可学习分割器训练参数
+    parser.add_argument("--lambda-splitter-entropy", type=float, default=0.1,
+                       help="Learnable splitter entropy loss weight (default: 0.1)")
+    parser.add_argument("--lambda-splitter-budget", type=float, default=0.01,
+                       help="Learnable splitter budget constraint weight (default: 0.01)")
+    parser.add_argument("--splitter-token-budget", type=int, default=64,
+                       help="Target token budget for learnable splitter (default: 64)")
+    
+    # P7-7: 温度退火调度参数
+    parser.add_argument("--splitter-temp-start", type=float, default=1.0,
+                       help="Learnable splitter initial temperature (default: 1.0)")
+    parser.add_argument("--splitter-temp-end", type=float, default=0.1,
+                       help="Learnable splitter final temperature (default: 0.1)")
+    parser.add_argument("--splitter-temp-warmup", type=int, default=5,
+                       help="Warmup epochs with fixed T_start (default: 5)")
+    
     # 训练
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=5e-4)
@@ -1287,6 +1325,14 @@ def main():
         # P6-2: LCA 温度配置
         lca_temperature=None if args.no_lca_temperature else args.lca_temperature,
         learnable_temperature=not args.fixed_lca_temperature,
+        # P7-6: 可学习分割器训练配置
+        lambda_splitter_entropy=args.lambda_splitter_entropy,
+        lambda_splitter_budget=args.lambda_splitter_budget,
+        splitter_token_budget=args.splitter_token_budget,
+        # P7-7: 温度退火调度配置
+        splitter_temp_start=args.splitter_temp_start,
+        splitter_temp_end=args.splitter_temp_end,
+        splitter_temp_warmup=args.splitter_temp_warmup,
         # 训练配置
         epochs=args.epochs,
         learning_rate=args.lr,
@@ -1350,6 +1396,9 @@ def main():
         enforce_balance=config.enforce_balance,
         # P6-1: 深度缩放配置
         depth_scale_range=config.depth_scale_range,
+        # 分割阈值参数
+        tau_0=config.split_tau0,
+        gamma=config.split_gamma,
     )
     
     # 创建模型 (V3 Variable Depth Tokens)
@@ -1524,6 +1573,19 @@ def main():
     
     for epoch in range(1, config.epochs + 1):
         start = time.time()
+        
+        # P7-7: 温度退火调度
+        # T(t) = T_start · (T_end / T_start)^((t - warmup) / (total - warmup))
+        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'set_split_temperature'):
+            if epoch <= config.splitter_temp_warmup:
+                # Warmup 阶段：固定 T_start
+                current_temp = config.splitter_temp_start
+            else:
+                # 退火阶段：指数衰减
+                progress = (epoch - config.splitter_temp_warmup) / max(1, config.epochs - config.splitter_temp_warmup)
+                ratio = config.splitter_temp_end / config.splitter_temp_start
+                current_temp = config.splitter_temp_start * (ratio ** progress)
+            model.tokenizer.set_split_temperature(current_temp)
         
         train_loss, train_acc, perf_stats = train_epoch(
             model, train_loader, optimizer, device, scaler, config,

@@ -1,49 +1,68 @@
 #!/usr/bin/env python3
-"""Fractal Curve ViT 交互式可视化脚本
+"""Fractal Curve ViT Interactive Visualization Script
 
-数学形式化
-============
+Mathematical Formalization
+===========================
 
-本脚本可视化 Fractal Curve ViT 的核心数学结构：
+This script visualizes the core mathematical structures of Fractal Curve ViT:
 
-1. **Hilbert 曲线**:
+1. **Hilbert Curve** (curve_hilbert.py):
    H: [0, n²) ↔ [0, n) × [0, n)
-   局部性: ||p1 - p2||_2 ≤ C · |H⁻¹(p1) - H⁻¹(p2)|^(1/2)
+   Locality: ||p1 - p2||_2 ≤ C · |H⁻¹(p1) - H⁻¹(p2)|^(1/2)
 
-2. **LCA (最低公共祖先) 偏置** (P6-2 改进):
-   LCA(i, j) = 第一个不同象限的层级 ∈ [0, L]
+2. **LCA (Lowest Common Ancestor) Bias** (attn_hilbert_bias.py, P6-2):
+   LCA(i, j) = first differing quadrant level ∈ [0, L]
    B[i,j] = τ_h · LCAEmbed(LCA(i,j))
    
-   其中 τ_h 是 per-head 可学习温度参数 (softplus 参数化)
+   where τ_h is a per-head learnable temperature (softplus parameterized)
 
-3. **Variable Depth Tokens (V3, 唯一支持)**:
-   Regions = AdaptiveQuadtreeSplit(I)  # 内容自适应分割
-   F = SharedConv(I)                    # 共享特征提取
-   Token_i = Pool(F[R_i]) * σ_d + E_d  # ROI-Align 池化 + 深度编码
+3. **LearnableSplitter** (split_adaptive.py, P7/P8):
+   Complexity function:
+     C(R) = α · Var(R)/(Var(R)+σ₀²) + (1-α) · G(R)/(G(R)+g₀²)
    
-   P6-1 改进: σ_d = σ_min + (σ_max - σ_min) · sigmoid(γ_d)
-   动态范围从 1.2x 扩展到 4x
+   Split decision:
+     p_split = σ((C_θ(R) - τ_d) / T)
+     z ~ Gumbel-Softmax(p) or STE
+   
+   Key components:
+     - ComplexityMLP: Learnable complexity predictor (no saturation)
+     - TemperatureScheduler: Exponential/linear/cosine temperature decay
+     - SpatialIndex: O(log N + k) neighbor queries via grid hashing
 
-注意：V1 和 V2 已从代码库完全移除。
+4. **Variable Depth Tokens (V3, Only Supported)**:
+   Regions = Splitter(F, I)         # Learnable or rule-based split
+   F = SharedConv(I)                 # Shared feature extraction
+   Token_i = Pool(F[R_i]) * σ_d + E_d  # ROI-Align pooling + depth encoding
+   
+   P6-1 improvement: σ_d = σ_min + (σ_max - σ_min) · sigmoid(γ_d)
+   Dynamic range expanded from 1.2x to 4x
 
-可视化功能
-----------
-1. Hilbert 曲线动画生成
-2. 不同阶数的曲线对比  
-3. LCA 距离矩阵可视化
-4. 四叉树路径与偏置关系
-5. 多尺度深度分布可视化
-6. 注意力偏置矩阵可视化
+Note: V1 and V2 have been completely removed from the codebase.
 
-使用示例：
-    # 生成所有可视化
+Visualization Functions
+-----------------------
+1. Hilbert curve animation generation
+2. Order comparison across different curve orders
+3. LCA distance matrix visualization
+4. Quadtree path and bias relationships
+5. Multi-scale depth distribution visualization
+6. Attention bias matrix visualization
+7. LearnableSplitter complexity function visualization (NEW)
+8. TemperatureScheduler decay curves (NEW)
+9. SpatialIndex neighbor query visualization (NEW)
+
+Usage Examples:
+    # Generate all visualizations
     python visualize_fractal_curves.py --all
     
-    # 生成 LCA 偏置可视化
+    # Generate LCA bias visualization
     python visualize_fractal_curves.py --lca-bias
     
-    # 生成多尺度深度分布可视化
-    python visualize_fractal_curves.py --depth-distribution
+    # Generate LearnableSplitter visualization (P7/P8)
+    python visualize_fractal_curves.py --learnable-splitter
+    
+    # Generate temperature scheduler visualization
+    python visualize_fractal_curves.py --temperature-scheduler
 """
 
 from __future__ import annotations
