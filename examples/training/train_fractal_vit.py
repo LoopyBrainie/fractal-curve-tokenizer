@@ -1,27 +1,55 @@
 #!/usr/bin/env python3
 """Fractal ViT Training Script - V3 Variable Depth Tokens
 
+数学形式化
+===========
+完整前向传播:
+    1. Tokenization:  (T, L) = Tokenizer(I)
+       其中 I ∈ R^{B × C × H × W}, T ∈ R^{B × N × D}, L ∈ Z^{B × N}
+    
+    2. 位置编码:      T' = T + E_pos(T, L)
+    
+    3. Transformer:   X' = Transformer([CLS; T'], L)
+    
+    4. 分类:          ŷ = MLP(Pool(X'))
+
+分割方案 (Split Schemes)
+-------------------------
++------------------+----------------------------------+-------------------+
+| 方案              | 数学描述                          | 适用场景           |
++==================+==================================+===================+
+| balanced_greedy  | C(R) < τ_d · γ^d → 停止分割      | 通用 (推荐)        |
+|                  | 强制 2:1 邻接平衡约束             |                   |
++------------------+----------------------------------+-------------------+
+| fixed_budget_dp  | min Σ Importance(R_i)            | 固定 token 预算    |
+|                  | s.t. |Leaves| = N_budget         |                   |
++------------------+----------------------------------+-------------------+
+| learnable        | p_split = σ((C_θ(R) - τ_d) / T)  | 端到端学习分割     |
+|                  | Gumbel-Softmax 可微分采样        |                   |
++------------------+----------------------------------+-------------------+
+
 特性：
-1. StreamingFractalTokenizerV3：Variable Depth Tokens 自适应多尺度 (唯一支持)
+1. StreamingFractalTokenizerV3：Variable Depth Tokens 自适应多尺度
    - 使用 AdaptiveQuadtreeSplit 进行内容自适应分割
    - 共享卷积特征提取 + 深度编码 + ROI-Align 池化
-2. SwiGLU FFN：现代化前馈网络
+   - 支持可学习分割器 (Scheme L) 端到端优化
+2. SwiGLU FFN：现代化前馈网络 (swiglu_level 推荐)
 3. Hilbert 曲线重排序：保持空间局部性
-4. AMP 混合精度训练
-
-V3 优势：
-- 密集梯度流：共享特征提取器所有路径都收到梯度
-- 无温度参数：训练更稳定
-- 自适应分割：根据图像内容动态决定分割深度
-- 深度编码：Token 携带尺度信息
+4. LCA Hilbert Bias：层级感知注意力偏置
+5. AMP 混合精度训练 + torch.compile 编译优化
 
 使用示例：
     # CIFAR-10 快速测试
     python train_fractal_vit.py --quick-test --use-amp
     
     # Tiny ImageNet 完整训练 (推荐配置)
-    python train_fractal_vit.py --dataset tiny-imagenet --epochs 100 --dim 256 \
-        --depth 8 --heads 8 --dropout 0.1 --drop-path 0.1 --use-amp
+    python train_fractal_vit.py --dataset tiny-imagenet --epochs 100 --dim 384 \\
+        --depth 12 --heads 8 --dropout 0.1 --drop-path 0.15 --use-amp \\
+        --gradient-checkpoint --compile --channels-last
+    
+    # 使用可学习分割器
+    python train_fractal_vit.py --dataset tiny-imagenet --split-scheme learnable \\
+        --splitter-temp-start 1.0 --splitter-temp-end 0.1
 
 注意：V1 和 V2 已从代码库中完全删除，当前仅支持 streaming_v3。
 """
@@ -880,6 +908,21 @@ def train_epoch(
                     target_tokens=config.splitter_token_budget,
                 )
             
+            # P8-3: 多层深度损失 (仅可学习分割器)
+            # 确保所有深度层级的阈值都收到梯度信号
+            multi_layer_loss = None
+            if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_multi_layer_depth_loss'):
+                try:
+                    multi_layer_loss = model.tokenizer.get_multi_layer_depth_loss(
+                        features=model.tokenizer._last_features,
+                        image_size=(imgs.shape[2], imgs.shape[3]),
+                        target_entropy=0.693,  # ln(2), 鼓励 50/50 分割概率
+                        weight_decay_factor=0.5,  # β=0.5, 深层权重衰减
+                    )
+                except (ValueError, AttributeError):
+                    # 非可学习分割器会抛出 ValueError
+                    pass
+            
             # 组合损失
             loss = ce_loss
             if entropy_loss is not None:
@@ -887,6 +930,8 @@ def train_epoch(
                 entropy_losses.append(entropy_loss.item())  # P1-5: 记录熵损失
             if splitter_loss is not None:
                 loss = loss + splitter_loss / config.accum_steps
+            if multi_layer_loss is not None:
+                loss = loss + 0.1 * multi_layer_loss / config.accum_steps  # λ_multi = 0.1
         
         # 检查 loss 是否为 NaN
         if torch.isnan(loss) or torch.isinf(loss):
@@ -949,6 +994,13 @@ def train_epoch(
         scale_entropy = model.tokenizer.get_scale_entropy()
         if scale_entropy is not None:
             perf_stats['scale_entropy'] = scale_entropy
+    
+    # P7/P8: 获取可学习分割器统计信息
+    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_training_stats'):
+        training_stats = model.tokenizer.get_training_stats()
+        if training_stats.get('learnable_split'):
+            perf_stats['learnable_thresholds'] = training_stats.get('learnable_thresholds')
+            perf_stats['learnable_temperature'] = training_stats.get('learnable_temperature')
     
     return total_loss / len(loader), 100.0 * correct / total, perf_stats
 
@@ -1182,8 +1234,8 @@ def main():
     
     # V3 Tokenizer 高级参数 (Adaptive Quadtree Split)
     parser.add_argument("--split-scheme", type=str, default="balanced_greedy",
-                       choices=["balanced_greedy", "fixed_budget_dp"],
-                       help="Split scheme: balanced_greedy (Scheme B) or fixed_budget_dp (Scheme C)")
+                       choices=["balanced_greedy", "fixed_budget_dp", "learnable"],
+                       help="Split scheme: balanced_greedy (Scheme B), fixed_budget_dp (Scheme C), or learnable (Scheme L)")
     parser.add_argument("--target-tokens", type=int, default=None,
                        help="Target token count per image (None = adaptive)")
     parser.add_argument("--complexity-alpha", type=float, default=0.5,
@@ -1266,6 +1318,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--quick-test", action="store_true")
+    parser.add_argument("--exp-name", type=str, default=None,
+                       help="Custom experiment name (default: auto-generated with timestamp)")
     
     args = parser.parse_args()
     
@@ -1399,6 +1453,9 @@ def main():
         # 分割阈值参数
         tau_0=config.split_tau0,
         gamma=config.split_gamma,
+        # P7-7: 可学习分割器温度参数
+        learnable_temperature=config.splitter_temp_start,
+        use_gumbel=True,  # 使用 Gumbel-Softmax 进行可微分采样
     )
     
     # 创建模型 (V3 Variable Depth Tokens)
@@ -1555,7 +1612,8 @@ def main():
     patience_counter = 0
     early_stopped = False
     
-    exp_dir = PROJECT_ROOT / "experiments" / f"fractal_vit_{time.strftime('%Y%m%d_%H%M%S')}"
+    exp_name = args.exp_name if args.exp_name else f"fractal_vit_{time.strftime('%Y%m%d_%H%M%S')}"
+    exp_dir = PROJECT_ROOT / "experiments" / exp_name
     exp_dir.mkdir(parents=True, exist_ok=True)
     (exp_dir / "checkpoints").mkdir(exist_ok=True)
     (exp_dir / "logs").mkdir(exist_ok=True)
@@ -1649,6 +1707,13 @@ def main():
             data_pct = perf_stats['avg_data_time'] / perf_stats['avg_batch_time'] * 100 if perf_stats['avg_batch_time'] > 0 else 0
             fwd_pct = perf_stats['avg_forward_time'] / perf_stats['avg_batch_time'] * 100 if perf_stats['avg_batch_time'] > 0 else 0
             print(f"  Perf:  data={data_pct:.1f}%, fwd={fwd_pct:.1f}%, mem={perf_stats['cuda_mem_peak_gb']:.2f}GB")
+        
+        # P7/P8: 显示可学习分割器状态 (仅 learnable scheme)
+        if perf_stats.get('learnable_thresholds') is not None:
+            thresholds = perf_stats['learnable_thresholds']
+            temperature = perf_stats.get('learnable_temperature', 1.0)
+            tau_str = ", ".join([f"τ{i}:{t:.3f}" for i, t in enumerate(thresholds[:4])])  # 只显示前4层
+            print(f"  Splitter: T={temperature:.3f}, {tau_str}")
         
         # 保存最佳
         if val_acc > best_val + config.min_delta:

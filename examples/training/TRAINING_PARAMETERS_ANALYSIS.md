@@ -1,13 +1,23 @@
 # 🔬 Fractal ViT 训练参数数学形式化分析
 
-> **文档版本**: v2.1 (批判性修订版 + V1 移除)  
-> **更新日期**: 2025-12-27  
+> **文档版本**: v2.2 (对齐 train_fractal_vit.py 修订版)  
+> **更新日期**: 2025-12-28  
 > **目标硬件**: RTX 4070 Laptop (8GB VRAM)  
 > **目标数据集**: Tiny-ImageNet (64×64, 200类, ~100K样本)
 
 ---
 
-## ⚠️ v2.0 批判性修订说明
+## ⚠️ v2.2 修订说明
+
+### v2.2 新增对齐 train_fractal_vit.py
+
+1. **新增 `--exp-name` 参数**：支持自定义实验名称，方便区分不同实验
+2. **新增 `--split-scheme` 选项**：支持 `balanced_greedy`（默认）、`fixed_budget_dp`、`learnable`（可学习分割器 Scheme L）
+3. **新增可学习分割器参数**：`--splitter-temp-start/end/warmup`、`--lambda-splitter-entropy/budget`、`--splitter-token-budget`
+4. **修正废弃参数说明**：`--max-level` 仍然有效，用于模型层级配置
+5. **新增 Scheme L 训练命令示例**
+
+### v2.0 批判性修订说明
 
 v1.0 版本存在以下**关键错误**，已在本版本修正：
 
@@ -509,6 +519,7 @@ $$\boxed{\tau = 1.0}$$
 
 ```powershell
 python examples/training/train_fractal_vit.py `
+    --exp-name tiny-imagenet-baseline `
     --dataset tiny-imagenet `
     --batch-size 128 `
     --epochs 100 `
@@ -518,6 +529,7 @@ python examples/training/train_fractal_vit.py `
     --dim-head 48 `
     --num-scales 3 `
     --tokenizer-type streaming_v3 `
+    --split-scheme balanced_greedy `
     --ffn-type swiglu_level `
     --pool cls `
     --lr 5e-4 `
@@ -538,10 +550,46 @@ python examples/training/train_fractal_vit.py `
     --seed 42
 ```
 
+### 使用可学习分割器 (Scheme L)
+
+```powershell
+python examples/training/train_fractal_vit.py `
+    --exp-name tiny-imagenet-learnable `
+    --dataset tiny-imagenet `
+    --batch-size 128 `
+    --epochs 100 `
+    --dim 384 `
+    --depth 12 `
+    --heads 8 `
+    --dim-head 48 `
+    --num-scales 3 `
+    --tokenizer-type streaming_v3 `
+    --split-scheme learnable `
+    --splitter-temp-start 1.0 `
+    --splitter-temp-end 0.1 `
+    --splitter-temp-warmup 10 `
+    --lambda-splitter-entropy 0.1 `
+    --lambda-splitter-budget 0.01 `
+    --splitter-token-budget 64 `
+    --ffn-type swiglu_level `
+    --pool cls `
+    --lr 5e-4 `
+    --warmup-epochs 10 `
+    --weight-decay 0.05 `
+    --dropout 0.1 `
+    --drop-path 0.15 `
+    --gradient-checkpoint `
+    --compile `
+    --channels-last `
+    --use-amp `
+    --seed 42
+```
+
 ### Bash 格式
 
 ```bash
 python examples/training/train_fractal_vit.py \
+    --exp-name tiny-imagenet-baseline \
     --dataset tiny-imagenet \
     --batch-size 128 \
     --epochs 100 \
@@ -551,6 +599,7 @@ python examples/training/train_fractal_vit.py \
     --dim-head 48 \
     --num-scales 3 \
     --tokenizer-type streaming_v3 \
+    --split-scheme balanced_greedy \
     --ffn-type swiglu_level \
     --pool cls \
     --lr 5e-4 \
@@ -579,16 +628,65 @@ python examples/training/train_fractal_vit.py \
 
 | 参数 | 值 | 数学依据 |
 |------|-----|----------|
+| `--exp-name` | 自定义 | 实验标识符，用于区分不同实验 |
 | `--dim` | 384 | **实测 31.66M**，远超 >20M 需求 |
 | `--depth` | 12 | $12 \times 16.71D^2 \approx 29.6M$ 主导参数 |
 | `--heads` | 8 | $D/d_h = 384/48 = 8$ |
 | `--dim-head` | 48 | 标准配置，每头 48 维 |
-| `--num-scales` | 3 | patch_sizes = (4, 8, 16) |
+| `--num-scales` | 3 | patch_sizes = (4, 8, 16)，对应 max_depth=2 |
 | `--tokenizer-type` | streaming_v3 | Variable Depth Tokens (唯一支持) |
+| `--split-scheme` | balanced_greedy | 默认分割方案 (Scheme B)，可选 learnable (Scheme L) |
 | `--ffn-type` | swiglu_level | SwiGLU + Level Adaptation |
 | `--pool` | cls | CLS token 池化 |
 
-> **注**: Hilbert Bias 模式固定为 `'lca'`（LCA 嵌入表，~408 参数/层），为推荐默认值，无需配置。
+> **注**: 
+> - Hilbert Bias 模式固定为 `'lca'`（LCA 嵌入表，~408 参数/层），为推荐默认值，无需配置。
+> - `--max-level` 参数保留用于模型层级结构配置，默认值 4，根据 image_size 自动推导。
+
+### 7.1.1 分割方案 (Split Schemes)
+
+| 方案 | 参数值 | 描述 | 适用场景 |
+|------|--------|------|----------|
+| **balanced_greedy** | `--split-scheme balanced_greedy` | $C(R) < \tau_d \cdot \gamma^d$ 贪婪分割 | 通用推荐 |
+| **fixed_budget_dp** | `--split-scheme fixed_budget_dp` | 动态规划固定预算 | 需要固定 token 数 |
+| **learnable** | `--split-scheme learnable` | Gumbel-Softmax 端到端学习 | 研究/最优性能 |
+
+### 7.1.2 可学习分割器参数 (Scheme L)
+
+| 参数 | 默认值 | 数学依据 |
+|------|--------|----------|
+| `--splitter-temp-start` | 1.0 | Gumbel-Softmax 起始温度 $T_{start}$ |
+| `--splitter-temp-end` | 0.1 | 退火终止温度 $T_{end}$，趋近离散采样 |
+| `--splitter-temp-warmup` | 10 | Warmup 阶段固定温度轮数 |
+| `--lambda-splitter-entropy` | 0.1 | 熵损失权重，鼓励尺度多样性 |
+| `--lambda-splitter-budget` | 0.01 | 预算约束损失权重 |
+| `--splitter-token-budget` | 64 | 目标 token 预算 $N_{budget}$ |
+
+### 7.1.3 深度缩放参数 (P6-1)
+
+控制不同深度 token 的特征缩放范围：
+
+| 参数 | 默认值 | 数学依据 |
+|------|--------|----------|
+| `--depth-scale-min` | 0.5 | 最小深度缩放 $\sigma_{min}$ |
+| `--depth-scale-max` | 2.0 | 最大深度缩放 $\sigma_{max}$ |
+| `--no-learnable-depth-scale` | False | 禁用可学习缩放 (legacy 模式) |
+
+数学形式：
+$$\sigma_d = \sigma_{min} + (\sigma_{max} - \sigma_{min}) \cdot \frac{d}{D_{max}}$$
+
+### 7.1.4 LCA 温度参数 (P6-2)
+
+控制 LCA Hilbert Bias 的注意力分布锐度：
+
+| 参数 | 默认值 | 数学依据 |
+|------|--------|----------|
+| `--lca-temperature` | 1.5 | LCA 偏置温度 $\tau$，SNR=1.5 |
+| `--no-lca-temperature` | False | 禁用温度缩放 (legacy 模式) |
+| `--fixed-lca-temperature` | False | 使用固定（非可学习）温度 |
+
+数学形式：
+$$\text{Bias}_{LCA} = \frac{\text{Embed}_{LCA}(d_1, d_2)}{\tau}$$
 
 ### 7.2 优化器参数
 
@@ -651,14 +749,16 @@ python examples/training/train_fractal_vit.py \
 
 | 废弃参数 | 替代方案 | 说明 |
 |----------|----------|------|
-| `--max-level` | 自动推导 | 根据 image_size 和 min_patch_size 自动计算，**请勿手动设置** |
-| `--gumbel-tau-*` | 无需配置 | V3 无需温度退火 |
+| `--gumbel-tau-*` | `--splitter-temp-*` | 可学习分割器温度参数已重命名 |
 | `--variable-tokens` | 无需配置 | V3 统一使用 Variable Depth Tokens |
 | `--use-soft-weights` | 无需配置 | V3 内置可微分融合 |
 | `--depth-bias-*` | 无需配置 | V3 不需要深度偏置预热 |
 | `--tokenizer-type streaming_v1` | `streaming_v3` | V1 已移除 |
+| `--tokenizer-type streaming_v2` | `streaming_v3` | V2 已移除 |
 
-> **注意**: V1 (`StreamingFractalTokenizer`) 和 V2 (Gumbel-Softmax) 已从代码库中完全删除，当前仅支持 `streaming_v3`。
+> **注意**: 
+> - V1 (`StreamingFractalTokenizer`) 和 V2 (Gumbel-Softmax 旧版) 已从代码库中完全删除，当前仅支持 `streaming_v3`。
+> - `--max-level` 参数**仍然有效**，用于模型的层级结构配置，默认值 4，一般无需修改。
 
 ---
 
@@ -741,4 +841,4 @@ Token_i = Σ_s α_{i,s} · V_{i,s}
 
 ---
 
-*文档结束 - v2.0 批判性修订版*
+*文档结束 - v2.2 对齐 train_fractal_vit.py 修订版*
