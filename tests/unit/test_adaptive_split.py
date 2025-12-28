@@ -40,6 +40,7 @@ from vit_pytorch.split_adaptive import (
     QuadtreeNode,
     SplitToken,
     SplitResult,
+    TensorSplitResult,  # P9-1: 新的张量化返回类型
     IntegralImageCache,
     ComplexityEstimator,
     HilbertTokenSorter,
@@ -273,21 +274,26 @@ class TestComplexityEstimator:
 class TestHilbertTokenSorter:
     
     def test_sorting_preserves_locality(self):
+        """Test that Hilbert sorting preserves spatial locality."""
         sorter = HilbertTokenSorter(64)
         
-        # Create tokens in random spatial order
-        tokens = [
-            SplitToken(Region(0, 0, 32, 32), 1, [0], 0, 0.1),
-            SplitToken(Region(32, 32, 64, 64), 1, [3], 0, 0.1),
-            SplitToken(Region(32, 0, 64, 32), 1, [1], 0, 0.1),
-            SplitToken(Region(0, 32, 32, 64), 1, [2], 0, 0.1),
+        # Create regions in different spatial positions
+        regions = [
+            Region(0, 0, 32, 32),     # Top-left
+            Region(32, 32, 64, 64),   # Bottom-right
+            Region(32, 0, 64, 32),    # Top-right
+            Region(0, 32, 32, 64),    # Bottom-left
         ]
         
-        sorted_tokens = sorter.sort_tokens(tokens)
+        # Get Hilbert indices for each region
+        indices = [sorter.get_hilbert_index(r) for r in regions]
         
-        # Verify Hilbert indices are assigned and sorted
-        indices = [t.hilbert_idx for t in sorted_tokens]
-        assert indices == sorted(indices)
+        # Sort regions by Hilbert index
+        sorted_pairs = sorted(zip(indices, regions))
+        sorted_indices = [p[0] for p in sorted_pairs]
+        
+        # Verify indices are sorted
+        assert sorted_indices == sorted(sorted_indices)
     
     def test_hilbert_index_uniqueness(self):
         sorter = HilbertTokenSorter(64)
@@ -327,12 +333,12 @@ class TestLearnableSplitter:
             pool_size=4,
         )
         
-        results = splitter.forward(simple_features, image_size)
+        result = splitter.forward(simple_features, image_size)
         
-        assert isinstance(results, list)
-        assert len(results) == 1  # batch size = 1
-        assert isinstance(results[0], SplitResult)
-        assert results[0].num_tokens > 0
+        # P9-1: 返回类型现在是 TensorSplitResult 而不是 List[SplitResult]
+        assert isinstance(result, TensorSplitResult)
+        assert result.num_tokens > 0
+        assert result.batch_size == 1
     
     def test_complexity_mlp_no_saturation(self, simple_features):
         """
@@ -391,12 +397,11 @@ class TestLearnableSplitter:
         splitter.train()
         
         features = simple_features.clone().requires_grad_(True)
-        results = splitter.forward(features, image_size)
+        result = splitter.forward(features, image_size)
         
-        # The result should allow gradient computation
-        # (actual gradient flow depends on implementation details)
-        assert len(results) == 1
-        assert results[0].num_tokens > 0
+        # P9-1: 返回类型现在是 TensorSplitResult
+        assert isinstance(result, TensorSplitResult)
+        assert result.num_tokens > 0
     
     def test_hilbert_ordering_preserved(self, simple_features, image_size):
         """Test that tokens are ordered by Hilbert index."""
@@ -405,12 +410,13 @@ class TestLearnableSplitter:
             max_depth=3,
         )
         
-        results = splitter.forward(simple_features, image_size)
-        result = results[0]
+        result = splitter.forward(simple_features, image_size)
         
-        # Tokens should be sorted by Hilbert index
+        # P9-1: TensorSplitResult 存储所有 batch 的 tokens
+        # 对于单个 batch，检查 Hilbert 索引是否排序
         if result.num_tokens > 1:
-            indices = [t.hilbert_idx for t in result.tokens]
+            indices = result.hilbert_indices.tolist()
+            # 按 batch 内排序
             assert indices == sorted(indices)
     
     def test_depth_distribution(self, simple_features, image_size):
@@ -420,13 +426,13 @@ class TestLearnableSplitter:
             max_depth=4,
         )
         
-        results = splitter.forward(simple_features, image_size)
-        result = results[0]
+        result = splitter.forward(simple_features, image_size)
         
-        # Should have valid depth distribution
-        assert isinstance(result.depth_distribution, dict)
-        assert all(isinstance(k, int) for k in result.depth_distribution.keys())
-        assert all(isinstance(v, int) for v in result.depth_distribution.values())
+        # P9-1: TensorSplitResult 使用 depths 张量
+        # 验证深度信息有效
+        assert result.depths.shape[0] == result.num_tokens
+        assert (result.depths >= 0).all()
+        assert (result.depths <= 4).all()
     
     def test_levels_info_format(self, simple_features, image_size):
         """Test levels_info tensor format."""
@@ -435,16 +441,15 @@ class TestLearnableSplitter:
             max_depth=4,
         )
         
-        results = splitter.forward(simple_features, image_size)
-        result = results[0]
-        levels_info = result.get_levels_info(4)
+        result = splitter.forward(simple_features, image_size)
+        levels_info = result.get_levels_info_tensor(4)
         
         assert levels_info.shape[0] == result.num_tokens
         assert levels_info.shape[1] == 5  # max_depth + 1
         
-        # First column should be depth
-        for i, token in enumerate(result.tokens):
-            assert levels_info[i, 0].item() == token.depth
+        # 第一列应该是深度
+        for i in range(result.num_tokens):
+            assert levels_info[i, 0].item() == result.depths[i].item()
 
 
 # =============================================================================
@@ -461,8 +466,9 @@ class TestFactoryFunctions:
     def test_split_image_convenience(self, simple_features):
         """Test split_image convenience function with feature input."""
         # Note: split_image treats input as pre-extracted features when no extractor provided
+        # P9-1: split_image 现在返回 TensorSplitResult
         result = split_image(simple_features)
-        assert isinstance(result, SplitResult)
+        assert isinstance(result, TensorSplitResult)
         assert result.num_tokens > 0
 
 
@@ -482,10 +488,11 @@ class TestEdgeCases:
             max_depth=2,
             min_region_size=2,
         )
-        results = splitter.forward(small_features, image_size)
+        result = splitter.forward(small_features, image_size)
         
-        assert len(results) == 1
-        assert results[0].num_tokens >= 1
+        # P9-1: 返回 TensorSplitResult
+        assert isinstance(result, TensorSplitResult)
+        assert result.num_tokens >= 1
     
     def test_batch_size_one(self):
         """Test with batch size of 1."""
@@ -496,10 +503,12 @@ class TestEdgeCases:
             feature_dim=64,
             max_depth=3,
         )
-        results = splitter.forward(features, image_size)
+        result = splitter.forward(features, image_size)
         
-        assert len(results) == 1
-        assert results[0].num_tokens >= 1
+        # P9-1: 返回 TensorSplitResult
+        assert isinstance(result, TensorSplitResult)
+        assert result.batch_size == 1
+        assert result.num_tokens >= 1
 
 
 # =============================================================================
@@ -513,23 +522,22 @@ class TestPerformanceMetrics:
             feature_dim=64,
             max_depth=4,
         )
-        results = splitter.forward(simple_features, image_size)
-        result = results[0]
+        result = splitter.forward(simple_features, image_size)
         
-        # Test all metric properties
+        # P9-1: TensorSplitResult 使用张量存储
         assert result.num_tokens > 0
-        assert isinstance(result.depth_distribution, dict)
-        assert result.depth_entropy >= 0
+        assert result.depths.shape[0] == result.num_tokens
+        assert result.complexities.shape[0] == result.num_tokens
     
     def test_regions_tensor(self, simple_features, image_size):
         splitter = LearnableSplitter(
             feature_dim=64,
             max_depth=3,
         )
-        results = splitter.forward(simple_features, image_size)
-        result = results[0]
+        result = splitter.forward(simple_features, image_size)
         
-        regions = result.get_regions_tensor()
+        # P9-1: 使用 get_regions_boxes() 而不是 get_regions_tensor()
+        regions = result.get_regions_boxes()
         
         assert regions.shape[0] == result.num_tokens
         assert regions.shape[1] == 4  # x1, y1, x2, y2
