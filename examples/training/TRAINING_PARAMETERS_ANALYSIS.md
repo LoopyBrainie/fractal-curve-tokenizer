@@ -7,15 +7,24 @@
 
 ---
 
-## ⚠️ v2.2 修订说明
+## ⚠️ v2.3 修订说明
 
-### v2.2 新增对齐 train_fractal_vit.py
+### v2.3 移除已废弃的分割方案
 
-1. **新增 `--exp-name` 参数**：支持自定义实验名称，方便区分不同实验
-2. **新增 `--split-scheme` 选项**：支持 `balanced_greedy`（默认）、`fixed_budget_dp`、`learnable`（可学习分割器 Scheme L）
-3. **新增可学习分割器参数**：`--splitter-temp-start/end/warmup`、`--lambda-splitter-entropy/budget`、`--splitter-token-budget`
-4. **修正废弃参数说明**：`--max-level` 仍然有效，用于模型层级配置
-5. **新增 Scheme L 训练命令示例**
+1. **移除 `--split-scheme` 参数**：Scheme B (balanced_greedy) 和 Scheme C (fixed_budget_dp) 已从代码库移除
+2. **统一使用 LearnableSplitter**：当前仅支持可学习分割器 (Scheme L)
+3. **简化命令行**：移除不必要的分割方案选项
+
+### 为什么移除 Scheme B/C？
+
+数学分析表明 LearnableSplitter 完全覆盖其功能并提供额外优势：
+
+| 特性 | Scheme B/C | LearnableSplitter (Scheme L) |
+|------|------------|-----------------------------|
+| 复杂度估计 | $C(R) = \frac{Var}{Var + \sigma_0^2}$ (饱和) | $C_\theta(R) = \sigma(MLP(ROI(F,R)))$ (无饱和) |
+| 可微分性 | ✗ 离散决策 | ✓ Gumbel-Softmax + STE |
+| 阈值学习 | ✗ 固定 $\tau_d = \tau_0 \cdot \gamma^d$ | ✓ $\tau_d = \tau_{base,d} + \delta_d$ |
+| 复杂度 | O(N·4ᴰ) DP | O(D) BFS |
 
 ### v2.0 批判性修订说明
 
@@ -529,7 +538,6 @@ python examples/training/train_fractal_vit.py `
     --dim-head 48 `
     --num-scales 3 `
     --tokenizer-type streaming_v3 `
-    --split-scheme balanced_greedy `
     --ffn-type swiglu_level `
     --pool cls `
     --lr 5e-4 `
@@ -543,6 +551,9 @@ python examples/training/train_fractal_vit.py `
     --mixup-prob 0.5 `
     --gradient-clip 1.0 `
     --patience 15 `
+    --splitter-temp-start 1.0 `
+    --splitter-temp-end 0.1 `
+    --splitter-temp-warmup 10 `
     --gradient-checkpoint `
     --compile `
     --channels-last `
@@ -550,11 +561,13 @@ python examples/training/train_fractal_vit.py `
     --seed 42
 ```
 
-### 使用可学习分割器 (Scheme L)
+### 可学习分割器高级配置
+
+如果需要调整分割器参数，可以使用以下配置：
 
 ```powershell
 python examples/training/train_fractal_vit.py `
-    --exp-name tiny-imagenet-learnable `
+    --exp-name tiny-imagenet-custom-splitter `
     --dataset tiny-imagenet `
     --batch-size 128 `
     --epochs 100 `
@@ -564,13 +577,12 @@ python examples/training/train_fractal_vit.py `
     --dim-head 48 `
     --num-scales 3 `
     --tokenizer-type streaming_v3 `
-    --split-scheme learnable `
     --splitter-temp-start 1.0 `
-    --splitter-temp-end 0.1 `
-    --splitter-temp-warmup 10 `
-    --lambda-splitter-entropy 0.1 `
-    --lambda-splitter-budget 0.01 `
-    --splitter-token-budget 64 `
+    --splitter-temp-end 0.05 `
+    --splitter-temp-warmup 15 `
+    --lambda-splitter-entropy 0.15 `
+    --lambda-splitter-budget 0.02 `
+    --splitter-token-budget 48 `
     --ffn-type swiglu_level `
     --pool cls `
     --lr 5e-4 `
@@ -599,7 +611,6 @@ python examples/training/train_fractal_vit.py \
     --dim-head 48 \
     --num-scales 3 \
     --tokenizer-type streaming_v3 \
-    --split-scheme balanced_greedy \
     --ffn-type swiglu_level \
     --pool cls \
     --lr 5e-4 \
@@ -613,6 +624,9 @@ python examples/training/train_fractal_vit.py \
     --mixup-prob 0.5 \
     --gradient-clip 1.0 \
     --patience 15 \
+    --splitter-temp-start 1.0 \
+    --splitter-temp-end 0.1 \
+    --splitter-temp-warmup 10 \
     --gradient-checkpoint \
     --compile \
     --channels-last \
@@ -635,23 +649,28 @@ python examples/training/train_fractal_vit.py \
 | `--dim-head` | 48 | 标准配置，每头 48 维 |
 | `--num-scales` | 3 | patch_sizes = (4, 8, 16)，对应 max_depth=2 |
 | `--tokenizer-type` | streaming_v3 | Variable Depth Tokens (唯一支持) |
-| `--split-scheme` | balanced_greedy | 默认分割方案 (Scheme B)，可选 learnable (Scheme L) |
 | `--ffn-type` | swiglu_level | SwiGLU + Level Adaptation |
 | `--pool` | cls | CLS token 池化 |
 
 > **注**: 
 > - Hilbert Bias 模式固定为 `'lca'`（LCA 嵌入表，~408 参数/层），为推荐默认值，无需配置。
 > - `--max-level` 参数保留用于模型层级结构配置，默认值 4，根据 image_size 自动推导。
+> - **分割方案**：当前仅支持 LearnableSplitter (Scheme L)，`--split-scheme` 参数已移除。
 
-### 7.1.1 分割方案 (Split Schemes)
+### 7.1.1 可学习分割器 (LearnableSplitter)
 
-| 方案 | 参数值 | 描述 | 适用场景 |
-|------|--------|------|----------|
-| **balanced_greedy** | `--split-scheme balanced_greedy` | $C(R) < \tau_d \cdot \gamma^d$ 贪婪分割 | 通用推荐 |
-| **fixed_budget_dp** | `--split-scheme fixed_budget_dp` | 动态规划固定预算 | 需要固定 token 数 |
-| **learnable** | `--split-scheme learnable` | Gumbel-Softmax 端到端学习 | 研究/最优性能 |
+当前仅支持 LearnableSplitter，它提供端到端可微分的分割策略：
 
-### 7.1.2 可学习分割器参数 (Scheme L)
+| 特性 | 数学描述 | 优势 |
+|------|----------|------|
+| 复杂度估计 | $C_\theta(R) = \sigma(MLP(ROI\text{-}Align(F, R)))$ | 无饱和问题 |
+| 分割概率 | $p_{split} = \sigma((C_\theta(R) - \tau_d) / T)$ | 可微分决策 |
+| 阈值学习 | $\tau_d = \tau_{base,d} + \delta_d$ | 自适应阈值 |
+| 可微分采样 | Gumbel-Softmax + STE | 端到端梯度流 |
+
+### 7.1.2 可学习分割器参数
+
+这些参数控制 LearnableSplitter 的温度退火和辅助损失：
 
 | 参数 | 默认值 | 数学依据 |
 |------|--------|----------|

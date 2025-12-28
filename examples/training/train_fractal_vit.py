@@ -15,18 +15,21 @@
 
 分割方案 (Split Schemes)
 -------------------------
+LearnableSplitter 是唯一的分割方案（Scheme B/C 已移除）:
+
 +------------------+----------------------------------+-------------------+
-| 方案              | 数学描述                          | 适用场景           |
+| 方案              | 数学描述                          | 特点               |
 +==================+==================================+===================+
-| balanced_greedy  | C(R) < τ_d · γ^d → 停止分割      | 通用 (推荐)        |
-|                  | 强制 2:1 邻接平衡约束             |                   |
-+------------------+----------------------------------+-------------------+
-| fixed_budget_dp  | min Σ Importance(R_i)            | 固定 token 预算    |
-|                  | s.t. |Leaves| = N_budget         |                   |
-+------------------+----------------------------------+-------------------+
 | learnable        | p_split = σ((C_θ(R) - τ_d) / T)  | 端到端学习分割     |
-|                  | Gumbel-Softmax 可微分采样        |                   |
+|                  | Gumbel-Softmax 可微分采样        | 无饱和、可学习阈值  |
 +------------------+----------------------------------+-------------------+
+
+Note: Scheme B (balanced_greedy) 和 Scheme C (fixed_budget_dp) 已移除。
+LearnableSplitter 提供完全覆盖的功能并具有额外优势:
+- 端到端可微分性 (Gumbel-Softmax + STE)
+- 无复杂度饱和 (MLP vs Var/(Var+σ₀²))
+- 可学习阈值: τ_d = τ_{base,d} + δ_d
+- O(D) BFS 复杂度 vs O(N·4^D) DP
 
 特性：
 1. StreamingFractalTokenizerV3：Variable Depth Tokens 自适应多尺度
@@ -47,9 +50,9 @@
         --depth 12 --heads 8 --dropout 0.1 --drop-path 0.15 --use-amp \\
         --gradient-checkpoint --compile --channels-last
     
-    # 使用可学习分割器
-    python train_fractal_vit.py --dataset tiny-imagenet --split-scheme learnable \\
-        --splitter-temp-start 1.0 --splitter-temp-end 0.1
+    # 可学习分割器温度退火调度 (默认已启用)
+    python train_fractal_vit.py --dataset tiny-imagenet --epochs 100 \\
+        --splitter-temp-start 1.0 --splitter-temp-end 0.1 --splitter-temp-warmup 5
 
 注意：V1 和 V2 已从代码库中完全删除，当前仅支持 streaming_v3。
 """
@@ -203,14 +206,11 @@ class TrainingConfig:
     # Tokenizer 配置 (V3 Variable Depth Tokens)
     tokenizer_type: str  # 'streaming_v3' (唯一支持)
     
-    # V3 高级分割参数 (Adaptive Quadtree Split)
-    split_scheme: str  # 'balanced_greedy' 或 'fixed_budget_dp'
+    # V3 高级分割参数 (LearnableSplitter - Scheme B/C 已移除)
     target_tokens: Optional[int]  # 目标 token 数量
-    complexity_alpha: float  # 复杂度函数方差权重 α ∈ [0,1]
     split_tau0: float  # 根节点阈值 τ₀
     split_gamma: float  # 阈值衰减因子 γ
     enforce_balance: bool  # 是否强制 2:1 平衡约束
-    domain_preset: Optional[str]  # 域适应预设
     
     # P6-1: 深度缩放参数
     depth_scale_range: Optional[Tuple[float, float]]  # (σ_min, σ_max)，默认 (0.5, 2.0)
@@ -1232,24 +1232,16 @@ def main():
                        choices=["streaming_v3"],
                        help="Tokenizer type: streaming_v3 (Variable Depth Tokens, only supported)")
     
-    # V3 Tokenizer 高级参数 (Adaptive Quadtree Split)
-    parser.add_argument("--split-scheme", type=str, default="balanced_greedy",
-                       choices=["balanced_greedy", "fixed_budget_dp", "learnable"],
-                       help="Split scheme: balanced_greedy (Scheme B), fixed_budget_dp (Scheme C), or learnable (Scheme L)")
+    # V3 Tokenizer 高级参数 (LearnableSplitter - Scheme B/C 已移除)
     parser.add_argument("--target-tokens", type=int, default=None,
                        help="Target token count per image (None = adaptive)")
-    parser.add_argument("--complexity-alpha", type=float, default=0.5,
-                       help="Complexity function variance weight alpha in [0,1] (0.5 = balanced)")
     parser.add_argument("--split-tau0", type=float, default=0.15,
                        help="Root threshold tau_0 for adaptive splitting")
     parser.add_argument("--split-gamma", type=float, default=0.85,
                        help="Threshold decay factor gamma in (0,1) per depth")
     parser.add_argument("--enforce-balance", action="store_true", default=True,
-                       help="Enforce 2:1 balance constraint in balanced_greedy")
+                       help="Enforce 2:1 balance constraint")
     parser.add_argument("--no-enforce-balance", action="store_false", dest="enforce_balance")
-    parser.add_argument("--domain-preset", type=str, default=None,
-                       choices=["natural", "medical", "satellite", "document"],
-                       help="Use domain-specific preset for split parameters")
     
     # P6-1: 深度缩放参数
     parser.add_argument("--depth-scale-min", type=float, default=0.5,
@@ -1366,14 +1358,11 @@ def main():
         hilbert_bias_mode=args.hilbert_bias_mode,
         # Tokenizer 配置 (V3)
         tokenizer_type=args.tokenizer_type,
-        # V3 高级分割参数
-        split_scheme=args.split_scheme,
+        # V3 高级分割参数 (LearnableSplitter only)
         target_tokens=args.target_tokens,
-        complexity_alpha=args.complexity_alpha,
         split_tau0=args.split_tau0,
         split_gamma=args.split_gamma,
         enforce_balance=args.enforce_balance,
-        domain_preset=args.domain_preset,
         # P6-1: 深度缩放配置
         depth_scale_range=(args.depth_scale_min, args.depth_scale_max) if not args.no_learnable_depth_scale else None,
         # P6-2: LCA 温度配置
@@ -1411,31 +1400,8 @@ def main():
         device=str(device),
     )
     
-    # 创建自定义 Tokenizer (支持高级分割参数)
+    # 创建 Tokenizer (仅支持 LearnableSplitter)
     from vit_pytorch.tokenizer_streaming import StreamingFractalTokenizerV3
-    from vit_pytorch.split_adaptive import AdaptiveSplitConfig, SplitScheme
-    
-    # 域适应预设
-    split_kwargs: Dict[str, Any] = {
-        'max_depth': config.num_scales - 1,
-        'alpha': config.complexity_alpha,
-        'tau_0': config.split_tau0,
-        'gamma': config.split_gamma,
-        'enforce_balance': config.enforce_balance,
-        'target_tokens': config.target_tokens,
-    }
-    
-    if config.domain_preset:
-        preset_map = {
-            'natural': AdaptiveSplitConfig.natural_images,
-            'medical': AdaptiveSplitConfig.medical_images,
-            'satellite': AdaptiveSplitConfig.satellite_images,
-            'document': AdaptiveSplitConfig.document_images,
-        }
-        if config.domain_preset in preset_map:
-            split_config = preset_map[config.domain_preset](**split_kwargs)
-            print(f"[OK] Using domain preset: {config.domain_preset}")
-            print(f"     sigma_0^2={split_config.sigma_0_sq:.4f}, g_0^2={split_config.g_0_sq:.4f}, alpha={split_config.alpha:.2f}")
     
     tokenizer = StreamingFractalTokenizerV3(
         image_size=max(spec.image_size, 32),
@@ -1444,9 +1410,7 @@ def main():
         base_patch_size=4,
         max_depth=config.num_scales - 1,
         use_hilbert_order=True,
-        split_scheme=config.split_scheme,
         target_tokens=config.target_tokens,
-        complexity_alpha=config.complexity_alpha,
         enforce_balance=config.enforce_balance,
         # P6-1: 深度缩放配置
         depth_scale_range=config.depth_scale_range,
@@ -1490,7 +1454,7 @@ def main():
     
     # 打印模型信息
     params = sum(p.numel() for p in model.parameters())
-    split_info = f"{config.split_scheme}"
+    split_info = "LearnableSplitter"
     if config.target_tokens:
         split_info += f", target={config.target_tokens}"
     tokenizer_name = f'StreamingFractalTokenizerV3 ({split_info})'
