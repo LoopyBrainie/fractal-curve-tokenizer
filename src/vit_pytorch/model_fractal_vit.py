@@ -288,6 +288,10 @@ class FractalCurveViT(nn.Module):
         
         数学形式化：
             T, L = S(I) where N varies per image in variable_tokens mode
+            
+        P9-5 优化：
+            原实现: O(B) Python 循环进行 padding
+            新实现: 使用 TokenizerOutput 的预填充缓存，O(1) 张量操作
         
         Args:
             img: 输入图像 [B, C, H, W]
@@ -299,50 +303,14 @@ class FractalCurveViT(nn.Module):
             - lengths: 每个样本的实际 token 数量
             - levels_list: 原始层级列表（用于辅助输出）
         """
-        batch_size = img.shape[0]
-        device = img.device
-
         # Streaming tokenizer 直接输出 D-dim embeddings
         token_output = self.tokenizer.tokenize(img)
         
-        # 使用 TokenizerOutput 的标准方法获取数据
-        tokens_list = token_output.tokens_list()   # List[Tensor[N_i, D]]
-        levels_raw = token_output.levels_list()    # List[Tensor[N_i, info_len]]
-        
-        # 获取每个样本的实际 token 数量
-        lengths = [t.shape[0] for t in tokens_list]
-        max_len = max(lengths)
-        
-        # 使用 pad_sequence 处理可变长度 tokens
-        # pad_sequence 默认 batch_first=False，需要转置
-        padded_tokens = torch.nn.utils.rnn.pad_sequence(
-            tokens_list, batch_first=True, padding_value=0.0
-        )  # [B, MaxN, D]
-        
-        # 构建 level info
+        # P9-5 优化: 使用预填充缓存接口，避免 O(B) Python 循环
         info_dim = self.max_level + 4
-        if levels_raw[0].dim() == 1:
-            # 如果是 1D，需要扩展并 padding
-            padded_levels = torch.zeros(
-                batch_size, max_len, info_dim,
-                dtype=torch.long, device=device
-            )
-            for i, lv in enumerate(levels_raw):
-                n = lv.shape[0]
-                padded_levels[i, :n, 0] = lv
-        else:
-            # 已经是 2D [N_i, info_len]，需要 padding
-            padded_levels = torch.zeros(
-                batch_size, max_len, info_dim,
-                dtype=torch.long, device=device
-            )
-            for i, lv in enumerate(levels_raw):
-                n = lv.shape[0]
-                info_len = lv.shape[1]
-                copy_len = min(info_len, info_dim)
-                padded_levels[i, :n, :copy_len] = lv[:, :copy_len]
-        
-        levels_list = levels_raw
+        padded_tokens, lengths = token_output.get_padded_tokens()
+        padded_levels = token_output.get_padded_levels(info_dim)
+        levels_list = token_output.levels_list()
         
         return padded_tokens, padded_levels, lengths, levels_list
 

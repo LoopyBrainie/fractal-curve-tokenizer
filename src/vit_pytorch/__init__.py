@@ -81,6 +81,7 @@ from .split_adaptive import (
     TemperatureScheduler,
     LearnableSplitter,
     SplitScheme,
+    TensorSplitResult,  # P9-1: 纯张量分割结果
 )
 
 
@@ -126,9 +127,10 @@ __all__ = [
     "get_quadrant_order",
     "hilbert_distance_to_xy",
     "xy_to_hilbert_distance",
-    # === 分割器 (P7/P8) ===
+    # === 分割器 (P7/P8/P9) ===
     "AdaptiveSplitConfig",
     "TemperatureScheduler",
     "LearnableSplitter",
-    "SplitScheme",  # Note: Only LEARNABLE scheme remains after B/C removal
+    "SplitScheme",
+    "TensorSplitResult",  # P9-1: 完全向量化分割结果
 ]

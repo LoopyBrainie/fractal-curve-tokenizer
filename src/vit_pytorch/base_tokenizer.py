@@ -69,8 +69,15 @@ class TokenizerOutput:
     提供便捷属性访问堆叠的 tokens 和 levels_info，
     同时保持对底层 TokenSequence 列表的完整访问。
     
+    P9-5 优化: 支持预填充缓存，避免重复 padding 操作。
+    当 Tokenizer 内部已经有 padding 后的张量时，可直接传入缓存，
+    消除 model._prepare_tokens 中的 O(B) Python 循环。
+    
     Attributes:
         sequences: 各样本的 TokenSequence 列表
+        _padded_tokens_cache: 预填充的 tokens [B, MaxN, D] (可选缓存)
+        _padded_levels_cache: 预填充的 levels [B, MaxN, info_dim] (可选缓存)
+        _lengths_cache: 每个样本的实际 token 数量 [B] (可选缓存)
         
     Properties:
         tokens: 堆叠的 tokens [B, N, D]（假设所有样本 token 数量相同）
@@ -78,6 +85,9 @@ class TokenizerOutput:
         batch_size: 批次大小
     """
     sequences: List[TokenSequence]
+    _padded_tokens_cache: Optional[torch.Tensor] = field(default=None, repr=False)
+    _padded_levels_cache: Optional[torch.Tensor] = field(default=None, repr=False)
+    _lengths_cache: Optional[List[int]] = field(default=None, repr=False)
 
     def __iter__(self) -> Iterator[TokenSequence]:
         return iter(self.sequences)
@@ -153,6 +163,69 @@ class TokenizerOutput:
 
     def tokens_list(self) -> List[torch.Tensor]:
         return [seq.tokens for seq in self.sequences]
+
+    def get_padded_tokens(self) -> Tuple[torch.Tensor, List[int]]:
+        """获取预填充的 tokens 和长度列表 (P9-5 优化).
+        
+        如果有缓存，直接返回缓存的张量，避免重复 padding。
+        否则使用 pad_sequence 进行填充。
+        
+        Returns:
+            (padded_tokens, lengths):
+            - padded_tokens: [B, MaxN, D] 填充后的 tokens
+            - lengths: 每个样本的实际 token 数量列表
+        """
+        if self._padded_tokens_cache is not None and self._lengths_cache is not None:
+            return self._padded_tokens_cache, self._lengths_cache
+        
+        # 回退: 使用 pad_sequence
+        tokens_list = self.tokens_list()
+        lengths = [t.shape[0] for t in tokens_list]
+        padded_tokens = torch.nn.utils.rnn.pad_sequence(
+            tokens_list, batch_first=True, padding_value=0.0
+        )
+        return padded_tokens, lengths
+
+    def get_padded_levels(self, info_dim: int) -> torch.Tensor:
+        """获取预填充的 levels 信息 (P9-5 优化).
+        
+        如果有缓存，直接返回缓存的张量，避免 O(B) Python 循环。
+        否则回退到标准 padding 逻辑。
+        
+        Args:
+            info_dim: 目标 info 维度 (通常是 max_level + 4)
+            
+        Returns:
+            padded_levels: [B, MaxN, info_dim] 填充后的 levels
+        """
+        if self._padded_levels_cache is not None:
+            cache = self._padded_levels_cache
+            # 检查是否需要扩展 info_dim
+            if cache.shape[2] >= info_dim:
+                return cache[:, :, :info_dim]
+            else:
+                # 需要扩展
+                B, MaxN, _ = cache.shape
+                device = cache.device
+                padded = torch.zeros(B, MaxN, info_dim, dtype=torch.long, device=device)
+                padded[:, :, :cache.shape[2]] = cache
+                return padded
+        
+        # 回退: 使用 levels_info 属性 (包含 Python 循环)
+        levels = self.levels_info
+        if levels is None:
+            B = len(self.sequences)
+            device = self.sequences[0].device if B > 0 else torch.device('cpu')
+            return torch.zeros(B, 1, info_dim, dtype=torch.long, device=device)
+        
+        if levels.shape[2] >= info_dim:
+            return levels[:, :, :info_dim]
+        else:
+            B, MaxN, _ = levels.shape
+            device = levels.device
+            padded = torch.zeros(B, MaxN, info_dim, dtype=torch.long, device=device)
+            padded[:, :, :levels.shape[2]] = levels
+            return padded
 
     def levels_list(self) -> List[torch.Tensor]:
         result: List[torch.Tensor] = []
