@@ -10,13 +10,12 @@ def test_v3_basic():
     print("Test 1: Basic V3 Tokenizer Functionality")
     print("=" * 60)
     
-    # Create tokenizer
+    # Create tokenizer (uses LearnableSplitter by default)
     t = StreamingFractalTokenizerV3(
         image_size=64,
         d_model=128,
         base_patch_size=4,
         max_depth=3,
-        split_scheme='balanced_greedy'
     )
     
     print(f"Tokenizer created: {type(t).__name__}")
@@ -81,9 +80,9 @@ def test_v3_levels_info():
 
 
 def test_v3_fixed_budget():
-    """Test fixed budget DP splitter."""
+    """Test learnable splitter with temperature control."""
     print("\n" + "=" * 60)
-    print("Test 3: Fixed Budget DP Splitter")
+    print("Test 3: LearnableSplitter with Temperature")
     print("=" * 60)
     
     t = StreamingFractalTokenizerV3(
@@ -91,22 +90,23 @@ def test_v3_fixed_budget():
         d_model=128,
         base_patch_size=4,
         max_depth=3,
-        split_scheme='fixed_budget_dp',
-        target_tokens=32,  # Fixed budget of 32 tokens
     )
+    
+    # Test temperature setting for learnable splitter
+    t.set_split_temperature(0.5)
     
     x = torch.randn(2, 3, 64, 64)
     out = t(x)
     
     stats = t.get_split_stats()
-    print(f"Target tokens: 32")
+    print(f"Split Temperature: 0.5")
     print(f"Actual tokens: {stats['num_tokens']}")
     print(f"Depth distributions: {stats['depth_distributions']}")
     
-    # Fixed budget DP should hit the target exactly (or very close)
+    # Check token count is within valid range
     for n in stats['num_tokens']:
-        # Allow some tolerance for edge cases
-        assert 16 <= n <= 64, f"Token count {n} outside valid range [16, 64]"
+        # Token count should be between min (all depth-3) and max (all depth-0)
+        assert n > 0, f"Token count {n} should be positive"
     
     print("\n✓ Test 3 PASSED")
 

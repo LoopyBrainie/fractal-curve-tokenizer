@@ -3,12 +3,26 @@
 StreamingFractalTokenizerV3 可学习分割集成测试
 
 测试用例:
-    1. 规则分割 (balanced_greedy) 基线
-    2. 可学习分割 (learnable) 功能验证
-    3. 梯度流验证 (端到端)
-    4. 辅助损失计算
-    5. 温度退火调度
-    6. 训练/推理模式切换
+    1. LearnableSplitter 初始化与前向传播
+    2. 梯度流验证 (端到端)
+    3. 辅助损失计算
+    4. 温度退火调度
+    5. 训练/推理模式切换
+
+Mathematical Note:
+==================
+Scheme B (BalancedGreedySplitter) 和 Scheme C (FixedBudgetDPSplitter)
+已从代码库中移除。LearnableSplitter 现在是唯一的分割器，提供:
+
+1. 端到端可微分性 (Gumbel-Softmax + STE):
+   P(split | R) = softmax((logits + G) / τ), G ~ Gumbel(0, 1)
+
+2. 无复杂度饱和 (MLP vs 方差公式):
+   C_θ(R) = σ(MLP(ROI-Align(F, R))) 代替 C(R) = Var/(Var+σ₀²)
+
+3. 可学习阈值: τ_d = τ_{base,d} + δ_d
+
+4. O(D) BFS 复杂度 vs O(N·4^D) DP
 """
 
 import pytest
@@ -19,50 +33,8 @@ from vit_pytorch import StreamingFractalTokenizerV3
 from vit_pytorch.split_adaptive import LearnableSplitter
 
 
-class TestV3RuleBased:
-    """规则分割测试组."""
-    
-    def test_balanced_greedy_basic(self):
-        """测试 balanced_greedy 基本功能."""
-        v3 = StreamingFractalTokenizerV3(
-            image_size=64,
-            d_model=128,
-            base_patch_size=4,
-            max_depth=3,
-            split_scheme='balanced_greedy',
-        )
-        
-        images = torch.randn(2, 3, 64, 64)
-        output = v3.tokenize(images)
-        
-        assert len(output.sequences) == 2
-        for seq in output.sequences:
-            # balanced_greedy 通常产生多个 token
-            assert len(seq.tokens) >= 1
-            assert seq.tokens.shape[-1] == 128  # d_model
-    
-    def test_fixed_budget_dp_basic(self):
-        """测试 fixed_budget_dp 基本功能."""
-        v3 = StreamingFractalTokenizerV3(
-            image_size=64,
-            d_model=128,
-            base_patch_size=4,
-            max_depth=3,
-            split_scheme='fixed_budget_dp',
-            target_tokens=16,
-        )
-        
-        images = torch.randn(2, 3, 64, 64)
-        output = v3.tokenize(images)
-        
-        assert len(output.sequences) == 2
-        for seq in output.sequences:
-            # DP 方法严格遵守预算
-            assert len(seq.tokens) <= 16
-
-
 class TestV3Learnable:
-    """可学习分割测试组."""
+    """可学习分割测试组 (现在是唯一的分割方式)."""
     
     def test_learnable_init(self):
         """测试可学习分割器初始化."""
@@ -71,15 +43,17 @@ class TestV3Learnable:
             d_model=128,
             base_patch_size=4,
             max_depth=3,
-            split_scheme='learnable',
         )
         
-        # 验证 splitter 类型
+        # 验证 splitter 类型 (应该总是 LearnableSplitter)
         assert isinstance(v3.splitter, LearnableSplitter)
         
         # 验证 shared_conv 属性
         assert hasattr(v3, 'shared_conv')
         assert isinstance(v3.shared_conv, nn.Module)
+        
+        # 验证 _use_learnable_split 始终为 True
+        assert v3._use_learnable_split is True
     
     def test_learnable_forward(self):
         """测试可学习分割前向传播."""
@@ -88,7 +62,6 @@ class TestV3Learnable:
             d_model=128,
             base_patch_size=4,
             max_depth=3,
-            split_scheme='learnable',
         )
         v3.train()
         
@@ -107,7 +80,6 @@ class TestV3Learnable:
             d_model=128,
             base_patch_size=4,
             max_depth=3,
-            split_scheme='learnable',
         )
         v3.train()
         
@@ -136,17 +108,12 @@ class TestV3GradientFlow:
             L_barrier = λ · Σ[ReLU(τ_min - τ)² + ReLU(τ - τ_max)²]
             
             梯度: ∂L_barrier/∂offset = ∂L_barrier/∂τ · ∂τ/∂offset = ∂L_barrier/∂τ · 1
-            
-        注意:
-            由于分割决策是离散的 (采样)，直接的 token 损失无法传播梯度到
-            SharedConv。这需要 P-GRAD-1 的直通估计器来解决。
         """
         v3 = StreamingFractalTokenizerV3(
             image_size=64,
             d_model=128,
             base_patch_size=4,
             max_depth=3,
-            split_scheme='learnable',
         )
         v3.train()
         
@@ -159,10 +126,6 @@ class TestV3GradientFlow:
         
         # threshold_offsets 应有梯度
         assert v3.splitter.threshold_offsets.grad is not None
-        # 对于接近边界的阈值，梯度可能为 0；对于超出边界的，梯度非 0
-        # 初始 tau_bases 约为 [0.3, 0.18, 0.11, 0.07]，加上 0.5 后约 [0.8, 0.68, 0.61, 0.57]
-        # 全部在 [0, 1] 内，barrier loss = 0，梯度为 0
-        # 需要更大的 offset 来测试
         
     def test_gradient_through_barrier_loss(self):
         """测试超出边界时 barrier loss 提供梯度."""
@@ -171,7 +134,6 @@ class TestV3GradientFlow:
             d_model=128,
             base_patch_size=4,
             max_depth=3,
-            split_scheme='learnable',
         )
         v3.train()
         
@@ -190,7 +152,6 @@ class TestV3GradientFlow:
         """测试梯度通过辅助损失流向 MLP 参数.
         
         数学分析:
-            由于分割决策是离散的，直接的 token 损失无法传播梯度到 MLP。
             辅助损失 (如 threshold regularization, depth loss) 提供
             可微分的梯度路径:
             
@@ -202,14 +163,13 @@ class TestV3GradientFlow:
             d_model=128,
             base_patch_size=4,
             max_depth=3,
-            split_scheme='learnable',
         )
         v3.train()
         
         images = torch.randn(2, 3, 64, 64)
         _ = v3.tokenize(images)
         
-        # 使用辅助损失而非直接的 token 损失
+        # 使用辅助损失
         aux_loss = v3.get_learnable_split_loss(
             lambda_entropy=0.1,
             lambda_budget=0.01,
@@ -221,9 +181,6 @@ class TestV3GradientFlow:
         
         # 阈值参数应有梯度 (来自正则化项)
         assert v3.splitter.threshold_offsets.grad is not None
-        
-        # 注意: MLP 梯度取决于 depth_loss 的实现
-        # 如果 depth_loss 使用预计算的特征进行复杂度计算，则 MLP 有梯度
     
     def test_gradient_through_regularization(self):
         """测试阈值正则化提供梯度."""
@@ -232,7 +189,6 @@ class TestV3GradientFlow:
             d_model=128,
             base_patch_size=4,
             max_depth=3,
-            split_scheme='learnable',
         )
         v3.train()
         
@@ -254,7 +210,6 @@ class TestV3AuxiliaryLoss:
             d_model=128,
             base_patch_size=4,
             max_depth=3,
-            split_scheme='learnable',
         )
         v3.train()
         
@@ -271,22 +226,6 @@ class TestV3AuxiliaryLoss:
         assert loss.requires_grad
         assert loss.item() >= 0
     
-    def test_split_loss_none_for_rule_based(self):
-        """测试规则分割器返回 None 损失."""
-        v3 = StreamingFractalTokenizerV3(
-            image_size=64,
-            d_model=128,
-            base_patch_size=4,
-            max_depth=3,
-            split_scheme='balanced_greedy',
-        )
-        
-        images = torch.randn(2, 3, 64, 64)
-        _ = v3.tokenize(images)
-        
-        loss = v3.get_learnable_split_loss()
-        assert loss is None
-    
     def test_scale_entropy(self):
         """测试尺度熵计算."""
         v3 = StreamingFractalTokenizerV3(
@@ -294,7 +233,6 @@ class TestV3AuxiliaryLoss:
             d_model=128,
             base_patch_size=4,
             max_depth=3,
-            split_scheme='learnable',
         )
         v3.train()
         
@@ -316,7 +254,6 @@ class TestV3TemperatureAnnealing:
             d_model=128,
             base_patch_size=4,
             max_depth=3,
-            split_scheme='learnable',
             learnable_temperature=1.0,
         )
         
@@ -338,7 +275,6 @@ class TestV3TemperatureAnnealing:
             d_model=128,
             base_patch_size=4,
             max_depth=3,
-            split_scheme='learnable',
             learnable_temperature=5.0,
         )
         v3_high_temp.train()
@@ -348,7 +284,6 @@ class TestV3TemperatureAnnealing:
             d_model=128,
             base_patch_size=4,
             max_depth=3,
-            split_scheme='learnable',
             learnable_temperature=0.1,
         )
         v3_low_temp.train()
@@ -376,7 +311,6 @@ class TestV3TrainEvalMode:
             d_model=128,
             base_patch_size=4,
             max_depth=3,
-            split_scheme='learnable',
         )
         v3.train()
         
@@ -397,7 +331,6 @@ class TestV3TrainEvalMode:
             d_model=128,
             base_patch_size=4,
             max_depth=3,
-            split_scheme='learnable',
         )
         v3.eval()
         
@@ -408,27 +341,17 @@ class TestV3TrainEvalMode:
         assert len(output.sequences[0].tokens) >= 1
 
 
-class TestV3BackwardCompatibility:
-    """向后兼容性测试组."""
+class TestV3API:
+    """API 测试组."""
     
-    def test_default_scheme_is_balanced_greedy(self):
-        """测试默认分割方案是 balanced_greedy."""
+    def test_api_methods_exist(self):
+        """测试所有必要的 API 方法存在."""
         v3 = StreamingFractalTokenizerV3(
             image_size=64,
             d_model=128,
         )
         
-        assert v3.split_scheme == 'balanced_greedy'
-        assert not v3._use_learnable_split
-    
-    def test_api_compatibility(self):
-        """测试 API 向后兼容."""
-        v3 = StreamingFractalTokenizerV3(
-            image_size=64,
-            d_model=128,
-        )
-        
-        # 所有旧 API 应该存在
+        # 核心 API 应该存在
         assert hasattr(v3, 'tokenize')
         assert hasattr(v3, 'forward')
         assert hasattr(v3, 'get_split_stats')
@@ -436,6 +359,80 @@ class TestV3BackwardCompatibility:
         assert hasattr(v3, 'get_scale_entropy')
         assert hasattr(v3, 'compute_scale_distribution')
         assert hasattr(v3, 'get_training_stats')
+        assert hasattr(v3, 'get_learnable_split_loss')
+        assert hasattr(v3, 'set_split_temperature')
+    
+    def test_always_uses_learnable_splitter(self):
+        """测试始终使用 LearnableSplitter (Scheme B/C 已移除)."""
+        v3 = StreamingFractalTokenizerV3(
+            image_size=64,
+            d_model=128,
+        )
+        
+        # 应该总是使用 LearnableSplitter
+        assert v3._use_learnable_split is True
+        assert isinstance(v3.splitter, LearnableSplitter)
+
+
+class TestV3MathematicalProperties:
+    """数学性质测试组."""
+    
+    def test_complexity_mlp_no_saturation(self):
+        """验证 MLP 复杂度估计不饱和.
+        
+        数学对比:
+        - Scheme B: C(R) = Var/(Var+σ₀²) → 1 as Var → ∞ (饱和)
+        - Scheme L: C_θ(R) = σ(MLP(features)) (无饱和，可学习)
+        """
+        v3 = StreamingFractalTokenizerV3(
+            image_size=64,
+            d_model=128,
+            base_patch_size=4,
+            max_depth=3,
+        )
+        
+        # LearnableSplitter 应有 complexity_mlp
+        assert hasattr(v3.splitter, 'complexity_mlp')
+        assert isinstance(v3.splitter.complexity_mlp, nn.Module)
+    
+    def test_learnable_thresholds(self):
+        """验证阈值是可学习参数.
+        
+        数学公式: τ_d = τ_{base,d} + δ_d
+        其中 δ_d 是可学习的。
+        """
+        v3 = StreamingFractalTokenizerV3(
+            image_size=64,
+            d_model=128,
+            base_patch_size=4,
+            max_depth=4,
+        )
+        
+        # 应有 threshold_offsets 参数
+        assert hasattr(v3.splitter, 'threshold_offsets')
+        assert isinstance(v3.splitter.threshold_offsets, nn.Parameter)
+        
+        # 应有 max_depth + 1 个阈值
+        assert v3.splitter.threshold_offsets.shape[0] == 5
+    
+    def test_depth_entropy_computed(self):
+        """验证深度熵正确计算."""
+        v3 = StreamingFractalTokenizerV3(
+            image_size=64,
+            d_model=128,
+            base_patch_size=4,
+            max_depth=3,
+        )
+        v3.eval()
+        
+        images = torch.randn(1, 3, 64, 64)
+        with torch.no_grad():
+            output = v3.tokenize(images)
+        
+        # 检查 split stats
+        stats = v3.get_split_stats()
+        assert 'depth_entropy' in stats
+        assert stats['depth_entropy'] >= 0
 
 
 if __name__ == '__main__':
