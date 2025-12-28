@@ -29,8 +29,7 @@ Hilbert 曲线策略 (自动选择):
 
 Tokenizer 类型:
     - 'streaming_v1': 基础单尺度 tokenizer
-    - 'streaming_v2': Gumbel-Softmax 自适应 (已弃用)
-    - 'streaming_v3': Cross-Scale Attention 自适应 (推荐)
+    - 'streaming_v3': LearnableSplitter 自适应分割 (推荐)
 
 Hilbert Bias 模式:
     - 'lca': LCA 嵌入 (~36 参数，推荐)
@@ -59,8 +58,8 @@ from typing import Literal, Tuple
 
 # 类型别名
 BiasMode = Literal['original', 'low_rank', 'hierarchical', 'lca']
-AnnealSchedule = Literal['linear', 'exponential', 'cosine']
-TokenizerType = Literal['streaming_v1', 'streaming_v3']
+AnnealSchedule = Literal['linear', 'exponential', 'cosine']  # 温度退火调度类型
+TokenizerType = Literal['streaming_v1', 'streaming_v3']  # streaming_v2 已移除
 
 
 @dataclass
@@ -79,8 +78,14 @@ class FractalConfig:
         
     Tokenizer 配置:
         tokenizer_type: tokenizer 类型
-            - 'streaming_v3': Variable Depth Tokens (推荐，默认)
+            - 'streaming_v3': LearnableSplitter 自适应分割 (推荐，默认)
             - 'streaming_v1': 单尺度基础版
+        
+    LearnableSplitter 配置 (streaming_v3):
+        分割器使用 Gumbel-Softmax + STE 实现端到端可微分:
+        - temperature: Gumbel-Softmax 温度 T (建议 1.0 → 0.1 退火)
+        - init_tau_base: 初始基础阈值 = 0.5 (中心初始化)
+        - gamma: 阈值衰减因子 γ = 0.85
         
     Hilbert Bias 配置:
         hilbert_bias_mode: 偏置计算模式
@@ -227,15 +232,14 @@ def create_fractal_config(
         # 基础配置
         config = create_fractal_config(64, 4)
         
-        # 自定义 Gumbel 温度
+        # 自定义 Hilbert 偏置模式
         config = create_fractal_config(
             64, 4,
-            gumbel_tau_init=1.0,
-            gumbel_tau_min=0.3,
-            gumbel_anneal_schedule='exponential'
+            hilbert_bias_mode='lca',
+            low_rank_r=32,
         )
         
-        # 启用可变 token
-        config = create_fractal_config(64, 4, variable_tokens=True)
+        # 使用基础 tokenizer
+        config = create_fractal_config(64, 4, tokenizer_type='streaming_v1')
     """
     return FractalConfig(image_size, min_patch_size, **kwargs)

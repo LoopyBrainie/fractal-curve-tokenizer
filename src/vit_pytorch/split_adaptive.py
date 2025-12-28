@@ -47,10 +47,15 @@ from .curve_hilbert import HilbertCurve
 # =============================================================================
 
 class SplitScheme(Enum):
-    """Available splitting schemes."""
-    BALANCED_GREEDY = "balanced_greedy"  # Scheme B
-    FIXED_BUDGET_DP = "fixed_budget_dp"  # Scheme C
-    LEARNABLE = "learnable"  # Scheme L (P7-1/P7-2/P7-3)
+    """Available splitting schemes.
+    
+    注意: Scheme B (BalancedGreedy) 和 Scheme C (FixedBudgetDP) 已被移除。
+    数学分析表明 LearnableSplitter 完全覆盖其功能并提供以下优势:
+    - 端到端可微分训练
+    - 无复杂度饱和问题
+    - 自适应阈值学习
+    """
+    LEARNABLE = "learnable"  # Scheme L (可学习分割器)
 
 
 @dataclass
@@ -139,30 +144,19 @@ class AdaptiveSplitConfig:
     
     # === Scheme Selection ===
     
-    scheme: SplitScheme = SplitScheme.BALANCED_GREEDY
-    """Which splitting scheme to use"""
+    scheme: SplitScheme = SplitScheme.LEARNABLE
+    """Splitting scheme (仅支持 LEARNABLE)"""
     
-    # === Scheme B Specific Parameters ===
+    # === Scheme L Specific Parameters ===
     
     enforce_balance: bool = True
     """Whether to enforce 2:1 balance constraint"""
-    
-    max_balance_iterations: int = 10
-    """Maximum iterations for balance refinement"""
     
     target_tokens: Optional[int] = None
     """Soft target for token count (None = no constraint)"""
     
     token_penalty_weight: float = 0.01
     """Weight for token count deviation penalty"""
-    
-    # === Scheme C Specific Parameters ===
-    
-    token_budget: int = 64
-    """Fixed token budget for Scheme C"""
-    
-    locality_penalty_weight: float = 0.1
-    """Weight for depth discontinuity penalty in DP"""
     
     # === Computation Parameters ===
     
@@ -203,20 +197,6 @@ class AdaptiveSplitConfig:
         assert self.max_depth >= 1, f"max_depth must be >= 1"
         assert self.min_region_size >= 1, f"min_region_size must be >= 1"
         assert self.gradient_method in ("simple", "sobel")
-    
-    @classmethod
-    def scheme_b(cls, **kwargs) -> "AdaptiveSplitConfig":
-        """Create Scheme B configuration."""
-        return cls(scheme=SplitScheme.BALANCED_GREEDY, **kwargs)
-    
-    @classmethod
-    def scheme_c(cls, token_budget: int = 64, **kwargs) -> "AdaptiveSplitConfig":
-        """Create Scheme C configuration."""
-        return cls(
-            scheme=SplitScheme.FIXED_BUDGET_DP,
-            token_budget=token_budget,
-            **kwargs
-        )
     
     @classmethod
     def scheme_l(cls, **kwargs) -> "AdaptiveSplitConfig":
@@ -1115,475 +1095,6 @@ class BaseAdaptiveSplitter(ABC):
 
 
 # =============================================================================
-# Scheme B: Balanced Greedy Splitter
-# =============================================================================
-
-class BalancedGreedySplitter(BaseAdaptiveSplitter):
-    """
-    Scheme B: Greedy splitting with 2:1 balance constraint.
-    
-    Algorithm:
-    1. Greedy recursive splitting based on complexity threshold
-    2. Post-process to enforce 2:1 balance (|d_i - d_j| ≤ 1 for neighbors)
-    3. Optionally apply token count soft constraint
-    
-    Properties:
-    - H_LCA_eff ≈ 1.18 (highest effective LCA information)
-    - J_max ≈ 21 pixels (low Hilbert jump distance)
-    - σ_N ≈ 22 (moderate token count variance)
-    """
-    
-    def split(self, image: Tensor) -> SplitResult:
-        if image.dim() == 4:
-            image = image.squeeze(0)
-        
-        C, H, W = image.shape
-        assert H == W, "Image must be square"
-        
-        # Initialize
-        cache = IntegralImageCache(
-            image, 
-            gradient_method=self.config.gradient_method
-        )
-        sorter = HilbertTokenSorter(H)
-        
-        # 初始化复杂度估计器 (传入 root_area 用于深度感知归一化)
-        root_area = H * W
-        complexity_estimator = self._get_complexity_estimator(root_area)
-        
-        # Step 1: Greedy recursive splitting
-        root_region = Region(0, 0, W, H)
-        leaves = self._greedy_split(root_region, 0, [], cache, complexity_estimator)
-        
-        # Step 2: Enforce 2:1 balance
-        if self.config.enforce_balance:
-            leaves = self._enforce_balance(leaves, cache, H, complexity_estimator)
-        
-        # Step 3: Apply token count constraint (optional)
-        if self.config.target_tokens is not None:
-            leaves = self._apply_token_constraint(leaves, cache, H, complexity_estimator)
-        
-        # Step 4: Convert to tokens and sort by Hilbert
-        tokens = [
-            SplitToken(
-                region=node.region,
-                depth=node.depth,
-                path=node.path,
-                hilbert_idx=0,
-                complexity=node.complexity
-            )
-            for node in leaves
-        ]
-        tokens = sorter.sort_tokens(tokens)
-        
-        return SplitResult(tokens=tokens)
-    
-    def _greedy_split(
-        self,
-        region: Region,
-        depth: int,
-        path: List[int],
-        cache: IntegralImageCache,
-        complexity_estimator: ComplexityEstimator,
-    ) -> List[QuadtreeNode]:
-        """Recursive greedy splitting."""
-        node = QuadtreeNode(
-            region=region,
-            depth=depth,
-            path=path.copy(),
-            complexity=complexity_estimator.compute(region, cache)
-        )
-        
-        # Termination conditions
-        threshold = self.config.get_threshold(depth)
-        min_size = self.config.min_region_size
-        
-        should_stop = (
-            depth >= self.config.max_depth or
-            node.complexity < threshold or
-            region.width < min_size * 2 or
-            region.height < min_size * 2
-        )
-        
-        if should_stop:
-            return [node]
-        
-        # Split into 4 quadrants
-        leaves = []
-        for q in range(4):
-            sub_region = region.get_quadrant(q)
-            sub_leaves = self._greedy_split(
-                sub_region, depth + 1, path + [q], cache, complexity_estimator
-            )
-            leaves.extend(sub_leaves)
-        
-        return leaves
-    
-    def _enforce_balance(
-        self,
-        leaves: List[QuadtreeNode],
-        cache: IntegralImageCache,
-        image_size: int,
-        complexity_estimator: ComplexityEstimator,
-    ) -> List[QuadtreeNode]:
-        """
-        Enforce 2:1 balance constraint.
-        
-        数学形式化:
-            ∀ (R_i, R_j) ∈ Adjacent: |d_i - d_j| ≤ 1
-            
-        算法:
-            迭代分割浅层邻居直到满足约束
-            
-        复杂度 (使用空间索引):
-            O(I × (N log N + N × k))
-            其中 I = 迭代次数, N = 节点数, k = 平均邻居数
-            
-        vs 暴力搜索:
-            O(I × N²)
-        """
-        # 初始化空间索引 (使用最小区域大小作为单元格)
-        spatial_index = SpatialIndex(cell_size=max(1, self.config.min_region_size))
-        
-        for iteration in range(self.config.max_balance_iterations):
-            # 构建/重建空间索引
-            spatial_index.build(leaves)
-            
-            violations = []
-            for node in leaves:
-                # 使用空间索引进行邻居查询 (O(log N + k) vs O(N))
-                neighbors = spatial_index.query_neighbors(node)
-                for neighbor in neighbors:
-                    if node.depth - neighbor.depth > 1:
-                        violations.append(neighbor)
-            
-            if not violations:
-                break
-            
-            # Split violating nodes
-            new_leaves = []
-            violated_set = set(id(n) for n in violations)
-            
-            for node in leaves:
-                if id(node) in violated_set:
-                    # Force split this node
-                    for q in range(4):
-                        sub_region = node.region.get_quadrant(q)
-                        sub_node = QuadtreeNode(
-                            region=sub_region,
-                            depth=node.depth + 1,
-                            path=node.path + [q],
-                            complexity=complexity_estimator.compute(
-                                sub_region, cache
-                            )
-                        )
-                        new_leaves.append(sub_node)
-                else:
-                    new_leaves.append(node)
-            
-            leaves = new_leaves
-        
-        return leaves
-    
-    def _find_neighbors(
-        self,
-        node: QuadtreeNode,
-        all_nodes: List[QuadtreeNode],
-        image_size: int
-    ) -> List[QuadtreeNode]:
-        """
-        Find all nodes adjacent to the given node.
-        
-        ⚠️ 已废弃: 此方法为 O(N) 暴力搜索，保留仅作后备。
-        推荐使用 SpatialIndex.query_neighbors() 进行 O(log N + k) 查询。
-        
-        复杂度: O(N)，其中 N = len(all_nodes)
-        """
-        neighbors = []
-        r = node.region
-        
-        for other in all_nodes:
-            if other is node:
-                continue
-            
-            o = other.region
-            
-            # Check adjacency (sharing an edge)
-            # Horizontal adjacency
-            h_adjacent = (
-                (r.x2 == o.x1 or r.x1 == o.x2) and
-                not (r.y2 <= o.y1 or r.y1 >= o.y2)
-            )
-            # Vertical adjacency  
-            v_adjacent = (
-                (r.y2 == o.y1 or r.y1 == o.y2) and
-                not (r.x2 <= o.x1 or r.x1 >= o.x2)
-            )
-            
-            if h_adjacent or v_adjacent:
-                neighbors.append(other)
-        
-        return neighbors
-    
-    def _apply_token_constraint(
-        self,
-        leaves: List[QuadtreeNode],
-        cache: IntegralImageCache,
-        image_size: int,
-        complexity_estimator: Optional[ComplexityEstimator] = None,
-    ) -> List[QuadtreeNode]:
-        """
-        Soft constraint to nudge token count toward target.
-        
-        If too many tokens: merge lowest-complexity sibling groups
-        If too few tokens: split highest-complexity nodes
-        """
-        target = self.config.target_tokens
-        if target is None:
-            return leaves
-        
-        # Simple heuristic: adjust threshold and re-split
-        # This is a soft constraint, not exact
-        current = len(leaves)
-        
-        if abs(current - target) / target < 0.2:
-            # Within 20%, acceptable
-            return leaves
-        
-        # Could implement more sophisticated merging/splitting
-        # For now, just return as-is (soft constraint)
-        return leaves
-
-
-# =============================================================================
-# Scheme C: Fixed Budget DP Splitter
-# =============================================================================
-
-class FixedBudgetDPSplitter(BaseAdaptiveSplitter):
-    """
-    Scheme C: Fixed token budget with dynamic programming selection.
-    
-    Algorithm:
-    1. Build complete quadtree to max_depth
-    2. Compute importance for each node
-    3. Use DP to select optimal pruning with exactly N tokens
-    4. Optional locality penalty for smooth depth transitions
-    
-    Properties:
-    - σ_N = 0 (exact token count)
-    - Globally optimal selection (not greedy)
-    - η_waste = 0 (perfect batch efficiency)
-    """
-    
-    def split(self, image: Tensor) -> SplitResult:
-        if image.dim() == 4:
-            image = image.squeeze(0)
-        
-        C, H, W = image.shape
-        assert H == W, "Image must be square"
-        
-        # Initialize
-        cache = IntegralImageCache(
-            image,
-            gradient_method=self.config.gradient_method
-        )
-        sorter = HilbertTokenSorter(H)
-        
-        # 初始化复杂度估计器 (传入 root_area 用于深度感知归一化)
-        root_area = H * W
-        complexity_estimator = self._get_complexity_estimator(root_area)
-        
-        # Step 1: Build complete quadtree
-        root_region = Region(0, 0, W, H)
-        root = self._build_complete_tree(root_region, 0, [], cache, complexity_estimator)
-        
-        # Step 2: Compute importance scores
-        self._compute_importance(root, cache, complexity_estimator)
-        
-        # Step 3: DP selection
-        budget = self.config.token_budget
-        selected = self._dp_select(root, budget)
-        
-        # Step 4: Convert to tokens and sort
-        tokens = [
-            SplitToken(
-                region=node.region,
-                depth=node.depth,
-                path=node.path,
-                hilbert_idx=0,
-                complexity=node.complexity
-            )
-            for node in selected
-        ]
-        tokens = sorter.sort_tokens(tokens)
-        
-        return SplitResult(tokens=tokens)
-    
-    def _build_complete_tree(
-        self,
-        region: Region,
-        depth: int,
-        path: List[int],
-        cache: IntegralImageCache,
-        complexity_estimator: ComplexityEstimator,
-    ) -> QuadtreeNode:
-        """Build complete quadtree to max_depth."""
-        node = QuadtreeNode(
-            region=region,
-            depth=depth,
-            path=path.copy(),
-            complexity=complexity_estimator.compute(region, cache)
-        )
-        
-        min_size = self.config.min_region_size
-        can_split = (
-            depth < self.config.max_depth and
-            region.width >= min_size * 2 and
-            region.height >= min_size * 2
-        )
-        
-        if can_split:
-            node.children = []
-            for q in range(4):
-                sub_region = region.get_quadrant(q)
-                child = self._build_complete_tree(
-                    sub_region, depth + 1, path + [q], cache, complexity_estimator
-                )
-                node.children.append(child)
-        
-        return node
-    
-    def _compute_importance(
-        self,
-        node: QuadtreeNode,
-        cache: IntegralImageCache,
-        complexity_estimator: Optional[ComplexityEstimator] = None,
-    ) -> None:
-        """
-        Compute importance score for each node.
-        
-        Importance = complexity × area_weight - locality_penalty
-        """
-        # Base importance from complexity
-        area_weight = node.region.area / (cache.H * cache.W)
-        node.importance = node.complexity * math.sqrt(area_weight)
-        
-        # Recurse to children
-        if node.children:
-            for child in node.children:
-                self._compute_importance(child, cache)
-    
-    def _dp_select(
-        self,
-        root: QuadtreeNode,
-        budget: int
-    ) -> List[QuadtreeNode]:
-        """
-        Dynamic programming to select optimal token set.
-        
-        Uses tree DP: for each subtree, compute best way to use k tokens
-        for all k from 1 to budget.
-        
-        State: dp[node][k] = maximum importance achievable using k tokens
-                            in the subtree rooted at node
-        """
-        # Memoization
-        memo: Dict[Tuple[int, int], Tuple[float, List[QuadtreeNode]]] = {}
-        
-        def dp(node: QuadtreeNode, k: int) -> Tuple[float, List[QuadtreeNode]]:
-            """
-            Returns (importance, selected_nodes) for using exactly k tokens
-            in the subtree rooted at node.
-            """
-            if k <= 0:
-                return (0.0, [])
-            
-            node_id = id(node)
-            if (node_id, k) in memo:
-                return memo[(node_id, k)]
-            
-            # Option 1: Use this node as a leaf (1 token)
-            if k == 1:
-                result = (node.importance, [node])
-                memo[(node_id, k)] = result
-                return result
-            
-            # Option 2: If no children, can only use 1 token
-            if not node.children:
-                if k == 1:
-                    result = (node.importance, [node])
-                else:
-                    result = (float('-inf'), [])  # Invalid
-                memo[(node_id, k)] = result
-                return result
-            
-            # Option 3: Distribute k tokens among 4 children
-            # Use DP to find best distribution
-            best_importance = node.importance if k == 1 else float('-inf')
-            best_selection = [node] if k == 1 else []
-            
-            # Try all valid distributions of k tokens to 4 children
-            # Each child must get at least 1 token (if used) or 0
-            # This is a partition problem
-            for dist in self._generate_distributions(k, 4):
-                total_imp = 0.0
-                selection = []
-                valid = True
-                
-                for i, child_k in enumerate(dist):
-                    if child_k > 0:
-                        imp, sel = dp(node.children[i], child_k)
-                        if imp == float('-inf'):
-                            valid = False
-                            break
-                        total_imp += imp
-                        selection.extend(sel)
-                
-                if valid and total_imp > best_importance:
-                    best_importance = total_imp
-                    best_selection = selection
-            
-            # Apply locality penalty for depth variance
-            if best_selection and self.config.locality_penalty_weight > 0:
-                depths = [n.depth for n in best_selection]
-                if len(depths) > 1:
-                    depth_var = sum((d - sum(depths)/len(depths))**2 
-                                   for d in depths) / len(depths)
-                    penalty = self.config.locality_penalty_weight * depth_var
-                    best_importance -= penalty
-            
-            result = (best_importance, best_selection)
-            memo[(node_id, k)] = result
-            return result
-        
-        _, selected = dp(root, budget)
-        return selected
-    
-    def _generate_distributions(
-        self, 
-        total: int, 
-        parts: int
-    ) -> List[Tuple[int, ...]]:
-        """
-        Generate all ways to distribute 'total' tokens to 'parts' children.
-        
-        Optimized to avoid combinatorial explosion.
-        """
-        if parts == 1:
-            return [(total,)]
-        
-        distributions = []
-        # Limit search space for efficiency
-        max_per_part = min(total, 64)  # Cap individual allocation
-        
-        for first in range(min(total + 1, max_per_part + 1)):
-            for rest in self._generate_distributions(total - first, parts - 1):
-                distributions.append((first,) + rest)
-        
-        return distributions
-
-
-# =============================================================================
 # Scheme L: Learnable Splitter (P7-1/P7-2/P7-3 Solution)
 # =============================================================================
 
@@ -1780,6 +1291,11 @@ class LearnableSplitter(nn.Module):
         # 统计信息 (用于监控)
         self.register_buffer('_split_probs', torch.zeros(max_depth + 1))
         self.register_buffer('_split_counts', torch.zeros(max_depth + 1))
+        
+        # P-GRAD-1: 自适应权重衰减 - EMA 分割概率
+        # 用于计算条件访问概率权重 w_d = ∏_{k<d} p̄_k
+        self.register_buffer('_ema_split_probs', torch.full((max_depth + 1,), 0.5))
+        self._ema_alpha: float = 0.1  # EMA 平滑因子
         
         # P-TEMP-1: 自动温度退火状态
         # 使用 register_buffer 确保 checkpoint 兼容
@@ -2228,6 +1744,14 @@ class LearnableSplitter(nn.Module):
         with torch.no_grad():
             self._split_probs[depth] += p_split.sum().item()
             self._split_counts[depth] += N
+            
+            # P-GRAD-1: 更新 EMA 分割概率 (用于自适应权重)
+            # p̄_d^{(t+1)} = α · p_d^{(t)} + (1 - α) · p̄_d^{(t)}
+            batch_p = p_split.mean()
+            self._ema_split_probs[depth] = (
+                self._ema_alpha * batch_p + 
+                (1 - self._ema_alpha) * self._ema_split_probs[depth]
+            )
         
         if hard or not self.training:
             # Hard decision
@@ -2884,6 +2408,66 @@ class LearnableSplitter(nn.Module):
         
         return loss
     
+    def get_adaptive_depth_weights(
+        self,
+        max_depth: Optional[int] = None,
+    ) -> Tensor:
+        """
+        获取自适应深度权重 (P-GRAD-1)。
+        
+        数学形式化
+        ==========
+        
+        问题: 固定权重 w_d = β^d 基于"每层均匀 50% 分割"假设。
+        但实际 BFS 路径受 τ_d 控制，分割概率非均匀分布。
+        
+        设 p̄_d 为第 d 层平均分割概率的 EMA 估计。
+        自适应权重 w_d 反映"固定网格区域实际被访问"的条件概率:
+        
+            w_d = P(BFS 到达深度 d | BFS 从 d=0 出发)
+                = ∏_{k=0}^{d-1} p̄_k
+        
+        特殊情况:
+            - w_0 = 1 (根节点必定访问)
+            - 若 p̄_k ≈ 0.5，则 w_d ≈ 0.5^d (退化为固定权重)
+            - 若 p̄_k < 0.5，则深层权重更小 (反映实际梯度稀疏性)
+        
+        EMA 更新规则 (在 _batch_split_decision 中):
+            p̄_d^{(t+1)} = α · p_d^{(t)} + (1 - α) · p̄_d^{(t)}
+            
+        其中 α = 0.1 平衡响应速度和稳定性。
+        
+        数值稳定性:
+            使用 eps = 0.01 进行 clamp，防止权重过快衰减至 0。
+        
+        Args:
+            max_depth: 最大深度 (默认 self.max_depth)
+            
+        Returns:
+            weights: Tensor[D+1] 权重向量，weights[d] 对应深度 d
+        """
+        if max_depth is None:
+            max_depth = self.max_depth
+            
+        max_depth = min(max_depth, self.max_depth)
+        device = self._ema_split_probs.device
+        dtype = self._ema_split_probs.dtype
+        
+        weights = torch.ones(max_depth + 1, device=device, dtype=dtype)
+        
+        # 数值稳定性: clamp 概率，防止权重指数衰减过快
+        eps = 0.01
+        
+        cumulative = 1.0
+        for d in range(max_depth + 1):
+            weights[d] = cumulative
+            if d < max_depth:
+                # p̄_d clamped to [eps, 1-eps] for numerical stability
+                p_safe = self._ema_split_probs[d].clamp(eps, 1 - eps)
+                cumulative = cumulative * p_safe
+                
+        return weights
+    
     def get_multi_layer_depth_loss(
         self,
         features: Tensor,
@@ -2892,6 +2476,7 @@ class LearnableSplitter(nn.Module):
         weight_decay_factor: float = 0.5,
         target_entropy: float = 0.693,
         return_details: bool = False,
+        use_adaptive_weights: bool = True,
     ) -> Union[Tensor, Tuple[Tensor, Dict[str, Tensor]]]:
         """
         多层可微分深度损失。
@@ -2900,21 +2485,24 @@ class LearnableSplitter(nn.Module):
             L_multi = Σ_d w_d · (H_target - H̄_d)²
             
             其中:
-            - w_d = β^d, β = weight_decay_factor (指数衰减权重)
             - H̄_d = (1/4^d) · Σ_{R∈Grid_d} H(p_d(R)) (第 d 层平均熵)
             - p_d(R) = σ((C_θ(R) - τ_d) / T) (分割概率)
             - H(p) = -p·log(p) - (1-p)·log(1-p) (二元熵)
+            
+        权重设计 (P-GRAD-1):
+            use_adaptive_weights=True (默认, 推荐):
+                w_d = ∏_{k=0}^{d-1} p̄_k
+                其中 p̄_k 是第 k 层分割概率的 EMA 估计。
+                理论依据: 反映固定网格区域"实际被 BFS 访问"的条件概率。
+                
+            use_adaptive_weights=False (向后兼容):
+                w_d = β^d, β = weight_decay_factor
+                基于"每层均匀 50% 分割"的简化假设。
             
         梯度分析:
             ∂L/∂τ_d = w_d · (1/4^d) · Σ_R ∂H/∂p · ∂p/∂τ_d
             
             其中 ∂p/∂τ = -p(1-p)/T，因此每个 τ_d 都有非零梯度。
-            
-        权重设计 (β=0.5 时的归一化梯度分布):
-            d=0: 51.6%, d=1: 25.8%, d=2: 12.9%, d=3: 6.5%, d=4: 3.2%
-            
-            理论依据: 浅层分割决定粗粒度结构，语义更重要。
-            深层仍有梯度信号，避免阈值完全不可学习。
             
         计算优化:
             使用批量 ROI-Align 评估所有网格区域 (1 次 GPU kernel 调用)
@@ -2924,9 +2512,10 @@ class LearnableSplitter(nn.Module):
             image_size: (H, W) 图像尺寸
             max_eval_depth: 最大评估深度 (默认 min(max_depth, 3))
                            D=3 时覆盖 96.8% 梯度信号，仅 85 区域
-            weight_decay_factor: 权重衰减因子 β (默认 0.5)
+            weight_decay_factor: 权重衰减因子 β (仅当 use_adaptive_weights=False)
             target_entropy: 目标熵 (默认 0.693 = ln(2)，鼓励 p→0.5)
             return_details: 是否返回各层详情 (用于 TensorBoard)
+            use_adaptive_weights: 使用自适应权重 (P-GRAD-1, 默认 True)
             
         Returns:
             loss: 标量损失
@@ -2937,6 +2526,7 @@ class LearnableSplitter(nn.Module):
                 'weight_per_depth': Tensor[D+1],  # 各层权重
                 'temperature': Tensor,            # 当前温度
                 'num_regions_per_depth': Tensor[D+1], # 各层区域数
+                'adaptive_weights_enabled': bool, # 是否使用自适应权重
             }
         """
         B, C, H_feat, W_feat = features.shape
@@ -3029,6 +2619,10 @@ class LearnableSplitter(nn.Module):
         # =====================================================================
         total_loss = torch.tensor(0.0, device=device, dtype=dtype)
         
+        # P-GRAD-1: 预计算自适应权重 (在循环外，避免重复计算)
+        if use_adaptive_weights:
+            adaptive_weights = self.get_adaptive_depth_weights(max_eval_depth)
+        
         # 预分配详情存储
         loss_per_depth = torch.zeros(max_eval_depth + 1, device=device, dtype=dtype)
         entropy_per_depth = torch.zeros(max_eval_depth + 1, device=device, dtype=dtype)
@@ -3057,8 +2651,13 @@ class LearnableSplitter(nn.Module):
             # 层损失: (H_target - H̄_d)²
             layer_loss = (target_entropy - mean_entropy_d).pow(2)
             
-            # 权重 w_d = β^d
-            w_d = weight_decay_factor ** d
+            # P-GRAD-1: 选择权重计算方式
+            # use_adaptive_weights=True:  w_d = ∏_{k<d} p̄_k (反映实际 BFS 访问概率)
+            # use_adaptive_weights=False: w_d = β^d (固定几何衰减)
+            if use_adaptive_weights:
+                w_d = adaptive_weights[d].item()
+            else:
+                w_d = weight_decay_factor ** d
             
             # 累加加权损失
             total_loss = total_loss + w_d * layer_loss
@@ -3083,6 +2682,7 @@ class LearnableSplitter(nn.Module):
                 'num_regions_per_depth': num_regions_per_depth,
                 'total_regions': N_regions,
                 'max_eval_depth': max_eval_depth,
+                'adaptive_weights_enabled': use_adaptive_weights,
             }
             return total_loss, details
         
@@ -3390,34 +2990,32 @@ class LearnableSplitter(nn.Module):
 def create_adaptive_splitter(
     config: AdaptiveSplitConfig,
     feature_dim: int = 256,
-) -> Union[BaseAdaptiveSplitter, LearnableSplitter]:
+) -> LearnableSplitter:
     """
-    Factory function to create appropriate splitter based on config.
+    Factory function to create LearnableSplitter.
+    
+    Note: 
+        Scheme B (BalancedGreedy) 和 Scheme C (FixedBudgetDP) 已被移除。
+        数学分析表明 LearnableSplitter 完全覆盖其功能并提供以下优势:
+        - 端到端可微分训练
+        - 无复杂度饱和问题
+        - 自适应阈值学习
     
     Args:
-        config: AdaptiveSplitConfig with scheme selection
-        feature_dim: Feature dimension for LearnableSplitter (Scheme L only)
+        config: AdaptiveSplitConfig
+        feature_dim: Feature dimension for LearnableSplitter
         
     Returns:
-        BalancedGreedySplitter (Scheme B), 
-        FixedBudgetDPSplitter (Scheme C), or
-        LearnableSplitter (Scheme L)
+        LearnableSplitter instance
     """
-    if config.scheme == SplitScheme.BALANCED_GREEDY:
-        return BalancedGreedySplitter(config)
-    elif config.scheme == SplitScheme.FIXED_BUDGET_DP:
-        return FixedBudgetDPSplitter(config)
-    elif config.scheme == SplitScheme.LEARNABLE:
-        return LearnableSplitter(
-            feature_dim=feature_dim,
-            max_depth=config.max_depth,
-            min_region_size=config.min_region_size,
-            enforce_balance=config.enforce_balance,
-            init_tau_base=config.tau_0 * 3,  # 调整初始阈值更接近中心
-            init_tau_gamma=config.gamma,
-        )
-    else:
-        raise ValueError(f"Unknown scheme: {config.scheme}")
+    return LearnableSplitter(
+        feature_dim=feature_dim,
+        max_depth=config.max_depth,
+        min_region_size=config.min_region_size,
+        enforce_balance=config.enforce_balance,
+        init_tau_base=config.tau_0 * 3,  # 调整初始阈值更接近中心
+        init_tau_gamma=config.gamma,
+    )
 
 
 # =============================================================================
@@ -3622,49 +3220,78 @@ class TemperatureScheduler:
 
 def split_image(
     image: Tensor,
-    scheme: str = "balanced_greedy",
+    feature_extractor: Optional[nn.Module] = None,
     **kwargs
 ) -> SplitResult:
     """
-    Convenience function to split a single image.
+    Convenience function to split a single image using LearnableSplitter.
+    
+    Mathematical formalization:
+    ─────────────────────────────────────────────────────────────────────
+    Uses the LearnableSplitter which implements:
+    
+    C_θ(R) = σ(MLP(RoI-Align(F, R)))
+    
+    Where:
+    - F: Feature map from the image
+    - R: Region of interest
+    - MLP: Learnable multi-layer perceptron with no saturation
+    - σ: Sigmoid activation for complexity score in [0, 1]
+    
+    The splitting decision uses Gumbel-Softmax with STE for differentiability:
+    
+    P(split | R) = softmax((logits + G) / τ)
+    
+    Where G ~ Gumbel(0, 1) and τ is the temperature (annealed during training).
+    ─────────────────────────────────────────────────────────────────────
     
     Args:
-        image: [C, H, W] or [1, C, H, W] tensor
-        scheme: "balanced_greedy" (B) or "fixed_budget_dp" (C)
-        **kwargs: Additional config parameters
+        image: [C, H, W] or [B, C, H, W] tensor (raw image or features)
+        feature_extractor: Optional feature extractor. If None, image is treated
+                          as pre-extracted features.
+        **kwargs: Additional config parameters for LearnableSplitter
         
     Returns:
         SplitResult with tokens
-    """
-    scheme_enum = SplitScheme(scheme)
-    config = AdaptiveSplitConfig(scheme=scheme_enum, **kwargs)
-    splitter = create_adaptive_splitter(config)
-    return splitter.split(image)
-
-
-def compare_schemes(
-    image: Tensor,
-    config_overrides: Optional[Dict] = None
-) -> Dict[str, SplitResult]:
-    """
-    Run both schemes on the same image for comparison.
-    
-    Args:
-        image: Input image tensor
-        config_overrides: Optional config parameters
         
-    Returns:
-        Dict with keys 'scheme_b' and 'scheme_c'
+    Note:
+        Scheme B (BalancedGreedySplitter) and Scheme C (FixedBudgetDPSplitter)
+        have been removed as LearnableSplitter provides superior functionality:
+        - End-to-end differentiability via Gumbel-Softmax + STE
+        - No complexity saturation (MLP vs variance-based formula)
+        - Learnable thresholds: τ_d = τ_{base,d} + δ_d
+        - O(D) BFS vs O(N·4^D) DP complexity
     """
-    overrides = config_overrides or {}
+    # Ensure 4D tensor
+    if image.dim() == 3:
+        image = image.unsqueeze(0)  # [C, H, W] -> [1, C, H, W]
     
-    config_b = AdaptiveSplitConfig.scheme_b(**overrides)
-    config_c = AdaptiveSplitConfig.scheme_c(**overrides)
+    B, C, H, W = image.shape
     
-    splitter_b = BalancedGreedySplitter(config_b)
-    splitter_c = FixedBudgetDPSplitter(config_c)
+    # Extract features if extractor provided
+    if feature_extractor is not None:
+        with torch.no_grad():
+            features = feature_extractor(image)
+    else:
+        # Treat input as pre-extracted features
+        features = image
     
-    return {
-        'scheme_b': splitter_b.split(image),
-        'scheme_c': splitter_c.split(image)
-    }
+    # Determine feature dimension
+    feature_dim = features.shape[1]
+    
+    # Create splitter with appropriate feature_dim
+    splitter = LearnableSplitter(
+        feature_dim=feature_dim,
+        max_depth=kwargs.get('max_depth', 4),
+        min_region_size=kwargs.get('min_region_size', 4),
+        enforce_balance=kwargs.get('enforce_balance', True),
+    )
+    
+    # Use image size from original input
+    image_size = (H, W)
+    
+    # Run forward pass (returns list of SplitResult)
+    results = splitter.forward(features, image_size, hard=True)
+    
+    # Return first result (single image)
+    return results[0]

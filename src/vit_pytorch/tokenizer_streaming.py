@@ -7,7 +7,7 @@ Streaming Fractal Tokenizer V3 (Unified Architecture)
 
 统一架构 (P7 重构):
     F = SharedConv(I)              # 共享特征提取
-    Regions = Splitter(F or I)     # 可学习或规则分割
+    Regions = Splitter(F or I)     # 可学习分割
     T = Embed(F, Regions)          # 区域池化 + 深度编码
 
 Tokenization 过程:
@@ -15,27 +15,33 @@ Tokenization 过程:
 
 Variable Depth Tokenization:
     N ∈ [N_min, N_max] 根据图像内容自适应
-    Regions = AdaptiveQuadtreeSplit(I) 或 LearnableSplit(F)
+    Regions = LearnableSplit(F)
     Token_i = Pool(F[R_i]) * σ_d + E_d
 
-分割模式:
-    1. 'balanced_greedy' (Scheme B): 规则方法，基于像素统计
-    2. 'fixed_budget_dp' (Scheme C): 规则方法，动态规划
-    3. 'learnable' (Scheme L): 可学习方法，端到端优化
+可学习分割 (Scheme L - LearnableSplitter):
+    C_θ(R) = σ(MLP(ROI-Align(F, R)))   # 可学习复杂度评估
+    
+    相比已移除的规则方法的优势:
+    - 端到端可微分 (Gumbel-Softmax + STE)
+    - 无复杂度饱和 (MLP vs 方差公式)
+    - 可学习阈值: τ_d = τ_{base,d} + δ_d
+    - O(D) BFS vs O(N·4^D) DP 复杂度
 
 复杂度分析
 ----------
 StreamingFractalTokenizerV3:
-    时间: O(C · H · W) + O(N_max · log N_max)
+    时间: O(C · H · W) + O(N_max · D × k²)
           ├─ 特征提取 (Conv):      O(C · H · W)         — 共享卷积
-          ├─ 自适应分割 (Greedy):  O(N_max · log N_max) — 优先队列
-          ├─ 自适应分割 (DP):      O(4^D_max · D_max)   — 动态规划
           └─ 可学习分割 (MLP):     O(N_max · D × k²)    — ROI + MLP
     空间: O(C · H · W) + O(N_max · D)
           ├─ 特征图:  O(C · H · W)
           └─ Token:   O(N_max · D)
 
-其中: C=channels, H×W=image_size, N_max=max_tokens, D=d_model, D_max=max_depth
+其中: C=channels, H×W=image_size, N_max=max_tokens, D=d_model
+
+Note:
+    Scheme B (BalancedGreedySplitter) 和 Scheme C (FixedBudgetDPSplitter)
+    已被移除，因为 LearnableSplitter 提供了更优的功能。
 """
 
 from __future__ import annotations
@@ -51,17 +57,17 @@ from .config_fractal import FractalConfig
 
 
 class StreamingFractalTokenizerV3(BaseTokenizer):
-    """Variable Depth Tokenizer with Adaptive/Learnable Quadtree Splitting.
+    """Variable Depth Tokenizer with Learnable Quadtree Splitting.
     
     数学形式化
     ==========
     
     统一架构 (P7 重构):
         F = SharedConv(I)              # 共享特征提取 (提升到 Tokenizer 级别)
-        Regions = Splitter(F, I)       # 可学习或规则分割
+        Regions = Splitter(F, I)       # 可学习分割
         Token_i = Pool(F[R_i]) * σ_d + E_d  # 区域池化 + 深度编码
     
-    可学习分割 (split_scheme='learnable'):
+    可学习分割 (LearnableSplitter):
         C_θ(R) = σ(MLP(ROI-Align(F, R)))   # 可学习复杂度
         p_split = σ((C_θ - τ_d) / T)        # 软分割决策
         z ~ Gumbel-Softmax                   # 可微分采样
@@ -77,15 +83,19 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         base_patch_size: 最细粒度 patch 大小
         max_depth: 最大四叉树深度
         use_hilbert_order: 是否使用 Hilbert 曲线排序
-        split_scheme: 分割方案 ('balanced_greedy', 'fixed_budget_dp', 'learnable')
         target_tokens: 目标 token 数量
-        complexity_alpha: 复杂度函数中方差权重 (规则方法)
         enforce_balance: 是否强制 2:1 平衡约束
         depth_scale_range: (P6-1) 深度缩放范围 (σ_min, σ_max)
-        tau_0: 根节点分割阈值 τ₀
-        gamma: 阈值衰减因子 γ ∈ (0,1)
-        learnable_temperature: (P7) 可学习分割的初始温度
-        use_gumbel: (P7) 是否使用 Gumbel-Softmax
+        gamma: 可学习分割器的阈值衰减因子 γ ∈ (0,1)
+        learnable_temperature: 可学习分割的初始温度
+        use_gumbel: 是否使用 Gumbel-Softmax
+        
+    Note:
+        Scheme B (BalancedGreedySplitter) 和 Scheme C (FixedBudgetDPSplitter)
+        已被移除。LearnableSplitter 提供了完全覆盖的功能并增加了:
+        - 端到端可微分性
+        - 无复杂度饱和
+        - 可学习阈值
     """
     
     def __init__(
@@ -96,12 +106,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         base_patch_size: int = 4,
         max_depth: int = 4,
         use_hilbert_order: bool = True,
-        split_scheme: str = 'balanced_greedy',
         target_tokens: Optional[int] = None,
-        complexity_alpha: float = 0.5,
         enforce_balance: bool = True,
         depth_scale_range: Optional[Tuple[float, float]] = (0.5, 2.0),
-        tau_0: float = 0.15,
         gamma: float = 0.85,
         learnable_temperature: float = 1.0,
         use_gumbel: bool = True,
@@ -117,8 +124,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         self.base_patch_size = base_patch_size
         self.max_depth = max_depth
         self.use_hilbert_order = use_hilbert_order
-        self.split_scheme = split_scheme
-        self._use_learnable_split = split_scheme == 'learnable'
+        self._use_learnable_split = True  # Always use LearnableSplitter
         
         # =====================================================================
         # Hilbert-Native Patch Embedding (包含 SharedConv)
@@ -135,52 +141,27 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         )
         
         # =====================================================================
-        # Adaptive/Learnable Splitter
+        # LearnableSplitter (Scheme B/C have been removed)
         # =====================================================================
-        from .split_adaptive import (
-            AdaptiveSplitConfig,
-            BalancedGreedySplitter,
-            FixedBudgetDPSplitter,
-            LearnableSplitter,
-            SplitScheme,
-        )
+        # Mathematical justification for removal:
+        # - Scheme B: C(R) = Var/(Var+σ₀²) saturates as Var → ∞
+        # - Scheme C: O(N·4^D) DP complexity, not differentiable
+        # - Scheme L: C_θ(R) = σ(MLP(ROI-Align(F, R))) - no saturation, O(D) BFS
+        # =====================================================================
+        from .split_adaptive import LearnableSplitter
         
-        if split_scheme == 'learnable' or split_scheme == SplitScheme.LEARNABLE:
-            # P7: 可学习分割器
-            self._use_learnable_split = True
-            self.splitter = LearnableSplitter(
-                feature_dim=d_model,
-                max_depth=max_depth,
-                hidden_dim=64,
-                pool_size=4,
-                temperature=learnable_temperature,
-                use_gumbel=use_gumbel,
-                enforce_balance=enforce_balance,
-                min_region_size=base_patch_size,
-                init_tau_base=0.5,  # P7-2: 更合理的初始阈值
-                init_tau_gamma=gamma,
-            )
-        elif split_scheme == 'fixed_budget_dp' or split_scheme == SplitScheme.FIXED_BUDGET_DP:
-            self._use_learnable_split = False
-            split_config = AdaptiveSplitConfig.scheme_c(
-                token_budget=target_tokens if target_tokens else 64,
-                max_depth=max_depth,
-                alpha=complexity_alpha,
-                tau_0=tau_0,
-                gamma=gamma,
-            )
-            self.splitter = FixedBudgetDPSplitter(split_config)
-        else:
-            self._use_learnable_split = False
-            split_config = AdaptiveSplitConfig.scheme_b(
-                max_depth=max_depth,
-                alpha=complexity_alpha,
-                enforce_balance=enforce_balance,
-                target_tokens=target_tokens,
-                tau_0=tau_0,
-                gamma=gamma,
-            )
-            self.splitter = BalancedGreedySplitter(split_config)
+        self.splitter = LearnableSplitter(
+            feature_dim=d_model,
+            max_depth=max_depth,
+            hidden_dim=64,
+            pool_size=4,
+            temperature=learnable_temperature,
+            use_gumbel=use_gumbel,
+            enforce_balance=enforce_balance,
+            min_region_size=base_patch_size,
+            init_tau_base=0.5,
+            init_tau_gamma=gamma,
+        )
         
         self._last_split_stats: Optional[Dict[str, Any]] = None
         self._last_features: Optional[torch.Tensor] = None
@@ -360,7 +341,13 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
     @torch.no_grad()
     def get_split_stats(self) -> Optional[Dict[str, Any]]:
         """获取最近一次分割的统计信息."""
-        return self._last_split_stats
+        if self._last_split_stats is None:
+            return None
+        
+        # 添加 depth_entropy 到统计信息
+        stats = self._last_split_stats.copy()
+        stats['depth_entropy'] = self.get_scale_entropy()
+        return stats
     
     def get_entropy_loss(self) -> Optional[torch.Tensor]:
         """获取熵正则化损失 (用于可学习分割器)."""
@@ -516,10 +503,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         """获取训练状态统计信息."""
         stats = {
             'tokenizer_version': 'v3_unified',
-            'architecture': 'shared_conv + adaptive/learnable_split + hilbert_embed',
-            'split_scheme': self.split_scheme,
+            'architecture': 'shared_conv + learnable_split + hilbert_embed',
+            'split_scheme': 'learnable',  # Only LearnableSplitter remains
             'max_depth': self.max_depth,
-            'learnable_split': self._use_learnable_split,
+            'learnable_split': True,  # Always true after Scheme B/C removal
         }
         
         if self._last_split_stats:
@@ -527,12 +514,12 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             stats['avg_tokens_per_image'] = avg_tokens
             stats['depth_entropy'] = self.get_scale_entropy()
         
-        if self._use_learnable_split:
-            from .split_adaptive import LearnableSplitter
-            assert isinstance(self.splitter, LearnableSplitter)
-            splitter_stats = self.splitter.get_split_statistics()
-            stats['learnable_thresholds'] = splitter_stats['thresholds'].tolist()
-            stats['learnable_temperature'] = splitter_stats['temperature'].item()
+        # Always use LearnableSplitter
+        from .split_adaptive import LearnableSplitter
+        assert isinstance(self.splitter, LearnableSplitter)
+        splitter_stats = self.splitter.get_split_statistics()
+        stats['learnable_thresholds'] = splitter_stats['thresholds'].tolist()
+        stats['learnable_temperature'] = splitter_stats['temperature'].item()
         
         return stats
     
@@ -591,12 +578,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         Raises:
             ValueError: 如果不是可学习分割器
         """
-        if not self._use_learnable_split:
-            raise ValueError(
-                "Temperature scheduler is only available for learnable splitter. "
-                "Set split_scheme='learnable' when creating the tokenizer."
-            )
-        
         from .split_adaptive import LearnableSplitter, TemperatureScheduler
         assert isinstance(self.splitter, LearnableSplitter)
         
@@ -660,12 +641,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         Raises:
             ValueError: 如果不是可学习分割器
         """
-        if not self._use_learnable_split:
-            raise ValueError(
-                "Multi-layer depth loss is only available for learnable splitter. "
-                "Set split_scheme='learnable' when creating the tokenizer."
-            )
-        
         from .split_adaptive import LearnableSplitter
         assert isinstance(self.splitter, LearnableSplitter)
         

@@ -80,8 +80,6 @@ from .split_adaptive import (
     AdaptiveSplitConfig,
     TemperatureScheduler,
     LearnableSplitter,
-    BalancedGreedySplitter,
-    FixedBudgetDPSplitter,
     SplitScheme,
 )
 
@@ -132,7 +130,5 @@ __all__ = [
     "AdaptiveSplitConfig",
     "TemperatureScheduler",
     "LearnableSplitter",
-    "BalancedGreedySplitter",
-    "FixedBudgetDPSplitter",
-    "SplitScheme",
+    "SplitScheme",  # Note: Only LEARNABLE scheme remains after B/C removal
 ]

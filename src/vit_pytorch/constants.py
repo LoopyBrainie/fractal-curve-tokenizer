@@ -14,13 +14,18 @@
 缩放因子:
     λ_hilbert = 0.1      Hilbert 偏置: B_h → λ_hilbert · B_h
     λ_level = 0.05       层级偏置: B_l → λ_level · B_l
-    λ_global = 0.1       全局上下文: ctx → λ_global · ctx
 
 初始化:
     σ_emb = 0.02         嵌入层初始化标准差
 
 Logits 裁剪:
     logits = clamp(logits, -10, 10)  防止数值溢出
+
+LearnableSplitter 默认参数:
+    T_start = 1.0        Gumbel-Softmax 起始温度
+    T_end = 0.1          Gumbel-Softmax 终止温度
+    τ_base = 0.5         初始基础阈值 (中心初始化)
+    γ = 0.85             阈值衰减因子 (每层)
 """
 
 from __future__ import annotations
@@ -49,8 +54,24 @@ HILBERT_BIAS_SCALE: float = 0.1
 #: 层级偏置的缩放因子
 LEVEL_BIAS_SCALE: float = 0.05
 
-#: 全局上下文的缩放因子 [已废弃: ARCH-R1 删除了 global_context_attn]
-GLOBAL_CONTEXT_SCALE: float = 0.1
+# ==================== LearnableSplitter 默认参数 ====================
+
+#: Gumbel-Softmax 起始温度 T_start
+SPLITTER_TEMP_START: float = 1.0
+
+#: Gumbel-Softmax 终止温度 T_end (0.1 接近 hard sampling)
+SPLITTER_TEMP_END: float = 0.1
+
+#: 阈值衰减因子 γ ∈ (0, 1)，每层深度阈值为 τ_d = τ_base · γ^d
+SPLIT_GAMMA: float = 0.85
+
+#: LearnableSplitter 初始基础阈值 (用于 MLP 参数初始化)
+#: 注意: 这不同于已废弃的规则分割器的 tau_0=0.15
+#: LearnableSplitter 使用 sigmoid 输出 C_θ(R) ∈ [0,1]，所以 0.5 是中心初始化
+LEARNABLE_INIT_TAU_BASE: float = 0.5
+
+#: LearnableSplitter 初始阈值衰减 (用于 MLP 参数初始化)
+LEARNABLE_INIT_TAU_GAMMA: float = 0.85
 
 # ==================== 数值稳定性常量 ====================
 
