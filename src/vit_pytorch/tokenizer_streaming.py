@@ -322,15 +322,20 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         embeds = self.patch_embed.depth_embed(depths_tensor)
         all_tokens = pooled * scales.unsqueeze(-1) + embeds
         
-        # 分配到输出 buffer
+        # 分配到输出 buffer (P-PERF-3: 向量化分配)
         tokens = torch.zeros(B, max_tokens, dim, device=device, dtype=dtype)
         levels_info = torch.zeros(B, max_tokens, self.max_depth + 1, dtype=torch.long, device=device)
         
-        for idx, (b, i) in enumerate(zip(batch_indices, token_indices)):
-            tokens[b, i] = all_tokens[idx]
-            levels_info[b, i] = torch.tensor(
-                all_levels_info[idx], dtype=torch.long, device=device
-            )
+        # 使用高级索引进行向量化分配
+        batch_idx_tensor = torch.tensor(batch_indices, device=device, dtype=torch.long)
+        token_idx_tensor = torch.tensor(token_indices, device=device, dtype=torch.long)
+        
+        # 向量化 token 分配
+        tokens[batch_idx_tensor, token_idx_tensor] = all_tokens
+        
+        # 向量化 levels_info 分配
+        levels_info_tensor = torch.tensor(all_levels_info, device=device, dtype=torch.long)
+        levels_info[batch_idx_tensor, token_idx_tensor] = levels_info_tensor
         
         return self.patch_embed.norm(tokens), levels_info
     
