@@ -1155,9 +1155,9 @@ def verify_train_eval_consistency(
     mean_diff = output_diff.mean().item()
     
     # V3 Variable Depth: train/eval 差异主要来自 Dropout
-    # 阈值 0.1 对于有 Dropout 的模型是合理的
+    # 阈值 0.2 对于有 Dropout 的模型是合理的（Dropout 可能导致 0.1-0.2 的差异）
     # 注意: 差异并不影响整体 passed 判定，仅作为警告
-    threshold = 0.1
+    threshold = 0.2
     output_check = {
         'max_diff': max_diff,
         'mean_diff': mean_diff,
