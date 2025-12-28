@@ -330,8 +330,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         batch_idx_tensor = torch.tensor(batch_indices, device=device, dtype=torch.long)
         token_idx_tensor = torch.tensor(token_indices, device=device, dtype=torch.long)
         
-        # 向量化 token 分配
-        tokens[batch_idx_tensor, token_idx_tensor] = all_tokens
+        # 向量化 token 分配 (确保 dtype 匹配，支持 AMP 混合精度)
+        tokens[batch_idx_tensor, token_idx_tensor] = all_tokens.to(dtype)
         
         # 向量化 levels_info 分配
         levels_info_tensor = torch.tensor(all_levels_info, device=device, dtype=torch.long)
