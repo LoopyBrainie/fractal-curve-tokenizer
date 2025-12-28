@@ -1414,8 +1414,7 @@ def main():
         enforce_balance=config.enforce_balance,
         # P6-1: 深度缩放配置
         depth_scale_range=config.depth_scale_range,
-        # 分割阈值参数
-        tau_0=config.split_tau0,
+        # 分割阈值参数 (gamma 控制阈值衰减)
         gamma=config.split_gamma,
         # P7-7: 可学习分割器温度参数
         learnable_temperature=config.splitter_temp_start,
