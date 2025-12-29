@@ -875,7 +875,10 @@ def train_epoch(
 ) -> Tuple[float, float, Dict[str, float]]:
     """训练一个 epoch"""
     model.train()
-    total_loss, correct, total = 0.0, 0, 0
+    # P11-8: 使用张量累加，延迟 .item() 调用到 epoch 结束
+    total_loss = torch.tensor(0.0, device=device)
+    correct = torch.tensor(0, device=device, dtype=torch.long)
+    total = 0
     optimizer.zero_grad(set_to_none=True)
     
     batch_times, data_times, forward_times = [], [], []
@@ -958,7 +961,9 @@ def train_epoch(
                     )
                     # 收集各项损失
                     splitter_loss = sum(aux_losses.values())
-                    splitter_metrics = {k: v.item() for k, v in aux_losses.items()}
+                    # P11-8: 延迟 .item() 调用，避免每个 batch 的 GPU-CPU 同步
+                    # 仅在需要显示时才调用
+                    splitter_metrics = aux_losses  # 保留张量引用
                 elif hasattr(model.tokenizer, 'get_learnable_split_loss'):
                     # 后备：旧版接口
                     splitter_loss = model.tokenizer.get_learnable_split_loss(
@@ -1016,25 +1021,33 @@ def train_epoch(
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
         
-        total_loss += loss.item() * config.accum_steps
-        _, pred = outs.max(1)
-        total += labels.size(0)
-        correct += pred.eq(labels).sum().item()
+        # P11-8: 使用 detach() 累加损失，避免保留计算图
+        # .item() 延迟到 epoch 结束时调用
+        with torch.no_grad():
+            total_loss += loss.detach() * config.accum_steps
+            _, pred = outs.detach().max(1)
+            total += labels.size(0)
+            correct += pred.eq(labels).sum()
         
         batch_times.append(time.time() - batch_start)
         
         if device.type == 'cuda':
             cuda_mem_peak = max(cuda_mem_peak, torch.cuda.max_memory_allocated() / 1024**3)
         
-        if profile and (i < 5 or i % 100 == 0):
-            pbar.set_postfix(
-                loss=f'{loss.item()*config.accum_steps:.3f}',
-                acc=f'{100.*correct/total:.1f}%',
-                data=f'{data_time*1000:.0f}ms',
-                fwd=f'{forward_time*1000:.0f}ms'
-            )
-        else:
-            pbar.set_postfix(loss=f'{loss.item()*config.accum_steps:.4f}', acc=f'{100.*correct/total:.1f}%')
+        # P11-8: 减少 .item() 调用频率，仅每 10 个 batch 同步一次
+        if i % 10 == 0:
+            loss_val = loss.item() * config.accum_steps
+            # correct 现在是张量，需要 .item()
+            acc_val = 100. * correct.item() / total if total > 0 else 0
+            if profile and (i < 5 or i % 100 == 0):
+                pbar.set_postfix(
+                    loss=f'{loss_val:.3f}',
+                    acc=f'{acc_val:.1f}%',
+                    data=f'{data_time*1000:.0f}ms',
+                    fwd=f'{forward_time*1000:.0f}ms'
+                )
+            else:
+                pbar.set_postfix(loss=f'{loss_val:.4f}', acc=f'{acc_val:.1f}%')
         
         data_start = time.time()
     
@@ -1083,7 +1096,10 @@ def train_epoch(
             except Exception:
                 pass
     
-    return total_loss / len(loader), 100.0 * correct / total, perf_stats
+    # P11-8: 在返回前进行一次 GPU-CPU 同步
+    final_loss = (total_loss / len(loader)).item()
+    final_acc = (100.0 * correct / total).item() if total > 0 else 0.0
+    return final_loss, final_acc, perf_stats
 
 
 @torch.no_grad()
@@ -1673,19 +1689,23 @@ def main():
     print()
     
     # 编译预热: 在正式训练前触发 JIT 编译
+    # P11-7 优化: 使用完整 batch size 预热，避免动态形状导致重新编译
     if config.compile_model:
-        print("[INFO] Warming up compiled model...")
+        print("[INFO] Warming up compiled model with full batch size...")
         try:
             warmup_batch = next(iter(train_loader))
             if isinstance(warmup_batch, (list, tuple)):
-                warmup_imgs = warmup_batch[0][:2].to(device)  # 只用2个样本
+                warmup_imgs = warmup_batch[0].to(device)  # 使用完整 batch
             else:
-                warmup_imgs = warmup_batch[:2].to(device)
+                warmup_imgs = warmup_batch.to(device)
             if config.channels_last:
                 warmup_imgs = warmup_imgs.to(memory_format=torch.channels_last)
+            # 多次预热确保编译稳定
             with torch.no_grad():
                 with get_amp_context(device, config.use_amp):
-                    _ = model(warmup_imgs)
+                    for _ in range(3):  # 3次预热确保编译稳定
+                        _ = model(warmup_imgs)
+                        torch.cuda.synchronize()  # 确保编译完成
             del warmup_imgs
             torch.cuda.empty_cache()
             print("[OK] Compilation complete!")
