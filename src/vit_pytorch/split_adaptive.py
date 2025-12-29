@@ -1946,8 +1946,11 @@ class LearnableSplitter(nn.Module):
             # Step 3: 批量计算分割决策 (向量化)
             # ------------------------------------------------------------------
             tau_d = self.thresholds[depth]
-            T = self.log_temperature.exp()
-            p_split = torch.sigmoid((complexities - tau_d) / T)  # [M]
+            # P10-NaN-6: 温度下界保护，防止 sigmoid 输入过大
+            T = self.log_temperature.exp().clamp(min=0.01)
+            # P10-NaN-6: clamp sigmoid 输入，防止极端梯度
+            sigmoid_input = ((complexities - tau_d) / T).clamp(-20.0, 20.0)
+            p_split = torch.sigmoid(sigmoid_input)  # [M]
             
             # 更新统计 (无梯度)
             with torch.no_grad():
@@ -1979,14 +1982,24 @@ class LearnableSplitter(nn.Module):
                     gumbel_noise = -torch.log(-torch.log(
                         torch.rand_like(p_split).clamp(1e-10, 1-1e-10)
                     ))
+                    # P10-NaN-1: 修复 log(p/(1-p)) 当 p→0 时产生 -Inf
+                    # 数学分析: 需要同时 clamp p 和 (1-p) 避免除零和 log(0)
+                    eps_logit = 1e-6  # 更宽松的 epsilon 避免数值极端
+                    p_safe = p_split.clamp(eps_logit, 1 - eps_logit)
                     # 构建 logits: [不分割, 分割]
                     logits = torch.stack([
                         torch.zeros_like(p_split),  # log(1-p) ≈ 0 for simplicity
-                        (p_split / (1 - p_split + 1e-10)).log()  # log(p/(1-p))
+                        (p_safe / (1 - p_safe)).log()  # log(p/(1-p)), 现在安全
                     ], dim=-1)  # [M, 2]
                     
+                    # P10-NaN-2: 修复低温度时 softmax 溢出
+                    # 数学分析: 当 T=0.05, logits=20 时, logits/T=400 导致 exp 溢出
+                    # 解决方案: clamp logits/T 到安全范围 [-88, 88] (FP32 exp 安全范围)
+                    T_safe = T.clamp(min=0.01)  # 温度下界保护
+                    scaled_logits = (logits + gumbel_noise.unsqueeze(-1)) / T_safe
+                    scaled_logits = scaled_logits.clamp(-88.0, 88.0)  # 防止 exp 溢出
                     # Gumbel-Softmax: 软概率
-                    y_soft = F.softmax((logits + gumbel_noise.unsqueeze(-1)) / T, dim=-1)
+                    y_soft = F.softmax(scaled_logits, dim=-1)
                     
                     # STE: 前向用硬决策，反向用软概率
                     # y_hard = one_hot(argmax(y_soft))
@@ -2211,10 +2224,13 @@ class LearnableSplitter(nn.Module):
         
         # 获取当前深度的阈值
         tau_d = self.thresholds[depth]
-        T = self.log_temperature.exp()
+        # P10-NaN-7: 温度下界保护
+        T = self.log_temperature.exp().clamp(min=0.01)
         
         # 计算分割概率
-        p_split = torch.sigmoid((complexities - tau_d) / T)  # [N]
+        # P10-NaN-7: clamp sigmoid 输入防止极端值
+        sigmoid_input = ((complexities - tau_d) / T).clamp(-20.0, 20.0)
+        p_split = torch.sigmoid(sigmoid_input)  # [N]
         
         # 更新统计信息
         with torch.no_grad():
@@ -2294,21 +2310,26 @@ class LearnableSplitter(nn.Module):
         """
         device = p_split.device
         N = p_split.shape[0]
-        eps = 1e-8
+        eps = 1e-6  # P10-NaN-3: 更宽松的 epsilon 避免数值极端
+        
+        # P10-NaN-3: clamp p_split 避免 log(0)
+        p_safe = p_split.clamp(eps, 1 - eps)
         
         # Log probabilities: [N, 2]
         log_probs = torch.stack([
-            torch.log(1 - p_split + eps),
-            torch.log(p_split + eps)
+            torch.log(1 - p_safe),  # 现在安全
+            torch.log(p_safe)       # 现在安全
         ], dim=1)  # [N, 2]
         
         # Gumbel noise: [N, 2]
-        u = torch.rand(N, 2, device=device)
-        gumbel = -torch.log(-torch.log(u + eps) + eps)
+        u = torch.rand(N, 2, device=device).clamp(1e-10, 1-1e-10)
+        gumbel = -torch.log(-torch.log(u))
         
-        # Gumbel-Softmax: [N, 2]
-        tau_gumbel = self.log_temperature.exp()
-        y = F.softmax((log_probs + gumbel) / tau_gumbel, dim=1)  # [N, 2]
+        # P10-NaN-4: 温度下界保护 + softmax 输入 clamp
+        tau_gumbel = self.log_temperature.exp().clamp(min=0.01)
+        scaled_logits = (log_probs + gumbel) / tau_gumbel
+        scaled_logits = scaled_logits.clamp(-88.0, 88.0)  # 防止 exp 溢出
+        y = F.softmax(scaled_logits, dim=1)  # [N, 2]
         
         # Hard decisions for control flow
         hard_indices = y[:, 1] > y[:, 0]  # [N] bool
@@ -2383,8 +2404,10 @@ class LearnableSplitter(nn.Module):
         
         # 3. 计算分割概率 p_split = σ((C - τ_d) / T)
         tau_d = self.thresholds[depth]
-        T = self.log_temperature.exp()
-        p_split = torch.sigmoid((complexity - tau_d) / T)
+        # P10-NaN-8: 温度下界保护
+        T = self.log_temperature.exp().clamp(min=0.01)
+        sigmoid_input = ((complexity - tau_d) / T).clamp(-20.0, 20.0)
+        p_split = torch.sigmoid(sigmoid_input)
         
         # 更新统计信息
         with torch.no_grad():
@@ -2499,16 +2522,20 @@ class LearnableSplitter(nn.Module):
         
         device = p_split.device
         
-        # Log probabilities
-        eps = 1e-8
-        log_probs = torch.log(torch.stack([1 - p_split + eps, p_split + eps]))
+        # P10-NaN-5: Log probabilities 数值稳定性修复
+        eps = 1e-6
+        p_safe = p_split.clamp(eps, 1 - eps)
+        log_probs = torch.log(torch.stack([1 - p_safe, p_safe]))
         
         # Gumbel noise
-        gumbel = -torch.log(-torch.log(torch.rand(2, device=device) + eps) + eps)
+        u = torch.rand(2, device=device).clamp(1e-10, 1-1e-10)
+        gumbel = -torch.log(-torch.log(u))
         
-        # Gumbel-Softmax
-        tau_gumbel = self.log_temperature.exp()
-        y = F.softmax((log_probs + gumbel) / tau_gumbel, dim=0)
+        # P10-NaN-5: Gumbel-Softmax 温度下界 + clamp
+        tau_gumbel = self.log_temperature.exp().clamp(min=0.01)
+        scaled_logits = (log_probs + gumbel) / tau_gumbel
+        scaled_logits = scaled_logits.clamp(-88.0, 88.0)
+        y = F.softmax(scaled_logits, dim=0)
         
         # Hard sample with STE
         if self.training:
@@ -2710,16 +2737,20 @@ class LearnableSplitter(nn.Module):
         
         # 分割概率
         tau_0 = self.thresholds[0]
-        T = self.log_temperature.exp()
-        p_split_root = torch.sigmoid((root_complexity - tau_0) / T)
+        # P10-NaN-9: 温度下界保护
+        T = self.log_temperature.exp().clamp(min=0.01)
+        sigmoid_input = ((root_complexity - tau_0) / T).clamp(-20.0, 20.0)
+        p_split_root = torch.sigmoid(sigmoid_input)
         
         # 预期 token 数 (粗略估计)
         # E[N] ≈ 1 * (1-p_0) + 4 * p_0 * (1-p_1) + 16 * p_0 * p_1 * (1-p_2) + ...
         expected_tokens = (1 - p_split_root)
         
         # 鼓励分割概率接近 0.5 (最大熵)
-        entropy_proxy = -(p_split_root * (p_split_root + 1e-8).log() + 
-                          (1 - p_split_root) * (1 - p_split_root + 1e-8).log())
+        # P10-NaN-9: clamp p 避免 log(0)
+        p_safe = p_split_root.clamp(1e-6, 1-1e-6)
+        entropy_proxy = -(p_safe * p_safe.log() + 
+                          (1 - p_safe) * (1 - p_safe).log())
         
         # 目标: 最大化熵
         loss = (target_entropy - entropy_proxy).pow(2)
@@ -2860,8 +2891,8 @@ class LearnableSplitter(nn.Module):
         scale_h = H_feat / H_img
         scale_w = W_feat / W_img
         
-        # 获取当前温度
-        T = self.log_temperature.exp()
+        # P10-NaN-12: 获取当前温度 (带下界保护)
+        T = self.log_temperature.exp().clamp(min=0.01)
         
         # =====================================================================
         # 1. 生成所有网格区域的 boxes
@@ -2957,12 +2988,14 @@ class LearnableSplitter(nn.Module):
             
             # 分割概率 p_d = σ((C - τ_d) / T)
             tau_d = self.thresholds[d]
-            p_split_d = torch.sigmoid((complexities_d - tau_d) / T)
+            # P10-NaN-10: clamp sigmoid 输入
+            sigmoid_input = ((complexities_d - tau_d) / T).clamp(-20.0, 20.0)
+            p_split_d = torch.sigmoid(sigmoid_input)
             
             # 二元熵 H(p) = -p·log(p) - (1-p)·log(1-p)
-            eps = 1e-8
-            entropy_d = -(p_split_d * (p_split_d + eps).log() + 
-                         (1 - p_split_d) * (1 - p_split_d + eps).log())
+            # P10-NaN-10: 使用 p_safe 避免 log(0)
+            entropy_d = -(p_safe * p_safe.log() + 
+                         (1 - p_safe) * (1 - p_safe).log())
             
             # 平均熵
             mean_entropy_d = entropy_d.mean()
@@ -3065,7 +3098,8 @@ class LearnableSplitter(nn.Module):
         
         scale_h = H_feat / H_img
         scale_w = W_feat / W_img
-        T = self.log_temperature.exp()
+        # P10-NaN-11: 温度下界保护
+        T = self.log_temperature.exp().clamp(min=0.01)
         
         cell_h = H_img / grid_size
         cell_w = W_img / grid_size
@@ -3133,7 +3167,9 @@ class LearnableSplitter(nn.Module):
             complexities = unique_complexities[inverse_indices]  # [G²]
             
             tau_d = self.thresholds[d]
-            p_split = torch.sigmoid((complexities - tau_d) / T)  # [G²]
+            # P10-NaN-11: clamp sigmoid 输入
+            sigmoid_input = ((complexities - tau_d) / T).clamp(-20.0, 20.0)
+            p_split = torch.sigmoid(sigmoid_input)  # [G²]
             
             if d < D:
                 p_stop = 1 - p_split
