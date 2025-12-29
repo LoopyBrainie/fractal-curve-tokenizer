@@ -36,25 +36,26 @@ P9 性能优化 (2025-12-28)
 训练速度从 24s/iter 优化至 ~1.6s/iter (14.8x 加速):
 
 1. P9-1: TensorSplitResult - 纯张量表示替代 Python dataclass
-   - 消除 O(N) Python 对象创建
-   - 零 GPU-CPU 同步点 (.item()/.tolist())
-
-2. P9-2: 完全向量化 BFS
-   - O(D) GPU kernels 替代 O(D×B) Python 循环
-   - 删除旧 Python 分割路径 (~340 行)
-
+2. P9-2: 完全向量化 BFS - O(D) GPU kernels
 3. P9-5: TokenizerOutput 预填充缓存
-   - 避免 _prepare_tokens 中的 O(B) padding 循环
+4. P9-6: depth_distribution 向量化 - scatter_add
 
-4. P9-6: depth_distribution 向量化
-   - scatter_add 替代嵌套 Python 循环
-   - GPU-CPU 同步从 O(B×D) 降至 O(1)
+P10 训练稳定性修复 (2025-01-14)
+-------------------------------
+解决 LearnableSplitter 梯度消失和训练崩溃问题:
+
+1. P10-1: STE 梯度修复 - 使用 hard_split - soft_probs.detach() + soft_probs
+2. P10-2: 初始化修复 - gain=1.0 替代 4.0，临界区从 95% 降至 22%
+3. P10-4/P10-5: 软熵损失 (推荐开启)
+   - 公式: H̃ = -Σ_d p̃(d) · log(p̃(d) + ε)
+   - 使用 BFS 缓存概率，而非固定网格评估
+   - 模式: 'maximize' (最大化多样性) 或 'target' (匹配目标)
+4. P10-9: 弹性预算损失 (推荐开启)
+   - Dead Zone [N_min, N_max] 内零惩罚
+   - 非对称惩罚: λ_over=0.1 >> λ_under=0.01
 
 特性：
 1. StreamingFractalTokenizerV3：Variable Depth Tokens 自适应多尺度
-   - 使用 LearnableSplitter 进行内容自适应分割
-   - 共享卷积特征提取 + 深度编码 + ROI-Align 池化
-   - 完全向量化的 BFS 分割 (P9-1)
 2. SwiGLU FFN：现代化前馈网络 (swiglu_level 推荐)
 3. Hilbert 曲线重排序：保持空间局部性
 4. LCA Hilbert Bias：层级感知注意力偏置
@@ -64,14 +65,17 @@ P9 性能优化 (2025-12-28)
     # CIFAR-10 快速测试
     python train_fractal_vit.py --quick-test --use-amp
     
-    # Tiny ImageNet 完整训练 (推荐配置)
+    # Tiny ImageNet 完整训练 (推荐配置 - 含 P10 优化)
     python train_fractal_vit.py --dataset tiny-imagenet --epochs 100 --dim 384 \\
         --depth 12 --heads 8 --dropout 0.1 --drop-path 0.15 --use-amp \\
-        --gradient-checkpoint --compile --channels-last
+        --gradient-checkpoint --compile --channels-last \\
+        --include-soft-entropy --include-elastic-budget
     
-    # 可学习分割器温度退火调度 (默认已启用)
+    # 自定义 P10 参数
     python train_fractal_vit.py --dataset tiny-imagenet --epochs 100 \\
-        --splitter-temp-start 1.0 --splitter-temp-end 0.1 --splitter-temp-warmup 5
+        --soft-entropy-mode maximize --soft-entropy-weight 0.1 \\
+        --elastic-N-min 32 --elastic-N-max 256 \\
+        --elastic-lambda-over 0.1 --elastic-lambda-under 0.01
 
 注意：V1 和 V2 已从代码库中完全删除，当前仅支持 streaming_v3。
 """
@@ -247,6 +251,19 @@ class TrainingConfig:
     splitter_temp_start: float  # 起始温度 T_start
     splitter_temp_end: float  # 终止温度 T_end
     splitter_temp_warmup: int  # Warmup epoch 数 (固定 T_start)
+    
+    # P10-4/P10-5: 软熵损失参数
+    include_soft_entropy: bool  # 是否启用软熵损失（推荐 True）
+    soft_entropy_mode: str  # 熵损失模式: 'maximize'（最大化熵）或 'target'（匹配目标）
+    soft_entropy_weight: float  # 软熵损失权重
+    soft_entropy_target: Optional[float]  # 目标熵值（仅 mode='target' 时使用）
+    
+    # P10-9: 弹性预算损失参数
+    include_elastic_budget: bool  # 是否启用弹性预算损失（推荐 True）
+    elastic_N_min: int  # 弹性预算下界（Dead Zone 左边界）
+    elastic_N_max: int  # 弹性预算上界（Dead Zone 右边界）
+    elastic_lambda_over: float  # 超出上界惩罚权重
+    elastic_lambda_under: float  # 低于下界约束权重
     
     # 训练
     epochs: int
@@ -917,15 +934,38 @@ def train_epoch(
             if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_entropy_loss'):
                 entropy_loss = model.tokenizer.get_entropy_loss()
             
-            # P7-6: 可学习分割器辅助损失
-            # 通过可微分路径优化分割策略：熵正则化 + 预算约束 + 阈值正则化
+            # P10-4/P10-9: 可学习分割器辅助损失（推荐使用统一接口）
+            # 包含: 软熵损失 + 弹性预算损失 + 阈值 barrier 正则化
             splitter_loss = None
-            if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_learnable_split_loss'):
-                splitter_loss = model.tokenizer.get_learnable_split_loss(
-                    lambda_entropy=config.lambda_splitter_entropy,
-                    lambda_budget=config.lambda_splitter_budget,
-                    target_tokens=config.splitter_token_budget,
-                )
+            splitter_metrics = {}
+            if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
+                splitter = model.tokenizer.splitter
+                if hasattr(splitter, 'get_auxiliary_losses'):
+                    aux_losses = splitter.get_auxiliary_losses(
+                        features=model.tokenizer._last_features,
+                        image_size=(imgs.shape[2], imgs.shape[3]),
+                        include_balance=config.enforce_balance,
+                        include_elastic_budget=config.include_elastic_budget,
+                        include_soft_entropy=config.include_soft_entropy,
+                        batch_size=imgs.shape[0],
+                        elastic_N_min=config.elastic_N_min,
+                        elastic_N_max=config.elastic_N_max,
+                        elastic_lambda_over=config.elastic_lambda_over,
+                        elastic_lambda_under=config.elastic_lambda_under,
+                        entropy_target=config.soft_entropy_target,
+                        entropy_weight=config.soft_entropy_weight,
+                        entropy_mode=config.soft_entropy_mode,
+                    )
+                    # 收集各项损失
+                    splitter_loss = sum(aux_losses.values())
+                    splitter_metrics = {k: v.item() for k, v in aux_losses.items()}
+                elif hasattr(model.tokenizer, 'get_learnable_split_loss'):
+                    # 后备：旧版接口
+                    splitter_loss = model.tokenizer.get_learnable_split_loss(
+                        lambda_entropy=config.lambda_splitter_entropy,
+                        lambda_budget=config.lambda_splitter_budget,
+                        target_tokens=config.splitter_token_budget,
+                    )
             
             # P8-3: 多层深度损失 (仅可学习分割器)
             # 确保所有深度层级的阈值都收到梯度信号
@@ -1020,6 +1060,28 @@ def train_epoch(
         if training_stats.get('learnable_split'):
             perf_stats['learnable_thresholds'] = training_stats.get('learnable_thresholds')
             perf_stats['learnable_temperature'] = training_stats.get('learnable_temperature')
+    
+    # P10-4/P10-5/P10-9: 获取 LearnableSplitter 深度分布统计
+    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
+        splitter = model.tokenizer.splitter
+        if hasattr(splitter, 'get_depth_distribution_stats'):
+            try:
+                depth_stats = splitter.get_depth_distribution_stats()
+                if depth_stats:
+                    perf_stats['soft_entropy'] = depth_stats.get('entropy')
+                    perf_stats['entropy_ratio'] = depth_stats.get('entropy_ratio')
+                    perf_stats['dominant_depth'] = depth_stats.get('dominant_depth')
+                    perf_stats['dominant_prob'] = depth_stats.get('dominant_prob')
+            except Exception:
+                pass  # 忽略统计收集错误
+        
+        # P10-9: 软 token 计数
+        if hasattr(splitter, 'get_soft_token_count'):
+            try:
+                soft_count = splitter.get_soft_token_count(batch_size=1)
+                perf_stats['soft_token_count'] = soft_count.item() if hasattr(soft_count, 'item') else soft_count
+            except Exception:
+                pass
     
     return total_loss / len(loader), 100.0 * correct / total, perf_stats
 
@@ -1296,6 +1358,33 @@ def main():
     parser.add_argument("--splitter-temp-warmup", type=int, default=5,
                        help="Warmup epochs with fixed T_start (default: 5)")
     
+    # P10-4/P10-5: 软熵损失参数
+    parser.add_argument("--include-soft-entropy", action="store_true", default=True,
+                       help="Enable soft entropy loss (default: True, recommended)")
+    parser.add_argument("--no-soft-entropy", action="store_false", dest="include_soft_entropy",
+                       help="Disable soft entropy loss")
+    parser.add_argument("--soft-entropy-mode", type=str, default="maximize",
+                       choices=["maximize", "target"],
+                       help="Soft entropy mode: 'maximize' or 'target' (default: maximize)")
+    parser.add_argument("--soft-entropy-weight", type=float, default=0.1,
+                       help="Soft entropy loss weight (default: 0.1)")
+    parser.add_argument("--soft-entropy-target", type=float, default=None,
+                       help="Target entropy for mode='target' (default: None, auto=ln(max_depth+1))")
+    
+    # P10-9: 弹性预算损失参数
+    parser.add_argument("--include-elastic-budget", action="store_true", default=True,
+                       help="Enable elastic budget loss (default: True, recommended)")
+    parser.add_argument("--no-elastic-budget", action="store_false", dest="include_elastic_budget",
+                       help="Disable elastic budget loss")
+    parser.add_argument("--elastic-N-min", type=int, default=32,
+                       help="Elastic budget lower bound (default: 32)")
+    parser.add_argument("--elastic-N-max", type=int, default=256,
+                       help="Elastic budget upper bound (default: 256)")
+    parser.add_argument("--elastic-lambda-over", type=float, default=0.1,
+                       help="Penalty weight for exceeding upper bound (default: 0.1)")
+    parser.add_argument("--elastic-lambda-under", type=float, default=0.01,
+                       help="Penalty weight for falling below lower bound (default: 0.01)")
+    
     # 训练
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=5e-4)
@@ -1397,6 +1486,17 @@ def main():
         splitter_temp_start=args.splitter_temp_start,
         splitter_temp_end=args.splitter_temp_end,
         splitter_temp_warmup=args.splitter_temp_warmup,
+        # P10-4/P10-5: 软熵损失配置
+        include_soft_entropy=args.include_soft_entropy,
+        soft_entropy_mode=args.soft_entropy_mode,
+        soft_entropy_weight=args.soft_entropy_weight,
+        soft_entropy_target=args.soft_entropy_target,
+        # P10-9: 弹性预算损失配置
+        include_elastic_budget=args.include_elastic_budget,
+        elastic_N_min=args.elastic_N_min,
+        elastic_N_max=args.elastic_N_max,
+        elastic_lambda_over=args.elastic_lambda_over,
+        elastic_lambda_under=args.elastic_lambda_under,
         # 训练配置
         epochs=args.epochs,
         learning_rate=args.lr,
@@ -1698,6 +1798,18 @@ def main():
             temperature = perf_stats.get('learnable_temperature', 1.0)
             tau_str = ", ".join([f"τ{i}:{t:.3f}" for i, t in enumerate(thresholds[:4])])  # 只显示前4层
             print(f"  Splitter: T={temperature:.3f}, {tau_str}")
+        
+        # P10-4/P10-5/P10-9: 显示软熵和弹性预算状态
+        if perf_stats.get('soft_entropy') is not None or perf_stats.get('soft_token_count') is not None:
+            p10_parts = []
+            if perf_stats.get('entropy_ratio') is not None:
+                p10_parts.append(f"H_ratio={perf_stats['entropy_ratio']:.2%}")
+            if perf_stats.get('dominant_prob') is not None:
+                p10_parts.append(f"dom_prob={perf_stats['dominant_prob']:.2%}")
+            if perf_stats.get('soft_token_count') is not None:
+                p10_parts.append(f"N_soft={perf_stats['soft_token_count']:.1f}")
+            if p10_parts:
+                print(f"  P10: {', '.join(p10_parts)}")
         
         # 保存最佳
         if val_acc > best_val + config.min_delta:
