@@ -141,6 +141,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, SubsetRandomSampler, Subset
 from torchvision import datasets, transforms
 from tqdm import tqdm
+import atexit
+import signal
 
 # 分层采样
 try:
@@ -802,12 +804,30 @@ def create_dataloaders(
         train_idx, val_idx = indices[val_size:], indices[:val_size]
     
     # DataLoader 参数
-    mp_context = 'spawn' if config.num_workers > 0 else None
+    # P10-RES-2: 优化多进程上下文选择
+    # - Linux: 使用 'fork' (更快，但注意 CUDA 兼容性)
+    # - Windows/macOS: 使用 'spawn' (更安全)
+    # - Docker 容器: 使用 'forkserver' 或 None (避免信号量泄漏)
+    import platform
+    if config.num_workers > 0:
+        if platform.system() == 'Linux':
+            # 检测是否在 Docker 容器中
+            is_docker = os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv')
+            if is_docker:
+                # Docker 中使用 forkserver 减少资源泄漏
+                mp_context = 'forkserver'
+            else:
+                mp_context = 'fork'
+        else:
+            mp_context = 'spawn'
+    else:
+        mp_context = None
+    
     loader_kwargs = {
         'batch_size': config.batch_size,
         'num_workers': config.num_workers,
         'pin_memory': config.num_workers > 0,
-        'multiprocessing_context': mp_context,
+        'multiprocessing_context': mp_context if config.num_workers > 0 else None,
         'persistent_workers': config.num_workers > 1,
     }
     if config.num_workers > 0:
@@ -821,6 +841,19 @@ def create_dataloaders(
     test_loader = DataLoader(test_ds, **test_kwargs)
     
     print(f"[OK] Data: train={len(train_idx)}, val={len(val_idx)}, test={len(test_ds)}")
+    
+    # P10-RES-1: 注册清理函数，防止信号量泄漏
+    def cleanup_dataloaders():
+        """清理 DataLoader 工作进程"""
+        try:
+            # 显式关闭迭代器
+            for loader in [train_loader, val_loader, test_loader]:
+                if hasattr(loader, '_iterator') and loader._iterator is not None:
+                    loader._iterator._shutdown_workers()
+        except Exception:
+            pass
+    
+    atexit.register(cleanup_dataloaders)
     
     return train_loader, val_loader, test_loader
 
@@ -1952,5 +1985,25 @@ def main():
         json.dump(results, f, indent=2)
 
 
+def cleanup_multiprocessing():
+    """清理多进程资源，防止信号量泄漏"""
+    import gc
+    gc.collect()
+    
+    # 强制终止所有子进程
+    try:
+        import multiprocessing
+        for p in multiprocessing.active_children():
+            p.terminate()
+            p.join(timeout=1)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[INFO] 训练被中断")
+    finally:
+        cleanup_multiprocessing()
