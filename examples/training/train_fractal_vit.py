@@ -54,6 +54,21 @@ P10 训练稳定性修复 (2025-01-14)
    - Dead Zone [N_min, N_max] 内零惩罚
    - 非对称惩罚: λ_over=0.1 >> λ_under=0.01
 
+P12 内部向量化优化 (2025-12-29)
+--------------------------------
+消除 O(B) 或 O(N) Python 循环，提升推理和训练速度:
+
+1. P12-1: get_soft_balance_loss - roi_align + scatter_reduce (23.1x 加速)
+   - 公式: L_soft = Σ_g (L_soft_g · w_g)，w_g = N_g / N
+   - 向量化: 使用 unique + scatter_reduce 批量计算每组统计
+2. P12-2: _create_attention_mask - 广播比较替代循环 (3.8-7.8x 加速)
+   - 公式: M_{b,s} = 1{s > L_b}，向量化: positions > lengths
+3. P12-3: _embed_with_tensor_result - segment cumsum (6.4-39x 加速)
+   - 公式: pos[i] = i - Σ_{j<i} 1{batch_idx[j] ≠ batch_idx[i-1]}
+   - 向量化: cummax 传播 segment 起始位置
+4. P12-4: to_split_results - bincount/cumsum (2.2x 加速，已废弃)
+5. P12-5: _fallback_roi_pool - 批量 grid_sample (15.1x 加速)
+
 特性：
 1. StreamingFractalTokenizerV3：Variable Depth Tokens 自适应多尺度
 2. SwiGLU FFN：现代化前馈网络 (swiglu_level 推荐)

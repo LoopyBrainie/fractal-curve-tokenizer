@@ -11,6 +11,11 @@
 支持 Tokenizer 类型：
 - StreamingFractalTokenizerV3 (Variable Depth Tokens, 唯一支持)
 
+P12 优化 (2025-12-29):
+- 内部向量化优化已自动生效，无需修改评估代码
+- get_padded_tokens() 返回 Tensor lengths (向后兼容)
+- _create_attention_mask 使用广播比较 (3.8-7.8x 加速)
+
 注意：V1 和 V2 已从代码库完全移除。
 
 使用示例：

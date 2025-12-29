@@ -37,6 +37,12 @@ This script visualizes the core mathematical structures of Fractal Curve ViT:
    P6-1 improvement: σ_d = σ_min + (σ_max - σ_min) · sigmoid(γ_d)
    Dynamic range expanded from 1.2x to 4x
 
+5. **P12 Internal Vectorization (2025-12-29)**:
+   - _create_attention_mask: Broadcast comparison (3.8-7.8x speedup)
+   - _embed_with_tensor_result: Segment cumsum (6.4-39x speedup)
+   - get_soft_balance_loss: roi_align + scatter_reduce (23.1x speedup)
+   - _fallback_roi_pool: Batch grid_sample (15.1x speedup)
+
 Note: V1 and V2 have been completely removed from the codebase.
 
 Visualization Functions
