@@ -2100,10 +2100,14 @@ class LearnableSplitter(nn.Module):
         # 按 (batch_idx, hilbert_idx) 排序
         result = result.sort_by_hilbert()
         
-        # 计算每个 batch 的 token 数量
-        tokens_per_batch = torch.zeros(B, device=device, dtype=torch.long)
-        for b in range(B):
-            tokens_per_batch[b] = (result.batch_indices == b).sum()
+        # P11-2 优化: 使用 torch.bincount 替代 Python 循环
+        # 原实现: for b in range(B): tokens_per_batch[b] = (result.batch_indices == b).sum()
+        # 复杂度: O(B) Python 循环 × O(N) 比较 = O(B×N)
+        # 优化后: O(N) 单次 bincount 操作
+        tokens_per_batch = torch.bincount(
+            result.batch_indices, 
+            minlength=B
+        )
         result.tokens_per_batch = tokens_per_batch
         
         return result

@@ -227,16 +227,21 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 hard=not self.training,
             )
             
-            # 更新统计信息 (需要一次 GPU-CPU 同步，但只在边界处)
+            # P11-3 优化: 使用 non_blocking=True 减少 GPU-CPU 同步阻塞
+            # 统计收集在 no_grad 块内，不影响梯度，但仍需数据传输
+            # non_blocking 允许 CUDA 流并行，减少等待时间
             with torch.no_grad():
                 tokens_per_batch = tensor_result.tokens_per_batch
                 if tokens_per_batch is not None:
-                    num_tokens_list = tokens_per_batch.cpu().tolist()
+                    # P11-3: 异步传输到 CPU
+                    num_tokens_list = tokens_per_batch.cpu(non_blocking=True).tolist()
                 else:
-                    num_tokens_list = []
-                    for b in range(B):
-                        n = (tensor_result.batch_indices == b).sum()
-                        num_tokens_list.append(int(n.item()))
+                    # Fallback: 使用 bincount (P11-2 优化的一致性)
+                    tokens_per_batch = torch.bincount(
+                        tensor_result.batch_indices, 
+                        minlength=B
+                    )
+                    num_tokens_list = tokens_per_batch.cpu(non_blocking=True).tolist()
                 
                 # 计算 depth distribution (P9-6 向量化优化)
                 # 使用批量操作减少 .item() 调用次数从 O(B × max_depth) 到 O(B)
@@ -255,9 +260,11 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                     ones = torch.ones_like(flat_idx)
                     count_matrix.view(-1).scatter_add_(0, flat_idx, ones)
                     
-                    # 一次性转为 CPU (单次同步)
-                    count_matrix_cpu = count_matrix.cpu().numpy()
+                    # P11-3: 异步传输到 CPU
+                    count_matrix_cpu = count_matrix.cpu(non_blocking=True).numpy()
                     
+                    # P11-4 保留: Python 循环构建 dict 结构
+                    # 这是必要的，因为输出格式需要稀疏字典表示
                     for b in range(B):
                         dist = {}
                         for d in range(max_d):
