@@ -1978,26 +1978,43 @@ class LearnableSplitter(nn.Module):
             else:
                 # Gumbel-Softmax + STE (向量化)
                 if self.use_gumbel:
-                    # Gumbel 噪声采样
-                    gumbel_noise = -torch.log(-torch.log(
-                        torch.rand_like(p_split).clamp(1e-10, 1-1e-10)
-                    ))
+                    # P10-NaN-14: 正确的 Gumbel-Softmax 实现
+                    # 数学形式化:
+                    #   Gumbel-Softmax: y_i = exp((log(π_i) + g_i) / τ) / Σ_j exp((log(π_j) + g_j) / τ)
+                    #   其中 g_i ~ Gumbel(0, 1) = -log(-log(U)), U ~ Uniform(0, 1)
+                    #   关键: 每个类别需要独立的 Gumbel 噪声！
+                    
+                    # P10-NaN-16: 强制在 FP32 下进行 Gumbel-Softmax 计算
+                    # AMP 环境下，FP16 的精度不足以安全计算 -log(-log(u)):
+                    #   - FP16 最小正数 ≈ 6e-5，clamp(1e-10) 无效
+                    #   - FP16 exp 安全范围 [-17, 11]，而非 FP32 的 [-88, 88]
+                    # 解决方案: 在 FP32 下计算，然后转回原精度
+                    original_dtype = p_split.dtype
+                    p_split_fp32 = p_split.float()  # 强制 FP32
+                    T_fp32 = T.float()
+                    
+                    # 为两个类别 [不分割, 分割] 独立采样 Gumbel 噪声
+                    # 形状: [M, 2]，始终使用 FP32
+                    uniform = torch.rand(p_split_fp32.shape[0], 2, device=p_split.device, dtype=torch.float32)
+                    uniform = uniform.clamp(1e-10, 1 - 1e-10)  # 避免 log(0)
+                    gumbel_noise = -torch.log(-torch.log(uniform))  # [M, 2]
+                    
                     # P10-NaN-1: 修复 log(p/(1-p)) 当 p→0 时产生 -Inf
-                    # 数学分析: 需要同时 clamp p 和 (1-p) 避免除零和 log(0)
-                    eps_logit = 1e-6  # 更宽松的 epsilon 避免数值极端
-                    p_safe = p_split.clamp(eps_logit, 1 - eps_logit)
-                    # 构建 logits: [不分割, 分割]
-                    logits = torch.stack([
-                        torch.zeros_like(p_split),  # log(1-p) ≈ 0 for simplicity
-                        (p_safe / (1 - p_safe)).log()  # log(p/(1-p)), 现在安全
+                    eps_logit = 1e-6
+                    p_safe = p_split_fp32.clamp(eps_logit, 1 - eps_logit)
+                    
+                    # 构建 log-概率 logits: [不分割, 分割]
+                    # log(1-p) 和 log(p)，而非 log-odds
+                    log_probs = torch.stack([
+                        (1 - p_safe).log(),  # log(1-p): 不分割的 log 概率
+                        p_safe.log()         # log(p): 分割的 log 概率
                     ], dim=-1)  # [M, 2]
                     
-                    # P10-NaN-2: 修复低温度时 softmax 溢出
-                    # 数学分析: 当 T=0.05, logits=20 时, logits/T=400 导致 exp 溢出
-                    # 解决方案: clamp logits/T 到安全范围 [-88, 88] (FP32 exp 安全范围)
-                    T_safe = T.clamp(min=0.01)  # 温度下界保护
-                    scaled_logits = (logits + gumbel_noise.unsqueeze(-1)) / T_safe
-                    scaled_logits = scaled_logits.clamp(-88.0, 88.0)  # 防止 exp 溢出
+                    # P10-NaN-2: 温度缩放 + clamp 防止溢出
+                    T_safe = T_fp32.clamp(min=0.01)
+                    scaled_logits = (log_probs + gumbel_noise) / T_safe
+                    scaled_logits = scaled_logits.clamp(-88.0, 88.0)  # FP32 exp 安全范围
+                    
                     # Gumbel-Softmax: 软概率
                     y_soft = F.softmax(scaled_logits, dim=-1)
                     
@@ -2881,7 +2898,9 @@ class LearnableSplitter(nn.Module):
         B, C, H_feat, W_feat = features.shape
         H_img, W_img = image_size
         device = features.device
-        dtype = features.dtype
+        # P10-NaN-17: 强制 FP32 计算，避免 AMP 下的精度问题
+        compute_dtype = torch.float32
+        original_dtype = features.dtype
         
         # 确定评估深度
         if max_eval_depth is None:
@@ -2891,8 +2910,8 @@ class LearnableSplitter(nn.Module):
         scale_h = H_feat / H_img
         scale_w = W_feat / W_img
         
-        # P10-NaN-12: 获取当前温度 (带下界保护)
-        T = self.log_temperature.exp().clamp(min=0.01)
+        # P10-NaN-12: 获取当前温度 (带下界保护，在 FP32 下)
+        T = self.log_temperature.exp().float().clamp(min=0.01)
         
         # =====================================================================
         # 1. 生成所有网格区域的 boxes
@@ -2923,8 +2942,8 @@ class LearnableSplitter(nn.Module):
                     all_boxes.append([0, x1_feat, y1_feat, x2_feat, y2_feat])
                     depth_indices.append(d)
         
-        # 转为 tensor
-        boxes_tensor = torch.tensor(all_boxes, dtype=dtype, device=device)
+        # 转为 tensor (使用 original_dtype 匹配 features 以兼容 roi_align)
+        boxes_tensor = torch.tensor(all_boxes, dtype=original_dtype, device=device)
         depth_tensor = torch.tensor(depth_indices, dtype=torch.long, device=device)
         
         # =====================================================================
@@ -2954,30 +2973,31 @@ class LearnableSplitter(nn.Module):
             pooled = torch.cat(pooled_list, dim=0)
         
         # =====================================================================
-        # 3. 批量 MLP 计算复杂度
+        # 3. 批量 MLP 计算复杂度 (在 FP32 下)
         # =====================================================================
         # pooled: [N_regions, C, pool_size, pool_size]
         N_regions = pooled.shape[0]
-        pooled_flat = pooled.flatten(1)  # [N_regions, C * pool_size^2]
+        # P10-NaN-17: 转换到 FP32 进行后续计算
+        pooled_flat = pooled.float().flatten(1)  # [N_regions, C * pool_size^2]
         
         # 复杂度: [N_regions]
         # 注意: complexity_mlp.forward() 内部已经做了 squeeze(-1)，返回 [N_regions]
         complexities = self.complexity_mlp(pooled_flat)
         
         # =====================================================================
-        # 4. 按深度计算损失
+        # 4. 按深度计算损失 (全部在 FP32 下)
         # =====================================================================
-        total_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        total_loss = torch.tensor(0.0, device=device, dtype=compute_dtype)
         
         # P-GRAD-1: 预计算自适应权重 (在循环外，避免重复计算)
         if use_adaptive_weights:
             adaptive_weights = self.get_adaptive_depth_weights(max_eval_depth)
         
         # 预分配详情存储
-        loss_per_depth = torch.zeros(max_eval_depth + 1, device=device, dtype=dtype)
-        entropy_per_depth = torch.zeros(max_eval_depth + 1, device=device, dtype=dtype)
-        p_split_per_depth = torch.zeros(max_eval_depth + 1, device=device, dtype=dtype)
-        weight_per_depth = torch.zeros(max_eval_depth + 1, device=device, dtype=dtype)
+        loss_per_depth = torch.zeros(max_eval_depth + 1, device=device, dtype=compute_dtype)
+        entropy_per_depth = torch.zeros(max_eval_depth + 1, device=device, dtype=compute_dtype)
+        p_split_per_depth = torch.zeros(max_eval_depth + 1, device=device, dtype=compute_dtype)
+        weight_per_depth = torch.zeros(max_eval_depth + 1, device=device, dtype=compute_dtype)
         num_regions_per_depth = torch.zeros(max_eval_depth + 1, device=device, dtype=torch.long)
         
         for d in range(max_eval_depth + 1):
@@ -2989,9 +3009,9 @@ class LearnableSplitter(nn.Module):
             # P10-NaN-11: 跳过空深度层，避免空张量 mean() 返回 NaN
             if n_regions == 0:
                 # 使用占位值，权重为0确保不影响损失
-                loss_per_depth[d] = torch.tensor(0.0, device=device, dtype=dtype)
-                entropy_per_depth[d] = torch.tensor(0.0, device=device, dtype=dtype)
-                p_split_per_depth[d] = torch.tensor(0.5, device=device, dtype=dtype)
+                loss_per_depth[d] = torch.tensor(0.0, device=device, dtype=compute_dtype)
+                entropy_per_depth[d] = torch.tensor(0.0, device=device, dtype=compute_dtype)
+                p_split_per_depth[d] = torch.tensor(0.5, device=device, dtype=compute_dtype)
                 weight_per_depth[d] = 0.0  # 权重为0，不贡献损失
                 num_regions_per_depth[d] = 0
                 continue
@@ -3106,12 +3126,15 @@ class LearnableSplitter(nn.Module):
         B, C, H_feat, W_feat = features.shape
         H_img, W_img = image_size
         device = features.device
-        dtype = features.dtype
+        # P10-NaN-17: 强制 FP32 计算，避免 AMP 下的精度问题
+        # 在 FP16 下，exp/log/sigmoid 容易溢出或产生 NaN
+        compute_dtype = torch.float32
+        original_dtype = features.dtype
         
         scale_h = H_feat / H_img
         scale_w = W_feat / W_img
-        # P10-NaN-11: 温度下界保护
-        T = self.log_temperature.exp().clamp(min=0.01)
+        # P10-NaN-11: 温度下界保护 (在 FP32 下计算)
+        T = self.log_temperature.exp().float().clamp(min=0.01)
         
         cell_h = H_img / grid_size
         cell_w = W_img / grid_size
@@ -3125,17 +3148,17 @@ class LearnableSplitter(nn.Module):
         # =====================================================================
         from torchvision.ops import roi_align
         
-        # 预计算网格中心点 [G, G]
-        grid_i = torch.arange(G, dtype=dtype, device=device)
-        grid_j = torch.arange(G, dtype=dtype, device=device)
+        # 预计算网格中心点 [G, G] (在 FP32 下)
+        grid_i = torch.arange(G, dtype=compute_dtype, device=device)
+        grid_j = torch.arange(G, dtype=compute_dtype, device=device)
         cy = (grid_i + 0.5) * cell_h
         cx = (grid_j + 0.5) * cell_w
         CY, CX = torch.meshgrid(cy, cx, indexing='ij')
         CY_flat = CY.flatten()  # [G²]
         CX_flat = CX.flatten()  # [G²]
         
-        cumulative_split = torch.ones(N, device=device, dtype=dtype)
-        expected_depth = torch.zeros(N, device=device, dtype=dtype)
+        cumulative_split = torch.ones(N, device=device, dtype=compute_dtype)
+        expected_depth = torch.zeros(N, device=device, dtype=compute_dtype)
         
         for d in range(D + 1):
             region_size = max(H_img, W_img) / (2 ** d)
@@ -3163,15 +3186,21 @@ class LearnableSplitter(nn.Module):
             y2_unique = region_y2[first_indices] * scale_h
             
             # roi_align boxes: [num_unique, 5] -> [batch_idx, x1, y1, x2, y2]
-            batch_idx = torch.zeros(num_unique, device=device, dtype=dtype)
-            boxes = torch.stack([batch_idx, x1_unique, y1_unique, x2_unique, y2_unique], dim=1)
+            # 使用 original_dtype 匹配 features 的类型以兼容 roi_align
+            batch_idx = torch.zeros(num_unique, device=device, dtype=original_dtype)
+            boxes = torch.stack([batch_idx, x1_unique.to(original_dtype), 
+                               y1_unique.to(original_dtype), x2_unique.to(original_dtype), 
+                               y2_unique.to(original_dtype)], dim=1)
             
             # 批量 roi_align [num_unique, C, pool_size, pool_size]
             pooled = roi_align(features, boxes, output_size=(self.pool_size, self.pool_size), aligned=True)
-            pooled_flat = pooled.flatten(1)  # [num_unique, C*pool_size*pool_size]
+            # P10-NaN-17: 转换到 FP32 进行后续计算
+            pooled_flat = pooled.float().flatten(1)  # [num_unique, C*pool_size*pool_size]
             
-            # 批量 MLP
-            unique_complexities = self.complexity_mlp(pooled_flat).squeeze(-1)  # [num_unique]
+            # 批量 MLP (在 FP32 下计算)
+            # 注意: complexity_mlp.forward() 内部已经做了 squeeze(-1)
+            unique_complexities = self.complexity_mlp(pooled_flat)  # [num_unique]
+            # P10-NaN-15: 确保输出至少是 1D 张量
             if unique_complexities.dim() == 0:
                 unique_complexities = unique_complexities.unsqueeze(0)
             
@@ -3331,7 +3360,8 @@ class LearnableSplitter(nn.Module):
             >>> elastic_loss = splitter.get_elastic_budget_loss(soft_count, N_min=32, N_max=256)
         """
         device = self.thresholds.device
-        dtype = self.thresholds.dtype
+        # P10-NaN-17: 强制 FP32 计算
+        dtype = torch.float32
         
         # 确定使用哪个概率源
         use_cached = bool(self._cached_split_probs) and self.training
@@ -3514,7 +3544,8 @@ class LearnableSplitter(nn.Module):
             此方法应在 forward() 之后调用，以使用最新的分割概率缓存。
         """
         device = self.thresholds.device
-        dtype = self.thresholds.dtype
+        # P10-NaN-17: 强制 FP32 计算
+        dtype = torch.float32
         D = self.max_depth
         
         # 确定使用哪个概率源
