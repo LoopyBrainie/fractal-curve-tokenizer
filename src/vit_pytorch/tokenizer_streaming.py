@@ -233,15 +233,15 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             with torch.no_grad():
                 tokens_per_batch = tensor_result.tokens_per_batch
                 if tokens_per_batch is not None:
-                    # P11-3: 异步传输到 CPU
-                    num_tokens_list = tokens_per_batch.cpu(non_blocking=True).tolist()
+                    # P11-3: 异步传输到 CPU (使用 .to() 支持 non_blocking)
+                    num_tokens_list = tokens_per_batch.to('cpu', non_blocking=True).tolist()
                 else:
                     # Fallback: 使用 bincount (P11-2 优化的一致性)
                     tokens_per_batch = torch.bincount(
                         tensor_result.batch_indices, 
                         minlength=B
                     )
-                    num_tokens_list = tokens_per_batch.cpu(non_blocking=True).tolist()
+                    num_tokens_list = tokens_per_batch.to('cpu', non_blocking=True).tolist()
                 
                 # 计算 depth distribution (P9-6 向量化优化)
                 # 使用批量操作减少 .item() 调用次数从 O(B × max_depth) 到 O(B)
@@ -260,8 +260,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                     ones = torch.ones_like(flat_idx)
                     count_matrix.view(-1).scatter_add_(0, flat_idx, ones)
                     
-                    # P11-3: 异步传输到 CPU
-                    count_matrix_cpu = count_matrix.cpu(non_blocking=True).numpy()
+                    # P11-3: 异步传输到 CPU (使用 .to() 支持 non_blocking)
+                    count_matrix_cpu = count_matrix.to('cpu', non_blocking=True).numpy()
                     
                     # P11-4 保留: Python 循环构建 dict 结构
                     # 这是必要的，因为输出格式需要稀疏字典表示
