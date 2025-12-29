@@ -832,9 +832,10 @@ def create_dataloaders(
 class CudaPrefetcher:
     """CUDA 异步数据预取器"""
     
-    def __init__(self, loader: DataLoader, device: torch.device):
+    def __init__(self, loader: DataLoader, device: torch.device, channels_last: bool = False):
         self.loader = loader
         self.device = device
+        self.channels_last = channels_last
         self.stream = torch.cuda.Stream() if device.type == 'cuda' else None
         
     def __iter__(self):
@@ -851,8 +852,11 @@ class CudaPrefetcher:
         
         if self.stream is not None:
             with torch.cuda.stream(self.stream):
+                imgs = self.next_batch[0].to(self.device, non_blocking=True)
+                if self.channels_last:
+                    imgs = imgs.to(memory_format=torch.channels_last)
                 self.next_data = (
-                    self.next_batch[0].to(self.device, non_blocking=True),
+                    imgs,
                     self.next_batch[1].to(self.device, non_blocking=True),
                 )
         else:
@@ -902,7 +906,7 @@ def train_epoch(
     use_mixup = mixup_fn is not None
     nan_count = 0  # NaN 计数器
     
-    data_iter = CudaPrefetcher(loader, device) if device.type == 'cuda' else loader
+    data_iter = CudaPrefetcher(loader, device, channels_last=config.channels_last) if device.type == 'cuda' else loader
     pbar = tqdm(data_iter, desc="Train", total=len(loader))
     data_start = time.time()
     
@@ -1125,6 +1129,7 @@ def evaluate(
     use_amp: bool,
     num_classes: int = 10,
     return_per_class: bool = False,
+    channels_last: bool = False,
 ) -> Tuple[float, float, Optional[Dict[str, Any]]]:
     """评估
     
@@ -1150,6 +1155,8 @@ def evaluate(
     for batch in tqdm(loader, desc="Eval"):
         imgs, labels = batch
         imgs = imgs.to(device)
+        if channels_last:
+            imgs = imgs.to(memory_format=torch.channels_last)
         labels = labels.to(device)
         
         with get_amp_context(device, use_amp):
@@ -1231,6 +1238,8 @@ def verify_train_eval_consistency(
     # 获取一个 batch 用于测试
     sample_batch = next(iter(loader))
     imgs = sample_batch[0][:4].to(device)  # 只用 4 张图
+    if config.channels_last:
+        imgs = imgs.to(memory_format=torch.channels_last)
     
     # 检查 1: train/eval 输出差异
     model.eval()
@@ -1771,7 +1780,10 @@ def main():
             profile=(epoch == 1)
         )
         
-        val_loss, val_acc, _ = evaluate(model, val_loader, device, config.use_amp, spec.num_classes)
+        val_loss, val_acc, _ = evaluate(
+            model, val_loader, device, config.use_amp, spec.num_classes,
+            channels_last=config.channels_last
+        )
         
         scheduler.step()
         
@@ -1893,7 +1905,8 @@ def main():
     
     test_loss, test_acc, per_class_stats = evaluate(
         model, test_loader, device, config.use_amp, 
-        spec.num_classes, return_per_class=True
+        spec.num_classes, return_per_class=True,
+        channels_last=config.channels_last
     )
     
     print(f"Test: loss={test_loss:.4f}, acc={test_acc:.2f}%")
