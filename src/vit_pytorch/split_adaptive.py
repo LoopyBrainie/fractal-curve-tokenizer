@@ -2994,6 +2994,8 @@ class LearnableSplitter(nn.Module):
             
             # 二元熵 H(p) = -p·log(p) - (1-p)·log(1-p)
             # P10-NaN-10: 使用 p_safe 避免 log(0)
+            eps = 1e-6
+            p_safe = p_split_d.clamp(eps, 1 - eps)
             entropy_d = -(p_safe * p_safe.log() + 
                          (1 - p_safe) * (1 - p_safe).log())
             
