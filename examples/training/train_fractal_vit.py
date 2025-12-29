@@ -870,15 +870,28 @@ class CudaPrefetcher:
         self.device = device
         self.channels_last = channels_last
         self.stream = torch.cuda.Stream() if device.type == 'cuda' else None
+        self._debug = False  # DEBUG: 设置为 True 启用详细日志
+        self._batch_count = 0
         
     def __iter__(self):
+        if self._debug:
+            print(f"[DEBUG CudaPrefetcher] __iter__ called, creating loader iterator...", flush=True)
         self.loader_iter = iter(self.loader)
+        if self._debug:
+            print(f"[DEBUG CudaPrefetcher] Loader iterator created, calling preload...", flush=True)
+        self._batch_count = 0
         self.preload()
+        if self._debug:
+            print(f"[DEBUG CudaPrefetcher] First preload done", flush=True)
         return self
     
     def preload(self):
         try:
+            if self._debug and self._batch_count < 3:
+                print(f"[DEBUG CudaPrefetcher] preload: getting next batch from loader...", flush=True)
             self.next_batch = next(self.loader_iter)
+            if self._debug and self._batch_count < 3:
+                print(f"[DEBUG CudaPrefetcher] preload: got batch, transferring to GPU...", flush=True)
         except StopIteration:
             self.next_batch = None
             return
@@ -896,13 +909,20 @@ class CudaPrefetcher:
             self.next_data = self.next_batch
     
     def __next__(self):
+        if self._debug and self._batch_count < 3:
+            print(f"[DEBUG CudaPrefetcher] __next__ batch {self._batch_count}: waiting for stream...", flush=True)
+        
         if self.stream is not None:
             torch.cuda.current_stream().wait_stream(self.stream)
+        
+        if self._debug and self._batch_count < 3:
+            print(f"[DEBUG CudaPrefetcher] __next__ batch {self._batch_count}: stream sync done", flush=True)
         
         if self.next_batch is None:
             raise StopIteration
         
         data = self.next_data
+        self._batch_count += 1
         self.preload()
         return data
     
@@ -939,11 +959,36 @@ def train_epoch(
     use_mixup = mixup_fn is not None
     nan_count = 0  # NaN 计数器
     
-    data_iter = CudaPrefetcher(loader, device, channels_last=config.channels_last) if device.type == 'cuda' else loader
+    # DEBUG: 在 CudaPrefetcher 创建前后添加日志
+    import sys
+    print(f"[DEBUG train_epoch] Creating data iterator...", flush=True)
+    sys.stdout.flush()
+    
+    # 使用环境变量 DISABLE_PREFETCH=1 来禁用 CudaPrefetcher 进行调试
+    use_prefetcher = device.type == 'cuda' and not os.environ.get('DISABLE_PREFETCH', '0') == '1'
+    if use_prefetcher:
+        data_iter = CudaPrefetcher(loader, device, channels_last=config.channels_last)
+    else:
+        data_iter = loader
+        if device.type == 'cuda':
+            print(f"[DEBUG] CudaPrefetcher DISABLED via DISABLE_PREFETCH env var")
+    
+    print(f"[DEBUG train_epoch] Data iterator created, creating tqdm...", flush=True)
+    sys.stdout.flush()
+    
     pbar = tqdm(data_iter, desc="Train", total=len(loader))
+    
+    print(f"[DEBUG train_epoch] Starting batch iteration...", flush=True)
+    sys.stdout.flush()
+    
     data_start = time.time()
     
     for i, batch in enumerate(pbar):
+        # DEBUG: 前几个 batch 打印日志
+        if i < 3:
+            print(f"[DEBUG train_epoch] Batch {i} received", flush=True)
+            sys.stdout.flush()
+            
         data_time = time.time() - data_start
         data_times.append(data_time)
         batch_start = time.time()
@@ -1382,6 +1427,8 @@ def main():
                        help="Use torch.compile for faster training (PyTorch 2.0+)")
     parser.add_argument("--channels-last", action="store_true",
                        help="Use channels-last memory format for faster convolutions")
+    parser.add_argument("--no-prefetch", action="store_true",
+                       help="Disable CudaPrefetcher (for debugging data loading issues)")
     
     # Tokenizer 类型
     parser.add_argument("--tokenizer-type", type=str, default="streaming_v3",
@@ -1793,6 +1840,14 @@ def main():
     for epoch in range(1, config.epochs + 1):
         start = time.time()
         
+        # DEBUG: Epoch 11 卡死调试日志
+        if epoch >= 10:
+            print(f"\n[DEBUG] Epoch {epoch} starting...")
+            print(f"[DEBUG] Warmup epochs: {config.warmup_epochs}, Splitter temp warmup: {config.splitter_temp_warmup}")
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+                print(f"[DEBUG] CUDA sync OK, GPU memory: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+        
         # P7-7: 温度退火调度
         # T(t) = T_start · (T_end / T_start)^((t - warmup) / (total - warmup))
         if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'set_split_temperature'):
@@ -1805,6 +1860,13 @@ def main():
                 ratio = config.splitter_temp_end / config.splitter_temp_start
                 current_temp = config.splitter_temp_start * (ratio ** progress)
             model.tokenizer.set_split_temperature(current_temp)
+            if epoch >= 10:
+                print(f"[DEBUG] Temperature set to {current_temp:.4f}")
+        
+        # DEBUG: 检查 scheduler 状态
+        if epoch >= 10:
+            print(f"[DEBUG] Current LR: {optimizer.param_groups[0]['lr']:.6f}")
+            print(f"[DEBUG] About to call train_epoch...")
         
         train_loss, train_acc, perf_stats = train_epoch(
             model, train_loader, optimizer, device, scaler, config,
