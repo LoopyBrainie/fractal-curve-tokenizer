@@ -361,41 +361,58 @@ class HilbertNativePatchEmbed(nn.Module):
     ) -> Tensor:
         """回退的 ROI 池化实现 (无 torchvision 时使用).
         
+        P12-5: 使用批量 grid_sample 实现向量化，从 O(N) 优化到 O(B)。
+        
         使用 grid_sample 实现类似 ROI-Align 的效果.
         """
+        import warnings
+        warnings.warn(
+            "_fallback_roi_pool 性能较差，建议安装 torchvision 使用 roi_align。",
+            UserWarning,
+            stacklevel=3
+        )
+        
         N = boxes.shape[0]
-        D = features.shape[1]
+        B, D = features.shape[0], features.shape[1]
         device = features.device
         dtype = features.dtype
         
+        if N == 0:
+            return torch.zeros(0, D, device=device, dtype=dtype)
+        
+        # P12-5: 向量化实现 - 按 batch 分组，每个 batch 内批量 grid_sample
+        batch_indices = boxes[:, 0].long()
+        x1, y1, x2, y2 = boxes[:, 1], boxes[:, 2], boxes[:, 3], boxes[:, 4]
+        
+        # 计算归一化中心点 (转换到 [-1, 1] 坐标系)
+        cx = (x1 + x2) / fw - 1
+        cy = (y1 + y2) / fh - 1
+        
         pooled = torch.zeros(N, D, device=device, dtype=dtype)
         
-        for idx in range(N):
-            b = int(boxes[idx, 0].item())
-            x1, y1, x2, y2 = boxes[idx, 1:5]
+        for b in range(B):
+            mask = batch_indices == b
+            if not mask.any():
+                continue
             
-            # 转换到 [-1, 1] 坐标系 for grid_sample
-            # grid_sample 期望 (x, y) 在 [-1, 1]
-            x1_norm = 2 * x1 / fw - 1
-            y1_norm = 2 * y1 / fh - 1
-            x2_norm = 2 * x2 / fw - 1
-            y2_norm = 2 * y2 / fh - 1
+            # 获取该 batch 的中心点
+            cx_b = cx[mask]
+            cy_b = cy[mask]
+            n = cx_b.shape[0]
             
-            # 创建 1x1 网格，采样中心点
-            cx = (x1_norm + x2_norm) / 2
-            cy = (y1_norm + y2_norm) / 2
-            grid = torch.tensor([[[[cx, cy]]]], device=device, dtype=dtype)  # [1, 1, 1, 2]
+            # 创建批量网格 [1, n, 1, 2]
+            grid = torch.stack([cx_b, cy_b], dim=-1).view(1, n, 1, 2)
             
-            # 采样
+            # 批量采样
             sampled = F.grid_sample(
                 features[b:b+1],  # [1, D, H', W']
                 grid,
                 mode='bilinear',
                 padding_mode='border',
                 align_corners=False,
-            )  # [1, D, 1, 1]
+            )  # [1, D, n, 1]
             
-            pooled[idx] = sampled.squeeze()
+            pooled[mask] = sampled.squeeze(-1).squeeze(0).T
         
         return pooled
     

@@ -401,7 +401,8 @@ class LCAHilbertBias(HilbertBiasBase):
         # P1-6 优化: LCA 深度矩阵缓存
         # 同一个 levels_info 在不同 Transformer 层之间是相同的
         # 缓存避免重复计算，理论加速 ~6x (6层时)
-        self._lca_cache_key: Optional[Tuple[int, torch.device]] = None  # (data_ptr, device)
+        # FIX: 缓存键包含形状，避免 torch.compile 下的内存重用导致的碰撞
+        self._lca_cache_key: Optional[Tuple[int, torch.device, Tuple[int, ...]]] = None  # (data_ptr, device, shape)
         self._lca_cache_value: Optional[torch.Tensor] = None
         
         # 初始化: 深度越大（越邻近）偏置越高
@@ -510,9 +511,9 @@ class LCAHilbertBias(HilbertBiasBase):
         paths = levels_info[:, :, 1:].long()
         
         # P1-6: 检查缓存
-        # 使用 (data_ptr, device) 作为缓存键，避免跨设备问题
-        # 同一个 forward pass 中，不同层共享相同的 levels_info 张量
-        cache_key = (levels_info.data_ptr(), levels_info.device)
+        # 使用 (data_ptr, device, shape) 作为缓存键
+        # FIX: 加入 shape 避免 torch.compile 下内存重用导致的尺寸不匹配
+        cache_key = (levels_info.data_ptr(), levels_info.device, tuple(levels_info.shape))
         
         if (self._lca_cache_key is not None and 
             self._lca_cache_key == cache_key and

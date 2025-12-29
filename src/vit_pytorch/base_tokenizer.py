@@ -33,7 +33,7 @@ levels_info 格式:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -73,11 +73,14 @@ class TokenizerOutput:
     当 Tokenizer 内部已经有 padding 后的张量时，可直接传入缓存，
     消除 model._prepare_tokens 中的 O(B) Python 循环。
     
+    P12-2 优化: _lengths_cache 存储为 Tensor 而非 List[int]，
+    避免 _create_attention_mask 中的 Python 列表到 Tensor 转换开销。
+    
     Attributes:
         sequences: 各样本的 TokenSequence 列表
         _padded_tokens_cache: 预填充的 tokens [B, MaxN, D] (可选缓存)
         _padded_levels_cache: 预填充的 levels [B, MaxN, info_dim] (可选缓存)
-        _lengths_cache: 每个样本的实际 token 数量 [B] (可选缓存)
+        _lengths_cache: 每个样本的实际 token 数量 Tensor[B] (可选缓存)
         
     Properties:
         tokens: 堆叠的 tokens [B, N, D]（假设所有样本 token 数量相同）
@@ -87,7 +90,7 @@ class TokenizerOutput:
     sequences: List[TokenSequence]
     _padded_tokens_cache: Optional[torch.Tensor] = field(default=None, repr=False)
     _padded_levels_cache: Optional[torch.Tensor] = field(default=None, repr=False)
-    _lengths_cache: Optional[List[int]] = field(default=None, repr=False)
+    _lengths_cache: Optional[torch.Tensor] = field(default=None, repr=False)
 
     def __iter__(self) -> Iterator[TokenSequence]:
         return iter(self.sequences)
@@ -164,23 +167,28 @@ class TokenizerOutput:
     def tokens_list(self) -> List[torch.Tensor]:
         return [seq.tokens for seq in self.sequences]
 
-    def get_padded_tokens(self) -> Tuple[torch.Tensor, List[int]]:
-        """获取预填充的 tokens 和长度列表 (P9-5 优化).
+    def get_padded_tokens(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """获取预填充的 tokens 和长度张量 (P9-5/P12-2 优化).
         
         如果有缓存，直接返回缓存的张量，避免重复 padding。
         否则使用 pad_sequence 进行填充。
         
+        P12-2 优化: lengths 返回 Tensor 而非 List[int]，
+        支持后续 attention mask 的向量化创建，避免 O(B) Python 循环。
+        
         Returns:
             (padded_tokens, lengths):
             - padded_tokens: [B, MaxN, D] 填充后的 tokens
-            - lengths: 每个样本的实际 token 数量列表
+            - lengths: Tensor[B] 每个样本的实际 token 数量
         """
         if self._padded_tokens_cache is not None and self._lengths_cache is not None:
             return self._padded_tokens_cache, self._lengths_cache
         
         # 回退: 使用 pad_sequence
         tokens_list = self.tokens_list()
-        lengths = [t.shape[0] for t in tokens_list]
+        lengths_list = [t.shape[0] for t in tokens_list]
+        device = tokens_list[0].device if len(tokens_list) > 0 else torch.device('cpu')
+        lengths = torch.tensor(lengths_list, dtype=torch.long, device=device)
         padded_tokens = torch.nn.utils.rnn.pad_sequence(
             tokens_list, batch_first=True, padding_value=0.0
         )

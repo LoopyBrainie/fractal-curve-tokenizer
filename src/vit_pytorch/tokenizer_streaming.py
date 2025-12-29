@@ -299,12 +299,14 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 )
                 sequences.append(seq)
             
-            # P9-5 优化: 传入已 padding 的张量缓存，避免 model 中重复 padding
+            # P9-5/P12-2 优化: 传入已 padding 的张量缓存，避免 model 中重复 padding
+            # P12-2: _lengths_cache 直接存储为 Tensor，避免后续 List->Tensor 转换
+            lengths_tensor = torch.tensor(num_tokens_list, dtype=torch.long, device=device)
             return TokenizerOutput(
                 sequences=sequences,
                 _padded_tokens_cache=tokens,
                 _padded_levels_cache=levels_info,
-                _lengths_cache=num_tokens_list,
+                _lengths_cache=lengths_tensor,
             )
         
         else:
@@ -542,15 +544,25 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         levels_info = torch.zeros(B, max_tokens, self.max_depth + 1, dtype=torch.long, device=device)
         
         # 计算每个 token 在其 batch 内的索引
-        # 使用 cumsum 和 scatter 实现向量化
-        token_positions = torch.zeros(N_total, dtype=torch.long, device=device)
-        
-        # 为每个 batch 单独计算位置 (这是唯一的 Python 循环，O(B) 次)
-        for b in range(B):
-            mask = batch_indices == b
-            n = mask.sum()
-            if n > 0:
-                token_positions[mask] = torch.arange(n, device=device)
+        # P12-3: 利用 batch_indices 已按 (batch_idx, hilbert_idx) 排序的特性
+        # 使用 cummax 传播段起始位置，实现 O(N) 单次遍历的向量化计算
+        if N_total == 0:
+            token_positions = torch.zeros(0, dtype=torch.long, device=device)
+        else:
+            # 检测段边界: S_i = 1 当 i=0 或 b_i ≠ b_{i-1}
+            segment_starts = torch.cat([
+                torch.ones(1, device=device, dtype=torch.long),
+                (batch_indices[1:] != batch_indices[:-1]).long()
+            ])
+            
+            # 全局位置索引
+            global_positions = torch.arange(N_total, device=device)
+            
+            # 段起始位置传播: cummax(i * S_i) 获取每个位置所属段的起始索引
+            segment_start_indices = (global_positions * segment_starts).cummax(dim=0)[0]
+            
+            # 段内位置 = 全局位置 - 段起始位置
+            token_positions = global_positions - segment_start_indices
         
         # 向量化分配
         tokens[batch_indices, token_positions] = all_tokens.to(dtype)

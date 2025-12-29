@@ -642,10 +642,24 @@ class TensorSplitResult:
     def to_split_results(self) -> List[SplitResult]:
         """转换回 Python SplitResult 列表 (兼容性).
         
+        .. deprecated:: 
+            此方法触发 GPU-CPU 同步，性能较差。
+            新代码应直接使用 TensorSplitResult 的张量属性。
+        
         注意: 这会触发 GPU-CPU 同步，仅用于与旧接口兼容。
+        
+        P12-4 优化: 从 O(B×N²) 优化到 O(N)，使用预计算索引范围。
         """
-        # 按 batch 分组
-        results = []
+        import warnings
+        import numpy as np
+        
+        warnings.warn(
+            "to_split_results() 触发 GPU-CPU 同步，性能较差。"
+            "新代码应直接使用 TensorSplitResult 的张量属性。",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        
         B = self.batch_size
         
         # 一次性传输所有数据到 CPU
@@ -655,12 +669,22 @@ class TensorSplitResult:
         hilbert_cpu = self.hilbert_indices.cpu().numpy()
         complexity_cpu = self.complexities.cpu().numpy()
         
+        N = len(batch_idx_cpu)
+        if N == 0:
+            return [SplitResult(tokens=[]) for _ in range(B)]
+        
+        # P12-4: 使用 bincount + cumsum 预计算索引范围，避免 O(N²) 的 nonzero 调用
+        counts = np.bincount(batch_idx_cpu, minlength=B)
+        sorted_order = np.argsort(batch_idx_cpu, kind='stable')
+        starts = np.zeros(B + 1, dtype=np.int64)
+        starts[1:] = np.cumsum(counts)
+        
+        results = []
         for b in range(B):
-            mask = batch_idx_cpu == b
+            batch_indices = sorted_order[starts[b]:starts[b+1]]
             tokens = []
             
-            for i in range(mask.sum()):
-                idx = mask.nonzero()[0][i]
+            for idx in batch_indices:
                 r = regions_cpu[idx]
                 tokens.append(SplitToken(
                     region=Region(int(r[0]), int(r[1]), int(r[2]), int(r[3])),
@@ -3046,113 +3070,111 @@ class LearnableSplitter(nn.Module):
         cell_h = H_img / grid_size
         cell_w = W_img / grid_size
         
-        # =====================================================================
-        # 1. 为每个网格位置计算软深度
-        # =====================================================================
-        soft_depths = torch.zeros(grid_size, grid_size, device=device, dtype=dtype)
-        
-        for gi in range(grid_size):
-            for gj in range(grid_size):
-                # 该格子中心点
-                cx = (gj + 0.5) * cell_w
-                cy = (gi + 0.5) * cell_h
-                
-                # 累积分割概率 = P(到达当前深度)
-                cumulative_split = torch.ones(1, device=device, dtype=dtype)
-                expected_depth = torch.zeros(1, device=device, dtype=dtype)
-                
-                for d in range(self.max_depth + 1):
-                    # 包含该点的区域在深度 d 的边界
-                    region_size = max(H_img, W_img) / (2 ** d)
-                    region_x1 = int(cx / region_size) * region_size
-                    region_y1 = int(cy / region_size) * region_size
-                    region_x2 = region_x1 + region_size
-                    region_y2 = region_y1 + region_size
-                    
-                    # 转换为特征图坐标
-                    x1_feat = region_x1 * scale_w
-                    y1_feat = region_y1 * scale_h
-                    x2_feat = region_x2 * scale_w
-                    y2_feat = region_y2 * scale_h
-                    
-                    # 简化的特征提取: 使用区域中心的特征
-                    cx_feat = int((x1_feat + x2_feat) / 2)
-                    cy_feat = int((y1_feat + y2_feat) / 2)
-                    cx_feat = max(0, min(W_feat - 1, cx_feat))
-                    cy_feat = max(0, min(H_feat - 1, cy_feat))
-                    
-                    # 使用 adaptive pooling 获取区域特征
-                    x1_i = max(0, int(x1_feat))
-                    y1_i = max(0, int(y1_feat))
-                    x2_i = min(W_feat, max(x1_i + 1, int(x2_feat)))
-                    y2_i = min(H_feat, max(y1_i + 1, int(y2_feat)))
-                    
-                    region_feat = features[0:1, :, y1_i:y2_i, x1_i:x2_i]
-                    pooled = F.adaptive_avg_pool2d(region_feat, (self.pool_size, self.pool_size))
-                    pooled_flat = pooled.flatten(1)  # [1, C*k*k]
-                    
-                    # 计算复杂度
-                    complexity = self.complexity_mlp(pooled_flat).squeeze()  # scalar
-                    
-                    # 分割概率
-                    tau_d = self.thresholds[d]
-                    p_split = torch.sigmoid((complexity - tau_d) / T)
-                    
-                    # 在深度 d 停止的概率
-                    if d < self.max_depth:
-                        p_stop = 1 - p_split
-                    else:
-                        p_stop = torch.ones_like(p_split)
-                    
-                    # 期望深度贡献
-                    expected_depth = expected_depth + cumulative_split * p_stop * d
-                    
-                    # 更新累积分割概率
-                    if d < self.max_depth:
-                        cumulative_split = cumulative_split * p_split
-                
-                soft_depths[gi, gj] = expected_depth.squeeze()
+        G = grid_size
+        D = self.max_depth
+        N = G * G
         
         # =====================================================================
-        # 2. 计算相邻位置的深度差异损失
+        # 1. 向量化计算软深度 (P12-1: 从 O(G²×D) 优化到 O((D+1) × unique_regions))
         # =====================================================================
-        total_loss = torch.zeros(1, device=device, dtype=dtype)
-        num_pairs = 0
-        max_violation = 0.0
-        num_violations = 0
+        from torchvision.ops import roi_align
         
-        for gi in range(grid_size):
-            for gj in range(grid_size):
-                # 右邻居
-                if gj < grid_size - 1:
-                    diff = (soft_depths[gi, gj] - soft_depths[gi, gj + 1]).abs()
-                    violation = F.relu(diff - 1.0)
-                    total_loss = total_loss + violation.pow(2)
-                    num_pairs += 1
-                    with torch.no_grad():
-                        if violation.item() > 0:
-                            num_violations += 1
-                            max_violation = max(max_violation, diff.item())
-                
-                # 下邻居
-                if gi < grid_size - 1:
-                    diff = (soft_depths[gi, gj] - soft_depths[gi + 1, gj]).abs()
-                    violation = F.relu(diff - 1.0)
-                    total_loss = total_loss + violation.pow(2)
-                    num_pairs += 1
-                    with torch.no_grad():
-                        if violation.item() > 0:
-                            num_violations += 1
-                            max_violation = max(max_violation, diff.item())
+        # 预计算网格中心点 [G, G]
+        grid_i = torch.arange(G, dtype=dtype, device=device)
+        grid_j = torch.arange(G, dtype=dtype, device=device)
+        cy = (grid_i + 0.5) * cell_h
+        cx = (grid_j + 0.5) * cell_w
+        CY, CX = torch.meshgrid(cy, cx, indexing='ij')
+        CY_flat = CY.flatten()  # [G²]
+        CX_flat = CX.flatten()  # [G²]
+        
+        cumulative_split = torch.ones(N, device=device, dtype=dtype)
+        expected_depth = torch.zeros(N, device=device, dtype=dtype)
+        
+        for d in range(D + 1):
+            region_size = max(H_img, W_img) / (2 ** d)
+            
+            # 批量计算区域边界 (图像坐标) [G²]
+            region_x1 = (CX_flat / region_size).floor() * region_size
+            region_y1 = (CY_flat / region_size).floor() * region_size
+            region_x2 = region_x1 + region_size
+            region_y2 = region_y1 + region_size
+            
+            # 去重：找到唯一区域
+            region_ids = (region_y1 * 10000 + region_x1).long()
+            unique_ids, inverse_indices = torch.unique(region_ids, return_inverse=True)
+            num_unique = len(unique_ids)
+            
+            # 向量化找到每个唯一区域的第一个索引 (使用 scatter_reduce)
+            indices = torch.arange(N, device=device)
+            first_indices = torch.full((num_unique,), N, dtype=torch.long, device=device)
+            first_indices.scatter_reduce_(0, inverse_indices, indices, reduce='amin')
+            
+            # 构建唯一区域的 boxes (特征图坐标)
+            x1_unique = region_x1[first_indices] * scale_w
+            y1_unique = region_y1[first_indices] * scale_h
+            x2_unique = region_x2[first_indices] * scale_w
+            y2_unique = region_y2[first_indices] * scale_h
+            
+            # roi_align boxes: [num_unique, 5] -> [batch_idx, x1, y1, x2, y2]
+            batch_idx = torch.zeros(num_unique, device=device, dtype=dtype)
+            boxes = torch.stack([batch_idx, x1_unique, y1_unique, x2_unique, y2_unique], dim=1)
+            
+            # 批量 roi_align [num_unique, C, pool_size, pool_size]
+            pooled = roi_align(features, boxes, output_size=(self.pool_size, self.pool_size), aligned=True)
+            pooled_flat = pooled.flatten(1)  # [num_unique, C*pool_size*pool_size]
+            
+            # 批量 MLP
+            unique_complexities = self.complexity_mlp(pooled_flat).squeeze(-1)  # [num_unique]
+            if unique_complexities.dim() == 0:
+                unique_complexities = unique_complexities.unsqueeze(0)
+            
+            # 广播到所有网格位置
+            complexities = unique_complexities[inverse_indices]  # [G²]
+            
+            tau_d = self.thresholds[d]
+            p_split = torch.sigmoid((complexities - tau_d) / T)  # [G²]
+            
+            if d < D:
+                p_stop = 1 - p_split
+            else:
+                p_stop = torch.ones_like(p_split)
+            
+            expected_depth = expected_depth + cumulative_split * p_stop * d
+            
+            if d < D:
+                cumulative_split = cumulative_split * p_split
+        
+        soft_depths = expected_depth.view(G, G)
+        
+        # =====================================================================
+        # 2. 向量化计算相邻位置的深度差异损失
+        # =====================================================================
+        # 水平差异 [G, G-1]
+        diff_h = (soft_depths[:, :-1] - soft_depths[:, 1:]).abs()
+        # 垂直差异 [G-1, G]
+        diff_v = (soft_depths[:-1, :] - soft_depths[1:, :]).abs()
+        
+        violation_h = F.relu(diff_h - 1.0)
+        violation_v = F.relu(diff_v - 1.0)
+        
+        total_loss = violation_h.pow(2).sum() + violation_v.pow(2).sum()
+        num_pairs = diff_h.numel() + diff_v.numel()
         
         # 归一化
-        loss = total_loss.squeeze() / max(num_pairs, 1)
+        loss = total_loss / max(num_pairs, 1)
         
         if return_details:
+            # 统计违规情况
+            with torch.no_grad():
+                all_violations = torch.cat([violation_h.flatten(), violation_v.flatten()])
+                num_violations = (all_violations > 0).sum().item()
+                max_violation = torch.cat([diff_h.flatten(), diff_v.flatten()]).max().item() if N > 1 else 0.0
+            
             details = {
                 'soft_depths': soft_depths.detach(),
                 'max_violation': max_violation,
-                'num_violations': num_violations,
+                'num_violations': int(num_violations),
                 'num_pairs': num_pairs,
             }
             return loss, details
