@@ -2986,6 +2986,16 @@ class LearnableSplitter(nn.Module):
             complexities_d = complexities[mask]  # [4^d]
             n_regions = complexities_d.shape[0]
             
+            # P10-NaN-11: 跳过空深度层，避免空张量 mean() 返回 NaN
+            if n_regions == 0:
+                # 使用占位值，权重为0确保不影响损失
+                loss_per_depth[d] = torch.tensor(0.0, device=device, dtype=dtype)
+                entropy_per_depth[d] = torch.tensor(0.0, device=device, dtype=dtype)
+                p_split_per_depth[d] = torch.tensor(0.5, device=device, dtype=dtype)
+                weight_per_depth[d] = 0.0  # 权重为0，不贡献损失
+                num_regions_per_depth[d] = 0
+                continue
+            
             # 分割概率 p_d = σ((C - τ_d) / T)
             tau_d = self.thresholds[d]
             # P10-NaN-10: clamp sigmoid 输入
@@ -3628,6 +3638,18 @@ class LearnableSplitter(nn.Module):
         if mode == 'maximize':
             # 最大化熵 = 最小化负熵
             loss = -soft_entropy
+            
+            # P10-NaN-12: 反崩塌机制
+            # 当分布坍缩到单一深度时（dominant_prob → 1），熵损失梯度消失
+            # 添加主导概率惩罚: L_anti = max(0, p_max - threshold)²
+            # 这在 p_max > threshold 时提供直接梯度，帮助分割器逃离崩塌状态
+            dominant_prob = depth_dist.max()
+            collapse_threshold = 0.9  # 当单一深度概率 > 90% 时触发惩罚
+            anti_collapse_penalty = F.relu(dominant_prob - collapse_threshold).pow(2)
+            # 权重: 当崩塌严重时加大惩罚 (最大额外 0.5 的权重)
+            anti_collapse_weight = 0.5
+            loss = loss + anti_collapse_weight * anti_collapse_penalty
+            
         elif mode == 'target':
             # 匹配目标熵
             loss = (soft_entropy - target_entropy) ** 2
@@ -3658,6 +3680,8 @@ class LearnableSplitter(nn.Module):
             # 软熵
             eps = 1e-8
             soft_entropy = -(depth_dist * (depth_dist + eps).log()).sum().item()
+            # P10-NaN-13: 修复浮点精度导致的微负熵值
+            soft_entropy = max(0.0, soft_entropy)
             
             # 理论最大熵
             D = self.max_depth
