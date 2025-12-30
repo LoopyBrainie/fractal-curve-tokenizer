@@ -1406,31 +1406,35 @@ class BaseAdaptiveSplitter(ABC):
 
 class ComplexityMLP(nn.Module):
     """
-    可学习复杂度预测器 (优化版)。
+    可学习复杂度预测器 (P11-10 优化版)。
     
     数学形式化
     ----------
     
-    解决问题 P7-1 (复杂度饱和效应):
-        原公式: C(R) = Var/(Var + σ₀²) 在 Var >> σ₀² 时饱和
-        新公式: C_θ(R) = σ(MLP(Pool(F, R)))
+    P11-10 修复: 移除输出层 sigmoid，消除双重 sigmoid 梯度衰减
+    
+    原问题 (双重 sigmoid):
+        p_split = σ((σ(z_MLP) - τ) / T)
+        梯度链: ∂p/∂z = [1/T · p(1-p)] · [C(1-C)]
+        当 |z| > 2 时，C(1-C) < 0.1，梯度衰减 90%+
+        
+    新设计 (单 sigmoid):
+        p_split = σ((z_MLP - τ) / T)
+        梯度链: ∂p/∂z = 1/T · p(1-p)
+        无内层 sigmoid 衰减，梯度提升 4x
+        
+    计算验证结果 (T=1.0, z ~ N(0, 1.4²)):
+        | 指标        | 双重 sigmoid | 单 sigmoid | 提升 |
+        |-------------|--------------|------------|------|
+        | 梯度均值    | 0.045        | 0.184      | 4.04x|
+        | p_split std | 0.065        | 0.262      | 4.04x|
         
     输入:
         f_R ∈ ℝ^(C × k × k): 区域特征 (ROI-Align 输出)
         
     输出:
-        C_θ(R) ∈ [0, 1]: 可学习复杂度
-        
-    架构优化 (解决 P-MLP-1):
-        - 增加隐藏层数: 2 → 3 层
-        - 增加隐藏维度: 64 → 128 (第一层)
-        - 逐步压缩: 4096 → 128 → 64 → 1
-        - 保持参数量相近 (~265K)
-        
-    梯度分析:
-        ∂C_θ/∂θ = σ'(z) · ∂MLP/∂θ
-        σ'(z) = σ(z)(1-σ(z)) ∈ (0, 0.25]
-        ✅ 梯度稳定，无饱和问题
+        z_θ(R) ∈ ℝ: 复杂度 logit (非概率！)
+        初始分布: z ~ N(0, ~1.4²)，配合 τ=0 实现对称初始化
     """
     
     def __init__(
@@ -1465,31 +1469,36 @@ class ComplexityMLP(nn.Module):
                 nn.Linear(intermediate_dim, 1),
             )
             
-            # P10-2 修复: 调整初始化以避免不稳定平衡点 (2024-12-29 修正版)
+            # P11-10 修复: 输出 logit 而非概率
             # 
-            # 数学形式化验证结论:
+            # 数学形式化验证结论 (2025-12-30):
             # ================================
-            # 原问题: gain=0.1 导致 σ_z ≈ 0.14，C_θ ∈ [0.43, 0.57] (99.4%)
-            #         τ 敏感度 = 10.31，微小扰动导致分割率剧烈变化 (振荡)
+            # 原问题 (双重 sigmoid):
+            #   - 梯度链: ∂p/∂z = [1/T · p(1-p)] · [C(1-C)]
+            #   - 当 |z| > 2 时，内层 C(1-C) < 0.1，导致梯度衰减 90%+
+            #   - p_split 标准差仅 0.065，探索能力受限
             #
-            # 解决方案: 对称配置 + 增大 gain
-            #   - gain=1.0 (原 0.1): 使 σ_z ≈ 1.4，C_θ 覆盖 [0.06, 0.94]
-            #   - bias=0.0 (保持): 对称分布，E[C_θ] = 0.5
-            #   - 配合 τ₀=0.5: 分割率 ≈ 50%，E[N] = 731 (满足限制)
+            # 解决方案 (单 sigmoid):
+            #   - 移除输出层 sigmoid，直接返回 logit z
+            #   - 配合 τ₀=0: E[z] = 0, E[p_split] = 0.5
+            #   - 梯度链简化为: ∂p/∂z = 1/T · p(1-p)
             #
-            # 验证结果:
-            #   | 配置      | 敏感度 | Std[C_θ] | C∈[0.4,0.6] |
-            #   |-----------|--------|----------|-------------|
-            #   | gain=0.1  | 10.31  | 3.7%     | 99.4%       | ← 失败
-            #   | gain=1.0  | 1.04   | 26.7%    | 21.9%       | ← 稳定
+            # 验证结果 (T=1.0, z ~ N(0, 1.4²)):
+            #   | 指标        | 双重 sigmoid | 单 sigmoid | 提升 |
+            #   |-------------|--------------|------------|------|
+            #   | 梯度均值    | 0.045        | 0.184      | 4.04x|
+            #   | p_split std | 0.065        | 0.262      | 4.04x|
+            #   | p=0.9 可达  | T<0.5 不可能 | 始终可达   | ∞    |
             #
-            # 注意: 不需要正分离度 (E[C_θ] > τ)，依赖 Budget Loss 调节
+            # 初始化策略 (继承 P10-2):
+            #   - gain=1.0: 使 σ_z ≈ 1.4
+            #   - bias=0.0: 对称分布，E[z] = 0
             nn.init.xavier_uniform_(self.mlp[0].weight)
             nn.init.zeros_(self.mlp[0].bias)
             nn.init.xavier_uniform_(self.mlp[3].weight)
             nn.init.zeros_(self.mlp[3].bias)
-            nn.init.xavier_uniform_(self.mlp[6].weight, gain=1.0)  # P10-2: 0.1 → 1.0
-            nn.init.zeros_(self.mlp[6].bias)                       # P10-2: 保持 0 (对称配置)
+            nn.init.xavier_uniform_(self.mlp[6].weight, gain=1.0)
+            nn.init.zeros_(self.mlp[6].bias)
         else:
             # 浅层 MLP: 保持一致的初始化策略
             self.mlp = nn.Sequential(
@@ -1499,12 +1508,12 @@ class ComplexityMLP(nn.Module):
                 nn.Linear(intermediate_dim, 1),
             )
             
-            # P10-2: 浅层 MLP 使用相同的初始化策略
-            # 见深度 MLP 注释中的数学验证
+            # P11-10: 浅层 MLP 使用相同的初始化策略
+            # 见深度 MLP 注释中的数学验证 (输出 logit，非概率)
             nn.init.xavier_uniform_(self.mlp[0].weight)
             nn.init.zeros_(self.mlp[0].bias)
-            nn.init.xavier_uniform_(self.mlp[3].weight, gain=1.0)  # P10-2: 0.1 → 1.0
-            nn.init.zeros_(self.mlp[3].bias)                       # P10-2: 保持 0
+            nn.init.xavier_uniform_(self.mlp[3].weight, gain=1.0)
+            nn.init.zeros_(self.mlp[3].bias)
     
     def forward(self, features: Tensor) -> Tensor:
         """
@@ -1512,29 +1521,39 @@ class ComplexityMLP(nn.Module):
             features: [N, C*k*k] 展平的区域特征
             
         Returns:
-            complexity: [N] 复杂度值 ∈ [0, 1]
+            complexity_logit: [N] 复杂度 logit ∈ ℝ
+            
+        P11-10: 返回原始 logit 而非 sigmoid 概率
+            - 原设计: return sigmoid(logits) → 双重 sigmoid 梯度衰减
+            - 新设计: return logits → 单 sigmoid，梯度提升 4x
         """
         logits = self.mlp(features).squeeze(-1)  # [N]
-        return torch.sigmoid(logits)
+        return logits  # P11-10: 移除 sigmoid，返回 ℝ 值
 
 
 class LearnableSplitter(nn.Module):
     """
-    可学习四叉树分割器 (Scheme L)。
+    可学习四叉树分割器 (Scheme L, P11-10 优化版)。
     
     数学形式化
     ==========
     
-    核心公式:
-        1. 复杂度预测: C_θ(R) = σ(MLP(ROI-Align(F, R)))
-        2. 分割概率:   p_split = σ((C_θ(R) - τ_d) / T)
+    核心公式 (P11-10 修订):
+        1. 复杂度预测: z_θ(R) = MLP(ROI-Align(F, R))  ∈ ℝ  (logit, 非概率!)
+        2. 分割概率:   p_split = σ((z_θ(R) - τ_d) / T)
         3. 离散采样:   z ~ Gumbel-Softmax([1-p, p], τ_gumbel)
         4. STE 推理:   z_hard = one_hot(argmax(z)); z_ST = z_hard - z.detach() + z
+    
+    P11-10 关键变更:
+        - 移除 ComplexityMLP 输出层 sigmoid → 消除双重 sigmoid 梯度衰减
+        - 阈值从 [0,1] 概率空间改为 ℝ logit 空间 (τ₀=0, τ_min=-3, τ_max=3)
+        - 梯度提升 4x，探索能力提升 4x
     
     解决的问题:
         P7-1: 复杂度饱和 → MLP 预测器无饱和上界
         P7-2: 阈值不匹配 → 可学习阈值向量 τ ∈ ℝ^(D+1)
         P7-3: 梯度阻断  → Gumbel-Softmax 可微分采样
+        P11-10: 双重 sigmoid → 单 sigmoid，梯度提升 4x
     
     Hilbert 约束:
         C1 (局部性): 保持四叉树-Hilbert 同构，LCA 兼容
@@ -1588,6 +1607,18 @@ class LearnableSplitter(nn.Module):
         self.enforce_balance = enforce_balance
         self.min_region_size = min_region_size
         
+        # P11-14: ROI-Align 采样有效性验证
+        # 当 min_region_size < pool_size * 2 时，ROI-Align 采样点可能采样同一特征像素
+        # 发出警告但不阻止 (允许用户有意为之)
+        if min_region_size < pool_size * 2:
+            import warnings
+            warnings.warn(
+                f"P11-14 Warning: min_region_size={min_region_size} < pool_size*2={pool_size*2}. "
+                f"ROI-Align 空间采样可能退化。建议 min_region_size >= {pool_size * 2}。",
+                UserWarning,
+                stacklevel=2
+            )
+        
         # P7-1: 可学习复杂度预测器 (优化版)
         input_dim = feature_dim * pool_size * pool_size
         self.complexity_mlp = ComplexityMLP(
@@ -1598,17 +1629,28 @@ class LearnableSplitter(nn.Module):
             use_deep_mlp=use_deep_mlp,
         )
         
-        # P-TAU-1: 纯 Offset + Barrier 阈值参数化
-        # 优势：梯度恒定 (∂τ/∂offset = 1)，边界附近无梯度消失
-        # 公式：τ_eff_d = τ_base_d + offset_d
-        # Barrier: L_barrier = λ · Σ [max(0, τ_min - τ)² + max(0, τ - τ_max)²]
-        tau_bases = [init_tau_base * (init_tau_gamma ** d) for d in range(max_depth + 1)]
+        # P11-10 + P-TAU-1: 阈值参数化 (配合 logit 输出)
+        # 
+        # 核心变更: 阈值从 [0, 1] 概率空间移至 ℝ logit 空间
+        #   - init_tau_base: 0.5 → 0.0 (对称初始化)
+        #   - tau_min/max: [0, 1] → [-3, 3] (覆盖 95% 的 logit 分布)
+        #
+        # 数学形式化:
+        #   - 复杂度输出: z_θ(R) ∈ ℝ, 初始 ~ N(0, 1.4²)
+        #   - 阈值: τ_d ∈ ℝ, 初始 τ₀ = 0
+        #   - 分割概率: p = σ((z - τ) / T)
+        #   - 对称初始化: E[z] = 0, τ = 0 → E[p] = 0.5
+        #
+        # P11-10: 使用 init_tau_base=0.0 覆盖外部传入值
+        tau_base_actual = 0.0  # P11-10: 强制为 0，忽略 init_tau_base 参数
+        tau_bases = [tau_base_actual * (init_tau_gamma ** d) for d in range(max_depth + 1)]
         self.register_buffer('_tau_bases', torch.tensor(tau_bases))
         self.threshold_offsets = nn.Parameter(torch.zeros(max_depth + 1))
         
-        # Barrier 正则化参数
-        self.tau_min = 0.0
-        self.tau_max = 1.0
+        # P11-10: 扩展 Barrier 边界到 logit 空间
+        # z ~ N(0, 1.4²)，99% 在 [-4.2, 4.2]，使用 [-3, 3] 作为软边界
+        self.tau_min = -3.0  # P11-10: 0.0 → -3.0
+        self.tau_max = 3.0   # P11-10: 1.0 → 3.0
         self.barrier_lambda = 5.0
         
         # 可学习温度 (可选)
@@ -3260,7 +3302,7 @@ class LearnableSplitter(nn.Module):
     
     def get_threshold_barrier_loss(self) -> Tensor:
         """
-        计算阈值 barrier 正则化损失 (P-TAU-1)。
+        计算阈值 barrier 正则化损失 (P-TAU-1 + P11-10)。
         
         数学形式化
         ==========
@@ -3272,16 +3314,15 @@ class LearnableSplitter(nn.Module):
             - 当 τ_eff ∈ [τ_min, τ_max] 时：L_barrier = 0，无梯度干扰
             - 当 τ_eff 越界时：二次惩罚，梯度正比于越界量
             
-        与 Sigmoid 参数化的对比：
-            Sigmoid: ∂τ/∂logits = τ(1-τ) → 边界附近梯度消失
-            Offset:  ∂τ_eff/∂offset = 1   → 恒定梯度
+        P11-10 变更：
+            阈值从概率空间 [0, 1] 改为 logit 空间 [-3, 3]
+            - 配合 ComplexityMLP 输出 logit (z ~ N(0, 1.4²))
+            - 边界 [-3, 3] 覆盖 95% 的 logit 分布
+            - 在 Dead Zone 内无梯度干扰，自由探索
             
-            边界安全通过损失函数实现，而非参数约束。
-            这使得在安全区域内梯度不受任何衰减。
-            
-        推荐参数：
+        推荐参数 (P11-10)：
             λ = 5.0（平衡收敛速度和边界安全）
-            τ_min = 0.0, τ_max = 1.0（匹配复杂度分布范围）
+            τ_min = -3.0, τ_max = 3.0（匹配 logit 分布范围）
             
         Returns:
             barrier_loss: 标量张量，所有深度的 barrier 损失之和
@@ -3345,6 +3386,14 @@ class LearnableSplitter(nn.Module):
             使用缓存的 _cached_split_probs (STE 输出) 保持梯度流
             如果缓存为空，使用 EMA 统计值 (无梯度，用于初始化)
             
+        P11-18 调用顺序说明:
+            此方法在 forward() 之后调用时使用精确的缓存概率，估计完全准确。
+            在 forward() 之前调用时使用 EMA + 理想四叉树假设，精度较低。
+            
+            典型训练流程（推荐）:
+            1. result = splitter.forward(features, image_size)  # 填充缓存
+            2. losses = splitter.get_auxiliary_losses(...)       # 使用缓存，准确
+            
         Args:
             batch_size: 当前 batch 大小 (根区域数)
             
@@ -3364,6 +3413,8 @@ class LearnableSplitter(nn.Module):
         dtype = torch.float32
         
         # 确定使用哪个概率源
+        # P11-18 说明: 缓存来自 forward()，在 forward 后调用此方法可获得准确估计
+        # 如果在 forward 之前调用，使用 EMA 统计值（精度较低，仅用于初始化阶段）
         use_cached = bool(self._cached_split_probs) and self.training
         
         if use_cached:
@@ -3827,7 +3878,7 @@ class LearnableSplitter(nn.Module):
     def get_temperature_scheduler(
         self,
         T_start: float = 1.0,
-        T_end: float = 0.1,
+        T_end: float = 0.3,  # P11-11: 0.1 → 0.3 安全下界
         schedule: str = 'exponential',
         warmup_steps: int = 0,
     ) -> "TemperatureScheduler":
@@ -3846,7 +3897,7 @@ class LearnableSplitter(nn.Module):
         
         Args:
             T_start: 初始温度 (默认 1.0，探索性)
-            T_end: 最终温度 (默认 0.1，近确定性)
+            T_end: 最终温度 (默认 0.3，P11-11 安全下界)
             schedule: 调度策略 ('exponential', 'linear', 'cosine')
             warmup_steps: 热身步数
             
@@ -3915,23 +3966,32 @@ class TemperatureScheduler:
         - 'linear':      T = T_s + (T_e - T_s) · t/T_total
         - 'cosine':      T = T_e + (T_s - T_e) · (1 + cos(πt/T_total)) / 2
     
-    梯度分析:
-        ∂p/∂C = (1/T) · p(1-p)
+    梯度分析 (P11-10/P11-11 修复后):
+        p = σ((z - τ) / T)
+        ∂p/∂z = (1/T) · p(1-p)
         
-        温度影响梯度幅值:
-        | T    | ∂p/∂C at C=τ | 行为     |
-        |------|--------------|----------|
-        | 1.0  | 0.25         | 探索充分 |
-        | 0.5  | 0.50         | 加速收敛 |
-        | 0.1  | 2.50         | 近确定性 |
-        | 0.01 | ~0 (饱和)    | 梯度消失 |
+        温度影响梯度幅值（假设 z ~ N(0, 1)）:
+        | T    | Active% | Decision Certainty | 推荐场景     |
+        |------|---------|-------------------|--------------|
+        | 1.0  | 100%    | 3%                | 初期探索     |
+        | 0.5  | 99%     | 27%               | 中期训练     |
+        | 0.3  | 92%     | 51%               | ✅ 末期安全  |
+        | 0.1  | 51%     | 82%               | ⚠️ 梯度稀疏  |
+    
+    P11-11 修复:
+        当 z 分布偏移（训练后期常见），低温导致梯度消失:
+        - T=0.1, z~N(2, 0.5): 仅 0.4% 活跃梯度 ❌
+        - T=0.3, z~N(2, 0.5): 30% 活跃梯度 ⚠️
+        - T=0.5, z~N(2, 0.5): 90% 活跃梯度 ✅
+        
+        因此强制 T_end >= 0.3 (SAFE_T_END_MIN)
     
     推荐参数:
         T_start = 1.0 (确保初期梯度稳定)
-        T_end = 0.1   (确保末期决策确定性, 但避免梯度消失)
+        T_end = 0.3   (P11-11: 安全下界，平衡决策确定性和梯度健康)
     
     用法示例:
-        >>> scheduler = TemperatureScheduler(splitter, T_start=1.0, T_end=0.1)
+        >>> scheduler = TemperatureScheduler(splitter, T_start=1.0, T_end=0.3)
         >>> scheduler.set_total_steps(total_epochs * steps_per_epoch)
         >>> 
         >>> for epoch in epochs:
@@ -3944,17 +4004,30 @@ class TemperatureScheduler:
     Args:
         splitter: LearnableSplitter 实例
         T_start: 初始温度 (默认 1.0)
-        T_end: 最终温度 (默认 0.1)
+        T_end: 最终温度 (默认 0.3, P11-11 安全下界)
         schedule: 调度策略 ('exponential', 'linear', 'cosine')
         warmup_steps: 热身步数，期间保持 T_start (默认 0)
         last_step: 上次步数 (用于恢复训练，默认 -1)
     """
     
+    # P11-11 修复: 温度下界从 0.1 提高到 0.3
+    # 
+    # 数学依据:
+    # 当 z 分布偏移（训练后期常见），低温会导致梯度消失:
+    # - T=0.1, z~N(2, 0.5): 仅 0.4% 样本有活跃梯度
+    # - T=0.3, z~N(2, 0.5): 30% 样本有活跃梯度
+    # - T=0.5, z~N(2, 0.5): 90% 样本有活跃梯度
+    #
+    # 权衡: T=0.3 在决策确定性 (51%) 和梯度健康之间取得平衡
+    # 
+    # 参见 IMPROVEMENT_PLAN.md P11-11 完整分析
+    SAFE_T_END_MIN = 0.3  # 安全的最低温度
+    
     def __init__(
         self,
         splitter: "LearnableSplitter",
         T_start: float = 1.0,
-        T_end: float = 0.1,
+        T_end: float = 0.3,  # P11-11: 0.1 → 0.3
         schedule: str = 'exponential',
         warmup_steps: int = 0,
         last_step: int = -1,
@@ -3965,6 +4038,16 @@ class TemperatureScheduler:
             raise ValueError(f"T_end should be <= T_start for annealing, got T_start={T_start}, T_end={T_end}")
         if schedule not in ('exponential', 'linear', 'cosine'):
             raise ValueError(f"Unknown schedule: {schedule}. Use 'exponential', 'linear', or 'cosine'")
+        
+        # P11-11: 强制温度下界保护
+        if T_end < self.SAFE_T_END_MIN:
+            import warnings
+            warnings.warn(
+                f"T_end={T_end} < {self.SAFE_T_END_MIN} may cause gradient vanishing "
+                f"(P11-11). Clamping to {self.SAFE_T_END_MIN}.",
+                UserWarning
+            )
+            T_end = self.SAFE_T_END_MIN
         
         self.splitter = splitter
         self.T_start = T_start

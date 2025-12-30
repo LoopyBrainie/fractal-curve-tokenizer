@@ -21,10 +21,10 @@
 Logits 裁剪:
     logits = clamp(logits, -10, 10)  防止数值溢出
 
-LearnableSplitter 默认参数:
+LearnableSplitter 默认参数 (P11-10/P11-11 修复后):
     T_start = 1.0        Gumbel-Softmax 起始温度
-    T_end = 0.1          Gumbel-Softmax 终止温度
-    τ_base = 0.5         初始基础阈值 (中心初始化)
+    T_end = 0.3          Gumbel-Softmax 终止温度 (P11-11: 安全下界)
+    τ_base = 0.0         初始基础阈值 (P11-10: 对称于 z 分布)
     γ = 0.85             阈值衰减因子 (每层)
 """
 

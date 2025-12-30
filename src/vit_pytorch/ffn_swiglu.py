@@ -11,9 +11,14 @@ SwiGLU FFN (LLaMA/PaLM 风格):
 层级自适应 (Level Adaptation):
     Output = (1 - α_d) · FFN(x) + α_d · Adapter([x; E_level(d)])
     其中:
-    - α_d = softmax(MixingWeights)_d
+    - α_d = sigmoid(MixingWeights[d]) ∈ (0, 1)，每个深度独立门控
     - Adapter 是小型 MLP
     - [;] 表示拼接
+    
+    Sigmoid 语义:
+    - sigmoid(0) = 0.5: 50% FFN + 50% Adapter (初始状态)
+    - sigmoid(+∞) → 1: 100% Adapter (深度特化)
+    - sigmoid(-∞) → 0: 100% FFN (深度无关)
 
 复杂度分析
 ----------
@@ -121,11 +126,15 @@ class AdaptiveFractalFeedForward(nn.Module):
     - 'swiglu': SwiGLU FFN (LLaMA-style, lightweight)
     - 'swiglu_level': SwiGLU + Level Adaptation (recommended, best balance)
     
+    P11-2 修复: 参数 max_level 现在应传入与 tokenizer.max_depth 一致的值，
+    而非硬编码的 50。这确保 level_embedding 和 level_mixing_weights 的
+    Embedding 表大小与实际使用的深度范围匹配，减少约 90% 的参数浪费。
+    
     Args:
         dim: Input/output dimension.
         hidden_dim: Hidden layer dimension.
         dropout: Dropout rate.
-        max_level: Maximum hierarchical level for embeddings.
+        max_level: Maximum hierarchical level for embeddings (P11-2: should match tokenizer.max_depth).
         use_level_adaptation: Whether to use level-aware adaptation (only for 'gelu').
         ffn_type: FFN variant to use ('gelu', 'swiglu', 'swiglu_level').
         bias: Whether to use bias in linear layers (default: False for SwiGLU).
@@ -136,7 +145,7 @@ class AdaptiveFractalFeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         dropout: float = 0.0,
-        max_level: int = 50,
+        max_level: int = 8,  # P11-2: 默认改为 8，应由上层传入实际 max_depth
         use_level_adaptation: bool = True,
         ffn_type: FFNType = 'swiglu_level',
         bias: bool = False,

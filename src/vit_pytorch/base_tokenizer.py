@@ -73,6 +73,9 @@ class TokenizerOutput:
     当 Tokenizer 内部已经有 padding 后的张量时，可直接传入缓存，
     消除 model._prepare_tokens 中的 O(B) Python 循环。
     
+    P11-3 改进: 新增 _regions_cache 和 _image_size_cache 用于
+    直接从区域边界计算正确的四叉树 LCA 偏置。
+    
     P12-2 优化: _lengths_cache 存储为 Tensor 而非 List[int]，
     避免 _create_attention_mask 中的 Python 列表到 Tensor 转换开销。
     
@@ -81,6 +84,8 @@ class TokenizerOutput:
         _padded_tokens_cache: 预填充的 tokens [B, MaxN, D] (可选缓存)
         _padded_levels_cache: 预填充的 levels [B, MaxN, info_dim] (可选缓存)
         _lengths_cache: 每个样本的实际 token 数量 Tensor[B] (可选缓存)
+        _regions_cache: (P11-3) 预填充的 regions [B, MaxN, 4] (可选缓存)
+        _image_size_cache: (P11-3) 图像边长 (可选缓存)
         
     Properties:
         tokens: 堆叠的 tokens [B, N, D]（假设所有样本 token 数量相同）
@@ -91,6 +96,8 @@ class TokenizerOutput:
     _padded_tokens_cache: Optional[torch.Tensor] = field(default=None, repr=False)
     _padded_levels_cache: Optional[torch.Tensor] = field(default=None, repr=False)
     _lengths_cache: Optional[torch.Tensor] = field(default=None, repr=False)
+    _regions_cache: Optional[torch.Tensor] = field(default=None, repr=False)
+    _image_size_cache: Optional[int] = field(default=None, repr=False)
 
     def __iter__(self) -> Iterator[TokenSequence]:
         return iter(self.sequences)
@@ -244,6 +251,20 @@ class TokenizerOutput:
             else:
                 result.append(levels)
         return result
+
+    def get_padded_regions(self) -> Tuple[Optional[torch.Tensor], Optional[int]]:
+        """获取预填充的 regions 和 image_size (P11-3 新增).
+        
+        用于直接从区域边界计算正确的四叉树 LCA 偏置，
+        绕过 levels_info 中全为 0 的路径问题。
+        
+        Returns:
+            (regions, image_size):
+            - regions: [B, MaxN, 4] 填充后的 regions，格式 [x1, y1, x2, y2]
+                       或 None (如果未设置缓存)
+            - image_size: 图像边长，或 None
+        """
+        return self._regions_cache, self._image_size_cache
 
     def to_legacy(self) -> "LegacyTokenizerOutput":
         return LegacyTokenizerOutput(

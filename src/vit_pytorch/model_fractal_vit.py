@@ -61,12 +61,15 @@ class FractalCurveViT(nn.Module):
     - 边缘检测和纹理复杂度分析
     - 自适应多尺度处理
     
+    P11-2 修复: max_level 参数现在默认为 None，将自动从 tokenizer.max_depth 获取。
+    这确保所有 Embedding 表大小与实际使用的深度范围匹配，减少约 90% 的参数浪费。
+    
     Attributes:
         image_size: 输入图像尺寸
         num_classes: 分类类别数
         dim: 模型维度
         pool: 池化策略 ('cls', 'mean' 或其他)
-        max_level: 最大递归层级
+        max_level: 最大递归层级 (从 tokenizer.max_depth 自动获取)
         tokenizer: 图像 tokenizer
         token_processor: token 处理器
         pos_embedding: 位置编码
@@ -88,7 +91,7 @@ class FractalCurveViT(nn.Module):
         dropout: float = 0.0,
         emb_dropout: float = 0.0,
         min_patch_size: Tuple[int, int] = (4, 4),
-        max_level: int = 50,
+        max_level: Optional[int] = None,  # P11-2: 默认 None，从 tokenizer.max_depth 自动获取
         use_hilbert_encoding: bool = True,
         use_spatial_encoding: bool = True,
         use_checkpoint: bool = False,
@@ -99,9 +102,6 @@ class FractalCurveViT(nn.Module):
         # Streaming Tokenizer 配置
         tokenizer_type: TokenizerType = "streaming_v3",
         num_scales: int = 4,
-        # Hilbert Bias 配置
-        hilbert_bias_mode: str = 'lca',
-        low_rank_r: int = 32,
         # P6-2: LCA 温度配置
         lca_temperature: Optional[float] = 1.5,
         learnable_temperature: bool = True,
@@ -121,7 +121,7 @@ class FractalCurveViT(nn.Module):
             dropout: Dropout 比率
             emb_dropout: 嵌入层 Dropout 比率
             min_patch_size: 最小 patch 尺寸
-            max_level: 最大递归层级
+            max_level: 最大递归层级（P11-2: 默认 None，自动从 tokenizer.max_depth 获取）
             use_hilbert_encoding: 是否使用 Hilbert 编码
             use_spatial_encoding: 是否使用空间编码
             ffn_type: FFN 变体 ('gelu', 'swiglu', 'swiglu_level')
@@ -129,11 +129,6 @@ class FractalCurveViT(nn.Module):
             position_embedding: 自定义位置编码（可选）
             tokenizer_type: tokenizer 类型 ("streaming_v3" - Variable Depth Tokens)
             num_scales: 多尺度金字塔层数
-            hilbert_bias_mode: Hilbert Bias 计算模式
-                - 'lca': LCA 嵌入表（推荐，~40参数，显式几何意义）
-                - 'low_rank': 低秩分解（显存友好，~50K参数）
-                - 'hierarchical': 分层计算（可解释性强）
-            low_rank_r: 低秩分解的秩参数（仅当 hilbert_bias_mode='low_rank' 时有效）
             lca_temperature: (P6-2) LCA 偏置温度参数，默认 1.5
                 - None: 不使用温度缩放 (兼容模式)
                 - float: 温度初始值
@@ -145,15 +140,13 @@ class FractalCurveViT(nn.Module):
         self.num_classes = num_classes
         self.dim = dim
         self.pool = pool
-        self.max_level = max_level
+        # P11-2: max_level 将在 tokenizer 创建后从 tokenizer.max_depth 获取
         self.use_checkpoint = use_checkpoint
         self.ffn_type = ffn_type
         
         # 保存 tokenizer 类型
         self.tokenizer_type = tokenizer_type
         self._is_streaming = True  # 现在所有 tokenizer 都是 streaming 模式
-        self.hilbert_bias_mode = hilbert_bias_mode
-        self.low_rank_r = low_rank_r
         self.lca_temperature = lca_temperature
         self.learnable_temperature = learnable_temperature
 
@@ -178,6 +171,16 @@ class FractalCurveViT(nn.Module):
         self.tokenizer = tokenizer
         # 兼容旧属性名
         self.fractal_tokenizer = tokenizer
+
+        # P11-2 修复: 从 tokenizer 动态获取 max_depth 作为 max_level
+        # 这确保 Embedding 表大小与实际使用的深度范围匹配
+        if max_level is None:
+            if hasattr(tokenizer, 'max_depth'):
+                max_level = tokenizer.max_depth
+            else:
+                # 向后兼容: 若 tokenizer 没有 max_depth 属性，使用保守默认值
+                max_level = 8
+        self.max_level = max_level
 
         # Streaming tokenizer 已直接输出 D-dim embeddings，无需 token_processor
         self.token_processor = None
@@ -223,8 +226,6 @@ class FractalCurveViT(nn.Module):
             drop_path_rate=drop_path_rate,
             ffn_type=ffn_type,
             use_checkpoint=use_checkpoint,
-            hilbert_bias_mode=hilbert_bias_mode,
-            low_rank_r=low_rank_r,
             lca_temperature=lca_temperature,
             learnable_temperature=learnable_temperature,
         )
@@ -283,7 +284,7 @@ class FractalCurveViT(nn.Module):
     @torch._dynamo.disable
     def _prepare_tokens(
         self, img: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], "TokenizerOutput"]:
         """准备 tokens 和进行 padding。
         
         数学形式化：
@@ -293,6 +294,9 @@ class FractalCurveViT(nn.Module):
             原实现: O(B) Python 循环进行 padding
             新实现: 使用 TokenizerOutput 的预填充缓存，O(1) 张量操作
             
+        P11-3 改进：
+            返回 TokenizerOutput 以便后续获取 regions 信息
+            
         P12-2 优化：
             lengths 返回 Tensor[B] 而非 List[int]，避免 _create_attention_mask 转换开销
         
@@ -300,11 +304,12 @@ class FractalCurveViT(nn.Module):
             img: 输入图像 [B, C, H, W]
             
         Returns:
-            (padded_tokens, padded_levels, lengths, levels_list):
+            (padded_tokens, padded_levels, lengths, levels_list, token_output):
             - padded_tokens: tokens [B, MaxN, Dim] (padded)
             - padded_levels: 层级信息 [B, MaxN, InfoDim]
             - lengths: Tensor[B] 每个样本的实际 token 数量
             - levels_list: 原始层级列表（用于辅助输出）
+            - token_output: TokenizerOutput (P11-3: 用于获取 regions)
         """
         # Streaming tokenizer 直接输出 D-dim embeddings
         token_output = self.tokenizer.tokenize(img)
@@ -315,7 +320,7 @@ class FractalCurveViT(nn.Module):
         padded_levels = token_output.get_padded_levels(info_dim)
         levels_list = token_output.levels_list()
         
-        return padded_tokens, padded_levels, lengths, levels_list
+        return padded_tokens, padded_levels, lengths, levels_list, token_output
 
     def _apply_position_and_cls(
         self,
@@ -504,19 +509,27 @@ class FractalCurveViT(nn.Module):
         batch_size = img.shape[0]
         device = img.device
 
-        # 1. 准备 tokens
-        padded_tokens, padded_levels, lengths, levels_list = self._prepare_tokens(img)
+        # 1. 准备 tokens (P11-3: 返回 token_output 用于获取 regions)
+        padded_tokens, padded_levels, lengths, levels_list, token_output = self._prepare_tokens(img)
+        
+        # P11-3: 获取 regions 和 image_size 用于正确的 LCA 偏置计算
+        regions, image_size = token_output.get_padded_regions()
 
         # 2. 添加位置编码和 CLS token
         x, padded_levels = self._apply_position_and_cls(padded_tokens, padded_levels)
+        
+        # P11-3: 为 regions 添加 CLS 对应的零填充
+        if regions is not None:
+            cls_region = torch.zeros(batch_size, 1, 4, dtype=regions.dtype, device=device)
+            regions = torch.cat([cls_region, regions], dim=1)
 
         # 3. 创建 attention mask
         attn_mask, key_padding_mask = self._create_attention_mask(
             batch_size, x.shape[1], lengths, device
         )
 
-        # 4. Transformer 处理
-        x = self.transformer(x, padded_levels, attn_mask)
+        # 4. Transformer 处理 (P11-3: 传递 regions 和 image_size)
+        x = self.transformer(x, padded_levels, attn_mask, regions=regions, image_size=image_size)
 
         # 5. 池化
         pooled = self._apply_pooling(x, key_padding_mask)

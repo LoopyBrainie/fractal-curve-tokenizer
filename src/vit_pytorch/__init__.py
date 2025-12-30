@@ -42,14 +42,11 @@ from .attn_hilbert_bias import (
     HilbertAwareMultiScaleAttention,
     HilbertBiasBase,
     LCAHilbertBias,
-    LowRankHilbertBias,
-    HierarchicalHilbertBias,
 )
 from .ffn_swiglu import AdaptiveFractalFeedForward, FFNType, SwiGLUFFN
 from .config_fractal import (
     FractalConfig,
     create_fractal_config,
-    BiasMode,
     AnnealSchedule,
     TokenizerType,
 )
@@ -92,7 +89,6 @@ __all__ = [
     # === 配置与路径编码 ===
     "FractalConfig",
     "create_fractal_config",
-    "BiasMode",
     "AnnealSchedule",
     "TokenizerType",
     "FractalPathEmbedding",
@@ -114,8 +110,6 @@ __all__ = [
     "HilbertAwareMultiScaleAttention",
     "HilbertBiasBase",
     "LCAHilbertBias",
-    "LowRankHilbertBias",
-    "HierarchicalHilbertBias",
     "AdaptiveFractalFeedForward",
     "SwiGLUFFN",
     "FFNType",

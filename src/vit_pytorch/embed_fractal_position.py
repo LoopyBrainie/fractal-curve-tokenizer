@@ -37,20 +37,10 @@ forward (位置编码):
           └─ 融合网络:  O(N · D · D)     — MLP
     空间: O(L_max · 4 · D)  — quadrant_embedding 表
 
-get_attention_bias:
-    时间: O(N²)  — 双向索引查表
-    空间: O((L_max+1)² · H)  — level_attention_bias 矩阵
+其中: N=seq_len, D=dim, L_max=max_level
 
-其中: N=seq_len, D=dim, L_max=max_level, H=heads
-
-类对照表
-----------
-+--------------------------------+-------------------------------+
-| 方法                            | 数学定义                        |
-+================================+===============================+
-| forward(levels_info)           | E_pos: L → R^{N × D}         |
-| get_attention_bias(depths)     | B_level: Z^N → R^{N × N}     |
-+--------------------------------+-------------------------------+
+P11-5 修复: 删除了未使用的 level_attention_bias 参数和 get_attention_bias 方法。
+注意力偏置功能已由 LCAHilbertBias (attn_hilbert_bias.py) 统一提供。
 """
 from __future__ import annotations
 
@@ -66,12 +56,15 @@ class FractalPositionEmbedding(nn.Module):
     """
     高级分形位置编码，完全对齐增强tokenizer
     支持动态层级、Hilbert路径编码和多尺度空间感知
+    
+    P11-2 修复: max_level 参数现在应传入与 tokenizer.max_depth 一致的值，
+    确保 Embedding 表大小与实际使用的深度范围匹配，减少约 90% 的参数浪费。
     """
 
     def __init__(
         self,
         dim: int,
-        max_level: int = 50,
+        max_level: int = 8,  # P11-2: 默认改为 8，应由上层传入实际 max_depth
         max_seq_len: int = 10000,
         use_hilbert_encoding: bool = True,
         use_spatial_encoding: bool = True,
@@ -101,14 +94,13 @@ class FractalPositionEmbedding(nn.Module):
             nn.Dropout(0.1),
         )
 
-        self.level_attention_bias = nn.Parameter(torch.zeros(max_level + 1, max_level + 1))
+        # P11-5: 删除了 level_attention_bias，注意力偏置由 LCAHilbertBias 统一提供
 
         self._init_parameters()
 
     def _init_parameters(self) -> None:
         nn.init.normal_(self.depth_embedding.weight, std=EMBEDDING_INIT_STD)
         nn.init.normal_(self.quadrant_embedding.weight, std=EMBEDDING_INIT_STD)
-        nn.init.uniform_(self.level_attention_bias, -HILBERT_BIAS_SCALE, HILBERT_BIAS_SCALE)
 
     def forward(
         self,
@@ -165,43 +157,6 @@ class FractalPositionEmbedding(nn.Module):
         
         return self.fusion_network(combined_emb)
 
-    def get_attention_bias(self, depths: torch.Tensor) -> torch.Tensor:
-        """
-        计算基于层级的注意力偏置矩阵
-        
-        此方法提供与 LCAHilbertBias 互补的层级偏置机制。
-        LCAHilbertBias 基于 Hilbert 路径的 LCA 深度，而此方法直接使用
-        token 深度对构建偏置矩阵。
-        
-        使用示例
-        --------
-        在自定义注意力模块中使用 level_attention_bias::
-        
-            pos_embed = FractalPositionEmbedding(dim=256, max_level=10)
-            
-            # 假设 levels_info 是 tokenizer 输出的层级信息
-            # levels_info[:, 0] 是每个 token 的深度
-            depths = levels_info[:, 0]
-            
-            # 获取 [N, N] 偏置矩阵
-            level_bias = pos_embed.get_attention_bias(depths)
-            
-            # 添加到注意力分数
-            # attn_scores: [B, H, N, N]
-            # level_bias: [N, N] → 广播到 [1, 1, N, N]
-            attn_scores = attn_scores + level_bias.unsqueeze(0).unsqueeze(0) * scale
-        
-        Args:
-            depths: (N,) 每个 token 的深度值
-            
-        Returns:
-            (N, N) 注意力偏置矩阵，其中 bias[i,j] = level_attention_bias[d_i, d_j]
-        """
-        # 向量化实现，避免双重循环
-        depths_clamped = depths.clamp(0, self.max_level).long()  # (N,)
-        
-        # 使用高级索引一次性获取所有偏置
-        # bias[i, j] = level_attention_bias[depths[i], depths[j]]
-        bias = self.level_attention_bias[depths_clamped.unsqueeze(1), depths_clamped.unsqueeze(0)]
-        
-        return bias
+    # P11-5: 删除了 get_attention_bias 方法
+    # 注意力偏置功能已由 LCAHilbertBias (attn_hilbert_bias.py) 统一提供
+    # 该方法基于 LCA 深度计算偏置，语义更精确 (编码空间距离而非尺度组合)

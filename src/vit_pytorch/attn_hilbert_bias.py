@@ -13,19 +13,14 @@ Hilbert 感知注意力:
 
 偏置项
 ------
-1. Low-Rank Hilbert Bias (低秩分解):
-   B_hilbert[i,j] = φ(path_i)^T · ψ(path_j)
-   其中 φ, ψ: R^d → R^r 是可学习线性投影
-   复杂度: O(N·r) vs 原始 O(N²)
+1. LCA Hilbert Bias (最近公共祖先):
+   B_hilbert[i,j] = LCAEmbed(LCA(i,j))
+   利用四叉树 LCA 深度直接编码空间距离，参数极少 (~100)
 
-2. Hierarchical Hilbert Bias (分层计算):
-   B_hilbert[i,j] = Σ_{ℓ=1}^L b^(ℓ)(q_i^(ℓ), q_j^(ℓ))
-   利用四叉树层级结构，各层独立计算
-
-3. Level Bias (相对层级偏置):
+2. Level Bias (相对层级偏置):
    B_level[i,j] = Embedding(clamp(d_i - d_j + L, 0, 2L))
 
-4. Level Scaling (层级缩放):
+3. Level Scaling (层级缩放):
    σ_scale(d) = LevelScaleEmb(d)
    深层 token 使用较小缩放
 
@@ -34,22 +29,18 @@ Hilbert 感知注意力:
 +-------------------------------+------------------------------------------+
 | 类                             | 数学定义                                   |
 +===============================+==========================================+
-| LowRankHilbertBias            | B = ΦΨ^T, Φ,Ψ ∈ R^{N × r × H}           |
-| HierarchicalHilbertBias       | B = Σ_ℓ MLP_ℓ(same, diff, q_i, q_j)      |
 | LCAHilbertBias                | B[i,j] = LCAEmbed(LCA(i,j))              |
 | HilbertAwareMultiScaleAttention| Attn + B_hilbert + B_level              |
 +-------------------------------+------------------------------------------+
 
-bias_mode 选项:
-- 'lca': LCA 嵌入表（推荐，~100参数，显式几何意义）
-- 'low_rank': 低秩分解（显存友好，~50K参数）
-- 'hierarchical': 分层计算（可解释性强）
+P11-8 简化: 移除未使用的 LowRankHilbertBias 和 HierarchicalHilbertBias
 """
 
 from __future__ import annotations
 
+import weakref
 from abc import ABC, abstractmethod
-from typing import Literal, Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -59,8 +50,6 @@ from einops import rearrange
 from .constants import HILBERT_BIAS_SCALE, LEVEL_BIAS_SCALE
 from .utils import extract_depths, normalize_levels_info
 from .embed_fractal_path import VectorizedPathEncoder
-
-BiasMode = Literal['lca', 'low_rank', 'hierarchical']
 
 
 class HilbertBiasBase(ABC, nn.Module):
@@ -132,192 +121,6 @@ class HilbertBiasBase(ABC, nn.Module):
         ...
 
 
-class LowRankHilbertBias(HilbertBiasBase):
-    """低秩分解的 Hilbert Bias 实现。
-    
-    使用两个独立的路径编码器，将 O(S²) 的偏置矩阵分解为 O(S×r) 的低秩形式。
-    
-    数学原理:
-        B[i,j] = φ(path_i)^T · ψ(path_j)
-        其中 φ, ψ: R^d → R^r 是可学习的编码器
-    
-    复杂度:
-        计算: O(S·r·H) vs 原始 O(S²·64·H)
-        显存: O(S·r·H) vs 原始 O(S²·H)
-    
-    注意：实际的 levels_info 路径维度取决于图像大小和 max_level 的组合，
-    forward 时会对输入进行动态截断或填充以匹配模型的 path_dim。
-    """
-    
-    def __init__(self, path_dim: int, rank: int, heads: int) -> None:
-        """初始化低秩 Hilbert Bias。
-        
-        Args:
-            path_dim: 路径维度（建议设置足够大，如 max_level + 16）
-            rank: 秩参数，控制近似精度（推荐 32-64）
-            heads: 注意力头数
-        """
-        super().__init__()
-        self.rank = rank
-        self.heads = heads
-        # 保存 path_dim 用于动态调整输入
-        self.path_dim = path_dim
-        
-        # Query 路径编码器
-        self.path_encoder_q = nn.Sequential(
-            nn.Linear(path_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, rank * heads),
-        )
-        
-        # Key 路径编码器
-        self.path_encoder_k = nn.Sequential(
-            nn.Linear(path_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, rank * heads),
-        )
-        
-        # 截断警告标志，避免重复警告
-        self._truncation_warned = False
-    
-    def _adjust_path_dim(self, paths: torch.Tensor) -> torch.Tensor:
-        """调整路径维度以匹配模型期望的 path_dim。
-        
-        Args:
-            paths: 输入路径 (..., actual_path_len)
-            
-        Returns:
-            调整后的路径 (..., path_dim)
-            
-        Note:
-            当 actual_dim > path_dim 时会截断深层路径后缀，可能降低 LCA 精度。
-            建议设置 path_dim >= max_level + 16 以避免截断。
-        """
-        actual_dim = paths.shape[-1]
-        if actual_dim == self.path_dim:
-            return paths
-        elif actual_dim < self.path_dim:
-            # 填充零
-            padding = torch.zeros(*paths.shape[:-1], self.path_dim - actual_dim, 
-                                  device=paths.device, dtype=paths.dtype)
-            return torch.cat([paths, padding], dim=-1)
-        else:
-            # 截断（保留前 path_dim 个元素）
-            # P1-3 改进: 添加运行时警告
-            if not self._truncation_warned:
-                import warnings
-                warnings.warn(
-                    f"LowRankHilbertBias: 路径维度 {actual_dim} 超出 path_dim={self.path_dim}，"
-                    f"将截断深层路径后缀。这可能降低 LCA 精度。"
-                    f"建议增加 path_dim 或使用 path_dim='auto'。",
-                    UserWarning
-                )
-                self._truncation_warned = True
-            return paths[..., :self.path_dim]
-    
-    def _compute_bias_3d(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
-        """计算低秩 Hilbert Bias（核心 3D 实现）。
-        
-        Args:
-            levels_info: (B, S, Info) 规范化后的层级信息
-            
-        Returns:
-            (B, H, S, S) 偏置矩阵，若无效则返回 None
-        """
-        batch_size, seq_len, info_dim = levels_info.shape
-        if info_dim <= 1:
-            return None
-        
-        paths = levels_info[:, :, 1:].float()  # (B, S, Path)
-        # 调整路径维度以匹配模型
-        paths = self._adjust_path_dim(paths)
-        
-        # 编码路径
-        phi = self.path_encoder_q(paths)  # (B, S, rank*H)
-        psi = self.path_encoder_k(paths)  # (B, S, rank*H)
-        
-        phi = phi.view(batch_size, seq_len, self.heads, self.rank)  # (B, S, H, r)
-        psi = psi.view(batch_size, seq_len, self.heads, self.rank)  # (B, S, H, r)
-        
-        # 低秩矩阵乘法
-        bias = torch.einsum('bihr,bjhr->bhij', phi, psi)  # (B, H, S, S)
-        return bias
-
-
-class HierarchicalHilbertBias(HilbertBiasBase):
-    """分层计算的 Hilbert Bias 实现。
-    
-    利用四叉树的层级结构，将偏置分解为各层的贡献之和。
-    
-    数学原理:
-        B[i,j] = Σ_{ℓ=1}^L b^(ℓ)(q_i^(ℓ), q_j^(ℓ), context)
-        其中 q^(ℓ) 是第 ℓ 层的象限索引
-    
-    优势:
-        - 可解释性强（可视化各层贡献）
-        - 参数共享（泛化能力好）
-        - 可并行计算各层
-    """
-    
-    def __init__(self, max_depth: int, heads: int) -> None:
-        """初始化分层 Hilbert Bias。
-        
-        Args:
-            max_depth: 最大四叉树深度
-            heads: 注意力头数
-        """
-        super().__init__()
-        self.max_depth = max_depth
-        self.heads = heads
-        
-        # 每层独立的偏置网络
-        # 输入特征: [same_quad, quad_diff, q_i, q_j] (4维)
-        self.layer_nets = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(4, 16),
-                nn.ReLU(),
-                nn.Linear(16, heads),
-            )
-            for _ in range(max_depth)
-        ])
-    
-    def _compute_bias_3d(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
-        """计算分层 Hilbert Bias（核心 3D 实现）。
-        
-        Args:
-            levels_info: (B, S, Info) 规范化后的层级信息
-            
-        Returns:
-            (B, H, S, S) 偏置矩阵，若无效则返回 None
-        """
-        batch_size, seq_len, info_dim = levels_info.shape
-        if info_dim <= 1:
-            return None
-        
-        paths = levels_info[:, :, 1:].long()  # (B, S, Path)
-        path_len = paths.shape[-1]
-        
-        bias = torch.zeros(batch_size, self.heads, seq_len, seq_len, device=paths.device)
-        
-        # 逐层累加偏置
-        for level in range(min(path_len, len(self.layer_nets))):
-            q = paths[:, :, level]  # (B, S)
-            
-            # 计算特征 (向量化)
-            same_quad = (q.unsqueeze(2) == q.unsqueeze(1)).float()  # (B, S, S)
-            quad_diff = (q.unsqueeze(2) - q.unsqueeze(1)).abs().float()  # (B, S, S)
-            q_i = q.unsqueeze(2).expand(batch_size, seq_len, seq_len).float()  # (B, S, S)
-            q_j = q.unsqueeze(1).expand(batch_size, seq_len, seq_len).float()  # (B, S, S)
-            
-            context = torch.stack([same_quad, quad_diff, q_i, q_j], dim=-1)  # (B, S, S, 4)
-            
-            # 通过第 level 层网络
-            layer_bias = self.layer_nets[level](context)  # (B, S, S, H)
-            bias += layer_bias.permute(0, 3, 1, 2)  # (B, H, S, S)
-        
-        return bias
-
-
 class LCAHilbertBias(HilbertBiasBase):
     """基于最近公共祖先 (LCA) 的 Hilbert Bias 实现。
     
@@ -336,6 +139,19 @@ class LCAHilbertBias(HilbertBiasBase):
         
     其中 LCAEmbed: {0,1,...,D} → R^H 是可学习的嵌入表，
     τ_h 是 per-head 可学习温度参数。
+    
+    P11-3 修复: 从 regions 直接计算路径
+    ===================================
+    问题: 原始设计中 levels_info 的路径部分全为 0，导致 LCA 失效。
+    
+    根本原因:
+        - TensorSplitResult 只存储 hilbert_indices 和 regions，不存储路径
+        - 代码注释声称 "path 可从 hilbert_idx 恢复" 是数学错误
+        - Hilbert index XOR ≠ Quadtree LCA (验证仅 56% 一致性)
+    
+    解决方案:
+        添加 forward_from_regions() 方法，从 regions 向量化计算真实四叉树路径，
+        然后计算正确的 LCA 深度矩阵。
     
     P6-2 改进: 可学习温度参数
     =========================
@@ -363,6 +179,7 @@ class LCAHilbertBias(HilbertBiasBase):
     3. 无需学习距离: 距离信息由编码结构直接提供
     4. 可解释性强: 偏置值可直接对应空间邻近程度
     5. [P6-2] 自适应强度: 每个 head 可学习最优的空间偏好强度
+    6. [P11-3] 语义正确: 从 regions 直接计算真实四叉树 LCA
     """
     
     def __init__(
@@ -398,11 +215,19 @@ class LCAHilbertBias(HilbertBiasBase):
         self._learnable_temperature = learnable_temperature
         self._init_temperature(lca_temperature, learnable_temperature)
         
-        # P1-6 优化: LCA 深度矩阵缓存
-        # 同一个 levels_info 在不同 Transformer 层之间是相同的
-        # 缓存避免重复计算，理论加速 ~6x (6层时)
-        # FIX: 缓存键包含形状，避免 torch.compile 下的内存重用导致的碰撞
-        self._lca_cache_key: Optional[Tuple[int, torch.device, Tuple[int, ...]]] = None  # (data_ptr, device, shape)
+        # P11-1 修复: LCA 深度矩阵缓存
+        # 使用 WeakRef 确保原张量仍存在，避免 data_ptr 重用导致的碰撞
+        # 
+        # 原方案 (data_ptr 缓存键) 的问题:
+        # - PyTorch 会重用相同大小的内存块 (测试显示 10 次分配仅 2 个唯一地址)
+        # - 缓存可能跨 batch 持久化，新 batch 可能复用旧地址
+        # - 在 torch.compile 下风险更高
+        #
+        # 新方案 (WeakRef):
+        # - 通过弱引用检测原张量是否仍存活
+        # - 如果原张量被释放，WeakRef 返回 None，触发重新计算
+        # - 零额外内存开销
+        self._lca_cache_ref: Optional["weakref.ref[torch.Tensor]"] = None
         self._lca_cache_value: Optional[torch.Tensor] = None
         
         # 初始化: 深度越大（越邻近）偏置越高
@@ -510,22 +335,22 @@ class LCAHilbertBias(HilbertBiasBase):
         # 提取四叉树路径: (B, S, Path)
         paths = levels_info[:, :, 1:].long()
         
-        # P1-6: 检查缓存
-        # 使用 (data_ptr, device, shape) 作为缓存键
-        # FIX: 加入 shape 避免 torch.compile 下内存重用导致的尺寸不匹配
-        cache_key = (levels_info.data_ptr(), levels_info.device, tuple(levels_info.shape))
+        # P11-1 修复: 使用 WeakRef 检查缓存
+        # WeakRef 确保原张量仍存在，避免 data_ptr 重用导致的碰撞
+        cache_hit = False
+        if self._lca_cache_ref is not None and self._lca_cache_value is not None:
+            cached_tensor = self._lca_cache_ref()  # 尝试获取原张量
+            if cached_tensor is levels_info:
+                # 缓存命中: 原张量仍存在且是同一个对象
+                cache_hit = True
+                lca_depths = self._lca_cache_value
         
-        if (self._lca_cache_key is not None and 
-            self._lca_cache_key == cache_key and
-            self._lca_cache_value is not None):
-            # 缓存命中
-            lca_depths = self._lca_cache_value
-        else:
+        if not cache_hit:
             # 缓存未命中，计算 LCA
             lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
             lca_depths = lca_depths.clamp(0, self.max_depth)
-            # 更新缓存
-            self._lca_cache_key = cache_key
+            # 更新缓存: 使用 WeakRef 指向原张量
+            self._lca_cache_ref = weakref.ref(levels_info)
             self._lca_cache_value = lca_depths
         
         # 批量嵌入: (B, S, S, H)
@@ -549,9 +374,76 @@ class LCAHilbertBias(HilbertBiasBase):
         - 开始新的 batch 前
         - 评估/推理前后
         - 内存清理时
+        
+        P11-1: 使用 WeakRef 后，缓存会在原张量被释放时自动失效。
+        此方法仍可用于显式清理或测试目的。
         """
-        self._lca_cache_key = None
+        self._lca_cache_ref = None
         self._lca_cache_value = None
+    
+    def forward_from_regions(
+        self,
+        regions: torch.Tensor,
+        image_size: int,
+    ) -> Optional[torch.Tensor]:
+        """从 regions 直接计算 LCA Hilbert Bias (P11-3 修复)。
+        
+        这是推荐的调用方式，绕过有问题的 levels_info 接口。
+        
+        数学原理:
+            1. 从区域边界计算中心点: cx = (x1+x2)/2, cy = (y1+y2)/2
+            2. 向量化计算四叉树路径: path[d] = bit(cx, D-d) + 2*bit(cy, D-d)
+            3. 向量化计算 LCA: LCA[i,j] = len(common_prefix(path_i, path_j))
+            4. 查表获取偏置: B[i,j] = LCAEmbed(LCA[i,j])
+        
+        Args:
+            regions: 区域边界张量
+                - 2D: (N, 4) 格式 [x1, y1, x2, y2]，单样本
+                - 3D: (B, N, 4) 格式，批量
+            image_size: 图像边长 (假设正方形)
+            
+        Returns:
+            偏置矩阵:
+                - 2D 输入 → (H, S, S)
+                - 3D 输入 → (B, H, S, S)
+            若输入无效则返回 None
+        """
+        if regions.numel() == 0:
+            return None
+        
+        # 记录原始维度
+        was_2d = regions.dim() == 2
+        if was_2d:
+            regions = regions.unsqueeze(0)  # [1, N, 4]
+        
+        B, N, _ = regions.shape
+        
+        # 从 regions 计算四叉树路径
+        paths = VectorizedPathEncoder.compute_paths_from_regions(
+            regions, image_size, self.max_depth
+        )  # [B, N, max_depth]
+        
+        # 计算 LCA 深度矩阵
+        lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
+        lca_depths = lca_depths.clamp(0, self.max_depth)  # [B, N, N]
+        
+        # 批量嵌入: (B, N, N, H)
+        bias = self.lca_embedding(lca_depths)
+        
+        # P6-2: 应用温度缩放
+        temperature = self.lca_temperature
+        if temperature is not None:
+            temp_scale = temperature.to(bias.device).view(1, 1, 1, -1)
+            bias = bias * temp_scale
+        
+        # 调整形状: (B, H, S, S)
+        bias = bias.permute(0, 3, 1, 2)
+        
+        # 若原始输入为 2D，移除 batch 维度
+        if was_2d:
+            bias = bias.squeeze(0)  # (H, S, S)
+        
+        return bias
 
 
 class   HilbertAwareMultiScaleAttention(nn.Module):
@@ -559,10 +451,15 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
 
     通过编码层级深度和 Hilbert 路径关系来调制注意力权重。
     
+    P11-2 修复: max_level 参数现在应传入与 tokenizer.max_depth 一致的值，
+    确保 Embedding 表大小与实际使用的深度范围匹配，减少约 90% 的参数浪费。
+    
+    P11-8 简化: 移除 bias_mode 和 low_rank_r 参数，仅保留 LCA 模式。
+    
     Attributes:
         heads: 注意力头数
         dim_head: 每个头的维度
-        max_level: 最大层级
+        max_level: 最大层级 (应与 tokenizer.max_depth 匹配)
         use_hilbert_bias: 是否使用 Hilbert 偏置
         use_level_scaling: 是否使用层级缩放
         scale: 注意力缩放因子
@@ -574,30 +471,28 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         heads: int = 8,
         dim_head: int = 64,
         dropout: float = 0.0,
-        max_level: int = 50,
+        max_level: int = 8,  # P11-2: 默认改为 8，应由上层传入实际 max_depth
         use_hilbert_bias: bool = True,
         use_level_scaling: bool = True,
-        bias_mode: BiasMode = 'lca',
-        low_rank_r: int = 32,
         lca_temperature: Optional[float] = 1.5,
         learnable_temperature: bool = True,
     ) -> None:
         """初始化 HilbertAwareMultiScaleAttention。
+        
+        P11-2 修复: 参数 max_level 现在应传入与 tokenizer.max_depth 一致的值，
+        而非硬编码的 50。这确保 level_scale 和 relative_pos_embedding 的
+        Embedding 表大小与实际使用的深度范围匹配，减少约 90% 的参数浪费。
+        
+        P11-8 简化: 移除 bias_mode 和 low_rank_r 参数，仅保留 LCA 模式。
         
         Args:
             dim: 输入维度
             heads: 注意力头数
             dim_head: 每个头的维度
             dropout: Dropout 比率
-            max_level: 最大层级
-            use_hilbert_bias: 是否使用 Hilbert 路径偏置
+            max_level: 最大层级 (P11-2: should match tokenizer.max_depth)
+            use_hilbert_bias: 是否使用 Hilbert 路径偏置 (使用 LCA 模式)
             use_level_scaling: 是否使用层级缩放
-            bias_mode: Hilbert Bias 计算模式
-                - 'original': 原始全连接网络（高显存，精确）
-                - 'low_rank': 低秩分解（显存友好，~50K参数）
-                - 'hierarchical': 分层计算（可解释性强）
-                - 'lca': LCA 嵌入表（推荐，~100参数，显式几何意义）
-            low_rank_r: 低秩分解的秩参数（仅当 bias_mode='low_rank' 时有效）
             lca_temperature: (P6-2) LCA 偏置温度参数，默认 1.5
                 - None: 不使用温度缩放 (兼容模式)
                 - float: 温度初始值
@@ -609,7 +504,6 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         self.max_level = max_level
         self.use_hilbert_bias = use_hilbert_bias
         self.use_level_scaling = use_level_scaling
-        self.bias_mode = bias_mode
 
         inner_dim = dim_head * heads
         self.scale = dim_head ** -0.5
@@ -617,69 +511,75 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
 
-        # 根据 bias_mode 初始化对应的实现
+        # P11-8 简化: 仅使用 LCA 模式
         if use_hilbert_bias:
-            if bias_mode == 'lca':
-                self.hilbert_bias_impl: Optional[nn.Module] = LCAHilbertBias(
-                    max_depth=max_level,
-                    heads=heads,
-                    lca_temperature=lca_temperature,
-                    learnable_temperature=learnable_temperature,
-                )
-            elif bias_mode == 'low_rank':
-                # 路径维度需要足够大以容纳实际的 levels_info
-                # 实际路径维度 = max_info_len - 1 ≈ max_level + log2(image_size/min_patch) + 3
-                # 使用 max_level + 16 作为安全的默认值
-                estimated_path_dim = max_level + 16
-                self.hilbert_bias_impl = LowRankHilbertBias(
-                    path_dim=estimated_path_dim,
-                    rank=low_rank_r,
-                    heads=heads,
-                )
-            elif bias_mode == 'hierarchical':
-                self.hilbert_bias_impl = HierarchicalHilbertBias(
-                    max_depth=max_level,
-                    heads=heads,
-                )
-            else:
-                raise ValueError(f"Unknown bias_mode: {bias_mode}. Valid: 'lca', 'low_rank', 'hierarchical'")
+            self.hilbert_bias_impl: Optional[nn.Module] = LCAHilbertBias(
+                max_depth=max_level,
+                heads=heads,
+                lca_temperature=lca_temperature,
+                learnable_temperature=learnable_temperature,
+            )
         else:
             self.hilbert_bias_impl = None
 
         if use_level_scaling:
-            self.level_scale_embedding: Optional[nn.Embedding] = nn.Embedding(max_level + 1, heads)
-            # STAB-3 修复: 使用正确的 N(1.0, 0.1) 初始化
-            # 原代码两次初始化，第二次覆盖第一次，导致实际为 N(0, 0.1)
-            nn.init.normal_(self.level_scale_embedding.weight, mean=1.0, std=0.1)
+            # P11-4 修复: 使用 Softplus 约束确保 level_scale > 0
+            # 原设计使用 N(1.0, 0.1) 初始化，但无正性约束，有偏梯度可导致负值
+            # 新设计: softplus(_level_scale_raw) ∈ (0, +∞)
+            # 初始化 x=0.54 使得 softplus(0.54) ≈ 1.0
+            self._level_scale_raw: Optional[nn.Embedding] = nn.Embedding(max_level + 1, heads)
+            nn.init.constant_(self._level_scale_raw.weight, 0.54)  # softplus(0.54) ≈ 1.0
         else:
-            self.level_scale_embedding = None
+            self._level_scale_raw = None
 
-        # STAB-3: scale_weights 保留初始化为 1.0，但在 forward 中使用 softplus 约束
-        self._scale_weights_raw = nn.Parameter(torch.zeros(heads))  # softplus(0) ≈ 0.69
+        # P11-7 修复: 初始化使 softplus(0.54) ≈ 1.0，与 level_scale 保持一致
+        self._scale_weights_raw = nn.Parameter(torch.full((heads,), 0.54))
         self.relative_pos_embedding = nn.Embedding(2 * max_level + 1, heads)
 
         self.attend = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
         self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
 
-    def _compute_hilbert_bias(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+    def _compute_hilbert_bias(
+        self,
+        levels_info: Optional[torch.Tensor] = None,
+        regions: Optional[torch.Tensor] = None,
+        image_size: Optional[int] = None,
+    ) -> Optional[torch.Tensor]:
         """计算基于 Hilbert 路径的注意力偏置。
         
         根据 bias_mode 调用不同的实现：
-        - 'lca': LCA 嵌入表（推荐）
+        - 'lca': LCA 嵌入表（推荐，支持 regions 直接计算）
         - 'low_rank': 低秩分解
         - 'hierarchical': 分层计算
         
+        P11-3 改进: 当提供 regions + image_size 时，使用 forward_from_regions
+        直接从区域边界计算正确的四叉树 LCA，绕过有问题的 levels_info 路径。
+        
         Args:
             levels_info: 层级信息张量，形状为 (Seq, Info) 或 (Batch, Seq, Info)
+                        [已废弃，路径部分全为 0]
+            regions: (P11-3) 区域边界张量，形状为 (B, N, 4)
+                     格式 [x1, y1, x2, y2]
+            image_size: (P11-3) 图像边长，与 regions 配合使用
             
         Returns:
             Hilbert 偏置张量，形状为 (H, S, S) 或 (B, H, S, S)，若无效则返回 None
         """
-        if not self.use_hilbert_bias or levels_info.numel() == 0:
+        if not self.use_hilbert_bias:
             return None
 
-        if self.hilbert_bias_impl is not None:
+        if self.hilbert_bias_impl is None:
+            return None
+        
+        # P11-3: 优先使用 regions 直接计算 (LCA 模式)
+        # P11-8: 简化后仅支持 LCA 模式
+        if regions is not None and image_size is not None:
+            if isinstance(self.hilbert_bias_impl, LCAHilbertBias):
+                return self.hilbert_bias_impl.forward_from_regions(regions, image_size)
+        
+        # 回退到 levels_info
+        if levels_info is not None and levels_info.numel() > 0:
             return self.hilbert_bias_impl(levels_info)
         
         return None
@@ -716,13 +616,21 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         x: torch.Tensor,
         levels_info: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        regions: Optional[torch.Tensor] = None,
+        image_size: Optional[int] = None,
     ) -> torch.Tensor:
         """前向传播。
         
+        P11-3 改进: 新增 regions 和 image_size 参数，用于直接从区域边界
+        计算正确的四叉树 LCA 偏置，绕过 levels_info 中全为 0 的路径问题。
+        
         Args:
             x: 输入张量，形状为 [B, N, D]
-            levels_info: 层级信息（可选）
+            levels_info: 层级信息（可选，用于 depth 提取和 level bias）
             attention_mask: 注意力掩码（可选）
+            regions: (P11-3) 区域边界张量，形状为 [B, N, 4]，
+                     格式 [x1, y1, x2, y2]，用于计算正确的 Hilbert LCA 偏置
+            image_size: (P11-3) 图像边长，与 regions 配合使用
             
         Returns:
             输出张量，形状为 [B, N, D]
@@ -741,20 +649,25 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
 
         if self.use_level_scaling and levels_info is not None and levels_info.numel() > 0:
             # Type guard: guaranteed non-None when use_level_scaling is True
-            assert self.level_scale_embedding is not None
+            assert self._level_scale_raw is not None
             
             depths = extract_depths(levels_info, self.max_level)
             if levels_info.dim() == 2:
-                level_scales = self.level_scale_embedding(depths)
+                # P11-4: Softplus 约束确保 level_scales ∈ (0, +∞)
+                level_scales = F.softplus(self._level_scale_raw(depths))
                 level_scales = level_scales.transpose(0, 1).unsqueeze(0).unsqueeze(-1)
             else:
-                level_scales = self.level_scale_embedding(depths) # (B, S, H)
-                level_scales = level_scales.permute(0, 2, 1).unsqueeze(-1) # (B, H, S, 1)
+                level_scales = F.softplus(self._level_scale_raw(depths))  # (B, S, H)
+                level_scales = level_scales.permute(0, 2, 1).unsqueeze(-1)  # (B, H, S, 1)
             
             dots = dots * level_scales
 
         if levels_info is not None:
-            hilbert_bias = self._compute_hilbert_bias(levels_info)
+            hilbert_bias = self._compute_hilbert_bias(
+                levels_info=levels_info,
+                regions=regions,
+                image_size=image_size,
+            )
             if hilbert_bias is not None:
                 # hilbert_bias: (H, S, S) or (B, H, S, S)
                 if hilbert_bias.dim() == 3:

@@ -31,10 +31,9 @@ Tokenizer 类型:
     - 'streaming_v1': 基础单尺度 tokenizer
     - 'streaming_v3': LearnableSplitter 自适应分割 (推荐)
 
-Hilbert Bias 模式:
-    - 'lca': LCA 嵌入 (~36 参数，推荐)
-    - 'low_rank': 低秩分解 (~50K 参数)
-    - 'hierarchical': 分层计算
+Hilbert Bias 模式 (P11-8 简化):
+    - 仅保留 'lca' 模式 (~36 参数)
+    - 已移除 'low_rank' 和 'hierarchical' 死代码
 
 示例:
     # 标准 2^k 配置
@@ -57,7 +56,6 @@ from typing import Literal, Tuple
 
 
 # 类型别名
-BiasMode = Literal['original', 'low_rank', 'hierarchical', 'lca']
 AnnealSchedule = Literal['linear', 'exponential', 'cosine']  # 温度退火调度类型
 TokenizerType = Literal['streaming_v1', 'streaming_v3']  # streaming_v2 已移除
 
@@ -87,9 +85,8 @@ class FractalConfig:
         - init_tau_base: 初始基础阈值 = 0.5 (中心初始化)
         - gamma: 阈值衰减因子 γ = 0.85
         
-    Hilbert Bias 配置:
-        hilbert_bias_mode: 偏置计算模式
-        low_rank_r: 低秩分解的秩 (仅 bias_mode='low_rank' 时有效)
+    Hilbert Bias 配置 (P11-8 简化):
+        - 仅使用 LCA 模式，无需额外配置
         
     Hilbert 策略 (自动推导):
         uses_pseudo_hilbert: 是否使用 Pseudo-Hilbert 曲线
@@ -101,10 +98,6 @@ class FractalConfig:
     
     # ========== Tokenizer 配置 ==========
     tokenizer_type: TokenizerType = 'streaming_v3'  # 默认使用 Variable Depth
-    
-    # ========== Hilbert Bias 配置 ==========
-    hilbert_bias_mode: BiasMode = 'lca'
-    low_rank_r: int = 32
     
     # ========== 推导参数 (自动计算) ==========
     max_depth: int = field(init=False)
@@ -207,8 +200,7 @@ class FractalConfig:
             f"  uses_pseudo_hilbert={self.uses_pseudo_hilbert}\n"
             f"  # Tokenizer\n"
             f"{tokenizer_info}"
-            f"  # Hilbert Bias\n"
-            f"  bias_mode='{self.hilbert_bias_mode}', low_rank_r={self.low_rank_r}\n"
+            f"  # Hilbert Bias: LCA mode (P11-8 simplified)\n"
             f")"
         )
 

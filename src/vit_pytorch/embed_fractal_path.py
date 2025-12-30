@@ -29,7 +29,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch._dynamo
@@ -151,6 +151,88 @@ class VectorizedPathEncoder:
         
         return paths.long()
     
+    @staticmethod
+    def compute_paths_from_regions(
+        regions: torch.Tensor,
+        image_size: Union[int, Tuple[int, int]],
+        max_depth: int,
+    ) -> torch.Tensor:
+        """从区域边界向量化计算四叉树路径.
+        
+        数学原理:
+            对于区域中心 (cx, cy)，第 d 层的象限由以下决定:
+            
+            grid_size = 2^max_depth
+            normalized_x = cx * grid_size / image_size
+            qx_d = (normalized_x >> (max_depth - 1 - d)) & 1
+            qy_d = (normalized_y >> (max_depth - 1 - d)) & 1
+            quadrant_d = qx_d + 2 * qy_d
+        
+        这与 compute_quadrant_paths 使用相同的数学公式，但输入是像素坐标而非网格坐标。
+        
+        Args:
+            regions: [N, 4] 或 [B, N, 4]，格式 (x1, y1, x2, y2)
+            image_size: 图像边长 (int 或 (H, W) tuple，Hilbert 曲线要求方形)
+            max_depth: 最大四叉树深度
+            
+        Returns:
+            paths: [N, max_depth] 或 [B, N, max_depth] 四叉树路径
+        """
+        # 处理 image_size 元组 (Hilbert 曲线要求方形，使用较大边)
+        if isinstance(image_size, tuple):
+            img_size = max(image_size)
+        else:
+            img_size = image_size
+        
+        # 处理输入维度
+        if regions.dim() == 2:
+            # [N, 4] → [1, N, 4]
+            was_2d = True
+            regions = regions.unsqueeze(0)
+        else:
+            was_2d = False
+        
+        B, N, _ = regions.shape
+        device = regions.device
+        
+        if max_depth == 0:
+            result = torch.zeros(B, N, 1, dtype=torch.long, device=device)
+            return result.squeeze(0) if was_2d else result
+        
+        # 计算区域中心 (使用整数算术避免精度问题)
+        # regions: [B, N, 4] = (x1, y1, x2, y2)
+        cx = (regions[:, :, 0] + regions[:, :, 2]) // 2  # [B, N]
+        cy = (regions[:, :, 1] + regions[:, :, 3]) // 2  # [B, N]
+        
+        # 将像素坐标转换为网格坐标 (grid_size = 2^max_depth)
+        grid_size = 2 ** max_depth
+        # 缩放: grid_x = cx * grid_size // img_size
+        gx = cx * grid_size // img_size  # [B, N]
+        gy = cy * grid_size // img_size  # [B, N]
+        
+        # 确保在有效范围内
+        gx = gx.clamp(0, grid_size - 1)
+        gy = gy.clamp(0, grid_size - 1)
+        
+        # 使用 compute_quadrant_paths 的相同位运算逻辑
+        # 但这里需要处理 batch 维度
+        depths = torch.arange(max_depth, device=device)  # [D]
+        shifts = max_depth - 1 - depths  # [D]
+        
+        # 扩展维度: [B, N, 1] 和 [1, 1, D]
+        gx_exp = gx.unsqueeze(-1)  # [B, N, 1]
+        gy_exp = gy.unsqueeze(-1)  # [B, N, 1]
+        shifts_exp = shifts.view(1, 1, -1)  # [1, 1, D]
+        
+        # 向量化位运算
+        qx = (gx_exp >> shifts_exp) & 1  # [B, N, D]
+        qy = (gy_exp >> shifts_exp) & 1  # [B, N, D]
+        
+        # 组合象限
+        paths = (qx + 2 * qy).long()  # [B, N, D]
+        
+        return paths.squeeze(0) if was_2d else paths
+
     @staticmethod
     def compute_common_ancestor_depth(
         paths: torch.Tensor,

@@ -102,17 +102,21 @@ class FractalTransformerBlock(nn.Module):
     This block combines Hilbert-aware attention with adaptive feed-forward,
     using level-dependent normalization for depth-aware processing.
     
+    P11-2 修复: 参数 max_level 现在应传入与 tokenizer.max_depth 一致的值，
+    而非硬编码的 50。这确保 Embedding 表大小与实际使用的深度范围匹配，
+    减少约 90% 的参数浪费。
+    
+    P11-8 简化: 移除 hilbert_bias_mode 和 low_rank_r 参数，仅保留 LCA 模式。
+    
     Args:
         dim: Input/output dimension.
         heads: Number of attention heads.
         dim_head: Dimension per head.
         mlp_dim: Feed-forward hidden dimension.
         dropout: Dropout rate.
-        max_level: Maximum hierarchical level.
+        max_level: Maximum hierarchical level (P11-2: should match tokenizer.max_depth).
         drop_path: DropPath rate for stochastic depth.
         ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
-        hilbert_bias_mode: Hilbert Bias mode ('lca', 'low_rank', 'hierarchical').
-        low_rank_r: Rank for low-rank decomposition (only used when hilbert_bias_mode='low_rank').
         lca_temperature: (P6-2) LCA bias temperature, default 1.5.
         learnable_temperature: (P6-2) Whether temperature is learnable.
     """
@@ -124,11 +128,9 @@ class FractalTransformerBlock(nn.Module):
         dim_head: int,
         mlp_dim: int,
         dropout: float = 0.0,
-        max_level: int = 50,
+        max_level: int = 8,  # P11-2: 默认改为 8，应由上层传入实际 max_depth
         drop_path: float = 0.0,
         ffn_type: FFNType = 'swiglu_level',
-        hilbert_bias_mode: str = 'lca',
-        low_rank_r: int = 32,
         lca_temperature: Optional[float] = 1.5,
         learnable_temperature: bool = True,
     ):
@@ -142,8 +144,6 @@ class FractalTransformerBlock(nn.Module):
             dim_head=dim_head,
             dropout=dropout,
             max_level=max_level,
-            bias_mode=hilbert_bias_mode,
-            low_rank_r=low_rank_r,
             lca_temperature=lca_temperature,
             learnable_temperature=learnable_temperature,
         )
@@ -156,21 +156,26 @@ class FractalTransformerBlock(nn.Module):
             ffn_type=ffn_type,
         )
 
-        # STAB-5 方案 B+: 层级感知的 Residual 权重 (P1-2 修复)
-        # 数学依据: 深层 token (细粒度) 需要更大的 residual 权重来保护高频信息
-        #          浅层 token (粗粒度) 可使用较小权重，让 Attention 更自由地精炼
-        # 实现: w(d) = sigmoid(Embedding(d)) * 2 ∈ [0, 2]
-        # 
-        # P1-2 修复: 使用「种子初始化」替代全零初始化
-        # - 原问题: zeros -> sigmoid(0)*2 = 1.0，所有深度初始权重完全相同
-        # - 修复: init[d] = 0.01 * d / max_level，为梯度提供方向暗示
-        # - 效果: w(0) ≈ 1.000, w(max) ≈ 1.005，差异仅 0.5%，近乎中性但有方向性
-        self._level_residual_embedding = nn.Embedding(max_level + 1, 2)
+        # STAB-5 方案 B+: 层级感知的残差门控 (P1-2 修复, P11-13 重命名)
+        # 功能: 控制 Attention/FFN 输出对残差连接的贡献程度
+        # 实现: gate(d) = sigmoid(Embedding(d)) * 2 ∈ [0, 2]
+        #       x' = x + gate_1(d) * Attn(x)
+        #       x'' = x' + gate_2(d) * FFN(x')
+        #
+        # 初始化: 种子初始化，为梯度提供方向暗示
+        # - init[d] = 0.01 * d / max_level
+        # - 效果: gate(0) ≈ 1.000, gate(max) ≈ 1.005
+        # - 模型通过学习自适应调整各深度的门控权重
+        #
+        # P11-13: 重命名 _level_residual_embedding → _residual_gate
+        # - 明确语义: 这是门控权重，不是嵌入向量
+        # - 移除误导: 原注释"保护高频信息"与实现不符
+        self._residual_gate = nn.Embedding(max_level + 1, 2)
         # 种子初始化: 极小的线性递增偏移
         with torch.no_grad():
             for d in range(max_level + 1):
-                seed_value = 0.01 * d / max_level  # 深层略大
-                self._level_residual_embedding.weight[d] = seed_value
+                seed_value = 0.01 * d / max_level
+                self._residual_gate.weight[d] = seed_value
         
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         
@@ -202,28 +207,33 @@ class FractalTransformerBlock(nn.Module):
         
         根据每个 token 的层级深度选择对应的 gamma 和 beta 参数。
         
+        P11-16 改进: 当 levels_info 为 None 时，生成深度 0 的默认 levels_info，
+        确保始终使用 level-aware norm，避免训练/推理行为不一致。
+        
         Args:
             x: 输入张量，形状为 [B, S, D]。
-            levels_info: 层级信息，可为 None。
+            levels_info: 层级信息，可为 None（将使用深度 0 作为默认）。
             gamma_emb: Gamma 参数的嵌入表。
             beta_emb: Beta 参数的嵌入表。
-            default_norm: 默认的 LayerNorm（当无层级信息时使用）。
+            default_norm: 默认的 LayerNorm（现已弃用，保留用于向后兼容）。
             
         Returns:
             归一化后的张量，形状为 [B, S, D]。
         """
-        if levels_info is None or levels_info.numel() == 0:
-            return default_norm(x)
-
         # 验证输入维度
         if x.dim() != 3:
             raise ValueError(f"Expected x to be 3D [B, S, D], got {x.dim()}D with shape {x.shape}")
 
-        # Vectorized implementation
         batch_size, seq_len, dim = x.shape
         
-        # Handle both (Seq, Info) and (Batch, Seq, Info) shapes for levels_info
-        if levels_info.dim() == 2:
+        # P11-16: 当 levels_info 为 None 时，生成深度 0 的默认值
+        # 这确保始终使用 level-aware norm，避免两种 norm 路径的行为差异
+        if levels_info is None or levels_info.numel() == 0:
+            # 创建全零 depths，表示所有 token 深度为 0
+            depths = torch.zeros(batch_size, seq_len, dtype=torch.long, device=x.device)
+            gamma = gamma_emb(depths)  # (B, S, dim)
+            beta = beta_emb(depths)    # (B, S, dim)
+        elif levels_info.dim() == 2:
             # Old behavior: (Seq, Info) -> broadcast to batch
             depths = extract_depths(levels_info, self.max_level) # (seq_len,)
             gamma = gamma_emb(depths).unsqueeze(0) # (1, seq_len, dim)
@@ -246,42 +256,56 @@ class FractalTransformerBlock(nn.Module):
         x: torch.Tensor,
         levels_info: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        regions: Optional[torch.Tensor] = None,
+        image_size: Optional[int] = None,
     ) -> torch.Tensor:
         """前向传播。
         
+        P11-3 改进: 新增 regions 和 image_size 参数，用于直接从区域边界
+        计算正确的四叉树 LCA 偏置，绕过 levels_info 中全为 0 的路径问题。
+        
         Args:
             x: 输入张量，形状为 [B, S, D]。
-            levels_info: 层级信息（可选）。
+            levels_info: 层级信息（可选），用于 depth 提取和 level bias。
             attention_mask: 注意力掩码（可选）。
+            regions: (P11-3) 区域边界张量，形状为 [B, N, 4]，
+                     格式 [x1, y1, x2, y2]，用于计算正确的 Hilbert LCA 偏置。
+            image_size: (P11-3) 图像边长，与 regions 配合使用。
             
         Returns:
             输出张量，形状为 [B, S, D]。
         """
-        # STAB-5 方案 B: 计算层级感知的 residual 权重
+        # STAB-5 方案 B: 计算层级感知的 residual 门控权重
         # 当 levels_info 可用时，每个 token 根据其深度获得不同的权重
         # 当 levels_info 不可用时，使用深度 0 的默认权重
         if levels_info is not None and levels_info.numel() > 0:
             depths = extract_depths(levels_info, self.max_level)  # (S,) or (B, S)
-            level_weights_raw = self._level_residual_embedding(depths)  # (..., 2)
-            residual_weights = torch.sigmoid(level_weights_raw) * 2  # (..., 2) ∈ [0, 2]
+            gate_raw = self._residual_gate(depths)  # (..., 2)
+            gate = torch.sigmoid(gate_raw) * 2  # (..., 2) ∈ [0, 2]
             
             # 调整形状以便广播: (B, S, 1) for element-wise multiplication with (B, S, D)
-            if residual_weights.dim() == 2:
+            if gate.dim() == 2:
                 # (S, 2) -> (1, S, 2, 1) for broadcasting
-                w1 = residual_weights[:, 0].view(1, -1, 1)
-                w2 = residual_weights[:, 1].view(1, -1, 1)
+                w1 = gate[:, 0].view(1, -1, 1)
+                w2 = gate[:, 1].view(1, -1, 1)
             else:
                 # (B, S, 2) -> w1, w2 each (B, S, 1)
-                w1 = residual_weights[:, :, 0].unsqueeze(-1)
-                w2 = residual_weights[:, :, 1].unsqueeze(-1)
+                w1 = gate[:, :, 0].unsqueeze(-1)
+                w2 = gate[:, :, 1].unsqueeze(-1)
         else:
             # 无 levels_info 时使用深度 0 的默认权重
-            default_w = torch.sigmoid(self._level_residual_embedding.weight[0]) * 2
-            w1 = default_w[0]
-            w2 = default_w[1]
+            default_gate = torch.sigmoid(self._residual_gate.weight[0]) * 2
+            w1 = default_gate[0]
+            w2 = default_gate[1]
 
         norm1_x = self._apply_level_aware_norm(x, levels_info, self.norm1_gamma, self.norm1_beta, self.default_norm1)
-        attn_out = self.attention(norm1_x, levels_info, attention_mask)
+        attn_out = self.attention(
+            norm1_x, 
+            levels_info=levels_info, 
+            attention_mask=attention_mask,
+            regions=regions,
+            image_size=image_size,
+        )
         x = x + self.drop_path(attn_out * w1)
 
         norm2_x = self._apply_level_aware_norm(x, levels_info, self.norm2_gamma, self.norm2_beta, self.default_norm2)
@@ -300,6 +324,11 @@ class FractalTransformer(nn.Module):
     
     Supports gradient checkpointing for memory-efficient training.
     
+    P11-2 修复: 参数 max_level 现在应传入与 tokenizer.max_depth 一致的值，
+    而非硬编码的 50。这确保所有子模块的 Embedding 表大小与实际使用的深度范围匹配。
+    
+    P11-8 简化: 移除 hilbert_bias_mode 和 low_rank_r 参数，仅保留 LCA 模式。
+    
     Args:
         dim: Input/output dimension.
         depth: Number of transformer blocks.
@@ -307,12 +336,10 @@ class FractalTransformer(nn.Module):
         dim_head: Dimension per head.
         mlp_dim: Feed-forward hidden dimension.
         dropout: Dropout rate.
-        max_level: Maximum hierarchical level.
+        max_level: Maximum hierarchical level (P11-2: should match tokenizer.max_depth).
         drop_path_rate: Maximum DropPath rate (linearly increased).
         ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
         use_checkpoint: Whether to use gradient checkpointing (saves memory).
-        hilbert_bias_mode: Hilbert Bias mode ('lca', 'low_rank', 'hierarchical').
-        low_rank_r: Rank for low-rank decomposition.
         lca_temperature: (P6-2) LCA bias temperature, default 1.5.
         learnable_temperature: (P6-2) Whether temperature is learnable.
     """
@@ -325,12 +352,10 @@ class FractalTransformer(nn.Module):
         dim_head: int,
         mlp_dim: int,
         dropout: float = 0.0,
-        max_level: int = 50,
+        max_level: int = 8,  # P11-2: 默认改为 8，应由上层传入实际 max_depth
         drop_path_rate: float = 0.1,
         ffn_type: FFNType = 'swiglu_level',
         use_checkpoint: bool = False,
-        hilbert_bias_mode: str = 'lca',
-        low_rank_r: int = 32,
         lca_temperature: Optional[float] = 1.5,
         learnable_temperature: bool = True,
     ):
@@ -340,8 +365,6 @@ class FractalTransformer(nn.Module):
         self.max_level = max_level
         self.ffn_type = ffn_type
         self.use_checkpoint = use_checkpoint
-        self.hilbert_bias_mode = hilbert_bias_mode
-        self.low_rank_r = low_rank_r
 
         # Stochastic depth decay rule
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
@@ -357,8 +380,6 @@ class FractalTransformer(nn.Module):
                     max_level=max_level,
                     drop_path=dpr[i],
                     ffn_type=ffn_type,
-                    hilbert_bias_mode=hilbert_bias_mode,
-                    low_rank_r=low_rank_r,
                     lca_temperature=lca_temperature,
                     learnable_temperature=learnable_temperature,
                 )
@@ -397,13 +418,21 @@ class FractalTransformer(nn.Module):
         x: torch.Tensor,
         levels_info: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        regions: Optional[torch.Tensor] = None,
+        image_size: Optional[int] = None,
     ) -> torch.Tensor:
         """前向传播。
         
+        P11-3 改进: 新增 regions 和 image_size 参数，用于直接从区域边界
+        计算正确的四叉树 LCA 偏置，绕过 levels_info 中全为 0 的路径问题。
+        
         Args:
             x: 输入张量，形状为 [B, S, D]。
-            levels_info: 层级信息（可选）。
+            levels_info: 层级信息（可选），用于 depth 提取和 level bias。
             attention_mask: 注意力掩码（可选）。
+            regions: (P11-3) 区域边界张量，形状为 [B, N, 4]，
+                     格式 [x1, y1, x2, y2]，用于计算正确的 Hilbert LCA 偏置。
+            image_size: (P11-3) 图像边长，与 regions 配合使用。
             
         Returns:
             输出张量，形状为 [B, S, D]。
@@ -413,9 +442,20 @@ class FractalTransformer(nn.Module):
         for layer in self.layers:
             if self.use_checkpoint and self.training:
                 # Gradient checkpointing: 重新计算激活值以节省显存
-                x = checkpoint(layer, x, levels_info, attention_mask, use_reentrant=False)
+                # Note: checkpoint 不支持关键字参数，需要使用位置参数
+                # P11-3: 传递 regions 和 image_size
+                x = checkpoint(
+                    layer, x, levels_info, attention_mask, regions, image_size, 
+                    use_reentrant=False
+                )
             else:
-                x = layer(x, levels_info, attention_mask)
+                x = layer(
+                    x, 
+                    levels_info=levels_info, 
+                    attention_mask=attention_mask,
+                    regions=regions,
+                    image_size=image_size,
+                )
 
         # ARCH-R1: 删除了冗余的 global_context_attn 调用
         # HilbertAwareMultiScaleAttention 已经充分保留全局信息流
