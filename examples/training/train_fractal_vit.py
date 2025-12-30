@@ -543,9 +543,11 @@ class MixupCutmix:
             lam = 1 - (x2 - x1) * (y2 - y1) / (W * H)
         else:
             # Mixup: 线性混合
-            mixed_images = lam * images + (1 - lam) * images[index]
+            # 注意: 需要保持原始 dtype (可能是 float16)
+            lam_t = torch.tensor(lam, dtype=images.dtype, device=device)
+            mixed_images = lam_t * images + (1 - lam_t) * images[index]
         
-        # 混合标签
+        # 混合标签 (始终使用 float32 以保持精度)
         mixed_labels = lam * labels_one_hot + (1 - lam) * labels_one_hot[index]
         
         return mixed_images, mixed_labels
@@ -1323,6 +1325,12 @@ class CudaPrefetcher:
 # 训练函数
 # ============================================================================
 
+def get_model_input_dtype(model: nn.Module) -> torch.dtype:
+    """获取模型期望的输入 dtype (根据第一个参数的 dtype)"""
+    for param in model.parameters():
+        return param.dtype
+    return torch.float32
+
 def train_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -1361,6 +1369,11 @@ def train_epoch(
         import sys
         print(f"[DEBUG] train_epoch started: epoch={epoch}, use_mixup=True", file=sys.stderr, flush=True)
     
+    # P15: 预先获取模型期望的 dtype (避免每次迭代都检查)
+    model_dtype = get_model_input_dtype(model) if use_mixup else None
+    if model_dtype is not None:
+        print(f"[DEBUG] Model expects input dtype: {model_dtype}")
+    
     # 使用环境变量 DISABLE_PREFETCH=1 来禁用 CudaPrefetcher 进行调试
     use_prefetcher = device.type == 'cuda' and os.environ.get('DISABLE_PREFETCH', '0') != '1'
     if use_prefetcher:
@@ -1396,6 +1409,13 @@ def train_epoch(
         if device.type != 'cuda':
             imgs = imgs.to(device)
             labels = labels.to(device)
+        else:
+            # 当不使用 CudaPrefetcher 时，需要手动处理 GPU 传输和 channels_last
+            if not use_prefetcher:
+                imgs = imgs.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                if config.channels_last:
+                    imgs = imgs.to(memory_format=torch.channels_last)
         
         # 检查 label 范围
         if labels.min() < 0 or labels.max() >= num_classes:
@@ -1408,12 +1428,23 @@ def train_epoch(
             if i == 0:
                 print(f"[DEBUG] Batch 0: 开始应用 Mixup...", flush=True)
             imgs, mixed_labels = mixup_fn(imgs, labels)
+            # 确保 Mixup 后保持 channels_last 格式 (Mixup 的线性混合可能会破坏 memory format)
+            if config.channels_last and imgs.device.type == 'cuda':
+                imgs = imgs.to(memory_format=torch.channels_last)
             if i == 0:
                 print(f"[DEBUG] Batch 0: Mixup 完成，mixed_labels.shape={mixed_labels.shape}", flush=True)
+                print(f"[DEBUG] Batch 0: imgs.dtype={imgs.dtype}, imgs.is_contiguous(memory_format=torch.channels_last)={imgs.is_contiguous(memory_format=torch.channels_last)}", flush=True)
         
         forward_start = time.time()
-        if i == 0 and use_mixup:
-            print(f"[DEBUG] Batch 0: 开始 forward pass...", flush=True)
+        
+        # P15: 确保输入 dtype 与模型权重匹配 (torch.compile + AMP 可能导致不匹配)
+        if model_dtype is not None and imgs.dtype != model_dtype:
+            if i == 0:
+                print(f"[WARN] dtype 不匹配! 将 imgs 从 {imgs.dtype} 转换为 {model_dtype}")
+            imgs = imgs.to(dtype=model_dtype)
+        elif i == 0 and use_mixup:
+            print(f"[DEBUG] Batch 0: 开始 forward pass, imgs.dtype={imgs.dtype}...", flush=True)
+        
         with get_amp_context(device, config.use_amp):
             outs, _ = model(imgs, return_aux_info=True)
             if i == 0 and use_mixup:
@@ -2355,6 +2386,16 @@ def main():
         except Exception as e:
             print(f"[WARN] torch.compile failed: {e}")
     
+    # 诊断: 检查模型参数 dtype
+    def check_model_dtypes(m, name="model"):
+        dtypes = set()
+        for n, p in m.named_parameters():
+            dtypes.add(str(p.dtype))
+            if p.dtype == torch.float16:
+                print(f"[WARN] {name}.{n} is float16!")
+        print(f"[DEBUG] {name} param dtypes: {dtypes}")
+    check_model_dtypes(model)
+    
     # 创建 Mixup/CutMix 增强器
     use_mixup = config.mixup_alpha > 0 or config.cutmix_alpha > 0
     mixup_fn = None
@@ -2455,6 +2496,9 @@ def main():
                     with get_amp_context(device, config.use_amp):
                         # 测试 Mixup 数据变换
                         test_imgs, test_mixed_labels = mixup_fn(warmup_imgs.clone(), warmup_labels.clone())
+                        # 确保 Mixup 后保持 channels_last 格式
+                        if config.channels_last:
+                            test_imgs = test_imgs.to(memory_format=torch.channels_last)
                         # 测试 forward + Mixup loss
                         test_outs = model(test_imgs)
                         _ = mixup_criterion(test_outs, test_mixed_labels)
@@ -2559,6 +2603,18 @@ def main():
         if epoch == config.warmup_epochs + 1 and mixup_fn is not None:
             print(f"[INFO] Epoch {epoch}: 启用 Mixup/CutMix 增强")
             print(f"[INFO] 首次 Mixup epoch：暂时禁用 CUDA Prefetcher 以确保稳定性")
+            
+            # 诊断: 检查此时模型的 dtype
+            print("[DEBUG] 检查模型参数 dtype...")
+            first_conv_bias = None
+            for name, param in model.named_parameters():
+                if 'conv' in name.lower() and 'bias' in name.lower():
+                    first_conv_bias = param
+                    print(f"[DEBUG] {name}: dtype={param.dtype}, device={param.device}")
+                    break
+            if first_conv_bias is not None and first_conv_bias.dtype == torch.float16:
+                print("[WARN] 模型 bias 已被转换为 float16!")
+            
             os.environ['DISABLE_PREFETCH'] = '1'
             disable_prefetch_this_epoch = True
             # 添加同步点，确保之前的 CUDA 操作完成
