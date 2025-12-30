@@ -108,6 +108,7 @@ class VectorizedPathEncoder:
         return x.to(device), y.to(device)
     
     @staticmethod
+    @torch._dynamo.disable  # 排除此函数被 torch.compile 追踪
     def compute_quadrant_paths(
         x: torch.Tensor,
         y: torch.Tensor,
@@ -152,6 +153,7 @@ class VectorizedPathEncoder:
         return paths.long()
     
     @staticmethod
+    @torch._dynamo.disable  # 排除此函数被 torch.compile 追踪，避免 Triton 编译错误
     def compute_paths_from_regions(
         regions: torch.Tensor,
         image_size: Union[int, Tuple[int, int]],
@@ -204,8 +206,10 @@ class VectorizedPathEncoder:
         cx = (regions[:, :, 0] + regions[:, :, 2]) // 2  # [B, N]
         cy = (regions[:, :, 1] + regions[:, :, 3]) // 2  # [B, N]
         
-        # 将像素坐标转换为网格坐标 (grid_size = 2^max_depth)
-        grid_size = 2 ** max_depth
+        # 将像素坐标转换为网格坐标
+        # 使用位移运算替代幂运算，避免 Triton 编译问题
+        # grid_size = 2^max_depth = 1 << max_depth
+        grid_size = 1 << max_depth
         # 缩放: grid_x = cx * grid_size // img_size
         gx = cx * grid_size // img_size  # [B, N]
         gy = cy * grid_size // img_size  # [B, N]
@@ -234,6 +238,7 @@ class VectorizedPathEncoder:
         return paths.squeeze(0) if was_2d else paths
 
     @staticmethod
+    @torch._dynamo.disable  # 排除此函数被 torch.compile 追踪，避免动态循环的编译问题
     def compute_common_ancestor_depth(
         paths: torch.Tensor,
         chunk_size: int = 64,
