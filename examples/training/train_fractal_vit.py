@@ -1356,12 +1356,21 @@ def train_epoch(
     use_mixup = mixup_fn is not None
     nan_count = 0  # NaN 计数器
     
+    # P15: Warmup 后首次启用 Mixup 的调试信息
+    if use_mixup and epoch is not None:
+        import sys
+        print(f"[DEBUG] train_epoch started: epoch={epoch}, use_mixup=True", file=sys.stderr, flush=True)
+    
     # 使用环境变量 DISABLE_PREFETCH=1 来禁用 CudaPrefetcher 进行调试
-    use_prefetcher = device.type == 'cuda' and not os.environ.get('DISABLE_PREFETCH', '0') == '1'
+    use_prefetcher = device.type == 'cuda' and os.environ.get('DISABLE_PREFETCH', '0') != '1'
     if use_prefetcher:
         data_iter = CudaPrefetcher(loader, device, channels_last=config.channels_last)
+        if use_mixup:
+            print(f"[DEBUG] 使用 CudaPrefetcher", flush=True)
     else:
         data_iter = loader
+        if use_mixup:
+            print(f"[DEBUG] 不使用 CudaPrefetcher (DISABLE_PREFETCH={os.environ.get('DISABLE_PREFETCH', 'not set')})", flush=True)
     
     pbar = tqdm(data_iter, desc="Train", total=len(loader))
     
@@ -1396,11 +1405,19 @@ def train_epoch(
         # 应用 Mixup/CutMix
         mixed_labels: Optional[torch.Tensor] = None
         if use_mixup and mixup_fn is not None:
+            if i == 0:
+                print(f"[DEBUG] Batch 0: 开始应用 Mixup...", flush=True)
             imgs, mixed_labels = mixup_fn(imgs, labels)
+            if i == 0:
+                print(f"[DEBUG] Batch 0: Mixup 完成，mixed_labels.shape={mixed_labels.shape}", flush=True)
         
         forward_start = time.time()
+        if i == 0 and use_mixup:
+            print(f"[DEBUG] Batch 0: 开始 forward pass...", flush=True)
         with get_amp_context(device, config.use_amp):
             outs, _ = model(imgs, return_aux_info=True)
+            if i == 0 and use_mixup:
+                print(f"[DEBUG] Batch 0: forward 完成，outs.shape={outs.shape}", flush=True)
             
             # 检查 logits 范围，防止爆炸
             if torch.isnan(outs).any() or torch.isinf(outs).any():
@@ -1425,6 +1442,8 @@ def train_epoch(
             if use_mixup and mixed_labels is not None:
                 # 使用混合标签的交叉熵 (Mixup 模式下不使用 Focal Loss)
                 ce_loss = mixup_criterion(outs, mixed_labels) / config.accum_steps
+                if i == 0:
+                    print(f"[DEBUG] Batch 0: mixup_criterion 计算完成，ce_loss={ce_loss.item():.4f}", flush=True)
             else:
                 # P14: 使用自定义损失函数 (Focal Loss / Class-Balanced Loss)
                 if loss_fn is not None:
@@ -2408,23 +2427,42 @@ def main():
     
     # 编译预热: 在正式训练前触发 JIT 编译
     # P11-7 优化: 使用完整 batch size 预热，避免动态形状导致重新编译
+    # P15 优化: 同时预热 Mixup 路径，避免 warmup 结束后的重编译延迟
     if config.compile_model:
         print("[INFO] Warming up compiled model with full batch size...")
         try:
             warmup_batch = next(iter(train_loader))
             if isinstance(warmup_batch, (list, tuple)):
                 warmup_imgs = warmup_batch[0].to(device)  # 使用完整 batch
+                warmup_labels = warmup_batch[1].to(device)
             else:
                 warmup_imgs = warmup_batch.to(device)
+                warmup_labels = torch.zeros(warmup_imgs.shape[0], dtype=torch.long, device=device)
             if config.channels_last:
                 warmup_imgs = warmup_imgs.to(memory_format=torch.channels_last)
-            # 多次预热确保编译稳定
+            
+            # 阶段1: 预热标准 forward pass
             with torch.no_grad():
                 with get_amp_context(device, config.use_amp):
                     for _ in range(3):  # 3次预热确保编译稳定
                         _ = model(warmup_imgs)
                         torch.cuda.synchronize()  # 确保编译完成
-            del warmup_imgs
+            
+            # 阶段2: 预热 Mixup 路径 (如果启用)
+            if mixup_fn is not None:
+                print("[INFO] Pre-warming Mixup code path...")
+                with torch.no_grad():
+                    with get_amp_context(device, config.use_amp):
+                        # 测试 Mixup 数据变换
+                        test_imgs, test_mixed_labels = mixup_fn(warmup_imgs.clone(), warmup_labels.clone())
+                        # 测试 forward + Mixup loss
+                        test_outs = model(test_imgs)
+                        _ = mixup_criterion(test_outs, test_mixed_labels)
+                        torch.cuda.synchronize()
+                        del test_imgs, test_mixed_labels, test_outs
+                print("[OK] Mixup path pre-warmed")
+            
+            del warmup_imgs, warmup_labels
             torch.cuda.empty_cache()
             print("[OK] Compilation complete!")
         except Exception as e:
@@ -2494,31 +2532,38 @@ def main():
         
         # P14: 渐进式数据增强
         # 在 warmup 结束后逐渐增加 Mixup/CutMix 强度
-        if config.progressive_aug and current_mixup_fn is not None:
+        # 注意: 通过调整 prob 而非 alpha 来实现渐进式，避免 Beta 分布极小 alpha 问题
+        if config.progressive_aug and current_mixup_fn is not None and mixup_fn is not None:
             # 计算增强进度 (0 -> 1 over first half of post-warmup epochs)
             post_warmup_epoch = epoch - config.warmup_epochs
-            ramp_epochs = (config.epochs - config.warmup_epochs) // 2  # 在一半 epoch 内达到满强度
-            aug_progress = min(1.0, post_warmup_epoch / max(1, ramp_epochs))
+            ramp_epochs = max(1, (config.epochs - config.warmup_epochs) // 2)  # 在一半 epoch 内达到满强度
+            aug_progress = min(1.0, post_warmup_epoch / ramp_epochs)
             
-            # 创建当前 epoch 的 Mixup 增强器 (alpha 渐增)
-            current_mixup_alpha = config.mixup_alpha * aug_progress
-            current_cutmix_alpha = config.cutmix_alpha * aug_progress
+            # 通过调整应用概率来实现渐进式增强 (避免极小 alpha 问题)
+            # prob 从 0.1 渐增到 config.mixup_prob
+            current_prob = 0.1 + (config.mixup_prob - 0.1) * aug_progress
             
-            if current_mixup_alpha > 0.01 or current_cutmix_alpha > 0.01:
-                current_mixup_fn = MixupCutmix(
-                    mixup_alpha=current_mixup_alpha,
-                    cutmix_alpha=current_cutmix_alpha,
-                    prob=config.mixup_prob,
-                    num_classes=spec.num_classes,
-                    label_smoothing=config.label_smoothing,
-                )
-                if post_warmup_epoch <= 5:  # 只在前几个 epoch 打印
-                    print(f"[INFO] Progressive Aug: mixup_alpha={current_mixup_alpha:.2f}, cutmix_alpha={current_cutmix_alpha:.2f}")
-            else:
-                current_mixup_fn = None
+            current_mixup_fn = MixupCutmix(
+                mixup_alpha=config.mixup_alpha,  # 保持原始 alpha
+                cutmix_alpha=config.cutmix_alpha,  # 保持原始 alpha
+                prob=current_prob,  # 渐增概率
+                num_classes=spec.num_classes,
+                label_smoothing=config.label_smoothing,
+            )
+            if post_warmup_epoch <= 3:  # 只在前 3 个 epoch 打印
+                print(f"[INFO] Progressive Aug (epoch {epoch}): prob={current_prob:.2f}")
         
+        # P15: Warmup 结束后首次启用 Mixup 的处理
+        # 在这个过渡 epoch，禁用 CudaPrefetcher 避免多进程+compile 冲突
+        disable_prefetch_this_epoch = False
         if epoch == config.warmup_epochs + 1 and mixup_fn is not None:
             print(f"[INFO] Epoch {epoch}: 启用 Mixup/CutMix 增强")
+            print(f"[INFO] 首次 Mixup epoch：暂时禁用 CUDA Prefetcher 以确保稳定性")
+            os.environ['DISABLE_PREFETCH'] = '1'
+            disable_prefetch_this_epoch = True
+            # 添加同步点，确保之前的 CUDA 操作完成
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
         
         train_loss, train_acc, perf_stats = train_epoch(
             model, train_loader, optimizer, device, scaler, config,
@@ -2530,6 +2575,11 @@ def main():
             class_weights=class_weights,
             epoch=epoch,
         )
+        
+        # P15: 恢复 CudaPrefetcher
+        if disable_prefetch_this_epoch:
+            os.environ.pop('DISABLE_PREFETCH', None)
+            print(f"[INFO] Epoch {epoch} 完成，后续 epoch 将恢复 CUDA Prefetcher")
         
         val_loss, val_acc, per_class_stats = evaluate(
             model, val_loader, device, config.use_amp, spec.num_classes,
