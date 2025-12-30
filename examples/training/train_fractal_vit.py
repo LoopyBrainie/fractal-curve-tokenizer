@@ -1026,11 +1026,21 @@ def train_epoch(
     
     pbar = tqdm(data_iter, desc="Train", total=len(loader))
     
+    # P13: 卡顿诊断 - 检测异常长的批次时间
+    stall_threshold = 5.0  # 超过 5 秒视为卡顿
+    stall_count = 0
+    
     data_start = time.time()
     
     for i, batch in enumerate(pbar):
-            
+        
+        # P13: 检测数据加载卡顿
         data_time = time.time() - data_start
+        if data_time > stall_threshold:
+            stall_count += 1
+            if stall_count <= 3:
+                print(f"\n[STALL] Batch {i}: 数据加载耗时 {data_time:.1f}s (可能是 GC/编译/I/O)")
+        
         data_times.append(data_time)
         batch_start = time.time()
         
@@ -1186,6 +1196,11 @@ def train_epoch(
                 )
             else:
                 pbar.set_postfix(loss=f'{loss_val:.4f}', acc=f'{acc_val:.1f}%')
+        
+        # P13: 定期手动 GC，避免大量临时对象导致长时间暂停
+        if i > 0 and i % 50 == 0:
+            import gc
+            gc.collect()
         
         data_start = time.time()
     
@@ -1780,6 +1795,18 @@ def main():
     
     scaler = create_grad_scaler(config.use_amp)
     
+    # P13: GC 优化 - 减少训练中的暂停
+    # Python GC 在大量临时对象时可能导致长时间暂停
+    import gc
+    gc.disable()  # 禁用自动 GC
+    gc_interval = 50  # 每 50 个 batch 手动 GC 一次
+    print("[OK] Disabled automatic GC (manual GC every 50 batches)")
+    
+    # CUDA 内存管理优化
+    if device.type == 'cuda':
+        # 启用内存池，减少分配/释放开销
+        os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+    
     # CUDA 优化
     if device.type == 'cuda':
         torch.backends.cudnn.benchmark = True
@@ -1792,17 +1819,23 @@ def main():
         print("[OK] Using channels-last memory format")
     
     # torch.compile 编译优化 (PyTorch 2.0+)
-    # 注意: mode='reduce-overhead' 使用 CUDA graphs，但不兼容动态缓存操作
-    # 使用 mode='default' 更稳定，编译时间更短
+    # 重要: Variable Depth Tokens 产生动态序列长度，必须使用 dynamic=True
+    # 否则每次序列长度变化都会触发重新编译，导致 GPU 空转
     if config.compile_model:
         try:
+            # 设置编译缓存大小，减少重新编译
+            import torch._dynamo
+            torch._dynamo.config.cache_size_limit = 256  # 增大缓存
+            torch._dynamo.config.suppress_errors = True  # 回退到 eager 模式
+            
             model = torch.compile(
                 model, 
-                mode='default',
+                mode='reduce-overhead',  # CUDA graphs 更快
                 fullgraph=False,
-                dynamic=False,  # 固定输入尺寸时设为 False 更快
+                dynamic=True,  # 关键: Variable Depth Tokens 需要动态形状
             )
-            print("[OK] Model compiled with torch.compile (mode=default)")
+            print("[OK] Model compiled with torch.compile (mode=reduce-overhead, dynamic=True)")
+            print("[INFO] 首次运行会进行 JIT 编译，可能耗时 1-2 分钟")
         except Exception as e:
             print(f"[WARN] torch.compile failed: {e}")
     
@@ -1875,6 +1908,11 @@ def main():
     
     for epoch in range(1, config.epochs + 1):
         start = time.time()
+        
+        # P13: 每个 epoch 开始时手动 GC
+        gc.collect()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
         
         # P7-7: 温度退火调度
         # T(t) = T_start · (T_end / T_start)^((t - warmup) / (total - warmup))
