@@ -166,6 +166,22 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         self._last_split_stats: Optional[Dict[str, Any]] = None
         self._last_features: Optional[torch.Tensor] = None
     
+    @property
+    def patch_sizes(self) -> List[int]:
+        """兼容性属性: 从 base_patch_size 和 max_depth 计算等效的 patch 大小列表.
+        
+        数学形式:
+            patch_sizes[d] = base_patch_size × 2^d, d ∈ [0, max_depth]
+            
+        例如: base_patch_size=4, max_depth=4
+            → patch_sizes = [4, 8, 16, 32, 64]
+            
+        Note:
+            这是为了向后兼容旧版评估脚本。V3 tokenizer 使用可变深度 token,
+            实际 patch 大小由 LearnableSplitter 动态决定。
+        """
+        return [self.base_patch_size * (2 ** d) for d in range(self.max_depth + 1)]
+    
     @property 
     def shared_conv(self) -> nn.Module:
         """获取共享卷积层 (用于可学习分割)."""
