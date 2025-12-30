@@ -1824,7 +1824,7 @@ def main():
     if config.compile_model:
         try:
             # 设置编译缓存大小，减少重新编译
-            import torch._dynamo
+            # 注意: torch._dynamo 已在文件顶部导入，这里直接使用
             torch._dynamo.config.cache_size_limit = 256  # 增大缓存
             torch._dynamo.config.suppress_errors = True  # 回退到 eager 模式
             
