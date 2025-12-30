@@ -812,37 +812,68 @@ def create_dataloaders(
         train_idx, val_idx = indices[val_size:], indices[:val_size]
     
     # DataLoader 参数
-    # P10-RES-2: 优化多进程上下文选择
-    # - Linux: 使用 'fork' (更快，但注意 CUDA 兼容性)
-    # - Windows/macOS: 使用 'spawn' (更安全)
-    # - Docker 容器: 使用 'forkserver' 或 None (避免信号量泄漏)
+    # P10-RES-2: 优化多进程上下文选择 (WSL + Podman/Docker 容器优化)
+    # - Linux 原生: 使用 'fork' (更快)
+    # - WSL: 使用 'spawn' (fork 在 WSL 中不稳定)
+    # - Docker/Podman 容器: 使用 'spawn' + 减少 workers (共享内存受限)
     import platform
+    
+    # 检测运行环境
+    is_container = os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv')
+    is_wsl = 'microsoft' in platform.uname().release.lower() if hasattr(platform.uname(), 'release') else False
+    is_podman = os.path.exists('/run/.containerenv')  # Podman 特有标志
+    
+    # 检测共享内存大小 (容器常见限制)
+    shm_size_gb = 0.064  # 默认假设 64MB
+    try:
+        if os.path.exists('/dev/shm'):
+            import shutil
+            shm_stat = shutil.disk_usage('/dev/shm')
+            shm_size_gb = shm_stat.total / (1024**3)
+    except Exception:
+        pass
+    
+    # 根据环境选择最优配置
+    effective_workers = config.num_workers
     if config.num_workers > 0:
-        if platform.system() == 'Linux':
-            # 检测是否在 Docker 容器中
-            is_docker = os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv')
-            if is_docker:
-                # Docker 中使用 forkserver 减少资源泄漏
-                mp_context = 'forkserver'
-            else:
-                mp_context = 'fork'
+        if is_container:
+            # 容器环境: spawn 更稳定，限制 workers 避免共享内存不足
+            mp_context = 'spawn'
+            # 共享内存 < 1GB 时限制 workers
+            if shm_size_gb < 1.0:
+                effective_workers = min(config.num_workers, 2)
+                print(f"[WARN] 共享内存受限 ({shm_size_gb:.2f}GB)，降低 workers: {config.num_workers} -> {effective_workers}")
+            print(f"[INFO] 容器环境检测: {'Podman' if is_podman else 'Docker'}, mp_context='spawn'")
+        elif is_wsl:
+            # WSL: spawn 更稳定
+            mp_context = 'spawn'
+            print(f"[INFO] WSL 环境检测, mp_context='spawn'")
+        elif platform.system() == 'Linux':
+            mp_context = 'fork'
         else:
             mp_context = 'spawn'
     else:
         mp_context = None
     
+    # DataLoader 参数优化
     loader_kwargs = {
         'batch_size': config.batch_size,
-        'num_workers': config.num_workers,
-        'pin_memory': config.num_workers > 0,
-        'multiprocessing_context': mp_context if config.num_workers > 0 else None,
-        'persistent_workers': config.num_workers > 1,
+        'num_workers': effective_workers,
+        'pin_memory': effective_workers > 0 and torch.cuda.is_available(),
+        'multiprocessing_context': mp_context if effective_workers > 0 else None,
+        'persistent_workers': effective_workers > 0,  # 避免每个 epoch 重建进程
+        'drop_last': True,  # 避免最后一个小 batch 的性能损失
     }
-    if config.num_workers > 0:
-        loader_kwargs['prefetch_factor'] = 4
+    if effective_workers > 0:
+        # 容器环境使用更大的 prefetch_factor 补偿 I/O 延迟
+        loader_kwargs['prefetch_factor'] = 8 if is_container else 4
     
     train_loader = DataLoader(train_ds, sampler=SubsetRandomSampler(train_idx), **loader_kwargs)
-    val_loader = DataLoader(train_ds, sampler=SubsetRandomSampler(val_idx), **loader_kwargs)
+    
+    # 验证集不需要 drop_last
+    val_kwargs = loader_kwargs.copy()
+    val_kwargs['drop_last'] = False
+    val_loader = DataLoader(train_ds, sampler=SubsetRandomSampler(val_idx), **val_kwargs)
     
     test_kwargs = loader_kwargs.copy()
     test_kwargs['shuffle'] = False
@@ -871,68 +902,87 @@ def create_dataloaders(
 # ============================================================================
 
 class CudaPrefetcher:
-    """CUDA 异步数据预取器"""
+    """CUDA 异步数据预取器 (双缓冲优化)
+    
+    使用双缓冲策略减少 GPU 空转:
+    - buffer[0]: 当前正在被 GPU 处理的数据
+    - buffer[1]: 后台 stream 异步加载的下一批数据
+    
+    数学分析:
+    - 单缓冲: T_total = T_load + T_compute (串行)
+    - 双缓冲: T_total = max(T_load, T_compute) (流水线)
+    - 加速比: (T_load + T_compute) / max(T_load, T_compute)
+    
+    当 T_load ≈ T_compute 时，理论加速比接近 2x
+    """
     
     def __init__(self, loader: DataLoader, device: torch.device, channels_last: bool = False):
         self.loader = loader
         self.device = device
         self.channels_last = channels_last
+        # 双缓冲: 使用两个 CUDA stream 实现流水线
         self.stream = torch.cuda.Stream() if device.type == 'cuda' else None
-        self._debug = False  # DEBUG: 设置为 True 启用详细日志
+        self._debug = False
         self._batch_count = 0
+        # 双缓冲状态
+        self._buffer = [None, None]  # (raw_batch, gpu_data)
+        self._buffer_idx = 0
         
     def __iter__(self):
-        if self._debug:
-            print(f"[DEBUG CudaPrefetcher] __iter__ called, creating loader iterator...", flush=True)
         self.loader_iter = iter(self.loader)
-        if self._debug:
-            print(f"[DEBUG CudaPrefetcher] Loader iterator created, calling preload...", flush=True)
         self._batch_count = 0
-        self.preload()
-        if self._debug:
-            print(f"[DEBUG CudaPrefetcher] First preload done", flush=True)
+        self._buffer = [None, None]
+        self._buffer_idx = 0
+        # 预加载两个 batch 填满双缓冲
+        self._preload_next()
+        self._preload_next()
         return self
     
-    def preload(self):
+    def _preload_next(self):
+        """预加载下一个 batch 到空闲缓冲区"""
         try:
-            if self._debug and self._batch_count < 3:
-                print(f"[DEBUG CudaPrefetcher] preload: getting next batch from loader...", flush=True)
-            self.next_batch = next(self.loader_iter)
-            if self._debug and self._batch_count < 3:
-                print(f"[DEBUG CudaPrefetcher] preload: got batch, transferring to GPU...", flush=True)
+            raw_batch = next(self.loader_iter)
         except StopIteration:
-            self.next_batch = None
-            return
+            return False
         
         if self.stream is not None:
             with torch.cuda.stream(self.stream):
-                imgs = self.next_batch[0].to(self.device, non_blocking=True)
+                imgs = raw_batch[0].to(self.device, non_blocking=True)
                 if self.channels_last:
                     imgs = imgs.to(memory_format=torch.channels_last)
-                self.next_data = (
+                gpu_data = (
                     imgs,
-                    self.next_batch[1].to(self.device, non_blocking=True),
+                    raw_batch[1].to(self.device, non_blocking=True),
                 )
         else:
-            self.next_data = self.next_batch
+            gpu_data = raw_batch
+        
+        # 找到空闲缓冲区
+        for i in range(2):
+            if self._buffer[i] is None:
+                self._buffer[i] = gpu_data
+                break
+        return True
     
     def __next__(self):
-        if self._debug and self._batch_count < 3:
-            print(f"[DEBUG CudaPrefetcher] __next__ batch {self._batch_count}: waiting for stream...", flush=True)
-        
+        # 等待当前缓冲区的传输完成
         if self.stream is not None:
             torch.cuda.current_stream().wait_stream(self.stream)
         
-        if self._debug and self._batch_count < 3:
-            print(f"[DEBUG CudaPrefetcher] __next__ batch {self._batch_count}: stream sync done", flush=True)
-        
-        if self.next_batch is None:
+        # 获取当前缓冲区数据
+        current_data = self._buffer[self._buffer_idx]
+        if current_data is None:
             raise StopIteration
         
-        data = self.next_data
+        # 清空当前缓冲区，切换到下一个
+        self._buffer[self._buffer_idx] = None
+        self._buffer_idx = 1 - self._buffer_idx
         self._batch_count += 1
-        self.preload()
-        return data
+        
+        # 后台预加载下一个 batch
+        self._preload_next()
+        
+        return current_data
     
     def __len__(self):
         return len(self.loader)
