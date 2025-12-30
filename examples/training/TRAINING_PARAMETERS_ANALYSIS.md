@@ -127,20 +127,21 @@ self.norm2_beta = nn.Embedding(max_level + 1, dim)
 
 $$P_{ln} = 4 \times (D_{max}+1) \times D$$
 
-#### STAB-5 Residual Embedding
+#### STAB-5 Residual Gate (P11-13 重命名)
 
 ```python
 # transformer.py L128
-self._level_residual_embedding = nn.Embedding(max_level + 1, 2)
-nn.init.zeros_(self._level_residual_embedding.weight)
+# P11-13: 重命名 _level_residual_embedding → _residual_gate
+self._residual_gate = nn.Embedding(max_level + 1, 2)
+# 种子初始化: seed_value = 0.01 * d / max_level
 ```
 
 数学形式：
-$$w(d) = \sigma(\text{Embed}(d)) \times 2 \in [0, 2]$$
+$$\text{gate}(d) = \sigma(\text{Embed}(d)) \times 2 \in [0, 2]$$
 
 初始化时 $\sigma(0) \times 2 = 1.0$，即标准残差连接。
 
-$$P_{residual} = (D_{max}+1) \times 2$$
+$$P_{gate} = (D_{max}+1) \times 2$$
 
 #### 单层总参数
 

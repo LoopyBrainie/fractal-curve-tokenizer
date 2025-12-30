@@ -1158,9 +1158,7 @@ def load_model_and_config(
         ffn_type=config.get('ffn_type', 'swiglu_level'),
         tokenizer_type=tokenizer_type,
         num_scales=config.get('num_scales', 3),
-        # Hilbert Bias 配置
-        hilbert_bias_mode=config.get('hilbert_bias_mode', 'lca'),
-        # P6-2: LCA 温度配置
+        # P6-2: LCA 温度配置 (P11-8: hilbert_bias_mode 已移除，仅 LCA)
         lca_temperature=config.get('lca_temperature', 1.5),
         learnable_temperature=config.get('learnable_temperature', True),
     )
@@ -1861,10 +1859,11 @@ def visualize_level_aware_processing(
     # 提取 level-aware 参数
     norm1_gamma = layer0.norm1_gamma.weight.detach().cpu().numpy()  # [max_level+1, dim]
     norm1_beta = layer0.norm1_beta.weight.detach().cpu().numpy()
-    residual_emb = layer0._level_residual_embedding.weight.detach().cpu().numpy()  # [max_level+1, 2]
+    # P11-13: _level_residual_embedding 重命名为 _residual_gate
+    residual_gate_raw = layer0._residual_gate.weight.detach().cpu().numpy()  # [max_level+1, 2]
     
-    # 计算残差权重
-    residual_weights = 1 / (1 + np.exp(-residual_emb)) * 2  # sigmoid * 2
+    # 计算残差门控权重
+    residual_gate = 1 / (1 + np.exp(-residual_gate_raw)) * 2  # sigmoid * 2
     
     # 转换图像
     img_np = image[0].permute(1, 2, 0).cpu().numpy()
@@ -1928,18 +1927,18 @@ def visualize_level_aware_processing(
     ax3.legend(loc='upper right', fontsize=8)
     ax3.grid(alpha=0.3)
     
-    # 4. Level-aware 残差权重
+    # 4. Level-aware 残差门控权重
     ax4 = fig.add_subplot(gs[1, 0])
     
     x_range = np.arange(max_used_depth)
-    ax4.plot(x_range, residual_weights[:max_used_depth, 0], 'g-o', 
-            markersize=4, label='Attention residual')
-    ax4.plot(x_range, residual_weights[:max_used_depth, 1], 'r-s', 
-            markersize=4, label='FFN residual')
-    ax4.axhline(1.0, color='gray', linestyle='--', alpha=0.5, label='Standard (w=1)')
+    ax4.plot(x_range, residual_gate[:max_used_depth, 0], 'g-o', 
+            markersize=4, label='Attention gate')
+    ax4.plot(x_range, residual_gate[:max_used_depth, 1], 'r-s', 
+            markersize=4, label='FFN gate')
+    ax4.axhline(1.0, color='gray', linestyle='--', alpha=0.5, label='Standard (gate=1)')
     ax4.set_xlabel('Depth Level', fontsize=10)
-    ax4.set_ylabel('Residual Weight', fontsize=10)
-    ax4.set_title('STAB-5: Level-aware Residual Weights', fontsize=11, fontweight='bold')
+    ax4.set_ylabel('Gate Weight', fontsize=10)
+    ax4.set_title('STAB-5: Level-aware Residual Gate', fontsize=11, fontweight='bold')
     ax4.legend(loc='best', fontsize=8)
     ax4.grid(alpha=0.3)
     ax4.set_ylim(0, 2.2)

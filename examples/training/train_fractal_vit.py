@@ -54,6 +54,15 @@ P10 训练稳定性修复 (2025-01-14)
    - Dead Zone [N_min, N_max] 内零惩罚
    - 非对称惩罚: λ_over=0.1 >> λ_under=0.01
 
+P11 数学形式化审查 (2025-12-30)
+--------------------------------
+架构审查和代码简化:
+
+1. P11-8: 死代码清理 - 删除 LowRankHilbertBias/HierarchicalHilbertBias，仅保留 LCAHilbertBias
+2. P11-9: 深度分布统计向量化 - O(B×D) Python 循环 → O(1) scatter_add
+3. P11-15: 注释修复 - level_mixing_weights sigmoid vs softmax 不一致
+4. P11-17: 索引越界审查 - 无需修改，现有 clamp 保护合理
+
 P12 内部向量化优化 (2025-12-29)
 --------------------------------
 消除 O(B) 或 O(N) Python 循环，提升推理和训练速度:
@@ -241,7 +250,6 @@ class TrainingConfig:
     num_scales: int
     pool: str
     ffn_type: str
-    hilbert_bias_mode: str
     
     # Tokenizer 配置 (V3 Variable Depth Tokens)
     tokenizer_type: str  # 'streaming_v3' (唯一支持)
@@ -959,35 +967,18 @@ def train_epoch(
     use_mixup = mixup_fn is not None
     nan_count = 0  # NaN 计数器
     
-    # DEBUG: 在 CudaPrefetcher 创建前后添加日志
-    import sys
-    print(f"[DEBUG train_epoch] Creating data iterator...", flush=True)
-    sys.stdout.flush()
-    
     # 使用环境变量 DISABLE_PREFETCH=1 来禁用 CudaPrefetcher 进行调试
     use_prefetcher = device.type == 'cuda' and not os.environ.get('DISABLE_PREFETCH', '0') == '1'
     if use_prefetcher:
         data_iter = CudaPrefetcher(loader, device, channels_last=config.channels_last)
     else:
         data_iter = loader
-        if device.type == 'cuda':
-            print(f"[DEBUG] CudaPrefetcher DISABLED via DISABLE_PREFETCH env var")
-    
-    print(f"[DEBUG train_epoch] Data iterator created, creating tqdm...", flush=True)
-    sys.stdout.flush()
     
     pbar = tqdm(data_iter, desc="Train", total=len(loader))
-    
-    print(f"[DEBUG train_epoch] Starting batch iteration...", flush=True)
-    sys.stdout.flush()
     
     data_start = time.time()
     
     for i, batch in enumerate(pbar):
-        # DEBUG: 前几个 batch 打印日志
-        if i < 3:
-            print(f"[DEBUG train_epoch] Batch {i} received", flush=True)
-            sys.stdout.flush()
             
         data_time = time.time() - data_start
         data_times.append(data_time)
@@ -1418,9 +1409,7 @@ def main():
     parser.add_argument("--pool", type=str, default="cls", choices=["cls", "mean"])
     parser.add_argument("--ffn-type", type=str, default="swiglu_level",
                        choices=["gelu", "swiglu", "swiglu_level"])
-    parser.add_argument("--hilbert-bias-mode", type=str, default="lca",
-                       choices=["lca", "low_rank", "hierarchical"],
-                       help="Hilbert bias mode (lca recommended, ~100 params)")
+    # P11-8: hilbert_bias_mode 已移除，仅使用 LCA 模式
     parser.add_argument("--gradient-checkpoint", action="store_true",
                        help="Enable gradient checkpointing to save memory")
     parser.add_argument("--compile", action="store_true",
@@ -1585,7 +1574,6 @@ def main():
         num_scales=args.num_scales,
         pool=args.pool,
         ffn_type=args.ffn_type,
-        hilbert_bias_mode=args.hilbert_bias_mode,
         # Tokenizer 配置 (V3)
         tokenizer_type=args.tokenizer_type,
         # V3 高级分割参数 (LearnableSplitter only)
@@ -1683,8 +1671,6 @@ def main():
         # 使用自定义 tokenizer (支持高级分割参数)
         tokenizer=tokenizer,
         num_scales=config.num_scales,
-        # Hilbert Bias 配置
-        hilbert_bias_mode=config.hilbert_bias_mode,
         # P6-2: LCA 温度配置
         lca_temperature=config.lca_temperature,
         learnable_temperature=config.learnable_temperature,
@@ -1709,7 +1695,7 @@ def main():
     print(f"Model: FractalCurveViT")
     print(f"Tokenizer: {tokenizer_name}")
     print(f"FFN Type: {config.ffn_type}")
-    print(f"Hilbert Bias: {config.hilbert_bias_mode}")
+    print(f"Hilbert Bias: LCA (only mode after P11-8 cleanup)")
     print(f"  - Depth Scale (P6-1): {depth_scale_info}")
     print(f"  - LCA Temperature (P6-2): {temp_info}")
     print(f"Parameters: {params:,}")
@@ -1840,14 +1826,6 @@ def main():
     for epoch in range(1, config.epochs + 1):
         start = time.time()
         
-        # DEBUG: Epoch 11 卡死调试日志
-        if epoch >= 10:
-            print(f"\n[DEBUG] Epoch {epoch} starting...")
-            print(f"[DEBUG] Warmup epochs: {config.warmup_epochs}, Splitter temp warmup: {config.splitter_temp_warmup}")
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-                print(f"[DEBUG] CUDA sync OK, GPU memory: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
-        
         # P7-7: 温度退火调度
         # T(t) = T_start · (T_end / T_start)^((t - warmup) / (total - warmup))
         if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'set_split_temperature'):
@@ -1860,13 +1838,6 @@ def main():
                 ratio = config.splitter_temp_end / config.splitter_temp_start
                 current_temp = config.splitter_temp_start * (ratio ** progress)
             model.tokenizer.set_split_temperature(current_temp)
-            if epoch >= 10:
-                print(f"[DEBUG] Temperature set to {current_temp:.4f}")
-        
-        # DEBUG: 检查 scheduler 状态
-        if epoch >= 10:
-            print(f"[DEBUG] Current LR: {optimizer.param_groups[0]['lr']:.6f}")
-            print(f"[DEBUG] About to call train_epoch...")
         
         train_loss, train_acc, perf_stats = train_epoch(
             model, train_loader, optimizer, device, scaler, config,
