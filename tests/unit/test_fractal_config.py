@@ -16,6 +16,8 @@ Hilbert 策略:
     - grid_size = 2^k: 标准 Hilbert
     - padding_ratio < 4/3: Hilbert + Padding
     - padding_ratio ≥ 4/3: Pseudo-Hilbert
+
+P11-8 简化: 移除 hilbert_bias_mode 和 low_rank_r 配置项，仅保留 LCA 模式。
 """
 
 import math
@@ -26,7 +28,6 @@ sys.path.insert(0, 'src')
 from vit_pytorch import (
     FractalConfig,
     create_fractal_config,
-    BiasMode,
 )
 
 
@@ -45,13 +46,6 @@ class TestFractalConfigBasic:
         assert config.grid_size == 16
         assert config.num_tokens == 256
     
-    def test_hilbert_defaults(self):
-        """测试 Hilbert Bias 默认参数."""
-        config = FractalConfig(64, 4)
-        
-        assert config.hilbert_bias_mode == 'lca'
-        assert config.low_rank_r == 32
-    
     def test_tokenizer_defaults(self):
         """测试 Tokenizer 默认参数."""
         config = FractalConfig(64, 4)
@@ -62,26 +56,12 @@ class TestFractalConfigBasic:
 class TestFractalConfigCustomization:
     """自定义配置测试."""
     
-    def test_custom_hilbert_params(self):
-        """测试自定义 Hilbert 参数."""
-        config = FractalConfig(
-            64, 4,
-            hilbert_bias_mode='low_rank',
-            low_rank_r=64,
-        )
-        
-        assert config.hilbert_bias_mode == 'low_rank'
-        assert config.low_rank_r == 64
-    
     def test_create_fractal_config_helper(self):
         """测试便捷函数."""
-        config = create_fractal_config(
-            64, 4,
-            hilbert_bias_mode='lca',
-        )
+        config = create_fractal_config(64, 4)
         
         assert config.image_size == 64
-        assert config.hilbert_bias_mode == 'lca'
+        assert config.min_patch_size == 4
 
 
 class TestFractalConfigValidation:
@@ -168,10 +148,9 @@ class TestRepr:
         repr_str = repr(config)
         
         assert "# Geometry" in repr_str
-        assert "# Hilbert Bias" in repr_str
+        assert "# Hilbert Bias" in repr_str or "LCA" in repr_str  # P11-8 simplified
         assert "# Tokenizer" in repr_str
         assert "image_size=64" in repr_str
-        assert "bias_mode='lca'" in repr_str
 
 
 if __name__ == "__main__":

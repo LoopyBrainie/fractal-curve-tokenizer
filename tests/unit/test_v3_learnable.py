@@ -128,7 +128,11 @@ class TestV3GradientFlow:
         assert v3.splitter.threshold_offsets.grad is not None
         
     def test_gradient_through_barrier_loss(self):
-        """测试超出边界时 barrier loss 提供梯度."""
+        """测试超出边界时 barrier loss 提供梯度.
+        
+        P11-10 更新: 边界从 [0, 1] 扩展到 [-3, 3]
+        需要设置更大的 offset 才能触发 barrier loss
+        """
         v3 = StreamingFractalTokenizerV3(
             image_size=64,
             d_model=128,
@@ -137,9 +141,10 @@ class TestV3GradientFlow:
         )
         v3.train()
         
-        # 设置 offset 使阈值超出上边界
+        # P11-10: 边界扩展到 [-3, 3]，需要设置 offset > 3 才能触发上边界惩罚
+        # tau_base = 0, offset = 4.0 → tau_eff = 4.0 > tau_max = 3.0
         with torch.no_grad():
-            v3.splitter.threshold_offsets.data = torch.tensor([1.0, 1.0, 1.0, 1.0])
+            v3.splitter.threshold_offsets.data = torch.tensor([4.0, 4.0, 4.0, 4.0])
         
         barrier_loss = v3.splitter.get_threshold_barrier_loss()
         barrier_loss.backward()

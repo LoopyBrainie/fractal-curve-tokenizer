@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """LCAHilbertBias 单元测试
 
+P11-8 简化: 移除 LowRankHilbertBias 和 HierarchicalHilbertBias 的测试，
+仅保留 LCAHilbertBias 相关测试。
+
 测试覆盖:
 1. 基本功能测试 (形状、设备、梯度)
 2. LCA 计算正确性验证
-3. 与其他 bias_mode 的性能对比
-4. 边界条件测试
+3. 边界条件测试
 """
 
 import pytest
@@ -14,8 +16,6 @@ import torch.nn as nn
 
 from vit_pytorch.attn_hilbert_bias import (
     LCAHilbertBias,
-    LowRankHilbertBias,
-    HierarchicalHilbertBias,
     HilbertAwareMultiScaleAttention,
 )
 from vit_pytorch.embed_fractal_path import VectorizedPathEncoder
@@ -43,13 +43,9 @@ class TestLCAHilbertBiasBasic:
         # P6-2: 新增 per-head 可学习温度参数
         assert num_params == 40
         
-        # 与 LowRankHilbertBias 对比
-        low_rank = LowRankHilbertBias(path_dim=16, rank=32, heads=4)
-        low_rank_params = sum(p.numel() for p in low_rank.parameters())
-        
-        # LCA 参数量应该远少于 Low-Rank
-        assert num_params < low_rank_params / 100, \
-            f"LCA params ({num_params}) should be << Low-Rank params ({low_rank_params})"
+        # P11-8: LCA 参数量应该很少（约 40 个）
+        assert num_params < 100, \
+            f"LCA params ({num_params}) should be < 100"
     
     def test_forward_2d(self, lca_bias):
         """2D 输入测试 (S, Info)"""
@@ -189,7 +185,7 @@ class TestLCAComputation:
 
 
 class TestIntegrationWithAttention:
-    """与 HilbertAwareMultiScaleAttention 集成测试"""
+    """与 HilbertAwareMultiScaleAttention 集成测试 (P11-8: 仅 LCA 模式)"""
     
     @pytest.fixture
     def attention_lca(self):
@@ -200,12 +196,10 @@ class TestIntegrationWithAttention:
             dim_head=16,
             max_level=8,
             use_hilbert_bias=True,
-            bias_mode='lca',
         )
     
     def test_lca_mode_initialization(self, attention_lca):
         """LCA 模式初始化测试"""
-        assert attention_lca.bias_mode == 'lca'
         assert isinstance(attention_lca.hilbert_bias_impl, LCAHilbertBias)
     
     def test_forward_with_lca_bias(self, attention_lca):
@@ -223,89 +217,28 @@ class TestIntegrationWithAttention:
         assert output.shape == (batch_size, seq_len, dim)
         assert not torch.isnan(output).any()
     
-    def test_parameter_efficiency_vs_low_rank(self):
-        """参数效率对比 (LCA vs Low-Rank)"""
-        attention_lca = HilbertAwareMultiScaleAttention(
-            dim=64, heads=4, max_level=8, bias_mode='lca'
-        )
-        attention_lr = HilbertAwareMultiScaleAttention(
-            dim=64, heads=4, max_level=8, bias_mode='low_rank'
-        )
-        
-        lca_params = sum(p.numel() for p in attention_lca.parameters())
-        lr_params = sum(p.numel() for p in attention_lr.parameters())
-        
-        # LCA 模式总参数应该更少
-        # 差异主要来自 hilbert_bias_impl
-        lca_bias_params = sum(
-            p.numel() for p in attention_lca.hilbert_bias_impl.parameters()
-        )
-        lr_bias_params = sum(
-            p.numel() for p in attention_lr.hilbert_bias_impl.parameters()
+    def test_gradient_flow_lca(self):
+        """LCA 模式梯度流测试"""
+        attention = HilbertAwareMultiScaleAttention(
+            dim=64,
+            heads=4,
+            max_level=8,
+            use_hilbert_bias=True,
         )
         
-        assert lca_bias_params < lr_bias_params / 50, \
-            f"LCA bias ({lca_bias_params}) should be << Low-Rank bias ({lr_bias_params})"
-
-
-class TestBiasModeComparison:
-    """不同 bias_mode 对比测试"""
-    
-    @pytest.fixture
-    def levels_info(self):
-        """共享测试数据"""
-        batch_size = 2
-        seq_len = 16
-        info_len = 9
-        levels_info = torch.randint(0, 4, (batch_size, seq_len, info_len))
+        levels_info = torch.randint(0, 4, (2, 16, 9))
         levels_info[:, :, 0] = 8
-        return levels_info
-    
-    def test_all_modes_produce_valid_output(self, levels_info):
-        """所有模式都应产生有效输出"""
-        modes = ['lca', 'low_rank', 'hierarchical']
         
-        for mode in modes:
-            attention = HilbertAwareMultiScaleAttention(
-                dim=64,
-                heads=4,
-                max_level=8,
-                use_hilbert_bias=True,
-                bias_mode=mode,
-            )
-            
-            x = torch.randn(2, 16, 64)
-            output = attention(x, levels_info=levels_info)
-            
-            assert output.shape == (2, 16, 64), f"Mode {mode} output shape wrong"
-            assert not torch.isnan(output).any(), f"Mode {mode} produced NaN"
-            assert not torch.isinf(output).any(), f"Mode {mode} produced Inf"
-    
-    def test_gradient_flow_all_modes(self, levels_info):
-        """所有模式梯度流测试"""
-        modes = ['lca', 'low_rank', 'hierarchical']
+        x = torch.randn(2, 16, 64, requires_grad=True)
+        output = attention(x, levels_info=levels_info)
+        loss = output.sum()
+        loss.backward()
         
-        for mode in modes:
-            attention = HilbertAwareMultiScaleAttention(
-                dim=64,
-                heads=4,
-                max_level=8,
-                use_hilbert_bias=True,
-                bias_mode=mode,
-            )
-            
-            x = torch.randn(2, 16, 64, requires_grad=True)
-            output = attention(x, levels_info=levels_info)
-            loss = output.sum()
-            loss.backward()
-            
-            assert x.grad is not None, f"Mode {mode} no gradient to input"
-            
-            # 检查 bias 实现的梯度
-            if attention.hilbert_bias_impl is not None:
-                for name, param in attention.hilbert_bias_impl.named_parameters():
-                    assert param.grad is not None, \
-                        f"Mode {mode} no gradient to {name}"
+        assert x.grad is not None
+        
+        # 检查 bias 实现的梯度
+        for name, param in attention.hilbert_bias_impl.named_parameters():
+            assert param.grad is not None, f"No gradient to {name}"
 
 
 class TestEdgeCases:

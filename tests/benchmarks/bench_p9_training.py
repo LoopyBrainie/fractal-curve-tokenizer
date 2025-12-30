@@ -71,7 +71,6 @@ def create_model(device: torch.device, batch_size: int = 8) -> nn.Module:
         max_level=4,
         ffn_type='swiglu_level',
         tokenizer_type='streaming_v3',
-        hilbert_bias_mode='lca',
         lca_temperature=1.5,
         learnable_temperature=True,
     ).to(device)

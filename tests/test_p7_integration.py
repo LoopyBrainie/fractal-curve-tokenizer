@@ -58,7 +58,8 @@ def main():
     print(f'[6] P7-7 Temperature annealing:')
     
     # 模拟 warmup (epoch 1-5)
-    T_start, T_end, warmup = 1.0, 0.1, 5
+    # P11-11 修复: T_end 从 0.1 提高到 0.3 以避免梯度消失
+    T_start, T_end, warmup = 1.0, 0.3, 5
     epochs = 20
     
     temps = []
