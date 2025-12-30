@@ -1393,7 +1393,14 @@ def train_epoch(
     
     data_start = time.time()
     
+    # P15: 在首个 Mixup epoch 添加额外诊断
+    debug_first_mixup_epoch = use_mixup and epoch is not None and os.environ.get('DISABLE_PREFETCH', '0') == '1'
+    
     for i, batch in enumerate(pbar):
+        
+        # P15: 额外诊断 - 检测数据加载卡顿
+        if debug_first_mixup_epoch and i <= 5:
+            print(f"[DEBUG] Batch {i}: 数据加载完成", flush=True)
         
         # P13: 检测数据加载卡顿
         data_time = time.time() - data_start
@@ -1495,9 +1502,10 @@ def train_epoch(
             
             # P1-5 修复: 收集熵正则化损失
             # 熵损失鼓励尺度分布多样性，防止 CrossScaleAttention 崩塌到单一尺度
+            # P15-FIX: 当使用新版 get_auxiliary_losses (包含 soft_entropy_loss) 时，
+            #          不再使用旧版 get_entropy_loss，避免重复添加熵损失
             entropy_loss = None
-            if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_entropy_loss'):
-                entropy_loss = model.tokenizer.get_entropy_loss()
+            use_legacy_entropy = False  # 默认使用新版
             
             # P10-4/P10-9: 可学习分割器辅助损失（推荐使用统一接口）
             # 包含: 软熵损失 + 弹性预算损失 + 阈值 barrier 正则化
@@ -1526,6 +1534,8 @@ def train_epoch(
                     # P11-8: 延迟 .item() 调用，避免每个 batch 的 GPU-CPU 同步
                     # 仅在需要显示时才调用
                     splitter_metrics = aux_losses  # 保留张量引用
+                    # 新版接口已包含 soft_entropy_loss，不需要旧版熵损失
+                    use_legacy_entropy = False
                 elif hasattr(model.tokenizer, 'get_learnable_split_loss'):
                     # 后备：旧版接口
                     splitter_loss = model.tokenizer.get_learnable_split_loss(
@@ -1533,6 +1543,15 @@ def train_epoch(
                         lambda_budget=config.lambda_splitter_budget,
                         target_tokens=config.splitter_token_budget,
                     )
+                    use_legacy_entropy = True  # 旧版接口需要单独的熵损失
+                else:
+                    use_legacy_entropy = True  # 没有 splitter 接口，使用旧版熵损失
+            else:
+                use_legacy_entropy = True  # 没有 splitter，使用旧版熵损失
+            
+            # P15-FIX: 仅在使用旧版接口时才获取旧版熵损失
+            if use_legacy_entropy and hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_entropy_loss'):
+                entropy_loss = model.tokenizer.get_entropy_loss()
             
             # P8-3: 多层深度损失 (仅可学习分割器)
             # 确保所有深度层级的阈值都收到梯度信号
@@ -2620,9 +2639,27 @@ def main():
             # 添加同步点，确保之前的 CUDA 操作完成
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+            
+            # P15-FIX: 创建单进程 DataLoader 避免多进程死锁
+            # persistent_workers + pin_memory 在某些情况下会导致死锁或 OOM
+            print("[INFO] 创建单进程 DataLoader 以确保稳定性...")
+            from torch.utils.data.sampler import SubsetRandomSampler
+            simple_train_loader = DataLoader(
+                train_loader.dataset,
+                batch_size=config.batch_size,
+                sampler=train_loader.sampler,
+                num_workers=0,  # 单进程
+                pin_memory=False,  # 禁用 pin_memory
+                drop_last=True,
+            )
+        else:
+            simple_train_loader = None
+        
+        # 选择使用的 loader
+        current_train_loader = simple_train_loader if disable_prefetch_this_epoch else train_loader
         
         train_loss, train_acc, perf_stats = train_epoch(
-            model, train_loader, optimizer, device, scaler, config,
+            model, current_train_loader, optimizer, device, scaler, config,
             mixup_fn=current_mixup_fn,
             num_classes=spec.num_classes,
             profile=(epoch == 1),
@@ -2632,10 +2669,11 @@ def main():
             epoch=epoch,
         )
         
-        # P15: 恢复 CudaPrefetcher
+        # P15: 恢复 CudaPrefetcher 和清理临时 loader
         if disable_prefetch_this_epoch:
             os.environ.pop('DISABLE_PREFETCH', None)
-            print(f"[INFO] Epoch {epoch} 完成，后续 epoch 将恢复 CUDA Prefetcher")
+            del simple_train_loader
+            print(f"[INFO] Epoch {epoch} 完成，后续 epoch 将恢复正常 DataLoader")
         
         val_loss, val_acc, per_class_stats = evaluate(
             model, val_loader, device, config.use_amp, spec.num_classes,
