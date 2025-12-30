@@ -1828,13 +1828,16 @@ def main():
             torch._dynamo.config.cache_size_limit = 256  # 增大缓存
             torch._dynamo.config.suppress_errors = True  # 回退到 eager 模式
             
+            # 使用 'default' 模式而非 'reduce-overhead'
+            # 原因: reduce-overhead 使用 Triton 编译器，对动态形状支持有限
+            # 已知问题: Triton 对 2**tensor 幂运算不支持，会报 __rpow__ 错误
             model = torch.compile(
                 model, 
-                mode='reduce-overhead',  # CUDA graphs 更快
+                mode='default',  # 使用 TorchInductor 而非 Triton CUDA graphs
                 fullgraph=False,
                 dynamic=True,  # 关键: Variable Depth Tokens 需要动态形状
             )
-            print("[OK] Model compiled with torch.compile (mode=reduce-overhead, dynamic=True)")
+            print("[OK] Model compiled with torch.compile (mode=default, dynamic=True)")
             print("[INFO] 首次运行会进行 JIT 编译，可能耗时 1-2 分钟")
         except Exception as e:
             print(f"[WARN] torch.compile failed: {e}")
