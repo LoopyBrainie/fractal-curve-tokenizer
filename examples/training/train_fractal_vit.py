@@ -315,9 +315,143 @@ class TrainingConfig:
     cutmix_alpha: float
     mixup_prob: float
     
+    # 长尾效应优化 (P14)
+    use_focal_loss: bool  # 是否使用 Focal Loss
+    focal_gamma: float  # Focal Loss 的 gamma 参数，默认 2.0
+    use_class_balanced: bool  # 是否使用类别平衡损失权重
+    class_balance_beta: float  # 类别平衡的 beta 参数，默认 0.9999
+    progressive_aug: bool  # 是否使用渐进式数据增强
+    
     # 系统
     seed: int
     device: str
+
+
+# ============================================================================
+# Focal Loss 实现 (P14: 长尾效应优化)
+# ============================================================================
+
+class FocalLoss(nn.Module):
+    """Focal Loss for addressing class imbalance.
+    
+    数学形式:
+        FL(p_t) = -α_t · (1 - p_t)^γ · log(p_t)
+        
+    其中:
+        - p_t 是模型对正确类别的预测概率
+        - γ (gamma) 是聚焦参数，默认 2.0
+        - α_t 是可选的类别权重
+    
+    优势:
+        1. 对容易分类的样本降低权重 (1-p_t)^γ → 0
+        2. 对困难样本保持高权重 (1-p_t)^γ → 1
+        3. γ=0 时退化为标准交叉熵
+    
+    参考: "Focal Loss for Dense Object Detection" (Lin et al., 2017)
+    """
+    
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: Optional[torch.Tensor] = None,
+        label_smoothing: float = 0.0,
+        reduction: str = 'mean',
+    ):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha  # [num_classes] 类别权重
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+    
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            inputs: [B, C] logits
+            targets: [B] 类别索引
+            
+        Returns:
+            Focal Loss 标量
+        """
+        # 计算 log_softmax 和 softmax
+        log_probs = F.log_softmax(inputs, dim=1)
+        probs = torch.exp(log_probs)
+        
+        # 获取正确类别的概率
+        # targets: [B] -> [B, 1]
+        targets_one_hot = F.one_hot(targets, num_classes=inputs.size(1)).float()
+        
+        # Label smoothing
+        if self.label_smoothing > 0:
+            targets_one_hot = targets_one_hot * (1 - self.label_smoothing) + \
+                              self.label_smoothing / inputs.size(1)
+        
+        # 计算 p_t
+        p_t = (probs * targets_one_hot).sum(dim=1)  # [B]
+        
+        # Focal weight: (1 - p_t)^gamma
+        focal_weight = (1 - p_t) ** self.gamma
+        
+        # 交叉熵损失
+        ce_loss = -(targets_one_hot * log_probs).sum(dim=1)  # [B]
+        
+        # 应用类别权重
+        if self.alpha is not None:
+            alpha_t = self.alpha.to(inputs.device)[targets]
+            focal_weight = alpha_t * focal_weight
+        
+        # 最终损失
+        loss = focal_weight * ce_loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
+def compute_class_weights(
+    labels: List[int],
+    num_classes: int,
+    beta: float = 0.9999,
+) -> torch.Tensor:
+    """计算类别平衡权重。
+    
+    数学形式 (Effective Number of Samples):
+        w_c = (1 - β) / (1 - β^{n_c})
+        
+    其中 n_c 是类别 c 的样本数量。
+    
+    当 β → 1 时，权重趋向于 1/n_c (逆频率权重)
+    当 β = 0 时，所有类别权重相等
+    
+    参考: "Class-Balanced Loss" (Cui et al., CVPR 2019)
+    
+    Args:
+        labels: 所有样本的标签列表
+        num_classes: 类别数量
+        beta: 平滑参数，默认 0.9999
+        
+    Returns:
+        [num_classes] 权重张量
+    """
+    # 统计每个类别的样本数
+    class_counts = torch.zeros(num_classes)
+    for label in labels:
+        class_counts[label] += 1
+    
+    # 避免除零
+    class_counts = class_counts.clamp(min=1)
+    
+    # 计算有效样本数权重
+    # w_c = (1 - β) / (1 - β^{n_c})
+    effective_num = 1.0 - torch.pow(beta, class_counts)
+    weights = (1.0 - beta) / effective_num
+    
+    # 归一化使得平均权重为 1
+    weights = weights / weights.mean() * 1.0
+    
+    return weights
 
 
 # ============================================================================
@@ -529,6 +663,203 @@ def create_grad_scaler(enabled: bool) -> GradScaler:
         return GradScaler('cuda', enabled=enabled)
     else:
         return GradScaler(enabled=enabled)
+
+
+# ============================================================================
+# NaN/Inf 诊断工具
+# ============================================================================
+
+def diagnose_nan_inf(
+    batch_idx: int,
+    imgs: torch.Tensor,
+    labels: torch.Tensor,
+    model: nn.Module,
+    logits: Optional[torch.Tensor] = None,
+    loss: Optional[torch.Tensor] = None,
+    ce_loss: Optional[torch.Tensor] = None,
+    entropy_loss: Optional[torch.Tensor] = None,
+    splitter_loss: Optional[torch.Tensor] = None,
+    log_file: Optional[str] = None,
+) -> str:
+    """诊断 NaN/Inf 出现的原因，输出详细信息
+    
+    Args:
+        batch_idx: 当前批次索引
+        imgs: 输入图像张量
+        labels: 标签张量
+        model: 模型
+        logits: 模型输出 logits（可选）
+        loss: 总损失（可选）
+        ce_loss: 交叉熵损失（可选）
+        entropy_loss: 熵损失（可选）
+        splitter_loss: 分割器损失（可选）
+        log_file: 日志文件路径（可选，用于持久化）
+        
+    Returns:
+        诊断报告字符串
+    """
+    lines = []
+    lines.append("=" * 70)
+    lines.append(f"[NaN/Inf 诊断报告] Batch {batch_idx}")
+    lines.append("=" * 70)
+    
+    # 1. 输入数据统计
+    lines.append("\n[1] 输入数据统计:")
+    lines.append(f"  imgs.shape: {imgs.shape}, dtype: {imgs.dtype}")
+    lines.append(f"  imgs: min={imgs.min().item():.4f}, max={imgs.max().item():.4f}, "
+                f"mean={imgs.mean().item():.4f}, std={imgs.std().item():.4f}")
+    lines.append(f"  imgs NaN: {torch.isnan(imgs).sum().item()}, Inf: {torch.isinf(imgs).sum().item()}")
+    lines.append(f"  labels: min={labels.min().item()}, max={labels.max().item()}")
+    
+    # 2. 损失统计
+    lines.append("\n[2] 损失统计:")
+    if loss is not None:
+        lines.append(f"  total_loss: {loss.item() if not (torch.isnan(loss) or torch.isinf(loss)) else 'NaN/Inf'}")
+        lines.append(f"    → isnan: {torch.isnan(loss).item()}, isinf: {torch.isinf(loss).item()}")
+    if ce_loss is not None:
+        ce_val = ce_loss.item() if not (torch.isnan(ce_loss) or torch.isinf(ce_loss)) else 'NaN/Inf'
+        lines.append(f"  ce_loss: {ce_val}")
+        lines.append(f"    → isnan: {torch.isnan(ce_loss).item()}, isinf: {torch.isinf(ce_loss).item()}")
+    if entropy_loss is not None:
+        ent_val = entropy_loss.item() if not (torch.isnan(entropy_loss) or torch.isinf(entropy_loss)) else 'NaN/Inf'
+        lines.append(f"  entropy_loss: {ent_val}")
+    if splitter_loss is not None:
+        if isinstance(splitter_loss, torch.Tensor):
+            spl_val = splitter_loss.item() if not (torch.isnan(splitter_loss) or torch.isinf(splitter_loss)) else 'NaN/Inf'
+            lines.append(f"  splitter_loss: {spl_val}")
+        else:
+            lines.append(f"  splitter_loss: {splitter_loss}")
+    
+    # 3. Logits 统计
+    if logits is not None:
+        lines.append("\n[3] Logits 统计:")
+        lines.append(f"  logits.shape: {logits.shape}")
+        nan_count = torch.isnan(logits).sum().item()
+        inf_count = torch.isinf(logits).sum().item()
+        lines.append(f"  NaN count: {nan_count}, Inf count: {inf_count}")
+        if nan_count == 0 and inf_count == 0:
+            lines.append(f"  min={logits.min().item():.4f}, max={logits.max().item():.4f}, "
+                        f"mean={logits.mean().item():.4f}, std={logits.std().item():.4f}")
+        # 检查是否有极端值
+        if not (torch.isnan(logits).any() or torch.isinf(logits).any()):
+            if logits.abs().max() > 100:
+                lines.append(f"  [WARN] Logits 有极端值 (>100)，可能导致 softmax 数值不稳定")
+    
+    # 4. 模型参数统计
+    lines.append("\n[4] 模型参数统计:")
+    param_stats = []
+    nan_params = []
+    inf_params = []
+    large_params = []
+    
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            has_nan = torch.isnan(param).any().item()
+            has_inf = torch.isinf(param).any().item()
+            if has_nan:
+                nan_params.append(name)
+            if has_inf:
+                inf_params.append(name)
+            # 检查极端值
+            if not (has_nan or has_inf):
+                max_val = param.abs().max().item()
+                if max_val > 1000:
+                    large_params.append((name, max_val))
+    
+    lines.append(f"  参数包含 NaN: {len(nan_params)} 个")
+    if nan_params:
+        for name in nan_params[:5]:  # 最多显示 5 个
+            lines.append(f"    - {name}")
+        if len(nan_params) > 5:
+            lines.append(f"    ... 还有 {len(nan_params) - 5} 个")
+    
+    lines.append(f"  参数包含 Inf: {len(inf_params)} 个")
+    if inf_params:
+        for name in inf_params[:5]:
+            lines.append(f"    - {name}")
+    
+    if large_params:
+        lines.append(f"  参数极端值 (>1000): {len(large_params)} 个")
+        for name, val in large_params[:5]:
+            lines.append(f"    - {name}: max={val:.2f}")
+    
+    # 5. 梯度统计（如果有）
+    lines.append("\n[5] 梯度统计:")
+    grad_nan = []
+    grad_inf = []
+    grad_large = []
+    
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            has_nan = torch.isnan(param.grad).any().item()
+            has_inf = torch.isinf(param.grad).any().item()
+            if has_nan:
+                grad_nan.append(name)
+            if has_inf:
+                grad_inf.append(name)
+            if not (has_nan or has_inf):
+                max_val = param.grad.abs().max().item()
+                if max_val > 1000:
+                    grad_large.append((name, max_val))
+    
+    lines.append(f"  梯度包含 NaN: {len(grad_nan)} 个")
+    if grad_nan:
+        for name in grad_nan[:5]:
+            lines.append(f"    - {name}")
+    
+    lines.append(f"  梯度包含 Inf: {len(grad_inf)} 个")
+    if grad_inf:
+        for name in grad_inf[:5]:
+            lines.append(f"    - {name}")
+    
+    if grad_large:
+        lines.append(f"  梯度极端值 (>1000): {len(grad_large)} 个")
+        for name, val in grad_large[:5]:
+            lines.append(f"    - {name}: max_grad={val:.2f}")
+    
+    # 6. Tokenizer/Splitter 状态（如果有）
+    lines.append("\n[6] Tokenizer/Splitter 状态:")
+    try:
+        if hasattr(model, 'tokenizer'):
+            tokenizer = model.tokenizer
+            if hasattr(tokenizer, 'splitter'):
+                splitter = tokenizer.splitter
+                if hasattr(splitter, 'get_temperature'):
+                    temp = splitter.get_temperature()
+                    lines.append(f"  Splitter temperature: {temp:.4f}")
+                if hasattr(splitter, '_last_tau_values') and splitter._last_tau_values is not None:
+                    taus = splitter._last_tau_values
+                    lines.append(f"  Last tau values: min={taus.min().item():.4f}, max={taus.max().item():.4f}")
+                    if torch.isnan(taus).any() or torch.isinf(taus).any():
+                        lines.append(f"    [WARN] tau 包含 NaN/Inf!")
+    except Exception as e:
+        lines.append(f"  [ERROR] 无法获取 Tokenizer 状态: {e}")
+    
+    # 7. 建议
+    lines.append("\n[7] 可能原因及建议:")
+    if nan_params or inf_params:
+        lines.append("  - 参数已损坏，建议降低学习率或检查初始化")
+    if grad_nan or grad_inf:
+        lines.append("  - 梯度爆炸，建议降低 gradient_clip 值或学习率")
+    if large_params:
+        lines.append("  - 参数值过大，可能导致数值不稳定")
+    if logits is not None and not (torch.isnan(logits).any() or torch.isinf(logits).any()):
+        if logits.abs().max() > 100:
+            lines.append("  - Logits 过大，建议检查分类头或添加 LayerNorm")
+    
+    lines.append("=" * 70)
+    
+    report = "\n".join(lines)
+    
+    # 写入日志文件（如果指定）
+    if log_file:
+        try:
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(report + "\n\n")
+        except Exception as e:
+            print(f"[WARN] 无法写入 NaN 诊断日志: {e}")
+    
+    return report
 
 
 # ============================================================================
@@ -1002,8 +1333,16 @@ def train_epoch(
     mixup_fn: Optional[MixupCutmix] = None,
     num_classes: int = 10,
     profile: bool = False,
+    exp_dir: Optional[Path] = None,
+    loss_fn: Optional[nn.Module] = None,
+    class_weights: Optional[torch.Tensor] = None,
+    epoch: int = 1,
 ) -> Tuple[float, float, Dict[str, float]]:
-    """训练一个 epoch"""
+    """训练一个 epoch
+    
+    Args:
+        exp_dir: 实验目录，用于保存 NaN/Inf 诊断日志
+    """
     model.train()
     # P11-8: 使用张量累加，延迟 .item() 调用到 epoch 结束
     total_loss = torch.tensor(0.0, device=device)
@@ -1068,16 +1407,41 @@ def train_epoch(
                 nan_count += 1
                 if nan_count <= 3:
                     print(f"\n[WARN] Logits 包含 NaN/Inf (batch {i}), 跳过此 batch")
+                    # 详细诊断
+                    report = diagnose_nan_inf(
+                        batch_idx=i,
+                        imgs=imgs,
+                        labels=labels,
+                        model=model,
+                        logits=outs,
+                        log_file=exp_dir / "nan_inf_diagnose.log" if exp_dir else None,
+                    )
+                    print(report)
                 if nan_count > 10:
                     raise RuntimeError(f"连续出现 {nan_count} 次 NaN，训练终止")
                 optimizer.zero_grad(set_to_none=True)
                 continue
             
             if use_mixup and mixed_labels is not None:
-                # 使用混合标签的交叉熵
+                # 使用混合标签的交叉熵 (Mixup 模式下不使用 Focal Loss)
                 ce_loss = mixup_criterion(outs, mixed_labels) / config.accum_steps
             else:
-                ce_loss = F.cross_entropy(outs, labels, label_smoothing=config.label_smoothing) / config.accum_steps
+                # P14: 使用自定义损失函数 (Focal Loss / Class-Balanced Loss)
+                if loss_fn is not None:
+                    ce_loss = loss_fn(outs, labels) / config.accum_steps
+                elif class_weights is not None:
+                    # 使用类别平衡权重
+                    ce_loss = F.cross_entropy(
+                        outs, labels, 
+                        weight=class_weights,
+                        label_smoothing=config.label_smoothing
+                    ) / config.accum_steps
+                else:
+                    # 默认交叉熵
+                    ce_loss = F.cross_entropy(
+                        outs, labels, 
+                        label_smoothing=config.label_smoothing
+                    ) / config.accum_steps
             
             # P1-5 修复: 收集熵正则化损失
             # 熵损失鼓励尺度分布多样性，防止 CrossScaleAttention 崩塌到单一尺度
@@ -1145,11 +1509,25 @@ def train_epoch(
             if multi_layer_loss is not None:
                 loss = loss + 0.1 * multi_layer_loss / config.accum_steps  # λ_multi = 0.1
         
-        # 检查 loss 是否为 NaN
+        # 检查 loss 是否为 NaN/Inf，并输出详细诊断信息
         if torch.isnan(loss) or torch.isinf(loss):
             nan_count += 1
             if nan_count <= 3:
                 print(f"\n[WARN] Loss 为 NaN/Inf (batch {i}), 跳过此 batch")
+                # 详细诊断
+                report = diagnose_nan_inf(
+                    batch_idx=i,
+                    imgs=imgs,
+                    labels=labels,
+                    model=model,
+                    logits=outs,
+                    loss=loss,
+                    ce_loss=ce_loss * config.accum_steps,  # 还原真实值
+                    entropy_loss=entropy_loss,
+                    splitter_loss=splitter_loss,
+                    log_file=exp_dir / "nan_inf_diagnose.log" if exp_dir else None,
+                )
+                print(report)
             if nan_count > 10:
                 raise RuntimeError(f"连续出现 {nan_count} 次 NaN loss，训练终止")
             optimizer.zero_grad(set_to_none=True)
@@ -1344,6 +1722,104 @@ def evaluate(
         }
     
     return total_loss / max(len(loader) - nan_batches, 1), 100.0 * correct / total, per_class_stats
+
+
+def analyze_class_balance(
+    per_class_stats: Optional[Dict[str, Any]],
+    epoch: int,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """分析类别准确率分布，检测长尾效应。
+    
+    P14: 长尾效应检测和预警
+    
+    检测指标:
+    1. 零准确率类别数量
+    2. 准确率标准差
+    3. 最差/最佳类别差距
+    4. 低于阈值的类别比例
+    
+    Args:
+        per_class_stats: evaluate() 返回的 per-class 统计
+        epoch: 当前 epoch
+        verbose: 是否打印详细信息
+        
+    Returns:
+        分析报告字典
+    """
+    if per_class_stats is None:
+        return {'status': 'no_stats'}
+    
+    class_acc = np.array(per_class_stats['class_accuracy'])
+    class_total = np.array(per_class_stats['class_total'])
+    
+    # 只考虑有样本的类别
+    valid_mask = class_total > 0
+    valid_acc = class_acc[valid_mask]
+    
+    if len(valid_acc) == 0:
+        return {'status': 'no_valid_classes'}
+    
+    # 计算统计指标
+    zero_acc_count = np.sum(valid_acc == 0)
+    low_acc_count = np.sum(valid_acc < 20)  # 低于 20% 的类别
+    acc_std = np.std(valid_acc)
+    acc_min = np.min(valid_acc)
+    acc_max = np.max(valid_acc)
+    acc_range = acc_max - acc_min
+    
+    # 长尾效应评分 (0-100, 越高越严重)
+    # 考虑: 零准确率比例、低准确率比例、方差
+    zero_ratio = zero_acc_count / len(valid_acc)
+    low_ratio = low_acc_count / len(valid_acc)
+    normalized_std = acc_std / 50  # 假设 50% 是最大期望标准差
+    
+    imbalance_score = (
+        zero_ratio * 40 +  # 零准确率权重最高
+        low_ratio * 30 +   # 低准确率其次
+        min(normalized_std, 1.0) * 30  # 方差占剩余
+    )
+    
+    report = {
+        'status': 'analyzed',
+        'zero_acc_count': int(zero_acc_count),
+        'zero_acc_ratio': float(zero_ratio),
+        'low_acc_count': int(low_acc_count),
+        'low_acc_ratio': float(low_ratio),
+        'accuracy_std': float(acc_std),
+        'accuracy_min': float(acc_min),
+        'accuracy_max': float(acc_max),
+        'accuracy_range': float(acc_range),
+        'imbalance_score': float(imbalance_score),
+        'worst_classes': per_class_stats['worst_classes'][:5],
+        'best_classes': per_class_stats['best_classes'][:5],
+    }
+    
+    # 预警输出
+    if verbose:
+        severity = 'INFO'
+        if imbalance_score > 30:
+            severity = 'WARN'
+        if imbalance_score > 50:
+            severity = 'CRITICAL'
+        
+        if imbalance_score > 20 or epoch % 10 == 0:
+            print(f"\n  [{severity}] Class Balance Analysis (Epoch {epoch}):")
+            print(f"    - Zero accuracy classes: {zero_acc_count}/{len(valid_acc)} ({zero_ratio*100:.1f}%)")
+            print(f"    - Low accuracy (<20%): {low_acc_count}/{len(valid_acc)} ({low_ratio*100:.1f}%)")
+            print(f"    - Accuracy range: [{acc_min:.1f}%, {acc_max:.1f}%] (std={acc_std:.1f})")
+            print(f"    - Imbalance score: {imbalance_score:.1f}/100 ({severity})")
+            
+            if zero_acc_count > 0 and epoch > 5:
+                worst_5 = per_class_stats['worst_classes'][:5]
+                worst_acc = [class_acc[c] for c in worst_5]
+                print(f"    - Worst classes (ID:acc): {list(zip(worst_5, [f'{a:.1f}%' for a in worst_acc]))}")
+            
+            # 建议
+            if imbalance_score > 30 and epoch > 10:
+                print(f"    [建议] 考虑启用 --use-focal-loss 和/或 --use-class-balanced")
+    
+    return report
 
 
 @torch.no_grad()
@@ -1590,6 +2066,18 @@ def main():
     parser.add_argument("--mixup-prob", type=float, default=0.5,
                        help="Probability of applying Mixup/CutMix (default: 0.5)")
     
+    # P14: 长尾效应优化
+    parser.add_argument("--use-focal-loss", action="store_true",
+                       help="Use Focal Loss to handle class imbalance")
+    parser.add_argument("--focal-gamma", type=float, default=2.0,
+                       help="Focal Loss gamma parameter (default: 2.0)")
+    parser.add_argument("--use-class-balanced", action="store_true",
+                       help="Use class-balanced loss weights")
+    parser.add_argument("--class-balance-beta", type=float, default=0.9999,
+                       help="Class balance beta parameter (default: 0.9999)")
+    parser.add_argument("--progressive-aug", action="store_true",
+                       help="Use progressive data augmentation (weaker at start)")
+    
     # 系统
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto")
@@ -1690,6 +2178,12 @@ def main():
         mixup_alpha=args.mixup_alpha,
         cutmix_alpha=args.cutmix_alpha,
         mixup_prob=args.mixup_prob,
+        # P14: 长尾效应优化
+        use_focal_loss=args.use_focal_loss,
+        focal_gamma=args.focal_gamma,
+        use_class_balanced=args.use_class_balanced,
+        class_balance_beta=args.class_balance_beta,
+        progressive_aug=args.progressive_aug,
         seed=args.seed,
         device=str(device),
     )
@@ -1854,6 +2348,54 @@ def main():
             label_smoothing=config.label_smoothing,
         )
     
+    # P14: 创建损失函数 (Focal Loss / Class-Balanced Loss)
+    loss_fn = None
+    class_weights = None
+    
+    if config.use_focal_loss or config.use_class_balanced:
+        # 收集训练集标签用于计算类别权重
+        print("[INFO] 收集训练集标签用于计算类别权重...")
+        all_labels = []
+        for _, labels in tqdm(train_loader, desc="Collecting labels", leave=False):
+            if isinstance(labels, torch.Tensor):
+                all_labels.extend(labels.tolist())
+            else:
+                all_labels.extend(labels)
+        
+        if config.use_class_balanced:
+            # 计算类别平衡权重
+            class_weights = compute_class_weights(
+                labels=all_labels,
+                num_classes=spec.num_classes,
+                beta=config.class_balance_beta,
+            ).to(device)
+            
+            # 打印类别权重统计
+            print(f"[INFO] Class-Balanced Weights (P14):")
+            print(f"  - Beta: {config.class_balance_beta}")
+            print(f"  - Weight range: [{class_weights.min():.4f}, {class_weights.max():.4f}]")
+            print(f"  - Weight mean: {class_weights.mean():.4f}")
+            
+            # 检测极端不平衡
+            max_ratio = class_weights.max() / class_weights.min()
+            if max_ratio > 10:
+                print(f"  - [WARN] 类别不平衡比例较大: {max_ratio:.2f}x")
+        
+        if config.use_focal_loss:
+            # 创建 Focal Loss
+            loss_fn = FocalLoss(
+                gamma=config.focal_gamma,
+                alpha=class_weights,  # 可选，如果同时启用 class_balanced
+                label_smoothing=config.label_smoothing,
+                reduction='mean',
+            )
+            print(f"[INFO] Focal Loss (P14):")
+            print(f"  - Gamma: {config.focal_gamma}")
+            print(f"  - Alpha (class weights): {'enabled' if class_weights is not None else 'disabled'}")
+            
+            # Focal Loss 已经使用 class_weights，避免重复
+            class_weights = None
+    
     # 训练
     print("="*70)
     print("TRAINING START")
@@ -1907,7 +2449,21 @@ def main():
     print(f"[INFO] Early stopping: patience={config.patience}, min_delta={config.min_delta}")
     print(f"[INFO] Regularization: dropout={config.dropout}, weight_decay={config.weight_decay}")
     print(f"[INFO] Label smoothing: {config.label_smoothing}")
-    print(f"[INFO] Mixup/CutMix: alpha={config.mixup_alpha}/{config.cutmix_alpha}, prob={config.mixup_prob}\n")
+    print(f"[INFO] Mixup/CutMix: alpha={config.mixup_alpha}/{config.cutmix_alpha}, prob={config.mixup_prob}")
+    if use_mixup and config.warmup_epochs > 0:
+        print(f"[INFO] Mixup/CutMix 将在 warmup 阶段 (epoch 1-{config.warmup_epochs}) 禁用")
+    
+    # P14: 长尾效应优化信息
+    if config.use_focal_loss or config.use_class_balanced or config.progressive_aug:
+        print(f"[INFO] P14 长尾效应优化:")
+        if config.use_focal_loss:
+            print(f"  - Focal Loss: gamma={config.focal_gamma}")
+        if config.use_class_balanced:
+            print(f"  - Class-Balanced Loss: beta={config.class_balance_beta}")
+        if config.progressive_aug:
+            print(f"  - Progressive Augmentation: 渐进式增强强度")
+    
+    print()
     
     for epoch in range(1, config.epochs + 1):
         start = time.time()
@@ -1930,17 +2486,58 @@ def main():
                 current_temp = config.splitter_temp_start * (ratio ** progress)
             model.tokenizer.set_split_temperature(current_temp)
         
+        # Warmup 阶段禁用 Mixup/CutMix
+        # 原因: warmup 阶段学习率较低，模型需要学习基本特征
+        # Mixup/CutMix 会使学习目标更复杂，可能干扰初始阶段的学习
+        # 参考: DeiT, Swin Transformer 等论文的训练策略
+        current_mixup_fn = None if epoch <= config.warmup_epochs else mixup_fn
+        
+        # P14: 渐进式数据增强
+        # 在 warmup 结束后逐渐增加 Mixup/CutMix 强度
+        if config.progressive_aug and current_mixup_fn is not None:
+            # 计算增强进度 (0 -> 1 over first half of post-warmup epochs)
+            post_warmup_epoch = epoch - config.warmup_epochs
+            ramp_epochs = (config.epochs - config.warmup_epochs) // 2  # 在一半 epoch 内达到满强度
+            aug_progress = min(1.0, post_warmup_epoch / max(1, ramp_epochs))
+            
+            # 创建当前 epoch 的 Mixup 增强器 (alpha 渐增)
+            current_mixup_alpha = config.mixup_alpha * aug_progress
+            current_cutmix_alpha = config.cutmix_alpha * aug_progress
+            
+            if current_mixup_alpha > 0.01 or current_cutmix_alpha > 0.01:
+                current_mixup_fn = MixupCutmix(
+                    mixup_alpha=current_mixup_alpha,
+                    cutmix_alpha=current_cutmix_alpha,
+                    prob=config.mixup_prob,
+                    num_classes=spec.num_classes,
+                    label_smoothing=config.label_smoothing,
+                )
+                if post_warmup_epoch <= 5:  # 只在前几个 epoch 打印
+                    print(f"[INFO] Progressive Aug: mixup_alpha={current_mixup_alpha:.2f}, cutmix_alpha={current_cutmix_alpha:.2f}")
+            else:
+                current_mixup_fn = None
+        
+        if epoch == config.warmup_epochs + 1 and mixup_fn is not None:
+            print(f"[INFO] Epoch {epoch}: 启用 Mixup/CutMix 增强")
+        
         train_loss, train_acc, perf_stats = train_epoch(
             model, train_loader, optimizer, device, scaler, config,
-            mixup_fn=mixup_fn,
+            mixup_fn=current_mixup_fn,
             num_classes=spec.num_classes,
-            profile=(epoch == 1)
+            profile=(epoch == 1),
+            exp_dir=exp_dir,
+            loss_fn=loss_fn,
+            class_weights=class_weights,
+            epoch=epoch,
         )
         
-        val_loss, val_acc, _ = evaluate(
+        val_loss, val_acc, per_class_stats = evaluate(
             model, val_loader, device, config.use_amp, spec.num_classes,
             channels_last=config.channels_last
         )
+        
+        # P14: 类别平衡分析
+        class_balance_report = analyze_class_balance(per_class_stats, epoch, verbose=True)
         
         scheduler.step()
         
@@ -1974,6 +2571,13 @@ def main():
             history_entry['training_stats'] = training_stats
         if scale_distribution is not None:
             history_entry['scale_distribution'] = scale_distribution
+        # P14: 类别平衡分析
+        if class_balance_report.get('status') == 'analyzed':
+            history_entry['class_balance'] = {
+                'imbalance_score': class_balance_report['imbalance_score'],
+                'zero_acc_count': class_balance_report['zero_acc_count'],
+                'accuracy_std': class_balance_report['accuracy_std'],
+            }
         history.append(history_entry)
         
         print(f"\nEpoch {epoch}/{config.epochs}:")
