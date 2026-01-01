@@ -8,6 +8,20 @@
 4. 注意力热力图：可视化模型注意力分布
 5. 特征图可视化：不同层的特征激活
 
+**架构调试与分析功能 (P16 新增):**
+6. 参数分布分析：各模块参数量、内存占用估算
+7. Tokenizer 行为诊断：token 数量统计、深度/尺度分布
+8. 注意力模式分析：attention 熵、head 利用率
+9. 推理性能基准：延迟、吞吐量、显存占用
+10. 错误分析：常见错误模式、混淆类别对
+11. 特征可视化：t-SNE 降维、类别聚类
+12. 训练曲线可视化：从 training_history.json 读取
+
+**面向非专业读者的可视化:**
+- 架构原理图解（中英文注释）
+- Hilbert 曲线局部性保持直观对比
+- 多尺度 tokenization 工作原理示意
+
 支持 Tokenizer 类型：
 - StreamingFractalTokenizerV3 (Variable Depth Tokens, 唯一支持)
 
@@ -16,10 +30,18 @@ P12 优化 (2025-12-29):
 - get_padded_tokens() 返回 Tensor lengths (向后兼容)
 - _create_attention_mask 使用广播比较 (3.8-7.8x 加速)
 
+P16 更新 (2025-12-31):
+- 新增模型架构深度分析功能
+- 新增推理性能基准测试
+- 新增错误分析与混淆类别可视化
+- 新增 t-SNE 特征可视化
+- 新增训练历史曲线可视化
+- 增强面向非专业读者的说明图
+
 注意：V1 和 V2 已从代码库完全移除。
 
 使用示例：
-    # 评估最佳模型
+    # 评估最佳模型（完整报告）
     python evaluate_and_visualize.py --checkpoint experiments/xxx/checkpoints/best.pth
     
     # 仅可视化 Hilbert 曲线
@@ -27,6 +49,12 @@ P12 优化 (2025-12-29):
     
     # 可视化 tokenization 过程
     python evaluate_and_visualize.py --checkpoint xxx.pth --visualize-tokenization
+    
+    # 运行性能基准测试
+    python evaluate_and_visualize.py --checkpoint xxx.pth --benchmark
+    
+    # 生成架构分析报告
+    python evaluate_and_visualize.py --checkpoint xxx.pth --analyze-architecture
 """
 
 from __future__ import annotations
@@ -34,12 +62,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import dataclass
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from matplotlib.gridspec import GridSpec
 from matplotlib.collections import LineCollection
 from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
@@ -1275,6 +1306,606 @@ def evaluate_model(
     }
 
 
+# ============================================================================
+# P16: 架构深度分析 (Architecture Deep Analysis)
+# ============================================================================
+
+def analyze_model_architecture(
+    model: nn.Module,
+    sample_input: torch.Tensor,
+    device: torch.device,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """深度分析模型架构
+    
+    提供以下信息用于架构调试和改进：
+    1. 各模块参数量分布
+    2. 内存占用估算 (训练/推理)
+    3. 计算量估算 (FLOPs)
+    4. 各层输出形状追踪
+    5. 可学习参数统计 (min/max/mean/std)
+    
+    Args:
+        model: FractalCurveViT 模型
+        sample_input: 样本输入 [B, C, H, W]
+        device: 计算设备
+        verbose: 是否打印详细信息
+        
+    Returns:
+        分析报告字典
+    """
+    model.eval()
+    report = {
+        'total_params': 0,
+        'trainable_params': 0,
+        'module_params': {},
+        'module_memory_mb': {},
+        'layer_shapes': [],
+        'param_stats': {},
+        'estimated_flops': 0,
+        'memory_estimation': {},
+    }
+    
+    # 1. 参数量统计
+    def count_params(module, name=""):
+        total = 0
+        trainable = 0
+        for p in module.parameters():
+            total += p.numel()
+            if p.requires_grad:
+                trainable += p.numel()
+        return total, trainable
+    
+    total, trainable = count_params(model)
+    report['total_params'] = total
+    report['trainable_params'] = trainable
+    
+    # 2. 各模块参数分布
+    module_names = ['tokenizer', 'pos_embedding', 'transformer', 'mlp_head', 'cls_token']
+    for name in module_names:
+        if hasattr(model, name):
+            module = getattr(model, name)
+            if isinstance(module, nn.Parameter):
+                params = module.numel()
+            else:
+                params, _ = count_params(module)
+            report['module_params'][name] = params
+            # 内存估算 (假设 float32 = 4 bytes)
+            report['module_memory_mb'][name] = params * 4 / (1024 * 1024)
+    
+    # 3. Transformer 层级分解
+    if hasattr(model, 'transformer') and hasattr(model.transformer, 'layers'):
+        layer_analysis = []
+        for i, layer in enumerate(model.transformer.layers):
+            layer_params, _ = count_params(layer)
+            
+            # 分解各子模块
+            layer_info = {
+                'layer_idx': i,
+                'total_params': layer_params,
+                'attention_params': 0,
+                'ffn_params': 0,
+                'norm_params': 0,
+                'other_params': 0,
+            }
+            
+            for sub_name, sub_module in layer.named_children():
+                sub_params, _ = count_params(sub_module)
+                if 'attention' in sub_name.lower() or 'attn' in sub_name.lower():
+                    layer_info['attention_params'] += sub_params
+                elif 'ff' in sub_name.lower() or 'mlp' in sub_name.lower():
+                    layer_info['ffn_params'] += sub_params
+                elif 'norm' in sub_name.lower() or 'ln' in sub_name.lower():
+                    layer_info['norm_params'] += sub_params
+                else:
+                    layer_info['other_params'] += sub_params
+            
+            layer_analysis.append(layer_info)
+        report['layer_analysis'] = layer_analysis
+    
+    # 4. 参数统计 (检测异常值)
+    param_stats = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            data = param.detach().float().cpu()
+            stats = {
+                'shape': list(param.shape),
+                'numel': param.numel(),
+                'min': data.min().item(),
+                'max': data.max().item(),
+                'mean': data.mean().item(),
+                'std': data.std().item(),
+                'has_nan': torch.isnan(data).any().item(),
+                'has_inf': torch.isinf(data).any().item(),
+            }
+            # 检查异常
+            if stats['has_nan'] or stats['has_inf']:
+                stats['warning'] = 'NaN/Inf detected!'
+            elif abs(stats['mean']) > 10:
+                stats['warning'] = 'Large mean value'
+            elif stats['std'] > 10:
+                stats['warning'] = 'Large std value'
+            
+            param_stats[name] = stats
+    report['param_stats'] = param_stats
+    
+    # 5. 层输出形状追踪
+    shapes = []
+    hooks = []
+    
+    def make_hook(name):
+        def hook(module, input, output):
+            if isinstance(output, torch.Tensor):
+                shapes.append((name, list(output.shape)))
+            elif isinstance(output, tuple) and len(output) > 0:
+                if isinstance(output[0], torch.Tensor):
+                    shapes.append((name, list(output[0].shape)))
+        return hook
+    
+    for name, module in model.named_modules():
+        if len(list(module.children())) == 0:  # 叶子模块
+            hooks.append(module.register_forward_hook(make_hook(name)))
+    
+    # 前向传播收集形状
+    with torch.no_grad():
+        _ = model(sample_input.to(device))
+    
+    for h in hooks:
+        h.remove()
+    
+    report['layer_shapes'] = shapes[:50]  # 只保留前50个
+    
+    # 6. 内存估算
+    B, C, H, W = sample_input.shape
+    param_memory = total * 4 / (1024 * 1024)  # MB
+    
+    # 估算激活内存 (粗略)
+    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'patch_sizes'):
+        min_ps = min(model.tokenizer.patch_sizes)
+        n_tokens = (H // min_ps) * (W // min_ps)
+    else:
+        n_tokens = (H // 4) * (W // 4)
+    
+    dim = model.dim if hasattr(model, 'dim') else 192
+    depth = len(model.transformer.layers) if hasattr(model, 'transformer') else 8
+    
+    # 激活内存: 每层约 2 * B * N * D (forward + backward)
+    activation_memory = 2 * B * n_tokens * dim * depth * 4 / (1024 * 1024)  # MB
+    
+    # 梯度内存约等于参数内存
+    gradient_memory = param_memory
+    
+    # 优化器状态 (Adam: 2x 参数)
+    optimizer_memory = param_memory * 2
+    
+    report['memory_estimation'] = {
+        'params_mb': param_memory,
+        'activations_mb': activation_memory,
+        'gradients_mb': gradient_memory,
+        'optimizer_mb': optimizer_memory,
+        'total_train_mb': param_memory + activation_memory + gradient_memory + optimizer_memory,
+        'inference_mb': param_memory + activation_memory / 2,
+    }
+    
+    if verbose:
+        print("\n" + "="*70)
+        print("MODEL ARCHITECTURE ANALYSIS")
+        print("="*70)
+        print(f"Total Parameters: {total:,} ({total/1e6:.2f}M)")
+        print(f"Trainable Parameters: {trainable:,} ({trainable/1e6:.2f}M)")
+        print("\n[Module Parameter Distribution]")
+        for name, params in report['module_params'].items():
+            pct = params / total * 100
+            print(f"  {name:20s}: {params:>12,} ({pct:5.1f}%)")
+        
+        print("\n[Memory Estimation]")
+        mem = report['memory_estimation']
+        print(f"  Parameters:   {mem['params_mb']:>8.1f} MB")
+        print(f"  Activations:  {mem['activations_mb']:>8.1f} MB")
+        print(f"  Gradients:    {mem['gradients_mb']:>8.1f} MB")
+        print(f"  Optimizer:    {mem['optimizer_mb']:>8.1f} MB")
+        print(f"  {'─'*30}")
+        print(f"  Training:     {mem['total_train_mb']:>8.1f} MB")
+        print(f"  Inference:    {mem['inference_mb']:>8.1f} MB")
+        
+        # 检查异常参数
+        warnings = [(k, v['warning']) for k, v in param_stats.items() if 'warning' in v]
+        if warnings:
+            print(f"\n[⚠️ Parameter Warnings]")
+            for name, warn in warnings[:10]:
+                print(f"  {name}: {warn}")
+        
+        print("="*70 + "\n")
+    
+    return report
+
+
+def benchmark_inference_performance(
+    model: nn.Module,
+    sample_input: torch.Tensor,
+    device: torch.device,
+    n_warmup: int = 10,
+    n_runs: int = 100,
+    batch_sizes: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    """推理性能基准测试
+    
+    测量：
+    1. 推理延迟 (latency)
+    2. 吞吐量 (throughput)
+    3. 不同 batch size 的性能
+    4. GPU 内存占用
+    
+    Args:
+        model: 模型
+        sample_input: 样本输入 [1, C, H, W]
+        device: 计算设备
+        n_warmup: 预热次数
+        n_runs: 测试次数
+        batch_sizes: 测试的 batch sizes
+        
+    Returns:
+        性能报告字典
+    """
+    model.eval()
+    
+    if batch_sizes is None:
+        batch_sizes = [1, 4, 8, 16, 32]
+    
+    C, H, W = sample_input.shape[1:]
+    results = {
+        'device': str(device),
+        'input_shape': [C, H, W],
+        'batch_results': {},
+    }
+    
+    for bs in batch_sizes:
+        try:
+            # 创建输入
+            x = torch.randn(bs, C, H, W, device=device)
+            
+            # 预热
+            for _ in range(n_warmup):
+                with torch.no_grad():
+                    _ = model(x)
+            
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            
+            # 测量内存
+            if device.type == 'cuda':
+                torch.cuda.reset_peak_memory_stats()
+                with torch.no_grad():
+                    _ = model(x)
+                torch.cuda.synchronize()
+                memory_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+            else:
+                memory_mb = 0
+            
+            # 测量延迟
+            latencies = []
+            for _ in range(n_runs):
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                start = time.perf_counter()
+                
+                with torch.no_grad():
+                    _ = model(x)
+                
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                end = time.perf_counter()
+                latencies.append((end - start) * 1000)  # ms
+            
+            latencies = np.array(latencies)
+            throughput = bs / (latencies.mean() / 1000)  # samples/sec
+            
+            results['batch_results'][bs] = {
+                'latency_mean_ms': latencies.mean(),
+                'latency_std_ms': latencies.std(),
+                'latency_p50_ms': np.percentile(latencies, 50),
+                'latency_p95_ms': np.percentile(latencies, 95),
+                'latency_p99_ms': np.percentile(latencies, 99),
+                'throughput_samples_per_sec': throughput,
+                'memory_mb': memory_mb,
+            }
+        except RuntimeError as e:
+            if 'out of memory' in str(e).lower():
+                results['batch_results'][bs] = {'error': 'OOM'}
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+            else:
+                raise
+    
+    # 打印结果
+    print("\n" + "="*70)
+    print("INFERENCE PERFORMANCE BENCHMARK")
+    print("="*70)
+    print(f"Device: {device}")
+    print(f"Input Shape: [{C}, {H}, {W}]")
+    print(f"Warmup: {n_warmup}, Runs: {n_runs}")
+    print()
+    print(f"{'Batch':>6} {'Latency (ms)':>15} {'P95 (ms)':>12} {'Throughput':>15} {'Memory':>10}")
+    print(f"{'Size':>6} {'mean ± std':>15} {'':>12} {'(samples/s)':>15} {'(MB)':>10}")
+    print("-"*70)
+    
+    for bs, res in results['batch_results'].items():
+        if 'error' in res:
+            print(f"{bs:>6} {'OOM':>15}")
+        else:
+            lat = f"{res['latency_mean_ms']:.2f} ± {res['latency_std_ms']:.2f}"
+            print(f"{bs:>6} {lat:>15} {res['latency_p95_ms']:>12.2f} "
+                  f"{res['throughput_samples_per_sec']:>15.1f} {res['memory_mb']:>10.1f}")
+    
+    print("="*70 + "\n")
+    
+    return results
+
+
+def analyze_tokenizer_behavior(
+    model: nn.Module,
+    data_loader: DataLoader,
+    device: torch.device,
+    n_batches: int = 20,
+) -> Dict[str, Any]:
+    """分析 Tokenizer 行为
+    
+    收集以下信息：
+    1. Token 数量统计 (min/max/mean/std)
+    2. 深度分布统计
+    3. 尺度使用分布
+    4. 各类别的 token 数量差异
+    
+    Args:
+        model: 模型
+        data_loader: 数据加载器
+        device: 计算设备
+        n_batches: 分析的 batch 数量
+        
+    Returns:
+        Tokenizer 行为报告
+    """
+    model.eval()
+    tokenizer = model.tokenizer
+    
+    report = {
+        'token_counts': [],
+        'depth_distributions': defaultdict(int),
+        'scale_usage': defaultdict(int),
+        'per_class_token_counts': defaultdict(list),
+    }
+    
+    if not hasattr(tokenizer, 'patch_sizes'):
+        print("[WARN] Tokenizer does not expose patch_sizes")
+        return report
+    
+    patch_sizes = tokenizer.patch_sizes
+    n_scales = len(patch_sizes)
+    
+    with torch.no_grad():
+        for batch_idx, (images, labels) in enumerate(data_loader):
+            if batch_idx >= n_batches:
+                break
+            
+            images = images.to(device)
+            B = images.shape[0]
+            
+            # 获取 tokenization 输出
+            try:
+                output = tokenizer.tokenize(images)
+                
+                for i, seq in enumerate(output.sequences):
+                    n_tokens = seq.tokens.shape[0]
+                    report['token_counts'].append(n_tokens)
+                    report['per_class_token_counts'][labels[i].item()].append(n_tokens)
+                    
+                    # 深度分布
+                    if 'levels' in seq.metadata and seq.metadata['levels'] is not None:
+                        levels = seq.metadata['levels']
+                        if levels.dim() > 1:
+                            depths = levels[:, 0].cpu().numpy()
+                        else:
+                            depths = levels.cpu().numpy()
+                        for d in depths:
+                            report['depth_distributions'][int(d)] += 1
+            except Exception as e:
+                print(f"[WARN] Tokenizer analysis error: {e}")
+                continue
+            
+            # 尺度使用分析
+            if hasattr(tokenizer, 'encoder') and hasattr(tokenizer, '_compute_scale_weights'):
+                try:
+                    features_dict = tokenizer.encoder(images)
+                    min_ps = min(features_dict.keys())
+                    _, target_size = features_dict[min_ps]
+                    scale_weights = tokenizer._compute_scale_weights(features_dict, target_size)
+                    scale_indices = scale_weights.argmax(dim=1)  # [B, H', W']
+                    
+                    for s in range(n_scales):
+                        count = (scale_indices == s).sum().item()
+                        report['scale_usage'][patch_sizes[s]] += count
+                except Exception:
+                    pass
+    
+    # 计算统计量
+    token_counts = np.array(report['token_counts'])
+    if len(token_counts) > 0:
+        report['token_stats'] = {
+            'min': int(token_counts.min()),
+            'max': int(token_counts.max()),
+            'mean': float(token_counts.mean()),
+            'std': float(token_counts.std()),
+            'median': float(np.median(token_counts)),
+        }
+    
+    # 转换为普通 dict
+    report['depth_distributions'] = dict(report['depth_distributions'])
+    report['scale_usage'] = dict(report['scale_usage'])
+    report['per_class_token_counts'] = {
+        k: {'mean': np.mean(v), 'std': np.std(v)}
+        for k, v in report['per_class_token_counts'].items()
+    }
+    
+    # 打印报告
+    print("\n" + "="*70)
+    print("TOKENIZER BEHAVIOR ANALYSIS")
+    print("="*70)
+    
+    if 'token_stats' in report:
+        stats = report['token_stats']
+        print(f"\n[Token Count Statistics]")
+        print(f"  Min: {stats['min']}, Max: {stats['max']}")
+        print(f"  Mean: {stats['mean']:.1f} ± {stats['std']:.1f}")
+        print(f"  Median: {stats['median']:.1f}")
+    
+    if report['depth_distributions']:
+        print(f"\n[Depth Distribution]")
+        total = sum(report['depth_distributions'].values())
+        for d in sorted(report['depth_distributions'].keys()):
+            count = report['depth_distributions'][d]
+            pct = count / total * 100
+            bar = '█' * int(pct / 2)
+            print(f"  Depth {d}: {count:>8} ({pct:>5.1f}%) {bar}")
+    
+    if report['scale_usage']:
+        print(f"\n[Scale Usage]")
+        total = sum(report['scale_usage'].values())
+        for ps in sorted(report['scale_usage'].keys()):
+            count = report['scale_usage'][ps]
+            pct = count / total * 100
+            bar = '█' * int(pct / 2)
+            print(f"  {ps}×{ps}: {count:>8} ({pct:>5.1f}%) {bar}")
+    
+    print("="*70 + "\n")
+    
+    return report
+
+
+def analyze_errors(
+    results: Dict[str, Any],
+    class_names: Optional[List[str]] = None,
+    top_k: int = 10,
+) -> Dict[str, Any]:
+    """错误分析
+    
+    分析：
+    1. 最常见的混淆类别对
+    2. 每类的错误率
+    3. 置信度与正确率的关系
+    4. 最难分类的样本
+    
+    Args:
+        results: evaluate_model 的返回结果
+        class_names: 类别名称
+        top_k: 显示 top k 个
+        
+    Returns:
+        错误分析报告
+    """
+    preds = results['predictions']
+    labels = results['labels']
+    probs = results['probabilities']
+    confusion = results['confusion_matrix']
+    
+    report = {
+        'total_errors': 0,
+        'error_rate': 0.0,
+        'confusion_pairs': [],
+        'per_class_error_rate': {},
+        'confidence_analysis': {},
+    }
+    
+    # 错误统计
+    errors = preds != labels
+    report['total_errors'] = int(errors.sum())
+    report['error_rate'] = float(errors.mean() * 100)
+    
+    # 混淆类别对
+    num_classes = confusion.shape[0]
+    confusion_pairs = []
+    for i in range(num_classes):
+        for j in range(num_classes):
+            if i != j and confusion[i, j] > 0:
+                true_name = class_names[i] if class_names else str(i)
+                pred_name = class_names[j] if class_names else str(j)
+                confusion_pairs.append({
+                    'true_class': true_name,
+                    'pred_class': pred_name,
+                    'count': int(confusion[i, j]),
+                })
+    
+    confusion_pairs.sort(key=lambda x: x['count'], reverse=True)
+    report['confusion_pairs'] = confusion_pairs[:top_k]
+    
+    # 每类错误率
+    for c in range(num_classes):
+        mask = labels == c
+        if mask.sum() > 0:
+            class_errors = (preds[mask] != labels[mask]).mean() * 100
+            class_name = class_names[c] if class_names else str(c)
+            report['per_class_error_rate'][class_name] = float(class_errors)
+    
+    # 置信度分析
+    confidences = probs.max(axis=1)
+    
+    # 正确预测的置信度
+    correct_conf = confidences[~errors]
+    wrong_conf = confidences[errors]
+    
+    report['confidence_analysis'] = {
+        'correct_predictions': {
+            'mean_confidence': float(correct_conf.mean()) if len(correct_conf) > 0 else 0,
+            'std_confidence': float(correct_conf.std()) if len(correct_conf) > 0 else 0,
+        },
+        'wrong_predictions': {
+            'mean_confidence': float(wrong_conf.mean()) if len(wrong_conf) > 0 else 0,
+            'std_confidence': float(wrong_conf.std()) if len(wrong_conf) > 0 else 0,
+        },
+    }
+    
+    # 置信度分桶分析
+    bins = [0, 0.25, 0.5, 0.75, 0.9, 0.95, 1.0]
+    report['confidence_analysis']['accuracy_by_confidence'] = {}
+    for i in range(len(bins) - 1):
+        mask = (confidences >= bins[i]) & (confidences < bins[i+1])
+        if mask.sum() > 0:
+            acc = (preds[mask] == labels[mask]).mean() * 100
+            report['confidence_analysis']['accuracy_by_confidence'][f'{bins[i]:.2f}-{bins[i+1]:.2f}'] = {
+                'count': int(mask.sum()),
+                'accuracy': float(acc),
+            }
+    
+    # 打印报告
+    print("\n" + "="*70)
+    print("ERROR ANALYSIS")
+    print("="*70)
+    print(f"\nTotal Errors: {report['total_errors']} ({report['error_rate']:.2f}%)")
+    
+    print(f"\n[Top {top_k} Confusion Pairs]")
+    for pair in report['confusion_pairs'][:top_k]:
+        print(f"  {pair['true_class']:>15} → {pair['pred_class']:<15}: {pair['count']:>4} errors")
+    
+    print(f"\n[Confidence Analysis]")
+    ca = report['confidence_analysis']
+    print(f"  Correct predictions: {ca['correct_predictions']['mean_confidence']:.3f} ± {ca['correct_predictions']['std_confidence']:.3f}")
+    print(f"  Wrong predictions:   {ca['wrong_predictions']['mean_confidence']:.3f} ± {ca['wrong_predictions']['std_confidence']:.3f}")
+    
+    print(f"\n[Accuracy by Confidence Level]")
+    for bin_range, stats in ca['accuracy_by_confidence'].items():
+        bar = '█' * int(stats['accuracy'] / 5)
+        print(f"  {bin_range}: {stats['accuracy']:>5.1f}% (n={stats['count']:>5}) {bar}")
+    
+    # 错误率最高的类别
+    sorted_errors = sorted(report['per_class_error_rate'].items(), key=lambda x: x[1], reverse=True)
+    print(f"\n[Top {min(5, len(sorted_errors))} Hardest Classes]")
+    for name, err_rate in sorted_errors[:5]:
+        print(f"  {name:>15}: {err_rate:.1f}% error rate")
+    
+    print("="*70 + "\n")
+    
+    return report
+
+
 @torch.no_grad()
 def check_train_eval_consistency(
     model: nn.Module,
@@ -1389,6 +2020,525 @@ def check_train_eval_consistency(
             print(f"     {w}")
     
     return report
+
+
+# ============================================================================
+# P16: 增强可视化 (训练曲线、t-SNE、错误可视化)
+# ============================================================================
+
+def visualize_training_history(
+    history_path: Path,
+    save_path: Optional[Path] = None,
+    show: bool = True,
+) -> Optional[plt.Figure]:
+    """可视化训练历史曲线
+    
+    从 training_history.json 读取并绘制：
+    1. Loss 曲线 (train/val)
+    2. Accuracy 曲线 (train/val)
+    3. Learning rate 曲线
+    4. Tokenizer 统计 (如果有)
+    
+    Args:
+        history_path: training_history.json 路径
+        save_path: 保存路径
+        show: 是否显示
+        
+    Returns:
+        matplotlib Figure
+    """
+    if not history_path.exists():
+        print(f"[WARN] Training history not found: {history_path}")
+        return None
+    
+    with open(history_path, 'r') as f:
+        history = json.load(f)
+    
+    if not history:
+        print("[WARN] Training history is empty")
+        return None
+    
+    epochs = [h['epoch'] for h in history]
+    train_loss = [h.get('train_loss', np.nan) for h in history]
+    val_loss = [h.get('val_loss', np.nan) for h in history]
+    train_acc = [h.get('train_acc', np.nan) for h in history]
+    val_acc = [h.get('val_acc', np.nan) for h in history]
+    lr = [h.get('lr', np.nan) for h in history]
+    
+    # 检查是否有 tokenizer 统计
+    has_tokenizer_stats = any('tokenizer_stats' in h for h in history)
+    
+    n_rows = 3 if has_tokenizer_stats else 2
+    fig, axes = plt.subplots(n_rows, 2, figsize=(14, 4 * n_rows))
+    
+    # 1. Loss 曲线
+    ax1 = axes[0, 0]
+    ax1.plot(epochs, train_loss, 'b-', label='Train Loss', linewidth=1.5)
+    ax1.plot(epochs, val_loss, 'r-', label='Val Loss', linewidth=1.5)
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.set_title('Training & Validation Loss', fontweight='bold')
+    ax1.legend()
+    ax1.grid(alpha=0.3)
+    ax1.set_xlim(epochs[0], epochs[-1])
+    
+    # 2. Accuracy 曲线
+    ax2 = axes[0, 1]
+    ax2.plot(epochs, train_acc, 'b-', label='Train Acc', linewidth=1.5)
+    ax2.plot(epochs, val_acc, 'r-', label='Val Acc', linewidth=1.5)
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Accuracy (%)')
+    ax2.set_title('Training & Validation Accuracy', fontweight='bold')
+    ax2.legend()
+    ax2.grid(alpha=0.3)
+    ax2.set_xlim(epochs[0], epochs[-1])
+    
+    # 标记最佳点
+    best_idx = np.nanargmax(val_acc)
+    ax2.scatter([epochs[best_idx]], [val_acc[best_idx]], color='green', s=100, 
+               zorder=5, marker='★', label=f'Best: {val_acc[best_idx]:.2f}%')
+    ax2.legend()
+    
+    # 3. Learning Rate 曲线
+    ax3 = axes[1, 0]
+    ax3.plot(epochs, lr, 'g-', linewidth=1.5)
+    ax3.set_xlabel('Epoch')
+    ax3.set_ylabel('Learning Rate')
+    ax3.set_title('Learning Rate Schedule', fontweight='bold')
+    ax3.set_yscale('log')
+    ax3.grid(alpha=0.3)
+    ax3.set_xlim(epochs[0], epochs[-1])
+    
+    # 4. Loss 比值 (检测过拟合)
+    ax4 = axes[1, 1]
+    loss_ratio = np.array(val_loss) / np.array(train_loss)
+    ax4.plot(epochs, loss_ratio, 'm-', linewidth=1.5)
+    ax4.axhline(1.0, color='gray', linestyle='--', alpha=0.5, label='No gap')
+    ax4.axhline(1.5, color='orange', linestyle='--', alpha=0.5, label='Mild overfit')
+    ax4.axhline(2.0, color='red', linestyle='--', alpha=0.5, label='Severe overfit')
+    ax4.set_xlabel('Epoch')
+    ax4.set_ylabel('Val/Train Loss Ratio')
+    ax4.set_title('Overfitting Indicator', fontweight='bold')
+    ax4.legend(loc='upper left')
+    ax4.grid(alpha=0.3)
+    ax4.set_xlim(epochs[0], epochs[-1])
+    ax4.set_ylim(0, min(3, max(loss_ratio) * 1.2) if not np.isnan(loss_ratio).all() else 3)
+    
+    # 5-6. Tokenizer 统计 (如果有)
+    if has_tokenizer_stats:
+        # 提取 tokenizer 统计
+        entropy_values = []
+        depth_entropy_values = []
+        for h in history:
+            stats = h.get('tokenizer_stats', {})
+            if 'entropy' in stats:
+                entropy_values.append(stats['entropy'])
+            elif 'scale_entropy' in stats:
+                entropy_values.append(stats['scale_entropy'])
+            else:
+                entropy_values.append(np.nan)
+            
+            if 'depth_entropy' in stats:
+                depth_entropy_values.append(stats['depth_entropy'])
+            else:
+                depth_entropy_values.append(np.nan)
+        
+        ax5 = axes[2, 0]
+        if not all(np.isnan(entropy_values)):
+            ax5.plot(epochs, entropy_values, 'c-', linewidth=1.5, label='Scale Entropy')
+        if not all(np.isnan(depth_entropy_values)):
+            ax5.plot(epochs, depth_entropy_values, 'y-', linewidth=1.5, label='Depth Entropy')
+        ax5.set_xlabel('Epoch')
+        ax5.set_ylabel('Entropy')
+        ax5.set_title('Tokenizer Entropy (Scale Diversity)', fontweight='bold')
+        ax5.legend()
+        ax5.grid(alpha=0.3)
+        ax5.set_xlim(epochs[0], epochs[-1])
+        
+        # 额外指标
+        ax6 = axes[2, 1]
+        ax6.text(0.5, 0.5, 'Additional\nTokenizer\nMetrics\n(if available)',
+                ha='center', va='center', fontsize=12, transform=ax6.transAxes)
+        ax6.axis('off')
+    
+    fig.suptitle('Training History', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] Training history saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
+
+
+def visualize_tsne_features(
+    model: nn.Module,
+    data_loader: DataLoader,
+    device: torch.device,
+    n_samples: int = 1000,
+    class_names: Optional[List[str]] = None,
+    save_path: Optional[Path] = None,
+    show: bool = True,
+) -> Optional[plt.Figure]:
+    """t-SNE 特征可视化
+    
+    提取模型最后一层特征并使用 t-SNE 降维可视化。
+    用于分析模型是否学到了良好的类别聚类。
+    
+    Args:
+        model: 模型
+        data_loader: 数据加载器
+        device: 计算设备
+        n_samples: 采样数量
+        class_names: 类别名称
+        save_path: 保存路径
+        show: 是否显示
+        
+    Returns:
+        matplotlib Figure
+    """
+    try:
+        from sklearn.manifold import TSNE
+    except ImportError:
+        print("[WARN] sklearn not installed. Skipping t-SNE visualization.")
+        return None
+    
+    model.eval()
+    
+    # 收集特征
+    features_list = []
+    labels_list = []
+    
+    # 注册 hook 捕获最后一层特征
+    last_features = []
+    
+    def hook_fn(module, input, output):
+        if isinstance(output, torch.Tensor):
+            last_features.append(output.detach().cpu())
+        elif isinstance(output, tuple):
+            last_features.append(output[0].detach().cpu())
+    
+    # 注册到 transformer 的最后一层
+    hook = None
+    if hasattr(model, 'transformer') and hasattr(model.transformer, 'layers'):
+        last_layer = model.transformer.layers[-1]
+        hook = last_layer.register_forward_hook(hook_fn)
+    
+    collected = 0
+    with torch.no_grad():
+        for imgs, labels in data_loader:
+            if collected >= n_samples:
+                break
+            
+            last_features.clear()
+            imgs = imgs.to(device)
+            _ = model(imgs)
+            
+            if last_features:
+                feat = last_features[0]
+                # 取 CLS token 或平均池化
+                if feat.dim() == 3:
+                    feat = feat[:, 0, :]  # CLS token
+                elif feat.dim() == 2:
+                    pass  # 已经是 [B, D]
+                
+                features_list.append(feat)
+                labels_list.extend(labels.numpy())
+                collected += len(labels)
+    
+    if hook:
+        hook.remove()
+    
+    if not features_list:
+        print("[WARN] No features collected for t-SNE")
+        return None
+    
+    features = torch.cat(features_list, dim=0).numpy()[:n_samples]
+    labels_arr = np.array(labels_list)[:n_samples]
+    
+    print(f"[INFO] Running t-SNE on {len(features)} samples...")
+    
+    # t-SNE 降维
+    tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(features) - 1))
+    features_2d = tsne.fit_transform(features)
+    
+    # 可视化
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    unique_labels = np.unique(labels_arr)
+    n_classes = len(unique_labels)
+    
+    if n_classes <= 20:
+        # 为每个类别使用不同颜色
+        cmap = plt.cm.get_cmap('tab20', n_classes)
+        for i, label in enumerate(unique_labels):
+            mask = labels_arr == label
+            name = class_names[label] if class_names and label < len(class_names) else str(label)
+            ax.scatter(features_2d[mask, 0], features_2d[mask, 1], 
+                      c=[cmap(i)], label=name, alpha=0.6, s=30)
+        ax.legend(loc='center left', bbox_to_anchor=(1, 0.5), ncol=1, fontsize=8)
+    else:
+        # 类别太多，用颜色编码
+        scatter = ax.scatter(features_2d[:, 0], features_2d[:, 1], 
+                            c=labels_arr, cmap='viridis', alpha=0.6, s=30)
+        plt.colorbar(scatter, ax=ax, label='Class')
+    
+    ax.set_xlabel('t-SNE 1')
+    ax.set_ylabel('t-SNE 2')
+    ax.set_title(f't-SNE Feature Visualization ({n_samples} samples)', fontweight='bold')
+    ax.grid(alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] t-SNE visualization saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
+
+
+def visualize_error_samples(
+    model: nn.Module,
+    test_loader: DataLoader,
+    device: torch.device,
+    class_names: Optional[List[str]] = None,
+    n_samples: int = 16,
+    save_path: Optional[Path] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """可视化错误分类样本
+    
+    展示模型分类错误的样本，帮助理解模型弱点。
+    
+    Args:
+        model: 模型
+        test_loader: 测试数据加载器
+        device: 计算设备
+        class_names: 类别名称
+        n_samples: 显示的样本数量
+        save_path: 保存路径
+        show: 是否显示
+        
+    Returns:
+        matplotlib Figure
+    """
+    model.eval()
+    
+    error_samples = []
+    
+    with torch.no_grad():
+        for imgs, labels in test_loader:
+            imgs_d = imgs.to(device)
+            outputs, _ = model(imgs_d, return_aux_info=True)
+            probs = F.softmax(outputs, dim=1)
+            preds = outputs.argmax(1)
+            
+            for i in range(len(labels)):
+                if preds[i] != labels[i] and len(error_samples) < n_samples:
+                    error_samples.append({
+                        'image': imgs[i].cpu(),
+                        'true_label': labels[i].item(),
+                        'pred_label': preds[i].item(),
+                        'true_prob': probs[i, labels[i]].item(),
+                        'pred_prob': probs[i, preds[i]].item(),
+                    })
+            
+            if len(error_samples) >= n_samples:
+                break
+    
+    if not error_samples:
+        print("[INFO] No error samples found!")
+        return None
+    
+    n_cols = 4
+    n_rows = (len(error_samples) + n_cols - 1) // n_cols
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4.5 * n_rows))
+    axes = axes.flatten() if n_rows > 1 or n_cols > 1 else [axes]
+    
+    for idx, sample in enumerate(error_samples):
+        ax = axes[idx]
+        
+        # 反归一化显示
+        img = sample['image'].permute(1, 2, 0).numpy()
+        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+        
+        ax.imshow(img)
+        
+        true_name = class_names[sample['true_label']] if class_names else str(sample['true_label'])
+        pred_name = class_names[sample['pred_label']] if class_names else str(sample['pred_label'])
+        
+        title = f"True: {true_name}\n({sample['true_prob']*100:.1f}%)"
+        title += f"\nPred: {pred_name}\n({sample['pred_prob']*100:.1f}%)"
+        
+        ax.set_title(title, fontsize=9, color='red')
+        ax.axis('off')
+    
+    # 隐藏多余子图
+    for idx in range(len(error_samples), len(axes)):
+        axes[idx].set_visible(False)
+    
+    fig.suptitle('Misclassified Samples', fontsize=14, fontweight='bold', color='red')
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] Error samples saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
+
+
+def visualize_architecture_explainer(
+    save_path: Optional[Path] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """生成架构解释图（面向非专业读者）
+    
+    用直观的图解说明 Fractal ViT 的核心创新点。
+    
+    Args:
+        save_path: 保存路径
+        show: 是否显示
+        
+    Returns:
+        matplotlib Figure
+    """
+    fig = plt.figure(figsize=(20, 14))
+    gs = GridSpec(3, 3, figure=fig, hspace=0.3, wspace=0.3)
+    
+    # 1. 传统 ViT vs Fractal ViT 对比
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.set_title('Traditional ViT: Fixed Patches\n传统 ViT: 固定大小的 Patch', fontsize=11, fontweight='bold')
+    
+    # 画固定网格
+    for i in range(5):
+        ax1.axhline(i * 0.2, color='blue', linewidth=2)
+        ax1.axvline(i * 0.2, color='blue', linewidth=2)
+    ax1.set_xlim(0, 0.8)
+    ax1.set_ylim(0, 0.8)
+    ax1.set_aspect('equal')
+    ax1.text(0.4, 0.9, '16 equal patches (4×4)', ha='center', fontsize=10)
+    ax1.text(0.4, -0.1, 'All patches same size\n所有 Patch 大小相同', ha='center', fontsize=9)
+    ax1.axis('off')
+    
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.set_title('Fractal ViT: Adaptive Patches\n自适应分形 Patch', fontsize=11, fontweight='bold')
+    
+    # 画自适应网格
+    # 大 patch
+    ax2.add_patch(plt.Rectangle((0, 0), 0.4, 0.4, fill=False, edgecolor='green', linewidth=2))
+    ax2.add_patch(plt.Rectangle((0.4, 0), 0.4, 0.4, fill=False, edgecolor='green', linewidth=2))
+    # 小 patch
+    for i in range(4):
+        for j in range(4):
+            ax2.add_patch(plt.Rectangle((i*0.1, 0.4+j*0.1), 0.1, 0.1, 
+                         fill=False, edgecolor='red', linewidth=1))
+    ax2.set_xlim(0, 0.8)
+    ax2.set_ylim(0, 0.8)
+    ax2.set_aspect('equal')
+    ax2.text(0.4, 0.9, '2 large + 16 small patches', ha='center', fontsize=10)
+    ax2.text(0.4, -0.1, 'Adaptive sizing\n自适应大小', ha='center', fontsize=9)
+    ax2.axis('off')
+    
+    # 2. Hilbert 曲线解释
+    ax3 = fig.add_subplot(gs[0, 2])
+    ax3.set_title('Hilbert Curve Token Order\n希尔伯特曲线遍历顺序', fontsize=11, fontweight='bold')
+    
+    # 画 Hilbert 曲线
+    n = 4
+    xs, ys = [], []
+    for d in range(n * n):
+        x, y = HilbertCurve.d_to_xy(n, d)
+        xs.append(x)
+        ys.append(y)
+    
+    points = np.array([xs, ys]).T.reshape(-1, 1, 2)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)
+    colors = np.linspace(0, 1, len(segments))
+    lc = LineCollection(segments, cmap='plasma', linewidths=3)
+    lc.set_array(colors)
+    ax3.add_collection(lc)
+    ax3.set_xlim(-0.5, n - 0.5)
+    ax3.set_ylim(-0.5, n - 0.5)
+    ax3.set_aspect('equal')
+    ax3.text(n/2, n, 'Nearby patches → nearby tokens\n相邻 Patch → 相邻 Token', 
+            ha='center', fontsize=9)
+    ax3.axis('off')
+    
+    # 3. 多尺度融合说明
+    ax4 = fig.add_subplot(gs[1, :])
+    ax4.axis('off')
+    
+    fusion_text = """
+╔═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                                    MULTI-SCALE CROSS-ATTENTION FUSION                                             ║
+║                                         多尺度交叉注意力融合                                                         ║
+╠═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+║                                                                                                                   ║
+║   Scale 1 (4×4)         Scale 2 (8×8)         Scale 3 (16×16)                                                    ║
+║   ┌─┬─┬─┬─┐             ┌───┬───┐             ┌───────┐                                                          ║
+║   ├─┼─┼─┼─┤             │   │   │             │       │         Cross-Scale Attention:                           ║
+║   ├─┼─┼─┼─┤  ──────▶    ├───┼───┤  ──────▶    │       │  ──▶    Token_i = Σ α_{i,s} × V_{i,s}                    ║
+║   ├─┼─┼─┼─┤             │   │   │             │       │                                                          ║
+║   └─┴─┴─┴─┘             └───┴───┘             └───────┘         where α = softmax(Q·K^T / √d)                    ║
+║   16 tokens             4 tokens              1 token                                                            ║
+║   Fine detail           Medium                Coarse            每个 Token 通过注意力机制                          ║
+║   精细细节               中等                  粗略               融合不同尺度的信息                                  ║
+║                                                                                                                   ║
+╚═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+"""
+    ax4.text(0.5, 0.5, fusion_text, fontsize=9, fontfamily='monospace',
+            ha='center', va='center', transform=ax4.transAxes,
+            bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.5))
+    
+    # 4. Level-aware 处理说明
+    ax5 = fig.add_subplot(gs[2, :])
+    ax5.axis('off')
+    
+    level_text = """
+╔═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
+║                                      LEVEL-AWARE TRANSFORMER PROCESSING                                           ║
+║                                           层级感知的 Transformer 处理                                               ║
+╠═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣
+║                                                                                                                   ║
+║  【Key Innovation 1: Level-aware LayerNorm】                     【关键创新 1: 层级感知的归一化】                    ║
+║   Each depth level has its own γ/β parameters                   不同深度的 token 使用不同的归一化参数               ║
+║   y = γ(depth) × (x - μ) / σ + β(depth)                        y = γ(深度) × (x - μ) / σ + β(深度)              ║
+║                                                                                                                   ║
+║  【Key Innovation 2: STAB-5 Residual Scaling】                   【关键创新 2: 稳定残差缩放】                       ║
+║   Level-dependent residual weights: w(d) = σ(Emb(d)) × 2       深度相关的残差权重，防止梯度问题                      ║
+║   Shallow tokens get different treatment than deep ones         浅层和深层 token 获得不同处理                       ║
+║                                                                                                                   ║
+║  【Key Innovation 3: LCA Hilbert Bias】                          【关键创新 3: 最低公共祖先注意力偏置】               ║
+║   Attention bias based on Lowest Common Ancestor depth          基于希尔伯特曲线上最低公共祖先深度的注意力偏置        ║
+║   Similar tokens attend more to each other                      空间相近的 token 获得更多相互注意力                  ║
+║                                                                                                                   ║
+╚═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝
+"""
+    ax5.text(0.5, 0.5, level_text, fontsize=9, fontfamily='monospace',
+            ha='center', va='center', transform=ax5.transAxes,
+            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.5))
+    
+    fig.suptitle('Fractal ViT Architecture Explainer\n分形 ViT 架构解析', 
+                fontsize=16, fontweight='bold')
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] Architecture explainer saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
 
 
 def visualize_confusion_matrix(
@@ -2461,32 +3611,12 @@ def generate_full_report(
     print(f"      Accuracy: {results['accuracy']:.2f}%")
     print(f"      Loss: {results['loss']:.4f}")
     
-    # 4. 可视化 Hilbert 曲线
-    print("[4/12] Generating Hilbert curve visualizations...")
-    visualize_hilbert_curve(
-        max_order=5,
-        save_path=output_dir / "hilbert_curves.png",
-        show=show,
-    )
-    
-    visualize_hilbert_locality(
-        order=4,
-        save_path=output_dir / "hilbert_locality.png",
-        show=show,
-    )
-    
-    # 5. 在样本图像上可视化
-    print("[5/12] Visualizing tokenization on sample images...")
+    # 4. 获取样本图像
+    print("[4/14] Loading sample images...")
     sample_imgs, sample_labels = next(iter(test_loader))
     
-    visualize_hilbert_on_image(
-        sample_imgs[0],
-        patch_size=4,
-        save_path=output_dir / "hilbert_on_image.png",
-        show=show,
-    )
-    
-    # 多尺度可视化
+    # 5. 多尺度 Tokenization 可视化
+    print("[5/14] Visualizing multi-scale tokenization...")
     if hasattr(model, 'tokenizer'):
         visualize_multi_scale_tokenization(
             sample_imgs[0:1].to(device),
@@ -2495,8 +3625,8 @@ def generate_full_report(
             show=show,
         )
     
-    # 6. 架构特性可视化 (NEW)
-    print("[6/12] Generating architecture feature visualizations...")
+    # 6. 架构特性可视化
+    print("[6/14] Generating architecture feature visualizations...")
     
     # 6.1 模型架构概览
     visualize_model_architecture_summary(
@@ -2527,7 +3657,7 @@ def generate_full_report(
     )
     
     # 7. 混合 Level 分割可视化
-    print("[7/12] Visualizing adaptive scale selection...")
+    print("[7/14] Visualizing adaptive scale selection...")
     if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'complexity_head'):
         visualize_adaptive_scale_selection(
             model, sample_imgs[:8], device,
@@ -2553,7 +3683,7 @@ def generate_full_report(
         print("      [SKIP] Tokenizer does not support adaptive scale selection")
     
     # 8. Train/Eval 一致性检查
-    print("[8/12] Checking train/eval consistency...")
+    print("[8/14] Checking train/eval consistency...")
     consistency_report = check_train_eval_consistency(model, sample_imgs[:4], device)
     
     # 保存一致性报告
@@ -2571,7 +3701,7 @@ def generate_full_report(
         json.dump(serializable_report, f, indent=2, default=str)
     
     # 9. 评估可视化
-    print("[9/12] Generating evaluation visualizations...")
+    print("[9/14] Generating evaluation visualizations...")
     
     visualize_confusion_matrix(
         results['confusion_matrix'],
@@ -2595,15 +3725,63 @@ def generate_full_report(
     )
     
     # 10. 注意力可视化
-    print("[10/12] Visualizing attention maps...")
+    print("[10/14] Visualizing attention maps...")
     visualize_attention_maps(
         model, sample_imgs[0:1], device,
         save_path=output_dir / "attention_maps.png",
         show=show,
     )
     
-    # 11. 保存结果
-    print("[11/12] Saving report...")
+    # ===== P16 增强功能 =====
+    
+    # 11. 架构分析 (P16)
+    print("[11/14] Analyzing model architecture...")
+    arch_report = analyze_model_architecture(model, device)
+    with open(output_dir / "architecture_analysis.json", 'w') as f:
+        json.dump(arch_report, f, indent=2, default=str)
+    
+    # 12. 推理性能基准测试 (P16)
+    print("[12/14] Running inference performance benchmark...")
+    perf_report = benchmark_inference_performance(
+        model, device, 
+        input_size=spec.image_size,
+        batch_sizes=[1, 4, 8, 16],
+        warmup_runs=3,
+        test_runs=10,
+    )
+    with open(output_dir / "performance_benchmark.json", 'w') as f:
+        json.dump(perf_report, f, indent=2, default=str)
+    
+    # 打印关键性能指标
+    if 'batch_1' in perf_report:
+        b1 = perf_report['batch_1']
+        print(f"      Latency (batch=1): {b1.get('latency_mean_ms', 0):.2f}ms ± {b1.get('latency_std_ms', 0):.2f}ms")
+        print(f"      Throughput: {b1.get('throughput_samples_per_sec', 0):.1f} samples/sec")
+    
+    # 13. Tokenizer 行为分析 (P16)
+    print("[13/14] Analyzing tokenizer behavior...")
+    tokenizer_analysis = analyze_tokenizer_behavior(
+        model, test_loader, device, n_batches=20
+    )
+    with open(output_dir / "tokenizer_analysis.json", 'w') as f:
+        json.dump(tokenizer_analysis, f, indent=2, default=str)
+    
+    # 14. 错误分析 (P16)
+    print("[14/14] Analyzing classification errors...")
+    error_analysis = analyze_errors(
+        model, test_loader, device,
+        class_names=spec.classes,
+        top_k_confusions=10,
+    )
+    with open(output_dir / "error_analysis.json", 'w') as f:
+        json.dump(error_analysis, f, indent=2, default=str)
+    
+    # 打印关键错误指标
+    print(f"      Total errors: {error_analysis.get('total_errors', 0)}")
+    print(f"      Top confusion pair: {error_analysis.get('top_confusion_pairs', [('N/A', 'N/A', 0)])[0]}")
+    
+    # 保存结果
+    print("\n[FINAL] Saving comprehensive report...")
     
     # 获取 tokenizer 状态
     tokenizer_stats = {}
@@ -2621,42 +3799,69 @@ def generate_full_report(
         'per_class_accuracy': results['per_class_accuracy'],
         'consistency_passed': consistency_report.get('passed', None),
         'tokenizer_stats': tokenizer_stats,
+        # P16 增强
+        'architecture_summary': {
+            'total_params': arch_report.get('total_parameters', 0),
+            'trainable_params': arch_report.get('trainable_parameters', 0),
+            'memory_inference_mb': arch_report.get('estimated_memory', {}).get('inference_mb', 0),
+        },
+        'performance_summary': {
+            'latency_ms': perf_report.get('batch_1', {}).get('latency_mean_ms', 0),
+            'throughput': perf_report.get('batch_1', {}).get('throughput_samples_per_sec', 0),
+        },
+        'error_summary': {
+            'total_errors': error_analysis.get('total_errors', 0),
+            'top_confusion_pairs': error_analysis.get('top_confusion_pairs', [])[:3],
+        },
     }
     
     with open(output_dir / "evaluation_report.json", 'w') as f:
         json.dump(report, f, indent=2, default=str)
     
-    # 12. 打印报告摘要
-    print("[12/12] Report summary...")
-    
-    print(f"\n{'='*70}")
-    print("REPORT COMPLETE")
-    print(f"{'='*70}")
+    # 打印报告摘要
+    print(f"\n{'='*80}")
+    print("EVALUATION REPORT COMPLETE")
+    print(f"{'='*80}")
     print(f"Results saved to: {output_dir}")
-    print(f"\n[Hilbert Curve Visualizations]")
-    print(f"  - hilbert_curves.png")
-    print(f"  - hilbert_locality.png")
-    print(f"  - hilbert_on_image.png")
+    
     print(f"\n[Tokenization Visualizations]")
     print(f"  - multi_scale_tokenization.png")
-    print(f"  - variable_depth_tokens.png        [NEW - V3 VDT]")
+    
     print(f"\n[Architecture Feature Visualizations]")
-    print(f"  - architecture_summary.png         [NEW - Model Overview]")
-    print(f"  - level_aware_processing.png       [NEW - STAB-5 + LCA]")
-    print(f"  - hilbert_vs_raster.png            [NEW - Locality Comparison]")
-    print(f"  - attention_maps.png               [NEW]")
+    print(f"  - architecture_summary.png         [Model Overview]")
+    print(f"  - cross_scale_attention.png        [Cross-Scale Attention]")
+    print(f"  - level_aware_processing.png       [STAB-5 + LCA]")
+    print(f"  - hilbert_vs_raster.png            [Locality Comparison]")
+    print(f"  - attention_maps.png")
+    
     print(f"\n[Adaptive Scale Selection]")
     print(f"  - adaptive_scale_selection.png")
     print(f"  - scale_distribution.png")
     print(f"  - scale_by_complexity.png")
+    
     print(f"\n[Evaluation Results]")
     print(f"  - confusion_matrix.png")
     print(f"  - per_class_accuracy.png")
     print(f"  - sample_predictions.png")
+    
+    print(f"\n[Architecture Debugging]")
+    print(f"  - architecture_analysis.json       [Deep architecture analysis]")
+    print(f"  - performance_benchmark.json       [Latency/Throughput]")
+    print(f"  - tokenizer_analysis.json          [Token behavior stats]")
+    print(f"  - error_analysis.json              [Confusion pairs, hardest classes]")
+    
     print(f"\n[Reports]")
     print(f"  - consistency_report.json")
-    print(f"  - evaluation_report.json")
-    print(f"{'='*70}\n")
+    print(f"  - evaluation_report.json           [Comprehensive summary]")
+    
+    print(f"\n{'='*80}")
+    print(f"Key Metrics:")
+    print(f"  Accuracy: {results['accuracy']:.2f}%")
+    print(f"  Loss: {results['loss']:.4f}")
+    print(f"  Parameters: {arch_report.get('total_parameters', 0):,}")
+    print(f"  Latency (batch=1): {perf_report.get('batch_1', {}).get('latency_mean_ms', 0):.2f}ms")
+    print(f"  Errors: {error_analysis.get('total_errors', 0)}")
+    print(f"{'='*80}\n")
     
     return report
 
@@ -2666,7 +3871,30 @@ def generate_full_report(
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Fractal ViT Evaluation & Visualization")
+    parser = argparse.ArgumentParser(
+        description="Fractal ViT Evaluation & Visualization (P16 Enhanced)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Full evaluation with all P16 features
+  python evaluate_and_visualize.py --checkpoint path/to/best.pth --dataset tiny-imagenet
+  
+  # Only visualize Hilbert curves (no model needed)
+  python evaluate_and_visualize.py --visualize-hilbert --max-order 6
+  
+  # Benchmark inference performance
+  python evaluate_and_visualize.py --checkpoint path/to/best.pth --benchmark
+  
+  # Analyze model architecture
+  python evaluate_and_visualize.py --checkpoint path/to/best.pth --analyze-architecture
+  
+  # Visualize training history
+  python evaluate_and_visualize.py --checkpoint path/to/best.pth --visualize-training-history
+  
+  # Generate architecture explainer for non-experts
+  python evaluate_and_visualize.py --architecture-explainer
+        """
+    )
     
     # 模式
     parser.add_argument("--checkpoint", type=str, default=None,
@@ -2688,6 +3916,20 @@ def main():
                        help="Visualize adaptive scale selection (mixed level segmentation)")
     parser.add_argument("--n-samples", type=int, default=8,
                        help="Number of samples for scale visualization")
+    
+    # P16 增强选项
+    parser.add_argument("--benchmark", action="store_true",
+                       help="Run inference performance benchmark")
+    parser.add_argument("--analyze-architecture", action="store_true",
+                       help="Analyze model architecture in detail")
+    parser.add_argument("--analyze-errors", action="store_true",
+                       help="Analyze classification errors")
+    parser.add_argument("--visualize-training-history", action="store_true",
+                       help="Visualize training history from JSON")
+    parser.add_argument("--visualize-tsne", action="store_true",
+                       help="Visualize t-SNE feature embeddings")
+    parser.add_argument("--architecture-explainer", action="store_true",
+                       help="Generate architecture explainer diagram for non-experts")
     
     # 系统
     parser.add_argument("--device", type=str, default="auto")
@@ -2725,6 +3967,16 @@ def main():
         print(f"[OK] Visualizations saved to: {output_dir}")
         return
     
+    # 仅生成架构解释图 (无需模型)
+    if args.architecture_explainer:
+        print("\n[*] Generating architecture explainer diagram...")
+        visualize_architecture_explainer(
+            save_path=output_dir / "architecture_explainer.png",
+            show=args.show,
+        )
+        print(f"[OK] Architecture explainer saved to: {output_dir}")
+        return
+    
     # 需要模型的评估
     if args.checkpoint is None:
         # 尝试找到最新的检查点
@@ -2746,6 +3998,85 @@ def main():
     checkpoint_path = Path(args.checkpoint)
     if not checkpoint_path.exists():
         print(f"[ERROR] Checkpoint not found: {checkpoint_path}")
+        return
+    
+    # P16: 仅基准测试
+    if args.benchmark:
+        print("\n[*] Running inference performance benchmark...")
+        model, config = load_model_and_config(checkpoint_path, device)
+        spec = DATASETS.get(args.dataset, DATASETS['cifar10'])
+        
+        perf_report = benchmark_inference_performance(
+            model, device,
+            input_size=spec.image_size,
+            batch_sizes=[1, 4, 8, 16, 32],
+            warmup_runs=5,
+            test_runs=20,
+        )
+        
+        print("\n" + "="*60)
+        print("INFERENCE PERFORMANCE BENCHMARK")
+        print("="*60)
+        for batch_key, metrics in perf_report.items():
+            if batch_key.startswith('batch_'):
+                batch_size = batch_key.split('_')[1]
+                print(f"\nBatch Size {batch_size}:")
+                print(f"  Latency: {metrics['latency_mean_ms']:.2f}ms ± {metrics['latency_std_ms']:.2f}ms")
+                print(f"  P95: {metrics['latency_p95_ms']:.2f}ms, P99: {metrics['latency_p99_ms']:.2f}ms")
+                print(f"  Throughput: {metrics['throughput_samples_per_sec']:.1f} samples/sec")
+                print(f"  Memory: {metrics.get('peak_memory_mb', 0):.1f} MB")
+        
+        with open(output_dir / "performance_benchmark.json", 'w') as f:
+            json.dump(perf_report, f, indent=2, default=str)
+        print(f"\n[OK] Benchmark saved to: {output_dir / 'performance_benchmark.json'}")
+        return
+    
+    # P16: 仅架构分析
+    if args.analyze_architecture:
+        print("\n[*] Analyzing model architecture...")
+        model, config = load_model_and_config(checkpoint_path, device)
+        
+        arch_report = analyze_model_architecture(model, device)
+        
+        print("\n" + "="*60)
+        print("MODEL ARCHITECTURE ANALYSIS")
+        print("="*60)
+        print(f"\nTotal Parameters: {arch_report['total_parameters']:,}")
+        print(f"Trainable Parameters: {arch_report['trainable_parameters']:,}")
+        print(f"\nParameter Distribution:")
+        for name, count in arch_report.get('parameters_by_module', {}).items():
+            pct = count / arch_report['total_parameters'] * 100
+            print(f"  {name}: {count:,} ({pct:.1f}%)")
+        
+        print(f"\nMemory Estimation:")
+        mem = arch_report.get('estimated_memory', {})
+        print(f"  Inference: {mem.get('inference_mb', 0):.1f} MB")
+        print(f"  Training: {mem.get('training_mb', 0):.1f} MB")
+        
+        with open(output_dir / "architecture_analysis.json", 'w') as f:
+            json.dump(arch_report, f, indent=2, default=str)
+        print(f"\n[OK] Analysis saved to: {output_dir / 'architecture_analysis.json'}")
+        return
+    
+    # P16: 仅训练历史可视化
+    if args.visualize_training_history:
+        print("\n[*] Visualizing training history...")
+        history_path = checkpoint_path.parent.parent / "training_history.json"
+        if not history_path.exists():
+            # 尝试其他路径
+            history_path = checkpoint_path.parent / "training_history.json"
+        
+        if history_path.exists():
+            visualize_training_history(
+                history_path,
+                save_path=output_dir / "training_history.png",
+                show=args.show,
+            )
+            print(f"[OK] Training history saved to: {output_dir / 'training_history.png'}")
+        else:
+            print(f"[ERROR] Training history not found. Tried:")
+            print(f"  - {checkpoint_path.parent.parent / 'training_history.json'}")
+            print(f"  - {checkpoint_path.parent / 'training_history.json'}")
         return
     
     # 仅可视化尺度选择

@@ -681,6 +681,7 @@ def diagnose_nan_inf(
     ce_loss: Optional[torch.Tensor] = None,
     entropy_loss: Optional[torch.Tensor] = None,
     splitter_loss: Optional[torch.Tensor] = None,
+    multi_layer_loss: Optional[torch.Tensor] = None,
     log_file: Optional[str] = None,
 ) -> str:
     """诊断 NaN/Inf 出现的原因，输出详细信息
@@ -717,20 +718,29 @@ def diagnose_nan_inf(
     lines.append("\n[2] 损失统计:")
     if loss is not None:
         lines.append(f"  total_loss: {loss.item() if not (torch.isnan(loss) or torch.isinf(loss)) else 'NaN/Inf'}")
-        lines.append(f"    → isnan: {torch.isnan(loss).item()}, isinf: {torch.isinf(loss).item()}")
+        lines.append(f"    → isnan: {torch.isnan(loss).item()}, isinf: {torch.isinf(loss).item()}, dtype: {loss.dtype}")
     if ce_loss is not None:
         ce_val = ce_loss.item() if not (torch.isnan(ce_loss) or torch.isinf(ce_loss)) else 'NaN/Inf'
         lines.append(f"  ce_loss: {ce_val}")
-        lines.append(f"    → isnan: {torch.isnan(ce_loss).item()}, isinf: {torch.isinf(ce_loss).item()}")
+        lines.append(f"    → isnan: {torch.isnan(ce_loss).item()}, isinf: {torch.isinf(ce_loss).item()}, dtype: {ce_loss.dtype}")
     if entropy_loss is not None:
         ent_val = entropy_loss.item() if not (torch.isnan(entropy_loss) or torch.isinf(entropy_loss)) else 'NaN/Inf'
         lines.append(f"  entropy_loss: {ent_val}")
+        lines.append(f"    → dtype: {entropy_loss.dtype}")
     if splitter_loss is not None:
         if isinstance(splitter_loss, torch.Tensor):
             spl_val = splitter_loss.item() if not (torch.isnan(splitter_loss) or torch.isinf(splitter_loss)) else 'NaN/Inf'
             lines.append(f"  splitter_loss: {spl_val}")
+            lines.append(f"    → isnan: {torch.isnan(splitter_loss).item()}, isinf: {torch.isinf(splitter_loss).item()}, dtype: {splitter_loss.dtype}")
         else:
             lines.append(f"  splitter_loss: {splitter_loss}")
+    if multi_layer_loss is not None:
+        if isinstance(multi_layer_loss, torch.Tensor):
+            ml_val = multi_layer_loss.item() if not (torch.isnan(multi_layer_loss) or torch.isinf(multi_layer_loss)) else 'NaN/Inf'
+            lines.append(f"  multi_layer_loss: {ml_val}")
+            lines.append(f"    → isnan: {torch.isnan(multi_layer_loss).item()}, isinf: {torch.isinf(multi_layer_loss).item()}, dtype: {multi_layer_loss.dtype}")
+        else:
+            lines.append(f"  multi_layer_loss: {multi_layer_loss}")
     
     # 3. Logits 统计
     if logits is not None:
@@ -1568,15 +1578,34 @@ def train_epoch(
                     # 非可学习分割器会抛出 ValueError
                     pass
             
-            # 组合损失
-            loss = ce_loss
+            # 组合损失 (在组合前检查每个损失项，并确保 dtype 一致)
+            # P15-FIX: 在 AMP 混合精度训练中，不同损失可能有不同 dtype
+            #          ce_loss 可能是 float16，而 splitter_loss/multi_layer_loss 是 float32
+            #          混合相加可能导致 NaN。统一转换为 float32 进行损失计算。
+            loss = ce_loss.float()  # 确保基础损失是 float32
+            
             if entropy_loss is not None:
-                loss = loss + entropy_loss / config.accum_steps
-                entropy_losses.append(entropy_loss.item())  # P1-5: 记录熵损失
+                entropy_loss_f32 = entropy_loss.float()
+                if torch.isnan(entropy_loss_f32) or torch.isinf(entropy_loss_f32):
+                    print(f"[WARN] entropy_loss 为 NaN/Inf: {entropy_loss_f32.item()}")
+                    entropy_loss = None  # 跳过该损失
+                else:
+                    loss = loss + entropy_loss_f32 / config.accum_steps
+                    entropy_losses.append(entropy_loss_f32.item())  # P1-5: 记录熵损失
             if splitter_loss is not None:
-                loss = loss + splitter_loss / config.accum_steps
+                splitter_loss_f32 = splitter_loss.float()
+                if torch.isnan(splitter_loss_f32) or torch.isinf(splitter_loss_f32):
+                    print(f"[WARN] splitter_loss 为 NaN/Inf: {splitter_loss_f32.item()}")
+                    splitter_loss = None  # 跳过该损失
+                else:
+                    loss = loss + splitter_loss_f32 / config.accum_steps
             if multi_layer_loss is not None:
-                loss = loss + 0.1 * multi_layer_loss / config.accum_steps  # λ_multi = 0.1
+                multi_layer_loss_f32 = multi_layer_loss.float()
+                if torch.isnan(multi_layer_loss_f32) or torch.isinf(multi_layer_loss_f32):
+                    print(f"[WARN] multi_layer_loss 为 NaN/Inf, 跳过")
+                    multi_layer_loss = None  # 跳过该损失
+                else:
+                    loss = loss + 0.1 * multi_layer_loss_f32 / config.accum_steps  # λ_multi = 0.1
         
         # 检查 loss 是否为 NaN/Inf，并输出详细诊断信息
         if torch.isnan(loss) or torch.isinf(loss):
@@ -1594,6 +1623,7 @@ def train_epoch(
                     ce_loss=ce_loss * config.accum_steps,  # 还原真实值
                     entropy_loss=entropy_loss,
                     splitter_loss=splitter_loss,
+                    multi_layer_loss=multi_layer_loss,
                     log_file=exp_dir / "nan_inf_diagnose.log" if exp_dir else None,
                 )
                 print(report)
@@ -1891,6 +1921,195 @@ def analyze_class_balance(
     return report
 
 
+# ============================================================================
+# P10-14: 分割器健康监控 (Splitter Health Monitoring)
+# ============================================================================
+
+@dataclass
+class SplitterHealthConfig:
+    """
+    分割器健康监控配置
+    
+    数学形式化:
+    - 坍缩检测: N(t) < N_min ∧ t > t_warmup
+    - 单调检测: H(t)/H_max < H_min_ratio ∧ t > t_warmup
+    - 饱和检测: N(t) > saturation_ratio * N_max
+    """
+    min_tokens_threshold: float = 2.0       # 最小平均 token 数 (N_min)
+    min_entropy_ratio: float = 0.1          # 最小熵比率 (H_min/H_max)
+    saturation_ratio: float = 0.9           # 饱和阈值比率
+    warmup_epochs: int = 3                  # 宽限期 epoch 数
+    expected_tokens_max: float = 64.0       # 期望最大 token 数 (N_max)
+
+
+@dataclass  
+class SplitterHealthStatus:
+    """分割器健康状态"""
+    is_healthy: bool
+    collapse_detected: bool      # 坍缩: 几乎不分割
+    monotone_detected: bool      # 单调: 深度分布过于集中
+    saturate_detected: bool      # 饱和: 完全分割
+    health_score: float          # 综合健康评分 [0, 1]
+    severity: str                # 'ok', 'warning', 'critical'
+    message: str
+
+
+def check_splitter_health(
+    avg_tokens: Optional[float],
+    entropy: Optional[float],
+    max_entropy: Optional[float],
+    epoch: int,
+    config: Optional[SplitterHealthConfig] = None,
+) -> SplitterHealthStatus:
+    """
+    检查分割器健康状态
+    
+    P10-14 实现: 早期检测分割器异常行为
+    
+    数学定义:
+        collapse_risk = ReLU(N_min - N) / N_min
+        monotone_risk = ReLU(H_min - H/H_max) / H_min  
+        saturate_risk = ReLU(N - 0.9*N_max) / (0.1*N_max)
+        health_score = (1 - collapse_risk) * (1 - monotone_risk) * (1 - saturate_risk)
+    
+    Args:
+        avg_tokens: 平均 token 数 (软计数或硬计数)
+        entropy: 当前深度熵
+        max_entropy: 理论最大熵 (log(D+1))
+        epoch: 当前 epoch
+        config: 健康监控配置
+    
+    Returns:
+        SplitterHealthStatus: 健康状态信息
+    """
+    if config is None:
+        config = SplitterHealthConfig()
+    
+    # 无数据时返回未知状态
+    if avg_tokens is None:
+        return SplitterHealthStatus(
+            is_healthy=True,
+            collapse_detected=False,
+            monotone_detected=False,
+            saturate_detected=False,
+            health_score=1.0,
+            severity='ok',
+            message='No splitter data available'
+        )
+    
+    # 宽限期内不报警
+    if epoch <= config.warmup_epochs:
+        return SplitterHealthStatus(
+            is_healthy=True,
+            collapse_detected=False,
+            monotone_detected=False,
+            saturate_detected=False,
+            health_score=1.0,
+            severity='ok',
+            message=f'Epoch {epoch} in warmup period (≤{config.warmup_epochs})'
+        )
+    
+    # 计算各风险指标
+    N_min = config.min_tokens_threshold
+    H_min = config.min_entropy_ratio
+    N_max = config.expected_tokens_max
+    
+    # 坍缩风险
+    collapse_risk = max(0.0, N_min - avg_tokens) / N_min
+    collapse_detected = avg_tokens < N_min
+    
+    # 单调风险 (如果有熵数据)
+    if entropy is not None and max_entropy is not None and max_entropy > 0:
+        entropy_ratio = entropy / max_entropy
+        monotone_risk = max(0.0, H_min - entropy_ratio) / H_min
+        monotone_detected = entropy_ratio < H_min
+    else:
+        entropy_ratio = 1.0
+        monotone_risk = 0.0
+        monotone_detected = False
+    
+    # 饱和风险
+    saturate_threshold = config.saturation_ratio * N_max
+    saturate_risk = max(0.0, avg_tokens - saturate_threshold) / (0.1 * N_max)
+    saturate_risk = min(1.0, saturate_risk)  # 限制在 [0, 1]
+    saturate_detected = avg_tokens > saturate_threshold
+    
+    # 综合健康评分
+    health_score = (1 - collapse_risk) * (1 - monotone_risk) * (1 - saturate_risk)
+    health_score = max(0.0, min(1.0, health_score))
+    
+    # 综合评估
+    is_healthy = not (collapse_detected or monotone_detected or saturate_detected)
+    
+    # 确定严重程度和消息
+    if collapse_detected:
+        severity = 'critical'
+        message = f'[P10-14] Splitter COLLAPSE: avg_tokens={avg_tokens:.2f} < {N_min}'
+    elif monotone_detected:
+        severity = 'warning'
+        message = f'[P10-14] Monotone distribution: entropy_ratio={entropy_ratio:.1%} < {H_min:.0%}'
+    elif saturate_detected:
+        severity = 'warning'
+        message = f'[P10-14] Saturation: avg_tokens={avg_tokens:.1f} > {saturate_threshold:.0f}'
+    else:
+        severity = 'ok'
+        message = f'Splitter healthy: tokens={avg_tokens:.1f}, health_score={health_score:.2f}'
+    
+    return SplitterHealthStatus(
+        is_healthy=is_healthy,
+        collapse_detected=collapse_detected,
+        monotone_detected=monotone_detected,
+        saturate_detected=saturate_detected,
+        health_score=health_score,
+        severity=severity,
+        message=message
+    )
+
+
+def log_splitter_health_to_tensorboard(
+    writer,
+    health_status: SplitterHealthStatus,
+    perf_stats: Dict[str, Any],
+    epoch: int,
+) -> None:
+    """
+    将分割器健康指标记录到 TensorBoard
+    
+    记录的指标:
+    - Splitter/health_score: 综合健康评分
+    - Splitter/entropy_ratio: 熵比率
+    - Splitter/soft_token_count: 软 token 计数
+    - Splitter/dominant_prob: 主导深度概率
+    """
+    if writer is None:
+        return
+    
+    # 健康评分
+    writer.add_scalar('Splitter/health_score', health_status.health_score, epoch)
+    
+    # 从 perf_stats 提取指标
+    if perf_stats.get('soft_token_count') is not None:
+        writer.add_scalar('Splitter/soft_token_count', perf_stats['soft_token_count'], epoch)
+    
+    if perf_stats.get('entropy_ratio') is not None:
+        writer.add_scalar('Splitter/entropy_ratio', perf_stats['entropy_ratio'], epoch)
+    
+    if perf_stats.get('soft_entropy') is not None:
+        writer.add_scalar('Splitter/entropy', perf_stats['soft_entropy'], epoch)
+    
+    if perf_stats.get('dominant_prob') is not None:
+        writer.add_scalar('Splitter/dominant_prob', perf_stats['dominant_prob'], epoch)
+    
+    if perf_stats.get('learnable_temperature') is not None:
+        writer.add_scalar('Splitter/temperature', perf_stats['learnable_temperature'], epoch)
+    
+    if perf_stats.get('learnable_thresholds') is not None:
+        thresholds = perf_stats['learnable_thresholds']
+        if hasattr(thresholds, '__len__') and len(thresholds) > 0:
+            mean_thresh = sum(thresholds) / len(thresholds)
+            writer.add_scalar('Splitter/threshold_mean', mean_thresh, epoch)
+
+
 @torch.no_grad()
 def verify_train_eval_consistency(
     model: nn.Module,
@@ -2070,10 +2289,12 @@ def main():
                        help="Target token budget for learnable splitter (default: 64)")
     
     # P7-7: 温度退火调度参数
+    # P10-11 更新: 将 T_end 默认值从 0.1 提升到 0.3，防止梯度消失
+    # 参考: constants.py SPLITTER_TEMP_END = 0.3
     parser.add_argument("--splitter-temp-start", type=float, default=1.0,
                        help="Learnable splitter initial temperature (default: 1.0)")
-    parser.add_argument("--splitter-temp-end", type=float, default=0.1,
-                       help="Learnable splitter final temperature (default: 0.1)")
+    parser.add_argument("--splitter-temp-end", type=float, default=0.3,
+                       help="Learnable splitter final temperature (default: 0.3, P10-11 optimized)")
     parser.add_argument("--splitter-temp-warmup", type=int, default=5,
                        help="Warmup epochs with fixed T_start (default: 5)")
     
@@ -2564,6 +2785,59 @@ def main():
         if config.progressive_aug:
             print(f"  - Progressive Augmentation: 渐进式增强强度")
     
+    # =========================================================================
+    # P7-7 / P10-12: 启用 LearnableSplitter 内置退火调度
+    # =========================================================================
+    # 使用 LearnableSplitter.enable_temperature_annealing() 替代手动温度调度
+    # 使用 LearnableSplitter.enable_explore_bias_annealing() 解决 P10-12 死锁问题
+    #
+    # 数学形式化:
+    #   温度退火: T(t) = T_start · (T_end / T_start)^(t / total_steps)
+    #   探索偏置: b(t) = b_start · (1 - t / total_steps)
+    #
+    # 优势:
+    #   - 在 forward() 中自动更新，无需在训练循环中手动调度
+    #   - 基于 step 级别的精细控制，而非 epoch 级别
+    #   - 支持 exponential/linear/cosine 多种调度策略
+    # =========================================================================
+    splitter_annealing_enabled = False
+    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
+        splitter = model.tokenizer.splitter
+        # 计算总训练步数 (epochs × batches_per_epoch)
+        batches_per_epoch = len(train_loader) // config.accum_steps
+        total_training_steps = config.epochs * batches_per_epoch
+        
+        # 启用温度退火 (P7-7)
+        if hasattr(splitter, 'enable_temperature_annealing'):
+            # 考虑 warmup: 在 warmup 期间使用 T_start，之后开始退火
+            post_warmup_steps = max(1, (config.epochs - config.splitter_temp_warmup) * batches_per_epoch)
+            splitter.enable_temperature_annealing(
+                total_steps=post_warmup_steps,
+                T_start=config.splitter_temp_start,
+                T_end=config.splitter_temp_end,
+                schedule='exponential',  # 最优的梯度-确定性权衡
+            )
+            print(f"[OK] 启用 LearnableSplitter 内置温度退火:")
+            print(f"     T: {config.splitter_temp_start} → {config.splitter_temp_end}")
+            print(f"     Steps: {post_warmup_steps} (after {config.splitter_temp_warmup} warmup epochs)")
+            print(f"     Schedule: exponential")
+            splitter_annealing_enabled = True
+        
+        # 启用探索偏置退火 (P10-12)
+        if hasattr(splitter, 'enable_explore_bias_annealing'):
+            splitter.enable_explore_bias_annealing(
+                total_steps=total_training_steps,
+                b_start=0.5,  # 初始偏置: P(split) ≈ 0.64
+                b_end=0.0,    # 终态: 纯 MLP 决策
+            )
+            print(f"[OK] 启用 P10-12 探索偏置退火:")
+            print(f"     Bias: 0.5 → 0.0")
+            print(f"     目的: 防止训练初期 avg_tokens=1 的'鸡生蛋'死锁")
+            splitter_annealing_enabled = True
+    
+    if not splitter_annealing_enabled:
+        print(f"[INFO] LearnableSplitter 退火未启用 (不支持或未使用可学习分割器)")
+    
     print()
     
     for epoch in range(1, config.epochs + 1):
@@ -2574,18 +2848,28 @@ def main():
         if device.type == 'cuda':
             torch.cuda.empty_cache()
         
-        # P7-7: 温度退火调度
-        # T(t) = T_start · (T_end / T_start)^((t - warmup) / (total - warmup))
-        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'set_split_temperature'):
+        # P7-7: 温度退火调度 (使用内置 LearnableSplitter.enable_temperature_annealing)
+        # 说明: 温度退火已在训练开始前通过 enable_temperature_annealing() 启用
+        #       在 forward() 中自动更新，无需手动调用 scheduler.step()
+        #       但 warmup 期间需要禁用退火，保持 T_start
+        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
+            splitter = model.tokenizer.splitter
             if epoch <= config.splitter_temp_warmup:
-                # Warmup 阶段：固定 T_start
-                current_temp = config.splitter_temp_start
-            else:
-                # 退火阶段：指数衰减
-                progress = (epoch - config.splitter_temp_warmup) / max(1, config.epochs - config.splitter_temp_warmup)
-                ratio = config.splitter_temp_end / config.splitter_temp_start
-                current_temp = config.splitter_temp_start * (ratio ** progress)
-            model.tokenizer.set_split_temperature(current_temp)
+                # Warmup 阶段：暂时禁用自动退火，固定 T_start
+                if hasattr(splitter, 'disable_temperature_annealing'):
+                    splitter.disable_temperature_annealing()
+                    splitter.set_temperature(config.splitter_temp_start)
+            elif epoch == config.splitter_temp_warmup + 1:
+                # Warmup 结束：重新启用退火
+                if hasattr(splitter, 'enable_temperature_annealing'):
+                    post_warmup_steps = max(1, (config.epochs - config.splitter_temp_warmup) * (len(train_loader) // config.accum_steps))
+                    splitter.enable_temperature_annealing(
+                        total_steps=post_warmup_steps,
+                        T_start=config.splitter_temp_start,
+                        T_end=config.splitter_temp_end,
+                        schedule='exponential',
+                    )
+                    print(f"[INFO] Epoch {epoch}: 温度退火正式开始 (warmup 结束)")
         
         # Warmup 阶段禁用 Mixup/CutMix
         # 原因: warmup 阶段学习率较低，模型需要学习基本特征
@@ -2762,6 +3046,36 @@ def main():
                 p10_parts.append(f"N_soft={perf_stats['soft_token_count']:.1f}")
             if p10_parts:
                 print(f"  P10: {', '.join(p10_parts)}")
+        
+        # P10-14: 分割器健康检查
+        # 动态获取 max_entropy (从 get_depth_distribution_stats 或配置推算)
+        max_entropy_value = 1.609  # 默认: log(5) for max_depth=4
+        if perf_stats.get('max_entropy') is not None:
+            max_entropy_value = perf_stats['max_entropy']
+        elif hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
+            # 从 splitter.max_depth 动态计算
+            splitter = model.tokenizer.splitter
+            if hasattr(splitter, 'max_depth'):
+                import math
+                max_entropy_value = math.log(splitter.max_depth + 1)
+        
+        if perf_stats.get('soft_token_count') is not None or perf_stats.get('soft_entropy') is not None:
+            health_status = check_splitter_health(
+                avg_tokens=perf_stats.get('soft_token_count'),
+                entropy=perf_stats.get('soft_entropy'),
+                max_entropy=max_entropy_value,
+                epoch=epoch,
+            )
+            if not health_status.is_healthy:
+                print(f"  ⚠️  {health_status.message}")
+            # 记录到 history 用于后续分析
+            history_entry['splitter_health'] = {
+                'is_healthy': health_status.is_healthy,
+                'health_score': health_status.health_score,
+                'severity': health_status.severity,
+                'collapse': health_status.collapse_detected,
+                'monotone': health_status.monotone_detected,
+            }
         
         # 保存最佳
         if val_acc > best_val + config.min_delta:
