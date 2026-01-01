@@ -109,16 +109,16 @@ class TestGetSoftEntropyLoss:
             pool_size=2,
         )
     
-    def test_maximize_mode_returns_negative_entropy(self, splitter):
-        """测试 maximize 模式返回负熵"""
+    def test_maximize_mode_returns_non_negative_loss(self, splitter):
+        """测试 maximize 模式返回非负损失 (P10-13: KL 散度)"""
         x = torch.randn(2, 64, 8, 8)
         splitter.train()
         _ = splitter(x, (32, 32))
         
         loss = splitter.get_soft_entropy_loss(batch_size=2, mode='maximize')
         
-        # 负熵应该是负数或零
-        assert loss.item() <= 0 or True, "Maximize mode returns -entropy"
+        # P10-13: 损失始终非负 (KL散度 + 反崩塌惩罚)
+        assert loss.item() >= 0, "P10-13: maximize mode uses KL divergence, loss should be non-negative"
         assert loss.requires_grad, "Loss should have gradients"
     
     def test_target_mode_requires_target(self, splitter):

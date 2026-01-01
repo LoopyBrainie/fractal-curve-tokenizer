@@ -86,14 +86,15 @@ class TestGetSoftTokenCount:
         assert soft_count.requires_grad
 
     def test_soft_token_count_no_cache_eval(self, splitter: LearnableSplitter):
-        """测试无缓存时使用 EMA 统计 (无梯度)."""
+        """测试无缓存时使用阈值先验 (P10-10 修复后始终有梯度)."""
         splitter.eval()
         splitter._cached_split_probs = {}  # 清空缓存
         
         soft_count = splitter.get_soft_token_count(batch_size=1)
         
-        # EMA 统计无梯度
-        assert not soft_count.requires_grad
+        # P10-10 修复: 阈值先验替代 EMA，始终有梯度
+        # 即使在 eval 模式且无缓存时，也可以通过阈值先验获得梯度信号
+        assert soft_count.requires_grad
 
 
 class TestGetElasticBudgetLoss:
