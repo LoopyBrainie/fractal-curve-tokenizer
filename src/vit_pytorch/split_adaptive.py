@@ -1406,7 +1406,7 @@ class BaseAdaptiveSplitter(ABC):
 
 class ComplexityMLP(nn.Module):
     """
-    可学习复杂度预测器 (P11-10 优化版)。
+    可学习复杂度预测器 (P11-10 优化版, P10-12 探索偏置)。
     
     数学形式化
     ----------
@@ -1422,6 +1422,20 @@ class ComplexityMLP(nn.Module):
         p_split = σ((z_MLP - τ) / T)
         梯度链: ∂p/∂z = 1/T · p(1-p)
         无内层 sigmoid 衰减，梯度提升 4x
+    
+    P10-12 探索偏置:
+        p_split = σ((z_MLP + b_explore - τ) / T)
+        
+        问题: 训练初期 avg_tokens=1 的"鸡生蛋"死锁
+          - Xavier 初始化使 E[z] = 0, τ = 0 → P(split) = 0.5
+          - 随机波动可能使 E[z|x] < 0，导致 P(split) < 0.5
+          - BFS 串行依赖: 一旦不分割，后续深度不被访问
+          - 形成死锁: MLP 只见粗糙区域，无法学习细分割
+          
+        解决: 探索偏置 b_explore > 0
+          - 初始 b = 0.5 → P(split) ≈ 0.62 (打破死锁)
+          - 退火: b(t) = b₀ · max(0, 1 - t/T_anneal)
+          - 让 MLP 逐渐接管决策
         
     计算验证结果 (T=1.0, z ~ N(0, 1.4²)):
         | 指标        | 双重 sigmoid | 单 sigmoid | 提升 |
@@ -1434,7 +1448,7 @@ class ComplexityMLP(nn.Module):
         
     输出:
         z_θ(R) ∈ ℝ: 复杂度 logit (非概率！)
-        初始分布: z ~ N(0, ~1.4²)，配合 τ=0 实现对称初始化
+        初始分布: z ~ N(b_explore, ~1.4²)，b_explore 提供初始探索倾向
     """
     
     def __init__(
@@ -1444,6 +1458,7 @@ class ComplexityMLP(nn.Module):
         intermediate_dim: int = 64,
         dropout: float = 0.1,
         use_deep_mlp: bool = True,
+        explore_bias_init: float = 0.5,
     ):
         """
         Args:
@@ -1452,8 +1467,14 @@ class ComplexityMLP(nn.Module):
             intermediate_dim: 第二隐藏层维度 (默认 64)
             dropout: Dropout 概率
             use_deep_mlp: 是否使用深度 MLP (3层)
+            explore_bias_init: P10-12 探索偏置初始值 (默认 0.5)
+                数学推导: b=0.5 → P(split) ≈ σ(0.5/1.4) ≈ 0.64
+                确保训练初期有足够分割探索，打破"永不分割"死锁
         """
         super().__init__()
+        
+        # P10-12: 探索偏置初始值 (用于退火)
+        self.explore_bias_init = explore_bias_init
         
         self.use_deep_mlp = use_deep_mlp
         
@@ -1490,15 +1511,23 @@ class ComplexityMLP(nn.Module):
             #   | p_split std | 0.065        | 0.262      | 4.04x|
             #   | p=0.9 可达  | T<0.5 不可能 | 始终可达   | ∞    |
             #
-            # 初始化策略 (继承 P10-2):
+            # 初始化策略 (P10-2 + P10-12):
             #   - gain=1.0: 使 σ_z ≈ 1.4
-            #   - bias=0.0: 对称分布，E[z] = 0
+            #   - bias=explore_bias_init: P10-12 探索偏置，打破死锁
+            #
+            # P10-12 数学推导:
+            #   - 问题: E[z] = 0, τ = 0 → P(split) = 0.5
+            #   - 随机波动可能导致 P(split) < 0.5 → 全不分割死锁
+            #   - 解决: 输出层偏置 b = 0.5
+            #   - 效果: z → z + 0.5, P(split) = σ(0.5/T) ≈ 0.62 (T=1)
+            #   - 对于 batch_size=2: P(至少一个分割) = 1 - 0.38² = 85.6%
             nn.init.xavier_uniform_(self.mlp[0].weight)
             nn.init.zeros_(self.mlp[0].bias)
             nn.init.xavier_uniform_(self.mlp[3].weight)
             nn.init.zeros_(self.mlp[3].bias)
             nn.init.xavier_uniform_(self.mlp[6].weight, gain=1.0)
-            nn.init.zeros_(self.mlp[6].bias)
+            # P10-12: 探索偏置初始化 (退火时会逐渐减小)
+            nn.init.constant_(self.mlp[6].bias, explore_bias_init)
         else:
             # 浅层 MLP: 保持一致的初始化策略
             self.mlp = nn.Sequential(
@@ -1508,12 +1537,13 @@ class ComplexityMLP(nn.Module):
                 nn.Linear(intermediate_dim, 1),
             )
             
-            # P11-10: 浅层 MLP 使用相同的初始化策略
+            # P11-10 + P10-12: 浅层 MLP 使用相同的初始化策略
             # 见深度 MLP 注释中的数学验证 (输出 logit，非概率)
             nn.init.xavier_uniform_(self.mlp[0].weight)
             nn.init.zeros_(self.mlp[0].bias)
             nn.init.xavier_uniform_(self.mlp[3].weight, gain=1.0)
-            nn.init.zeros_(self.mlp[3].bias)
+            # P10-12: 探索偏置初始化
+            nn.init.constant_(self.mlp[3].bias, explore_bias_init)
     
     def forward(self, features: Tensor) -> Tensor:
         """
@@ -1529,6 +1559,29 @@ class ComplexityMLP(nn.Module):
         """
         logits = self.mlp(features).squeeze(-1)  # [N]
         return logits  # P11-10: 移除 sigmoid，返回 ℝ 值
+    
+    def get_output_bias(self) -> float:
+        """获取当前输出层偏置值."""
+        if self.use_deep_mlp:
+            return self.mlp[6].bias.item()
+        else:
+            return self.mlp[3].bias.item()
+    
+    def set_explore_bias(self, bias: float) -> None:
+        """设置探索偏置 (用于退火).
+        
+        P10-12 退火机制:
+            b(t) = b₀ · max(0, 1 - t/T_anneal)
+            
+        数学含义:
+            - 初期 b = b₀ = 0.5: P(split) ≈ 0.62，强制探索
+            - 逐渐 b → 0: P(split) → 0.5，MLP 接管决策
+            - 终态 b = 0: 纯 MLP 决策，无探索偏置
+        """
+        if self.use_deep_mlp:
+            self.mlp[6].bias.data.fill_(bias)
+        else:
+            self.mlp[3].bias.data.fill_(bias)
 
 
 class LearnableSplitter(nn.Module):
@@ -1674,6 +1727,16 @@ class LearnableSplitter(nn.Module):
         self._temp_schedule: str = 'exponential'
         self._temp_enabled: bool = False
         
+        # P10-12: 探索偏置退火状态
+        # 数学形式化:
+        #   b(t) = b₀ · max(0, 1 - t/T_anneal)
+        #   初期 b = b₀ 强制探索，逐渐 b → 0 让 MLP 接管
+        self.register_buffer('_bias_step', torch.tensor(0, dtype=torch.long))
+        self.register_buffer('_bias_total_steps', torch.tensor(0, dtype=torch.long))
+        self.register_buffer('_bias_start', torch.tensor(0.5))  # b₀
+        self.register_buffer('_bias_end', torch.tensor(0.0))    # 终态偏置
+        self._bias_enabled: bool = False
+        
         # P10-1: STE 软分割概率缓存
         # 用于后续辅助损失计算 (P10-4 熵损失, P10-9 Elastic Budget)
         self._cached_split_probs: Dict[int, Tensor] = {}
@@ -1778,6 +1841,113 @@ class LearnableSplitter(nn.Module):
         """禁用自动温度退火。"""
         self._temp_enabled = False
         return self
+    
+    def enable_explore_bias_annealing(
+        self,
+        total_steps: int,
+        b_start: float = 0.5,
+        b_end: float = 0.0,
+    ) -> "LearnableSplitter":
+        """
+        启用 P10-12 探索偏置退火调度。
+        
+        数学形式化
+        ----------
+        问题: 训练初期 avg_tokens=1 的"鸡生蛋"死锁
+            - Xavier 初始化使 E[z] = 0, τ = 0 → P(split) = 0.5
+            - 随机波动可能导致 P(split) < 0.5 → 全不分割
+            - BFS 串行依赖: 一旦不分割，后续深度不被访问
+            - MLP 只见粗糙区域，无法学习细分割 → 死锁
+            
+        解决: 探索偏置 b > 0
+            z → z + b ⟹ P(split) = σ((z + b)/T) > 0.5
+            
+        退火公式:
+            progress = min(1.0, step / total_steps)
+            b(t) = b_start + (b_end - b_start) · progress
+                 = b_start · (1 - progress)  [当 b_end = 0]
+            
+        计算验证 (b_start=0.5, σ_z=1.4, T=1):
+            初期: P(split) = Φ(0.5/1.4) ≈ 0.64
+            终态: P(split) = Φ(0) = 0.5 (纯 MLP 决策)
+            
+        Args:
+            total_steps: 总退火步数 (建议与温度退火一致)
+            b_start: 初始偏置 (默认 0.5)
+            b_end: 终态偏置 (默认 0.0)
+            
+        Returns:
+            self (支持链式调用)
+            
+        Example:
+            >>> splitter.enable_explore_bias_annealing(
+            ...     total_steps=1000,
+            ...     b_start=0.5,
+            ...     b_end=0.0,
+            ... )
+        """
+        if total_steps <= 0:
+            raise ValueError(f"total_steps must be positive, got {total_steps}")
+        
+        self._bias_total_steps.fill_(total_steps)
+        self._bias_start.fill_(b_start)
+        self._bias_end.fill_(b_end)
+        self._bias_step.zero_()
+        self._bias_enabled = True
+        
+        # 设置初始偏置
+        self.complexity_mlp.set_explore_bias(b_start)
+        
+        return self
+    
+    def disable_explore_bias_annealing(self) -> "LearnableSplitter":
+        """禁用探索偏置退火。"""
+        self._bias_enabled = False
+        return self
+    
+    def _update_explore_bias(self) -> float:
+        """
+        更新探索偏置 (内部方法，在 forward 中调用)。
+        
+        数学形式化:
+            progress = min(1.0, step / total)
+            b = b_start + (b_end - b_start) · progress
+            
+        Returns:
+            更新后的偏置值
+        """
+        if not self._bias_enabled:
+            return self.complexity_mlp.get_output_bias()
+        
+        total = self._bias_total_steps.item()
+        if total <= 0:
+            return self.complexity_mlp.get_output_bias()
+        
+        step = self._bias_step.item()
+        progress = min(1.0, step / total)
+        
+        b_s = self._bias_start.item()
+        b_e = self._bias_end.item()
+        
+        # 线性退火 (简单有效)
+        b = b_s + (b_e - b_s) * progress
+        
+        self.complexity_mlp.set_explore_bias(b)
+        self._bias_step.add_(1)
+        
+        return b
+    
+    def get_explore_bias_progress(self) -> Dict[str, Any]:
+        """获取探索偏置退火进度信息。"""
+        return {
+            'enabled': self._bias_enabled,
+            'current_step': self._bias_step.item(),
+            'total_steps': self._bias_total_steps.item(),
+            'progress': self._bias_step.item() / max(1, self._bias_total_steps.item()),
+            'current_bias': self.complexity_mlp.get_output_bias(),
+            'b_start': self._bias_start.item(),
+            'b_end': self._bias_end.item(),
+        }
     
     def _update_temperature(self) -> float:
         """
@@ -1994,7 +2164,16 @@ class LearnableSplitter(nn.Module):
             sigmoid_input = ((complexities - tau_d) / T).clamp(-20.0, 20.0)
             p_split = torch.sigmoid(sigmoid_input)  # [M]
             
-            # 更新统计 (无梯度)
+            # P10-10 修复 (方案 A): 始终缓存软分割概率，确保梯度流
+            # 数学形式化:
+            #   ∂p/∂θ_S = σ'(·) · (1/T) · ∂C_θ/∂θ_S ≠ 0
+            #   缓存 p_split 使得 get_soft_depth_distribution() 可以获得完整梯度链
+            # 关键: 无论 hard 参数如何，都缓存用于辅助损失计算
+            if not hasattr(self, '_cached_split_probs'):
+                self._cached_split_probs = {}
+            self._cached_split_probs[depth] = p_split  # 保留梯度图
+            
+            # 更新统计 (无梯度，仅用于监控)
             with torch.no_grad():
                 self._split_probs[depth] = self._split_probs[depth] + p_split.sum()
                 self._split_counts[depth] = self._split_counts[depth] + M
@@ -2070,9 +2249,11 @@ class LearnableSplitter(nn.Module):
                     split_prob_st = y_st[:, 1]  # [M]
                     should_split = split_prob_st > 0.5  # 用于索引
                     
-                    # 缓存软分割概率用于辅助损失 (P10-4, P10-9)
-                    if not hasattr(self, '_cached_split_probs'):
-                        self._cached_split_probs = {}
+                    # P10-10: Gumbel 路径使用 STE 概率覆盖缓存
+                    # 数学说明: split_prob_st 通过 STE 保留梯度
+                    #   y_st = y_hard - sg(y_soft) + y_soft
+                    #   ∂y_st/∂y_soft = 1 (Straight-Through)
+                    # 这里覆盖 p_split 缓存，使用更准确的 STE 版本
                     self._cached_split_probs[depth] = split_prob_st
                 else:
                     should_split = p_split > 0.5
@@ -2240,6 +2421,10 @@ class LearnableSplitter(nn.Module):
         # P-TEMP-1: 训练模式下自动更新温度
         if self.training and self._temp_enabled:
             self._update_temperature()
+        
+        # P10-12: 训练模式下自动更新探索偏置
+        if self.training and self._bias_enabled:
+            self._update_explore_bias()
         
         H_img, W_img = image_size
         _, _, H_feat, W_feat = features.shape
@@ -3412,26 +3597,28 @@ class LearnableSplitter(nn.Module):
         # P10-NaN-17: 强制 FP32 计算
         dtype = torch.float32
         
-        # 确定使用哪个概率源
-        # P11-18 说明: 缓存来自 forward()，在 forward 后调用此方法可获得准确估计
-        # 如果在 forward 之前调用，使用 EMA 统计值（精度较低，仅用于初始化阶段）
-        use_cached = bool(self._cached_split_probs) and self.training
+        # P10-10 修复 (方案 D): 纯可微分软 Token 计数
+        # 数学形式化:
+        #   访问深度: p_d = mean(_cached_split_probs[d])
+        #     ∂p_d/∂θ_S = (1/M_d) Σ_i σ'(·) · (1/T) · ∂C_θ/∂θ_S ≠ 0
+        #   未访问深度: p_d = σ((0.5 - τ_d) / T)  (阈值先验)
+        #     ∂p_d/∂τ_d = -p_d(1-p_d)/T ≠ 0
+        # 关键: 完全移除 EMA 用于损失计算的路径
         
-        if use_cached:
-            # 训练时使用 STE 缓存的概率 (有梯度)
-            # _cached_split_probs[d] 是深度 d 的分割概率向量 [M_d]
-            # 取平均作为该深度的期望分割率
-            p_splits = []
-            for d in range(self.max_depth + 1):
-                if d in self._cached_split_probs and self._cached_split_probs[d].numel() > 0:
-                    p_d = self._cached_split_probs[d].mean()
-                else:
-                    # 该深度无访问区域，使用 EMA 统计
-                    p_d = self._ema_split_probs[d]
-                p_splits.append(p_d)
-        else:
-            # 推理时使用 EMA 统计 (无梯度)
-            p_splits = [self._ema_split_probs[d] for d in range(self.max_depth + 1)]
+        # 获取当前温度 (用于阈值先验)
+        T = self.log_temperature.exp().clamp(min=0.01)
+        
+        # 构建分割概率列表 (保持梯度)
+        p_splits = []
+        for d in range(self.max_depth + 1):
+            if d in self._cached_split_probs and self._cached_split_probs[d].numel() > 0:
+                # 访问过的深度: 使用缓存 (对 MLP 有梯度)
+                p_d = self._cached_split_probs[d].float().mean()
+            else:
+                # 未访问深度: 阈值先验 (对 τ 和 T 有梯度)
+                prior_input = ((0.5 - self.thresholds[d]) / T).clamp(-20.0, 20.0)
+                p_d = torch.sigmoid(prior_input)
+            p_splits.append(p_d)
         
         # 递推计算期望 Token 数
         # R_0 = batch_size (根区域数)
@@ -3599,24 +3786,38 @@ class LearnableSplitter(nn.Module):
         dtype = torch.float32
         D = self.max_depth
         
-        # 确定使用哪个概率源
-        use_cached = bool(self._cached_split_probs) and self.training
+        # P10-10 修复 (方案 D): 纯可微分软深度分布
+        # 数学形式化:
+        #   访问深度: p_d = mean(_cached_split_probs[d])
+        #     ∂p_d/∂θ_S = (1/M_d) Σ_i σ'(·) · (1/T) · ∂C_θ/∂θ_S ≠ 0
+        #   未访问深度: p_d = σ((0.5 - τ_d) / T)  (阈值先验)
+        #     ∂p_d/∂τ_d = -p_d(1-p_d)/T ≠ 0
+        #     ∂p_d/∂T = -(0.5-τ_d)·p_d(1-p_d)/T² ≠ 0
+        # 关键: 完全移除 EMA 用于损失计算的路径
         
-        # 构建分割概率向量 [D+1]
-        p_splits = torch.zeros(D + 1, device=device, dtype=dtype)
+        # 获取当前温度 (用于阈值先验)
+        T = self.log_temperature.exp().clamp(min=0.01)
         
-        if use_cached:
-            # 训练时使用 STE 缓存的概率 (有梯度)
-            for d in range(D + 1):
-                if d in self._cached_split_probs and self._cached_split_probs[d].numel() > 0:
-                    p_splits[d] = self._cached_split_probs[d].mean()
-                else:
-                    # 该深度无访问区域，使用 EMA 统计 (无梯度)
-                    p_splits[d] = self._ema_split_probs[d]
-        else:
-            # 推理时使用 EMA 统计
-            for d in range(D + 1):
-                p_splits[d] = self._ema_split_probs[d]
+        # 构建分割概率向量 [D+1] - 使用列表收集以保持梯度
+        p_splits_list = []
+        
+        for d in range(D + 1):
+            if d in self._cached_split_probs and self._cached_split_probs[d].numel() > 0:
+                # 访问过的深度: 使用缓存 (对 MLP 有梯度)
+                p_d = self._cached_split_probs[d].float().mean()
+            else:
+                # 未访问深度: 阈值先验 (对 τ 和 T 有梯度)
+                # 假设复杂度 = 0.5 (中性值)，计算在此阈值下的分割概率
+                # 数学: p_d = σ((0.5 - τ_d) / T)
+                # 当 τ_d = 0.5 时，p_d = 0.5 (最大不确定性)
+                # 当 τ_d < 0.5 时，p_d > 0.5 (倾向分割)
+                # 当 τ_d > 0.5 时，p_d < 0.5 (倾向保持)
+                prior_input = ((0.5 - self.thresholds[d]) / T).clamp(-20.0, 20.0)
+                p_d = torch.sigmoid(prior_input)
+            p_splits_list.append(p_d)
+        
+        # 转为张量 (保持梯度)
+        p_splits = torch.stack(p_splits_list)
         
         # 递推计算各深度期望叶节点数
         leaf_counts = torch.zeros(D + 1, device=device, dtype=dtype)
@@ -3646,7 +3847,7 @@ class LearnableSplitter(nn.Module):
         mode: str = 'maximize',
     ) -> Tensor:
         """
-        可微分的软熵损失 (P10-4/P10-5 核心实现)。
+        可微分的软熵损失 (P10-4/P10-5/P10-13 核心实现)。
         
         数学形式化
         ==========
@@ -3656,9 +3857,24 @@ class LearnableSplitter(nn.Module):
             
         其中 p̃(d) 是软深度分布 (来自 get_soft_depth_distribution)。
         
-        损失模式:
-            mode='maximize':  L = -H̃  (最大化熵，鼓励多尺度)
-            mode='target':    L = (H̃ - H_target)²  (匹配目标熵)
+        损失模式 (P10-13 更新):
+            mode='maximize':  
+                L = KL(p̃ || uniform) + w · ReLU(p_max - θ)²
+                  = [log(D+1) - H̃] + w · ReLU(p_max - θ)²
+                
+                P10-13 关键改进:
+                - 旧方案: L = -H̃ ∈ [-log(D+1), 0] (负值！语义混淆)
+                - 新方案: L = log(D+1) - H̃ ∈ [0, log(D+1)] (始终非负)
+                - 梯度方向不变 (∂L/∂θ 相同，仅差常数)
+                - 最小值在均匀分布时取得 (L = 0)
+                
+            mode='target':    
+                L = (H̃ - H_target)²  (匹配目标熵)
+            
+        反崩塌机制 (P10-13 增强):
+            - 阈值 θ = 0.8 (更保守，旧值 0.9)
+            - 权重 w = 1.0 (独立控制，旧值 0.5)
+            - 当 p_max > θ 时触发惩罚，帮助逃离崩塌状态
             
         目标熵设计 (Hilbert Curve ViT 最优化):
             对于 max_depth=D 的系统:
@@ -3667,16 +3883,17 @@ class LearnableSplitter(nn.Module):
             - 推荐目标: H_target = 0.5 × H_max  (平衡探索与专注)
             
             具体值:
-            | D   | H_max  | H_target (50%) |
-            |-----|--------|----------------|
-            | 2   | 1.099  | 0.549          |
-            | 3   | 1.386  | 0.693          |
-            | 4   | 1.609  | 0.805          |
+            | D   | H_max  | KL_max (崩塌) |
+            |-----|--------|---------------|
+            | 2   | 1.099  | 1.099         |
+            | 3   | 1.386  | 1.386         |
+            | 4   | 1.609  | 1.609         |
             
         梯度分析:
             ∂L/∂p̄_d = ∂L/∂H̃ · ∂H̃/∂p̃ · ∂p̃/∂p̄_d
             
             其中:
+            - ∂(log(D+1) - H̃)/∂H̃ = -1 (与 ∂(-H̃)/∂H̃ = -1 相同)
             - ∂H̃/∂p̃(d) = -(1 + log(p̃(d) + ε))
             - ∂p̃/∂p̄_d 通过 get_soft_depth_distribution 的递推传播
             
@@ -3692,7 +3909,7 @@ class LearnableSplitter(nn.Module):
             mode: 'maximize' (最大化熵) 或 'target' (匹配目标)
             
         Returns:
-            标量损失张量
+            标量损失张量 (始终非负)
             
         Raises:
             ValueError: mode='target' 但未提供 target_entropy
@@ -3718,18 +3935,29 @@ class LearnableSplitter(nn.Module):
         
         # 根据模式计算损失
         if mode == 'maximize':
-            # 最大化熵 = 最小化负熵
-            loss = -soft_entropy
+            # P10-13 修复: 使用 KL 散度代替负熵
+            # 数学形式化:
+            #   旧: L = -H̃  ∈ [-log(D+1), 0] (负值！语义混淆)
+            #   新: L = KL(p̃ || uniform) = log(D+1) - H̃  ∈ [0, log(D+1)]
+            #
+            # 优势:
+            #   - 损失始终非负，语义一致 (越小越好)
+            #   - 梯度方向相同 (∂L/∂θ 不变，仅差常数)
+            #   - 最小值在均匀分布时取得 (L = 0)
+            #   - 与其他损失项尺度可比
+            H_max = math.log(self.max_depth + 1)
+            kl_to_uniform = H_max - soft_entropy  # = log(D+1) - H̃ ≥ 0
+            loss = kl_to_uniform
             
-            # P10-NaN-12: 反崩塌机制
-            # 当分布坍缩到单一深度时（dominant_prob → 1），熵损失梯度消失
-            # 添加主导概率惩罚: L_anti = max(0, p_max - threshold)²
-            # 这在 p_max > threshold 时提供直接梯度，帮助分割器逃离崩塌状态
+            # P10-13: 增强反崩塌机制
+            # 改进:
+            #   - 阈值从 0.9 降至 0.8 (更早检测崩塌)
+            #   - 权重从 0.5 增至 1.0 (独立控制)
+            # 数学: penalty = w × ReLU(p_max - θ)²
             dominant_prob = depth_dist.max()
-            collapse_threshold = 0.9  # 当单一深度概率 > 90% 时触发惩罚
+            collapse_threshold = 0.8  # P10-13: 0.9 → 0.8 (更保守)
             anti_collapse_penalty = F.relu(dominant_prob - collapse_threshold).pow(2)
-            # 权重: 当崩塌严重时加大惩罚 (最大额外 0.5 的权重)
-            anti_collapse_weight = 0.5
+            anti_collapse_weight = 1.0  # P10-13: 0.5 → 1.0 (独立权重)
             loss = loss + anti_collapse_weight * anti_collapse_penalty
             
         elif mode == 'target':

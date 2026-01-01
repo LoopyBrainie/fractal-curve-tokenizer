@@ -59,8 +59,10 @@ LEVEL_BIAS_SCALE: float = 0.05
 #: Gumbel-Softmax 起始温度 T_start
 SPLITTER_TEMP_START: float = 1.0
 
-#: Gumbel-Softmax 终止温度 T_end (0.1 接近 hard sampling)
-SPLITTER_TEMP_END: float = 0.1
+#: Gumbel-Softmax 终止温度 T_end
+#: P10-11 修复: 0.1 → 0.3 (梯度放大从10x降至3.3x, 数值稳定)
+#: 数学推导见 scripts/verify_p10_11_temperature_analysis.py
+SPLITTER_TEMP_END: float = 0.3
 
 #: 阈值衰减因子 γ ∈ (0, 1)，每层深度阈值为 τ_d = τ_base · γ^d
 SPLIT_GAMMA: float = 0.85
