@@ -3770,9 +3770,9 @@ def generate_full_report(
     # 14. 错误分析 (P16)
     print("[14/14] Analyzing classification errors...")
     error_analysis = analyze_errors(
-        model, test_loader, device,
+        results,
         class_names=spec.classes,
-        top_k_confusions=10,
+        top_k=10,
     )
     with open(output_dir / "error_analysis.json", 'w') as f:
         json.dump(error_analysis, f, indent=2, default=str)
