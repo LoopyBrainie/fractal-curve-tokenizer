@@ -3736,7 +3736,7 @@ def generate_full_report(
     
     # 11. 架构分析 (P16)
     print("[11/14] Analyzing model architecture...")
-    arch_report = analyze_model_architecture(model, device)
+    arch_report = analyze_model_architecture(model, sample_imgs[:1], device)
     with open(output_dir / "architecture_analysis.json", 'w') as f:
         json.dump(arch_report, f, indent=2, default=str)
     
@@ -4035,8 +4035,11 @@ Examples:
     if args.analyze_architecture:
         print("\n[*] Analyzing model architecture...")
         model, config = load_model_and_config(checkpoint_path, device)
+        spec = DATASETS.get(args.dataset, DATASETS['cifar10'])
         
-        arch_report = analyze_model_architecture(model, device)
+        # 创建示例输入用于架构分析
+        sample_input = torch.randn(1, 3, spec.image_size, spec.image_size, device=device)
+        arch_report = analyze_model_architecture(model, sample_input, device)
         
         print("\n" + "="*60)
         print("MODEL ARCHITECTURE ANALYSIS")
