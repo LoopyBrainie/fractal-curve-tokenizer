@@ -3742,12 +3742,13 @@ def generate_full_report(
     
     # 12. 推理性能基准测试 (P16)
     print("[12/14] Running inference performance benchmark...")
+    # 创建示例输入用于基准测试
+    benchmark_sample = torch.randn(1, 3, spec.image_size, spec.image_size, device=device)
     perf_report = benchmark_inference_performance(
-        model, device, 
-        input_size=spec.image_size,
+        model, benchmark_sample, device,
+        n_warmup=3,
+        n_runs=10,
         batch_sizes=[1, 4, 8, 16],
-        warmup_runs=3,
-        test_runs=10,
     )
     with open(output_dir / "performance_benchmark.json", 'w') as f:
         json.dump(perf_report, f, indent=2, default=str)
@@ -4006,12 +4007,13 @@ Examples:
         model, config = load_model_and_config(checkpoint_path, device)
         spec = DATASETS.get(args.dataset, DATASETS['cifar10'])
         
+        # 创建示例输入用于基准测试
+        benchmark_sample = torch.randn(1, 3, spec.image_size, spec.image_size, device=device)
         perf_report = benchmark_inference_performance(
-            model, device,
-            input_size=spec.image_size,
+            model, benchmark_sample, device,
+            n_warmup=5,
+            n_runs=20,
             batch_sizes=[1, 4, 8, 16, 32],
-            warmup_runs=5,
-            test_runs=20,
         )
         
         print("\n" + "="*60)
