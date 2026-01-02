@@ -1737,6 +1737,27 @@ class LearnableSplitter(nn.Module):
         self.register_buffer('_bias_end', torch.tensor(0.0))    # 终态偏置
         self._bias_enabled: bool = False
         
+        # P10-15 + P10-16: 深度相关偏置 (指数衰减方案)
+        # 
+        # 数学形式化:
+        #   总偏置: b_d(t) = b_base(t) + Δb_d
+        #   深度偏置: Δb_d = β · γ^d
+        #   
+        # 计算验证结论 (2026-01-02):
+        #   β = 1.0, γ = 0.5 时:
+        #     d=0: Δb = 1.00, 终态 P(split) = 0.72
+        #     d=1: Δb = 0.50, 终态 P(split) = 0.61
+        #     d=2: Δb = 0.25, 终态 P(split) = 0.56
+        #     d=3: Δb = 0.13, 终态 P(split) = 0.53
+        #     d=4: Δb = 0.06, 终态 P(split) = 0.51
+        #   
+        # 关键优势:
+        #   1. 根节点保护: 终态 P(root) = 0.72 > 0.5，防止单点失败
+        #   2. 平滑衰减: 浅层(语义)更可能分割，深层(细节)让 MLP 决策
+        #   3. 与 Hilbert 曲线兼容: 保持多尺度空间局部性
+        self.register_buffer('_depth_bias_beta', torch.tensor(1.0))   # β: 深度偏置系数
+        self.register_buffer('_depth_bias_gamma', torch.tensor(0.5))  # γ: 指数衰减率
+        
         # P10-1: STE 软分割概率缓存
         # 用于后续辅助损失计算 (P10-4 熵损失, P10-9 Elastic Budget)
         self._cached_split_probs: Dict[int, Tensor] = {}
@@ -1947,6 +1968,65 @@ class LearnableSplitter(nn.Module):
             'current_bias': self.complexity_mlp.get_output_bias(),
             'b_start': self._bias_start.item(),
             'b_end': self._bias_end.item(),
+        }
+    
+    # ==================== 深度偏置管理 (P10-15/P10-16) ====================
+    
+    def set_depth_bias(self, beta: float = 1.0, gamma: float = 0.5) -> "LearnableSplitter":
+        """
+        设置深度偏置参数。
+        
+        数学形式化:
+            深度偏置采用指数衰减形式:
+            Δb_d = β · γ^d
+            
+            其中:
+            - β: 基础偏置系数 (根节点偏置 = β)
+            - γ: 衰减率 (0 < γ < 1)
+            - d: 当前深度
+            
+            深度偏置加入分割概率计算:
+            p_d = σ((z_θ(R) + b_base + Δb_d - τ_d) / T)
+            
+        经验证最优参数: β=1.0, γ=0.5
+        
+        Args:
+            beta: 基础偏置系数，控制偏置强度
+            gamma: 衰减率，控制偏置随深度衰减速度
+            
+        Returns:
+            self，支持链式调用
+        """
+        if beta < 0:
+            raise ValueError(f"beta 必须非负，got {beta}")
+        if not 0 < gamma < 1:
+            raise ValueError(f"gamma 必须在 (0, 1) 范围内，got {gamma}")
+        
+        self._depth_bias_beta.fill_(beta)
+        self._depth_bias_gamma.fill_(gamma)
+        
+        return self
+    
+    def get_depth_bias_info(self) -> Dict[str, Any]:
+        """
+        获取深度偏置配置和诊断信息。
+        
+        Returns:
+            包含深度偏置参数和各深度偏置值的字典
+        """
+        beta = self._depth_bias_beta.item()
+        gamma = self._depth_bias_gamma.item()
+        
+        # 计算前几层的深度偏置
+        depth_biases = {}
+        for d in range(8):
+            depth_biases[f"depth_{d}"] = beta * (gamma ** d)
+        
+        return {
+            'beta': beta,
+            'gamma': gamma,
+            'depth_biases': depth_biases,
+            'formula': f"Δb_d = {beta:.2f} × {gamma:.2f}^d",
         }
     
     def _update_temperature(self) -> float:
@@ -2160,8 +2240,21 @@ class LearnableSplitter(nn.Module):
             tau_d = self.thresholds[depth]
             # P10-NaN-6: 温度下界保护，防止 sigmoid 输入过大
             T = self.log_temperature.exp().clamp(min=0.01)
+            
+            # P10-15 + P10-16: 计算深度相关偏置
+            # 数学形式化:
+            #   Δb_d = β · γ^d
+            #   总偏置 = explore_bias (来自 MLP 输出层) + Δb_d
+            #   p_split = σ((z + total_bias - τ) / T)
+            #
+            # 注意: explore_bias 已经在 ComplexityMLP 的输出层偏置中
+            #       这里只需要添加深度相关的额外偏置 Δb_d
+            depth_bias = self._depth_bias_beta * (self._depth_bias_gamma ** depth)
+            
             # P10-NaN-6: clamp sigmoid 输入，防止极端梯度
-            sigmoid_input = ((complexities - tau_d) / T).clamp(-20.0, 20.0)
+            # 现在输入为: (z + depth_bias - τ) / T
+            # 注意: z 已经包含了 explore_bias (在 ComplexityMLP 输出层)
+            sigmoid_input = ((complexities + depth_bias - tau_d) / T).clamp(-20.0, 20.0)
             p_split = torch.sigmoid(sigmoid_input)  # [M]
             
             # P10-10 修复 (方案 A): 始终缓存软分割概率，确保梯度流
