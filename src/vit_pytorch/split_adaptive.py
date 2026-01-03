@@ -1762,6 +1762,33 @@ class LearnableSplitter(nn.Module):
         # 用于后续辅助损失计算 (P10-4 熵损失, P10-9 Elastic Budget)
         self._cached_split_probs: Dict[int, Tensor] = {}
         self._cached_complexities: Optional[Tensor] = None
+        
+        # I14-1 修复 (A1): Warmup 强制分割状态
+        # 
+        # 数学形式化:
+        #   问题: Gumbel 采样的随机性可能导致即使 p_split = 0.7，
+        #         实际决策仍然是"不分割"。一旦 epoch 1 所有样本都
+        #         碰巧选择"不分割"，就形成死锁。
+        #   
+        #   解决: 在 warmup 期间，对每个 batch 强制至少 min_force_ratio
+        #         比例的区域进行分割，不受 Gumbel 随机性影响。
+        #   
+        #   公式: forced_split_count = ceil(M * min_force_ratio)
+        #         若 actual_split_count < forced_split_count:
+        #             强制选择 top-(forced_split_count - actual_split_count)
+        #             个 p_split 最高的区域进行分割
+        #   
+        #   min_force_ratio(t) = r_start * (1 - t/T_warmup) + r_end * (t/T_warmup)
+        #   
+        # 计算验证 (max_depth=2, r_start=0.7):
+        #   深度 0: 强制 70% 分割 → V_1 >= 0.7
+        #   深度 1: 强制 70% 分割 → V_2 >= 0.49
+        #   期望 tokens >= 1 + 0.3 + 0.7*4*(0.3) + 0.7*4*0.7*4 ≈ 9.7
+        self.register_buffer('_warmup_force_step', torch.tensor(0, dtype=torch.long))
+        self.register_buffer('_warmup_force_total_steps', torch.tensor(0, dtype=torch.long))
+        self.register_buffer('_warmup_force_ratio_start', torch.tensor(0.7))  # 初始强制分割比例
+        self.register_buffer('_warmup_force_ratio_end', torch.tensor(0.3))    # 结束时强制分割比例
+        self._warmup_force_enabled: bool = False
     
     @property
     def thresholds(self) -> Tensor:
@@ -1968,6 +1995,128 @@ class LearnableSplitter(nn.Module):
             'current_bias': self.complexity_mlp.get_output_bias(),
             'b_start': self._bias_start.item(),
             'b_end': self._bias_end.item(),
+        }
+    
+    # ==================== I14-1 修复: Warmup 强制分割 (A1 方案) ====================
+    
+    def enable_warmup_forced_split(
+        self,
+        total_steps: int,
+        ratio_start: float = 0.7,
+        ratio_end: float = 0.3,
+    ) -> "LearnableSplitter":
+        """
+        启用 I14-1 修复: Warmup 强制分割 (A1 方案)。
+        
+        数学形式化
+        ==========
+        
+        问题根源:
+            Gumbel 噪声的随机性可能导致即使 p_split = 0.7，实际决策仍然
+            是"不分割"。当 batch 中所有样本都碰巧选择"不分割"时，形成死锁。
+            
+            设 p = 0.7, T = 1.0:
+              log(0.3) ≈ -1.20, log(0.7) ≈ -0.36
+              Gumbel std ≈ π/√6 ≈ 1.28
+              若 g_0 - g_1 > 0.84 (发生概率约 25%)，则选择"不分割"
+              
+        解决方案:
+            在 warmup 期间，对每个 batch 的每个深度强制至少 min_force_ratio
+            比例的区域进行分割，不受 Gumbel 随机性影响。
+            
+            forced_split_count = ceil(M * current_ratio)
+            若 actual_split_count < forced_split_count:
+                强制选择 top-(forced_split_count - actual_split_count)
+                个 p_split 最高的区域进行分割
+                
+        退火公式:
+            progress = min(1.0, step / total_steps)
+            current_ratio = ratio_start * (1 - progress) + ratio_end * progress
+            
+        计算验证 (max_depth=2, ratio_start=0.7):
+            深度 0: 强制 70% 分割 → V_1 >= 0.7
+            深度 1: 强制 70% 分割 → V_2 >= 0.49
+            期望 tokens >= 1*(1-0.7) + 4*0.7*(1-0.7) + 16*0.7*0.7 = 8.98
+            
+        与 explore_bias 的区别:
+            - explore_bias: 概率偏置，仍受 Gumbel 随机性影响
+            - warmup_forced_split: 后采样硬约束，完全消除随机性风险
+            
+        Args:
+            total_steps: warmup 总步数
+            ratio_start: 初始强制分割比例 (默认 0.7)
+            ratio_end: 结束时强制分割比例 (默认 0.3)
+            
+        Returns:
+            self (支持链式调用)
+            
+        Example:
+            >>> splitter.enable_warmup_forced_split(
+            ...     total_steps=warmup_epochs * batches_per_epoch,
+            ...     ratio_start=0.7,
+            ...     ratio_end=0.3,
+            ... )
+        """
+        if total_steps <= 0:
+            raise ValueError(f"total_steps must be positive, got {total_steps}")
+        if not 0 <= ratio_start <= 1:
+            raise ValueError(f"ratio_start must be in [0, 1], got {ratio_start}")
+        if not 0 <= ratio_end <= 1:
+            raise ValueError(f"ratio_end must be in [0, 1], got {ratio_end}")
+        
+        self._warmup_force_total_steps.fill_(total_steps)
+        self._warmup_force_ratio_start.fill_(ratio_start)
+        self._warmup_force_ratio_end.fill_(ratio_end)
+        self._warmup_force_step.zero_()
+        self._warmup_force_enabled = True
+        
+        return self
+    
+    def disable_warmup_forced_split(self) -> "LearnableSplitter":
+        """禁用 warmup 强制分割。"""
+        self._warmup_force_enabled = False
+        return self
+    
+    def _get_current_force_ratio(self) -> float:
+        """
+        获取当前强制分割比例 (内部方法)。
+        
+        Returns:
+            当前的强制分割比例 [0, 1]，若未启用则返回 0
+        """
+        if not self._warmup_force_enabled:
+            return 0.0
+        
+        total = self._warmup_force_total_steps.item()
+        if total <= 0:
+            return 0.0
+        
+        step = self._warmup_force_step.item()
+        progress = min(1.0, step / total)
+        
+        r_s = self._warmup_force_ratio_start.item()
+        r_e = self._warmup_force_ratio_end.item()
+        
+        return r_s + (r_e - r_s) * progress
+    
+    def _update_warmup_force_step(self) -> None:
+        """更新 warmup 强制分割步数 (内部方法)。"""
+        if self._warmup_force_enabled:
+            self._warmup_force_step.add_(1)
+            # 检查是否结束
+            if self._warmup_force_step.item() >= self._warmup_force_total_steps.item():
+                self._warmup_force_enabled = False
+    
+    def get_warmup_force_progress(self) -> Dict[str, Any]:
+        """获取 warmup 强制分割进度信息。"""
+        return {
+            'enabled': self._warmup_force_enabled,
+            'current_step': self._warmup_force_step.item(),
+            'total_steps': self._warmup_force_total_steps.item(),
+            'progress': self._warmup_force_step.item() / max(1, self._warmup_force_total_steps.item()),
+            'current_ratio': self._get_current_force_ratio(),
+            'ratio_start': self._warmup_force_ratio_start.item(),
+            'ratio_end': self._warmup_force_ratio_end.item(),
         }
     
     # ==================== 深度偏置管理 (P10-15/P10-16) ====================
@@ -2352,6 +2501,50 @@ class LearnableSplitter(nn.Module):
                     should_split = p_split > 0.5
             
             # ------------------------------------------------------------------
+            # I14-1 修复 (A1): Warmup 强制分割
+            # ------------------------------------------------------------------
+            # 数学形式化:
+            #   问题: Gumbel 随机性可能导致 should_split 全 False
+            #   解决: 强制至少 min_force_ratio 比例的区域分割
+            #   
+            #   算法:
+            #     1. 计算当前强制比例 r = _get_current_force_ratio()
+            #     2. 计算需要分割的最小数量 min_split = ceil(M * r)
+            #     3. 统计实际分割数量 actual_split = should_split.sum()
+            #     4. 若 actual_split < min_split:
+            #          选择 p_split 最高的 (min_split - actual_split) 个
+            #          未分割区域，强制标记为分割
+            #
+            # 梯度保留:
+            #   修改 should_split 不影响梯度，因为它只用于前向路径的索引
+            #   梯度通过 _cached_split_probs 中的 p_split 或 split_prob_st 传播
+            force_ratio = self._get_current_force_ratio()
+            if force_ratio > 0 and M > 0:
+                min_split_count = int(math.ceil(M * force_ratio))
+                actual_split_count = should_split.sum().item()
+                
+                if actual_split_count < min_split_count:
+                    # 需要强制分割更多区域
+                    need_force = min_split_count - int(actual_split_count)
+                    
+                    # 找到未分割区域中 p_split 最高的 need_force 个
+                    not_split_mask = ~should_split
+                    not_split_indices = not_split_mask.nonzero(as_tuple=True)[0]
+                    
+                    if len(not_split_indices) > 0:
+                        # 获取这些区域的 p_split 值
+                        not_split_probs = p_split[not_split_indices]
+                        
+                        # 选择 top-k (k = min(need_force, available))
+                        k = min(need_force, len(not_split_indices))
+                        _, top_k_local_indices = torch.topk(not_split_probs, k)
+                        top_k_global_indices = not_split_indices[top_k_local_indices]
+                        
+                        # 强制标记为分割
+                        should_split = should_split.clone()  # 避免 in-place 修改
+                        should_split[top_k_global_indices] = True
+            
+            # ------------------------------------------------------------------
             # Step 4: 分离保持/分割区域
             # ------------------------------------------------------------------
             keep_mask = ~should_split
@@ -2518,6 +2711,12 @@ class LearnableSplitter(nn.Module):
         # P10-12: 训练模式下自动更新探索偏置
         if self.training and self._bias_enabled:
             self._update_explore_bias()
+        
+        # I14-1 (A1): 训练模式下更新 warmup 强制分割步数
+        # 注意: 实际的强制分割逻辑在 _forward_vectorized_tensor 中执行
+        #       这里只更新步数计数器
+        if self.training and self._warmup_force_enabled:
+            self._update_warmup_force_step()
         
         H_img, W_img = image_size
         _, _, H_feat, W_feat = features.shape
@@ -3694,7 +3893,7 @@ class LearnableSplitter(nn.Module):
         # 数学形式化:
         #   访问深度: p_d = mean(_cached_split_probs[d])
         #     ∂p_d/∂θ_S = (1/M_d) Σ_i σ'(·) · (1/T) · ∂C_θ/∂θ_S ≠ 0
-        #   未访问深度: p_d = σ((0.5 - τ_d) / T)  (阈值先验)
+        #   未访问深度: p_d = σ((0.0 - τ_d) / T) = σ(-τ_d / T)  (阈值先验, I13-1 修复)
         #     ∂p_d/∂τ_d = -p_d(1-p_d)/T ≠ 0
         # 关键: 完全移除 EMA 用于损失计算的路径
         
@@ -3709,7 +3908,10 @@ class LearnableSplitter(nn.Module):
                 p_d = self._cached_split_probs[d].float().mean()
             else:
                 # 未访问深度: 阈值先验 (对 τ 和 T 有梯度)
-                prior_input = ((0.5 - self.thresholds[d]) / T).clamp(-20.0, 20.0)
+                # P11-10 后使用 logit 空间: 中性值 = 0.0 (而非概率空间的 0.5)
+                # 数学: p_d = σ((0 - τ_d) / T) = σ(-τ_d / T)
+                # 当 τ_d = 0 时，p_d = 0.5 (最大不确定性)
+                prior_input = (-self.thresholds[d] / T).clamp(-20.0, 20.0)
                 p_d = torch.sigmoid(prior_input)
             p_splits.append(p_d)
         
@@ -3743,45 +3945,45 @@ class LearnableSplitter(nn.Module):
         N_target: Optional[int] = None,
         lambda_over: float = 0.1,
         lambda_under: float = 0.01,
+        actual_token_count: Optional[int] = None,
+        lambda_collapse: float = 1.0,
     ) -> Tensor:
         """
-        Elastic Budget 弹性预算损失 (P10-9 核心实现)。
+        Elastic Budget 弹性预算损失 (P10-9 核心实现 + I14-1 D1 修复)。
         
         数学形式化
         ==========
         
-        损失函数设计:
-            L_elastic = λ_over · φ(N - N_max) + λ_under · ψ(N_min - N)
+        损失函数设计 (I14-1 D1 增强):
+            L_elastic = λ_over · φ(N - N_max) 
+                      + λ_under · ψ(N_min - N)
+                      + λ_collapse · 𝟙[N_actual < 2]  # D1 新增
             
         其中:
             φ(x) = ReLU(x)² / N_max   # 二次惩罚，越界越严重
             ψ(x) = ReLU(x) / N_max    # 线性软约束，温和引导
+            𝟙[·] = 指示函数，崩溃时触发
+            
+        I14-1 D1 修复:
+            问题: 当 N_actual = 1 且 N_min < batch_size 时，
+                  under_loss = λ_under * (N_min - 1) / norm 可能很小
+                  无法有效惩罚崩溃状态
+                  
+            解决: 添加显式崩溃惩罚
+                  当 actual_token_count < 2 时，触发强惩罚
+                  
+            数学验证:
+                  N_min = 8, N_actual = 1, norm = 64
+                  旧: under_loss = 0.01 * 7 / 64 = 0.0011 (太小!)
+                  新: collapse_loss = 1.0 (强惩罚)
             
         区间行为:
             | 区间           | 损失 | 梯度方向 | 行为     |
             |----------------|------|----------|----------|
-            | N < N_min      | > 0  | ∂L/∂N < 0 → 鼓励增加 N | 软约束 |
-            | N ∈ [N_min, N_max] | = 0 | 0 | Dead Zone，自由探索 |
-            | N > N_max      | > 0  | ∂L/∂N > 0 → 强制减少 N | 二次惩罚 |
-            
-        非对称设计原理 (λ_over >> λ_under):
-            - 细分割捷径是主要威胁 (P10-8)
-            - 用二次惩罚强抑制 N > N_max (过多 tokens)
-            - 用线性约束软引导 N < N_min (过少 tokens)
-            
-            典型比例: λ_over : λ_under = 10 : 1
-            
-        博弈论分析:
-            | 状态 | Splitter 倾向 | Regularizer 倾向 | 均衡 |
-            |------|---------------|------------------|------|
-            | N < N_min | ↗ 增加 | 维持 (低成本) | 轻微增加 |
-            | Dead Zone | 自由 | 自由 | 稳定探索 ✅ |
-            | N > N_max | ↗ 增加 (捷径) | ↓↓ 强抑制 | 强制减少 |
-            
-        Hilbert Curve 约束:
-            - N_max 应为 4^m (完整四叉树层)，确保 Hilbert 排序连贯性
-            - 推荐: N_max ∈ {64, 256, 1024} = {4², 4⁴, 4⁵}
-            - 对于 64×64 输入 (Tiny ImageNet): N_max = 256 = 4⁴
+            | N_actual < 2   | >> 0 | 强 ∂L/∂N < 0 | 崩溃惩罚 |
+            | N < N_min      | > 0  | ∂L/∂N < 0 | 软约束   |
+            | N ∈ [N_min, N_max] | = 0 | 0 | Dead Zone |
+            | N > N_max      | > 0  | ∂L/∂N > 0 | 二次惩罚 |
             
         Args:
             soft_token_count: 可微分的软 Token 计数 (来自 get_soft_token_count)
@@ -3789,7 +3991,9 @@ class LearnableSplitter(nn.Module):
             N_max: Dead Zone 上界 (建议: 4.0 × N_target, 且为 4^m)
             N_target: 目标 Token 数 (仅用于归一化，可选)
             lambda_over: 超出上界惩罚权重 (建议: 0.1)
-            lambda_under: 低于下界约束权重 (建议: 0.01)
+            lambda_under: 低于下界约束权重 (建议: 0.05, D1 提高)
+            actual_token_count: 实际 Token 数量 (可选，用于崩溃检测)
+            lambda_collapse: 崩溃惩罚权重 (建议: 1.0)
             
         Returns:
             elastic_loss: 标量张量，弹性预算损失
@@ -3797,10 +4001,12 @@ class LearnableSplitter(nn.Module):
         Example:
             >>> result = splitter(features, image_size)
             >>> soft_count = splitter.get_soft_token_count(batch_size=B)
+            >>> actual_count = result.num_tokens  # 实际 token 数
             >>> elastic_loss = splitter.get_elastic_budget_loss(
-            ...     soft_count, N_min=32, N_max=256, lambda_over=0.1, lambda_under=0.01
+            ...     soft_count, N_min=8, N_max=64,
+            ...     actual_token_count=actual_count,
+            ...     lambda_collapse=1.0,
             ... )
-            >>> total_loss = main_loss + elastic_loss
         """
         N = soft_token_count
         
@@ -3817,7 +4023,20 @@ class LearnableSplitter(nn.Module):
         under_excess = F.relu(float(N_min) - N)
         under_loss = lambda_under * under_excess / norm
         
-        return over_loss + under_loss
+        # I14-1 D1 修复: 崩溃惩罚
+        # 当实际 token 数 < 2 时，触发强惩罚
+        # 使用可微分的软版本: collapse_loss = λ * sigmoid(threshold - N)
+        collapse_loss = torch.tensor(0.0, device=N.device, dtype=N.dtype)
+        if actual_token_count is not None and actual_token_count < 2:
+            # 硬惩罚: 实际崩溃时触发
+            collapse_loss = torch.tensor(lambda_collapse, device=N.device, dtype=N.dtype)
+        
+        # 软版本崩溃惩罚 (始终有梯度)
+        # 当 soft_token_count 接近 1 时，额外添加软惩罚
+        # 使用 softplus 确保平滑: softplus(2 - N) 当 N < 2 时显著
+        soft_collapse_loss = lambda_collapse * 0.1 * F.softplus(2.0 - N)
+        
+        return over_loss + under_loss + collapse_loss + soft_collapse_loss
 
     # =========================================================================
     # P10-4/P10-5: 可微分软熵损失 (统一解决方案)
@@ -3883,9 +4102,9 @@ class LearnableSplitter(nn.Module):
         # 数学形式化:
         #   访问深度: p_d = mean(_cached_split_probs[d])
         #     ∂p_d/∂θ_S = (1/M_d) Σ_i σ'(·) · (1/T) · ∂C_θ/∂θ_S ≠ 0
-        #   未访问深度: p_d = σ((0.5 - τ_d) / T)  (阈值先验)
+        #   未访问深度: p_d = σ((0.0 - τ_d) / T) = σ(-τ_d / T)  (阈值先验, I13-1 修复)
         #     ∂p_d/∂τ_d = -p_d(1-p_d)/T ≠ 0
-        #     ∂p_d/∂T = -(0.5-τ_d)·p_d(1-p_d)/T² ≠ 0
+        #     ∂p_d/∂T = -τ_d·p_d(1-p_d)/T² ≠ 0  (I13-1: 0.0 替代 0.5)
         # 关键: 完全移除 EMA 用于损失计算的路径
         
         # 获取当前温度 (用于阈值先验)
@@ -3900,12 +4119,12 @@ class LearnableSplitter(nn.Module):
                 p_d = self._cached_split_probs[d].float().mean()
             else:
                 # 未访问深度: 阈值先验 (对 τ 和 T 有梯度)
-                # 假设复杂度 = 0.5 (中性值)，计算在此阈值下的分割概率
-                # 数学: p_d = σ((0.5 - τ_d) / T)
-                # 当 τ_d = 0.5 时，p_d = 0.5 (最大不确定性)
-                # 当 τ_d < 0.5 时，p_d > 0.5 (倾向分割)
-                # 当 τ_d > 0.5 时，p_d < 0.5 (倾向保持)
-                prior_input = ((0.5 - self.thresholds[d]) / T).clamp(-20.0, 20.0)
+                # P11-10 后使用 logit 空间: 中性值 = 0.0 (而非概率空间的 0.5)
+                # 数学: p_d = σ(-τ_d / T)
+                # 当 τ_d = 0 时，p_d = 0.5 (最大不确定性)
+                # 当 τ_d < 0 时，p_d > 0.5 (倾向分割)
+                # 当 τ_d > 0 时，p_d < 0.5 (倾向保持)
+                prior_input = (-self.thresholds[d] / T).clamp(-20.0, 20.0)
                 p_d = torch.sigmoid(prior_input)
             p_splits_list.append(p_d)
         
@@ -4117,6 +4336,8 @@ class LearnableSplitter(nn.Module):
         elastic_N_max: int = 256,
         elastic_lambda_over: float = 0.1,
         elastic_lambda_under: float = 0.01,
+        elastic_lambda_collapse: float = 1.0,  # I14-1 D1: 崩溃惩罚权重
+        actual_token_count: Optional[int] = None,  # I14-1 D1: 实际 token 数（用于崩溃检测）
         entropy_target: Optional[float] = None,
         entropy_weight: float = 0.1,
         entropy_mode: str = 'maximize',
@@ -4142,6 +4363,8 @@ class LearnableSplitter(nn.Module):
             elastic_N_max: Elastic Budget 上界
             elastic_lambda_over: 超出上界惩罚权重
             elastic_lambda_under: 低于下界约束权重
+            elastic_lambda_collapse: 崩溃惩罚权重 (I14-1 D1, 建议: 1.0)
+            actual_token_count: 实际 token 数量 (I14-1 D1, 用于崩溃检测)
             entropy_target: 软熵目标值 (仅 entropy_mode='target' 时使用)
             entropy_weight: 软熵损失权重
             entropy_mode: 'maximize' (最大化熵) 或 'target' (匹配目标)
@@ -4154,12 +4377,15 @@ class LearnableSplitter(nn.Module):
                 - 'soft_entropy_loss': 软熵损失（如果 include_soft_entropy=True）
                 
         Example:
+            >>> # I14-1 D1: 传递 actual_token_count 以启用崩溃惩罚
             >>> losses = splitter.get_auxiliary_losses(
             ...     features, image_size,
             ...     include_elastic_budget=True,
             ...     include_soft_entropy=True,
             ...     batch_size=B,
             ...     elastic_N_min=32, elastic_N_max=256,
+            ...     elastic_lambda_collapse=1.0,
+            ...     actual_token_count=result.num_tokens,
             ...     entropy_mode='maximize',
             ... )
             >>> total_aux = sum(losses.values())
@@ -4174,7 +4400,7 @@ class LearnableSplitter(nn.Module):
         if include_balance and features is not None and image_size is not None:
             losses['balance_loss'] = self.get_soft_balance_loss(features, image_size, grid_size)
         
-        # P10-9: Elastic Budget 弹性预算损失
+        # P10-9 + I14-1 D1: Elastic Budget 弹性预算损失（含崩溃惩罚）
         if include_elastic_budget:
             soft_count = self.get_soft_token_count(batch_size=batch_size)
             losses['elastic_budget_loss'] = self.get_elastic_budget_loss(
@@ -4183,6 +4409,8 @@ class LearnableSplitter(nn.Module):
                 N_max=elastic_N_max,
                 lambda_over=elastic_lambda_over,
                 lambda_under=elastic_lambda_under,
+                actual_token_count=actual_token_count,  # I14-1 D1
+                lambda_collapse=elastic_lambda_collapse,  # I14-1 D1
             )
         
         # P10-4/P10-5: 可微分软熵损失

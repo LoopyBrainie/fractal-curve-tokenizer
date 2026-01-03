@@ -54,6 +54,7 @@ import torch.nn as nn
 
 from .base_tokenizer import BaseTokenizer, TokenizerOutput, TokenSequence
 from .config_fractal import FractalConfig
+from .embed_fractal_path import VectorizedPathEncoder  # I12-3: 用于计算路径
 
 
 class StreamingFractalTokenizerV3(BaseTokenizer):
@@ -601,8 +602,27 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 向量化分配
         tokens[batch_indices, token_positions] = all_tokens.to(dtype)
         
-        # levels_info: [depth, 0, 0, ..., 0]
+        # =====================================================================
+        # I12-3 修复: 从 regions 计算四叉树路径填充 levels_info
+        # 原问题: levels_info[:, :, 1:] 全为零，导致所有 token 共享相同的路径编码
+        # 修复方案: 使用 VectorizedPathEncoder.compute_paths_from_regions 计算正确路径
+        # =====================================================================
         levels_info[batch_indices, token_positions, 0] = depths
+        
+        # 计算四叉树路径 (基于区域中心的空间位置)
+        # regions: [N_total, 4] -> paths: [N_total, max_depth]
+        if N_total > 0:
+            # 获取图像尺寸 (Hilbert 曲线要求方形，使用较大边)
+            img_size = max(self.image_size) if isinstance(self.image_size, tuple) else self.image_size
+            paths = VectorizedPathEncoder.compute_paths_from_regions(
+                tensor_result.regions,  # [N_total, 4]
+                img_size,
+                self.max_depth
+            )  # [N_total, max_depth]
+            
+            # 填充路径到 levels_info
+            # levels_info 格式: [depth, path[0], path[1], ..., path[max_depth-1]]
+            levels_info[batch_indices, token_positions, 1:] = paths
         
         # P11-3: 分配 regions 到 padded buffer
         padded_regions[batch_indices, token_positions] = tensor_result.regions

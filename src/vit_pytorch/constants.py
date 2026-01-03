@@ -33,7 +33,8 @@ from __future__ import annotations
 # ==================== 层级相关常量 ====================
 
 #: 默认最大递归层级（当未指定 max_level 时使用）
-DEFAULT_MAX_LEVEL: int = 10
+#: P11-2/I12-5: 与代码中的默认值保持一致
+DEFAULT_MAX_LEVEL: int = 8
 
 #: 系统支持的最大层级上限
 MAX_SUPPORTED_LEVEL: int = 50
@@ -68,9 +69,9 @@ SPLITTER_TEMP_END: float = 0.3
 SPLIT_GAMMA: float = 0.85
 
 #: LearnableSplitter 初始基础阈值 (用于 MLP 参数初始化)
-#: 注意: 这不同于已废弃的规则分割器的 tau_0=0.15
-#: LearnableSplitter 使用 sigmoid 输出 C_θ(R) ∈ [0,1]，所以 0.5 是中心初始化
-LEARNABLE_INIT_TAU_BASE: float = 0.5
+#: P11-10 修复: 使用 logit 空间初始化，τ₀ = 0.0 (对称初始化)
+#: 注意: split_adaptive.py 中硬编码为 0.0，此常量仅为文档目的
+LEARNABLE_INIT_TAU_BASE: float = 0.0
 
 #: LearnableSplitter 初始阈值衰减 (用于 MLP 参数初始化)
 LEARNABLE_INIT_TAU_GAMMA: float = 0.85
