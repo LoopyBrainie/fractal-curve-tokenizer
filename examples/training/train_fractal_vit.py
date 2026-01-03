@@ -54,6 +54,30 @@ P10 训练稳定性修复 (2025-01-14)
    - Dead Zone [N_min, N_max] 内零惩罚
    - 非对称惩罚: λ_over=0.1 >> λ_under=0.01
 
+I13 数学形式化全面审查 (2026-01-03)
+---------------------------------------
+全面审查核心模块数学一致性:
+
+1. I13-1: 阈值先验值修复 - 0.5 → 0.0 (logit 空间中性值)
+   - 修复位置: get_soft_token_count, get_soft_depth_distribution
+   - 公式: p_d = σ((0.0 - τ_d) / T) = σ(-τ_d / T)
+   - 效果: 当 τ_d = 0 时，p_d = 0.5 (正确的最大不确定性)
+
+I14 分割器初始化健壮性 (2026-01-03)
+-----------------------------------
+解决 warmup 阶段强制分割与梯度稳定性问题:
+
+1. I14-1 A1: Warmup 强制分割
+   - enable_warmup_forced_split(steps) API
+   - 前 N 步内强制至少 70% 区域分割，消除 Gumbel 随机性死锁
+   
+2. I14-1 D1: 弹性预算崩溃惩罚
+   - 当 actual_tokens < 2 时触发强惩罚
+   - 公式: L_collapse = λ_collapse · 𝟙[N_actual < 2]
+   - 软版本: L_soft_collapse = λ · 0.1 · softplus(2 - N)
+   - 参数: --elastic-lambda-collapse (默认 1.0)
+   - API: get_auxiliary_losses() 现在正确传递 actual_token_count
+
 P11 数学形式化审查 (2025-12-30)
 --------------------------------
 架构审查和代码简化:
@@ -289,6 +313,7 @@ class TrainingConfig:
     elastic_N_max: int  # 弹性预算上界（Dead Zone 右边界）
     elastic_lambda_over: float  # 超出上界惩罚权重
     elastic_lambda_under: float  # 低于下界约束权重
+    elastic_lambda_collapse: float  # I14-1 D1: 崩溃惩罚权重（建议 1.0）
     
     # 训练
     epochs: int
@@ -1463,7 +1488,7 @@ def train_epoch(
             print(f"[DEBUG] Batch 0: 开始 forward pass, imgs.dtype={imgs.dtype}...", flush=True)
         
         with get_amp_context(device, config.use_amp):
-            outs, _ = model(imgs, return_aux_info=True)
+            outs, aux_infos = model(imgs, return_aux_info=True)  # I14-1 D1: 捕获 aux_info 用于崩溃检测
             if i == 0 and use_mixup:
                 print(f"[DEBUG] Batch 0: forward 完成，outs.shape={outs.shape}", flush=True)
             
@@ -1519,11 +1544,19 @@ def train_epoch(
             
             # P10-4/P10-9: 可学习分割器辅助损失（推荐使用统一接口）
             # 包含: 软熵损失 + 弹性预算损失 + 阈值 barrier 正则化
+            # I14-1 D1: 新增崩溃惩罚，需要传递 actual_token_count
             splitter_loss = None
             splitter_metrics = {}
             if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
                 splitter = model.tokenizer.splitter
                 if hasattr(splitter, 'get_auxiliary_losses'):
+                    # I14-1 D1: 计算 batch 中的平均 token 数用于崩溃检测
+                    actual_token_count = None
+                    if aux_infos is not None and len(aux_infos) > 0:
+                        token_counts = [info.get('num_tokens', 0) for info in aux_infos if isinstance(info, dict)]
+                        if token_counts:
+                            actual_token_count = int(sum(token_counts) / len(token_counts))
+                    
                     aux_losses = splitter.get_auxiliary_losses(
                         features=model.tokenizer._last_features,
                         image_size=(imgs.shape[2], imgs.shape[3]),
@@ -1535,6 +1568,8 @@ def train_epoch(
                         elastic_N_max=config.elastic_N_max,
                         elastic_lambda_over=config.elastic_lambda_over,
                         elastic_lambda_under=config.elastic_lambda_under,
+                        elastic_lambda_collapse=config.elastic_lambda_collapse,  # I14-1 D1
+                        actual_token_count=actual_token_count,  # I14-1 D1: 用于崩溃检测
                         entropy_target=config.soft_entropy_target,
                         entropy_weight=config.soft_entropy_weight,
                         entropy_mode=config.soft_entropy_mode,
@@ -2324,6 +2359,8 @@ def main():
                        help="Penalty weight for exceeding upper bound (default: 0.1)")
     parser.add_argument("--elastic-lambda-under", type=float, default=0.01,
                        help="Penalty weight for falling below lower bound (default: 0.01)")
+    parser.add_argument("--elastic-lambda-collapse", type=float, default=1.0,
+                       help="I14-1 D1: Collapse penalty weight (default: 1.0, triggers when actual_tokens < 2)")
     
     # 训练
     parser.add_argument("--epochs", type=int, default=50)
@@ -2448,6 +2485,7 @@ def main():
         elastic_N_max=args.elastic_N_max,
         elastic_lambda_over=args.elastic_lambda_over,
         elastic_lambda_under=args.elastic_lambda_under,
+        elastic_lambda_collapse=args.elastic_lambda_collapse,  # I14-1 D1
         # 训练配置
         epochs=args.epochs,
         learning_rate=args.lr,
@@ -2823,17 +2861,60 @@ def main():
             print(f"     Schedule: exponential")
             splitter_annealing_enabled = True
         
-        # 启用探索偏置退火 (P10-12)
+        # 启用探索偏置退火 (P10-12 + P10-15)
+        # P10-15 修复: 偏置退火与温度退火同步，延迟到 warmup 后开始
+        # 数学形式化:
+        #   warmup 期间: b = b_warmup = 0.6 (固定高探索偏置)
+        #   post-warmup: b(t) = b_warmup + (b_end - b_warmup) · progress
+        #   与温度退火同步，使 b 和 T 同时衰减，避免时序失配
         if hasattr(splitter, 'enable_explore_bias_annealing'):
             splitter.enable_explore_bias_annealing(
-                total_steps=total_training_steps,
-                b_start=0.5,  # 初始偏置: P(split) ≈ 0.64
+                total_steps=post_warmup_steps,  # P10-15: 与温度退火同步
+                b_start=0.6,  # P10-15: 提高初始偏置 (warmup 期间固定)
                 b_end=0.0,    # 终态: 纯 MLP 决策
             )
-            print(f"[OK] 启用 P10-12 探索偏置退火:")
-            print(f"     Bias: 0.5 → 0.0")
+            print(f"[OK] 启用 P10-12/P10-15 探索偏置退火:")
+            print(f"     Bias: 0.6 → 0.0")
+            print(f"     Steps: {post_warmup_steps} (与温度退火同步)")
             print(f"     目的: 防止训练初期 avg_tokens=1 的'鸡生蛋'死锁")
             splitter_annealing_enabled = True
+        
+        # I14-1 修复 (A1): 启用 Warmup 强制分割
+        # 数学形式化:
+        #   问题: Gumbel 噪声随机性可能导致即使 p_split=0.7，实际决策
+        #         仍然是"不分割"。一旦所有样本都碰巧选择"不分割"，形成死锁。
+        #   解决: 在 warmup 期间强制至少 ratio 比例的区域分割
+        #   公式: forced_split_count = ceil(M * current_ratio)
+        #   
+        # 与 explore_bias 的区别:
+        #   - explore_bias: 概率偏置，仍受 Gumbel 随机性影响
+        #   - warmup_forced_split: 后采样硬约束，完全消除随机性风险
+        if hasattr(splitter, 'enable_warmup_forced_split'):
+            warmup_steps = config.splitter_temp_warmup * batches_per_epoch
+            splitter.enable_warmup_forced_split(
+                total_steps=warmup_steps,
+                ratio_start=0.7,  # 初始强制 70% 分割
+                ratio_end=0.3,    # 结束时强制 30% 分割
+            )
+            print(f"[OK] 启用 I14-1 A1 Warmup 强制分割:")
+            print(f"     Ratio: 0.7 → 0.3")
+            print(f"     Steps: {warmup_steps} (warmup 期间)")
+            print(f"     目的: 消除 Gumbel 随机性导致的训练死锁")
+            splitter_annealing_enabled = True
+        
+        # 配置深度偏置 (P10-16: 根节点单点失效保护)
+        # 数学形式化:
+        #   Δb_d = β · γ^d
+        #   β=1.0: 根节点获得最大偏置保护
+        #   γ=0.5: 每深入一层偏置减半
+        #   计算验证: P(root split) > 0.7 即使在终态
+        if hasattr(splitter, 'set_depth_bias'):
+            splitter.set_depth_bias(beta=1.0, gamma=0.5)
+            depth_info = splitter.get_depth_bias_info()
+            print(f"[OK] 启用 P10-16 深度偏置保护:")
+            print(f"     公式: {depth_info['formula']}")
+            print(f"     根节点偏置: Δb_0 = {depth_info['depth_biases']['depth_0']:.2f}")
+            print(f"     深度1偏置: Δb_1 = {depth_info['depth_biases']['depth_1']:.2f}")
     
     if not splitter_annealing_enabled:
         print(f"[INFO] LearnableSplitter 退火未启用 (不支持或未使用可学习分割器)")
@@ -2848,28 +2929,42 @@ def main():
         if device.type == 'cuda':
             torch.cuda.empty_cache()
         
-        # P7-7: 温度退火调度 (使用内置 LearnableSplitter.enable_temperature_annealing)
+        # P7-7 + P10-15: 温度退火和偏置退火调度 (同步控制)
         # 说明: 温度退火已在训练开始前通过 enable_temperature_annealing() 启用
         #       在 forward() 中自动更新，无需手动调用 scheduler.step()
-        #       但 warmup 期间需要禁用退火，保持 T_start
+        #       但 warmup 期间需要禁用退火，保持 T_start 和 b_warmup
         if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
             splitter = model.tokenizer.splitter
             if epoch <= config.splitter_temp_warmup:
-                # Warmup 阶段：暂时禁用自动退火，固定 T_start
+                # Warmup 阶段：暂时禁用自动退火，固定 T_start 和 b_warmup
                 if hasattr(splitter, 'disable_temperature_annealing'):
                     splitter.disable_temperature_annealing()
                     splitter.set_temperature(config.splitter_temp_start)
+                # P10-15: 偏置退火也在 warmup 期间禁用，固定高探索偏置
+                if hasattr(splitter, 'disable_explore_bias_annealing'):
+                    splitter.disable_explore_bias_annealing()
+                    if hasattr(splitter.complexity_mlp, 'set_explore_bias'):
+                        splitter.complexity_mlp.set_explore_bias(0.6)  # warmup 期间固定偏置
             elif epoch == config.splitter_temp_warmup + 1:
-                # Warmup 结束：重新启用退火
+                # Warmup 结束：重新启用温度退火和偏置退火
+                post_warmup_steps = max(1, (config.epochs - config.splitter_temp_warmup) * (len(train_loader) // config.accum_steps))
+                
+                # 重新启用温度退火
                 if hasattr(splitter, 'enable_temperature_annealing'):
-                    post_warmup_steps = max(1, (config.epochs - config.splitter_temp_warmup) * (len(train_loader) // config.accum_steps))
                     splitter.enable_temperature_annealing(
                         total_steps=post_warmup_steps,
                         T_start=config.splitter_temp_start,
                         T_end=config.splitter_temp_end,
                         schedule='exponential',
                     )
-                    print(f"[INFO] Epoch {epoch}: 温度退火正式开始 (warmup 结束)")
+                # P10-15: 同步启用偏置退火
+                if hasattr(splitter, 'enable_explore_bias_annealing'):
+                    splitter.enable_explore_bias_annealing(
+                        total_steps=post_warmup_steps,
+                        b_start=0.6,
+                        b_end=0.0,
+                    )
+                print(f"[INFO] Epoch {epoch}: 温度退火和偏置退火正式开始 (warmup 结束)")
         
         # Warmup 阶段禁用 Mixup/CutMix
         # 原因: warmup 阶段学习率较低，模型需要学习基本特征
