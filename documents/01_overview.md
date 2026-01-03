@@ -26,9 +26,9 @@ Input Image (B, C, H, W)
 ┌───────────────────────────────────────────────┐
 │       StreamingFractalTokenizerV3             │
 │  ┌─────────────────────────────────────────┐  │
-│  │ 1. Compute Complexity: C(R)             │  │
-│  │ 2. Adaptive Quadtree Split              │  │
-│  │ 3. Region Pooling via HilbertPatchEmbed │  │
+│  │ 1. Learnable Complexity: C_theta(R)     │  │
+│  │ 2. Differentiable Quadtree Split        │  │
+│  │ 3. Region Pooling via ROI-Align         │  │
 │  │ 4. Hilbert Curve Reordering             │  │
 │  └─────────────────────────────────────────┘  │
 └───────────────────────────────────────────────┘
@@ -89,7 +89,7 @@ Input Image (B, C, H, W)
 | **L3** | Pipeline | `tokenizer_streaming.py` | `StreamingFractalTokenizerV3` |
 |        |          | `block_transformer.py` | `FractalTransformer` |
 | **L2** | Components | `attn_hilbert_bias.py` | `HilbertAwareMultiScaleAttention`, `LCAHilbertBias` |
-|        |            | `split_adaptive.py` | `BalancedGreedySplitter`, `FixedBudgetDPSplitter` |
+|        |            | `split_adaptive.py` | `LearnableSplitter` (Scheme L) |
 |        |            | `embed_hilbert_patch.py` | `HilbertNativePatchEmbed` |
 |        |            | `ffn_swiglu.py` | `SwiGLUFFN`, `AdaptiveFractalFeedForward` |
 |        |            | `embed_fractal_position.py` | `FractalPositionEmbedding` |

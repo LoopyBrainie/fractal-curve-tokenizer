@@ -44,10 +44,12 @@ class FractalTransformer(nn.Module):
         mlp_dim: int = None,
         dropout: float = 0.0,
         drop_path: float = 0.0,
-        max_level: int = 50,
-        use_hilbert_bias: bool = True,
-        bias_mode: str = 'lca',
+        max_level: int = 8,
+        drop_path_rate: float = 0.1,
         ffn_type: str = 'swiglu_level',
+        use_checkpoint: bool = False,
+        lca_temperature: float = 1.5,
+        learnable_temperature: bool = True,
     ):
         ...
 ```
@@ -63,8 +65,9 @@ class FractalTransformer(nn.Module):
 | `mlp_dim` | int | dim × 4 | FFN hidden dimension |
 | `dropout` | float | 0.0 | Dropout rate |
 | `drop_path` | float | 0.0 | DropPath rate |
-| `bias_mode` | str | 'lca' | Hilbert bias mode |
 | `ffn_type` | str | 'swiglu_level' | FFN type |
+| `lca_temperature` | float | 1.5 | LCA bias temperature |
+| `learnable_temperature` | bool | True | Learnable temperature |
 
 ### Forward Pass
 

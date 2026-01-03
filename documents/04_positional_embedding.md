@@ -29,11 +29,13 @@ $$E_{depth}(d) = W_{depth}[d], \quad W_{depth} \in \mathbb{R}^{(d_{max}+1) \time
 
 Aggregated quadrant embeddings along the path:
 
-$$E_{path}(p) = \sum_{i=1}^{d} W_{level}[i] \odot W_{quad}[q_i]$$
+$$E_{path}(p) = \frac{1}{\sqrt{d}} \sum_{i=1}^{d} W_{quad}[L_i \cdot 4 + q_i]$$
 
 where:
-- $W_{level} \in \mathbb{R}^{d_{max} \times D}$: Level-specific weights
-- $W_{quad} \in \mathbb{R}^{4 \times D}$: Quadrant embeddings
+- $W_{quad} \in \mathbb{R}^{(d_{max} \cdot 4) \times D}$: Flattened level-quadrant embeddings
+- $L_i$: Level index of the $i$-th step
+- $q_i$: Quadrant index of the $i$-th step
+- $\frac{1}{\sqrt{d}}$: Normalization factor to maintain constant variance across depths (STAB-4 fix)
 
 ### 4.2.4 Fusion Network
 

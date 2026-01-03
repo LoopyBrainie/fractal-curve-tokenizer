@@ -25,7 +25,7 @@ where:
 
 ## 5.3 Hilbert Bias Modes
 
-### 5.3.1 LCA Hilbert Bias (Recommended)
+### 5.3.1 LCA Hilbert Bias (Standard)
 
 **Mathematical definition**:
 
@@ -34,43 +34,21 @@ $$B[i,j] = \tau_h \cdot \text{LCAEmbed}(\text{LCA}(i, j))$$
 where:
 - $\text{LCA}(i, j)$: Lowest Common Ancestor depth in quadtree
 - $\text{LCAEmbed}: [0, d_{max}] \to \mathbb{R}^H$: Learnable embedding
-- $\tau_h$: Temperature parameter (learnable)
+- $\tau_h$: Per-head learnable temperature parameter (initialized to $\approx 1.5$)
 
 **Properties**:
 - Parameter count: ~100 (99.8% reduction vs low-rank)
 - Explicit geometric meaning: LCA depth ≈ spatial distance
 - Efficient computation via path comparison
+- **Robustness**: LCA is computed directly from region coordinates to ensure correctness (P11-3 fix).
 
 **LCA Computation**:
 
-$$\text{LCA}(i, j) = \max\{k : p_i[1:k] = p_j[1:k]\}$$
+$$\text{LCA}(i, j) = \text{Depth}(\text{SmallestBoundingBox}(R_i, R_j))$$
 
-where $p_i, p_j$ are quadtree paths.
+This is implemented by vectorizing the region coordinates and computing the intersection depth.
 
-### 5.3.2 Low-Rank Hilbert Bias
-
-**Mathematical definition**:
-
-$$B[i,j] = \phi(p_i)^T \cdot \psi(p_j)$$
-
-where $\phi, \psi: \mathbb{R}^d \to \mathbb{R}^r$ are learnable projections.
-
-**Properties**:
-- Parameter count: ~50K
-- Complexity: $O(N \cdot r)$ vs $O(N^2)$
-- Memory efficient for large sequences
-
-### 5.3.3 Hierarchical Hilbert Bias
-
-**Mathematical definition**:
-
-$$B[i,j] = \sum_{\ell=1}^{L} b^{(\ell)}(q_i^{(\ell)}, q_j^{(\ell)})$$
-
-where $b^{(\ell)}: [0,3]^2 \to \mathbb{R}$ are level-specific bias functions.
-
-**Properties**:
-- Interpretable per-level contributions
-- Factorized representation
+*Note: Low-Rank Hilbert Bias and Hierarchical Hilbert Bias have been removed to simplify the architecture.*
 
 ---
 
@@ -111,9 +89,9 @@ Deeper tokens (finer resolution) use smaller scaling factors.
 
 ### Class: HilbertAwareMultiScaleAttention
 
-```python
-class HilbertAwareMultiScaleAttention(nn.Module):
-    def __init__(
+```pythonSoftplus}(\text{LevelScaleEmb}(d))$$
+
+Deeper tokens (finer resolution) use smaller scaling factors. The softplus activation ensures positive scaling factors (STAB-3)
         self,
         dim: int,
         heads: int = 8,

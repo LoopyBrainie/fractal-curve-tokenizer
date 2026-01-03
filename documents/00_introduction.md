@@ -83,7 +83,7 @@ model = FractalCurveViT(
     heads=6,
     mlp_dim=768,
     tokenizer_type='streaming_v3',  # Variable Depth Tokens
-    bias_mode='lca',                # LCA Hilbert Bias
+    hilbert_bias_mode='lca',        # LCA Hilbert Bias
 )
 
 images = torch.randn(4, 3, 224, 224)

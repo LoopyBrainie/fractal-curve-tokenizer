@@ -10,93 +10,57 @@ The `StreamingFractalTokenizerV3` implements **Variable Depth Tokenization** via
 
 ### 3.2.1 Tokenization Pipeline
 
-$$I \xrightarrow{\text{Split}} \{R_i\}_{i=1}^{N} \xrightarrow{\text{Embed}} \{t_i\}_{i=1}^{N} \xrightarrow{\text{Sort}} \{t_{\pi(i)}\}_{i=1}^{N}$$
+$$I \xrightarrow{\text{SharedConv}} F \xrightarrow{\text{Split}} \{R_i\}_{i=1}^{N} \xrightarrow{\text{Embed}} \{t_i\}_{i=1}^{N} \xrightarrow{\text{Sort}} \{t_{\pi(i)}\}_{i=1}^{N}$$
 
 where:
 - $I \in \mathbb{R}^{C \times H \times W}$: Input image
+- $F \in \mathbb{R}^{D \times H' \times W'}$: Shared feature map
 - $R_i$: Quadtree region (axis-aligned rectangle)
 - $t_i \in \mathbb{R}^D$: Token embedding
 - $\pi$: Hilbert curve permutation
 
-### 3.2.2 Complexity Function
+### 3.2.2 Learnable Complexity Function
 
-The splitting decision is based on a normalized complexity measure:
+The splitting decision is based on a learnable complexity measure estimated from region features:
 
-$$C(R) = \alpha \cdot C_{var}(R) + (1 - \alpha) \cdot C_{grad}(R)$$
-
-where:
-
-$$C_{var}(R) = \frac{\text{Var}(R)}{\text{Var}(R) + \sigma_0^2}, \quad C_{grad}(R) = \frac{G(R)}{G(R) + g_0^2}$$
-
-- $\text{Var}(R)$: Pixel variance within region $R$
-- $G(R)$: Gradient energy (sum of squared gradients)
-- $\alpha \in [0, 1]$: Balance parameter (default: 0.5)
-- $\sigma_0^2, g_0^2$: Normalization constants
-
-### 3.2.3 Depth-Dependent Threshold
-
-$$\tau_d = \tau_0 \cdot \gamma^d$$
+$$C_\theta(R) = \sigma(\text{MLP}(\text{ROI}(F, R)))$$
 
 where:
-- $\tau_0$: Root threshold (default: 0.15)
-- $\gamma$: Decay factor (default: 0.85)
-- $d$: Current depth
+- $\text{ROI}(F, R)$: ROI-Aligned features for region $R$
+- $\text{MLP}$: Multi-layer perceptron
+- $\sigma$: Sigmoid activation
+
+This replaces the previous heuristic-based complexity (variance + gradient) with an end-to-end differentiable estimator.
+
+### 3.2.3 Learnable Threshold
+
+The splitting threshold is depth-dependent and learnable:
+
+$$\tau_d = \tau_{base,d} + \delta_d$$
+
+where:
+- $\tau_{base,d}$: Base threshold for depth $d$
+- $\delta_d$: Learnable offset parameter
 
 **Splitting criterion**:
-$$\text{Split}(R) \iff C(R) > \tau_d \land d < d_{max} \land \text{size}(R) \geq \text{min\_size}$$
+$$\text{Split}(R) \iff C_\theta(R) > \tau_d \land d < d_{max} \land \text{size}(R) \geq \text{min\_size}$$
+
+The decision is made differentiable via Gumbel-Softmax during training.
 
 ---
 
 ## 3.3 Splitting Schemes
 
-### 3.3.1 Balanced Greedy Splitting (Scheme B)
+### 3.3.1 Learnable Splitting (Scheme L)
 
-**Algorithm**:
+**End-to-end differentiable splitting** via Gumbel-Softmax (Standard):
 
-```
-Input: Image I, config cfg
-Output: Set of leaf regions {R_i}
-
-1. Initialize priority queue Q with root region
-2. While Q is not empty:
-   a. Pop region R with highest complexity
-   b. If Split(R):
-      - Add 4 children to Q
-   c. Else:
-      - Add R to output set
-3. Post-process for 2:1 balance constraint
-```
-
-**2:1 Balance Constraint**: Adjacent regions differ by at most 1 level in depth.
-
-$$\forall R_i, R_j \text{ adjacent}: |d_i - d_j| \leq 1$$
-
-This ensures smooth transitions and is enforced via iterative refinement.
-
-### 3.3.2 Fixed Budget DP Splitting (Scheme C)
-
-**Objective**:
-$$\min_{\{R_i\}} \sum_{i=1}^{N} C(R_i) \quad \text{s.t.} \quad |\{R_i\}| = K$$
-
-**Algorithm**: Dynamic programming on quadtree structure.
-
-```
-Input: Image I, token budget K
-Output: Optimal split with exactly K tokens
-
-1. Compute complexity for all possible regions
-2. DP on quadtree: dp[node][budget] = min complexity
-3. Backtrack to recover optimal split
-```
-
-### 3.3.3 Learnable Splitting (Scheme L)
-
-**End-to-end differentiable splitting** via Gumbel-Softmax:
-
-$$\text{SplitProb}(R) = \sigma(\text{MLP}([C_{var}, C_{grad}, d, \ldots]))$$
+$$\text{SplitProb}(R) = \sigma(\text{MLP}(\text{ROI}(F, R)))$$
 
 Temperature-annealed sampling:
 $$z = \text{GumbelSoftmax}(\log p, \tau(t))$$
+
+*Note: Scheme B (Balanced Greedy) and Scheme C (Fixed Budget DP) have been deprecated in favor of the unified Learnable Splitter.*
 
 where $\tau(t) = \tau_{max} \cdot (\tau_{min}/\tau_{max})^{t/T}$.
 

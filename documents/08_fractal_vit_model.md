@@ -59,9 +59,10 @@ class FractalCurveViT(nn.Module):
 | `heads` | int | 8 | Number of attention heads |
 | `mlp_dim` | int | dim × 4 | FFN hidden dimension |
 | `pool` | str | 'cls' | Pooling strategy ('cls' or 'mean') |
+| `max_level` | int | None | Max recursion level (auto-inferred) |
 | `dropout` | float | 0.1 | Dropout rate |
 | `tokenizer_type` | str | 'streaming_v3' | Tokenizer type (V3 only) |
-| `hilbert_bias_mode` | str | 'lca' | Attention bias mode |
+| `hilbert_bias_mode` | str | 'lca' | Attention bias mode (only 'lca' supported) |
 | `ffn_type` | str | 'swiglu_level' | FFN type |
 
 ---
