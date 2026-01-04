@@ -2333,6 +2333,12 @@ def main():
     parser.add_argument("--splitter-temp-warmup", type=int, default=5,
                        help="Warmup epochs with fixed T_start (default: 5)")
     
+    # I10-19: 连续松弛参数
+    parser.add_argument("--use-continuous-relaxation", action="store_true", default=False,
+                       help="I10-19: Enable continuous relaxation for fully differentiable forward pass")
+    parser.add_argument("--continuous-max-depth", type=int, default=3,
+                       help="I10-19: Max depth for continuous parallel evaluator (default: 3, 85 candidates)")
+    
     # P10-4/P10-5: 软熵损失参数
     parser.add_argument("--include-soft-entropy", action="store_true", default=True,
                        help="Enable soft entropy loss (default: True, recommended)")
@@ -2535,6 +2541,9 @@ def main():
         # P7-7: 可学习分割器温度参数
         learnable_temperature=config.splitter_temp_start,
         use_gumbel=True,  # 使用 Gumbel-Softmax 进行可微分采样
+        # I10-19: 连续松弛配置
+        use_continuous_relaxation=args.use_continuous_relaxation,
+        continuous_max_depth=args.continuous_max_depth,
     )
     
     # 创建模型 (V3 Variable Depth Tokens)
@@ -3116,7 +3125,12 @@ def main():
             dominant = scale_distribution['dominant_scale']
             ratio_str = ", ".join([f"p{ps}:{r*100:.1f}%" for ps, r in ratios.items()])
             print(f"  Scales: {ratio_str}")
-            print(f"  Entropy: {entropy:.3f}/{max_entropy:.3f} ({entropy/max_entropy*100:.1f}%), Dominant: {dominant}px")
+            # I10-19: 连续模式下 max_entropy 可能为 0 (无离散深度分布)
+            if max_entropy > 0:
+                entropy_pct = entropy / max_entropy * 100
+                print(f"  Entropy: {entropy:.3f}/{max_entropy:.3f} ({entropy_pct:.1f}%), Dominant: {dominant}px")
+            else:
+                print(f"  Entropy: {entropy:.3f} (continuous mode, no discrete depths)")
         
         if epoch == 1:
             data_pct = perf_stats['avg_data_time'] / perf_stats['avg_batch_time'] * 100 if perf_stats['avg_batch_time'] > 0 else 0
