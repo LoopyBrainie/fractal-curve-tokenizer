@@ -557,10 +557,19 @@ def detect_environment() -> Dict[str, Any]:
             import psutil
             shm = psutil.disk_usage('/dev/shm')
             shm_gb = shm.total / (1024**3)
-            if shm_gb >= 8:
-                env['recommended_workers'] = min(12, env['cpu_count'])
-            elif shm_gb >= 4:
-                env['recommended_workers'] = min(8, env['cpu_count'])
+            # 容器环境优化：更激进的 workers 配置
+            if env['in_container']:
+                if shm_gb >= 8:
+                    env['recommended_workers'] = min(16, env['cpu_count'])
+                elif shm_gb >= 4:
+                    env['recommended_workers'] = min(12, env['cpu_count'])
+                else:
+                    env['recommended_workers'] = min(8, env['cpu_count'])
+            else:
+                if shm_gb >= 8:
+                    env['recommended_workers'] = min(12, env['cpu_count'])
+                elif shm_gb >= 4:
+                    env['recommended_workers'] = min(8, env['cpu_count'])
         except ImportError:
             pass
     
@@ -1150,7 +1159,10 @@ def create_dataloaders(
     }
     if effective_workers > 0:
         # 容器环境使用更大的 prefetch_factor 补偿 I/O 延迟
-        loader_kwargs['prefetch_factor'] = 8 if is_container else 4
+        # 增大到 16/8 以最大化 GPU 利用率
+        loader_kwargs['prefetch_factor'] = 16 if is_container else 8
+        # 添加 generator 参数以提高多进程随机性
+        loader_kwargs['generator'] = torch.Generator().manual_seed(42)
     
     train_loader = DataLoader(train_ds, sampler=SubsetRandomSampler(train_idx), **loader_kwargs)
     
