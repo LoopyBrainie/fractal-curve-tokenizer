@@ -3612,7 +3612,7 @@ def generate_full_report(
     )
     
     print(f"      Accuracy: {results['accuracy']:.2f}%")
-    print(f"      Loss: {results['loss']:.4f}")
+    print(f"      Loss: {results['avg_loss']:.4f}")
     
     # 4. 获取样本图像
     print("[4/14] Loading sample images...")
