@@ -91,6 +91,20 @@ from vit_pytorch import FractalCurveViT
 from vit_pytorch.curve_hilbert import HilbertCurve
 from vit_pytorch.tokenizer_streaming import StreamingFractalTokenizerV3
 
+# Fractal Training 模块 (I15)
+from fractal_training import (
+    # Metrics
+    ClassificationMetrics,
+    # Visualization
+    VisualizationConfig,
+    ExperimentVisualizer,
+    plot_per_class_accuracy,
+    plot_confusion_matrix,
+    plot_token_distribution,
+    plot_depth_distribution,
+    plot_training_curves,
+)
+
 # 设置中文字体 (可选)
 plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False
@@ -1250,7 +1264,7 @@ def evaluate_model(
     num_classes: int,
     class_names: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """详细评估模型"""
+    """详细评估模型（使用 fractal_training.metrics.ClassificationMetrics）"""
     model.eval()
     
     all_preds = []
@@ -1278,22 +1292,32 @@ def evaluate_model(
     all_labels = np.array(all_labels)
     all_probs = np.array(all_probs)
     
-    # 计算指标
-    accuracy = (all_preds == all_labels).mean() * 100
+    # 使用 ClassificationMetrics 计算指标
+    preds_tensor = torch.from_numpy(all_preds)
+    labels_tensor = torch.from_numpy(all_labels)
     
-    # 每类准确率
+    metrics_result = ClassificationMetrics.compute_metrics(
+        predictions=preds_tensor,
+        labels=labels_tensor,
+        num_classes=num_classes,
+    )
+    
+    # 转换为原始格式以保持兼容性
     per_class_acc = {}
     for c in range(num_classes):
-        mask = all_labels == c
-        if mask.sum() > 0:
-            class_acc = (all_preds[mask] == all_labels[mask]).mean() * 100
-            class_name = class_names[c] if class_names else str(c)
-            per_class_acc[class_name] = class_acc
+        class_name = class_names[c] if class_names else str(c)
+        per_class_acc[class_name] = metrics_result.per_class_accuracy[c] * 100
     
-    # 混淆矩阵
-    confusion = np.zeros((num_classes, num_classes), dtype=int)
-    for pred, label in zip(all_preds, all_labels):
-        confusion[label, pred] += 1
+    return {
+        'accuracy': metrics_result.top1_accuracy * 100,
+        'mean_class_accuracy': metrics_result.mean_class_accuracy * 100,
+        'per_class_accuracy': per_class_acc,
+        'confusion_matrix': metrics_result.confusion_matrix.numpy(),
+        'predictions': all_preds,
+        'labels': all_labels,
+        'probabilities': all_probs,
+        'avg_loss': total_loss / len(test_loader),
+    }
     
     return {
         'accuracy': accuracy,
@@ -2031,13 +2055,12 @@ def visualize_training_history(
     save_path: Optional[Path] = None,
     show: bool = True,
 ) -> Optional[plt.Figure]:
-    """可视化训练历史曲线
+    """可视化训练历史曲线（使用 fractal_training.visualization）
     
     从 training_history.json 读取并绘制：
     1. Loss 曲线 (train/val)
     2. Accuracy 曲线 (train/val)
     3. Learning rate 曲线
-    4. Tokenizer 统计 (如果有)
     
     Args:
         history_path: training_history.json 路径
@@ -2058,22 +2081,30 @@ def visualize_training_history(
         print("[WARN] Training history is empty")
         return None
     
-    epochs = [h['epoch'] for h in history]
-    train_loss = [h.get('train_loss', np.nan) for h in history]
-    val_loss = [h.get('val_loss', np.nan) for h in history]
-    train_acc = [h.get('train_acc', np.nan) for h in history]
-    val_acc = [h.get('val_acc', np.nan) for h in history]
-    lr = [h.get('lr', np.nan) for h in history]
+    # 转换为 plot_training_curves 期望的格式
+    train_history = {
+        'train_loss': [h.get('train_loss', None) for h in history],
+        'val_loss': [h.get('val_loss', None) for h in history],
+        'train_accuracy': [h.get('train_acc', None) for h in history if h.get('train_acc') is not None],
+        'val_accuracy': [h.get('val_acc', None) for h in history if h.get('val_acc') is not None],
+        'learning_rates': [h.get('lr', None) for h in history],
+    }
     
-    # 检查是否有 tokenizer 统计
-    has_tokenizer_stats = any('tokenizer_stats' in h for h in history)
+    config = VisualizationConfig(auto_save=False)
     
-    n_rows = 3 if has_tokenizer_stats else 2
-    fig, axes = plt.subplots(n_rows, 2, figsize=(14, 4 * n_rows))
+    fig = plot_training_curves(
+        history=train_history,
+        config=config,
+    )
     
-    # 1. Loss 曲线
-    ax1 = axes[0, 0]
-    ax1.plot(epochs, train_loss, 'b-', label='Train Loss', linewidth=1.5)
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"[OK] Training history saved to: {save_path}")
+    
+    if show:
+        plt.show()
+    
+    return fig
     ax1.plot(epochs, val_loss, 'r-', label='Val Loss', linewidth=1.5)
     ax1.set_xlabel('Epoch')
     ax1.set_ylabel('Loss')
@@ -2547,42 +2578,18 @@ def visualize_confusion_matrix(
     save_path: Optional[Path] = None,
     show: bool = True,
 ) -> plt.Figure:
-    """可视化混淆矩阵"""
-    num_classes = confusion.shape[0]
+    """可视化混淆矩阵（使用 fractal_training.visualization）"""
+    config = VisualizationConfig(auto_save=False)
     
-    # 归一化
-    confusion_norm = confusion.astype(float) / (confusion.sum(axis=1, keepdims=True) + 1e-8)
-    
-    fig, ax = plt.subplots(figsize=(min(12, num_classes), min(10, num_classes)))
-    
-    im = ax.imshow(confusion_norm, cmap='Blues')
-    
-    # 设置坐标轴
-    if class_names and num_classes <= 20:
-        ax.set_xticks(np.arange(num_classes))
-        ax.set_yticks(np.arange(num_classes))
-        ax.set_xticklabels(class_names, rotation=45, ha='right', fontsize=8)
-        ax.set_yticklabels(class_names, fontsize=8)
-    
-    ax.set_xlabel('Predicted', fontsize=12)
-    ax.set_ylabel('True', fontsize=12)
-    ax.set_title('Confusion Matrix (Normalized)', fontsize=14)
-    
-    plt.colorbar(im, ax=ax, shrink=0.8)
-    
-    # 添加数值标注 (仅小矩阵)
-    if num_classes <= 15:
-        for i in range(num_classes):
-            for j in range(num_classes):
-                val = confusion_norm[i, j]
-                color = 'white' if val > 0.5 else 'black'
-                ax.text(j, i, f'{val:.2f}', ha='center', va='center', 
-                       color=color, fontsize=6)
-    
-    plt.tight_layout()
+    fig = plot_confusion_matrix(
+        confusion_matrix=confusion,
+        class_names=class_names,
+        normalize=True,
+        config=config,
+    )
     
     if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"[OK] Confusion matrix saved to: {save_path}")
     
     if show:
@@ -2597,44 +2604,32 @@ def visualize_per_class_accuracy(
     show: bool = True,
     top_k: int = 20,
 ) -> plt.Figure:
-    """可视化每类准确率"""
-    # 排序
-    sorted_items = sorted(per_class_acc.items(), key=lambda x: x[1])
+    """可视化每类准确率（使用 fractal_training.visualization）"""
+    # 转换格式：将 str keys 转为 int keys
+    per_class_acc_int = {}
+    class_names = []
+    for k, v in per_class_acc.items():
+        if isinstance(k, str) and k.isdigit():
+            idx = int(k)
+        elif isinstance(k, str):
+            # 尝试找到类别索引
+            idx = len(class_names)
+            class_names.append(k)
+        else:
+            idx = k
+        per_class_acc_int[idx] = v / 100.0  # 转换为 [0, 1] 范围
     
-    # 限制显示数量
-    if len(sorted_items) > top_k * 2:
-        # 显示最差和最好的
-        display_items = sorted_items[:top_k] + sorted_items[-top_k:]
-    else:
-        display_items = sorted_items
+    config = VisualizationConfig(auto_save=False)
     
-    classes = [item[0] for item in display_items]
-    accs = [item[1] for item in display_items]
-    
-    fig, ax = plt.subplots(figsize=(10, max(6, len(classes) * 0.3)))
-    
-    colors = ['red' if acc < 50 else 'orange' if acc < 70 else 'green' for acc in accs]
-    
-    bars = ax.barh(classes, accs, color=colors, alpha=0.7)
-    ax.set_xlabel('Accuracy (%)', fontsize=12)
-    ax.set_title('Per-Class Accuracy', fontsize=14)
-    ax.set_xlim(0, 100)
-    
-    # 添加数值标注
-    for bar, acc in zip(bars, accs):
-        ax.text(acc + 1, bar.get_y() + bar.get_height()/2, 
-               f'{acc:.1f}%', va='center', fontsize=8)
-    
-    # 添加平均线
-    mean_acc = np.mean(list(per_class_acc.values()))
-    ax.axvline(mean_acc, color='blue', linestyle='--', linewidth=2, 
-              label=f'Mean: {mean_acc:.1f}%')
-    ax.legend(loc='lower right')
-    
-    plt.tight_layout()
+    fig = plot_per_class_accuracy(
+        per_class_accuracy=per_class_acc_int,
+        class_names=class_names if class_names else None,
+        config=config,
+        sort_by_accuracy=True,
+    )
     
     if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"[OK] Per-class accuracy saved to: {save_path}")
     
     if show:

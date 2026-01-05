@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """Fractal ViT Training Script - V3 Variable Depth Tokens
 
+⚠️  **重要更新 (2026-01-05 - I15 完成)**:
+   fractal_training 模块现已可用，提供以下增强功能：
+   - ClassBalancedSampler / ProgressiveSampler - 类别平衡采样
+   - FocalLoss / ClassBalancedCE - 长尾效应优化
+   - ModularTrainer - 模块化训练器（替代手写循环）
+   - ClassificationMetrics - 完整评估指标
+   - ExperimentVisualizer - 统一可视化接口
+   
+   本脚本已导入 fractal_training 模块，但保留了手写训练循环以供参考。
+   如需使用 ModularTrainer，请参考 examples/training/README.md
+
 数学形式化
 ===========
 完整前向传播:
@@ -238,6 +249,38 @@ if str(SRC_PATH) not in sys.path:
 
 from vit_pytorch import FractalCurveViT
 
+# Fractal Training 模块 (I15)
+from fractal_training import (
+    # Samplers
+    ClassBalancedSampler,
+    ProgressiveSampler,
+    # Losses
+    FocalLoss as FTFocalLoss,
+    ClassBalancedCE,
+    FocalClassBalancedLoss,
+    # Metrics
+    ClassificationMetrics,
+    # Schedulers
+    FLOPSConfig,
+    compute_transformer_flops,
+    FLOPSBudgetLoss,
+    DepthWeightedBudgetLoss,
+    BudgetScheduler,
+    # Trainer
+    ModularTrainer,
+    # Config
+    TrainerConfig,
+    ExperimentConfig,
+    # Callbacks
+    EarlyStopping,
+    CheckpointCallback,
+    WandBCallback,
+    WandBConfig,
+    # Visualization
+    VisualizationConfig,
+    ExperimentVisualizer,
+)
+
 
 # ============================================================================
 # 数据类
@@ -353,134 +396,7 @@ class TrainingConfig:
 
 
 # ============================================================================
-# Focal Loss 实现 (P14: 长尾效应优化)
-# ============================================================================
-
-class FocalLoss(nn.Module):
-    """Focal Loss for addressing class imbalance.
-    
-    数学形式:
-        FL(p_t) = -α_t · (1 - p_t)^γ · log(p_t)
-        
-    其中:
-        - p_t 是模型对正确类别的预测概率
-        - γ (gamma) 是聚焦参数，默认 2.0
-        - α_t 是可选的类别权重
-    
-    优势:
-        1. 对容易分类的样本降低权重 (1-p_t)^γ → 0
-        2. 对困难样本保持高权重 (1-p_t)^γ → 1
-        3. γ=0 时退化为标准交叉熵
-    
-    参考: "Focal Loss for Dense Object Detection" (Lin et al., 2017)
-    """
-    
-    def __init__(
-        self,
-        gamma: float = 2.0,
-        alpha: Optional[torch.Tensor] = None,
-        label_smoothing: float = 0.0,
-        reduction: str = 'mean',
-    ):
-        super().__init__()
-        self.gamma = gamma
-        self.alpha = alpha  # [num_classes] 类别权重
-        self.label_smoothing = label_smoothing
-        self.reduction = reduction
-    
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            inputs: [B, C] logits
-            targets: [B] 类别索引
-            
-        Returns:
-            Focal Loss 标量
-        """
-        # 计算 log_softmax 和 softmax
-        log_probs = F.log_softmax(inputs, dim=1)
-        probs = torch.exp(log_probs)
-        
-        # 获取正确类别的概率
-        # targets: [B] -> [B, 1]
-        targets_one_hot = F.one_hot(targets, num_classes=inputs.size(1)).float()
-        
-        # Label smoothing
-        if self.label_smoothing > 0:
-            targets_one_hot = targets_one_hot * (1 - self.label_smoothing) + \
-                              self.label_smoothing / inputs.size(1)
-        
-        # 计算 p_t
-        p_t = (probs * targets_one_hot).sum(dim=1)  # [B]
-        
-        # Focal weight: (1 - p_t)^gamma
-        focal_weight = (1 - p_t) ** self.gamma
-        
-        # 交叉熵损失
-        ce_loss = -(targets_one_hot * log_probs).sum(dim=1)  # [B]
-        
-        # 应用类别权重
-        if self.alpha is not None:
-            alpha_t = self.alpha.to(inputs.device)[targets]
-            focal_weight = alpha_t * focal_weight
-        
-        # 最终损失
-        loss = focal_weight * ce_loss
-        
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        else:
-            return loss
-
-
-def compute_class_weights(
-    labels: List[int],
-    num_classes: int,
-    beta: float = 0.9999,
-) -> torch.Tensor:
-    """计算类别平衡权重。
-    
-    数学形式 (Effective Number of Samples):
-        w_c = (1 - β) / (1 - β^{n_c})
-        
-    其中 n_c 是类别 c 的样本数量。
-    
-    当 β → 1 时，权重趋向于 1/n_c (逆频率权重)
-    当 β = 0 时，所有类别权重相等
-    
-    参考: "Class-Balanced Loss" (Cui et al., CVPR 2019)
-    
-    Args:
-        labels: 所有样本的标签列表
-        num_classes: 类别数量
-        beta: 平滑参数，默认 0.9999
-        
-    Returns:
-        [num_classes] 权重张量
-    """
-    # 统计每个类别的样本数
-    class_counts = torch.zeros(num_classes)
-    for label in labels:
-        class_counts[label] += 1
-    
-    # 避免除零
-    class_counts = class_counts.clamp(min=1)
-    
-    # 计算有效样本数权重
-    # w_c = (1 - β) / (1 - β^{n_c})
-    effective_num = 1.0 - torch.pow(beta, class_counts)
-    weights = (1.0 - beta) / effective_num
-    
-    # 归一化使得平均权重为 1
-    weights = weights / weights.mean() * 1.0
-    
-    return weights
-
-
-# ============================================================================
-# Mixup/CutMix 实现
+# Mixup/CutMix 实现 (简化版，使用 fractal_training 的 FocalLoss)
 # ============================================================================
 
 class MixupCutmix:
