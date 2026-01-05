@@ -119,26 +119,54 @@ def test_forward_pass_continuous_mode():
     # Forward pass
     result = splitter(features, image_size, hard=False)
     
-    # 验证输出结构
-    assert hasattr(result, 'regions')
-    assert hasattr(result, 'depths')
-    assert hasattr(result, 'batch_indices')
-    assert hasattr(result, 'hilbert_indices')
-    assert hasattr(result, 'tokens_per_batch')
+    # I10-19更新: 连续模式返回ShallowCandidateProbs而非TensorSplitResult
+    from vit_pytorch.split_adaptive import ShallowCandidateProbs
     
-    # 验证batch数量
-    assert result.tokens_per_batch.shape[0] == B
-    assert result.tokens_per_batch.sum() == result.regions.shape[0]
-    
-    print(f"✓ Forward pass successful in continuous mode")
-    print(f"  - Batch size: {B}")
-    print(f"  - Total tokens: {result.regions.shape[0]}")
-    print(f"  - Tokens per batch: {result.tokens_per_batch.tolist()}")
+    if isinstance(result, ShallowCandidateProbs):
+        # 验证ShallowCandidateProbs结构
+        assert hasattr(result, 'candidate_regions')
+        assert hasattr(result, 'candidate_depths')
+        assert hasattr(result, 'probs')
+        assert hasattr(result, 'cumulative_probs')
+        assert hasattr(result, 'parent_indices')
+        
+        # 验证形状
+        assert result.probs.shape[0] == B
+        N = result.num_candidates
+        assert result.probs.shape[1] == N
+        assert result.cumulative_probs.shape == (B, N)
+        
+        print(f"✓ Forward pass successful in continuous mode (ShallowCandidateProbs)")
+        print(f"  - Batch size: {B}")
+        print(f"  - Candidates: {N}")
+        print(f"  - Probs shape: {result.probs.shape}")
+    else:
+        # 旧的TensorSplitResult结构验证
+        assert hasattr(result, 'regions')
+        assert hasattr(result, 'depths')
+        assert hasattr(result, 'batch_indices')
+        assert hasattr(result, 'hilbert_indices')
+        assert hasattr(result, 'tokens_per_batch')
+        
+        # 验证batch数量
+        assert result.tokens_per_batch.shape[0] == B
+        assert result.tokens_per_batch.sum() == result.regions.shape[0]
+        
+        print(f"✓ Forward pass successful in continuous mode (TensorSplitResult)")
+        print(f"  - Batch size: {B}")
+        print(f"  - Total tokens: {result.regions.shape[0]}")
+        print(f"  - Tokens per batch: {result.tokens_per_batch.tolist()}")
 
 
 def test_forward_pass_discrete_vs_continuous_structure():
-    """测试离散和连续模式输出结构一致性."""
+    """测试离散和连续模式输出结构对比.
+    
+    I10-19更新: 连续模式现在返回ShallowCandidateProbs而非TensorSplitResult。
+    两种模式输出结构不同是设计决策，不再要求结构一致。
+    """
     torch.manual_seed(42)
+    
+    from vit_pytorch.split_adaptive import ShallowCandidateProbs
     
     # 创建离散模式splitter
     splitter_discrete = LearnableSplitter(
@@ -179,24 +207,23 @@ def test_forward_pass_discrete_vs_continuous_structure():
     result_discrete = splitter_discrete(features, image_size, hard=True)
     result_continuous = splitter_continuous(features, image_size, hard=True)
     
-    # 验证输出字段一致
+    # 验证离散模式: TensorSplitResult
     assert hasattr(result_discrete, 'regions')
-    assert hasattr(result_continuous, 'regions')
-    assert result_discrete.regions.shape[1] == result_continuous.regions.shape[1] == 4
-    
     assert hasattr(result_discrete, 'depths')
-    assert hasattr(result_continuous, 'depths')
-    
     assert hasattr(result_discrete, 'batch_indices')
-    assert hasattr(result_continuous, 'batch_indices')
-    
     assert hasattr(result_discrete, 'tokens_per_batch')
-    assert hasattr(result_continuous, 'tokens_per_batch')
-    assert result_discrete.tokens_per_batch.shape == result_continuous.tokens_per_batch.shape
+    assert result_discrete.regions.shape[1] == 4
     
-    print("✓ Discrete and continuous modes have consistent output structure")
-    print(f"  - Discrete: {result_discrete.regions.shape[0]} tokens")
-    print(f"  - Continuous (TODO): {result_continuous.regions.shape[0]} tokens")
+    # 验证连续模式: ShallowCandidateProbs
+    assert isinstance(result_continuous, ShallowCandidateProbs)
+    assert hasattr(result_continuous, 'candidate_regions')
+    assert hasattr(result_continuous, 'candidate_depths')
+    assert hasattr(result_continuous, 'probs')
+    assert hasattr(result_continuous, 'cumulative_probs')
+    
+    print("✓ Discrete and continuous modes have distinct output structures (by design)")
+    print(f"  - Discrete: TensorSplitResult with {result_discrete.regions.shape[0]} tokens")
+    print(f"  - Continuous: ShallowCandidateProbs with {result_continuous.num_candidates} candidates")
 
 
 def test_shallow_evaluator_candidate_count():
