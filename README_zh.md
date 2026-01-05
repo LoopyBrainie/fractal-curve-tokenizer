@@ -46,9 +46,9 @@ $$\|p_1 - p_2\|_2 \leq C \cdot |H^{-1}(p_1) - H^{-1}(p_2)|^{1/2}$$
 
 这意味着空间相邻的 patch 在注意力序列中也保持接近，提升局部注意力模式的有效性。
 
-![Hilbert 曲线阶数](workspace/visualizations/fractal_curves/hilbert_order_comparison.png)
+![Hilbert 曲线阶数](workspace/visualizations/hilbert_curve.png)
 
-*1-5 阶 Hilbert 曲线。每个象限包含整条曲线的旋转副本（自相似性）。*
+*架构工具直接生成的 Hilbert 曲线（示例阶数 4）。*
 
 ### 2. 自适应四叉树分词
 
@@ -60,9 +60,9 @@ $$C(R) = \alpha \cdot \frac{\text{Var}(R)}{\text{Var}(R) + \sigma_0^2} + (1-\alp
 - **G(R)**：梯度能量（边缘）
 - **分割条件**：$C(R) > \tau_0 \cdot \gamma^d$（深度相关阈值）
 
-![四叉树结构](workspace/visualizations/fractal_curves/quadtree_structure.png)
+![四叉树结构](workspace/visualizations/quadtree.png)
 
-*四叉树分解：复杂区域被递归细分。*
+*由模型分割启发式驱动的合成自适应四叉树（无需训练数据）。*
 
 ### 3. 基于 LCA 的注意力偏置
 
@@ -76,9 +76,9 @@ $$B[i,j] = \tau_h \cdot \text{Embed}(\text{LCA}(i,j))$$
 - **明确的几何意义**：相邻 patch 共享更深的祖先
 - **每头可学习温度** τ_h，用于自适应缩放
 
-![LCA 偏置矩阵](workspace/visualizations/fractal_curves/lca_bias_matrix.png)
+![LCA 偏置矩阵](workspace/visualizations/lca_bias.png)
 
-*LCA 距离矩阵：层级结构自然浮现。*
+*仅由四叉树路径推导的 LCA 深度矩阵（架构级偏置）。*
 
 ## 架构
 

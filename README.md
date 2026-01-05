@@ -46,9 +46,9 @@ $$\|p_1 - p_2\|_2 \leq C \cdot |H^{-1}(p_1) - H^{-1}(p_2)|^{1/2}$$
 
 This means spatially adjacent patches remain close in the attention sequence, improving the effectiveness of local attention patterns.
 
-![Hilbert Curve Orders](workspace/visualizations/fractal_curves/hilbert_order_comparison.png)
+![Hilbert Curve Orders](workspace/visualizations/hilbert_curve.png)
 
-*Hilbert curves at orders 1-5. Each quadrant contains a rotated copy of the whole curve (self-similarity).*
+*Hilbert curve (order=4) generated directly from the architecture utility.*
 
 ### 2. Adaptive Quadtree Tokenization
 
@@ -60,9 +60,9 @@ $$C(R) = \alpha \cdot \frac{\text{Var}(R)}{\text{Var}(R) + \sigma_0^2} + (1-\alp
 - **G(R)**: Gradient energy (edges)
 - **Split if**: $C(R) > \tau_0 \cdot \gamma^d$ (depth-dependent threshold)
 
-![Quadtree Structure](workspace/visualizations/fractal_curves/quadtree_structure.png)
+![Quadtree Structure](workspace/visualizations/quadtree.png)
 
-*Quadtree decomposition: complex regions are recursively subdivided.*
+*Synthetic adaptive quadtree driven by the architecture splitting heuristic (no training data).*
 
 ### 3. LCA-Based Attention Bias
 
@@ -75,9 +75,9 @@ where LCA(i,j) is the tree depth at which paths to tokens i and j first diverge.
 - **Explicit geometric meaning**: nearby patches share deeper ancestors
 - **Per-head learnable temperature** τ_h for adaptive scaling
 
-![LCA Bias Matrix](workspace/visualizations/fractal_curves/lca_bias_matrix.png)
+![LCA Bias Matrix](workspace/visualizations/lca_bias.png)
 
-*LCA distance matrix: hierarchical structure emerges naturally.*
+*LCA depth matrix derived purely from quadtree paths (architecture-level bias).* 
 
 ## Architecture
 
