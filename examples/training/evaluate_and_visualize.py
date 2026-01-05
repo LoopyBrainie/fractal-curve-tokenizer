@@ -1305,9 +1305,10 @@ def evaluate_model(
     metrics_calculator.update(logits_tensor, labels_tensor)
     metrics_result = metrics_calculator.compute()
     
-    # 计算混淆矩阵
-    from sklearn.metrics import confusion_matrix
-    conf_matrix = confusion_matrix(all_labels, all_preds, labels=list(range(num_classes)))
+    # 手动计算混淆矩阵 (不依赖 sklearn)
+    conf_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for true_label, pred_label in zip(all_labels, all_preds):
+        conf_matrix[true_label, pred_label] += 1
     
     # 转换为原始格式以保持兼容性
     per_class_acc = {}
