@@ -1,54 +1,36 @@
-# Fractal ViT Visualization Suite
+# Visualization (Architecture-Driven, No Training Data Needed)
 
-This directory contains visualization tools to demonstrate the mathematical principles of the Fractal Curve Tokenizer and Fractal ViT.
+This folder visualizes **Fractal Curve ViT** purely基于模型架构与源码：Hilbert 曲线、可学习四叉树 token 化、LCA 偏置等，不依赖任何训练结果或日志。
 
-## Overview
+## 文件
 
-The visualizations are divided into two categories:
-1.  **Static Analysis (`static_analysis/`)**: Uses `seaborn` and `matplotlib` to generate plots showing token density, depth distribution, and comparisons with standard ViT.
-2.  **Dynamic Animations (`manim_animations/`)**: Uses `manim` to create animations of the adaptive quadtree splitting, Hilbert curve traversal, and LCA-based attention.
+- `CRITICAL_ANALYSIS.md`: 数学与架构批判阅读笔记。
+- `seaborn_viz.py`: 生成出版级静态图（Hilbert 路径、合成四叉树、LCA 偏置热力图、深度分布、标度曲线）。
+- `manim_viz.py`: 动画场景（HilbertCurveScene、AdaptiveQuadTreeScene、HilbertTraversalScene）。
+- `run_viz.py`: 统一入口，运行静态图并打印 manim 命令示例。
 
-## Mathematical Concepts
+## 依赖
 
-### 1. Adaptive Quadtree Tokenization
-Unlike standard ViT which uses a fixed grid (e.g., 16x16 patches), Fractal ViT recursively splits the image based on a complexity function $C(R)$:
-
-$$ C(R) = \alpha \cdot C_{var}(R) + (1-\alpha) \cdot C_{grad}(R) $$
-
-Where $C_{var}$ is the normalized variance and $C_{grad}$ is the normalized gradient energy. A region $R$ is split if $C(R) > \tau_d$, where $\tau_d$ is a depth-dependent threshold.
-
-### 2. Hilbert Curve Traversal
-The 2D quadtree leaves are mapped to a 1D sequence using a recursive Hilbert curve. This preserves locality better than raster scan order.
-
-### 3. LCA-Based Attention
-The model uses a relative positional encoding based on the Lowest Common Ancestor (LCA) in the quadtree. The attention bias is a function of the tree distance between two tokens.
-
-## Usage
-
-### Prerequisites
-*   Python 3.8+
-*   `numpy`, `matplotlib`, `seaborn`, `opencv-python`
-*   `manim` (for animations)
-
-### Running Static Analysis
-Run the driver script from the project root:
 ```bash
-python examples/visualization/run_all.py
-```
-This will generate:
-*   `token_density.png`: Heatmap of token density.
-*   `depth_distribution.png`: Histogram of token depths.
-*   `vit_comparison.png`: Visual comparison between fixed grid and adaptive quadtree.
-
-### Running Animations
-To generate the animations, use the `manim` command line tool:
-
-**Tokenization Process:**
-```bash
-manim -pql examples/visualization/manim_animations/tokenization.py AdaptiveTokenization
+pip install seaborn matplotlib numpy manim
 ```
 
-**Attention Mechanism:**
+## 运行静态可视化（推荐）
+
 ```bash
-manim -pql examples/visualization/manim_animations/attention.py LCAAttention
+python examples/visualization/run_viz.py --max-depth 4 --static
 ```
+输出位于 `workspace/visualizations/`。
+
+## 运行 Manim 动画
+
+```bash
+manim -pql --media_dir workspace/visualizations/manim_media examples/visualization/manim_viz.py AdaptiveQuadTreeScene
+manim -pql --media_dir workspace/visualizations/manim_media examples/visualization/manim_viz.py HilbertCurveScene
+```
+
+## 可视化要点
+
+1) **Hilbert 曲线局部性**：1D 序列与 2D 网格的局部保持。
+2) **自适应四叉树 token 化**：合成场驱动的分割阈值，展示层级与 Hilbert 序列顺序。
+3) **LCA 注意力偏置**：按四叉树路径精确计算 LCA 深度矩阵，体现层级亲缘度。
