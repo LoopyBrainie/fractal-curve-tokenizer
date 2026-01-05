@@ -272,10 +272,10 @@ from fractal_training import (
     TrainerConfig,
     ExperimentConfig,
     # Callbacks
-    EarlyStopping,
+    EarlyStoppingCallback,
     CheckpointCallback,
     WandBCallback,
-    WandBConfig,
+    WandBCallbackConfig,
     # Visualization
     VisualizationConfig,
     ExperimentVisualizer,
