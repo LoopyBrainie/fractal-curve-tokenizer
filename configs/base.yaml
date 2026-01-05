@@ -1,0 +1,86 @@
+# Fractal-ViT 基础配置
+# =====================
+# 所有实验的默认配置，可被继承
+
+name: base
+description: "Base configuration for Fractal-ViT experiments"
+seed: 42
+
+# 数据配置
+data:
+  dataset: tiny-imagenet
+  data_dir: ./data
+  batch_size: 128
+  num_workers: 4
+  pin_memory: true
+  image_size: 64
+  random_crop: true
+  horizontal_flip: true
+  color_jitter: 0.4
+  sampler_type: default  # default, class_balanced, progressive
+
+# 模型配置
+model:
+  name: fractal_vit
+  image_size: 64
+  patch_size: 8
+  embed_dim: 384
+  depth: 10
+  num_heads: 8
+  num_classes: 200
+  mlp_ratio: 4.0
+  dropout: 0.1
+  attention_dropout: 0.1
+  max_depth: 4
+  splitter_hidden_dim: 128
+  splitter_dropout: 0.1
+
+# 损失函数配置
+loss:
+  type: cross_entropy
+  focal_gamma: 2.0
+  cb_beta: 0.9999
+  label_smoothing: 0.0
+
+# 资源预算配置
+budget:
+  enabled: false
+  type: flops
+  flops_budget: 5000000000  # 5 GFLOPS
+  flops_lambda: 0.1
+  depth_alpha: 0.5
+  schedule: constant
+
+# 优化器配置
+optimizer:
+  type: adamw
+  lr: 1.0e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+# 学习率调度器
+scheduler:
+  type: cosine
+  min_lr: 1.0e-6
+  warmup_epochs: 5
+  warmup_lr: 1.0e-6
+
+# 训练配置
+training:
+  num_epochs: 100
+  gradient_clip_norm: 1.0
+  accumulation_steps: 1
+  use_amp: true
+  validate_interval: 1
+  checkpoint_dir: ./checkpoints
+  save_best_only: true
+  monitor_metric: val_accuracy
+  early_stopping: true
+  patience: 20
+  log_interval: 50
+
+# Weights & Biases
+wandb:
+  enabled: false
+  project: fractal-vit
