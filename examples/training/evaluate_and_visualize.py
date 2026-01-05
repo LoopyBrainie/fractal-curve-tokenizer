@@ -1293,14 +1293,21 @@ def evaluate_model(
     all_probs = np.array(all_probs)
     
     # 使用 ClassificationMetrics 计算指标
-    preds_tensor = torch.from_numpy(all_preds)
+    # 需要从 all_probs 重建 logits（使用 log-softmax 的逆操作）
+    probs_tensor = torch.from_numpy(all_probs)
     labels_tensor = torch.from_numpy(all_labels)
     
-    metrics_result = ClassificationMetrics.compute_metrics(
-        predictions=preds_tensor,
-        labels=labels_tensor,
-        num_classes=num_classes,
-    )
+    # 从概率恢复 logits (添加小值避免 log(0))
+    logits_tensor = torch.log(probs_tensor + 1e-10)
+    
+    # 创建 ClassificationMetrics 实例并更新
+    metrics_calculator = ClassificationMetrics(num_classes=num_classes)
+    metrics_calculator.update(logits_tensor, labels_tensor)
+    metrics_result = metrics_calculator.compute()
+    
+    # 计算混淆矩阵
+    from sklearn.metrics import confusion_matrix
+    conf_matrix = confusion_matrix(all_labels, all_preds, labels=list(range(num_classes)))
     
     # 转换为原始格式以保持兼容性
     per_class_acc = {}
@@ -1312,7 +1319,7 @@ def evaluate_model(
         'accuracy': metrics_result.top1_accuracy * 100,
         'mean_class_accuracy': metrics_result.mean_class_accuracy * 100,
         'per_class_accuracy': per_class_acc,
-        'confusion_matrix': metrics_result.confusion_matrix.numpy(),
+        'confusion_matrix': conf_matrix,
         'predictions': all_preds,
         'labels': all_labels,
         'probabilities': all_probs,
