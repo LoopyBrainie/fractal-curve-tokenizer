@@ -3798,7 +3798,7 @@ def generate_full_report(
         'checkpoint': str(checkpoint_path),
         'dataset': dataset_name,
         'accuracy': results['accuracy'],
-        'loss': results['loss'],
+        'loss': results['avg_loss'],
         'config': config,
         'per_class_accuracy': results['per_class_accuracy'],
         'consistency_passed': consistency_report.get('passed', None),
@@ -3861,7 +3861,7 @@ def generate_full_report(
     print(f"\n{'='*80}")
     print(f"Key Metrics:")
     print(f"  Accuracy: {results['accuracy']:.2f}%")
-    print(f"  Loss: {results['loss']:.4f}")
+    print(f"  Loss: {results['avg_loss']:.4f}")
     print(f"  Parameters: {arch_report.get('total_parameters', 0):,}")
     print(f"  Latency (batch=1): {perf_report.get('batch_1', {}).get('latency_mean_ms', 0):.2f}ms")
     print(f"  Errors: {error_analysis.get('total_errors', 0)}")
