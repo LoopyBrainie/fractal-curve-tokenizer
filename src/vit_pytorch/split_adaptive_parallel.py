@@ -411,6 +411,8 @@ class ShallowParallelEvaluator(nn.Module):
         probs: Tensor,
         cumulative_probs: Tensor,
         embed_dim: int,
+        threshold: float = 0.01,
+        max_tokens: Optional[int] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
         I10-19: 连续松弛token生成（核心方法）
@@ -508,27 +510,47 @@ class ShallowParallelEvaluator(nn.Module):
                 tokens_dict[idx_item] = fused_token
         
         # 选择最终tokens：使用cumulative_probs作为权重
-        # 策略：选择累积概率 > threshold的所有节点
-        # 或者：Top-K选择
-        threshold = 0.01  # 低于1%的概率忽略
+        # 
+        # 数学形式化:
+        #   选择策略: 保留 α(R) > threshold 的候选
+        #   训练模式: 使用较低阈值 (0.01) 保持梯度流到更多候选
+        #   推理模式: 可以使用较高阈值 (0.1+) 或 Top-K 减少计算
+        #
+        # 有效token数公式 (软计数):
+        #   N_eff = Σ_i w_i  其中 w_i = α_i / Σ_j α_j
+        #   当阈值过低时，N_eff ≈ 叶子节点数 (64 for depth=3)
+        #   当阈值适中时，N_eff 反映实际复杂度分布
         
         final_tokens_list = []
         final_weights_list = []
+        final_depths_list = []  # I10-18增强: 记录深度用于LCA偏置
         
         for b in range(B):
             batch_tokens = []
             batch_weights = []
+            batch_depths = []
             
             for idx in range(N):
                 weight = cumulative_probs[b, idx].item()
                 if weight > threshold:
                     batch_tokens.append(tokens_dict[idx][b])  # [D]
                     batch_weights.append(weight)
+                    batch_depths.append(self.candidate_depths[idx].item())
             
             if len(batch_tokens) == 0:
                 # 至少保留根节点
                 batch_tokens.append(tokens_dict[0][b])
                 batch_weights.append(1.0)
+                batch_depths.append(0)
+            
+            # 可选: Top-K 限制
+            if max_tokens is not None and len(batch_tokens) > max_tokens:
+                # 按权重排序，保留Top-K
+                sorted_indices = sorted(range(len(batch_weights)), key=lambda i: batch_weights[i], reverse=True)
+                sorted_indices = sorted_indices[:max_tokens]
+                batch_tokens = [batch_tokens[i] for i in sorted_indices]
+                batch_weights = [batch_weights[i] for i in sorted_indices]
+                batch_depths = [batch_depths[i] for i in sorted_indices]
             
             # Stack and normalize
             batch_tokens = torch.stack(batch_tokens, dim=0)  # [M_b, D]
@@ -537,28 +559,42 @@ class ShallowParallelEvaluator(nn.Module):
             
             final_tokens_list.append(batch_tokens)
             final_weights_list.append(batch_weights)
+            final_depths_list.append(batch_depths)
         
         # Pad to max length in batch
-        max_tokens = max(t.size(0) for t in final_tokens_list)
+        max_tokens_in_batch = max(t.size(0) for t in final_tokens_list)
         
         padded_tokens = []
         padded_weights = []
+        padded_depths = []
         
-        for batch_tokens, batch_weights in zip(final_tokens_list, final_weights_list):
+        for batch_tokens, batch_weights, batch_depths in zip(
+            final_tokens_list, final_weights_list, final_depths_list
+        ):
             M_b = batch_tokens.size(0)
-            if M_b < max_tokens:
+            if M_b < max_tokens_in_batch:
                 # Pad with zeros
-                pad_tokens = torch.zeros(max_tokens - M_b, D, device=device, dtype=batch_tokens.dtype)
-                pad_weights = torch.zeros(max_tokens - M_b, device=device, dtype=batch_weights.dtype)
+                pad_tokens = torch.zeros(max_tokens_in_batch - M_b, D, device=device, dtype=batch_tokens.dtype)
+                pad_weights = torch.zeros(max_tokens_in_batch - M_b, device=device, dtype=batch_weights.dtype)
+                pad_depths = torch.zeros(max_tokens_in_batch - M_b, device=device, dtype=torch.long)
                 
                 batch_tokens = torch.cat([batch_tokens, pad_tokens], dim=0)
                 batch_weights = torch.cat([batch_weights, pad_weights], dim=0)
+                batch_depths_tensor = torch.tensor(batch_depths, device=device, dtype=torch.long)
+                batch_depths_tensor = torch.cat([batch_depths_tensor, pad_depths], dim=0)
+            else:
+                batch_depths_tensor = torch.tensor(batch_depths, device=device, dtype=torch.long)
             
             padded_tokens.append(batch_tokens)
             padded_weights.append(batch_weights)
+            padded_depths.append(batch_depths_tensor)
         
-        tokens = torch.stack(padded_tokens, dim=0)  # [B, max_tokens, D]
-        token_weights = torch.stack(padded_weights, dim=0)  # [B, max_tokens]
+        tokens = torch.stack(padded_tokens, dim=0)  # [B, max_tokens_in_batch, D]
+        token_weights = torch.stack(padded_weights, dim=0)  # [B, max_tokens_in_batch]
+        token_depths = torch.stack(padded_depths, dim=0)  # [B, max_tokens_in_batch]
+        
+        # 缓存深度信息供外部使用 (用于LCA偏置计算)
+        self._last_token_depths = token_depths
         
         return tokens, token_weights
 

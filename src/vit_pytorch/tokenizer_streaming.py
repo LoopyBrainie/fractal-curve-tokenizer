@@ -609,13 +609,20 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # =====================================================================
         # Step 2: 连续加权融合
         # 使用ShallowParallelEvaluator的get_continuous_tokens方法
+        # 
+        # I10-18增强: 传递threshold参数控制token数量
+        # - 训练时使用低阈值(0.01)保持梯度流
+        # - 推理时可以用更高阈值减少计算
         # =====================================================================
+        threshold = 0.01 if self.training else 0.05  # 推理时稍严格
+        
         continuous_tokens, token_weights = self.splitter.shallow_evaluator.get_continuous_tokens(
             features=features,                          # [B, C, H_feat, W_feat]
             embeddings=candidate_embeddings,            # [B, N_candidates, D]
             probs=probs_result.probs,                   # [B, N_candidates]
             cumulative_probs=probs_result.cumulative_probs,  # [B, N_candidates]
             embed_dim=dim,                              # D
+            threshold=threshold,
         )  # [B, N_output, D], [B, N_output]
         
         # N_output 是实际输出token数量 (通常小于N_candidates)
@@ -627,10 +634,14 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # =====================================================================
         num_tokens_list = [N_output] * B  # 连续模式下每个batch token数相同
         
-        # levels_info: 连续模式下使用软深度分布
-        # 这里简化为深度=0 (后续可以添加期望深度)
+        # levels_info: 使用evaluator缓存的深度信息
+        # I10-18增强: 从get_continuous_tokens获取实际深度
         levels_info = torch.zeros(B, N_output, self.max_depth + 1, dtype=torch.long, device=device)
-        levels_info[:, :, 0] = 0  # 全部标记为depth=0 (或计算期望深度)
+        
+        if hasattr(self.splitter.shallow_evaluator, '_last_token_depths'):
+            token_depths = self.splitter.shallow_evaluator._last_token_depths  # [B, N_output]
+            # levels_info[:, :, 0] 存储深度值
+            levels_info[:, :, 0] = token_depths.clamp(max=self.max_depth)
         
         # padded_regions: 使用候选区域的前N_output个
         padded_regions = torch.zeros(B, N_output, 4, dtype=torch.long, device=device)
