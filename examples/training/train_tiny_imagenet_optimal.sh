@@ -11,7 +11,6 @@ uv run python examples/training/train_fractal_vit.py \
   --dim 384 \
   --depth 12 \
   --heads 6 \
-  --mlp-dim 1536 \
   --dim-head 64 \
   --max-level 4 \
   --pool cls \
@@ -26,7 +25,7 @@ uv run python examples/training/train_fractal_vit.py \
   `# 训练配置 (batch_size=128, lr 线性缩放)` \
   --batch-size 128 \
   --num-workers 4 \
-  --learning-rate 7e-4 \
+  --lr 7e-4 \
   --weight-decay 0.05 \
   --warmup-epochs 10 \
   \
