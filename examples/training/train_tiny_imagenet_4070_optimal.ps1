@@ -2,7 +2,7 @@
 # Tiny-ImageNet 最优训练脚本 (RTX 4070 Laptop)
 # ============================================================================
 #
-# 数学形式化分析 (2026-01-07)
+# 数学形式化分析 (2026-01-08)
 # ===========================
 #
 # 1. 模型容量 vs 数据集规模
@@ -25,30 +25,29 @@
 # 3. 学习率缩放 (Linear Scaling Rule)
 #    ---------------------------------
 #    lr_base = 5e-4 @ batch_size=64
-#    lr = lr_base × (batch_size / 64) = 5e-4 × (128/64) = 1e-3
+#    lr = lr_base × (batch_size / 64) × 0.8 = 5e-4 × (196/64) × 0.8 ≈ 1.2e-3
 #    
-#    但对于 Tiny-ImageNet (小数据集)，降低 20% 防止不稳定:
-#    lr_final = 1e-3 × 0.8 = 8e-4
+#    保守调整因子 0.8 防止小数据集上的不稳定
 #
 # 4. VRAM 预算 (8GB - 4070 Laptop)
 #    ------------------------------
 #    Model (fp32): 21.14M × 4B = 84.6 MB
 #    Optimizer (AdamW): 21.14M × 8B = 169.1 MB
 #    Gradients: 84.6 MB
-#    Activations (AMP + Checkpoint): ~1.5 GB
-#    Buffer: ~0.5 GB
-#    Total: ~2.5 GB << 8 GB ✓
+#    Activations (AMP + Checkpoint): ~0.5 GB (batch_size=196)
+#    Buffer: ~0.15 GB
+#    Total: ~0.9 GB << 8 GB ✓
 #    
-#    结论: batch_size=128 可行，且有充足余量
+#    结论: batch_size=196 可行，充分利用 GPU 并行能力
 #
 # 5. 训练时间估算
 #    -------------
 #    样本数: 100,000
-#    batch_size: 128
-#    迭代/epoch: ⌈100,000 / 128⌉ = 782
+#    batch_size: 196
+#    迭代/epoch: ⌈100,000 / 196⌉ = 511
 #    假设速度: 1.8 s/iter (含 compile 优化)
-#    epoch 时间: 782 × 1.8s = 23.5 min
-#    100 epochs: ~39 小时
+#    epoch 时间: 511 × 1.8s ≈ 15.3 min
+#    100 epochs: ~25.5 小时
 #
 # 6. 最新架构特性
 #    -------------
@@ -56,7 +55,7 @@
 #    ✓ Soft Entropy Loss (尺度多样性)
 #    ✓ Elastic Budget Loss (Dead Zone 惩罚)
 #    ✓ Warmup Forced Split (初始化稳定性)
-#    ✓ I10-19 Continuous Relaxation (可选)
+#    ✓ I10-19 Continuous Relaxation (启用 - 解决 Splitter 崩塌)
 #
 # ============================================================================
 
@@ -88,12 +87,12 @@ uv run python examples/training/train_fractal_vit.py `
   --enforce-balance `
   `
   <# ====================================================================== #> `
-  <# 训练配置 (batch_size=128 最大化 GPU 利用率)                            #> `
-  <#   lr = 8e-4 (线性缩放 + 小数据集保守调整)                               #> `
+  <# 训练配置 (batch_size=196 最大化 GPU 利用率)                            #> `
+  <#   lr = 1.2e-3 (线性缩放 + 小数据集保守调整 0.8×)                       #> `
   <# ====================================================================== #> `
-  --batch-size 128 `
+  --batch-size 196 `
   --num-workers 4 `
-  --lr 8e-4 `
+  --lr 1.2e-3 `
   --weight-decay 0.05 `
   --warmup-epochs 10 `
   `
@@ -135,6 +134,13 @@ uv run python examples/training/train_fractal_vit.py `
   --splitter-temp-warmup 5 `
   `
   <# ====================================================================== #> `
+  <# I10-19 连续松弛 (解决 Splitter 崩塌问题)                               #> `
+  <#   启用完全可微分前向传播，让主损失梯度也能流向 Splitter                  #> `
+  <# ====================================================================== #> `
+  --use-continuous-relaxation `
+  --continuous-max-depth 3 `
+  `
+  <# ====================================================================== #> `
   <# 性能优化 (4070 Laptop 最大化)                                          #> `
   <#   AMP: FP16 计算，减少 VRAM 和加速                                      #> `
   <#   Gradient Checkpoint: 用计算换内存                                     #> `
@@ -152,4 +158,5 @@ uv run python examples/training/train_fractal_vit.py `
   <# 早停策略 (patience=15 防止过拟合)                                      #> `
   <# ====================================================================== #> `
   --patience 15 `
-  --min-delta 0.001 
+  --min-delta 0.001 `
+  --exp-name tiny_imagenet_4070_optimal_320d_12l_bs196
