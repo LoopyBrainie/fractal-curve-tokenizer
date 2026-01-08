@@ -561,25 +561,28 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         dim = self.d_model
         
         # =====================================================================
-        # Step 1: 预计算所有候选区域的embeddings
+        # Step 1: 预计算所有候选区域的embeddings (向量化)
         # 数学说明: E = f_φ(features, candidate_regions) 独立于 P
+        # 
+        # 性能优化: 消除 Python for 循环，使用广播构建 boxes
         # =====================================================================
         N_candidates = probs_result.num_candidates
         candidate_regions = probs_result.candidate_regions  # [N_candidates, 4]
         
-        # 为每个batch复制候选区域
-        # boxes: [B×N_candidates, 5] -> (batch_idx, x1, y1, x2, y2)
+        # 向量化构建 boxes: [B×N_candidates, 5] -> (batch_idx, x1, y1, x2, y2)
         p = self.base_patch_size
-        boxes = torch.zeros(B * N_candidates, 5, device=device, dtype=dtype)
         
-        for b in range(B):
-            start_idx = b * N_candidates
-            end_idx = (b + 1) * N_candidates
-            boxes[start_idx:end_idx, 0] = b
-            boxes[start_idx:end_idx, 1] = candidate_regions[:, 0].float() / p  # x1
-            boxes[start_idx:end_idx, 2] = candidate_regions[:, 1].float() / p  # y1
-            boxes[start_idx:end_idx, 3] = candidate_regions[:, 2].float() / p  # x2
-            boxes[start_idx:end_idx, 4] = candidate_regions[:, 3].float() / p  # y2
+        # 创建 batch 索引 [B, N_candidates] → flatten
+        batch_indices = torch.arange(B, device=device, dtype=dtype).unsqueeze(1).expand(-1, N_candidates)  # [B, N]
+        batch_indices_flat = batch_indices.reshape(-1)  # [B*N]
+        
+        # 扩展区域坐标 [N_candidates, 4] → [B, N_candidates, 4] → [B*N, 4]
+        regions_scaled = candidate_regions.float() / p  # [N, 4]
+        regions_expanded = regions_scaled.unsqueeze(0).expand(B, -1, -1)  # [B, N, 4]
+        regions_flat = regions_expanded.reshape(B * N_candidates, 4)  # [B*N, 4]
+        
+        # 组合成 boxes [B*N, 5]
+        boxes = torch.cat([batch_indices_flat.unsqueeze(1), regions_flat], dim=1)  # [B*N, 5]
         
         # 确保最小尺寸
         boxes[:, 3] = torch.maximum(boxes[:, 1] + 0.5, boxes[:, 3])

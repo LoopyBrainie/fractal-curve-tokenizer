@@ -251,6 +251,8 @@ class ShallowParallelEvaluator(nn.Module):
         B, C, H_feat, W_feat = features.shape
         H_img, W_img = self.image_size
         N = self.num_candidates
+        device = features.device
+        dtype = features.dtype
         
         scale_h = H_feat / H_img
         scale_w = W_feat / W_img
@@ -258,23 +260,24 @@ class ShallowParallelEvaluator(nn.Module):
         # Step 1: 归一化候选区域坐标到特征图空间
         # candidate_regions: [N, 4] (x0, y0, x1, y1) in image space
         # 转换为 [x0', y0', x1', y1'] in feature space
-        regions_feat = self.candidate_regions.clone()
+        regions_feat = self.candidate_regions.clone().to(dtype)
         regions_feat[:, [0, 2]] *= scale_w  # x坐标
         regions_feat[:, [1, 3]] *= scale_h  # y坐标
         
-        # Step 2: 批量ROI-Align
-        # 扩展为 [B*N, 5] (batch_idx, x0, y0, x1, y1)
-        # torchvision.ops.roi_align expects boxes in format [N_boxes, 5]
-        # where each box is [batch_idx, x0, y0, x1, y1]
-        boxes = []
-        for b in range(B):
-            batch_boxes = torch.cat([
-                torch.full((N, 1), b, dtype=regions_feat.dtype, device=regions_feat.device),
-                regions_feat
-            ], dim=1)  # [N, 5]
-            boxes.append(batch_boxes)
+        # Step 2: 批量ROI-Align (向量化构建 boxes)
+        # =========================================
+        # 性能优化: 消除 Python for 循环
+        # =========================================
         
-        boxes = torch.cat(boxes, dim=0)  # [B*N, 5]
+        # 创建 batch 索引 [B] → [B, 1] → [B, N, 1]
+        batch_indices = torch.arange(B, device=device, dtype=dtype).view(B, 1, 1).expand(-1, N, -1)  # [B, N, 1]
+        
+        # 扩展区域坐标 [N, 4] → [1, N, 4] → [B, N, 4]
+        regions_expanded = regions_feat.unsqueeze(0).expand(B, -1, -1)  # [B, N, 4]
+        
+        # 组合成 boxes [B, N, 5] → [B*N, 5]
+        boxes = torch.cat([batch_indices, regions_expanded], dim=2)  # [B, N, 5]
+        boxes = boxes.view(B * N, 5)  # [B*N, 5]
         
         # ROI-Align: [B*N, C, k, k]
         from torchvision.ops import roi_align
@@ -303,23 +306,82 @@ class ShallowParallelEvaluator(nn.Module):
         sigmoid_input = ((logits - taus.unsqueeze(0)) / temperature).clamp(-20.0, 20.0)
         probs = torch.sigmoid(sigmoid_input)  # [B, N]
         
-        # Step 5: 计算累积概率 α(R) = Π_{ancestors} p_split
-        # 初始化: 所有节点的累积概率为1
-        cumulative_probs_list = [torch.ones(B, device=probs.device) for _ in range(N)]
-        
-        # 按深度顺序累乘 (depth 0 → K)
-        # parent_indices: [N], parent_idx=-1 表示root
-        for idx in range(N):
-            parent_idx = self.parent_indices[idx].item()
-            if parent_idx >= 0:
-                # α_child = α_parent × p_parent
-                cumulative_probs_list[idx] = (
-                    cumulative_probs_list[parent_idx] * probs[:, parent_idx]
-                )
-        
-        cumulative_probs = torch.stack(cumulative_probs_list, dim=1)  # [B, N]
+        # Step 5: 计算累积概率 α(R) = Π_{ancestors} p_split (向量化)
+        # =========================================================
+        # 性能优化: 消除 Python for 循环和 .item() 调用
+        # 
+        # 数学原理:
+        #   四叉树有 K+1 层: depths 0, 1, ..., K
+        #   每层 d 有 4^d 个节点
+        #   父节点索引: parent[d, i, j] = (d-1, i//2, j//2)
+        #   
+        # 向量化策略:
+        #   1. 按深度分层处理 (K+1 次, 而非 N 次)
+        #   2. 使用 gather 代替逐元素索引
+        #   3. 避免所有 .item() 调用
+        # =========================================================
+        cumulative_probs = self._compute_cumulative_probs_vectorized(probs)  # [B, N]
         
         return logits, probs, cumulative_probs
+    
+    def _compute_cumulative_probs_vectorized(self, probs: Tensor) -> Tensor:
+        """
+        向量化累积概率计算 (性能优化版).
+        
+        数学形式化:
+            α(R_root) = 1
+            α(R_child) = α(R_parent) × p(R_parent)
+            
+        实现策略:
+            按深度从浅到深传播概率，使用 scatter 操作批量更新。
+            
+        性能特点:
+            - O(K+1) 次 GPU kernel 调用 (vs O(N) 次 Python 循环)
+            - 0 次 .item() 调用 (vs N 次)
+            - 完全并行化
+            
+        Args:
+            probs: [B, N] 分割概率
+            
+        Returns:
+            cumulative_probs: [B, N] 累积概率
+        """
+        B, N = probs.shape
+        device = probs.device
+        
+        # 初始化累积概率为 1
+        cumulative_probs = torch.ones(B, N, device=device, dtype=probs.dtype)
+        
+        # 按深度从浅到深处理
+        # depth 0: 根节点, 累积概率 = 1 (无需处理)
+        # depth d (d>0): α_child = α_parent × p_parent
+        
+        for depth in range(1, self.max_depth_parallel + 1):
+            # 找到当前深度的所有节点 (向量化mask)
+            depth_mask = (self.candidate_depths == depth)  # [N]
+            
+            if not depth_mask.any():
+                continue
+                
+            # 获取当前深度节点的父节点索引 (向量化)
+            # parent_indices: [N], -1 for root
+            current_parent_indices = self.parent_indices[depth_mask]  # [M_d]
+            
+            # 从父节点获取累积概率和分割概率 (使用 index_select)
+            parent_cumulative = cumulative_probs[:, current_parent_indices]  # [B, M_d]
+            parent_probs = probs[:, current_parent_indices]  # [B, M_d]
+            
+            # 计算子节点的累积概率
+            child_cumulative = parent_cumulative * parent_probs  # [B, M_d]
+            
+            # 更新累积概率 (使用 masked_scatter)
+            # 需要扩展 mask 到 batch 维度
+            depth_mask_expanded = depth_mask.unsqueeze(0).expand(B, -1)  # [B, N]
+            cumulative_probs = cumulative_probs.masked_scatter(
+                depth_mask_expanded, child_cumulative
+            )
+        
+        return cumulative_probs
     
     def get_candidate_probs_result(
         self,
@@ -415,7 +477,7 @@ class ShallowParallelEvaluator(nn.Module):
         max_tokens: Optional[int] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
-        I10-19: 连续松弛token生成（核心方法）
+        I10-19: 连续松弛token生成（向量化优化版）
         
         数学形式化
         ==========
@@ -426,17 +488,23 @@ class ShallowParallelEvaluator(nn.Module):
         其中:
             p: 父节点的分割概率
             α_i: 归一化的子节点累积概率
-            α_i = cumulative_prob(child_i) / Σ_j cumulative_prob(child_j)
             
-        实现策略:
-            1. 从叶子节点向根节点递归计算
-            2. 叶子节点: t_leaf = Embed(R_leaf) (无子节点)
-            3. 内部节点: t = (1-p)·embed + p·Σα_i·t_child
+        性能优化 (vs 原始实现)
+        ====================
+        
+        原始实现问题:
+            1. Python for 循环遍历 N=85 个候选 (N次GPU同步)
+            2. 嵌套循环遍历子节点 (额外 4N 次操作)
+            3. 大量 .item() 调用 (每次触发 GPU→CPU 同步)
+            4. 逐样本处理 batch (B 倍开销)
             
-        梯度流动:
-            ∂t/∂p = Σα_i·t_child - Embed(R)  (完全可微)
-            ∂t/∂embed = (1-p)  (完全可微)
-            ∂t/∂t_child = p·α_i  (完全可微)
+        向量化策略:
+            1. 预计算父子关系矩阵 (一次性)
+            2. 使用 gather/scatter 批量索引
+            3. 完全消除 .item() 调用
+            4. 按深度分层处理 (K+1 次 vs N 次)
+            
+        预期加速: 4-8x (4s/iter → 1s/iter)
             
         Args:
             features: [B, C, H, W] 特征图（用于embedding）
@@ -444,6 +512,8 @@ class ShallowParallelEvaluator(nn.Module):
             probs: [B, N] 分割概率 p_split
             cumulative_probs: [B, N] 累积概率 α(R)
             embed_dim: D, embedding维度
+            threshold: 保留token的最小累积概率
+            max_tokens: 最大token数量限制
             
         Returns:
             tokens: [B, M, D] 连续融合后的tokens (M为选中的token数)
@@ -451,152 +521,172 @@ class ShallowParallelEvaluator(nn.Module):
         """
         B, N, D = embeddings.shape
         device = embeddings.device
+        dtype = embeddings.dtype
         
-        # 按深度倒序处理（叶子→根）
-        max_depth = self.candidate_depths.max().item()
+        # =====================================================================
+        # Step 1: 构建父子关系结构 (向量化预计算)
+        # =====================================================================
+        # 创建子节点索引矩阵: children_matrix[i] = [child1, child2, child3, child4] 或 -1
+        if not hasattr(self, '_children_matrix') or self._children_matrix.device != device:
+            self._precompute_tree_structure(device)
         
-        # 初始化：所有节点的token初始值为其embedding
-        tokens_dict = {i: embeddings[:, i, :] for i in range(N)}  # [B, D]
+        children_matrix = self._children_matrix  # [N, 4] 子节点索引, -1表示无子节点
+        has_children = self._has_children  # [N] 是否有子节点
         
-        # 从深层到浅层递归计算
-        for depth in range(max_depth, -1, -1):
-            # 找到当前深度的所有节点
-            depth_mask = (self.candidate_depths == depth)
-            depth_indices = depth_mask.nonzero(as_tuple=True)[0]
+        # =====================================================================
+        # Step 2: 从叶子到根的递归融合 (向量化)
+        # =====================================================================
+        # 初始化: 所有节点的token = embedding
+        tokens_all = embeddings.clone()  # [B, N, D]
+        
+        # 按深度从深到浅处理 (max_depth → 0)
+        max_depth = self.max_depth_parallel
+        
+        for depth in range(max_depth - 1, -1, -1):  # depth K-1 到 0
+            # 找到当前深度有子节点的所有节点
+            depth_mask = (self.candidate_depths == depth) & has_children  # [N]
             
-            for idx in depth_indices:
-                idx_item = idx.item()
-                
-                # 找到子节点（parent_indices中指向当前节点的）
-                children_mask = (self.parent_indices == idx_item)
-                children_indices = children_mask.nonzero(as_tuple=True)[0]
-                
-                if len(children_indices) == 0:
-                    # 叶子节点：token就是embedding
-                    continue
-                
-                # 内部节点：加权融合
-                p_split = probs[:, idx_item]  # [B]
-                parent_embed = embeddings[:, idx_item, :]  # [B, D]
-                
-                # 获取子节点的tokens和累积概率
-                children_tokens = []
-                children_cum_probs = []
-                for child_idx in children_indices:
-                    child_idx_item = child_idx.item()
-                    children_tokens.append(tokens_dict[child_idx_item])  # [B, D]
-                    children_cum_probs.append(cumulative_probs[:, child_idx_item])  # [B]
-                
-                children_tokens = torch.stack(children_tokens, dim=1)  # [B, num_children, D]
-                children_cum_probs = torch.stack(children_cum_probs, dim=1)  # [B, num_children]
-                
-                # 归一化子节点权重
-                children_weights = F.softmax(children_cum_probs, dim=1)  # [B, num_children]
-                
-                # 加权求和子节点
-                weighted_children = (
-                    children_weights.unsqueeze(-1) * children_tokens
-                ).sum(dim=1)  # [B, D]
-                
-                # 连续松弛融合: t = (1-p)·parent_embed + p·weighted_children
-                # 扩展维度以进行广播
-                p_split_expanded = p_split.unsqueeze(-1)  # [B, 1]
-                fused_token = (
-                    (1 - p_split_expanded) * parent_embed +
-                    p_split_expanded * weighted_children
-                )  # [B, D]
-                
-                # 更新token
-                tokens_dict[idx_item] = fused_token
-        
-        # 选择最终tokens：使用cumulative_probs作为权重
-        # 
-        # 数学形式化:
-        #   选择策略: 保留 α(R) > threshold 的候选
-        #   训练模式: 使用较低阈值 (0.01) 保持梯度流到更多候选
-        #   推理模式: 可以使用较高阈值 (0.1+) 或 Top-K 减少计算
-        #
-        # 有效token数公式 (软计数):
-        #   N_eff = Σ_i w_i  其中 w_i = α_i / Σ_j α_j
-        #   当阈值过低时，N_eff ≈ 叶子节点数 (64 for depth=3)
-        #   当阈值适中时，N_eff 反映实际复杂度分布
-        
-        final_tokens_list = []
-        final_weights_list = []
-        final_depths_list = []  # I10-18增强: 记录深度用于LCA偏置
-        
-        for b in range(B):
-            batch_tokens = []
-            batch_weights = []
-            batch_depths = []
+            if not depth_mask.any():
+                continue
             
-            for idx in range(N):
-                weight = cumulative_probs[b, idx].item()
-                if weight > threshold:
-                    batch_tokens.append(tokens_dict[idx][b])  # [D]
-                    batch_weights.append(weight)
-                    batch_depths.append(self.candidate_depths[idx].item())
+            # 当前深度的节点索引
+            parent_indices_at_depth = depth_mask.nonzero(as_tuple=True)[0]  # [M_d]
+            M_d = parent_indices_at_depth.shape[0]
             
-            if len(batch_tokens) == 0:
-                # 至少保留根节点
-                batch_tokens.append(tokens_dict[0][b])
-                batch_weights.append(1.0)
-                batch_depths.append(0)
+            if M_d == 0:
+                continue
             
-            # 可选: Top-K 限制
-            if max_tokens is not None and len(batch_tokens) > max_tokens:
-                # 按权重排序，保留Top-K
-                sorted_indices = sorted(range(len(batch_weights)), key=lambda i: batch_weights[i], reverse=True)
-                sorted_indices = sorted_indices[:max_tokens]
-                batch_tokens = [batch_tokens[i] for i in sorted_indices]
-                batch_weights = [batch_weights[i] for i in sorted_indices]
-                batch_depths = [batch_depths[i] for i in sorted_indices]
+            # 获取这些节点的子节点索引 [M_d, 4]
+            children_at_depth = children_matrix[parent_indices_at_depth]  # [M_d, 4]
             
-            # Stack and normalize
-            batch_tokens = torch.stack(batch_tokens, dim=0)  # [M_b, D]
-            batch_weights = torch.tensor(batch_weights, device=device, dtype=torch.float32)
-            batch_weights = batch_weights / batch_weights.sum()  # 归一化
+            # 获取父节点的分割概率 [B, M_d]
+            p_split = probs[:, parent_indices_at_depth]  # [B, M_d]
             
-            final_tokens_list.append(batch_tokens)
-            final_weights_list.append(batch_weights)
-            final_depths_list.append(batch_depths)
+            # 获取父节点的embedding [B, M_d, D]
+            parent_embeds = embeddings[:, parent_indices_at_depth, :]  # [B, M_d, D]
+            
+            # 获取子节点的tokens和累积概率 (批量gather)
+            # children_at_depth: [M_d, 4], 需要扩展到 [B, M_d, 4]
+            children_expanded = children_at_depth.unsqueeze(0).expand(B, -1, -1)  # [B, M_d, 4]
+            
+            # 对于 tokens_all [B, N, D], 需要 gather dim=1
+            # gather 需要 index 形状与 output 相同，所以需要 [B, M_d*4, D]
+            children_flat = children_expanded.reshape(B, M_d * 4)  # [B, M_d*4]
+            children_flat_clamped = children_flat.clamp(min=0)  # 将 -1 替换为 0 (后面会mask)
+            
+            # Gather children tokens [B, M_d*4, D]
+            children_flat_expanded = children_flat_clamped.unsqueeze(-1).expand(-1, -1, D)  # [B, M_d*4, D]
+            children_tokens_flat = torch.gather(tokens_all, 1, children_flat_expanded)  # [B, M_d*4, D]
+            children_tokens = children_tokens_flat.view(B, M_d, 4, D)  # [B, M_d, 4, D]
+            
+            # Gather children cumulative probs [B, M_d, 4]
+            children_cum_probs = torch.gather(cumulative_probs, 1, children_flat_clamped)  # [B, M_d*4]
+            children_cum_probs = children_cum_probs.view(B, M_d, 4)  # [B, M_d, 4]
+            
+            # 创建有效子节点mask (children_at_depth != -1)
+            valid_children_mask = (children_at_depth >= 0).unsqueeze(0).expand(B, -1, -1)  # [B, M_d, 4]
+            
+            # 将无效子节点的累积概率设为 -inf (softmax后为0)
+            children_cum_probs_masked = children_cum_probs.masked_fill(~valid_children_mask, float('-inf'))
+            
+            # 归一化子节点权重 (softmax over valid children)
+            children_weights = F.softmax(children_cum_probs_masked, dim=-1)  # [B, M_d, 4]
+            children_weights = children_weights.masked_fill(~valid_children_mask, 0.0)  # 确保无效子节点权重为0
+            
+            # 加权求和子节点 [B, M_d, D]
+            weighted_children = (children_weights.unsqueeze(-1) * children_tokens).sum(dim=2)  # [B, M_d, D]
+            
+            # 连续松弛融合: t = (1-p)·parent_embed + p·weighted_children
+            p_expanded = p_split.unsqueeze(-1)  # [B, M_d, 1]
+            fused_tokens = (1 - p_expanded) * parent_embeds + p_expanded * weighted_children  # [B, M_d, D]
+            
+            # 更新 tokens_all (使用 scatter)
+            parent_indices_expanded = parent_indices_at_depth.unsqueeze(0).unsqueeze(-1).expand(B, -1, D)  # [B, M_d, D]
+            tokens_all = tokens_all.scatter(1, parent_indices_expanded, fused_tokens)
         
-        # Pad to max length in batch
-        max_tokens_in_batch = max(t.size(0) for t in final_tokens_list)
+        # =====================================================================
+        # Step 3: 选择最终tokens (向量化)
+        # =====================================================================
+        # 使用累积概率阈值过滤
+        token_mask = cumulative_probs > threshold  # [B, N]
         
-        padded_tokens = []
-        padded_weights = []
-        padded_depths = []
+        # 计算每个batch有多少有效token
+        valid_counts = token_mask.sum(dim=1)  # [B]
         
-        for batch_tokens, batch_weights, batch_depths in zip(
-            final_tokens_list, final_weights_list, final_depths_list
-        ):
-            M_b = batch_tokens.size(0)
-            if M_b < max_tokens_in_batch:
-                # Pad with zeros
-                pad_tokens = torch.zeros(max_tokens_in_batch - M_b, D, device=device, dtype=batch_tokens.dtype)
-                pad_weights = torch.zeros(max_tokens_in_batch - M_b, device=device, dtype=batch_weights.dtype)
-                pad_depths = torch.zeros(max_tokens_in_batch - M_b, device=device, dtype=torch.long)
-                
-                batch_tokens = torch.cat([batch_tokens, pad_tokens], dim=0)
-                batch_weights = torch.cat([batch_weights, pad_weights], dim=0)
-                batch_depths_tensor = torch.tensor(batch_depths, device=device, dtype=torch.long)
-                batch_depths_tensor = torch.cat([batch_depths_tensor, pad_depths], dim=0)
-            else:
-                batch_depths_tensor = torch.tensor(batch_depths, device=device, dtype=torch.long)
-            
-            padded_tokens.append(batch_tokens)
-            padded_weights.append(batch_weights)
-            padded_depths.append(batch_depths_tensor)
+        # 确保至少有一个token (根节点)
+        valid_counts = valid_counts.clamp(min=1)
         
-        tokens = torch.stack(padded_tokens, dim=0)  # [B, max_tokens_in_batch, D]
-        token_weights = torch.stack(padded_weights, dim=0)  # [B, max_tokens_in_batch]
-        token_depths = torch.stack(padded_depths, dim=0)  # [B, max_tokens_in_batch]
+        # 如果所有batch的mask都为空,强制保留根节点
+        if not token_mask.any():
+            token_mask[:, 0] = True
+        
+        # 获取最大token数
+        max_valid = int(valid_counts.max().item()) if valid_counts.numel() > 0 else 1
+        
+        # 应用 max_tokens 限制
+        if max_tokens is not None:
+            max_valid = min(max_valid, max_tokens)
+        
+        # 使用 Top-K 选择 (按累积概率排序)
+        # 这比逐元素过滤更高效
+        topk_probs, topk_indices = torch.topk(cumulative_probs, max_valid, dim=1)  # [B, max_valid]
+        
+        # Gather selected tokens [B, max_valid, D]
+        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, D)  # [B, max_valid, D]
+        selected_tokens = torch.gather(tokens_all, 1, topk_indices_expanded)  # [B, max_valid, D]
+        
+        # Gather selected depths [B, max_valid]
+        selected_depths = self.candidate_depths[topk_indices]  # [B, max_valid]
+        
+        # 归一化权重
+        token_weights = topk_probs / (topk_probs.sum(dim=1, keepdim=True) + 1e-8)  # [B, max_valid]
+        
+        # 创建padding mask (topk_probs > threshold)
+        padding_mask = topk_probs > threshold  # [B, max_valid]
+        
+        # 将padding位置的token设为0
+        selected_tokens = selected_tokens * padding_mask.unsqueeze(-1).float()
+        token_weights = token_weights * padding_mask.float()
+        
+        # 重新归一化权重
+        weight_sum = token_weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        token_weights = token_weights / weight_sum
         
         # 缓存深度信息供外部使用 (用于LCA偏置计算)
-        self._last_token_depths = token_depths
+        self._last_token_depths = selected_depths
         
-        return tokens, token_weights
+        return selected_tokens, token_weights
+    
+    def _precompute_tree_structure(self, device: torch.device) -> None:
+        """
+        预计算四叉树的父子关系结构 (一次性, 缓存).
+        
+        构建:
+            children_matrix[i, :] = 节点 i 的4个子节点索引, -1表示无子节点
+            has_children[i] = 节点 i 是否有子节点
+        """
+        N = self.num_candidates
+        
+        # 初始化 children_matrix 为 -1 (无子节点)
+        children_matrix = torch.full((N, 4), -1, dtype=torch.long, device=device)
+        
+        # 遍历所有节点,填充其子节点
+        # parent_indices[child] = parent, 所以反向查找
+        for child_idx in range(N):
+            parent_idx = self.parent_indices[child_idx].item()
+            if parent_idx >= 0:
+                # 找到 parent 的下一个空槽
+                for slot in range(4):
+                    if children_matrix[parent_idx, slot] == -1:
+                        children_matrix[parent_idx, slot] = child_idx
+                        break
+        
+        # 计算 has_children
+        has_children = (children_matrix >= 0).any(dim=1)  # [N]
+        
+        # 注册为 buffer (不参与训练)
+        self.register_buffer('_children_matrix', children_matrix)
+        self.register_buffer('_has_children', has_children)
 
 
 def integrate_shallow_parallel_to_splitter(
