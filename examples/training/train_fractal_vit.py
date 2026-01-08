@@ -2196,8 +2196,8 @@ def main():
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--dim-head", type=int, default=32)
     parser.add_argument("--max-level", type=int, default=4)
-    parser.add_argument("--num-scales", type=int, default=3,
-                       help="Number of scales for multi-scale tokenizer")
+    parser.add_argument("--num-scales", type=int, default=5,
+                       help="Number of scales (I16-2: default=5 for max_depth=4, max_tokens=341)")
     parser.add_argument("--pool", type=str, default="cls", choices=["cls", "mean"])
     parser.add_argument("--ffn-type", type=str, default="swiglu_level",
                        choices=["gelu", "swiglu", "swiglu_level"])
@@ -2286,9 +2286,9 @@ def main():
     parser.add_argument("--no-elastic-budget", action="store_false", dest="include_elastic_budget",
                        help="Disable elastic budget loss")
     parser.add_argument("--elastic-N-min", type=int, default=32,
-                       help="Elastic budget lower bound (default: 32)")
+                       help="Elastic budget lower bound (I16-2: must < max_tokens)")
     parser.add_argument("--elastic-N-max", type=int, default=256,
-                       help="Elastic budget upper bound (default: 256)")
+                       help="Elastic budget upper bound (I16-2: default=256 for num_scales=5)")
     parser.add_argument("--elastic-lambda-over", type=float, default=0.1,
                        help="Penalty weight for exceeding upper bound (default: 0.1)")
     parser.add_argument("--elastic-lambda-under", type=float, default=0.01,

@@ -15,8 +15,9 @@ uv run python examples/training/train_fractal_vit.py `
   --pool cls `
   --ffn-type swiglu_level `
   `
-  <# LearnableSplitter 配置 #> `
+  <# LearnableSplitter 配置 (I16-2: 几何极限 max_depth=4) #> `
   --tokenizer-type streaming_v3 `
+  --num-scales 5 `
   --target-tokens 96 `
   --split-tau0 0.0 `
   --split-gamma 0.5 `
@@ -39,13 +40,13 @@ uv run python examples/training/train_fractal_vit.py `
   --cutmix-alpha 1.0 `
   --mixup-prob 0.5 `
   `
-  <# P10 优化 (软熵 + 弹性预算) #> `
+  <# P10 优化 (软熵 + 弹性预算) - I16-2: 修复数学矛盾 #> `
   --include-soft-entropy `
   --soft-entropy-mode maximize `
   --soft-entropy-weight 0.1 `
   --include-elastic-budget `
-  --elastic-N-min 64 `
-  --elastic-N-max 128 `
+  --elastic-N-min 32 `
+  --elastic-N-max 256 `
   --elastic-lambda-over 0.1 `
   --elastic-lambda-under 0.01 `
   --elastic-lambda-collapse 1.0 `
