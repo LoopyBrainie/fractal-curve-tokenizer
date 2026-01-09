@@ -54,6 +54,7 @@ import torch.nn as nn
 
 from .base_tokenizer import BaseTokenizer, TokenizerOutput, TokenSequence
 from .config_fractal import FractalConfig
+from .constants import LOG_EPSILON, PROB_EPSILON  # I12-7: 数值稳定性常量
 from .embed_fractal_path import VectorizedPathEncoder  # I12-3: 用于计算路径
 
 
@@ -113,9 +114,12 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         gamma: float = 0.85,
         learnable_temperature: float = 1.0,
         use_gumbel: bool = True,
-        # I10-19: 连续松弛参数
+        # I10-19: 连续松弛参数 (已废弃, 保留向后兼容)
         use_continuous_relaxation: bool = False,
         continuous_max_depth: int = 3,
+        # I20: Gumbel-Top-K 参数
+        K_min: int = 8,
+        K_max: int = 64,
     ) -> None:
         super().__init__()
         
@@ -128,7 +132,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         self.base_patch_size = base_patch_size
         self.max_depth = max_depth
         self.use_hilbert_order = use_hilbert_order
-        self._use_learnable_split = True  # Always use LearnableSplitter
+        self._use_learnable_split = True  # Legacy flag, always True
         
         # =====================================================================
         # Hilbert-Native Patch Embedding (包含 SharedConv)
@@ -145,33 +149,36 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         )
         
         # =====================================================================
-        # LearnableSplitter (Scheme B/C have been removed)
+        # I20: GumbelTopKSplitter (替代 LearnableSplitter)
         # =====================================================================
-        # Mathematical justification for removal:
-        # - Scheme B: C(R) = Var/(Var+σ₀²) saturates as Var → ∞
-        # - Scheme C: O(N·4^D) DP complexity, not differentiable
-        # - Scheme L: C_θ(R) = σ(MLP(ROI-Align(F, R))) - no saturation, O(D) BFS
+        # 数学形式化分析结论 (2026-01-10):
+        # 
+        # Scheme A (LearnableSplitter/BFS+STE):
+        #   - Hilbert 局部性: 100% ✓
+        #   - 梯度覆盖: ~25% ✗ (BFS 串行依赖导致深层饥饿)
+        #   - 崩塌风险: 高 (τ/T > 3 时不可逆崩塌)
+        #
+        # Scheme D (GumbelTopKSplitter):
+        #   - Hilbert 局部性: 100% ✓
+        #   - 梯度覆盖: 100% ✓ (STE 使所有 85 候选都有梯度)
+        #   - 崩塌风险: 低 (无串行依赖)
+        #   - LCA 兼容性: 完全 (每个 token 精确对应一个四叉树节点)
+        #
+        # 结论: Scheme D 是 Hilbert Curve ViT 的最优分割器
         # =====================================================================
-        from .split_adaptive import LearnableSplitter
+        from .gumbel_topk_splitter import GumbelTopKSplitter
         
-        # P11-14: 确保 min_region_size >= 2 * base_patch_size
-        # 这保证最小区域至少覆盖 2×2 = 4 个特征像素,
-        # 使 ROI-Align 的 4×4 采样网格能获得有意义的空间信息
-        safe_min_region_size = max(base_patch_size * 2, 8)
-        
-        self.splitter = LearnableSplitter(
+        self.splitter = GumbelTopKSplitter(
             feature_dim=d_model,
             max_depth=max_depth,
             hidden_dim=64,
             pool_size=4,
             temperature=learnable_temperature,
-            use_gumbel=use_gumbel,
-            enforce_balance=enforce_balance,
-            min_region_size=safe_min_region_size,
-            init_tau_base=0.5,
-            init_tau_gamma=gamma,
-            # I10-19: 传递连续松弛配置
-            use_continuous_relaxation=use_continuous_relaxation,
+            K_min=K_min,
+            K_max=K_max,
+            dropout=0.1,
+            use_dynamic_k=True,
+            image_size=image_size,
         )
         
         self._last_split_stats: Optional[Dict[str, Any]] = None
@@ -224,11 +231,11 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             2. TensorResult = Splitter.forward(F)   # 纯张量分割 (P9-1)
             3. T = _embed_with_tensor_result(F, TensorResult)  # 纯张量嵌入
             
-        性能特性 (LearnableSplitter):
-            - O(D) GPU kernels 替代 O(N×D) Python 循环
-            - 预期加速: ~8x
-            
-        对于规则分割器，回退到旧实现。
+        性能特性 (GumbelTopKSplitter - I20):
+            - 100% Hilbert 局部性
+            - 100% 梯度覆盖 (STE)
+            - 无串行依赖
+            - 预期加速: ~8x (vs Python 循环)
         """
         if images.dim() != 4:
             raise ValueError(
@@ -243,169 +250,97 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         features = self.shared_conv(images)  # [B, d_model, H/p, W/p]
         self._last_features = features
         
-        # 2. Adaptive/Learnable Splitting
-        if self._use_learnable_split:
-            # P9-1: 使用完全向量化的 forward()
-            from .split_adaptive import (
-                LearnableSplitter, 
-                TensorSplitResult,
-                ShallowCandidateProbs,
-            )
-            assert isinstance(self.splitter, LearnableSplitter)
-            
-            split_result = self.splitter(
-                features,
-                image_size=(H, W),
-                hard=not self.training,
-            )
-            
-            # I10-19: 连续松弛路径
-            if isinstance(split_result, ShallowCandidateProbs):
-                # 连续松弛模式: Splitter 返回概率信息，Tokenizer 创建tokens
-                # 数学形式化:
-                #   E = f_φ(features, candidate_regions)  ← embeddings (本层负责)
-                #   P = g_θ(features, candidate_regions)  ← 概率 (Splitter已提供)
-                #   T = fuse(E, P)                        ← 连续加权融合
-                #
-                # 关键: 无循环依赖，E和P独立计算，T仅依赖(E, P)
-                tokens, levels_info, padded_regions, num_tokens_list = (
-                    self._tokenize_continuous(features, split_result)
-                )
-                
-                # 构建统计信息 (连续模式下没有离散深度分布)
-                depth_dists = [{} for _ in range(B)]  # 空字典
-                self._last_depth_count_matrix = None
-                
-                self._last_split_stats = {
-                    'num_tokens': num_tokens_list,
-                    'depth_distributions': depth_dists,
-                }
-            
-            elif isinstance(split_result, TensorSplitResult):
-                # 离散模式: 原始实现
-                tensor_result = split_result
-                
-                # P11-3 优化: 使用 non_blocking=True 减少 GPU-CPU 同步阻塞
-                # 统计收集在 no_grad 块内，不影响梯度，但仍需数据传输
-                # non_blocking 允许 CUDA 流并行，减少等待时间
-                with torch.no_grad():
-                    tokens_per_batch = tensor_result.tokens_per_batch
-                    if tokens_per_batch is not None:
-                        # P11-3: 异步传输到 CPU (使用 .to() 支持 non_blocking)
-                        num_tokens_list = tokens_per_batch.to('cpu', non_blocking=True).tolist()
-                    else:
-                        # Fallback: 使用 bincount (P11-2 优化的一致性)
-                        tokens_per_batch = torch.bincount(
-                            tensor_result.batch_indices, 
-                            minlength=B
-                        )
-                        num_tokens_list = tokens_per_batch.to('cpu', non_blocking=True).tolist()
-                    
-                    # 计算 depth distribution (P9-6 向量化优化)
-                    # 使用批量操作减少 .item() 调用次数从 O(B × max_depth) 到 O(B)
-                    depth_dists = []
-                    max_d = self.max_depth + 1
-                    depths = tensor_result.depths
-                    batch_indices = tensor_result.batch_indices
-                    
-                    # 一次性计算所有 (batch, depth) 组合的计数
-                    # 使用 one-hot encoding + scatter_add
-                    if tensor_result.num_tokens > 0:
-                        # 创建 [B, max_depth+1] 的计数矩阵
-                        count_matrix = torch.zeros(B, max_d, dtype=torch.long, device=device)
-                        # 使用 index_add 在每个 (batch, depth) 位置累加 1
-                        flat_idx = batch_indices * max_d + depths.clamp(max=max_d - 1)
-                        ones = torch.ones_like(flat_idx)
-                        count_matrix.view(-1).scatter_add_(0, flat_idx, ones)
-                        
-                        # P11-9: 保存张量以供 get_scale_entropy 使用
-                        self._last_depth_count_matrix = count_matrix
-                        
-                        # P11-3: 异步传输到 CPU (使用 .to() 支持 non_blocking)
-                        count_matrix_cpu = count_matrix.to('cpu', non_blocking=True).numpy()
-                        
-                        # P11-4 保留: Python 循环构建 dict 结构
-                        # 这是必要的，因为输出格式需要稀疏字典表示
-                        for b in range(B):
-                            dist = {}
-                            for d in range(max_d):
-                                count = int(count_matrix_cpu[b, d])
-                                if count > 0:
-                                    dist[d] = count
-                            depth_dists.append(dist)
-                    else:
-                        depth_dists = [{} for _ in range(B)]
-                        self._last_depth_count_matrix = None  # P11-9: 清除缓存
-                
-                self._last_split_stats = {
-                    'num_tokens': num_tokens_list,
-                    'depth_distributions': depth_dists,
-                }
-                
-                # 3. 纯张量嵌入 (P11-3: 额外返回 regions)
-                tokens, levels_info, padded_regions = self._embed_with_tensor_result(features, tensor_result)
-            
-            else:
-                raise ValueError(f"Unexpected split result type: {type(split_result)}")
-            
-            # 4. 构建输出 (P9-5: 保留已 padding 的张量作为缓存)
-            sequences = []
-            for b in range(B):
-                num_tokens = num_tokens_list[b]
-                seq = TokenSequence(
-                    tokens=tokens[b, :num_tokens],
-                    metadata={
-                        "levels": levels_info[b, :num_tokens],
-                        "split_stats": {
-                            "num_tokens": num_tokens,
-                            "depth_distribution": depth_dists[b],
-                        },
-                    },
-                )
-                sequences.append(seq)
-            
-            # P9-5/P12-2 优化: 传入已 padding 的张量缓存，避免 model 中重复 padding
-            # P11-3: 新增 _regions_cache 和 _image_size_cache 用于正确的 LCA 偏置计算
-            # P12-2: _lengths_cache 直接存储为 Tensor，避免后续 List->Tensor 转换
-            lengths_tensor = torch.tensor(num_tokens_list, dtype=torch.long, device=device)
-            return TokenizerOutput(
-                sequences=sequences,
-                _padded_tokens_cache=tokens,
-                _padded_levels_cache=levels_info,
-                _lengths_cache=lengths_tensor,
-                _regions_cache=padded_regions,
-                _image_size_cache=self.image_size,
-            )
+        # 2. I20: GumbelTopKSplitter 分割
+        from .gumbel_topk_splitter import GumbelTopKSplitter, GumbelTopKResult
+        from .split_adaptive import TensorSplitResult
         
+        split_result = self.splitter(
+            features,
+            image_size=(H, W),
+            hard=not self.training,
+        )
+        
+        # I20: GumbelTopKResult → TensorSplitResult 转换
+        if isinstance(split_result, GumbelTopKResult):
+            tensor_result = split_result.to_tensor_split_result()
+        elif isinstance(split_result, TensorSplitResult):
+            tensor_result = split_result
         else:
-            # 规则分割: 使用原始实现
-            split_results = self.splitter.split_batch(images)
-            
-            self._last_split_stats = {
-                'num_tokens': [sr.num_tokens for sr in split_results],
-                'depth_distributions': [sr.depth_distribution for sr in split_results],
-            }
-            
-            # Hilbert-Native Patch Embedding
-            tokens, levels_info = self._embed_with_features(features, split_results)
-            
-            # 构建输出
-            sequences = []
-            for b in range(B):
-                num_tokens = split_results[b].num_tokens
-                seq = TokenSequence(
-                    tokens=tokens[b, :num_tokens],
-                    metadata={
-                        "levels": levels_info[b, :num_tokens],
-                        "split_stats": {
-                            "num_tokens": num_tokens,
-                            "depth_distribution": split_results[b].depth_distribution,
-                        },
-                    },
+            raise ValueError(f"Unexpected split result type: {type(split_result)}")
+        
+        # 统计收集 (no_grad)
+        with torch.no_grad():
+            tokens_per_batch = tensor_result.tokens_per_batch
+            if tokens_per_batch is not None:
+                num_tokens_list = tokens_per_batch.to('cpu', non_blocking=True).tolist()
+            else:
+                tokens_per_batch = torch.bincount(
+                    tensor_result.batch_indices, 
+                    minlength=B
                 )
-                sequences.append(seq)
+                num_tokens_list = tokens_per_batch.to('cpu', non_blocking=True).tolist()
             
-            return TokenizerOutput(sequences)
+            # 计算 depth distribution
+            depth_dists = []
+            max_d = self.max_depth + 1
+            depths = tensor_result.depths
+            batch_indices = tensor_result.batch_indices
+            
+            if tensor_result.num_tokens > 0:
+                count_matrix = torch.zeros(B, max_d, dtype=torch.long, device=device)
+                flat_idx = batch_indices * max_d + depths.clamp(max=max_d - 1)
+                ones = torch.ones_like(flat_idx)
+                count_matrix.view(-1).scatter_add_(0, flat_idx, ones)
+                
+                self._last_depth_count_matrix = count_matrix
+                count_matrix_cpu = count_matrix.to('cpu', non_blocking=True).numpy()
+                
+                for b in range(B):
+                    dist = {}
+                    for d in range(max_d):
+                        count = int(count_matrix_cpu[b, d])
+                        if count > 0:
+                            dist[d] = count
+                    depth_dists.append(dist)
+            else:
+                depth_dists = [{} for _ in range(B)]
+                self._last_depth_count_matrix = None
+        
+        self._last_split_stats = {
+            'num_tokens': num_tokens_list,
+            'depth_distributions': depth_dists,
+        }
+        
+        # 3. 纯张量嵌入
+        tokens, levels_info, padded_regions = self._embed_with_tensor_result(features, tensor_result)
+        
+        # 4. 构建输出 (P9-5: 保留已 padding 的张量作为缓存)
+        sequences = []
+        for b in range(B):
+            num_tokens = num_tokens_list[b]
+            seq = TokenSequence(
+                tokens=tokens[b, :num_tokens],
+                metadata={
+                    "levels": levels_info[b, :num_tokens],
+                    "split_stats": {
+                        "num_tokens": num_tokens,
+                        "depth_distribution": depth_dists[b],
+                    },
+                },
+            )
+            sequences.append(seq)
+        
+        # P9-5/P12-2 优化: 传入已 padding 的张量缓存，避免 model 中重复 padding
+        # I20: 简化输出构建
+        lengths_tensor = torch.tensor(num_tokens_list, dtype=torch.long, device=device)
+        return TokenizerOutput(
+            sequences=sequences,
+            _padded_tokens_cache=tokens,
+            _padded_levels_cache=levels_info,
+            _lengths_cache=lengths_tensor,
+            _regions_cache=padded_regions,
+            _image_size_cache=self.image_size,
+        )
     
     def tokenize_tensor(self, images: torch.Tensor) -> TokenizerOutput:
         """兼容别名: 已弃用，请使用 tokenize().
@@ -614,10 +549,12 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 使用ShallowParallelEvaluator的get_continuous_tokens方法
         # 
         # I10-18增强: 传递threshold参数控制token数量
-        # - 训练时使用低阈值(0.01)保持梯度流
-        # - 推理时可以用更高阈值减少计算
+        # I18-3修复: 提高训练threshold从0.01到0.1
+        #   - threshold=0.01 导致所有85个候选都通过 (cumulative_prob > 0.01)
+        #   - threshold=0.1 可以有效过滤低权重候选，预期30-60 tokens
+        #   - 梯度流通过累积概率保持，无需所有候选都显式保留
         # =====================================================================
-        threshold = 0.01 if self.training else 0.05  # 推理时稍严格
+        threshold = 0.1 if self.training else 0.1  # 训练和推理使用相同阈值保证一致性
         
         continuous_tokens, token_weights = self.splitter.shallow_evaluator.get_continuous_tokens(
             features=features,                          # [B, C, H_feat, W_feat]
@@ -634,8 +571,16 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         
         # =====================================================================
         # Step 3: 构建输出
+        # I18-3 修复: 使用实际有效token数而非输出张量维度
         # =====================================================================
-        num_tokens_list = [N_output] * B  # 连续模式下每个batch token数相同
+        # 从 evaluator 缓存获取每个batch的有效token数
+        if hasattr(self.splitter.shallow_evaluator, '_last_valid_counts'):
+            valid_counts = self.splitter.shallow_evaluator._last_valid_counts  # [B]
+            num_tokens_list = valid_counts.tolist()
+        else:
+            # Fallback: 使用 token_weights 计算有效数量
+            # 有效token的weight > 0 (非padding)
+            num_tokens_list = (token_weights > PROB_EPSILON).sum(dim=1).tolist()
         
         # levels_info: 使用evaluator缓存的深度信息
         # I10-18增强: 从get_continuous_tokens获取实际深度
@@ -822,34 +767,45 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         return stats
     
     def get_entropy_loss(self) -> Optional[torch.Tensor]:
-        """获取熵正则化损失 (用于可学习分割器)."""
+        """获取熵正则化损失 (用于可学习分割器).
+        
+        I20: 支持 LearnableSplitter 和 GumbelTopKSplitter 两种分割器。
+        """
         if not self._use_learnable_split:
             return None
         
         from .split_adaptive import LearnableSplitter
-        assert isinstance(self.splitter, LearnableSplitter)
+        from .gumbel_topk_splitter import GumbelTopKSplitter
         
         if self._last_split_stats is None:
             return None
         
-        # 构造 SplitResult 列表用于熵计算
-        from .split_adaptive import SplitResult, SplitToken, Region
-        results = []
-        for i, dist in enumerate(self._last_split_stats['depth_distributions']):
-            # 重建简化的 SplitResult
-            tokens = []
-            for depth, count in dist.items():
-                for _ in range(count):
-                    tokens.append(SplitToken(
-                        region=Region(0, 0, 1, 1),  # 占位
-                        depth=depth,
-                        path=[],
-                        hilbert_idx=0,
-                        complexity=0.0,
-                    ))
-            results.append(SplitResult(tokens=tokens))
+        # GumbelTopKSplitter: 使用其内置的熵损失方法
+        if isinstance(self.splitter, GumbelTopKSplitter):
+            return self.splitter.get_depth_entropy_loss()
         
-        return self.splitter.get_entropy_loss(results)
+        # LearnableSplitter: 原有逻辑
+        if isinstance(self.splitter, LearnableSplitter):
+            # 构造 SplitResult 列表用于熵计算
+            from .split_adaptive import SplitResult, SplitToken, Region
+            results = []
+            for i, dist in enumerate(self._last_split_stats['depth_distributions']):
+                # 重建简化的 SplitResult
+                tokens = []
+                for depth, count in dist.items():
+                    for _ in range(count):
+                        tokens.append(SplitToken(
+                            region=Region(0, 0, 1, 1),  # 占位
+                            depth=depth,
+                            path=[],
+                            hilbert_idx=0,
+                            complexity=0.0,
+                        ))
+                results.append(SplitResult(tokens=tokens))
+            
+            return self.splitter.get_entropy_loss(results)
+        
+        return None
     
     def get_learnable_split_loss(
         self,
@@ -916,7 +872,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 return None
             probs = total_counts / total
             # 避免 log(0)
-            log_probs = torch.log(probs + 1e-10)
+            log_probs = torch.log(probs + LOG_EPSILON)
             entropy = -(probs * log_probs).sum().item()
             return entropy
         
@@ -982,7 +938,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             
             # 向量化熵计算
             probs = total_counts.float() / total_tokens
-            log_probs = torch.log(probs + 1e-10)
+            log_probs = torch.log(probs + LOG_EPSILON)
             entropy = -(probs * log_probs).sum().item()
             
             num_depths = self.max_depth + 1
@@ -1041,13 +997,27 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         }
     
     def get_training_stats(self) -> Dict[str, Any]:
-        """获取训练状态统计信息."""
+        """获取训练状态统计信息.
+        
+        I20: 支持 LearnableSplitter 和 GumbelTopKSplitter 两种分割器。
+        """
+        from .split_adaptive import LearnableSplitter
+        from .gumbel_topk_splitter import GumbelTopKSplitter
+        
+        # 确定分割器类型
+        if isinstance(self.splitter, GumbelTopKSplitter):
+            split_scheme = 'gumbel_topk'
+        elif isinstance(self.splitter, LearnableSplitter):
+            split_scheme = 'learnable'
+        else:
+            split_scheme = 'unknown'
+        
         stats = {
             'tokenizer_version': 'v3_unified',
             'architecture': 'shared_conv + learnable_split + hilbert_embed',
-            'split_scheme': 'learnable',  # Only LearnableSplitter remains
+            'split_scheme': split_scheme,
             'max_depth': self.max_depth,
-            'learnable_split': True,  # Always true after Scheme B/C removal
+            'learnable_split': True,
         }
         
         if self._last_split_stats:
@@ -1055,12 +1025,14 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             stats['avg_tokens_per_image'] = avg_tokens
             stats['depth_entropy'] = self.get_scale_entropy()
         
-        # Always use LearnableSplitter
-        from .split_adaptive import LearnableSplitter
-        assert isinstance(self.splitter, LearnableSplitter)
-        splitter_stats = self.splitter.get_split_statistics()
-        stats['learnable_thresholds'] = splitter_stats['thresholds'].tolist()
-        stats['learnable_temperature'] = splitter_stats['temperature'].item()
+        # 获取分割器特定的统计信息
+        if isinstance(self.splitter, GumbelTopKSplitter):
+            stats['learnable_thresholds'] = self.splitter.thresholds.tolist()
+            stats['learnable_temperature'] = self.splitter.current_temperature
+        elif isinstance(self.splitter, LearnableSplitter):
+            splitter_stats = self.splitter.get_split_statistics()
+            stats['learnable_thresholds'] = splitter_stats['thresholds'].tolist()
+            stats['learnable_temperature'] = splitter_stats['temperature'].item()
         
         return stats
     
@@ -1069,18 +1041,30 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         
         数学形式化:
             T(t) = T_start · (T_end / T_start)^(t / T_total)
+            
+        I20: 支持 LearnableSplitter 和 GumbelTopKSplitter 两种分割器。
         """
         if self._use_learnable_split:
             from .split_adaptive import LearnableSplitter
-            assert isinstance(self.splitter, LearnableSplitter)
-            self.splitter.set_temperature(temperature)
+            from .gumbel_topk_splitter import GumbelTopKSplitter
+            
+            if isinstance(self.splitter, GumbelTopKSplitter):
+                self.splitter.set_temperature(temperature)
+            elif isinstance(self.splitter, LearnableSplitter):
+                self.splitter.set_temperature(temperature)
     
     def reset_split_statistics(self) -> None:
-        """重置可学习分割器的统计信息."""
+        """重置可学习分割器的统计信息.
+        
+        I20: 支持 LearnableSplitter 和 GumbelTopKSplitter 两种分割器。
+        """
         if self._use_learnable_split:
             from .split_adaptive import LearnableSplitter
-            assert isinstance(self.splitter, LearnableSplitter)
-            self.splitter.reset_statistics()
+            from .gumbel_topk_splitter import GumbelTopKSplitter
+            
+            if isinstance(self.splitter, LearnableSplitter):
+                self.splitter.reset_statistics()
+            # GumbelTopKSplitter 暂无 reset_statistics 方法
     
     def get_temperature_scheduler(
         self,

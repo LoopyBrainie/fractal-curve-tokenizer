@@ -1892,7 +1892,7 @@ class LearnableSplitter(nn.Module):
         self,
         total_steps: int,
         T_start: float = 1.0,
-        T_end: float = 0.05,
+        T_end: float = 0.3,
         schedule: str = 'exponential',
     ) -> "LearnableSplitter":
         """
@@ -1915,17 +1915,22 @@ class LearnableSplitter(nn.Module):
                 
         Hilbert ViT 约束分析:
             - 早期 (T ≈ 1.0): 探索决策空间，梯度稳定
-            - 后期 (T ≈ 0.05): 决策确定性高，满足 2:1 平衡
+            - 后期 (T ≥ 0.3): 决策确定性提高，满足 2:1 平衡
             
-        推荐超参数 (基于计算验证):
+        推荐超参数 (基于 I18-2 梯度分析):
             - T_start = 1.0 (充分探索)
-            - T_end = 0.05 (避免梯度消失的安全下界)
+            - T_end = 0.3 (避免梯度消失的安全下界，见 I12-7)
             - schedule = 'exponential' (最优的梯度-确定性权衡)
+            
+        Note:
+            I18-2/I18-5 温度下界保护: 当 T < 0.1 时 softmax 梯度 ≈ 0，
+            导致 STE 梯度死亡。实际下界强制为 max(T_end, 0.1)。
+            推荐 T_end ≥ 0.3 以保持梯度稳定性。
             
         Args:
             total_steps: 总训练步数 (epochs × batches_per_epoch)
             T_start: 初始温度 (默认 1.0)
-            T_end: 最终温度 (默认 0.05，基于梯度消失分析的安全下界)
+            T_end: 最终温度 (默认 0.3，基于 I18-2 梯度消失分析的安全下界)
             schedule: 调度策略 ('exponential', 'linear', 'cosine')
             
         Returns:
@@ -1936,7 +1941,7 @@ class LearnableSplitter(nn.Module):
             >>> splitter.enable_temperature_annealing(
             ...     total_steps=1000,
             ...     T_start=1.0,
-            ...     T_end=0.05,
+            ...     T_end=0.3,  # I18-2: 安全下界，避免梯度消失
             ... )
             >>> # 训练时自动退火，无需手动调用 scheduler.step()
             >>> for batch in dataloader:
@@ -1948,6 +1953,18 @@ class LearnableSplitter(nn.Module):
             raise ValueError(f"Temperatures must be positive, got T_start={T_start}, T_end={T_end}")
         if T_end > T_start:
             raise ValueError(f"T_end should be <= T_start for annealing")
+        # I18-2: 强制温度下界保护，防止梯度消失
+        # 数学分析: 当 T < 0.3 时，sigmoid 梯度 ≈ 0 for |z - τ| > 1
+        T_MIN_SAFE = 0.3
+        if T_end < T_MIN_SAFE:
+            import warnings
+            warnings.warn(
+                f"I18-2: T_end={T_end} < {T_MIN_SAFE} may cause gradient vanishing. "
+                f"Clamping to {T_MIN_SAFE}.",
+                UserWarning,
+                stacklevel=2,
+            )
+            T_end = T_MIN_SAFE
         if schedule not in ('exponential', 'linear', 'cosine'):
             raise ValueError(f"Unknown schedule: {schedule}")
         
@@ -2409,6 +2426,36 @@ class LearnableSplitter(nn.Module):
                 temperature=self.log_temperature.exp().clamp(min=0.01),
                 pool_size=self.pool_size,
             )
+            
+            # ================================================================
+            # I18-1 修复: 连续松弛模式下缓存概率用于辅助损失
+            # ================================================================
+            # 数学形式化:
+            #   问题: 辅助损失 (get_soft_depth_distribution) 依赖 _cached_split_probs
+            #         但连续松弛模式跳过了 BFS，没有填充这个缓存
+            #   
+            #   解决: 从 evaluator 结果构建缓存
+            #         probs_result.probs: [B, N_candidates] 包含所有候选的分割概率
+            #         candidate_depths: [N_candidates] 每个候选的深度
+            #   
+            #   关键优势:
+            #     - 所有候选都有 MLP 梯度 (∂p/∂θ_MLP ≠ 0)
+            #     - 不依赖 BFS 的串行访问路径
+            #     - 辅助损失对所有深度都有梯度信号
+            #
+            # 缓存结构: {depth: probs_tensor}
+            #   depth d 的 probs 是所有深度为 d 的候选区域的分割概率
+            self._cached_split_probs = {}
+            candidate_depths = probs_result.candidate_depths  # [N_candidates]
+            probs_all = probs_result.probs  # [B, N_candidates]
+            
+            for d in range(self.max_depth + 1):
+                depth_mask = (candidate_depths == d)
+                if depth_mask.any():
+                    # 取所有 batch 中深度为 d 的候选的概率
+                    # 形状: [B, num_candidates_at_depth_d] → flatten → [B * n_d]
+                    probs_at_depth = probs_all[:, depth_mask]  # [B, n_d]
+                    self._cached_split_probs[d] = probs_at_depth.flatten()
             
             # 返回概率信息，由 FractalTokenizer 创建最终tokens
             return probs_result

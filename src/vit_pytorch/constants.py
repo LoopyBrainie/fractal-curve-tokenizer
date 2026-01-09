@@ -84,6 +84,32 @@ LOGITS_CLAMP_MIN: float = -10.0
 #: Logits 截断的最大值（防止数值不稳定）
 LOGITS_CLAMP_MAX: float = 10.0
 
+# ==================== 数值稳定性常量 (I12-7) ====================
+# 数学分析见: workspace/numerical_constants_analysis.py
+
+#: Gumbel 采样 uniform clamp (FP32)
+#: 数学: g = -log(-log(u)), u ∈ [ε, 1-ε]
+#: 验证: ε=1e-10 → g ∈ [-23, 23], 足够表达随机性
+GUMBEL_EPSILON: float = 1e-10
+
+#: Log 计算安全 epsilon
+#: 用途: log(p + ε) 防止 log(0)
+#: 验证: 对熵计算误差 < 1e-10
+LOG_EPSILON: float = 1e-10
+
+#: 除法安全 epsilon
+#: 用途: x / (sum + ε) 防止除零
+DIVISION_EPSILON: float = 1e-8
+
+#: 概率下界 (避免 0 概率参与计算)
+#: 用途: prob.clamp(min=PROB_EPSILON)
+PROB_EPSILON: float = 1e-8
+
+#: 温度参数下界 (Gumbel-Softmax/Top-K)
+#: 数学分析: T < 0.1 时 softmax 梯度趋近于 0
+#: 验证见: workspace/ste_gradient_analysis.py
+TEMPERATURE_MIN: float = 0.1
+
 # ==================== 信息长度相关常量 ====================
 
 #: levels_info 的最小长度

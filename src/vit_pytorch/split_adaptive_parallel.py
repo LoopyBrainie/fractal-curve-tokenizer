@@ -75,6 +75,9 @@ from torch import Tensor
 from typing import Tuple, List, Optional
 import math
 
+# I12-7: 数值稳定性常量
+from .constants import DIVISION_EPSILON
+
 # 导入现有数据结构
 from .split_adaptive import TensorSplitResult, Region
 
@@ -589,8 +592,29 @@ class ShallowParallelEvaluator(nn.Module):
             # 将无效子节点的累积概率设为 -inf (softmax后为0)
             children_cum_probs_masked = children_cum_probs.masked_fill(~valid_children_mask, float('-inf'))
             
+            # NaN 保护: 检查是否所有子节点都是 -inf (这会导致 softmax 产生 NaN)
+            # 如果一行全是 -inf，将第一个有效位置设为 0
+            all_inf_mask = (children_cum_probs_masked == float('-inf')).all(dim=-1)  # [B, M_d]
+            if all_inf_mask.any():
+                # 找到第一个有效子节点位置并设为 0
+                first_valid = valid_children_mask.float().argmax(dim=-1)  # [B, M_d]
+                # 只对 all_inf 的行进行修复
+                for b in range(B):
+                    for m in range(M_d):
+                        if all_inf_mask[b, m] and valid_children_mask[b, m].any():
+                            children_cum_probs_masked[b, m, first_valid[b, m]] = 0.0
+            
             # 归一化子节点权重 (softmax over valid children)
             children_weights = F.softmax(children_cum_probs_masked, dim=-1)  # [B, M_d, 4]
+            
+            # NaN 保护: 将 NaN 替换为均匀分布
+            if torch.isnan(children_weights).any():
+                nan_mask = torch.isnan(children_weights)
+                # 对于 NaN 位置，使用均匀分布 (1/num_valid_children)
+                num_valid = valid_children_mask.float().sum(dim=-1, keepdim=True).clamp(min=1)  # [B, M_d, 1]
+                uniform_weight = valid_children_mask.float() / num_valid
+                children_weights = torch.where(nan_mask, uniform_weight, children_weights)
+            
             children_weights = children_weights.masked_fill(~valid_children_mask, 0.0)  # 确保无效子节点权重为0
             
             # 加权求和子节点 [B, M_d, D]
@@ -639,7 +663,7 @@ class ShallowParallelEvaluator(nn.Module):
         selected_depths = self.candidate_depths[topk_indices]  # [B, max_valid]
         
         # 归一化权重
-        token_weights = topk_probs / (topk_probs.sum(dim=1, keepdim=True) + 1e-8)  # [B, max_valid]
+        token_weights = topk_probs / (topk_probs.sum(dim=1, keepdim=True) + DIVISION_EPSILON)  # [B, max_valid]
         
         # 创建padding mask (topk_probs > threshold)
         padding_mask = topk_probs > threshold  # [B, max_valid]
@@ -649,11 +673,16 @@ class ShallowParallelEvaluator(nn.Module):
         token_weights = token_weights * padding_mask.float()
         
         # 重新归一化权重
-        weight_sum = token_weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        weight_sum = token_weights.sum(dim=1, keepdim=True).clamp(min=DIVISION_EPSILON)
         token_weights = token_weights / weight_sum
         
         # 缓存深度信息供外部使用 (用于LCA偏置计算)
         self._last_token_depths = selected_depths
+        
+        # I18-3 修复: 缓存每个batch的有效token数 (非padding的token数量)
+        # padding_mask: [B, max_valid], True表示有效token
+        # 这允许 tokenizer 获取准确的 avg_tokens_per_image 统计
+        self._last_valid_counts = padding_mask.sum(dim=1).clamp(min=1)  # [B]
         
         return selected_tokens, token_weights
     
