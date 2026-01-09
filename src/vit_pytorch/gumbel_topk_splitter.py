@@ -447,6 +447,9 @@ class GumbelTopKSplitter(nn.Module):
             consistent_mask, topk_indices, logits, probs
         )
         
+        # 缓存 probs 用于辅助损失计算
+        self._last_probs = probs
+        
         # 更新统计
         with torch.no_grad():
             self._avg_selected = 0.9 * self._avg_selected + 0.1 * result.num_selected_per_batch.float().mean()
@@ -779,6 +782,118 @@ class GumbelTopKSplitter(nn.Module):
     # ========================================================================
     # 辅助损失接口 (与 LearnableSplitter 兼容)
     # ========================================================================
+    
+    def get_auxiliary_losses(
+        self,
+        features: Optional[Tensor] = None,
+        image_size: Optional[Tuple[int, int]] = None,
+        include_balance: bool = False,
+        include_elastic_budget: bool = True,
+        include_soft_entropy: bool = True,
+        batch_size: int = 1,
+        elastic_N_min: int = 16,
+        elastic_N_max: int = 64,
+        elastic_lambda_over: float = 0.1,
+        elastic_lambda_under: float = 0.01,
+        elastic_lambda_collapse: float = 1.0,
+        actual_token_count: Optional[int] = None,
+        entropy_target: Optional[float] = None,
+        entropy_weight: float = 0.1,
+        entropy_mode: str = 'maximize',
+        **kwargs,
+    ) -> Dict[str, Tensor]:
+        """
+        获取所有辅助损失 (与 LearnableSplitter.get_auxiliary_losses 兼容).
+        
+        数学形式化
+        ==========
+        
+        Gumbel-Top-K 的辅助损失:
+        
+        1. Elastic Budget Loss (弹性预算损失):
+           L_elastic = λ_over × max(0, N - N_max)² + λ_under × max(0, N_min - N)²
+           
+        2. Soft Entropy Loss (软熵损失):
+           maximize mode: L_entropy = -weight × H(depth_probs)
+           target mode:   L_entropy = weight × |H - H_target|²
+           
+        3. Collapse Penalty (崩溃惩罚):
+           L_collapse = λ_collapse × 1{N < threshold}
+        
+        Args:
+            features: 特征图 [B, C, H, W] (可选)
+            image_size: 图像尺寸 (可选)
+            include_balance: 是否包含平衡损失 (对 GumbelTopK 忽略)
+            include_elastic_budget: 是否包含弹性预算损失
+            include_soft_entropy: 是否包含软熵损失
+            batch_size: batch 大小
+            elastic_N_min: 最小 token 数
+            elastic_N_max: 最大 token 数
+            elastic_lambda_over: 超出惩罚系数
+            elastic_lambda_under: 不足惩罚系数
+            elastic_lambda_collapse: 崩溃惩罚系数
+            actual_token_count: 实际 token 数 (用于崩溃检测)
+            entropy_target: 熵目标值 (target mode)
+            entropy_weight: 熵损失权重
+            entropy_mode: 'maximize' 或 'target'
+            **kwargs: 其他参数 (向前兼容)
+            
+        Returns:
+            Dict[str, Tensor]: 各项损失
+        """
+        device = self.candidate_regions.device
+        losses = {}
+        
+        # 获取 cached probs
+        probs = self._last_probs if hasattr(self, '_last_probs') else None
+        
+        # 1. Elastic Budget Loss
+        if include_elastic_budget:
+            avg_tokens = self._avg_selected
+            
+            # 超出惩罚
+            over_loss = elastic_lambda_over * torch.relu(avg_tokens - elastic_N_max).pow(2)
+            # 不足惩罚
+            under_loss = elastic_lambda_under * torch.relu(elastic_N_min - avg_tokens).pow(2)
+            
+            elastic_loss = over_loss + under_loss
+            losses['elastic_budget_loss'] = elastic_loss
+            
+            # 崩溃惩罚 (I14-1 D1)
+            if actual_token_count is not None:
+                collapse_threshold = max(1, elastic_N_min // 2)
+                if actual_token_count < collapse_threshold:
+                    collapse_loss = torch.tensor(elastic_lambda_collapse, device=device)
+                    losses['collapse_loss'] = collapse_loss
+        
+        # 2. Soft Entropy Loss
+        if include_soft_entropy and probs is not None:
+            entropy_loss = self.get_depth_entropy_loss(weight=entropy_weight, probs=probs)
+            
+            if entropy_mode == 'target' and entropy_target is not None:
+                # Target mode: minimize |H - H_target|²
+                B, N = probs.shape
+                depths = self.candidate_depths
+                
+                # 计算当前熵
+                depth_probs = []
+                for d in range(self.max_depth + 1):
+                    mask = (depths == d)
+                    if mask.any():
+                        p_d = probs[:, mask].mean()
+                        depth_probs.append(p_d.clamp(min=PROB_EPSILON))
+                    else:
+                        depth_probs.append(torch.tensor(PROB_EPSILON, device=device))
+                
+                depth_probs_t = torch.stack(depth_probs)
+                depth_probs_t = depth_probs_t / depth_probs_t.sum()
+                current_entropy = -(depth_probs_t * depth_probs_t.log()).sum()
+                
+                entropy_loss = entropy_weight * (current_entropy - entropy_target).pow(2)
+            
+            losses['soft_entropy_loss'] = entropy_loss
+        
+        return losses
     
     def get_elastic_budget_loss(
         self,
