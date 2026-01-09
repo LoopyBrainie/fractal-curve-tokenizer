@@ -621,15 +621,17 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         count_matrix = self._depth_count_matrix_for_stats
         max_d = count_matrix.shape[1]
         
-        # 转换到 CPU (non_blocking)
-        count_matrix_cpu = count_matrix.to('cpu', non_blocking=True).numpy()
+        # 转换到 CPU (同步方式，确保数据完整)
+        # 注意: 使用 non_blocking=True 会导致 torch.compile 下的竞态条件
+        count_matrix_cpu = count_matrix.cpu().numpy()
         
         # 向量化构建 dicts
         depth_dists = []
         for b in range(B):
             row = count_matrix_cpu[b]
             # 使用 numpy where 找到非零元素
-            nonzero_indices = row.nonzero()[0]
+            nonzero_mask = row > 0
+            nonzero_indices = nonzero_mask.nonzero()[0]
             dist = {int(d): int(row[d]) for d in nonzero_indices}
             depth_dists.append(dist)
         
