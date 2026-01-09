@@ -2,14 +2,14 @@
 """Fractal ViT Training Script - V3 Variable Depth Tokens
 
 ⚠️  **重要更新 (2026-01-05 - I15 完成)**:
-   fractal_training 模块现已可用，提供以下增强功能：
+   training 模块现已可用（位于 examples/training/），提供以下增强功能：
    - ClassBalancedSampler / ProgressiveSampler - 类别平衡采样
    - FocalLoss / ClassBalancedCE - 长尾效应优化
    - ModularTrainer - 模块化训练器（替代手写循环）
    - ClassificationMetrics - 完整评估指标
    - ExperimentVisualizer - 统一可视化接口
    
-   本脚本已导入 fractal_training 模块，但保留了手写训练循环以供参考。
+   本脚本已导入 training 模块，但保留了手写训练循环以供参考。
    如需使用 ModularTrainer，请参考 examples/training/README.md
 
 数学形式化
@@ -26,21 +26,23 @@
 
 分割方案 (Split Schemes)
 -------------------------
-LearnableSplitter 是唯一的分割方案（Scheme B/C 已移除）:
+默认使用 Scheme D (GumbelTopKSplitter)，Scheme A (LearnableSplitter) 为备用:
 
-+------------------+----------------------------------+-------------------+
-| 方案              | 数学描述                          | 特点               |
-+==================+==================================+===================+
-| learnable        | p_split = σ((C_θ(R) - τ_d) / T)  | 端到端学习分割     |
-|                  | Gumbel-Softmax 可微分采样        | 无饱和、可学习阈值  |
-+------------------+----------------------------------+-------------------+
++------------------+----------------------------------+-------------------------+
+| 方案              | 数学描述                          | 特点                     |
++==================+==================================+=========================+
+| Scheme D         | selected = TopK(logits + g, K)   | 端到端学习, 100%梯度覆盖 |
+| (GumbelTopK)     | 树一致性约束 + STE               | 硬 K 约束, 并行评估      |
++------------------+----------------------------------+-------------------------+
+| Scheme A         | p_split = σ((C_θ(R) - τ_d) / T)  | 端到端学习分割           |
+| (Learnable)      | Gumbel-Softmax 可微分采样        | 软约束, BFS 串行        |
++------------------+----------------------------------+-------------------------+
 
-Note: Scheme B (balanced_greedy) 和 Scheme C (fixed_budget_dp) 已移除。
-LearnableSplitter 提供完全覆盖的功能并具有额外优势:
-- 端到端可微分性 (Gumbel-Softmax + STE)
-- 无复杂度饱和 (MLP vs Var/(Var+σ₀²))
-- 可学习阈值: τ_d = τ_{base,d} + δ_d
-- O(D) BFS 复杂度 vs O(N·4^D) DP
+Note: Scheme B/C 已移除。Scheme D 优势:
+- 100% 梯度覆盖 (STE 使所有候选都有梯度)
+- 硬 K 约束 [K_min, K_max] 消除死锁风险
+- O(1) 并行评估所有候选 vs O(D) BFS
+- 树一致性向量化约束保证 Hilbert 100%
 
 P9 性能优化 (2025-12-28)
 -------------------------
@@ -53,7 +55,7 @@ P9 性能优化 (2025-12-28)
 
 P10 训练稳定性修复 (2025-01-14)
 -------------------------------
-解决 LearnableSplitter 梯度消失和训练崩溃问题:
+解决自适应分割器梯度消失和训练崩溃问题:
 
 1. P10-1: STE 梯度修复 - 使用 hard_split - soft_probs.detach() + soft_probs
 2. P10-2: 初始化修复 - gain=1.0 替代 4.0，临界区从 95% 降至 22%
@@ -244,13 +246,16 @@ except ImportError:
 # 项目路径
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = PROJECT_ROOT / "src"
+EXAMPLES_PATH = PROJECT_ROOT / "examples"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
+if str(EXAMPLES_PATH) not in sys.path:
+    sys.path.insert(0, str(EXAMPLES_PATH))
 
 from vit_pytorch import FractalCurveViT
 
-# Fractal Training 模块 (I15)
-from fractal_training import (
+# Fractal Training 模块 (I15) - 现在位于 examples/training
+from training import (
     # Samplers
     ClassBalancedSampler,
     ProgressiveSampler,
@@ -321,7 +326,7 @@ class TrainingConfig:
     # Tokenizer 配置 (V3 Variable Depth Tokens)
     tokenizer_type: str  # 'streaming_v3' (唯一支持)
     
-    # V3 高级分割参数 (LearnableSplitter - Scheme B/C 已移除)
+    # V3 高级分割参数 (Scheme D: GumbelTopKSplitter 默认)
     target_tokens: Optional[int]  # 目标 token 数量
     split_tau0: float  # 根节点阈值 τ₀
     split_gamma: float  # 阈值衰减因子 γ
@@ -396,7 +401,7 @@ class TrainingConfig:
 
 
 # ============================================================================
-# Mixup/CutMix 实现 (简化版，使用 fractal_training 的 FocalLoss)
+# Mixup/CutMix 实现 (简化版，使用 training 模块的 FocalLoss)
 # ============================================================================
 
 class MixupCutmix:
@@ -1667,7 +1672,7 @@ def train_epoch(
             perf_stats['learnable_thresholds'] = training_stats.get('learnable_thresholds')
             perf_stats['learnable_temperature'] = training_stats.get('learnable_temperature')
     
-    # P10-4/P10-5/P10-9: 获取 LearnableSplitter 深度分布统计
+    # P10-4/P10-5/P10-9: 获取自适应分割器深度分布统计
     if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
         splitter = model.tokenizer.splitter
         if hasattr(splitter, 'get_depth_distribution_stats'):
@@ -2216,7 +2221,7 @@ def main():
                        choices=["streaming_v3"],
                        help="Tokenizer type: streaming_v3 (Variable Depth Tokens, only supported)")
     
-    # V3 Tokenizer 高级参数 (LearnableSplitter - Scheme B/C 已移除)
+    # V3 Tokenizer 高级参数 (Scheme D: GumbelTopKSplitter 默认)
     parser.add_argument("--target-tokens", type=int, default=None,
                        help="Target token count per image (None = adaptive)")
     parser.add_argument("--split-tau0", type=float, default=0.15,
@@ -2390,7 +2395,7 @@ def main():
         ffn_type=args.ffn_type,
         # Tokenizer 配置 (V3)
         tokenizer_type=args.tokenizer_type,
-        # V3 高级分割参数 (LearnableSplitter only)
+        # V3 高级分割参数 (GumbelTopKSplitter 默认)
         target_tokens=args.target_tokens,
         split_tau0=args.split_tau0,
         split_gamma=args.split_gamma,
@@ -2450,7 +2455,7 @@ def main():
         device=str(device),
     )
     
-    # 创建 Tokenizer (仅支持 LearnableSplitter)
+    # 创建 Tokenizer (默认使用 GumbelTopKSplitter - Scheme D)
     from vit_pytorch.tokenizer_streaming import StreamingFractalTokenizerV3
     
     tokenizer = StreamingFractalTokenizerV3(
@@ -2504,7 +2509,7 @@ def main():
     
     # 打印模型信息
     params = sum(p.numel() for p in model.parameters())
-    split_info = "LearnableSplitter"
+    split_info = "GumbelTopKSplitter (Scheme D)"
     if config.target_tokens:
         split_info += f", target={config.target_tokens}"
     tokenizer_name = f'StreamingFractalTokenizerV3 ({split_info})'
@@ -2761,19 +2766,19 @@ def main():
             print(f"  - Progressive Augmentation: 渐进式增强强度")
     
     # =========================================================================
-    # P7-7 / P10-12: 启用 LearnableSplitter 内置退火调度
+    # P7-7 / P10-12: 启用自适应分割器内置退火调度 (Scheme D 兼容)
     # =========================================================================
-    # 使用 LearnableSplitter.enable_temperature_annealing() 替代手动温度调度
-    # 使用 LearnableSplitter.enable_explore_bias_annealing() 解决 P10-12 死锁问题
+    # GumbelTopKSplitter 和 LearnableSplitter 均支持统一的退火 API:
+    #   - enable_temperature_annealing()
+    #   - enable_explore_bias_annealing()
     #
     # 数学形式化:
     #   温度退火: T(t) = T_start · (T_end / T_start)^(t / total_steps)
     #   探索偏置: b(t) = b_start · (1 - t / total_steps)
     #
-    # 优势:
-    #   - 在 forward() 中自动更新，无需在训练循环中手动调度
-    #   - 基于 step 级别的精细控制，而非 epoch 级别
-    #   - 支持 exponential/linear/cosine 多种调度策略
+    # Scheme D 特有:
+    #   - Top-K 硬约束保证 token 数量，偏置影响 *哪些* 被选中
+    #   - STE 梯度仍依赖温度，退火保证梯度质量
     # =========================================================================
     splitter_annealing_enabled = False
     if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
@@ -2792,7 +2797,7 @@ def main():
                 T_end=config.splitter_temp_end,
                 schedule='exponential',  # 最优的梯度-确定性权衡
             )
-            print(f"[OK] 启用 LearnableSplitter 内置温度退火:")
+            print(f"[OK] 启用自适应分割器温度退火:")
             print(f"     T: {config.splitter_temp_start} → {config.splitter_temp_end}")
             print(f"     Steps: {post_warmup_steps} (after {config.splitter_temp_warmup} warmup epochs)")
             print(f"     Schedule: exponential")
@@ -2854,7 +2859,7 @@ def main():
             print(f"     深度1偏置: Δb_1 = {depth_info['depth_biases']['depth_1']:.2f}")
     
     if not splitter_annealing_enabled:
-        print(f"[INFO] LearnableSplitter 退火未启用 (不支持或未使用可学习分割器)")
+        print(f"[INFO] 自适应分割器退火未启用 (不支持或未使用可学习分割器)")
     
     print()
     

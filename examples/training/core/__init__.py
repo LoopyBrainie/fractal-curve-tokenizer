@@ -7,6 +7,9 @@ Training Core Components
 
 from .resource_stats import ModelResourceStats, compute_resource_stats_batch
 
+# 从同级模块导入以便统一访问
+# 注意：这些模块在 examples/training 下的新位置
+
 __all__ = [
     "ModelResourceStats",
     "compute_resource_stats_batch",

@@ -15,12 +15,12 @@
 
 ---
 
-## 🎯 核心模块 `fractal_training`
+## 🎯 核心模块 `training`
 
-新的模块化训练系统位于 `src/fractal_training/`，提供完整的训练基础设施：
+模块化训练系统位于 `examples/training/`，提供完整的训练基础设施：
 
 ```
-src/fractal_training/
+examples/training/
 ├── __init__.py           # 统一导出接口
 ├── samplers/             # 类别平衡采样器
 │   └── __init__.py       # ClassBalancedSampler, ProgressiveSampler
@@ -128,7 +128,7 @@ resource/flops, resource/memory
 
 **使用示例**:
 ```python
-from fractal_training import WandBCallback, WandBCallbackConfig
+from training import WandBCallback, WandBCallbackConfig
 
 wandb_callback = WandBCallback(
     config=WandBCallbackConfig(
@@ -167,7 +167,7 @@ trainer = ModularTrainer(
 
 **使用示例**:
 ```python
-from fractal_training.visualization import ExperimentVisualizer
+from training.visualization import ExperimentVisualizer
 
 visualizer = ExperimentVisualizer(save_dir='experiments/my_exp/plots')
 
@@ -277,13 +277,13 @@ cd examples\training
 ---
 
 ### 方式 2:
-### 1. 使用 fractal_training 模块
+### 1. 使用 training 模块
 
 ```python
 import sys
-sys.path.insert(0, 'src')
+sys.path.insert(0, 'examples')
 
-from fractal_training import (
+from training import (
     # Samplers
     ClassBalancedSampler,
     ProgressiveSampler,
@@ -354,7 +354,7 @@ history = trainer.fit()
 ### 2. 加载 YAML 配置
 
 ```python
-from fractal_training import ConfigLoader
+from training import ConfigLoader
 
 loader = ConfigLoader(config_dir='configs')
 
@@ -377,7 +377,7 @@ config = loader.load('base.yaml', overrides={
 
 ```bash
 cd d:\myProject\fractal-curve-tokenizer
-uv run pytest tests/test_fractal_training.py -v
+uv run pytest tests/test_fractal_training.py -v  # 测试文件名保持不变
 ```
 
 **输出**:
@@ -454,7 +454,7 @@ budget:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    fractal_training                         │
+│                       training                              │
 ├──────────┬──────────┬──────────┬──────────┬────────────────┤
 │ Samplers │  Losses  │ Metrics  │Schedulers│    Trainer     │
 │          │          │          │          │                │
@@ -522,7 +522,7 @@ budget:
 
 | 文件 | 功能 | 说明 |
 |------|------|------|
-| `train_fractal_vit.py` | 主训练脚本 | 支持所有 fractal_training 模块 |
+| `train_fractal_vit.py` | 主训练脚本 | 支持所有 training 模块 |
 | `evaluate_and_visualize.py` | 模型评估 | 集成 ClassificationMetrics + Visualizer |
 | `train_tiny_imagenet_optimal.sh` | 优化脚本 (Bash) | 数学推导的最佳参数配置 |
 | `train_tiny_imagenet_optimal.ps1` | 优化脚本 (PowerShell) | Windows 版本 |
@@ -535,4 +535,4 @@ budget:
 **最后更新**: 2026-01-05  
 **测试覆盖**: 46/46 单元测试通过 ✅  
 **I15 进度**: 11/11 完成 🎉  
-**代码位置**: `src/fractal_training/`
+**代码位置**: `examples/training/`

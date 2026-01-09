@@ -84,15 +84,18 @@ from tqdm import tqdm
 # 项目路径
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = PROJECT_ROOT / "src"
+EXAMPLES_PATH = PROJECT_ROOT / "examples"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
+if str(EXAMPLES_PATH) not in sys.path:
+    sys.path.insert(0, str(EXAMPLES_PATH))
 
 from vit_pytorch import FractalCurveViT
 from vit_pytorch.curve_hilbert import HilbertCurve
 from vit_pytorch.tokenizer_streaming import StreamingFractalTokenizerV3
 
-# Fractal Training 模块 (I15)
-from fractal_training import (
+# Fractal Training 模块 (I15) - 现在位于 examples/training
+from training import (
     # Metrics
     ClassificationMetrics,
     # Visualization
@@ -1264,7 +1267,7 @@ def evaluate_model(
     num_classes: int,
     class_names: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """详细评估模型（使用 fractal_training.metrics.ClassificationMetrics）"""
+    """详细评估模型（使用 training.metrics.ClassificationMetrics）"""
     model.eval()
     
     all_preds = []
@@ -2063,7 +2066,7 @@ def visualize_training_history(
     save_path: Optional[Path] = None,
     show: bool = True,
 ) -> Optional[plt.Figure]:
-    """可视化训练历史曲线（使用 fractal_training.visualization）
+    """可视化训练历史曲线（使用 training.visualization）
     
     从 training_history.json 读取并绘制：
     1. Loss 曲线 (train/val)
@@ -2586,7 +2589,7 @@ def visualize_confusion_matrix(
     save_path: Optional[Path] = None,
     show: bool = True,
 ) -> plt.Figure:
-    """可视化混淆矩阵（使用 fractal_training.visualization）"""
+    """可视化混淆矩阵（使用 training.visualization）"""
     config = VisualizationConfig(auto_save=False)
     
     fig = plot_confusion_matrix(
@@ -2612,7 +2615,7 @@ def visualize_per_class_accuracy(
     show: bool = True,
     top_k: int = 20,
 ) -> plt.Figure:
-    """可视化每类准确率（使用 fractal_training.visualization）"""
+    """可视化每类准确率（使用 training.visualization）"""
     # 转换格式：将 str keys 转为 int keys
     per_class_acc_int = {}
     class_names = []
