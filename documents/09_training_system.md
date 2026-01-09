@@ -2,7 +2,7 @@
 
 ## 9.1 Overview
 
-This chapter describes the modular training infrastructure for `FractalCurveViT`, including the new `fractal_training` module that provides class-balanced sampling, focal loss, FLOPS budgeting, and a fully decoupled trainer architecture.
+This chapter describes the modular training infrastructure for `FractalCurveViT`, including the new `training` module that provides class-balanced sampling, focal loss, FLOPS budgeting, and a fully decoupled trainer architecture.
 
 ### Key Design Principles
 
@@ -14,7 +14,7 @@ This chapter describes the modular training infrastructure for `FractalCurveViT`
 ### Module Structure
 
 ```
-src/fractal_training/
+examples/training/
 ├── samplers/      # ClassBalancedSampler, ProgressiveSampler
 ├── losses/        # FocalLoss, ClassBalancedCE, CompositeLoss
 ├── metrics/       # ClassificationMetrics (MCA, per-class, head/tail)
@@ -42,7 +42,7 @@ src/fractal_training/
 For imbalanced datasets (e.g., Tiny-ImageNet), use `ClassBalancedSampler`:
 
 ```python
-from fractal_training import ClassBalancedSampler
+from training import ClassBalancedSampler
 
 # Get labels from dataset
 labels = [label for _, label in train_dataset]
@@ -70,7 +70,7 @@ Where:
 For hard sample mining:
 
 ```python
-from fractal_training import FocalLoss
+from training import FocalLoss
 
 loss_fn = FocalLoss(gamma=2.0, alpha=None)  # alpha=None for auto-compute
 ```
@@ -83,7 +83,7 @@ $$\mathcal{L}_{focal} = -\alpha_c (1 - p_c)^\gamma \log(p_c)$$
 Based on effective number of samples (Cui et al., CVPR 2019):
 
 ```python
-from fractal_training import ClassBalancedCE
+from training import ClassBalancedCE
 
 loss_fn = ClassBalancedCE(class_counts=class_counts, beta=0.9999)
 ```
@@ -94,7 +94,7 @@ $$E_c = \frac{1 - \beta^{n_c}}{1 - \beta}, \quad w_c = \frac{1}{E_c}$$
 ### Combined Focal + Class-Balanced
 
 ```python
-from fractal_training import FocalClassBalancedLoss
+from training import FocalClassBalancedLoss
 
 loss_fn = FocalClassBalancedLoss(
     num_classes=200,
@@ -127,7 +127,7 @@ loss_fn = FocalClassBalancedLoss(
 ### Basic Usage
 
 ```python
-from fractal_training import (
+from training import (
     ModularTrainer,
     TrainerConfig,
     FocalLoss,
@@ -190,7 +190,7 @@ def train_epoch(self):
 ### FLOPS Computation
 
 ```python
-from fractal_training import FLOPSConfig, compute_transformer_flops
+from training import FLOPSConfig, compute_transformer_flops
 
 config = FLOPSConfig(embed_dim=384, num_layers=12, num_heads=8)
 flops = compute_transformer_flops(n_tokens=197, config=config)
@@ -208,7 +208,7 @@ Where:
 ### FLOPS Budget Loss
 
 ```python
-from fractal_training import FLOPSBudgetLoss
+from training import FLOPSBudgetLoss
 
 budget_loss = FLOPSBudgetLoss(
     budget=5e9,  # 5 GFLOPS
@@ -226,7 +226,7 @@ $$\mathcal{L}_{FLOPS} = \lambda \cdot \text{ReLU}\left(\frac{\text{FLOPS}_{actua
 Dynamic budget annealing (cosine or linear):
 
 ```python
-from fractal_training import BudgetScheduler
+from training import BudgetScheduler
 
 scheduler = BudgetScheduler(
     budget_max=7.5e9,  # Initial relaxed
@@ -320,7 +320,7 @@ budget:
 ### Loading Configuration
 
 ```python
-from fractal_training import ConfigLoader
+from training import ConfigLoader
 
 loader = ConfigLoader(config_dir='configs')
 config = loader.load('tiny_imagenet_balanced.yaml')
@@ -339,7 +339,7 @@ config = loader.load('base.yaml', overrides={
 ### Classification Metrics
 
 ```python
-from fractal_training import ClassificationMetrics
+from training import ClassificationMetrics
 
 metrics = ClassificationMetrics(num_classes=200, topk=(1, 5))
 
@@ -515,15 +515,15 @@ python examples/training/train_fractal_vit.py \
 
 | Component | Status | Location |
 |:----------|:-------|:---------|
-| ClassBalancedSampler | ✅ Complete | `fractal_training.samplers` |
-| ProgressiveSampler | ✅ Complete | `fractal_training.samplers` |
-| FocalLoss | ✅ Complete | `fractal_training.losses` |
-| ClassBalancedCE | ✅ Complete | `fractal_training.losses` |
-| ClassificationMetrics | ✅ Complete | `fractal_training.metrics` |
-| FLOPSBudgetLoss | ✅ Complete | `fractal_training.schedulers` |
-| BudgetScheduler | ✅ Complete | `fractal_training.schedulers` |
-| ModularTrainer | ✅ Complete | `fractal_training.trainer` |
-| ConfigLoader | ✅ Complete | `fractal_training.config` |
+| ClassBalancedSampler | ✅ Complete | `training.samplers` |
+| ProgressiveSampler | ✅ Complete | `training.samplers` |
+| FocalLoss | ✅ Complete | `training.losses` |
+| ClassBalancedCE | ✅ Complete | `training.losses` |
+| ClassificationMetrics | ✅ Complete | `training.metrics` |
+| FLOPSBudgetLoss | ✅ Complete | `training.schedulers` |
+| BudgetScheduler | ✅ Complete | `training.schedulers` |
+| ModularTrainer | ✅ Complete | `training.trainer` |
+| ConfigLoader | ✅ Complete | `training.config` |
 | W&B Integration | ⏳ Pending | - |
 | Visualization Panel | ⏳ Pending | - |
 
