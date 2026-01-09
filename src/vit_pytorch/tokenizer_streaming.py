@@ -1207,7 +1207,18 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             ValueError: 如果不是可学习分割器
         """
         from .split_adaptive import LearnableSplitter
-        assert isinstance(self.splitter, LearnableSplitter)
+        from .gumbel_topk_splitter import GumbelTopKSplitter
+        
+        # GumbelTopKSplitter 不使用多层深度损失机制
+        if isinstance(self.splitter, GumbelTopKSplitter):
+            if return_details:
+                return None, {}
+            return None
+        
+        if not isinstance(self.splitter, LearnableSplitter):
+            if return_details:
+                return None, {}
+            return None
         
         if image_size is None:
             image_size = self.image_size
