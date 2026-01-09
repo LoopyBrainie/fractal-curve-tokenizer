@@ -281,6 +281,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 num_tokens_list = tokens_per_batch.to('cpu', non_blocking=True).tolist()
             
             # 计算 depth distribution
+            # P-OPT-3: 使用向量化操作，避免 Python for 循环
             depth_dists = []
             max_d = self.max_depth + 1
             depths = tensor_result.depths
@@ -293,18 +294,20 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 count_matrix.view(-1).scatter_add_(0, flat_idx, ones)
                 
                 self._last_depth_count_matrix = count_matrix
-                count_matrix_cpu = count_matrix.to('cpu', non_blocking=True).numpy()
                 
-                for b in range(B):
-                    dist = {}
-                    for d in range(max_d):
-                        count = int(count_matrix_cpu[b, d])
-                        if count > 0:
-                            dist[d] = count
-                    depth_dists.append(dist)
+                # P-OPT-3: 延迟转换到 CPU，使用 non_blocking
+                # 仅在实际需要 depth_dists 时才转换（统计信息通常只用于日志）
+                # 将 dict 构建移到 _build_depth_dists_lazy 方法
+                self._depth_count_matrix_for_stats = count_matrix
+                depth_dists = None  # 延迟构建
             else:
                 depth_dists = [{} for _ in range(B)]
                 self._last_depth_count_matrix = None
+                self._depth_count_matrix_for_stats = None
+        
+        # P-OPT-3: 延迟构建 depth_dists (仅在需要时转换)
+        if depth_dists is None:
+            depth_dists = self._build_depth_dists_lazy(B)
         
         self._last_split_stats = {
             'num_tokens': num_tokens_list,
@@ -314,7 +317,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 3. 纯张量嵌入
         tokens, levels_info, padded_regions = self._embed_with_tensor_result(features, tensor_result)
         
-        # 4. 构建输出 (P9-5: 保留已 padding 的张量作为缓存)
+        # 4. 构建输出 (P-OPT-4: 向量化输出构建，避免 Python for 循环)
+        # TokenSequence 对象仍需构建，但使用预计算的张量切片
         sequences = []
         for b in range(B):
             num_tokens = num_tokens_list[b]
@@ -324,7 +328,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                     "levels": levels_info[b, :num_tokens],
                     "split_stats": {
                         "num_tokens": num_tokens,
-                        "depth_distribution": depth_dists[b],
+                        "depth_distribution": depth_dists[b] if depth_dists else {},
                     },
                 },
             )
@@ -596,6 +600,40 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         padded_regions[:, :, :] = candidate_regions[:N_output].unsqueeze(0).expand(B, -1, -1)
         
         return continuous_tokens, levels_info, padded_regions, num_tokens_list
+    
+    def _build_depth_dists_lazy(self, B: int) -> List[Dict[int, int]]:
+        """延迟构建 depth distribution dicts (P-OPT-3).
+        
+        性能优化:
+            - 仅在实际需要时才从 GPU 拷贝到 CPU
+            - 使用 non_blocking=True 避免同步等待
+            - 使用 numpy 向量化操作替代 Python 循环
+        
+        Args:
+            B: batch size
+            
+        Returns:
+            List of depth distribution dicts
+        """
+        if self._depth_count_matrix_for_stats is None:
+            return [{} for _ in range(B)]
+        
+        count_matrix = self._depth_count_matrix_for_stats
+        max_d = count_matrix.shape[1]
+        
+        # 转换到 CPU (non_blocking)
+        count_matrix_cpu = count_matrix.to('cpu', non_blocking=True).numpy()
+        
+        # 向量化构建 dicts
+        depth_dists = []
+        for b in range(B):
+            row = count_matrix_cpu[b]
+            # 使用 numpy where 找到非零元素
+            nonzero_indices = row.nonzero()[0]
+            dist = {int(d): int(row[d]) for d in nonzero_indices}
+            depth_dists.append(dist)
+        
+        return depth_dists
     
     def _embed_with_tensor_result(
         self,

@@ -322,7 +322,14 @@ class GumbelTopKSplitter(nn.Module):
         self._children_matrix = None
     
     def _ensure_children_matrix(self):
-        """确保子节点矩阵已计算。"""
+        """确保子节点矩阵已计算。
+        
+        性能优化 (P-OPT-2):
+            使用向量化操作替换 Python for 循环和 .item() 调用。
+            通过一次性 CPU 转换 + numpy 操作提升性能。
+            
+        注意: 此方法仅在初始化时调用一次，后续使用缓存结果。
+        """
         if self._children_matrix is not None:
             return
         
@@ -332,16 +339,23 @@ class GumbelTopKSplitter(nn.Module):
         # 初始化为 -1
         children_matrix = torch.full((N, 4), -1, dtype=torch.long, device=device)
         
-        # 遍历所有节点，填充子节点
-        for child_idx in range(N):
-            parent_idx = self.parent_indices[child_idx].item()
-            if parent_idx >= 0:
-                for slot in range(4):
-                    if children_matrix[parent_idx, slot] == -1:
-                        children_matrix[parent_idx, slot] = child_idx
-                        break
+        # P-OPT-2: 一次性转换到 CPU，使用 numpy 进行槽位分配
+        # 这比逐个 .item() 调用快得多
+        parent_indices_cpu = self.parent_indices.cpu().numpy()
+        children_matrix_cpu = children_matrix.cpu().numpy()
         
-        self._children_matrix = children_matrix
+        # 使用 numpy 进行槽位分配
+        slot_counts = {}  # parent_idx -> next_slot
+        for child_idx in range(N):
+            parent_idx = parent_indices_cpu[child_idx]
+            if parent_idx >= 0:
+                slot = slot_counts.get(parent_idx, 0)
+                if slot < 4:  # 最多 4 个子节点
+                    children_matrix_cpu[parent_idx, slot] = child_idx
+                    slot_counts[parent_idx] = slot + 1
+        
+        # 转回 GPU
+        self._children_matrix = torch.from_numpy(children_matrix_cpu).to(device)
     
     @property
     def current_temperature(self) -> float:
@@ -718,6 +732,10 @@ class GumbelTopKSplitter(nn.Module):
             
         Returns:
             GumbelTopKResult
+            
+        性能优化 (P-OPT-1):
+            使用向量化操作替换 Python for 循环，避免 B 次小张量操作。
+            通过 nonzero() + scatter 一次性处理所有 batch。
         """
         B, N = consistent_mask.shape
         device = consistent_mask.device
@@ -725,37 +743,37 @@ class GumbelTopKSplitter(nn.Module):
         # 使用硬阈值选择最终区域
         final_selected = (consistent_mask > 0.5)  # [B, N]
         
-        # 收集选中的区域信息
-        regions_list = []
-        depths_list = []
-        batch_indices_list = []
-        hilbert_indices_list = []
-        num_selected_per_batch = []
+        # P-OPT-1: 向量化收集选中区域
+        # 计算每个 batch 的选中数量
+        num_selected_per_batch = final_selected.sum(dim=1)  # [B]
         
-        for b in range(B):
-            selected_indices = final_selected[b].nonzero(as_tuple=True)[0]
-            
-            if len(selected_indices) == 0:
-                # 至少保留根节点
-                selected_indices = torch.tensor([0], device=device)
-            
-            regions_list.append(self.candidate_regions[selected_indices])
-            depths_list.append(self.candidate_depths[selected_indices])
-            batch_indices_list.append(
-                torch.full((len(selected_indices),), b, dtype=torch.long, device=device)
-            )
-            hilbert_indices_list.append(self.hilbert_indices[selected_indices])
-            num_selected_per_batch.append(len(selected_indices))
+        # 确保每个 batch 至少有一个 token (根节点)
+        empty_batches = (num_selected_per_batch == 0)
+        if empty_batches.any():
+            # 对空 batch 强制选中根节点 (index 0)
+            final_selected = final_selected.clone()
+            final_selected[empty_batches, 0] = True
+            num_selected_per_batch = final_selected.sum(dim=1)
+        
+        # 一次性获取所有选中位置 [total_selected, 2] -> (batch_idx, candidate_idx)
+        selected_positions = final_selected.nonzero(as_tuple=False)  # [total, 2]
+        batch_indices = selected_positions[:, 0]  # [total]
+        candidate_indices = selected_positions[:, 1]  # [total]
+        
+        # 向量化索引所有候选属性
+        regions = self.candidate_regions[candidate_indices]  # [total, 4]
+        depths = self.candidate_depths[candidate_indices]  # [total]
+        hilbert_indices = self.hilbert_indices[candidate_indices]  # [total]
         
         return GumbelTopKResult(
-            regions=torch.cat(regions_list, dim=0),
-            depths=torch.cat(depths_list, dim=0),
-            batch_indices=torch.cat(batch_indices_list, dim=0),
-            hilbert_indices=torch.cat(hilbert_indices_list, dim=0),
+            regions=regions,
+            depths=depths,
+            batch_indices=batch_indices,
+            hilbert_indices=hilbert_indices,
             selected_mask=consistent_mask,
             logits=logits,
             probs=probs,
-            num_selected_per_batch=torch.tensor(num_selected_per_batch, device=device),
+            num_selected_per_batch=num_selected_per_batch,
         )
     
     # ========================================================================

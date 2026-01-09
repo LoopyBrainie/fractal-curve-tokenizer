@@ -458,18 +458,25 @@ class FractalCurveViT(nn.Module):
             
         Returns:
             (aux_infos, features_list)
+            
+        性能优化 (P-OPT-5):
+            - aux_info 仅在验证/调试时使用，保持简单实现
+            - 使用 non_blocking 转移减少同步等待
         """
         aux_infos: List[Dict[str, Any]] = []
         features_list: List[torch.Tensor] = []
 
         if return_aux_info:
-            # lengths 是 Tensor，需要索引访问
+            # P-OPT-5: 批量获取 lengths 到 CPU，避免多次 .item() 调用
+            lengths_cpu = lengths.to('cpu', non_blocking=True)
+            
             for i in range(batch_size):
                 l = levels_list[i]
                 if l.numel() > 0:
                     depths = l[:, 0]
-                    unique = depths.unique().tolist()
-                    aux_infos.append({"num_tokens": int(lengths[i].item()), "levels_used": unique})
+                    # P-OPT-5: unique 操作在 GPU 上执行，结果再转 CPU
+                    unique = depths.unique().to('cpu', non_blocking=True).tolist()
+                    aux_infos.append({"num_tokens": int(lengths_cpu[i].item()), "levels_used": unique})
                 else:
                     aux_infos.append({"num_tokens": 0})
         
