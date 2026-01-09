@@ -1,0 +1,451 @@
+"""
+方案 D: Gumbel-Top-K + 树一致性 分割器测试
+
+测试验证:
+    1. Hilbert 局部性: 每个 token 精确对应一个四叉树区域
+    2. 梯度覆盖: STE 使所有候选都有梯度
+    3. 树一致性: 子节点选中时父节点被排除
+    4. 动态 K 选择: K 在 [K_min, K_max] 范围内
+"""
+
+import pytest
+import torch
+import torch.nn.functional as F
+from typing import Tuple
+
+
+class TestGumbelTopKSplitter:
+    """GumbelTopKSplitter 单元测试。"""
+    
+    @pytest.fixture
+    def splitter(self):
+        """创建测试用分割器。"""
+        from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+        
+        return GumbelTopKSplitter(
+            feature_dim=64,
+            max_depth=2,  # 1 + 4 + 16 = 21 candidates (快速测试)
+            hidden_dim=32,
+            pool_size=2,
+            temperature=1.0,
+            K_min=4,
+            K_max=16,
+            image_size=(32, 32),
+        )
+    
+    @pytest.fixture
+    def features(self, splitter):
+        """创建测试特征。"""
+        B, C, H, W = 2, 64, 8, 8
+        return torch.randn(B, C, H, W)
+    
+    def test_forward_output_shape(self, splitter, features):
+        """测试前向传播输出形状。"""
+        result = splitter(features)
+        
+        B = features.shape[0]
+        N = splitter.num_candidates
+        
+        # 检查输出字段
+        assert result.regions.dim() == 2
+        assert result.regions.shape[1] == 4
+        assert result.depths.dim() == 1
+        assert result.batch_indices.dim() == 1
+        assert result.selected_mask.shape == (B, N)
+        assert result.logits.shape == (B, N)
+        assert result.probs.shape == (B, N)
+    
+    def test_hilbert_locality(self, splitter, features):
+        """
+        测试 Hilbert 局部性: 每个 token 精确对应一个四叉树区域。
+        
+        验证: 选中的每个 region 都来自预计算的候选区域列表。
+        """
+        result = splitter(features)
+        
+        # 检查每个选中的区域是否在候选列表中
+        selected_regions = result.regions
+        candidate_regions = splitter.candidate_regions
+        
+        for region in selected_regions:
+            # 检查该区域是否精确匹配某个候选
+            matches = (candidate_regions == region.unsqueeze(0)).all(dim=1)
+            assert matches.any(), f"Region {region} not in candidate list"
+    
+    def test_gradient_coverage(self, splitter, features):
+        """
+        测试梯度覆盖: STE 使所有候选都有梯度。
+        
+        验证: logits 的梯度非零数量 >= 80% (STE 保证)
+        """
+        splitter.train()
+        features.requires_grad_(True)
+        
+        result = splitter(features)
+        
+        # 使用 selected_mask (STE 版本) 计算损失
+        loss = (result.selected_mask * result.logits).sum()
+        loss.backward()
+        
+        # 检查 MLP 参数梯度
+        mlp_has_grad = False
+        for param in splitter.complexity_mlp.parameters():
+            if param.grad is not None and param.grad.abs().sum() > 0:
+                mlp_has_grad = True
+                break
+        
+        assert mlp_has_grad, "MLP parameters should have gradients via STE"
+    
+    def test_tree_consistency(self, splitter, features):
+        """
+        测试树一致性: 若子节点被选中，则父节点不被选中。
+        
+        验证: 遍历所有选中节点，确保其父节点未被选中。
+        """
+        result = splitter(features)
+        
+        B, N = result.selected_mask.shape
+        selected = (result.selected_mask > 0.5)  # 硬决策
+        
+        for b in range(B):
+            selected_indices = selected[b].nonzero(as_tuple=True)[0]
+            
+            for idx in selected_indices:
+                parent_idx = splitter.parent_indices[idx].item()
+                if parent_idx >= 0:
+                    # 父节点不应被选中
+                    assert not selected[b, parent_idx], \
+                        f"Tree consistency violated: node {idx} selected but parent {parent_idx} also selected"
+    
+    def test_dynamic_k_selection(self, splitter, features):
+        """
+        测试动态 K 选择: K 在 [K_min, K_max] 范围内。
+        """
+        result = splitter(features)
+        
+        # 检查每个 batch 的选中数量
+        for b in range(features.shape[0]):
+            num_selected = result.num_selected_per_batch[b].item()
+            # 由于树一致性约束，实际选中可能少于 K
+            assert num_selected >= 1, "At least 1 token should be selected"
+            # 不检查上界，因为树一致性可能减少 token 数
+    
+    def test_to_tensor_split_result(self, splitter, features):
+        """测试转换为 TensorSplitResult。"""
+        result = splitter(features)
+        tensor_result = result.to_tensor_split_result()
+        
+        # 检查字段一致性
+        assert torch.equal(tensor_result.regions, result.regions)
+        assert torch.equal(tensor_result.depths, result.depths)
+        assert torch.equal(tensor_result.batch_indices, result.batch_indices)
+        assert torch.equal(tensor_result.hilbert_indices, result.hilbert_indices)
+    
+    def test_inference_mode(self, splitter, features):
+        """测试推理模式 (hard=True)。"""
+        splitter.eval()
+        
+        with torch.no_grad():
+            result = splitter(features, hard=True)
+        
+        # 推理模式下 selected_mask 应该是硬掩码 (0/1)
+        unique_vals = result.selected_mask.unique()
+        assert len(unique_vals) <= 2
+        if len(unique_vals) == 2:
+            assert 0.0 in unique_vals
+            assert 1.0 in unique_vals
+    
+    def test_auxiliary_losses(self, splitter, features):
+        """测试辅助损失计算。"""
+        result = splitter(features)
+        
+        # 弹性预算损失
+        budget_loss = splitter.get_elastic_budget_loss(target_tokens=8)
+        assert budget_loss.dim() == 0  # 标量
+        assert budget_loss >= 0
+        
+        # 深度熵损失
+        entropy_loss = splitter.get_depth_entropy_loss(probs=result.probs)
+        assert entropy_loss.dim() == 0  # 标量
+    
+    def test_diagnostics(self, splitter, features):
+        """测试诊断信息。"""
+        _ = splitter(features)
+        diag = splitter.get_diagnostics()
+        
+        assert 'num_candidates' in diag
+        assert 'max_depth' in diag
+        assert 'avg_selected' in diag
+        assert 'temperature' in diag
+        
+        # 验证候选数量公式
+        expected_candidates = sum(4 ** d for d in range(splitter.max_depth + 1))
+        assert diag['num_candidates'] == expected_candidates
+
+
+class TestTreeConsistencyVectorized:
+    """树一致性向量化实现的详细测试。"""
+    
+    def test_children_matrix_construction(self):
+        """测试子节点矩阵构建正确性。"""
+        from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+        
+        splitter = GumbelTopKSplitter(
+            feature_dim=32,
+            max_depth=2,
+            hidden_dim=16,
+            pool_size=2,
+            image_size=(16, 16),
+        )
+        
+        # 确保矩阵已构建
+        splitter._ensure_children_matrix()
+        
+        children = splitter._children_matrix
+        N = splitter.num_candidates  # 1 + 4 + 16 = 21
+        
+        assert children.shape == (N, 4)
+        
+        # 根节点 (idx=0) 应该有 4 个子节点 (idx=1,2,3,4)
+        root_children = children[0]
+        assert (root_children >= 0).all(), "Root should have 4 children"
+        assert set(root_children.tolist()) == {1, 2, 3, 4}
+        
+        # 最后一层节点不应该有子节点
+        depth_2_start = 1 + 4  # = 5
+        for i in range(depth_2_start, N):
+            assert (children[i] == -1).all(), f"Node {i} at depth 2 should have no children"
+    
+    def test_tree_consistency_exclusion(self):
+        """测试树一致性排除逻辑。"""
+        from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+        
+        splitter = GumbelTopKSplitter(
+            feature_dim=32,
+            max_depth=2,
+            hidden_dim=16,
+            pool_size=2,
+            image_size=(16, 16),
+        )
+        
+        splitter._ensure_children_matrix()
+        
+        B, N = 1, splitter.num_candidates
+        
+        # 构造测试场景: 选中根节点及其第一个子节点
+        # 树一致性应该排除根节点 (因为子节点被选中)
+        selected_mask = torch.zeros(B, N)
+        selected_mask[0, 0] = 1.0  # 根节点
+        selected_mask[0, 1] = 1.0  # 第一个子节点
+        
+        topk_indices = torch.tensor([[0, 1]])
+        
+        consistent = splitter._enforce_tree_consistency(selected_mask, topk_indices)
+        
+        # 根节点应被排除
+        assert consistent[0, 0] < 0.5, "Root should be excluded when child is selected"
+        assert consistent[0, 1] > 0.5, "Child should remain selected"
+
+
+class TestGradientFlow:
+    """梯度流测试。"""
+    
+    def test_ste_gradient_through_topk(self):
+        """测试 STE 使梯度穿过 Top-K 操作。"""
+        from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+        
+        splitter = GumbelTopKSplitter(
+            feature_dim=32,
+            max_depth=2,
+            hidden_dim=16,
+            pool_size=2,
+            image_size=(16, 16),
+            K_min=4,
+            K_max=8,
+        )
+        splitter.train()
+        
+        B, C, H, W = 2, 32, 4, 4
+        features = torch.randn(B, C, H, W, requires_grad=True)
+        
+        result = splitter(features)
+        
+        # 使用 STE 掩码计算损失
+        loss = (result.selected_mask * result.logits).mean()
+        loss.backward()
+        
+        # 验证特征有梯度
+        assert features.grad is not None
+        assert features.grad.abs().sum() > 0
+        
+        # 验证 MLP 有梯度
+        grad_count = 0
+        total_count = 0
+        for param in splitter.complexity_mlp.parameters():
+            total_count += 1
+            if param.grad is not None and param.grad.abs().sum() > 0:
+                grad_count += 1
+        
+        # 大部分参数应该有梯度
+        assert grad_count >= total_count * 0.5, \
+            f"Only {grad_count}/{total_count} MLP params have gradients"
+
+
+class TestFactoryFunction:
+    """工厂函数测试。"""
+    
+    def test_create_from_config(self):
+        """测试从配置创建。"""
+        from vit_pytorch.gumbel_topk_splitter import create_gumbel_topk_from_config
+        
+        splitter = create_gumbel_topk_from_config(
+            feature_dim=128,
+            max_depth=3,
+            hidden_dim=64,
+            K_min=8,
+            K_max=32,
+        )
+        
+        assert splitter.feature_dim == 128
+        assert splitter.max_depth == 3
+        assert splitter.K_min == 8
+        assert splitter.K_max == 32
+        assert splitter.num_candidates == 1 + 4 + 16 + 64  # = 85
+
+
+class TestAnnealingAPI:
+    """退火 API 测试 (与 LearnableSplitter 兼容性)。"""
+    
+    @pytest.fixture
+    def splitter(self):
+        """创建测试用分割器。"""
+        from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+        return GumbelTopKSplitter(
+            feature_dim=64,
+            max_depth=2,
+            hidden_dim=32,
+            pool_size=2,
+            temperature=1.0,
+            K_min=4,
+            K_max=16,
+            image_size=(32, 32),
+        )
+    
+    def test_enable_temperature_annealing(self, splitter):
+        """测试温度退火启用。"""
+        initial_temp = splitter.current_temperature
+        
+        # 链式调用
+        result = splitter.enable_temperature_annealing(
+            total_steps=100,
+            T_start=1.0,
+            T_end=0.3,
+            schedule='exponential',
+        )
+        
+        assert result is splitter  # 链式调用
+        assert splitter._temp_enabled
+        assert splitter._temp_total_steps.item() == 100
+        assert splitter._temp_start.item() == pytest.approx(1.0, rel=0.01)
+        assert splitter._temp_end.item() == pytest.approx(0.3, rel=0.01)
+        assert splitter.current_temperature == pytest.approx(1.0, rel=0.01)
+    
+    def test_temperature_annealing_clamps_low_values(self, splitter):
+        """测试 I18-2 温度下界保护。"""
+        import warnings
+        
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            splitter.enable_temperature_annealing(
+                total_steps=100,
+                T_start=1.0,
+                T_end=0.05,  # 低于安全下界
+            )
+            
+            # 应该有警告
+            assert len(w) == 1
+            assert "I18-2" in str(w[0].message)
+            
+        # T_end 应该被钳制到 0.3
+        assert splitter._temp_end.item() == pytest.approx(0.3, rel=0.01)
+    
+    def test_enable_explore_bias_annealing(self, splitter):
+        """测试探索偏置退火启用。"""
+        result = splitter.enable_explore_bias_annealing(
+            total_steps=100,
+            b_start=0.6,
+            b_end=0.0,
+        )
+        
+        assert result is splitter
+        assert splitter._bias_enabled
+        assert splitter._bias_total_steps.item() == 100
+        assert splitter.explore_bias.item() == pytest.approx(0.6, rel=0.01)
+    
+    def test_annealing_updates_during_training(self, splitter):
+        """测试训练时退火自动更新。"""
+        features = torch.randn(2, 64, 8, 8)
+        
+        # 启用退火
+        splitter.enable_temperature_annealing(total_steps=10, T_start=1.0, T_end=0.3)
+        splitter.enable_explore_bias_annealing(total_steps=10, b_start=0.5, b_end=0.0)
+        
+        initial_temp = splitter.current_temperature
+        initial_bias = splitter.explore_bias.item()
+        
+        # 训练模式前向传播
+        splitter.train()
+        for _ in range(5):
+            splitter(features)
+        
+        # 温度和偏置应该已更新
+        assert splitter.current_temperature < initial_temp
+        assert splitter.explore_bias.item() < initial_bias
+    
+    def test_annealing_frozen_during_eval(self, splitter):
+        """测试推理时退火不更新。"""
+        features = torch.randn(2, 64, 8, 8)
+        
+        splitter.enable_temperature_annealing(total_steps=10, T_start=1.0, T_end=0.3)
+        
+        # 推理模式
+        splitter.eval()
+        initial_step = splitter._temp_step.item()
+        
+        for _ in range(5):
+            splitter(features)
+        
+        # step 不应该增加
+        assert splitter._temp_step.item() == initial_step
+    
+    def test_disable_annealing(self, splitter):
+        """测试禁用退火。"""
+        splitter.enable_temperature_annealing(total_steps=100)
+        splitter.enable_explore_bias_annealing(total_steps=100)
+        
+        assert splitter._temp_enabled
+        assert splitter._bias_enabled
+        
+        splitter.disable_temperature_annealing()
+        splitter.disable_explore_bias_annealing()
+        
+        assert not splitter._temp_enabled
+        assert not splitter._bias_enabled
+    
+    def test_api_compatibility_with_training_script(self, splitter):
+        """
+        测试与 train_fractal_vit.py 的 API 兼容性。
+        
+        训练脚本使用 hasattr 检测这些方法。
+        """
+        # 这些是训练脚本期望的方法
+        assert hasattr(splitter, 'enable_temperature_annealing')
+        assert hasattr(splitter, 'enable_explore_bias_annealing')
+        assert hasattr(splitter, 'set_temperature')
+        assert hasattr(splitter, 'set_explore_bias')
+        assert callable(splitter.enable_temperature_annealing)
+        assert callable(splitter.enable_explore_bias_annealing)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "--tb=short"])

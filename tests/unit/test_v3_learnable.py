@@ -23,6 +23,12 @@ Scheme B (BalancedGreedySplitter) 和 Scheme C (FixedBudgetDPSplitter)
 3. 可学习阈值: τ_d = τ_{base,d} + δ_d
 
 4. O(D) BFS 复杂度 vs O(N·4^D) DP
+
+I20 Update (2024):
+==================
+StreamingFractalTokenizerV3 现在默认使用 GumbelTopKSplitter (Scheme D)。
+以下针对 LearnableSplitter (Scheme A) 的测试已被标记为跳过。
+Scheme D 相关测试请参见 tests/test_gumbel_topk_splitter.py。
 """
 
 import pytest
@@ -31,11 +37,17 @@ import torch.nn as nn
 
 from vit_pytorch import StreamingFractalTokenizerV3
 from vit_pytorch.split_adaptive import LearnableSplitter
+from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+
+
+# I20: StreamingFractalTokenizerV3 现在使用 GumbelTopKSplitter
+SCHEME_D_SKIP_MSG = "I20: StreamingFractalTokenizerV3 now uses GumbelTopKSplitter (Scheme D). See tests/test_gumbel_topk_splitter.py for Scheme D tests."
 
 
 class TestV3Learnable:
     """可学习分割测试组 (现在是唯一的分割方式)."""
     
+    @pytest.mark.skip(reason=SCHEME_D_SKIP_MSG)
     def test_learnable_init(self):
         """测试可学习分割器初始化."""
         v3 = StreamingFractalTokenizerV3(
@@ -73,6 +85,7 @@ class TestV3Learnable:
             assert len(seq.tokens) >= 1
             assert seq.tokens.shape[-1] == 128
     
+    @pytest.mark.skip(reason=SCHEME_D_SKIP_MSG)
     def test_learnable_training_stats(self):
         """测试训练统计信息."""
         v3 = StreamingFractalTokenizerV3(
@@ -97,6 +110,7 @@ class TestV3Learnable:
 class TestV3GradientFlow:
     """梯度流测试组."""
     
+    @pytest.mark.skip(reason=SCHEME_D_SKIP_MSG)
     def test_gradient_to_threshold_offsets(self):
         """测试梯度是否流向 threshold_offsets 参数.
         
@@ -126,7 +140,8 @@ class TestV3GradientFlow:
         
         # threshold_offsets 应有梯度
         assert v3.splitter.threshold_offsets.grad is not None
-        
+    
+    @pytest.mark.skip(reason=SCHEME_D_SKIP_MSG)
     def test_gradient_through_barrier_loss(self):
         """测试超出边界时 barrier loss 提供梯度.
         
@@ -153,6 +168,7 @@ class TestV3GradientFlow:
         assert v3.splitter.threshold_offsets.grad is not None
         assert not torch.all(v3.splitter.threshold_offsets.grad == 0)
     
+    @pytest.mark.skip(reason=SCHEME_D_SKIP_MSG)
     def test_gradient_through_auxiliary_loss(self):
         """测试梯度通过辅助损失流向 MLP 参数.
         
@@ -187,6 +203,7 @@ class TestV3GradientFlow:
         # 阈值参数应有梯度 (来自正则化项)
         assert v3.splitter.threshold_offsets.grad is not None
     
+    @pytest.mark.skip(reason=SCHEME_D_SKIP_MSG)
     def test_gradient_through_regularization(self):
         """测试阈值正则化提供梯度."""
         v3 = StreamingFractalTokenizerV3(
@@ -208,6 +225,7 @@ class TestV3GradientFlow:
 class TestV3AuxiliaryLoss:
     """辅助损失测试组."""
     
+    @pytest.mark.skip(reason=SCHEME_D_SKIP_MSG)
     def test_split_loss_computation(self):
         """测试可学习分割损失计算."""
         v3 = StreamingFractalTokenizerV3(
@@ -252,6 +270,7 @@ class TestV3AuxiliaryLoss:
 class TestV3TemperatureAnnealing:
     """温度退火测试组."""
     
+    @pytest.mark.skip(reason=SCHEME_D_SKIP_MSG)
     def test_set_temperature(self):
         """测试温度设置."""
         v3 = StreamingFractalTokenizerV3(
@@ -367,6 +386,7 @@ class TestV3API:
         assert hasattr(v3, 'get_learnable_split_loss')
         assert hasattr(v3, 'set_split_temperature')
     
+    @pytest.mark.skip(reason=SCHEME_D_SKIP_MSG)
     def test_always_uses_learnable_splitter(self):
         """测试始终使用 LearnableSplitter (Scheme B/C 已移除)."""
         v3 = StreamingFractalTokenizerV3(
