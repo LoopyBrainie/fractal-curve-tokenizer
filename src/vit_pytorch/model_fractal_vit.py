@@ -244,27 +244,40 @@ class FractalCurveViT(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """初始化权重 - 遵循 ViT 标准初始化"""
+        """初始化权重 - 使用正确的方差缩放
+        
+        I17 修复: 解决 logits 输出过小导致的模型坍缩问题
+        
+        问题分析:
+            原实现使用固定 std=0.02 的 trunc_normal 初始化，
+            不考虑 fan_in，导致:
+            - 信号在 MLP Head 中逐层衰减
+            - 最终 logits std 仅 ~0.05 (期望 ~1.0)
+            - 所有类别 logits 过于接近
+            - 模型坍缩到单一类别预测
+            
+        修复方案:
+            分类头使用 Xavier 初始化 (考虑 fan_in + fan_out)
+            保证信号在前向传播中保持稳定
+            
+        参考:
+            - Xavier/Glorot: Var(W) = 2 / (fan_in + fan_out)
+            - 这确保输入和输出的方差大致相等
+        """
         # CLS token: 使用较小的标准差
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         
-        # 分类头：使用较小的标准差初始化，最后一层更小
+        # 分类头：使用 Xavier 初始化
+        # I17 修复: 使用 xavier_uniform 替代固定 std 的 trunc_normal
         for module in self.mlp_head.modules():
             if isinstance(module, nn.Linear):
-                nn.init.trunc_normal_(module.weight, std=0.02)
+                # Xavier 初始化: std = sqrt(2 / (fan_in + fan_out))
+                nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.LayerNorm):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
-        
-        # 最后一层（分类层）使用更小的标准差
-        for module in reversed(list(self.mlp_head.modules())):
-            if isinstance(module, nn.Linear):
-                nn.init.trunc_normal_(module.weight, std=0.01)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-                break
         
         # Transformer 层权重初始化
         self._init_transformer_weights()

@@ -164,7 +164,11 @@ class HilbertNativePatchEmbed(nn.Module):
         # =====================================================================
         
         # 深度嵌入: 加法偏置，编码 region 的「语义角色」
+        # I24: 使用较小的初始化标准差 (0.02)，避免淹没 pooled features
+        # 原问题: nn.Embedding 默认初始化 std~1.0，而 ROI-Align pooled std~0.2
+        # 这导致 96% 的 token (同一 depth) 共享几乎相同的表示
         self.depth_embed = nn.Embedding(max_depth + 1, dim)
+        nn.init.normal_(self.depth_embed.weight, mean=0.0, std=0.02)
         
         # 深度缩放: 乘法因子，编码 region 的「信息密度」
         # P6-1 改进: 使用 sigmoid 参数化，扩展动态范围到 4x
