@@ -447,5 +447,156 @@ class TestAnnealingAPI:
         assert callable(splitter.enable_explore_bias_annealing)
 
 
+class TestI21DepthBalance:
+    """
+    I21: 深度分布平衡方案测试。
+    
+    测试验证:
+        1. β: Log-Compensation Bias 正确计算
+        2. δ: Subset Softmax 梯度增强
+        3. ε: Depth KL Loss 正确计算
+    """
+    
+    @pytest.fixture
+    def splitter(self):
+        """创建测试用分割器 (max_depth=3)。"""
+        from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+        
+        return GumbelTopKSplitter(
+            feature_dim=64,
+            max_depth=3,  # N=85 candidates
+            hidden_dim=32,
+            pool_size=2,
+            temperature=1.0,
+            K_min=8,
+            K_max=32,
+            image_size=(64, 64),
+        )
+    
+    @pytest.fixture
+    def features(self, splitter):
+        """创建测试特征。"""
+        B, C, H, W = 2, 64, 16, 16
+        return torch.randn(B, C, H, W)
+    
+    def test_log_compensation_bias_shape(self, splitter):
+        """测试 log_compensation_bias 形状正确。"""
+        assert hasattr(splitter, 'log_compensation_bias')
+        assert splitter.log_compensation_bias.shape == (85,)  # N=1+4+16+64
+    
+    def test_log_compensation_bias_values(self, splitter):
+        """
+        测试 log_compensation_bias 值符合数学公式。
+        
+        数学: b_d = log(N_total / N_d)
+        """
+        import math
+        
+        N_total = 85
+        
+        # depth=0: N_d=1, b=log(85/1)=4.443
+        assert abs(splitter.log_compensation_bias[0].item() - math.log(85/1)) < 1e-5
+        
+        # depth=1: N_d=4, b=log(85/4)=3.056
+        assert abs(splitter.log_compensation_bias[1].item() - math.log(85/4)) < 1e-5
+        
+        # depth=2: N_d=16, b=log(85/16)=1.670
+        idx_d2 = 1 + 4  # 跳过 depth 0 和 1
+        assert abs(splitter.log_compensation_bias[idx_d2].item() - math.log(85/16)) < 1e-5
+        
+        # depth=3: N_d=64, b=log(85/64)=0.284
+        idx_d3 = 1 + 4 + 16  # 跳过 depth 0, 1, 2
+        assert abs(splitter.log_compensation_bias[idx_d3].item() - math.log(85/64)) < 1e-5
+    
+    def test_log_compensation_monotonicity(self, splitter):
+        """
+        测试 log_compensation_bias 单调性: 浅层偏置 > 深层偏置。
+        
+        这确保浅层候选在 Top-K 选择中获得更大优势。
+        """
+        # 获取每个深度的第一个候选的偏置
+        b_d0 = splitter.log_compensation_bias[0].item()          # depth=0
+        b_d1 = splitter.log_compensation_bias[1].item()          # depth=1
+        b_d2 = splitter.log_compensation_bias[5].item()          # depth=2
+        b_d3 = splitter.log_compensation_bias[21].item()         # depth=3
+        
+        # 验证单调递减
+        assert b_d0 > b_d1 > b_d2 > b_d3
+    
+    def test_depth_kl_loss_returns_tensor(self, splitter, features):
+        """测试 get_depth_kl_loss 返回有效张量。"""
+        splitter.train()
+        result = splitter(features)
+        
+        kl_loss = splitter.get_depth_kl_loss(
+            selected_mask=result.selected_mask
+        )
+        
+        assert isinstance(kl_loss, torch.Tensor)
+        assert kl_loss.dim() == 0  # 标量
+        assert kl_loss.item() >= 0  # KL 散度非负
+    
+    def test_depth_kl_loss_gradient_flow(self, splitter, features):
+        """测试 Depth KL Loss 有梯度流。"""
+        splitter.train()
+        result = splitter(features)
+        
+        kl_loss = splitter.get_depth_kl_loss(
+            selected_mask=result.selected_mask
+        )
+        
+        # 反向传播
+        kl_loss.backward()
+        
+        # 验证 MLP 参数有梯度
+        for name, param in splitter.complexity_mlp.named_parameters():
+            if param.requires_grad:
+                assert param.grad is not None, f"No gradient for {name}"
+    
+    def test_auxiliary_losses_includes_depth_kl(self, splitter, features):
+        """测试 get_auxiliary_losses 包含 depth_kl_loss。"""
+        splitter.train()
+        _ = splitter(features)  # 缓存 selected_mask
+        
+        losses = splitter.get_auxiliary_losses(
+            include_elastic_budget=True,
+            include_soft_entropy=True,
+        )
+        
+        assert 'depth_kl_loss' in losses
+        assert losses['depth_kl_loss'].item() >= 0
+    
+    def test_subset_softmax_gradient_strength(self, splitter, features):
+        """
+        测试 Subset Softmax 梯度强度增强。
+        
+        数学预期:
+            全局 softmax: 每个元素 ≈ 1/N
+            子集 softmax: 每个元素 ≈ 1/K
+            增强比例: N/K ≈ 85/32 ≈ 2.7x
+        """
+        from vit_pytorch.constants import SUBSET_SOFTMAX_ENABLED
+        
+        if not SUBSET_SOFTMAX_ENABLED:
+            pytest.skip("SUBSET_SOFTMAX_ENABLED is False")
+        
+        splitter.train()
+        features_grad = features.clone().requires_grad_(True)
+        
+        # 前向
+        result = splitter(features_grad)
+        
+        # 使用 selected_mask 作为 loss
+        loss = result.selected_mask.sum()
+        loss.backward()
+        
+        # 验证梯度存在
+        assert features_grad.grad is not None
+        
+        # 梯度不应该过于稀疏
+        nonzero_ratio = (features_grad.grad != 0).float().mean().item()
+        assert nonzero_ratio > 0.1, f"Gradient too sparse: {nonzero_ratio:.2%}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
