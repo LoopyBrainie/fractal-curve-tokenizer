@@ -59,10 +59,15 @@ import shutil
 import sys
 import time
 import urllib.request
+import warnings
 import zipfile
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+# 过滤非关键警告
+warnings.filterwarnings("ignore", message="Truncating the start/stop/step of slice")
+warnings.filterwarnings("ignore", message="std\\(\\): degrees of freedom is <= 0")
 
 import numpy as np
 import torch

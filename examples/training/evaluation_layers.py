@@ -897,10 +897,10 @@ class StabilityEvaluator:
             if torch.isinf(data).any():
                 has_inf = True
             
-            # 统计
+            # 统计 (处理 numel <= 1 的情况)
             weight_stats[name] = {
                 'mean': data.mean().item(),
-                'std': data.std().item(),
+                'std': data.std().item() if data.numel() > 1 else 0.0,
                 'min': data.min().item(),
                 'max': data.max().item(),
                 'norm': data.norm().item(),

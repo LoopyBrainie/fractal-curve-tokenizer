@@ -1,69 +1,69 @@
 # ============================================================================
-# Tiny-ImageNet 最优训练脚本 (RTX 4070 Laptop)
+# Tiny-ImageNet I21 最优训练脚本 (RTX 4070 Laptop)
 # ============================================================================
 #
-# 数学形式化分析 (2026-01-10) - Scheme D 对齐版本
+# 数学形式化分析 (2026-01-11) - I21 深度平衡版本
 # ================================================
 #
-# 1. 模型容量 vs 数据集规模
+# 1. 模型容量计算
 #    -------------------------
-#    Tiny-ImageNet: N = 100,000 samples, C = 200 classes
-#    经验法则: θ_optimal ∈ [N/100, N/10] = [1M, 10M] (防止过拟合)
+#    Tiny-ImageNet: N_train = 100,000 samples, C = 200 classes
 #    
-#    选择: dim=256, depth=8, heads=8 → θ ≈ 4.2M
-#    理由: 更保守的容量，配合强正则化防止过拟合
+#    经验法则 (考虑正则化):
+#      P_target ∈ [N/10, N/5] × regularization_factor
+#               = [10M, 20M] × 1.5 = [15M, 30M]
+#    
+#    选择: dim=320, depth=12, heads=8 → θ ≈ 20M
+#    验证:
+#      P_attn = 4 × 320² + 4 × 320 = 410,880
+#      P_ffn(SwiGLU) = 3 × 320 × 1280 + 1600 = 1,230,400
+#      P_layer = 1,641,280
+#      P_transformer = 12 × 1,641,280 ≈ 19.7M
+#      P_total ≈ 20M ✓
 #
-# 2. Scheme D (GumbelTopKSplitter) 架构
+# 2. I21 深度平衡机制 (自动启用)
 #    -----------------------------------
-#    核心公式:
-#      selected = TopK(logits + Gumbel(0,1), K)
-#      logits_i = MLP(ROI_i) + b_explore + β·γ^{d_i} - τ_{d_i}
+#    β: Log-Compensation Bias
+#       b_d = log(N_total / N_d)
+#       b_0=4.44, b_1=3.06, b_2=1.67, b_3=0.28
 #    
-#    优势:
-#      - 100% 梯度覆盖 (STE 使所有候选都有梯度)
-#      - 硬 K 约束 [K_min, K_max] 消除死锁风险
-#      - O(1) 并行评估所有候选 vs O(D) BFS
+#    δ: Subset Softmax  
+#       梯度增强: N/K = 85/32 ≈ 2.7×
+#    
+#    ε: Depth KL Loss
+#       L_depth = 0.1 × D_KL(π_depth || Uniform)
 #
 # 3. 几何极限约束
 #    ----------------------
 #    image_size=64, num_scales=4 → max_depth=3
-#    候选数 N = 1 + 4 + 16 + 64 = 85
-#    推荐 K 范围: [16, 64]
-#    
-#    验证: elastic_N_max=80 < 候选数=85 ✓
+#    候选数: N = 1 + 4 + 16 + 64 = 85
+#    目标 token 数: target_tokens=48 (压缩比 ~5:1)
+#    弹性预算 Dead Zone: [24, 96]
 #
 # 4. 学习率缩放 (Linear Scaling Rule)
 #    ---------------------------------
-#    lr_base = 5e-4 @ batch_size=64
-#    lr = lr_base × (batch_size / 64) = 5e-4 × (192/64) = 1.5e-3
-#    
-#    保守调整: 0.8× → lr = 1.2e-3
+#    lr_base = 5e-4 @ batch_size=256
+#    lr = lr_base × (B / 256) = 5e-4 × (192/256) = 3.75e-4
 #
 # 5. VRAM 预算 (8GB - 4070 Laptop)
 #    ------------------------------
-#    Model (fp32): 4.2M × 4B = 16.8 MB
-#    Optimizer (AdamW): 4.2M × 8B = 33.6 MB
-#    Gradients: 16.8 MB
-#    Activations (AMP + Checkpoint): ~0.8 GB (batch_size=192)
-#    Buffer: ~0.15 GB
-#    Total: ~1.0 GB << 8 GB ✓
+#    Model (fp16+fp32): ~160 MB
+#    Activations (checkpoint): ~2 GB
+#    Optimizer states: ~320 MB  
+#    Total: ~3 GB << 8 GB ✓
 #
-# 6. 退火策略 (I18-2 安全下界)
+# 6. 退火策略 (P10-11 验证)
 #    -------------------------
-#    温度退火: T(t) = 1.0 · (0.3)^(t/total)  [exponential]
-#    偏置退火: b(t) = 0.6 · (1 - t/total)     [linear]
-#    Warmup: 10 epochs (10% of training)
-#    
-#    I18-2 约束: T_end ≥ 0.3 避免 STE 梯度消失
+#    温度: T(t) = 1.0 × (0.3)^(t/S_post), exponential
+#    偏置: 使用模型默认值 (0.5 → 0.0)
+#    Warmup: splitter_temp_warmup=5 epochs
 #
 # 7. 训练时间估算
 #    -------------
-#    样本数: 100,000
-#    batch_size: 192
 #    迭代/epoch: ⌈100,000 / 192⌉ = 521
-#    假设速度: 1.5 s/iter (含 compile 优化)
-#    epoch 时间: 521 × 1.5s ≈ 13 min
-#    100 epochs: ~21.5 小时
+#    速度 (compile + AMP): ~1.2 s/iter
+#    epoch 时间: 521 × 1.2s ≈ 10.4 min
+#    100 epochs: ~17.3 小时
 #
 # ============================================================================
 
@@ -72,12 +72,14 @@ uv run python examples/training/train_fractal_vit.py `
   --epochs 100 `
   `
   <# ====================================================================== #> `
-  <# 模型架构 (4.2M 参数 - 保守容量防止过拟合)                               #> `
+  <# 模型架构 (~20M 参数 - I21 优化容量)                                     #> `
+  <# 验证: dim=320, depth=12, heads=8 → P ≈ 20M                             #> `
+  <# dim_head = dim / heads = 320 / 8 = 40                                   #> `
   <# ====================================================================== #> `
-  --dim 256 `
-  --depth 8 `
+  --dim 320 `
+  --depth 12 `
   --heads 8 `
-  --dim-head 32 `
+  --dim-head 40 `
   --max-level 3 `
   --pool cls `
   --ffn-type swiglu_level `
@@ -85,22 +87,24 @@ uv run python examples/training/train_fractal_vit.py `
   <# ====================================================================== #> `
   <# Scheme D: GumbelTopKSplitter 配置                                      #> `
   <#   num_scales=4 → max_depth=3 → 候选数=85                               #> `
-  <#   splitter_token_budget=48 (目标 token 数)                             #> `
+  <#   target_tokens=48 (期望 token 数, 压缩比 ~5:1)                         #> `
+  <#   I21 深度平衡: 自动启用 (constants.py 默认值)                          #> `
   <# ====================================================================== #> `
   --tokenizer-type streaming_v3 `
   --num-scales 4 `
-  --splitter-token-budget 48 `
-  --split-tau0 0.0 `
-  --split-gamma 0.7 `
+  --target-tokens 48 `
+  --split-gamma 0.85 `
   --enforce-balance `
   `
   <# ====================================================================== #> `
   <# 训练配置 (batch_size=192 最大化 GPU 利用率)                            #> `
   <#   lr = 1.2e-3 (线性缩放 + 保守调整 0.8×)                               #> `
   <# ====================================================================== #> `
+  <# 学习率: lr = 5e-4 × (192/256) = 3.75e-4                                #> `
+  <# ====================================================================== #> `
   --batch-size 192 `
   --num-workers 4 `
-  --lr 1.2e-3 `
+  --lr 3.75e-4 `
   --weight-decay 0.05 `
   --warmup-epochs 10 `
   `
@@ -120,27 +124,29 @@ uv run python examples/training/train_fractal_vit.py `
   --mixup-prob 0.5 `
   `
   <# ====================================================================== #> `
-  <# P10 辅助损失 (推荐启用)                                                #> `
-  <#   Soft Entropy: 最大化尺度多样性 (防止崩塌)                             #> `
-  <#   Elastic Budget: Dead Zone [24, 80] 内零惩罚 (在85候选内)             #> `
+  <# 辅助损失配置                                                           #> `
+  <#   Soft Entropy: 最大化尺度多样性                                        #> `
+  <#   Elastic Budget: Dead Zone [24, 96] 内零惩罚                           #> `
+  <#   I21 Depth KL: 自动启用 (DEPTH_KL_WEIGHT=0.1)                          #> `
   <# ====================================================================== #> `
   --include-soft-entropy `
   --soft-entropy-mode maximize `
   --soft-entropy-weight 0.1 `
   --include-elastic-budget `
   --elastic-N-min 24 `
-  --elastic-N-max 80 `
+  --elastic-N-max 96 `
   --elastic-lambda-over 0.1 `
   --elastic-lambda-under 0.01 `
   --elastic-lambda-collapse 1.0 `
   `
   <# ====================================================================== #> `
-  <# Splitter 温度退火 (I18-2 安全下界 T_end=0.3)                           #> `
-  <#   数学公式: T(t) = T_start · (T_end / T_start)^(t / total)             #> `
+  <# Splitter 温度退火 (P10-11 安全下界 T_end=0.3)                          #> `
+  <#   公式: T(t) = T_start × (T_end / T_start)^(t / S_post)                #> `
+  <#   Warmup=5 epochs 期间固定 T=T_start                                   #> `
   <# ====================================================================== #> `
   --splitter-temp-start 1.0 `
   --splitter-temp-end 0.3 `
-  --splitter-temp-warmup 10 `
+  --splitter-temp-warmup 5 `
   `
   <# ====================================================================== #> `
   <# 性能优化 (4070 Laptop 最大化)                                          #> `
@@ -161,4 +167,5 @@ uv run python examples/training/train_fractal_vit.py `
   <# ====================================================================== #> `
   --patience 15 `
   --min-delta 0.001 `
-  --exp-name tiny_imagenet_4070_schemeD_256d_8l_bs192
+  --progressive-aug `
+  --exp-name tiny_imagenet_i21_320d_12l_bs192

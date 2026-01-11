@@ -76,20 +76,20 @@ I13 数学形式化全面审查 (2026-01-03)
    - 公式: p_d = σ((0.0 - τ_d) / T) = σ(-τ_d / T)
    - 效果: 当 τ_d = 0 时，p_d = 0.5 (正确的最大不确定性)
 
-I14 分割器初始化健壮性 (2026-01-03)
------------------------------------
-解决 warmup 阶段强制分割与梯度稳定性问题:
+I14 分割器初始化健壮性 (2026-01-03) [Scheme D 不适用]
+-----------------------------------------------------
+注: 以下 API 是为 Scheme A (LearnableSplitter) 设计的。
+Scheme D (GumbelTopKSplitter) 通过 Top-K 硬约束自动保证 token 数量，
+因此不需要 warmup_forced_split 机制。训练器不再调用这些 API。
 
-1. I14-1 A1: Warmup 强制分割
-   - enable_warmup_forced_split(steps) API
-   - 前 N 步内强制至少 70% 区域分割，消除 Gumbel 随机性死锁
+1. I14-1 A1: [已移除] Warmup 强制分割
+   - GumbelTopKSplitter 的 Top-K 硬约束已消除死锁风险
    
-2. I14-1 D1: 弹性预算崩溃惩罚
+2. I14-1 D1: 弹性预算崩溃惩罚 (仍适用)
    - 当 actual_tokens < 2 时触发强惩罚
    - 公式: L_collapse = λ_collapse · 𝟙[N_actual < 2]
-   - 软版本: L_soft_collapse = λ · 0.1 · softplus(2 - N)
    - 参数: --elastic-lambda-collapse (默认 1.0)
-   - API: get_auxiliary_losses() 现在正确传递 actual_token_count
+   - API: get_auxiliary_losses() 传递 actual_token_count
 
 P11 数学形式化审查 (2025-12-30)
 --------------------------------
@@ -2805,58 +2805,31 @@ def main():
         
         # 启用探索偏置退火 (P10-12 + P10-15)
         # P10-15 修复: 偏置退火与温度退火同步，延迟到 warmup 后开始
-        # 数学形式化:
-        #   warmup 期间: b = b_warmup = 0.6 (固定高探索偏置)
-        #   post-warmup: b(t) = b_warmup + (b_end - b_warmup) · progress
-        #   与温度退火同步，使 b 和 T 同时衰减，避免时序失配
+        # 
+        # 遵循模型架构默认值:
+        #   - b_start, b_end 使用 GumbelTopKSplitter.enable_explore_bias_annealing() 的默认参数
+        #   - 训练器只传递必需的 total_steps
         if hasattr(splitter, 'enable_explore_bias_annealing'):
             splitter.enable_explore_bias_annealing(
                 total_steps=post_warmup_steps,  # P10-15: 与温度退火同步
-                b_start=0.6,  # P10-15: 提高初始偏置 (warmup 期间固定)
-                b_end=0.0,    # 终态: 纯 MLP 决策
+                # b_start/b_end 使用模型默认值 (0.5 → 0.0)
             )
-            print(f"[OK] 启用 P10-12/P10-15 探索偏置退火:")
-            print(f"     Bias: 0.6 → 0.0")
+            print(f"[OK] 启用探索偏置退火 (使用模型默认参数)")
             print(f"     Steps: {post_warmup_steps} (与温度退火同步)")
-            print(f"     目的: 防止训练初期 avg_tokens=1 的'鸡生蛋'死锁")
             splitter_annealing_enabled = True
         
-        # I14-1 修复 (A1): 启用 Warmup 强制分割
-        # 数学形式化:
-        #   问题: Gumbel 噪声随机性可能导致即使 p_split=0.7，实际决策
-        #         仍然是"不分割"。一旦所有样本都碰巧选择"不分割"，形成死锁。
-        #   解决: 在 warmup 期间强制至少 ratio 比例的区域分割
-        #   公式: forced_split_count = ceil(M * current_ratio)
-        #   
-        # 与 explore_bias 的区别:
-        #   - explore_bias: 概率偏置，仍受 Gumbel 随机性影响
-        #   - warmup_forced_split: 后采样硬约束，完全消除随机性风险
-        if hasattr(splitter, 'enable_warmup_forced_split'):
-            warmup_steps = config.splitter_temp_warmup * batches_per_epoch
-            splitter.enable_warmup_forced_split(
-                total_steps=warmup_steps,
-                ratio_start=0.7,  # 初始强制 70% 分割
-                ratio_end=0.3,    # 结束时强制 30% 分割
-            )
-            print(f"[OK] 启用 I14-1 A1 Warmup 强制分割:")
-            print(f"     Ratio: 0.7 → 0.3")
-            print(f"     Steps: {warmup_steps} (warmup 期间)")
-            print(f"     目的: 消除 Gumbel 随机性导致的训练死锁")
-            splitter_annealing_enabled = True
-        
-        # 配置深度偏置 (P10-16: 根节点单点失效保护)
-        # 数学形式化:
-        #   Δb_d = β · γ^d
-        #   β=1.0: 根节点获得最大偏置保护
-        #   γ=0.5: 每深入一层偏置减半
-        #   计算验证: P(root split) > 0.7 即使在终态
-        if hasattr(splitter, 'set_depth_bias'):
-            splitter.set_depth_bias(beta=1.0, gamma=0.5)
-            depth_info = splitter.get_depth_bias_info()
-            print(f"[OK] 启用 P10-16 深度偏置保护:")
-            print(f"     公式: {depth_info['formula']}")
-            print(f"     根节点偏置: Δb_0 = {depth_info['depth_biases']['depth_0']:.2f}")
-            print(f"     深度1偏置: Δb_1 = {depth_info['depth_biases']['depth_1']:.2f}")
+        # =====================================================================
+        # I21 深度平衡机制
+        # =====================================================================
+        # GumbelTopKSplitter (Scheme D) 默认启用以下深度平衡组件:
+        #   - β: Log-Compensation Bias (LOG_COMPENSATION_ENABLED=True)
+        #   - δ: Subset Softmax (SUBSET_SOFTMAX_ENABLED=True)  
+        #   - ε: Depth KL Loss (DEPTH_KL_WEIGHT=0.1)
+        #
+        # 这些是模型架构的内部设计，遵循 constants.py 中的默认值。
+        # 训练器不应硬编码覆盖这些参数。
+        # 如需调整，请修改 constants.py 或通过模型初始化参数传递。
+        # =====================================================================
     
     if not splitter_annealing_enabled:
         print(f"[INFO] 自适应分割器退火未启用 (不支持或未使用可学习分割器)")
@@ -2874,19 +2847,18 @@ def main():
         # P7-7 + P10-15: 温度退火和偏置退火调度 (同步控制)
         # 说明: 温度退火已在训练开始前通过 enable_temperature_annealing() 启用
         #       在 forward() 中自动更新，无需手动调用 scheduler.step()
-        #       但 warmup 期间需要禁用退火，保持 T_start 和 b_warmup
+        #       但 warmup 期间需要禁用退火，保持 T_start
         if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
             splitter = model.tokenizer.splitter
             if epoch <= config.splitter_temp_warmup:
-                # Warmup 阶段：暂时禁用自动退火，固定 T_start 和 b_warmup
+                # Warmup 阶段：暂时禁用自动退火，固定 T_start
                 if hasattr(splitter, 'disable_temperature_annealing'):
                     splitter.disable_temperature_annealing()
                     splitter.set_temperature(config.splitter_temp_start)
-                # P10-15: 偏置退火也在 warmup 期间禁用，固定高探索偏置
+                # 偏置退火也在 warmup 期间禁用 (使用模型初始值)
                 if hasattr(splitter, 'disable_explore_bias_annealing'):
                     splitter.disable_explore_bias_annealing()
-                    if hasattr(splitter.complexity_mlp, 'set_explore_bias'):
-                        splitter.complexity_mlp.set_explore_bias(0.6)  # warmup 期间固定偏置
+                    # 注意: 不再硬编码偏置值，使用模型的初始 explore_bias (默认 0.5)
             elif epoch == config.splitter_temp_warmup + 1:
                 # Warmup 结束：重新启用温度退火和偏置退火
                 post_warmup_steps = max(1, (config.epochs - config.splitter_temp_warmup) * (len(train_loader) // config.accum_steps))
@@ -2899,12 +2871,11 @@ def main():
                         T_end=config.splitter_temp_end,
                         schedule='exponential',
                     )
-                # P10-15: 同步启用偏置退火
+                # P10-15: 同步启用偏置退火 (使用模型默认参数)
                 if hasattr(splitter, 'enable_explore_bias_annealing'):
                     splitter.enable_explore_bias_annealing(
                         total_steps=post_warmup_steps,
-                        b_start=0.6,
-                        b_end=0.0,
+                        # b_start/b_end 使用模型默认值
                     )
                 print(f"[INFO] Epoch {epoch}: 温度退火和偏置退火正式开始 (warmup 结束)")
         

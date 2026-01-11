@@ -92,6 +92,26 @@ from .config import (
     auto_save_figure,
 )
 
+# 分层可视化基础模块 (与 LayeredEvaluator 对齐)
+from .base import (
+    FigureConfig,
+    VisualizationResult,
+    VisualizationLayer,
+    create_gridspec_layout,
+    truncate_labels,
+    compute_entropy,
+    format_large_number,
+)
+
+# 分层可视化器
+from .layer_classification import L1ClassificationVisualizer
+from .layer_tokenizer import L2TokenizerVisualizer
+from .layer_attention import L3AttentionVisualizer
+from .layer_representation import L4RepresentationVisualizer
+from .layer_efficiency import L5EfficiencyVisualizer
+from .layer_stability import L6StabilityVisualizer
+from .layered_visualizer import LayeredVisualizer, LayeredVisualizationReport
+
 __all__ = [
     # Class metrics
     "plot_per_class_accuracy",
@@ -108,8 +128,25 @@ __all__ = [
     "plot_memory_curve",
     "plot_resource_budget_comparison",
     "plot_training_curves",
-    # Config & Utils
+    # Config & Utils (legacy)
     "VisualizationConfig",
     "ExperimentVisualizer",
     "auto_save_figure",
+    # Layered Visualization Base (new)
+    "FigureConfig",
+    "VisualizationResult",
+    "VisualizationLayer",
+    "create_gridspec_layout",
+    "truncate_labels",
+    "compute_entropy",
+    "format_large_number",
+    # Layered Visualizers (new)
+    "L1ClassificationVisualizer",
+    "L2TokenizerVisualizer",
+    "L3AttentionVisualizer",
+    "L4RepresentationVisualizer",
+    "L5EfficiencyVisualizer",
+    "L6StabilityVisualizer",
+    "LayeredVisualizer",
+    "LayeredVisualizationReport",
 ]
