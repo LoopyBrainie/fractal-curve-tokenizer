@@ -110,6 +110,23 @@ PROB_EPSILON: float = 1e-8
 #: 验证见: workspace/ste_gradient_analysis.py
 TEMPERATURE_MIN: float = 0.1
 
+# ==================== 深度平衡常量 (I21) ====================
+# 数学分析: 解决深度分布崩溃问题
+# 问题: 候选数量不平衡 (d=0:1, d=1:4, d=2:16, d=3:64) 导致 Top-K 偏向 depth=3
+
+#: Log-Compensation 是否启用
+#: 数学: b_d = log(N_total / N_d) 实现期望均衡
+LOG_COMPENSATION_ENABLED: bool = True
+
+#: Depth KL 正则化损失权重
+#: 数学: L_depth = λ × D_KL(π_depth || Uniform)
+#: 目标: 鼓励选中 token 的深度分布趋向均匀
+DEPTH_KL_WEIGHT: float = 0.1
+
+#: Subset Softmax 是否启用
+#: 数学: 将 STE softmax 从 N=85 缩小到 K=32，梯度增强 ~2.7x
+SUBSET_SOFTMAX_ENABLED: bool = True
+
 # ==================== 信息长度相关常量 ====================
 
 #: levels_info 的最小长度

@@ -14,7 +14,13 @@
 
 决策公式:
     1. 并行评估所有 N=85 个候选区域:
-       logits_i = MLP(ROI_i) + b_explore + β·γ^{d_i} - τ_{d_i}
+       logits_i = MLP(ROI_i) + b_explore + b_log_d + β·γ^{d_i} - τ_{d_i}
+       
+       I21 深度平衡: b_log_d = log(N_total / N_d) 补偿候选数量不平衡
+           depth=0: b_log = log(85/1)  = 4.44
+           depth=1: b_log = log(85/4)  = 3.06
+           depth=2: b_log = log(85/16) = 1.67
+           depth=3: b_log = log(85/64) = 0.28
        
     2. Gumbel 扰动:
        g_i ~ Gumbel(0, 1)
@@ -67,7 +73,15 @@ import torch.nn.functional as F
 from torch import Tensor
 
 # I12-7: 从 constants 统一导入数值稳定性常量
-from .constants import TEMPERATURE_MIN, GUMBEL_EPSILON, PROB_EPSILON
+# I21: 导入深度平衡常量
+from .constants import (
+    TEMPERATURE_MIN, 
+    GUMBEL_EPSILON, 
+    PROB_EPSILON,
+    LOG_COMPENSATION_ENABLED,
+    DEPTH_KL_WEIGHT,
+    SUBSET_SOFTMAX_ENABLED,
+)
 
 
 @dataclass
@@ -214,6 +228,12 @@ class GumbelTopKSplitter(nn.Module):
         self.register_buffer('depth_bias_beta', torch.tensor(0.5))
         self.register_buffer('depth_bias_gamma', torch.tensor(0.7))
         
+        # ====================================================================
+        # I21: Log-Compensation Bias (β方案)
+        # 数学: b_log_d = log(N_total / N_d) 补偿候选数量不平衡
+        # ====================================================================
+        self._precompute_log_compensation_bias()
+        
         # 统计信息
         self.register_buffer('_avg_selected', torch.tensor(16.0))
         
@@ -357,6 +377,65 @@ class GumbelTopKSplitter(nn.Module):
         # 转回 GPU
         self._children_matrix = torch.from_numpy(children_matrix_cpu).to(device)
     
+    def _precompute_log_compensation_bias(self):
+        """
+        预计算 Log-Compensation Bias (I21 β方案)。
+        
+        数学形式化
+        ==========
+        
+        问题: 候选数量不平衡导致 Top-K 偏向高深度
+            depth=0: N_0=1   (1.2%)
+            depth=1: N_1=4   (4.7%)
+            depth=2: N_2=16  (18.8%)
+            depth=3: N_3=64  (75.3%)
+            
+        解决方案: Log-Compensation Bias
+            b_d^{log} = log(N_total / N_d)
+            
+        效果: 期望上每个深度被选中的概率相等
+            E[π_d] = N_d × softmax(z + b_d^{log})
+                   = N_d × exp(b_d^{log}) / Σ N_k exp(b_k^{log})
+                   = N_d × (N_total/N_d) / Σ N_k (N_total/N_k)
+                   = N_total / (D+1) × N_total  # 每个深度贡献相等
+                   
+        推导验证:
+            Σ_d N_d × exp(log(N_total/N_d)) = Σ_d N_d × (N_total/N_d)
+                                            = Σ_d N_total
+                                            = (D+1) × N_total
+        """
+        # 计算每个深度的候选数量
+        N_total = self.num_candidates
+        counts_per_depth = []
+        
+        for d in range(self.max_depth + 1):
+            N_d = 4 ** d  # depth d 有 4^d 个候选
+            counts_per_depth.append(N_d)
+        
+        # 计算 log-compensation bias: b_d = log(N_total / N_d)
+        log_comp_per_depth = []
+        for d, N_d in enumerate(counts_per_depth):
+            b_d = math.log(N_total / N_d)
+            log_comp_per_depth.append(b_d)
+        
+        # 扩展为每个候选的偏置 [N]
+        log_comp_bias = []
+        for d in range(self.max_depth + 1):
+            N_d = counts_per_depth[d]
+            b_d = log_comp_per_depth[d]
+            log_comp_bias.extend([b_d] * N_d)
+        
+        # 注册为 buffer
+        self.register_buffer(
+            'log_compensation_bias',
+            torch.tensor(log_comp_bias, dtype=torch.float32)
+        )
+        
+        # 打印诊断信息 (仅在初始化时)
+        if not hasattr(self, '_log_comp_initialized'):
+            self._log_comp_initialized = True
+            # 静默初始化，不打印
+
     @property
     def current_temperature(self) -> float:
         """当前温度 τ > 0。
@@ -447,8 +526,9 @@ class GumbelTopKSplitter(nn.Module):
             consistent_mask, topk_indices, logits, probs
         )
         
-        # 缓存 probs 用于辅助损失计算
+        # 缓存 probs 和 selected_mask 用于辅助损失计算
         self._last_probs = probs
+        self._last_selected_mask = consistent_mask  # I21: 用于 Depth KL Loss
         
         # 更新统计
         with torch.no_grad():
@@ -515,14 +595,25 @@ class GumbelTopKSplitter(nn.Module):
         # 固定深度偏置 (可选，用于平滑过渡)
         depth_bias_fixed = self.depth_bias_beta * (self.depth_bias_gamma ** depths.float())
         
+        # ====================================================================
+        # I21 β: Log-Compensation Bias
+        # 数学: b_log_d = log(N_total / N_d) 补偿候选数量不平衡
+        # 效果: 使每个深度被选中的期望概率相等
+        # ====================================================================
+        if LOG_COMPENSATION_ENABLED:
+            log_comp = self.log_compensation_bias  # [N]
+        else:
+            log_comp = torch.zeros(N, device=device, dtype=dtype)
+        
         # 阈值
         taus = self.thresholds[depths]  # [N]
         
         # 总 logits
-        # logits = z + depth_bias + explore_bias - tau
+        # logits = z + depth_bias + log_compensation + explore_bias - tau
         logits = (complexity_logits 
                   + depth_bias_learned.unsqueeze(0)
                   + depth_bias_fixed.unsqueeze(0)
+                  + log_comp.unsqueeze(0)  # I21: Log-Compensation
                   + self.explore_bias
                   - taus.unsqueeze(0))
         
@@ -575,6 +666,20 @@ class GumbelTopKSplitter(nn.Module):
             3. selected = TopK(perturbed, K)
             4. STE: hard_mask - softmax.detach() + softmax
             
+        I21 δ: Subset Softmax 改进
+        =========================
+        问题: 全局 softmax(N=85) 导致梯度稀释 ~1/85
+        解决: 在 Top-K 选中的子集上计算 softmax，梯度增强到 ~1/K
+        
+        数学推导:
+            原始: soft_mask = softmax(perturbed)  # [B, N], 每个元素 ≈ 1/N
+            改进: soft_mask[topk] = softmax(perturbed[topk])  # ~1/K >> 1/N
+            
+        梯度增强: 
+            原始梯度: ∂L/∂z_i ≈ 1/N × ∂L/∂mask_i
+            改进梯度: ∂L/∂z_i ≈ 1/K × ∂L/∂mask_i  (对选中的 K 个)
+            增强比例: N/K = 85/32 ≈ 2.7x
+            
         Args:
             logits: [B, N] 候选 logits
             K: 选择数量
@@ -618,8 +723,22 @@ class GumbelTopKSplitter(nn.Module):
         hard_mask = torch.zeros(B, N, device=device, dtype=torch.float32)
         hard_mask.scatter_(1, topk_indices, 1.0)
         
-        # 软掩码 (用于 STE 梯度)
-        soft_mask = F.softmax(perturbed, dim=1)
+        # ====================================================================
+        # I21 δ: Subset Softmax
+        # 在 Top-K 子集上计算 softmax，而非全局 N=85
+        # 梯度增强: 1/N → 1/K (约 2.7x)
+        # ====================================================================
+        if SUBSET_SOFTMAX_ENABLED:
+            # 方法: 在 topk_indices 对应的子集上计算 softmax
+            # topk_vals: [B, K] 已经是选中位置的 perturbed 值
+            subset_softmax = F.softmax(topk_vals, dim=1)  # [B, K]
+            
+            # 将子集 softmax 散布回完整 [B, N] 张量
+            soft_mask = torch.zeros(B, N, device=device, dtype=torch.float32)
+            soft_mask.scatter_(1, topk_indices, subset_softmax)
+        else:
+            # 原始全局 softmax
+            soft_mask = F.softmax(perturbed, dim=1)
         
         # STE: 前向用硬掩码，反向用软掩码的梯度
         st_mask = hard_mask - soft_mask.detach() + soft_mask
@@ -844,8 +963,9 @@ class GumbelTopKSplitter(nn.Module):
         device = self.candidate_regions.device
         losses = {}
         
-        # 获取 cached probs
+        # 获取 cached probs 和 selected_mask
         probs = self._last_probs if hasattr(self, '_last_probs') else None
+        selected_mask = self._last_selected_mask if hasattr(self, '_last_selected_mask') else None
         
         # 1. Elastic Budget Loss
         if include_elastic_budget:
@@ -892,6 +1012,17 @@ class GumbelTopKSplitter(nn.Module):
                 entropy_loss = entropy_weight * (current_entropy - entropy_target).pow(2)
             
             losses['soft_entropy_loss'] = entropy_loss
+        
+        # ====================================================================
+        # I21 ε: Depth KL Regularization Loss
+        # 鼓励选中 token 的深度分布趋向均匀
+        # ====================================================================
+        if selected_mask is not None and DEPTH_KL_WEIGHT > 0:
+            depth_kl_loss = self.get_depth_kl_loss(
+                selected_mask=selected_mask,
+                weight=DEPTH_KL_WEIGHT,
+            )
+            losses['depth_kl_loss'] = depth_kl_loss
         
         return losses
     
@@ -960,6 +1091,86 @@ class GumbelTopKSplitter(nn.Module):
         
         # 最大化熵 → 最小化负熵
         loss = -weight * entropy
+        return loss
+    
+    def get_depth_kl_loss(
+        self,
+        selected_mask: Optional[Tensor] = None,
+        weight: float = DEPTH_KL_WEIGHT,
+    ) -> Tensor:
+        """
+        计算深度 KL 散度正则化损失 (I21 ε方案)。
+        
+        数学形式化
+        ==========
+        
+        问题: 选中 token 的深度分布 π_d 崩溃到单一深度
+        目标: 鼓励 π_d 趋向均匀分布 U(D+1)
+        
+        定义:
+            π_d = Σ_{i: depth(i)=d} mask_i / Σ_i mask_i
+                = (该深度选中数量) / (总选中数量)
+                
+            U_d = 1 / (D+1)  均匀分布
+            
+        KL 散度:
+            D_KL(π || U) = Σ_d π_d log(π_d / U_d)
+                         = Σ_d π_d log(π_d) + log(D+1)
+                         = -H(π) + log(D+1)
+                         
+        损失:
+            L_depth = λ × D_KL(π || U)
+            
+        梯度流:
+            ∂L/∂mask_i = λ × (log(π_{d(i)}) + 1 - log(1/(D+1)))
+                       = λ × (log(π_{d(i)}) + 1 + log(D+1))
+                       
+        效果:
+            - 深度 d 过多选中 → π_d 高 → 梯度为正 → 降低该深度 logits
+            - 深度 d 选中不足 → π_d 低 → 梯度为负 → 提高该深度 logits
+        
+        Args:
+            selected_mask: [B, N] STE 选择掩码 (有梯度)
+            weight: KL 损失权重 (默认 DEPTH_KL_WEIGHT=0.1)
+            
+        Returns:
+            loss: 标量 KL 损失
+        """
+        if selected_mask is None:
+            return torch.tensor(0.0, device=self.candidate_regions.device)
+        
+        B, N = selected_mask.shape
+        device = selected_mask.device
+        depths = self.candidate_depths  # [N]
+        D = self.max_depth + 1  # 深度类别数
+        
+        # 计算每个深度的选中数量 (软计数，保持梯度)
+        # selected_mask: [B, N], 有梯度
+        depth_counts = []
+        for d in range(D):
+            mask_d = (depths == d).float()  # [N]
+            count_d = (selected_mask * mask_d.unsqueeze(0)).sum()  # 标量
+            depth_counts.append(count_d)
+        
+        depth_counts = torch.stack(depth_counts)  # [D]
+        total_count = depth_counts.sum()
+        
+        # 防止除零
+        total_count = total_count.clamp(min=PROB_EPSILON)
+        
+        # 深度分布 π_d
+        pi = depth_counts / total_count  # [D]
+        pi = pi.clamp(min=PROB_EPSILON)  # 数值稳定
+        
+        # 均匀分布
+        uniform = torch.ones(D, device=device) / D
+        
+        # KL 散度: D_KL(π || U) = Σ π_d log(π_d / U_d)
+        kl_div = (pi * (pi.log() - uniform.log())).sum()
+        
+        # 损失
+        loss = weight * kl_div
+        
         return loss
     
     # ========================================================================
