@@ -1383,6 +1383,14 @@ def train_epoch(
             print(f"\n[WARN] Label 范围异常: min={labels.min().item()}, max={labels.max().item()}, num_classes={num_classes}")
             continue
         
+        # I23-4-FIX: 检查输入图像是否包含 NaN/Inf
+        # 这可能由数据加载/增强导致，跳过有问题的 batch 避免 splitter_loss 变成 NaN
+        if torch.isnan(imgs).any() or torch.isinf(imgs).any():
+            nan_count_input = torch.isnan(imgs).sum().item()
+            inf_count_input = torch.isinf(imgs).sum().item()
+            print(f"\n[WARN] Batch {i}: 输入图像包含 NaN={nan_count_input}, Inf={inf_count_input}，跳过此 batch")
+            continue
+        
         # 应用 Mixup/CutMix
         mixed_labels: Optional[torch.Tensor] = None
         if use_mixup and mixup_fn is not None:
@@ -1683,6 +1691,11 @@ def evaluate(
         if channels_last:
             imgs = imgs.to(memory_format=torch.channels_last)
         labels = labels.to(device)
+        
+        # I23-4-FIX: 检查输入图像是否包含 NaN/Inf
+        if torch.isnan(imgs).any() or torch.isinf(imgs).any():
+            nan_batches += 1
+            continue
         
         with get_amp_context(device, use_amp):
             outs, _ = model(imgs, return_aux_info=True)

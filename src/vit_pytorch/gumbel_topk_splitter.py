@@ -1099,6 +1099,28 @@ class GumbelTopKSplitter(nn.Module):
         probs = self._last_probs if hasattr(self, '_last_probs') else None
         selected_mask = self._last_selected_mask if hasattr(self, '_last_selected_mask') else None
         
+        # I23-4-FIX: NaN 检测与防护
+        # 如果缓存的 probs 或 selected_mask 包含 NaN，返回零损失
+        # 这可能由上游输入包含 NaN 导致，应在训练脚本中处理根因
+        has_nan = False
+        if probs is not None and torch.isnan(probs).any():
+            has_nan = True
+        if selected_mask is not None and torch.isnan(selected_mask).any():
+            has_nan = True
+        
+        if has_nan:
+            # 返回零损失，避免 NaN 传播到总损失
+            zero = torch.tensor(0.0, device=device)
+            if include_elastic_budget:
+                losses['elastic_budget_loss'] = zero
+            if include_soft_entropy:
+                losses['soft_entropy_loss'] = zero
+            if DEPTH_KL_WEIGHT > 0:
+                losses['depth_kl_loss'] = zero
+            if DEPTH_QUOTA_ENABLED:
+                losses['quota_loss'] = zero
+            return losses
+        
         # 1. Elastic Budget Loss
         # I23-2 方案 B: 简化弹性惩罚
         # 硬下界修复后 (K = max(K, K_min))，avg_tokens >= K_min 恒成立
