@@ -105,6 +105,9 @@ class FractalCurveViT(nn.Module):
         # P6-2: LCA 温度配置
         lca_temperature: Optional[float] = 1.5,
         learnable_temperature: bool = True,
+        # I23-2: Token 数量约束
+        K_min: int = 8,
+        K_max: int = 64,
     ) -> None:
         """初始化 FractalCurveViT。
         
@@ -133,6 +136,8 @@ class FractalCurveViT(nn.Module):
                 - None: 不使用温度缩放 (兼容模式)
                 - float: 温度初始值
             learnable_temperature: (P6-2) 是否使温度可学习
+            K_min: (I23-2) GumbelTopKSplitter 最小 token 数量硬下界
+            K_max: (I23-2) GumbelTopKSplitter 最大 token 数量
         """
         super().__init__()
 
@@ -163,6 +168,8 @@ class FractalCurveViT(nn.Module):
                 d_model=dim,
                 base_patch_size=base_ps,
                 max_depth=max_depth_v3,
+                K_min=K_min,
+                K_max=K_max,
             )
         else:
             raise ValueError(f"Unknown tokenizer_type: {tokenizer_type}. Use 'streaming_v3'.")

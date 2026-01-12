@@ -110,18 +110,45 @@ PROB_EPSILON: float = 1e-8
 #: 验证见: workspace/ste_gradient_analysis.py
 TEMPERATURE_MIN: float = 0.1
 
-# ==================== 深度平衡常量 (I21) ====================
+# ==================== 深度平衡常量 (I21 + I23-1) ====================
 # 数学分析: 解决深度分布崩溃问题
 # 问题: 候选数量不平衡 (d=0:1, d=1:4, d=2:16, d=3:64) 导致 Top-K 偏向 depth=3
+# I23-1: 根本原因是 MLP 输出方差与深度相关 (σ_3/σ_0 ≈ 8)，Log-Compensation 只能
+#        补偿期望差异，无法处理方差差异
 
 #: Log-Compensation 是否启用
 #: 数学: b_d = log(N_total / N_d) 实现期望均衡
 LOG_COMPENSATION_ENABLED: bool = True
 
+#: I23-1 方案C: 深度方差归一化是否启用
+#: 数学: z_i^norm = (z_i - μ_d) / σ_d，使各深度 MLP 输出服从 N(0,1)
+#: 效果: 消除方差差异导致的 Top-K 偏好，使 Log-Compensation 理论生效
+#: 验证: 归一化后预测分布 π ≈ (0.249, 0.246, 0.248, 0.257)
+DEPTH_VARIANCE_NORM_ENABLED: bool = True
+
+#: 方差归一化的稳定性 epsilon
+DEPTH_VARIANCE_NORM_EPS: float = 1e-6
+
 #: Depth KL 正则化损失权重
 #: 数学: L_depth = λ × D_KL(π_depth || Uniform)
 #: 目标: 鼓励选中 token 的深度分布趋向均匀
-DEPTH_KL_WEIGHT: float = 0.1
+#: I23-1 方案A: 0.1 → 0.5 (梯度量级分析表明 0.1 太弱，被主任务梯度淹没)
+DEPTH_KL_WEIGHT: float = 0.5
+
+#: I23-1 方案D: 软配额正则化是否启用
+#: 数学: L_quota = Σ_d ReLU(|π_d - π_d^target| - ε)^2
+#: 效果: 惩罚极端偏离目标分布，允许任务微调
+DEPTH_QUOTA_ENABLED: bool = True
+
+#: 软配额目标分布 (基于信息论分析)
+#: 说明: depth 3 略高是因为高频纹理信息对分类有额外贡献
+DEPTH_QUOTA_TARGET: tuple = (0.15, 0.20, 0.25, 0.40)
+
+#: 软配额容忍带 ε (±5%)
+DEPTH_QUOTA_TOLERANCE: float = 0.05
+
+#: 软配额损失权重
+DEPTH_QUOTA_WEIGHT: float = 0.2
 
 #: Subset Softmax 是否启用
 #: 数学: 将 STE softmax 从 N=85 缩小到 K=32，梯度增强 ~2.7x

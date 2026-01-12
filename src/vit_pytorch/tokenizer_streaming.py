@@ -824,27 +824,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         if isinstance(self.splitter, GumbelTopKSplitter):
             return self.splitter.get_depth_entropy_loss()
         
-        # LearnableSplitter: 原有逻辑
-        if isinstance(self.splitter, LearnableSplitter):
-            # 构造 SplitResult 列表用于熵计算
-            from .split_adaptive import SplitResult, SplitToken, Region
-            results = []
-            for i, dist in enumerate(self._last_split_stats['depth_distributions']):
-                # 重建简化的 SplitResult
-                tokens = []
-                for depth, count in dist.items():
-                    for _ in range(count):
-                        tokens.append(SplitToken(
-                            region=Region(0, 0, 1, 1),  # 占位
-                            depth=depth,
-                            path=[],
-                            hilbert_idx=0,
-                            complexity=0.0,
-                        ))
-                results.append(SplitResult(tokens=tokens))
-            
-            return self.splitter.get_entropy_loss(results)
-        
+        # 其他分割器类型不支持
         return None
     
     def get_learnable_split_loss(
@@ -853,43 +833,22 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         lambda_budget: float = 0.01,
         target_tokens: int = 64,
     ) -> Optional[torch.Tensor]:
-        """获取可学习分割器的辅助损失.
+        """[DEPRECATED] 获取可学习分割器的辅助损失.
         
-        数学形式化:
-            L_split = λ₁ · L_entropy + λ₂ · L_budget + L_reg
-            
-        其中:
-            L_entropy = -H(depth_distribution)  # 鼓励多尺度
-            L_budget = ReLU(N - N_target)²      # 预算约束
-            L_reg = 阈值正则化                   # 防止坍塌
+        此方法仅适用于 LearnableSplitter (Scheme A)，已被 GumbelTopKSplitter 取代。
+        对于 GumbelTopKSplitter，请使用 splitter.get_auxiliary_losses() 代替。
         
-        Args:
-            lambda_entropy: 熵损失权重
-            lambda_budget: 预算损失权重  
-            target_tokens: 目标 token 数
-            
         Returns:
-            可微分的辅助损失 (用于多任务训练)
+            None (始终返回 None，不再支持 LearnableSplitter)
         """
-        if not self._use_learnable_split:
-            return None
-        
-        from .split_adaptive import LearnableSplitter
-        assert isinstance(self.splitter, LearnableSplitter)
-        
-        # 阈值正则化 (可微分)
-        reg_loss = self.splitter.get_threshold_regularization_loss()
-        
-        # 深度损失 (需要特征图)
-        if self._last_features is not None:
-            depth_loss = self.splitter.get_differentiable_depth_loss(
-                self._last_features, 
-                self.image_size,
-            )
-        else:
-            depth_loss = torch.tensor(0.0, device=reg_loss.device)
-        
-        return lambda_entropy * depth_loss + reg_loss
+        import warnings
+        warnings.warn(
+            "get_learnable_split_loss() is deprecated. "
+            "For GumbelTopKSplitter, use splitter.get_auxiliary_losses() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return None
     
     def get_scale_entropy(self) -> Optional[float]:
         """获取尺度分布熵值.
@@ -1065,14 +1024,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             stats['avg_tokens_per_image'] = avg_tokens
             stats['depth_entropy'] = self.get_scale_entropy()
         
-        # 获取分割器特定的统计信息
+        # 获取分割器特定的统计信息 (仅 GumbelTopKSplitter)
         if isinstance(self.splitter, GumbelTopKSplitter):
             stats['learnable_thresholds'] = self.splitter.thresholds.tolist()
             stats['learnable_temperature'] = self.splitter.current_temperature
-        elif isinstance(self.splitter, LearnableSplitter):
-            splitter_stats = self.splitter.get_split_statistics()
-            stats['learnable_thresholds'] = splitter_stats['thresholds'].tolist()
-            stats['learnable_temperature'] = splitter_stats['temperature'].item()
         
         return stats
     
@@ -1085,12 +1040,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         I20: 支持 LearnableSplitter 和 GumbelTopKSplitter 两种分割器。
         """
         if self._use_learnable_split:
-            from .split_adaptive import LearnableSplitter
             from .gumbel_topk_splitter import GumbelTopKSplitter
             
             if isinstance(self.splitter, GumbelTopKSplitter):
-                self.splitter.set_temperature(temperature)
-            elif isinstance(self.splitter, LearnableSplitter):
                 self.splitter.set_temperature(temperature)
     
     def reset_split_statistics(self) -> None:
@@ -1099,61 +1051,38 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         I20: 支持 LearnableSplitter 和 GumbelTopKSplitter 两种分割器。
         """
         if self._use_learnable_split:
-            from .split_adaptive import LearnableSplitter
-            from .gumbel_topk_splitter import GumbelTopKSplitter
-            
-            if isinstance(self.splitter, LearnableSplitter):
-                self.splitter.reset_statistics()
             # GumbelTopKSplitter 暂无 reset_statistics 方法
+            pass
     
     def get_temperature_scheduler(
         self,
         T_start: float = 1.0,
-        T_end: float = 0.3,  # P11-11: 0.1 → 0.3 安全下界
+        T_end: float = 0.3,
         schedule: str = 'exponential',
         warmup_steps: int = 0,
     ):
-        """获取温度退火调度器 (仅可学习分割器).
+        """[DEPRECATED] 获取温度退火调度器.
         
-        数学形式化:
-            T(t) = T_start · (T_end / T_start)^(t / total_steps)
-            
-        推荐参数 (P11-11 修复后):
-            T_start = 1.0: 探索充分，100% 样本有活跃梯度
-            T_end = 0.3:   决策确定性 51%，92% 样本有活跃梯度
-            
-            注意: T_end < 0.3 会导致训练后期梯度稀疏（当 z 分布偏移时）
-            
-        用法:
-            scheduler = tokenizer.get_temperature_scheduler()
-            scheduler.set_total_steps(epochs * steps_per_epoch)
-            
-            for step in training_loop:
-                loss = model(batch)
-                ...
-                scheduler.step()  # 自动更新温度
+        此方法仅适用于 LearnableSplitter (Scheme A)，已被 GumbelTopKSplitter 取代。
+        对于 GumbelTopKSplitter，温度退火应在训练循环中手动调用:
         
-        Args:
-            T_start: 初始温度 (默认 1.0)
-            T_end: 最终温度 (默认 0.3, P11-11 安全下界)
-            schedule: 调度策略 ('exponential', 'linear', 'cosine')
-            warmup_steps: 热身步数，期间保持 T_start
-            
-        Returns:
-            TemperatureScheduler 实例
-            
+            splitter.set_temperature(current_temp)
+            # 或使用 enable_temperature_annealing() API
+        
         Raises:
-            ValueError: 如果不是可学习分割器
+            DeprecationWarning: 此方法已弃用
         """
-        from .split_adaptive import LearnableSplitter, TemperatureScheduler
-        assert isinstance(self.splitter, LearnableSplitter)
-        
-        return TemperatureScheduler(
-            splitter=self.splitter,
-            T_start=T_start,
-            T_end=T_end,
-            schedule=schedule,
-            warmup_steps=warmup_steps,
+        import warnings
+        warnings.warn(
+            "get_temperature_scheduler() is deprecated. "
+            "For GumbelTopKSplitter, use splitter.enable_temperature_annealing() "
+            "or manual splitter.set_temperature() calls instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        raise NotImplementedError(
+            "Temperature scheduler is only available for LearnableSplitter. "
+            "Use GumbelTopKSplitter.enable_temperature_annealing() instead."
         )
 
     def get_multi_layer_depth_loss(
@@ -1165,71 +1094,26 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         target_entropy: float = 0.693,
         return_details: bool = False,
     ):
-        """获取多层可微分深度损失 (仅可学习分割器).
+        """[DEPRECATED] 获取多层可微分深度损失.
         
-        数学形式化:
-            L_multi = Σ_d w_d · (H_target - H̄_d)²
-            
-        为什么需要多层损失:
-            单层损失仅在根区域评估，深层阈值 τ₁, τ₂, τ₃... 无梯度信号。
-            多层损失在每层的规则网格评估，确保所有阈值可学习。
-            
-        梯度覆盖率 (β=0.5, D=3):
-            d=0: 51.6%, d=1: 25.8%, d=2: 12.9%, d=3: 6.5%
-            总覆盖: 96.8%
-            
-        用法:
-            loss, details = tokenizer.get_multi_layer_depth_loss(
-                features, image_size, return_details=True
-            )
-            
-            # TensorBoard 可视化
-            for d, (l, e, p) in enumerate(zip(
-                details['loss_per_depth'],
-                details['entropy_per_depth'], 
-                details['p_split_per_depth']
-            )):
-                writer.add_scalar(f'depth/loss_d{d}', l, step)
-                writer.add_scalar(f'depth/entropy_d{d}', e, step)
-                writer.add_scalar(f'depth/p_split_d{d}', p, step)
-                
-        Args:
-            features: [B, C, H', W'] 特征图
-            image_size: (H, W) 图像尺寸，默认使用 self.image_size
-            max_eval_depth: 最大评估深度 (默认 min(max_depth, 3))
-            weight_decay_factor: 权重衰减因子 β (默认 0.5)
-            target_entropy: 目标熵 (默认 0.693 = ln(2))
-            return_details: 是否返回各层详情
+        此方法仅适用于 LearnableSplitter (Scheme A)，已被 GumbelTopKSplitter 取代。
+        GumbelTopKSplitter 使用 I21 深度平衡机制 (log补偿 + KL正则) 替代此方法。
+        
+        对于 GumbelTopKSplitter，请使用:
+            - splitter.get_depth_kl_loss() 获取深度 KL 散度损失
+            - splitter.get_auxiliary_losses() 获取所有辅助损失
             
         Returns:
-            loss: 标量损失
-            details (if return_details): 各层损失详情字典
-            
-        Raises:
-            ValueError: 如果不是可学习分割器
+            (None, {}) 始终返回空值
         """
-        from .split_adaptive import LearnableSplitter
-        from .gumbel_topk_splitter import GumbelTopKSplitter
-        
-        # GumbelTopKSplitter 不使用多层深度损失机制
-        if isinstance(self.splitter, GumbelTopKSplitter):
-            if return_details:
-                return None, {}
-            return None
-        
-        if not isinstance(self.splitter, LearnableSplitter):
-            if return_details:
-                return None, {}
-            return None
-        
-        if image_size is None:
-            image_size = self.image_size
-        
-        return self.splitter.get_multi_layer_depth_loss(
-            features=features,
-            image_size=image_size,
-            max_eval_depth=max_eval_depth,
-            weight_decay_factor=weight_decay_factor,
-            target_entropy=target_entropy,
-            return_details=return_details,
+        import warnings
+        warnings.warn(
+            "get_multi_layer_depth_loss() is deprecated. "
+            "For GumbelTopKSplitter, use splitter.get_auxiliary_losses() instead.",
+            DeprecationWarning,
+            stacklevel=2,
         )
+        if return_details:
+            return None, {}
+        return None
+
