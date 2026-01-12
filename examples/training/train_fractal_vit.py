@@ -26,7 +26,7 @@
 
 分割方案 (Split Schemes)
 -------------------------
-默认使用 Scheme D (GumbelTopKSplitter)，Scheme A (LearnableSplitter) 为备用:
+使用 Scheme D (GumbelTopKSplitter) - 唯一支持的分割器:
 
 +------------------+----------------------------------+-------------------------+
 | 方案              | 数学描述                          | 特点                     |
@@ -34,14 +34,11 @@
 | Scheme D         | selected = TopK(logits + g, K)   | 端到端学习, 100%梯度覆盖 |
 | (GumbelTopK)     | 树一致性约束 + STE               | 硬 K 约束, 并行评估      |
 +------------------+----------------------------------+-------------------------+
-| Scheme A         | p_split = σ((C_θ(R) - τ_d) / T)  | 端到端学习分割           |
-| (Learnable)      | Gumbel-Softmax 可微分采样        | 软约束, BFS 串行        |
-+------------------+----------------------------------+-------------------------+
 
-Note: Scheme B/C 已移除。Scheme D 优势:
+Scheme D 优势:
 - 100% 梯度覆盖 (STE 使所有候选都有梯度)
 - 硬 K 约束 [K_min, K_max] 消除死锁风险
-- O(1) 并行评估所有候选 vs O(D) BFS
+- O(1) 并行评估所有候选
 - 树一致性向量化约束保证 Hilbert 100%
 
 P9 性能优化 (2025-12-28)
@@ -76,16 +73,12 @@ I13 数学形式化全面审查 (2026-01-03)
    - 公式: p_d = σ((0.0 - τ_d) / T) = σ(-τ_d / T)
    - 效果: 当 τ_d = 0 时，p_d = 0.5 (正确的最大不确定性)
 
-I14 分割器初始化健壮性 (2026-01-03) [Scheme D 不适用]
+I14 分割器稳定性 (2026-01-03)
 -----------------------------------------------------
-注: 以下 API 是为 Scheme A (LearnableSplitter) 设计的。
-Scheme D (GumbelTopKSplitter) 通过 Top-K 硬约束自动保证 token 数量，
-因此不需要 warmup_forced_split 机制。训练器不再调用这些 API。
-
-1. I14-1 A1: [已移除] Warmup 强制分割
-   - GumbelTopKSplitter 的 Top-K 硬约束已消除死锁风险
+GumbelTopKSplitter 通过 Top-K 硬约束自动保证 token 数量，
+无需 warmup_forced_split 机制。
    
-2. I14-1 D1: 弹性预算崩溃惩罚 (仍适用)
+弹性预算崩溃惩罚 (I14-1 D1):
    - 当 actual_tokens < 2 时触发强惩罚
    - 公式: L_collapse = λ_collapse · 𝟙[N_actual < 2]
    - 参数: --elastic-lambda-collapse (默认 1.0)
@@ -326,11 +319,9 @@ class TrainingConfig:
     # Tokenizer 配置 (V3 Variable Depth Tokens)
     tokenizer_type: str  # 'streaming_v3' (唯一支持)
     
-    # V3 高级分割参数 (Scheme D: GumbelTopKSplitter 默认)
-    target_tokens: Optional[int]  # 目标 token 数量
-    split_tau0: float  # 根节点阈值 τ₀
-    split_gamma: float  # 阈值衰减因子 γ
-    enforce_balance: bool  # 是否强制 2:1 平衡约束
+    # GumbelTopKSplitter (Scheme D) 参数
+    K_min: int  # 最小 token 数量 (硬下界约束)
+    K_max: int  # 最大 token 数量 (软上界约束)
     
     # P6-1: 深度缩放参数
     depth_scale_range: Optional[Tuple[float, float]]  # (σ_min, σ_max)，默认 (0.5, 2.0)
@@ -339,12 +330,7 @@ class TrainingConfig:
     lca_temperature: Optional[float]  # LCA 偏置温度，默认 1.5
     learnable_temperature: bool  # 是否可学习温度，默认 True
     
-    # P7-6: 可学习分割器训练参数
-    lambda_splitter_entropy: float  # 熵损失权重，鼓励尺度多样性
-    lambda_splitter_budget: float  # 预算约束权重
-    splitter_token_budget: int  # 目标 token 数预算
-    
-    # P7-7: 温度退火调度参数
+    # P7-7: GumbelTopKSplitter 温度退火调度参数
     splitter_temp_start: float  # 起始温度 T_start
     splitter_temp_end: float  # 终止温度 T_end
     splitter_temp_warmup: int  # Warmup epoch 数 (固定 T_start)
@@ -1493,7 +1479,6 @@ def train_epoch(
                     aux_losses = splitter.get_auxiliary_losses(
                         features=model.tokenizer._last_features,
                         image_size=(imgs.shape[2], imgs.shape[3]),
-                        include_balance=config.enforce_balance,
                         include_elastic_budget=config.include_elastic_budget,
                         include_soft_entropy=config.include_soft_entropy,
                         batch_size=imgs.shape[0],
@@ -1512,39 +1497,8 @@ def train_epoch(
                     # P11-8: 延迟 .item() 调用，避免每个 batch 的 GPU-CPU 同步
                     # 仅在需要显示时才调用
                     splitter_metrics = aux_losses  # 保留张量引用
-                    # 新版接口已包含 soft_entropy_loss，不需要旧版熵损失
+                    # GumbelTopKSplitter 的 get_auxiliary_losses 已包含所有必需损失
                     use_legacy_entropy = False
-                elif hasattr(model.tokenizer, 'get_learnable_split_loss'):
-                    # 后备：旧版接口
-                    splitter_loss = model.tokenizer.get_learnable_split_loss(
-                        lambda_entropy=config.lambda_splitter_entropy,
-                        lambda_budget=config.lambda_splitter_budget,
-                        target_tokens=config.splitter_token_budget,
-                    )
-                    use_legacy_entropy = True  # 旧版接口需要单独的熵损失
-                else:
-                    use_legacy_entropy = True  # 没有 splitter 接口，使用旧版熵损失
-            else:
-                use_legacy_entropy = True  # 没有 splitter，使用旧版熵损失
-            
-            # P15-FIX: 仅在使用旧版接口时才获取旧版熵损失
-            if use_legacy_entropy and hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_entropy_loss'):
-                entropy_loss = model.tokenizer.get_entropy_loss()
-            
-            # P8-3: 多层深度损失 (仅可学习分割器)
-            # 确保所有深度层级的阈值都收到梯度信号
-            multi_layer_loss = None
-            if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'get_multi_layer_depth_loss'):
-                try:
-                    multi_layer_loss = model.tokenizer.get_multi_layer_depth_loss(
-                        features=model.tokenizer._last_features,
-                        image_size=(imgs.shape[2], imgs.shape[3]),
-                        target_entropy=0.693,  # ln(2), 鼓励 50/50 分割概率
-                        weight_decay_factor=0.5,  # β=0.5, 深层权重衰减
-                    )
-                except (ValueError, AttributeError):
-                    # 非可学习分割器会抛出 ValueError
-                    pass
             
             # 组合损失 (在组合前检查每个损失项，并确保 dtype 一致)
             # P15-FIX: 在 AMP 混合精度训练中，不同损失可能有不同 dtype
@@ -1567,13 +1521,6 @@ def train_epoch(
                     splitter_loss = None  # 跳过该损失
                 else:
                     loss = loss + splitter_loss_f32 / config.accum_steps
-            if multi_layer_loss is not None:
-                multi_layer_loss_f32 = multi_layer_loss.float()
-                if torch.isnan(multi_layer_loss_f32) or torch.isinf(multi_layer_loss_f32):
-                    print(f"[WARN] multi_layer_loss 为 NaN/Inf, 跳过")
-                    multi_layer_loss = None  # 跳过该损失
-                else:
-                    loss = loss + 0.1 * multi_layer_loss_f32 / config.accum_steps  # λ_multi = 0.1
         
         # 检查 loss 是否为 NaN/Inf，并输出详细诊断信息
         if torch.isnan(loss) or torch.isinf(loss):
@@ -1591,7 +1538,6 @@ def train_epoch(
                     ce_loss=ce_loss * config.accum_steps,  # 还原真实值
                     entropy_loss=entropy_loss,
                     splitter_loss=splitter_loss,
-                    multi_layer_loss=multi_layer_loss,
                     log_file=exp_dir / "nan_inf_diagnose.log" if exp_dir else None,
                 )
                 print(report)
@@ -2221,16 +2167,11 @@ def main():
                        choices=["streaming_v3"],
                        help="Tokenizer type: streaming_v3 (Variable Depth Tokens, only supported)")
     
-    # V3 Tokenizer 高级参数 (Scheme D: GumbelTopKSplitter 默认)
-    parser.add_argument("--target-tokens", type=int, default=None,
-                       help="Target token count per image (None = adaptive)")
-    parser.add_argument("--split-tau0", type=float, default=0.15,
-                       help="Root threshold tau_0 for adaptive splitting")
-    parser.add_argument("--split-gamma", type=float, default=0.85,
-                       help="Threshold decay factor gamma in (0,1) per depth")
-    parser.add_argument("--enforce-balance", action="store_true", default=True,
-                       help="Enforce 2:1 balance constraint")
-    parser.add_argument("--no-enforce-balance", action="store_false", dest="enforce_balance")
+    # GumbelTopKSplitter (Scheme D) 参数
+    parser.add_argument("--K-min", type=int, default=16,
+                       help="Minimum token count (hard lower bound, default: 16)")
+    parser.add_argument("--K-max", type=int, default=64,
+                       help="Maximum token count (soft upper bound, default: 64)")
     
     # P6-1: 深度缩放参数
     parser.add_argument("--depth-scale-min", type=float, default=0.5,
@@ -2248,15 +2189,7 @@ def main():
     parser.add_argument("--fixed-lca-temperature", action="store_true",
                        help="Use fixed (non-learnable) LCA temperature")
     
-    # P7-6: 可学习分割器训练参数
-    parser.add_argument("--lambda-splitter-entropy", type=float, default=0.1,
-                       help="Learnable splitter entropy loss weight (default: 0.1)")
-    parser.add_argument("--lambda-splitter-budget", type=float, default=0.01,
-                       help="Learnable splitter budget constraint weight (default: 0.01)")
-    parser.add_argument("--splitter-token-budget", type=int, default=64,
-                       help="Target token budget for learnable splitter (default: 64)")
-    
-    # P7-7: 温度退火调度参数
+    # P7-7: GumbelTopKSplitter 温度退火调度参数
     # P10-11 更新: 将 T_end 默认值从 0.1 提升到 0.3，防止梯度消失
     # 参考: constants.py SPLITTER_TEMP_END = 0.3
     parser.add_argument("--splitter-temp-start", type=float, default=1.0,
@@ -2395,21 +2328,15 @@ def main():
         ffn_type=args.ffn_type,
         # Tokenizer 配置 (V3)
         tokenizer_type=args.tokenizer_type,
-        # V3 高级分割参数 (GumbelTopKSplitter 默认)
-        target_tokens=args.target_tokens,
-        split_tau0=args.split_tau0,
-        split_gamma=args.split_gamma,
-        enforce_balance=args.enforce_balance,
+        # GumbelTopKSplitter (Scheme D) 参数
+        K_min=args.K_min,
+        K_max=args.K_max,
         # P6-1: 深度缩放配置
         depth_scale_range=(args.depth_scale_min, args.depth_scale_max) if not args.no_learnable_depth_scale else None,
         # P6-2: LCA 温度配置
         lca_temperature=None if args.no_lca_temperature else args.lca_temperature,
         learnable_temperature=not args.fixed_lca_temperature,
-        # P7-6: 可学习分割器训练配置
-        lambda_splitter_entropy=args.lambda_splitter_entropy,
-        lambda_splitter_budget=args.lambda_splitter_budget,
-        splitter_token_budget=args.splitter_token_budget,
-        # P7-7: 温度退火调度配置
+        # P7-7: GumbelTopKSplitter 温度退火调度配置
         splitter_temp_start=args.splitter_temp_start,
         splitter_temp_end=args.splitter_temp_end,
         splitter_temp_warmup=args.splitter_temp_warmup,
@@ -2465,18 +2392,13 @@ def main():
         base_patch_size=4,
         max_depth=config.num_scales - 1,
         use_hilbert_order=True,
-        target_tokens=config.target_tokens,
-        enforce_balance=config.enforce_balance,
         # P6-1: 深度缩放配置
         depth_scale_range=config.depth_scale_range,
-        # 分割阈值参数 (gamma 控制阈值衰减)
-        gamma=config.split_gamma,
         # P7-7: 可学习分割器温度参数
         learnable_temperature=config.splitter_temp_start,
-        use_gumbel=True,  # 使用 Gumbel-Softmax 进行可微分采样
-        # I10-19: 连续松弛配置
-        use_continuous_relaxation=args.use_continuous_relaxation,
-        continuous_max_depth=args.continuous_max_depth,
+        # GumbelTopKSplitter (Scheme D) 参数
+        K_min=config.K_min,
+        K_max=config.K_max,
     )
     
     # 创建模型 (V3 Variable Depth Tokens)
@@ -2509,9 +2431,7 @@ def main():
     
     # 打印模型信息
     params = sum(p.numel() for p in model.parameters())
-    split_info = "GumbelTopKSplitter (Scheme D)"
-    if config.target_tokens:
-        split_info += f", target={config.target_tokens}"
+    split_info = f"GumbelTopKSplitter (K∈[{config.K_min}, {config.K_max}])"
     tokenizer_name = f'StreamingFractalTokenizerV3 ({split_info})'
     
     # P6-1/P6-2 信息
@@ -2766,9 +2686,9 @@ def main():
             print(f"  - Progressive Augmentation: 渐进式增强强度")
     
     # =========================================================================
-    # P7-7 / P10-12: 启用自适应分割器内置退火调度 (Scheme D 兼容)
+    # P7-7 / P10-12: 启用 GumbelTopKSplitter 内置退火调度
     # =========================================================================
-    # GumbelTopKSplitter 和 LearnableSplitter 均支持统一的退火 API:
+    # GumbelTopKSplitter 退火 API:
     #   - enable_temperature_annealing()
     #   - enable_explore_bias_annealing()
     #
@@ -2776,7 +2696,7 @@ def main():
     #   温度退火: T(t) = T_start · (T_end / T_start)^(t / total_steps)
     #   探索偏置: b(t) = b_start · (1 - t / total_steps)
     #
-    # Scheme D 特有:
+    # Scheme D 特性:
     #   - Top-K 硬约束保证 token 数量，偏置影响 *哪些* 被选中
     #   - STE 梯度仍依赖温度，退火保证梯度质量
     # =========================================================================

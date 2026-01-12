@@ -25,15 +25,15 @@
 # 3. 几何极限约束
 #    image_size=64, num_scales=4 → max_depth=3
 #    候选数: N = 1 + 4 + 16 + 64 = 85
-#    目标 token 数: target_tokens=48 (压缩比 ~5:1)
-#    弹性预算 Dead Zone: [24, 96]
+#    K_min=16, K_max=64 (token 数硬约束)
+#    弹性预算 Dead Zone: [16, 96]
 #
 # 4. 学习率缩放 (Linear Scaling Rule)
 #    lr = lr_base × (B / 256) = 5e-4 × (192/256) = 3.75e-4
 #
 # 5. 退火策略 (P10-11 验证)
 #    温度: T(t) = 1.0 × (0.3)^(t/S_post), T_end ≥ 0.3
-#    Warmup: 5 epochs
+#    Warmup: 10 epochs
 #
 # 6. VRAM 预算: ~3 GB << 8 GB ✓ (with AMP + Checkpoint)
 #
@@ -55,12 +55,12 @@ uv run python examples/training/train_fractal_vit.py \
   \
   `# === Scheme D: GumbelTopKSplitter 配置 ===` \
   `# num_scales=4 → max_depth=3 → 候选数=85` \
+  `# K_min=16, K_max=64 (token 数硬约束)` \
   `# I21 深度平衡: 自动启用 (constants.py)` \
   --tokenizer-type streaming_v3 \
   --num-scales 4 \
-  --target-tokens 48 \
-  --split-gamma 0.85 \
-  --enforce-balance \
+  --K-min 16 \
+  --K-max 64 \
   \
   `# === 学习率: lr = 5e-4 × (192/256) = 3.75e-4 ===` \
   --batch-size 192 \
@@ -83,13 +83,13 @@ uv run python examples/training/train_fractal_vit.py \
   \
   `# === 辅助损失配置 ===` \
   `# Soft Entropy: 最大化尺度多样性` \
-  `# Elastic Budget: Dead Zone [24, 96]` \
-  `# I21 Depth KL: 自动启用 (DEPTH_KL_WEIGHT=0.1)` \
+  `# Elastic Budget: Dead Zone [16, 96]` \
+  `# I21 Depth KL: 自动启用 (DEPTH_KL_WEIGHT=0.5)` \
   --include-soft-entropy \
   --soft-entropy-mode maximize \
   --soft-entropy-weight 0.1 \
   --include-elastic-budget \
-  --elastic-N-min 24 \
+  --elastic-N-min 16 \
   --elastic-N-max 96 \
   --elastic-lambda-over 0.1 \
   --elastic-lambda-under 0.01 \
@@ -97,9 +97,10 @@ uv run python examples/training/train_fractal_vit.py \
   \
   `# === Splitter 温度退火 (P10-11 安全下界) ===` \
   `# 公式: T(t) = T_start × (T_end / T_start)^(t / S_post)` \
+  `# Warmup=10 epochs 期间固定 T=T_start` \
   --splitter-temp-start 1.0 \
   --splitter-temp-end 0.3 \
-  --splitter-temp-warmup 5 \
+  --splitter-temp-warmup 10 \
   \
   `# === 性能优化 (4070 Laptop) ===` \
   --use-amp \
