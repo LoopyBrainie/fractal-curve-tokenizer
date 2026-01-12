@@ -381,3 +381,120 @@ scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[5])
 | `LowRankHilbertBias` | P11-8 死代码删除 | 2025-12-30 |
 | `HierarchicalHilbertBias` | P11-8 死代码删除 | 2025-12-30 |
 | `level_attention_bias` | P11-5 死代码删除 | 2025-12-30 |
+
+
+## 11.16 Training Performance (I9)
+
+| ID | Description | Result | Status |
+|:---|:------------|:-------|:-------|
+| I9 | Training speed bottleneck (24s/it) | **1.62s/it** (14.8x speedup) | ✓ Done |
+| I9-1 | Vectorized BFS & GPU structs | Eliminated CPU blocking | ✓ Done |
+| I9-2 | `TensorSplitResult` Implementation | Removed Python loops | ✓ Done |
+
+---
+
+## 11.17 Splitter Failure Analysis (I10)
+
+| ID | Issue | Root Cause | Resolution |
+|:---|:------|:-----------|:-----------|
+| I10 | Learnable splitter collapse | BFS serial dependency | Replaced by **Scheme D** |
+| I10-1 | No gradient flow | STE implementation error | Fixed in Scheme A |
+| I10-18 | BFS serial dependency | Architecture flaw | Parallel Evaluation |
+| I10-19 | Discrete-continuous mismatch | Quantization error | Continuous Relaxation |
+
+---
+
+## 11.18 Math Review (I11)
+
+> Status: All 18 issues resolved.
+
+| ID | Issue | Solution |
+|:---|:------|:---------|
+| I11-2 | LayerNorm Parameter Explosion | Dynamic Depth Embedding (92% reduction) |
+| I11-10 | ComplexityMLP range coupling | Removed output sigmoid |
+| I11-11 | Gumbel-Softmax low temp | Enforced T_end >= 0.3 |
+
+---
+
+## 11.19 Deep Math Review (I12)
+
+| ID | Issue | Severity | Status |
+|:---|:------|:---------|:-------|
+| I12-1 | Gumbel-Softmax double sampling | High | Verified Correct |
+| I12-2 | LCA irregular quadtree | Critical | Verified Correct |
+| I12-3 | Empty path data source | Critical | Fixed |
+
+---
+
+## 11.20 Comprehensive Review (I13)
+
+| ID | Component | Findings | Status |
+|:---|:----------|:---------|:-------|
+| I13-1 | FractalPositionEmbedding | Valid logic | Verified |
+| I13-2 | AttnHilbertBias | O(N) memory achieved | Verified |
+| I13-5 | FeedForwardNetwork | SwiGLU correctly implemented | Verified |
+
+---
+
+## 11.21 Experimental Verification (I14)
+
+| Experiment | Configuration | Result | Note |
+|:-----------|:--------------|:-------|:-----|
+| E4070 | Tiny-ImageNet, 384d, 12L | 50.74% Acc | Baseline |
+| E4071 | Scheme D Integration | Pending | **I14-5 Active** |
+
+---
+
+## 11.22 Training System Refactor (I15)
+
+| Module | Change | Benefit |
+|:-------|:-------|:--------|
+| `examples/training` | Modular design | Separation of concerns |
+| `Trainer` class | Hydra config integration | Reproducibility |
+| Logging | TensorBoard + JSONL | Detailed analytics |
+
+---
+
+## 11.23 Collapse Root Cause (I16)
+
+**Diagnosis**: The combination of **Rapid Temperature Annealing** (T < 0.1) and **Unconstrained Threshold Learning** allowed thresholds to grow unchecked, while the **Serial BFS** prevented deep gradients from correcting the behavior.
+
+**Resolution**: Abandoned Scheme A (BFS) in favor of Scheme D (Gumbel Top-K).
+
+---
+
+## 11.24 End-to-End Refactor (I17)
+
+All items in I17 (End-to-End Learnable Splitter) have been subsumed by **Scheme D** implementation.
+
+---
+
+## 11.25 Code Critique (I18)
+
+| ID | Issue | Solution |
+|:---|:------|:---------|
+| I18-1 | Soft Entropy gradient block | Use cached MLP probabilities |
+| I18-2 | Temperature unsafe lower bound | Force `TEMPERATURE_MIN = 0.1` |
+| I18-5 | Temperature learning constraint | Added clamp to learner |
+
+---
+
+## 11.26 Scheme D: Gumbel-Top-K (I19)
+
+**Concept**: Select exactly $K$ tokens from $N$ candidates using Gumbel-Top-K trick.
+**Key Advantage**: 100% Gradient Coverage (all regions receive gradients via softmax-STE) + 100% Hilbert Locality (unlike continuous relaxation).
+
+| Feature | Implementation | Status |
+|:--------|:---------------|:-------|
+| Logic | `GumbelTopKSplitter` | ✓ Done |
+| Math | $mask = \mathbb{1}_{TopK} - \sigma(z).detach() + \sigma(z)$ | ✓ Verified |
+| Tree | $parent 
+otin selected$ | ✓ Enforced |
+
+---
+
+## 11.27 Final Analysis (I20)
+
+**Conclusion**: Scheme D represents the mathematically correct solution to the adaptive tokenization problem, solving the "Serial Dependency" and "Gradient Sparsity" problems of Scheme A while maintaining the geometric properties that Scheme B lost.
+
+> **Status**: Scheme D is now the default tokenizer strategy.
