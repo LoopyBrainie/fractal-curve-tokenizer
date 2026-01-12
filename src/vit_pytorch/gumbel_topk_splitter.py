@@ -1383,8 +1383,22 @@ class GumbelTopKSplitter(nn.Module):
         total_count = depth_counts.sum().clamp(min=PROB_EPSILON)
         pi = depth_counts / total_count  # [D]
         
-        # 目标分布
-        target_tensor = torch.tensor(target, device=device, dtype=dtype)
+        # I23-4-FIX: 动态调整目标分布以匹配实际深度数量 D
+        # 当 len(target) != D 时，重新归一化或扩展目标分布
+        target_list = list(target)
+        if len(target_list) < D:
+            # 扩展: 用均匀分布填充新增深度
+            extra = D - len(target_list)
+            fill_val = (1.0 - sum(target_list)) / extra if extra > 0 else 1.0 / D
+            target_list.extend([max(fill_val, 0.01)] * extra)
+        elif len(target_list) > D:
+            # 截断: 只取前 D 个
+            target_list = target_list[:D]
+        # 归一化确保和为 1
+        target_sum = sum(target_list)
+        target_list = [t / target_sum for t in target_list]
+        
+        target_tensor = torch.tensor(target_list, device=device, dtype=dtype)
         
         # 软配额损失: Σ ReLU(|π - target| - ε)²
         deviation = (pi - target_tensor).abs()
@@ -1435,8 +1449,18 @@ class GumbelTopKSplitter(nn.Module):
             uniform = torch.ones(D, device=device) / D
             kl = (pi_safe * (pi_safe.log() - uniform.log())).sum().item()
             
-            # 配额偏差
-            target = torch.tensor(DEPTH_QUOTA_TARGET, device=device)
+            # 配额偏差 (I23-4-FIX: 动态调整目标分布长度)
+            target_list = list(DEPTH_QUOTA_TARGET)
+            if len(target_list) < D:
+                extra = D - len(target_list)
+                fill_val = (1.0 - sum(target_list)) / extra if extra > 0 else 1.0 / D
+                target_list.extend([max(fill_val, 0.01)] * extra)
+            elif len(target_list) > D:
+                target_list = target_list[:D]
+            target_sum = sum(target_list)
+            target_list = [t / target_sum for t in target_list]
+            
+            target = torch.tensor(target_list, device=device)
             deviation = (pi - target).abs().tolist()
             
             return {
