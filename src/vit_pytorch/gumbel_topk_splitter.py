@@ -1190,6 +1190,16 @@ class GumbelTopKSplitter(nn.Module):
             quota_loss = self.get_quota_loss(selected_mask=selected_mask)
             losses['quota_loss'] = quota_loss
         
+        # ====================================================================
+        # I23-5-FIX: 最终 NaN/Inf 检查与清理
+        # 确保返回的所有损失都是有效数值
+        # ====================================================================
+        device = self.candidate_regions.device
+        zero = torch.tensor(0.0, device=device)
+        for key, val in list(losses.items()):
+            if torch.isnan(val) or torch.isinf(val):
+                losses[key] = zero
+        
         return losses
     
     def get_elastic_budget_loss(

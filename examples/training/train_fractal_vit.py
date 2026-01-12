@@ -1501,7 +1501,15 @@ def train_epoch(
                         entropy_mode=config.soft_entropy_mode,
                     )
                     # 收集各项损失
-                    splitter_loss = sum(aux_losses.values())
+                    # I23-5-FIX: 确保 splitter_loss 是张量类型
+                    # 当 aux_losses 为空时，sum({}.values()) 返回 int(0)
+                    if aux_losses:
+                        splitter_loss = sum(aux_losses.values())
+                        # 类型检查防护
+                        if not isinstance(splitter_loss, torch.Tensor):
+                            splitter_loss = torch.tensor(float(splitter_loss), device=device)
+                    else:
+                        splitter_loss = torch.tensor(0.0, device=device)
                     # P11-8: 延迟 .item() 调用，避免每个 batch 的 GPU-CPU 同步
                     # 仅在需要显示时才调用
                     splitter_metrics = aux_losses  # 保留张量引用
