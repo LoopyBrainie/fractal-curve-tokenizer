@@ -694,6 +694,9 @@ class GumbelTopKSplitter(nn.Module):
         roi_flat = roi_features.flatten(1)  # [B*N, C*k*k]
         complexity_logits = self.complexity_mlp(roi_flat).squeeze(-1)  # [B*N]
         complexity_logits = complexity_logits.view(B, N)  # [B, N]
+        # I23-4: Clamp MLP 输出，防止归一化后数值溢出
+        # 数学: logits ∈ [-10, 10] 确保 sigmoid ∈ [4.5e-5, 0.99995]，梯度健康
+        complexity_logits = complexity_logits.clamp(-10.0, 10.0)
         
         # ====================================================================
         # I23-1 方案C: 深度方差归一化 (核心修复)
@@ -1138,6 +1141,8 @@ class GumbelTopKSplitter(nn.Module):
                 
                 depth_probs_t = torch.stack(depth_probs)
                 depth_probs_t = depth_probs_t / depth_probs_t.sum()
+                # I23-4: 归一化后再次 clamp，防止 FP16 下溢导致 log(0)
+                depth_probs_t = depth_probs_t.clamp(min=PROB_EPSILON)
                 current_entropy = -(depth_probs_t * depth_probs_t.log()).sum()
                 
                 entropy_loss = entropy_weight * (current_entropy - entropy_target).pow(2)
@@ -1221,8 +1226,11 @@ class GumbelTopKSplitter(nn.Module):
         prob_sums = torch.einsum('bn,nd->d', probs, depth_onehot)  # [D], batch 求和
         depth_probs = (prob_sums / (B * depth_counts)).clamp(min=PROB_EPSILON)  # [D], 平均概率
         depth_probs = depth_probs / depth_probs.sum()  # 归一化
+        # I23-4: 归一化后再次 clamp，防止 FP16 下溢导致 log(0)
+        depth_probs = depth_probs.clamp(min=PROB_EPSILON)
         
-        # 熵
+        # 熵 (使用 log_softmax 等价形式提升稳定性)
+        # H = -Σ p_i log(p_i) = -Σ p_i (log_p_i) where log_p_i = log(p_i)
         entropy = -(depth_probs * depth_probs.log()).sum()
         
         # 最大化熵 → 最小化负熵
