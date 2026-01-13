@@ -995,13 +995,6 @@ class GumbelTopKSplitter(nn.Module):
             hard_mask[:, 0] = 1.0
             soft_mask[:, 0] = 1.0
         
-        # I24-14 修复: 验证每个 batch 至少选中了一个
-        per_batch_selected = hard_mask.sum(dim=1)  # [B]
-        empty_batches = (per_batch_selected == 0)
-        if empty_batches.any():
-            hard_mask[empty_batches, 0] = 1.0
-            soft_mask[empty_batches, 0] = 1.0
-        
         # STE: 前向用硬掩码，反向用软掩码的梯度
         if self.training and not hard:
             st_mask = hard_mask - soft_mask.detach() + soft_mask
@@ -1189,17 +1182,6 @@ class GumbelTopKSplitter(nn.Module):
         # 应用排除
         consistent_mask = selected_mask * exclusion_mask
         
-        # I24-14 核心修复: 使用硬掩码进行 0 token 检查
-        # 原问题: selected_mask 是 STE 软掩码，sum == 0 的浮点比较不可靠
-        # 解决: 先转布尔再比较，确保整数比较准确
-        hard_consistent = (consistent_mask > 0.5)  # 转布尔
-        per_batch_count = hard_consistent.sum(dim=1)  # 整数统计
-        all_excluded = (per_batch_count == 0)  # 整数比较，准确
-        if all_excluded.any():
-            # 对于被完全排除的 batch，强制选中根节点
-            consistent_mask = consistent_mask.clone()
-            consistent_mask[all_excluded, 0] = 1.0
-        
         return consistent_mask
     
     def _build_result(
@@ -1224,6 +1206,10 @@ class GumbelTopKSplitter(nn.Module):
         性能优化 (P-OPT-1):
             使用向量化操作替换 Python for 循环，避免 B 次小张量操作。
             通过 nonzero() + scatter 一次性处理所有 batch。
+            
+        I24-14 torch.compile 兼容性:
+            使用无条件张量操作替代数据依赖的 if 语句，
+            确保编译图包含所有防御路径。
         """
         B, N = consistent_mask.shape
         device = consistent_mask.device
@@ -1231,29 +1217,16 @@ class GumbelTopKSplitter(nn.Module):
         # 使用硬阈值选择最终区域
         final_selected = (consistent_mask > 0.5)  # [B, N]
         
+        # I24-14: 无条件保证根节点被选中 (torch.compile 安全)
+        # 使用 logical_or 替代数据依赖的 if 语句
+        # 这确保每个 batch 的 index 0 (根节点) 始终被选中
+        root_mask = torch.zeros_like(final_selected)
+        root_mask[:, 0] = True
+        final_selected = final_selected | root_mask  # 无条件添加根节点
+        
         # P-OPT-1: 向量化收集选中区域
-        # 计算每个 batch 的选中数量
+        # 计算每个 batch 的选中数量 (现在保证 >= 1)
         num_selected_per_batch = final_selected.sum(dim=1)  # [B]
-        
-        # 确保每个 batch 至少有一个 token (根节点)
-        empty_batches = (num_selected_per_batch == 0)
-        if empty_batches.any():
-            # 对空 batch 强制选中根节点 (index 0)
-            final_selected = final_selected.clone()
-            final_selected[empty_batches, 0] = True
-            num_selected_per_batch = final_selected.sum(dim=1)
-        
-        # I24-14 核心修复: 最终防御 - 确保 nonzero 不返回空
-        # 这应该永远不触发，但作为最后防线
-        total_selected = final_selected.sum()
-        if total_selected == 0:
-            import warnings
-            warnings.warn(
-                "GumbelTopKSplitter: All selections excluded! Forcing root selection for all batches."
-            )
-            final_selected = torch.zeros_like(final_selected)
-            final_selected[:, 0] = True  # 每个 batch 选中根节点
-            num_selected_per_batch = torch.ones(B, dtype=torch.long, device=device)
         
         # 一次性获取所有选中位置 [total_selected, 2] -> (batch_idx, candidate_idx)
         selected_positions = final_selected.nonzero(as_tuple=False)  # [total, 2]
