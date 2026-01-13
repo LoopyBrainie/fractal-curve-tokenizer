@@ -282,6 +282,18 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             else:
                 # 边界情况: 没有任何 token
                 tokens_per_batch = torch.zeros(B, dtype=torch.long, device=device)
+            
+            # I24-14 关键修复: 在构建 sequences 之前就执行 clamp
+            # 这确保 TokenSequence.tokens 至少有 1 个 token，避免空序列
+            min_count = tokens_per_batch.min().item() if tokens_per_batch.numel() > 0 else 0
+            if min_count < 1:
+                import warnings
+                warnings.warn(
+                    f"StreamingFractalTokenizerV3: {(tokens_per_batch == 0).sum().item()} samples "
+                    "have 0 tokens. Clamping to min=1."
+                )
+            # 无条件 clamp (torch.compile 安全)
+            tokens_per_batch = tokens_per_batch.clamp(min=1)
             num_tokens_list = tokens_per_batch.to('cpu', non_blocking=True).tolist()
             
             # 计算 depth distribution
@@ -340,21 +352,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         
         # P9-5/P12-2 优化: 传入已 padding 的张量缓存，避免 model 中重复 padding
         # I20: 简化输出构建
+        # I24-14: num_tokens_list 已在前面 clamp 过，直接使用
         lengths_tensor = torch.tensor(num_tokens_list, dtype=torch.long, device=device)
-        
-        # I24-14: 无条件 clamp - 确保每个样本至少有 1 个 token
-        # 原因: torch.compile 追踪时可能跳过数据依赖的 if 分支
-        # 解决: 无条件执行 clamp(min=1)，保证编译图中始终有防御
-        min_len = lengths_tensor.min().item() if lengths_tensor.numel() > 0 else 0
-        if min_len < 1:
-            import warnings
-            warnings.warn(
-                f"StreamingFractalTokenizerV3: {(lengths_tensor == 0).sum().item()} samples "
-                "have 0 tokens. Clamping to min=1."
-            )
-        # 无条件 clamp (torch.compile 安全)
-        lengths_tensor = lengths_tensor.clamp(min=1)
-        num_tokens_list = lengths_tensor.tolist()
         
         return TokenizerOutput(
             sequences=sequences,
