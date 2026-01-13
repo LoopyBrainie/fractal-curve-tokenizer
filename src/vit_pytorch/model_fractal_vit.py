@@ -340,16 +340,18 @@ class FractalCurveViT(nn.Module):
         padded_levels = token_output.get_padded_levels(info_dim)
         levels_list = token_output.levels_list()
         
-        # I24-ALIGN: 防御性断言确保 token 数量在有效范围内
-        if __debug__:  # 仅在非优化模式下检查
-            min_len = lengths.min().item()
-            max_len = lengths.max().item()
-            if min_len < 1:
+        # I24-14: 最终防御层 - 确保 lengths >= 1
+        # 即使上游所有 clamp 都失效，这里也能捕获并修复
+        min_len = lengths.min().item() if lengths.numel() > 0 else 0
+        if min_len < 1:
+            if __debug__:
                 import warnings
                 warnings.warn(
                     f"FractalCurveViT: lengths.min()={min_len} < 1, "
-                    "this may cause downstream attention mask issues."
+                    "this may cause downstream attention mask issues. Clamping."
                 )
+            # 主动修复而不只是警告
+            lengths = lengths.clamp(min=1)
         
         return padded_tokens, padded_levels, lengths, levels_list, token_output
 

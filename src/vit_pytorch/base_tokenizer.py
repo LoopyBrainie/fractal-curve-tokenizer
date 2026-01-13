@@ -196,6 +196,10 @@ class TokenizerOutput:
         lengths_list = [t.shape[0] for t in tokens_list]
         device = tokens_list[0].device if len(tokens_list) > 0 else torch.device('cpu')
         lengths = torch.tensor(lengths_list, dtype=torch.long, device=device)
+        
+        # I24-14: 回退路径也需要 clamp，防止空序列
+        lengths = lengths.clamp(min=1)
+        
         padded_tokens = torch.nn.utils.rnn.pad_sequence(
             tokens_list, batch_first=True, padding_value=0.0
         )
