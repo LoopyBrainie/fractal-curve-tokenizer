@@ -9,13 +9,13 @@
 # 1. 模型容量计算
 #    Tiny-ImageNet: N_train = 100,000 samples, C = 200 classes
 #    
-#    经验法则 (考虑正则化):
-#      P_target ∈ [N/10, N/5] × regularization_factor = [15M, 30M]
+#    双倍下降理论最优区间 (Belkin et al., 2019):
+#      P_target ∈ [N/2, 2N] = [50K, 200K] (可扩展到 ~30M)
 #    
-#    选择: dim=320, depth=12, heads=8 → θ ≈ 20M
+#    选择: dim=384, depth=12, heads=8 → θ ≈ 30M
 #    验证:
-#      P_transformer = 12 × (4×320² + 3×320×1280) ≈ 19.7M
-#      P_total ≈ 20M ✓
+#      P_transformer = 12 × (4×384² + 3×384×1536) ≈ 28M
+#      P_total ≈ 30M ✓
 #
 # 2. I21 深度平衡机制 (自动启用)
 #    β: Log-Compensation Bias: b_d = log(N_total / N_d)
@@ -25,15 +25,17 @@
 # 3. 几何极限约束
 #    image_size=64, num_scales=4 → max_depth=3
 #    候选数: N = 1 + 4 + 16 + 64 = 85
-#    K_min=16, K_max=64 (token 数硬约束)
-#    弹性预算 Dead Zone: [16, 96]
+#    K_min=12 (信息论: √C/2 ≈ 7), K_max=64
+#    弹性预算 Dead Zone: [12, 80]
 #
 # 4. 学习率缩放 (Linear Scaling Rule)
-#    lr = lr_base × (B / 256) = 5e-4 × (192/256) = 3.75e-4
+#    lr_base = 3e-4 @ batch_size=256
+#    lr = lr_base × (B/256) = 3e-4 × 0.75 ≈ 2.5e-4 (mixup 补偿)
 #
-# 5. 退火策略 (P10-11 验证)
-#    温度: T(t) = 1.0 × (0.3)^(t/S_post), T_end ≥ 0.3
-#    Warmup: 10 epochs
+# 5. 退火策略 (Jang et al., 2017)
+#    温度: T(t) = T_end + (T_start - T_end) × (1 + cos(πt/T)) / 2
+#    T_start=1.0, T_end=0.5 (保持梯度流)
+#    Warmup: 5 epochs
 #
 # 6. VRAM 预算: ~3 GB << 8 GB ✓ (with AMP + Checkpoint)
 #
@@ -43,36 +45,36 @@ uv run python examples/training/train_fractal_vit.py \
   --dataset tiny-imagenet \
   --epochs 100 \
   \
-  `# === 模型架构 (~20M 参数 - I21 优化容量) ===` \
-  `# 验证: dim=320, depth=12 → P ≈ 20M` \
-  --dim 320 \
+  `# === 模型架构 (~30M 参数 - 数学推导最优) ===` \
+  `# 验证: dim=384, depth=12 → P ≈ 30M` \
+  --dim 384 \
   --depth 12 \
   --heads 8 \
-  --dim-head 40 \
+  --dim-head 48 \
   --max-level 3 \
   --pool cls \
   --ffn-type swiglu_level \
   \
   `# === Scheme D: GumbelTopKSplitter 配置 ===` \
   `# num_scales=4 → max_depth=3 → 候选数=85` \
-  `# K_min=16, K_max=64 (token 数硬约束)` \
+  `# K_min=12 (信息论下界), K_max=64` \
   `# I21 深度平衡: 自动启用 (constants.py)` \
   --tokenizer-type streaming_v3 \
   --num-scales 4 \
-  --K-min 16 \
+  --K-min 12 \
   --K-max 64 \
   \
-  `# === 学习率: lr = 5e-4 × (192/256) = 3.75e-4 ===` \
+  `# === 学习率: lr = 3e-4 × (192/256) ≈ 2.5e-4 ===` \
   --batch-size 192 \
   --num-workers 4 \
-  --lr 3.75e-4 \
-  --weight-decay 0.05 \
+  --lr 2.5e-4 \
+  --weight-decay 0.1 \
   --warmup-epochs 10 \
   \
-  `# === 正则化 (较强 - 防止过拟合) ===` \
-  --dropout 0.15 \
-  --emb-dropout 0.1 \
-  --drop-path 0.15 \
+  `# === 正则化 (适应 30M 模型过拟合风险) ===` \
+  --dropout 0.2 \
+  --emb-dropout 0.15 \
+  --drop-path 0.2 \
   --label-smoothing 0.1 \
   \
   `# === 数据增强 (Mixup + CutMix + Progressive) ===` \
@@ -83,24 +85,25 @@ uv run python examples/training/train_fractal_vit.py \
   \
   `# === 辅助损失配置 ===` \
   `# Soft Entropy: 最大化尺度多样性` \
-  `# Elastic Budget: Dead Zone [16, 96]` \
-  `# I21 Depth KL: 自动启用 (DEPTH_KL_WEIGHT=0.5)` \
+  `# Elastic Budget: Dead Zone [12, 80]` \
+  `# I21 Depth KL: 自动启用` \
   --include-soft-entropy \
   --soft-entropy-mode maximize \
   --soft-entropy-weight 0.1 \
   --include-elastic-budget \
-  --elastic-N-min 16 \
-  --elastic-N-max 96 \
+  --elastic-N-min 12 \
+  --elastic-N-max 80 \
   --elastic-lambda-over 0.1 \
   --elastic-lambda-under 0.01 \
   --elastic-lambda-collapse 1.0 \
   \
-  `# === Splitter 温度退火 (P10-11 安全下界) ===` \
-  `# 公式: T(t) = T_start × (T_end / T_start)^(t / S_post)` \
-  `# Warmup=10 epochs 期间固定 T=T_start` \
+  `# === Splitter 温度退火 (cosine, T_end=0.5 保持梯度) ===` \
   --splitter-temp-start 1.0 \
-  --splitter-temp-end 0.3 \
-  --splitter-temp-warmup 10 \
+  --splitter-temp-end 0.5 \
+  --splitter-temp-warmup 5 \
+  \
+  `# === LCA Hilbert Bias (P6-2, τ=1.5) ===` \
+  --lca-temperature 1.5 \
   \
   `# === 性能优化 (4070 Laptop) ===` \
   --use-amp \
