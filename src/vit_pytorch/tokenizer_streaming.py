@@ -337,6 +337,18 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # P9-5/P12-2 优化: 传入已 padding 的张量缓存，避免 model 中重复 padding
         # I20: 简化输出构建
         lengths_tensor = torch.tensor(num_tokens_list, dtype=torch.long, device=device)
+        
+        # I24-14: 防御性检查 - 确保每个样本至少有 1 个 token
+        if (lengths_tensor == 0).any():
+            import warnings
+            warnings.warn(
+                f"StreamingFractalTokenizerV3: {(lengths_tensor == 0).sum().item()} samples "
+                "have 0 tokens. Clamping to min=1."
+            )
+            lengths_tensor = lengths_tensor.clamp(min=1)
+            # 同步更新 num_tokens_list
+            num_tokens_list = lengths_tensor.tolist()
+        
         return TokenizerOutput(
             sequences=sequences,
             _padded_tokens_cache=tokens,

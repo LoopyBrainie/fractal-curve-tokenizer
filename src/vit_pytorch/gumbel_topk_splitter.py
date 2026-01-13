@@ -1225,6 +1225,16 @@ class GumbelTopKSplitter(nn.Module):
             final_selected[empty_batches, 0] = True
             num_selected_per_batch = final_selected.sum(dim=1)
         
+        # I24-14: 防御性断言 - 确保保护生效
+        # 如果仍有空 batch，发出警告并使用 clamp 强制最小值为 1
+        if (num_selected_per_batch == 0).any():
+            import warnings
+            warnings.warn(
+                "GumbelTopKSplitter: Empty batch detected after root fallback. "
+                "Using clamp to ensure min 1 token per batch."
+            )
+            num_selected_per_batch = num_selected_per_batch.clamp(min=1)
+        
         # 一次性获取所有选中位置 [total_selected, 2] -> (batch_idx, candidate_idx)
         selected_positions = final_selected.nonzero(as_tuple=False)  # [total, 2]
         batch_indices = selected_positions[:, 0]  # [total]
