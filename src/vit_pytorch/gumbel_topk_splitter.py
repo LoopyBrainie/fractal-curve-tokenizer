@@ -1182,6 +1182,14 @@ class GumbelTopKSplitter(nn.Module):
         # 应用排除
         consistent_mask = selected_mask * exclusion_mask
         
+        # I24-14: 确保至少每个 batch 有一个 token
+        # 树一致性可能排除所有选择（极端情况），此时强制选择根节点
+        all_excluded = (consistent_mask.sum(dim=1) == 0)
+        if all_excluded.any():
+            # 对于被完全排除的 batch，强制选中根节点
+            consistent_mask = consistent_mask.clone()
+            consistent_mask[all_excluded, 0] = 1.0
+        
         return consistent_mask
     
     def _build_result(
