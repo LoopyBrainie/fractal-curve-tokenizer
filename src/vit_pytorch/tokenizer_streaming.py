@@ -270,29 +270,21 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         
         # 统计收集 (no_grad)
         with torch.no_grad():
-            # I24-14 修复: 始终使用 bincount 从 batch_indices 重新计算
-            # 原问题: tokens_per_batch 可能与实际 batch_indices 不一致
-            #         (尤其是在 torch.compile 模式下)
-            # 解决: 直接从 batch_indices 计算，确保一致性
-            if tensor_result.num_tokens > 0:
-                tokens_per_batch = torch.bincount(
-                    tensor_result.batch_indices, 
-                    minlength=B
-                )
-            else:
-                # 边界情况: 没有任何 token
-                tokens_per_batch = torch.zeros(B, dtype=torch.long, device=device)
+            # I24-14 修复: 使用无条件张量操作 (torch.compile 安全)
+            # 原问题: 数据依赖的 if 语句在 torch.compile 下可能被跳过
+            # 解决: 无条件计算 bincount，然后无条件 clamp
             
-            # I24-14 关键修复: 在构建 sequences 之前就执行 clamp
-            # 这确保 TokenSequence.tokens 至少有 1 个 token，避免空序列
-            min_count = tokens_per_batch.min().item() if tokens_per_batch.numel() > 0 else 0
-            if min_count < 1:
-                import warnings
-                warnings.warn(
-                    f"StreamingFractalTokenizerV3: {(tokens_per_batch == 0).sum().item()} samples "
-                    "have 0 tokens. Clamping to min=1."
-                )
-            # 无条件 clamp (torch.compile 安全)
+            # bincount 需要至少一个元素，使用 torch.where 处理空情况
+            # 创建一个始终有效的 batch_indices (添加一个 dummy 0)
+            batch_indices_safe = tensor_result.batch_indices
+            if batch_indices_safe.numel() == 0:
+                # 极端边界情况：完全没有 token
+                batch_indices_safe = torch.zeros(1, dtype=torch.long, device=device)
+            
+            tokens_per_batch = torch.bincount(batch_indices_safe, minlength=B)
+            
+            # I24-14: 无条件 clamp (torch.compile 安全)
+            # 不使用 .item() 或数据依赖的 if，直接 clamp
             tokens_per_batch = tokens_per_batch.clamp(min=1)
             num_tokens_list = tokens_per_batch.to('cpu', non_blocking=True).tolist()
             

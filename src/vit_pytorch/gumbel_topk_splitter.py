@@ -1218,10 +1218,11 @@ class GumbelTopKSplitter(nn.Module):
         final_selected = (consistent_mask > 0.5)  # [B, N]
         
         # I24-14: 无条件保证根节点被选中 (torch.compile 安全)
-        # 使用 logical_or 替代数据依赖的 if 语句
-        # 这确保每个 batch 的 index 0 (根节点) 始终被选中
-        root_mask = torch.zeros_like(final_selected)
-        root_mask[:, 0] = True
+        # 使用纯张量操作，避免 inplace 赋值
+        # 创建 one-hot 根节点掩码: [B, N] 其中 [:, 0] = True
+        root_indices = torch.zeros(B, 1, dtype=torch.long, device=device)  # [B, 1] 全是 0
+        root_mask = torch.zeros(B, N, dtype=torch.bool, device=device)
+        root_mask = root_mask.scatter(1, root_indices, True)  # 非 inplace scatter
         final_selected = final_selected | root_mask  # 无条件添加根节点
         
         # P-OPT-1: 向量化收集选中区域

@@ -340,18 +340,9 @@ class FractalCurveViT(nn.Module):
         padded_levels = token_output.get_padded_levels(info_dim)
         levels_list = token_output.levels_list()
         
-        # I24-14: 最终防御层 - 确保 lengths >= 1
-        # 即使上游所有 clamp 都失效，这里也能捕获并修复
-        min_len = lengths.min().item() if lengths.numel() > 0 else 0
-        if min_len < 1:
-            if __debug__:
-                import warnings
-                warnings.warn(
-                    f"FractalCurveViT: lengths.min()={min_len} < 1, "
-                    "this may cause downstream attention mask issues. Clamping."
-                )
-            # 主动修复而不只是警告
-            lengths = lengths.clamp(min=1)
+        # I24-14: 最终防御层 - 无条件 clamp (torch.compile 安全)
+        # 不使用 .item() 或数据依赖的 if，直接 clamp
+        lengths = lengths.clamp(min=1)
         
         return padded_tokens, padded_levels, lengths, levels_list, token_output
 
