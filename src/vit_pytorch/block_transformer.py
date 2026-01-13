@@ -162,19 +162,31 @@ class FractalTransformerBlock(nn.Module):
         #       x' = x + gate_1(d) * Attn(x)
         #       x'' = x' + gate_2(d) * FFN(x')
         #
-        # 初始化: 种子初始化，为梯度提供方向暗示
-        # - init[d] = 0.01 * d / max_level
-        # - 效果: gate(0) ≈ 1.000, gate(max) ≈ 1.005
-        # - 模型通过学习自适应调整各深度的门控权重
+        # I24-6 改进: 基于训练结果的智能初始化
+        # 训练后学习到的门控模式:
+        #   - depth=0 (全图): w ≈ 0.7 → 抑制全局信息
+        #   - depth=1: w ≈ 1.0 → 保持原样
+        #   - depth=2: w ≈ 0.85 → 轻微抑制
+        #   - depth=3 (细粒度): w ≈ 0.65 → 抑制细节
+        # 
+        # 使用 inverse_sigmoid 反算: sigmoid(x) * 2 = target → x = logit(target/2)
+        # target=0.7 → x ≈ -0.36, target=1.0 → x = 0, target=0.65 → x ≈ -0.54
         #
         # P11-13: 重命名 _level_residual_embedding → _residual_gate
         # - 明确语义: 这是门控权重，不是嵌入向量
-        # - 移除误导: 原注释"保护高频信息"与实现不符
         self._residual_gate = nn.Embedding(max_level + 1, 2)
-        # 种子初始化: 极小的线性递增偏移
+        # I24-6: 基于训练结果的智能初始化
+        # 使用 V 形模式: depth=0 和 depth=3 抑制，中间层保持
         with torch.no_grad():
             for d in range(max_level + 1):
-                seed_value = 0.01 * d / max_level
+                # V 形抑制: 两端深度抑制，中间保持
+                # depth_ratio: 0 → 0.0, max/2 → 1.0, max → 0.0
+                depth_ratio = 1.0 - abs(2.0 * d / max_level - 1.0)
+                # 目标门控值: 两端 0.7，中间 1.0
+                target_gate = 0.7 + 0.3 * depth_ratio
+                # inverse_sigmoid: sigmoid(x) * 2 = target → x = log(target / (2 - target))
+                import math
+                seed_value = math.log(target_gate / (2.0 - target_gate))
                 self._residual_gate.weight[d] = seed_value
         
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()

@@ -90,6 +90,11 @@ from .constants import (
     DEPTH_QUOTA_TARGET,
     DEPTH_QUOTA_TOLERANCE,
     DEPTH_QUOTA_WEIGHT,
+    # I24-2 方案E: 可学习配额
+    LEARNABLE_QUOTA_ENABLED,
+    QUOTA_MIN_PER_DEPTH,
+    QUOTA_INIT_LOGITS,
+    QUOTA_ENTROPY_WEIGHT,
 )
 
 
@@ -238,10 +243,36 @@ class GumbelTopKSplitter(nn.Module):
         self.register_buffer('depth_bias_gamma', torch.tensor(0.7))
         
         # ====================================================================
-        # I21: Log-Compensation Bias (β方案)
+        # I21: Log-Compensation Bias (β方案) - 被 I24-2 方案E 替代
         # 数学: b_log_d = log(N_total / N_d) 补偿候选数量不平衡
+        # 注: 当 LEARNABLE_QUOTA_ENABLED=True 时，此偏置不再使用
         # ====================================================================
         self._precompute_log_compensation_bias()
+        
+        # ====================================================================
+        # I24-2 方案E: 可学习配额 (Learnable Quota)
+        # 数学:
+        #   K_d = max(K_min, round(softmax(φ)_d × K_total))
+        #   selected_d = TopK(logits[depth=d], K_d)
+        # 
+        # 初始化:
+        #   φ^(0) = log(p_target) - mean(log(p_target))
+        #   使得 softmax(φ^(0)) = p_target = (0.15, 0.20, 0.25, 0.40)
+        #   对于 D > 4，扩展为均匀分布
+        # ====================================================================
+        if LEARNABLE_QUOTA_ENABLED:
+            D = max_depth + 1
+            if D <= len(QUOTA_INIT_LOGITS):
+                quota_init = torch.tensor(QUOTA_INIT_LOGITS[:D], dtype=torch.float32)
+            else:
+                # 扩展: 前 4 个用预计算值，后续用均匀分布 (log(1/D))
+                base_init = list(QUOTA_INIT_LOGITS)
+                # 均匀分布的 logit = 0 (因为 softmax 对平移不变)
+                extra_init = [0.0] * (D - len(base_init))
+                quota_init = torch.tensor(base_init + extra_init, dtype=torch.float32)
+            self.quota_logits = nn.Parameter(quota_init)
+        else:
+            self.quota_logits = None
         
         # 统计信息
         self.register_buffer('_avg_selected', torch.tensor(16.0))
@@ -603,6 +634,7 @@ class GumbelTopKSplitter(nn.Module):
         
         # ====================================================================
         # Step 2: Gumbel-Top-K 选择
+        # I24-2: 使用分层 Top-K (方案E) 或全局 Top-K (传统方案)
         # ====================================================================
         # 计算动态 K
         if self.use_dynamic_k:
@@ -616,10 +648,14 @@ class GumbelTopKSplitter(nn.Module):
         # I23-3: 但不能超过 N（当 N < K_min 时，使用 N）
         K = max(min(K, N), min(self.K_min, N))
         
-        # Gumbel-Top-K with STE
-        selected_mask, topk_indices = self._gumbel_topk_ste(logits, K, hard)
+        # I24-2 方案E: 分层 Top-K (可学习配额)
+        if LEARNABLE_QUOTA_ENABLED and self.quota_logits is not None:
+            selected_mask, topk_indices = self._stratified_gumbel_topk_ste(logits, K, hard)
+        else:
+            # 传统全局 Top-K
+            selected_mask, topk_indices = self._gumbel_topk_ste(logits, K, hard)
         # selected_mask: [B, N] (STE 版本，有梯度)
-        # topk_indices: [B, K] (硬选择索引)
+        # topk_indices: [B, K'] (硬选择索引，K' 可能略小于 K)
         
         # ====================================================================
         # Step 3: 树一致性约束
@@ -723,11 +759,14 @@ class GumbelTopKSplitter(nn.Module):
         depth_bias_fixed = self.depth_bias_beta * (self.depth_bias_gamma ** depths.float())
         
         # ====================================================================
-        # I21 β: Log-Compensation Bias
-        # 数学: b_log_d = log(N_total / N_d) 补偿候选数量不平衡
-        # 效果: 使每个深度被选中的期望概率相等
+        # I21 β: Log-Compensation Bias (传统方案)
+        # I24-2: 当启用可学习配额 (方案E) 时，禁用 Log-Compensation
+        #        因为分层 Top-K 已经通过配额保证深度分布
         # ====================================================================
-        if LOG_COMPENSATION_ENABLED:
+        if LEARNABLE_QUOTA_ENABLED and self.quota_logits is not None:
+            # 方案E: 分层 Top-K 不需要 Log-Compensation
+            log_comp = torch.zeros(N, device=device, dtype=dtype)
+        elif LOG_COMPENSATION_ENABLED:
             log_comp = self.log_compensation_bias  # [N]
         else:
             log_comp = torch.zeros(N, device=device, dtype=dtype)
@@ -792,6 +831,183 @@ class GumbelTopKSplitter(nn.Module):
             
             return K
     
+    def _compute_quota_allocation(self, K: int) -> Tensor:
+        """
+        计算可学习配额分配 (I24-2 方案E 核心)。
+        
+        数学形式化
+        ==========
+        
+        配额分配公式:
+            p_d = softmax(φ)_d
+            K_d^{raw} = round(p_d × K_total)
+            K_d = max(K_min_per_depth, K_d^{raw})
+            
+        配额调整 (保证 Σ K_d = K_total):
+            if Σ K_d > K_total:
+                excess = Σ K_d - K_total
+                d_max = argmax(K)
+                K[d_max] -= excess
+                
+        下界保护证明:
+            设 K_d = 0，则深度 d 无 token 进入 Transformer
+            ∂L/∂φ_d = 0 (死区)
+            因此必须 K_d >= K_min_per_depth >= 1
+            
+        Args:
+            K: 总 token 配额
+            
+        Returns:
+            quota: [D] 每个深度的配额分配
+        """
+        D = self.max_depth + 1
+        device = self.candidate_depths.device
+        
+        if self.quota_logits is None or not LEARNABLE_QUOTA_ENABLED:
+            # 回退到均匀分配
+            quota = torch.full((D,), K // D, dtype=torch.long, device=device)
+            quota[D - 1] += K - quota.sum()  # 余数给最后一个深度
+            return quota
+        
+        # Softmax 计算配额比例
+        quota_probs = F.softmax(self.quota_logits, dim=0)  # [D]
+        
+        # 原始配额 (四舍五入)
+        quota_raw = (quota_probs * K).round().long()  # [D]
+        
+        # 下界保护: K_d >= QUOTA_MIN_PER_DEPTH
+        min_quota = QUOTA_MIN_PER_DEPTH
+        quota = quota_raw.clamp(min=min_quota)
+        
+        # 调整以保证 Σ K_d = K
+        total = quota.sum().item()
+        if total > K:
+            # 从最大配额深度扣除
+            excess = total - K
+            d_max = quota.argmax().item()
+            quota[d_max] = max(min_quota, quota[d_max].item() - excess)
+        elif total < K:
+            # 给最大配额深度增加
+            deficit = K - total
+            d_max = quota.argmax().item()
+            quota[d_max] += deficit
+        
+        return quota
+    
+    def _stratified_gumbel_topk_ste(
+        self,
+        logits: Tensor,
+        K: int,
+        hard: bool = False,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        分层 Gumbel-Top-K 选择 (I24-2 方案E 核心)。
+        
+        数学形式化
+        ==========
+        
+        与全局 Top-K 的区别:
+            全局: selected = TopK(logits, K)  → 深度崩塌
+            分层: selected = ∪_d TopK(logits[d], K_d)  → 配额保证
+            
+        STE 梯度流:
+            深度内独立 softmax → 梯度增强 K/K_d 倍
+            例: K=32, K_d=8 → 梯度增强 4x (相比全局 softmax)
+            
+        配额下界保护:
+            K_d >= 1 保证每个深度至少有梯度信号
+            
+        Args:
+            logits: [B, N] 候选 logits
+            K: 总选择数量
+            hard: 是否使用硬决策
+            
+        Returns:
+            selected_mask: [B, N] STE 选择掩码 (有梯度)
+            topk_indices: [B, K'] 硬选择索引 (K' 可能略小于 K)
+        """
+        B, N = logits.shape
+        device = logits.device
+        D = self.max_depth + 1
+        depths = self.candidate_depths  # [N]
+        
+        # 计算配额分配
+        quota = self._compute_quota_allocation(K)  # [D]
+        
+        # I18-5: 使用 TEMPERATURE_MIN 常量确保梯度健康
+        T = self.log_temperature.exp().clamp(min=TEMPERATURE_MIN)
+        
+        # 初始化输出
+        hard_mask = torch.zeros(B, N, device=device, dtype=torch.float32)
+        soft_mask = torch.zeros(B, N, device=device, dtype=torch.float32)
+        all_topk_indices = []
+        
+        # 转换为 FP32 计算
+        original_dtype = logits.dtype
+        logits_fp32 = logits.float()
+        T_fp32 = T.float()
+        
+        # 分层选择
+        for d in range(D):
+            # 获取该深度的候选索引
+            depth_mask = (depths == d)  # [N]
+            depth_indices = depth_mask.nonzero(as_tuple=True)[0]  # [N_d]
+            N_d = len(depth_indices)
+            K_d = min(quota[d].item(), N_d)  # 配额不能超过候选数
+            
+            if K_d <= 0 or N_d == 0:
+                continue
+            
+            # 提取该深度的 logits
+            logits_d = logits_fp32[:, depth_indices]  # [B, N_d]
+            
+            if hard or not self.training:
+                # 推理模式：直接 Top-K
+                _, topk_local = torch.topk(logits_d, K_d, dim=1)  # [B, K_d]
+            else:
+                # 训练模式：Gumbel + Top-K
+                uniform = torch.rand(B, N_d, device=device, dtype=torch.float32)
+                uniform = uniform.clamp(GUMBEL_EPSILON, 1 - GUMBEL_EPSILON)
+                gumbel = -torch.log(-torch.log(uniform))
+                perturbed = (logits_d + gumbel) / T_fp32
+                topk_vals, topk_local = torch.topk(perturbed, K_d, dim=1)  # [B, K_d]
+                
+                # 深度内 Subset Softmax
+                subset_softmax = F.softmax(topk_vals, dim=1)  # [B, K_d]
+                
+                # 映射回全局索引
+                topk_global = depth_indices[topk_local]  # [B, K_d]
+                
+                # 更新 soft_mask
+                soft_mask.scatter_(1, topk_global, subset_softmax)
+            
+            # 更新 hard_mask
+            topk_global = depth_indices[topk_local]  # [B, K_d]
+            hard_mask.scatter_(1, topk_global, 1.0)
+            all_topk_indices.append(topk_global)
+        
+        # 合并所有深度的 Top-K 索引
+        if all_topk_indices:
+            topk_indices = torch.cat(all_topk_indices, dim=1)  # [B, K']
+        else:
+            # 边界情况：至少选择根节点
+            topk_indices = torch.zeros(B, 1, device=device, dtype=torch.long)
+            hard_mask[:, 0] = 1.0
+            soft_mask[:, 0] = 1.0
+        
+        # STE: 前向用硬掩码，反向用软掩码的梯度
+        if self.training and not hard:
+            st_mask = hard_mask - soft_mask.detach() + soft_mask
+        else:
+            st_mask = hard_mask
+        
+        # 转回原始精度
+        if original_dtype != torch.float32:
+            st_mask = st_mask.to(original_dtype)
+            hard_mask = hard_mask.to(original_dtype)
+        
+        return st_mask, topk_indices
+
     def _gumbel_topk_ste(
         self,
         logits: Tensor,
@@ -1191,6 +1407,14 @@ class GumbelTopKSplitter(nn.Module):
             losses['quota_loss'] = quota_loss
         
         # ====================================================================
+        # I24-2 方案E: 配额熵正则化损失
+        # 鼓励可学习配额保持多样性，避免崩塌到单一深度
+        # ====================================================================
+        if LEARNABLE_QUOTA_ENABLED and self.quota_logits is not None:
+            quota_entropy_loss = self.get_quota_entropy_loss(weight=QUOTA_ENTROPY_WEIGHT)
+            losses['quota_entropy_loss'] = quota_entropy_loss
+        
+        # ====================================================================
         # I23-5-FIX: 最终 NaN/Inf 检查与清理
         # 确保返回的所有损失都是有效数值
         # ====================================================================
@@ -1436,6 +1660,54 @@ class GumbelTopKSplitter(nn.Module):
         deviation = (pi - target_tensor).abs()
         excess = F.relu(deviation - tolerance)
         loss = weight * (excess ** 2).sum()
+        
+        return loss
+    
+    def get_quota_entropy_loss(
+        self,
+        weight: float = QUOTA_ENTROPY_WEIGHT,
+    ) -> Tensor:
+        """
+        计算配额熵正则化损失 (I24-2 方案E)。
+        
+        数学形式化
+        ==========
+        
+        动机:
+            可学习配额 φ 可能崩塌到单一深度 (所有配额给 depth=3)。
+            通过熵正则化鼓励配额分布保持多样性。
+            
+        损失公式:
+            p = softmax(φ)  配额分布
+            H(p) = -Σ_d p_d log(p_d)  熵
+            L_entropy = -λ × H(p)  最大化熵 → 最小化负熵
+            
+        梯度流:
+            ∂L/∂φ_d = -λ × (∂H/∂p_d) × (∂p_d/∂φ_d)
+                    = λ × (1 + log(p_d)) × p_d × (1 - p_d)  [对 softmax]
+                    
+        效果:
+            - 高 p_d → log(p_d) 大 → 正梯度 → 降低 φ_d
+            - 低 p_d → log(p_d) 小 → 负梯度 → 提高 φ_d
+            
+        Args:
+            weight: 熵损失权重 (默认 QUOTA_ENTROPY_WEIGHT=0.1)
+            
+        Returns:
+            loss: 标量熵损失
+        """
+        if self.quota_logits is None:
+            return torch.tensor(0.0, device=self.candidate_regions.device)
+        
+        # Softmax 计算配额分布
+        quota_probs = F.softmax(self.quota_logits, dim=0)  # [D]
+        quota_probs = quota_probs.clamp(min=PROB_EPSILON)
+        
+        # 熵
+        entropy = -(quota_probs * quota_probs.log()).sum()
+        
+        # 最大化熵 → 最小化负熵
+        loss = -weight * entropy
         
         return loss
     

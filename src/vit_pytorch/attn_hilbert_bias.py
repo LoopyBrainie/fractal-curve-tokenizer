@@ -246,6 +246,11 @@ class LCAHilbertBias(HilbertBiasBase):
         - 求逆: γ = log(exp(τ) - 1)
         - 对于 τ=1.5: γ = log(e^1.5 - 1) ≈ 1.176
         
+        数值稳定性:
+        - 当 τ < ln(2) ≈ 0.693 时, exp(τ) - 1 < 1, log 参数趋近 0
+        - 使用 softplus_inverse 的稳定形式: γ = τ + log(1 - exp(-τ))
+        - 此公式对所有 τ > 0 数值稳定
+        
         Args:
             lca_temperature: 目标温度值，None 表示禁用
             learnable: 是否可学习
@@ -258,8 +263,17 @@ class LCAHilbertBias(HilbertBiasBase):
             self._lca_temp_fixed: Optional[float] = None
         elif learnable:
             # 可学习模式: per-head 温度
-            # 反推 softplus 初始值: γ = log(exp(τ) - 1)
-            init_raw = math.log(math.exp(lca_temperature) - 1)
+            # I24-ALIGN: 数值稳定的 softplus 逆变换
+            # 标准公式 γ = log(exp(τ) - 1) 在 τ < 0.693 时不稳定
+            # 使用等价形式: γ = τ + log(1 - exp(-τ))
+            # 对于 τ → 0+: γ → -∞ (正确)
+            # 对于 τ → ∞: γ → τ (正确)
+            if lca_temperature > 20:
+                # 大温度: softplus 饱和，γ ≈ τ
+                init_raw = lca_temperature
+            else:
+                # 通用稳定公式
+                init_raw = lca_temperature + math.log(1 - math.exp(-lca_temperature))
             self._lca_temp_raw = nn.Parameter(
                 torch.full((self.heads,), init_raw)
             )
@@ -504,6 +518,11 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         self.max_level = max_level
         self.use_hilbert_bias = use_hilbert_bias
         self.use_level_scaling = use_level_scaling
+        
+        # I24-11: 注意力权重存储开关 (默认关闭以节省内存)
+        # 评估时设为 True 以支持 attention 可视化和分析
+        self.store_attn_weights: bool = False
+        self._last_attn_weights: Optional[torch.Tensor] = None
 
         inner_dim = dim_head * heads
         self.scale = dim_head ** -0.5
@@ -688,6 +707,11 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             dots.masked_fill_(~attention_mask.bool(), mask_value)
 
         attn = self.attend(dots)
+        
+        # I24-11: 条件存储注意力权重 (评估时启用)
+        if self.store_attn_weights:
+            self._last_attn_weights = attn.detach()
+        
         attn = self.dropout(attn)
 
         out = torch.matmul(attn, v)

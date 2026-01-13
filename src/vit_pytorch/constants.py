@@ -61,9 +61,17 @@ LEVEL_BIAS_SCALE: float = 0.05
 SPLITTER_TEMP_START: float = 1.0
 
 #: Gumbel-Softmax 终止温度 T_end
-#: P10-11 修复: 0.1 → 0.3 (梯度放大从10x降至3.3x, 数值稳定)
-#: 数学推导见 scripts/verify_p10_11_temperature_analysis.py
-SPLITTER_TEMP_END: float = 0.3
+#: I24-7 分析: 0.3 过低会过早停止探索
+#: 改进: 提高到 0.5，保持更长的探索能力
+#: 数学: T=0.5 时 softmax 梯度仍有效 (∂p/∂z ≈ 1)
+SPLITTER_TEMP_END: float = 0.5
+
+#: 温度退火调度策略
+#: 可选值: 'exponential', 'linear', 'cosine'
+#: I24-7 改进: 使用 cosine 退火
+#: 优势: 开始慢降(保持探索) → 中期快降(高效收敛) → 末期平稳(稳定决策)
+#: 数学: T(t) = T_end + (T_start - T_end) * (1 + cos(πt)) / 2
+SPLITTER_TEMP_SCHEDULE: str = 'cosine'
 
 #: 阈值衰减因子 γ ∈ (0, 1)，每层深度阈值为 τ_d = τ_base · γ^d
 SPLIT_GAMMA: float = 0.85
@@ -122,9 +130,11 @@ LOG_COMPENSATION_ENABLED: bool = True
 
 #: I23-1 方案C: 深度方差归一化是否启用
 #: 数学: z_i^norm = (z_i - μ_d) / σ_d，使各深度 MLP 输出服从 N(0,1)
-#: 效果: 消除方差差异导致的 Top-K 偏好，使 Log-Compensation 理论生效
-#: 验证: 归一化后预测分布 π ≈ (0.249, 0.246, 0.248, 0.257)
-DEPTH_VARIANCE_NORM_ENABLED: bool = True
+#: I24-5 批判分析: 当启用方案E (分层 Top-K) 时，归一化对选择结果无影响
+#:   证明: TopK(z) = TopK((z-μ)/σ)，因仿射变换保持相对顺序
+#:   结论: 方案E 下禁用归一化，减少计算开销和训练-推理不一致
+#: 状态: 当 LEARNABLE_QUOTA_ENABLED=True 时自动禁用
+DEPTH_VARIANCE_NORM_ENABLED: bool = False  # I24-5: 方案E下禁用
 
 #: 方差归一化的稳定性 epsilon
 DEPTH_VARIANCE_NORM_EPS: float = 1e-6
@@ -149,6 +159,41 @@ DEPTH_QUOTA_TOLERANCE: float = 0.05
 
 #: 软配额损失权重
 DEPTH_QUOTA_WEIGHT: float = 0.2
+
+# ==================== 方案 E: 可学习配额常量 (I24-2) ====================
+# 数学分析: 解决 Log-Compensation 对 Top-K 理论无效的问题
+# 原理: 先按可学习配额分配各深度 K_d，再在深度内 Top-K 选择
+# 优势: 
+#   1. 配额硬约束保证深度分布
+#   2. 可学习比例允许任务自适应
+#   3. 深度内竞争保持 token 质量优化
+
+#: 是否启用可学习配额方案 (替代 Log-Compensation)
+LEARNABLE_QUOTA_ENABLED: bool = True
+
+#: 每个深度的最小配额 (防止死区)
+#: 数学: K_d >= K_MIN_PER_DEPTH 保证梯度流
+QUOTA_MIN_PER_DEPTH: int = 1
+
+#: 配额初始化 (对数空间，softmax 后 = DEPTH_QUOTA_TARGET)
+#: 计算: φ_d = log(p_d) - mean(log(p))
+#: 验证: softmax(-0.495, -0.207, 0.016, 0.486) ≈ (0.15, 0.20, 0.25, 0.40)
+QUOTA_INIT_LOGITS: tuple = (-0.495, -0.207, 0.016, 0.486)
+
+#: 配额熵正则化权重 (鼓励分布多样性)
+#: 数学: L_entropy = -λ × H(K/K_total)
+QUOTA_ENTROPY_WEIGHT: float = 0.1
+
+# ==================== I24-8: 阈值正则化常量 ====================
+
+#: 阈值方差正则化是否启用
+#: 数学: L_threshold = λ × Var(τ)
+#: 目的: 防止某个深度阈值极端偏离，导致选择偏差
+THRESHOLD_VAR_REG_ENABLED: bool = True
+
+#: 阈值方差正则化权重
+#: 设计: 0.3 使梯度量级与其他辅助损失匹配
+THRESHOLD_VAR_REG_WEIGHT: float = 0.3
 
 #: Subset Softmax 是否启用
 #: 数学: 将 STE softmax 从 N=85 缩小到 K=32，梯度增强 ~2.7x
