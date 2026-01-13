@@ -270,15 +270,19 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         
         # 统计收集 (no_grad)
         with torch.no_grad():
-            tokens_per_batch = tensor_result.tokens_per_batch
-            if tokens_per_batch is not None:
-                num_tokens_list = tokens_per_batch.to('cpu', non_blocking=True).tolist()
-            else:
+            # I24-14 修复: 始终使用 bincount 从 batch_indices 重新计算
+            # 原问题: tokens_per_batch 可能与实际 batch_indices 不一致
+            #         (尤其是在 torch.compile 模式下)
+            # 解决: 直接从 batch_indices 计算，确保一致性
+            if tensor_result.num_tokens > 0:
                 tokens_per_batch = torch.bincount(
                     tensor_result.batch_indices, 
                     minlength=B
                 )
-                num_tokens_list = tokens_per_batch.to('cpu', non_blocking=True).tolist()
+            else:
+                # 边界情况: 没有任何 token
+                tokens_per_batch = torch.zeros(B, dtype=torch.long, device=device)
+            num_tokens_list = tokens_per_batch.to('cpu', non_blocking=True).tolist()
             
             # 计算 depth distribution
             # P-OPT-3: 使用向量化操作，避免 Python for 循环
@@ -338,16 +342,19 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # I20: 简化输出构建
         lengths_tensor = torch.tensor(num_tokens_list, dtype=torch.long, device=device)
         
-        # I24-14: 防御性检查 - 确保每个样本至少有 1 个 token
-        if (lengths_tensor == 0).any():
+        # I24-14: 无条件 clamp - 确保每个样本至少有 1 个 token
+        # 原因: torch.compile 追踪时可能跳过数据依赖的 if 分支
+        # 解决: 无条件执行 clamp(min=1)，保证编译图中始终有防御
+        min_len = lengths_tensor.min().item() if lengths_tensor.numel() > 0 else 0
+        if min_len < 1:
             import warnings
             warnings.warn(
                 f"StreamingFractalTokenizerV3: {(lengths_tensor == 0).sum().item()} samples "
                 "have 0 tokens. Clamping to min=1."
             )
-            lengths_tensor = lengths_tensor.clamp(min=1)
-            # 同步更新 num_tokens_list
-            num_tokens_list = lengths_tensor.tolist()
+        # 无条件 clamp (torch.compile 安全)
+        lengths_tensor = lengths_tensor.clamp(min=1)
+        num_tokens_list = lengths_tensor.tolist()
         
         return TokenizerOutput(
             sequences=sequences,
