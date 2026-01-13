@@ -995,6 +995,13 @@ class GumbelTopKSplitter(nn.Module):
             hard_mask[:, 0] = 1.0
             soft_mask[:, 0] = 1.0
         
+        # I24-14 修复: 验证每个 batch 至少选中了一个
+        per_batch_selected = hard_mask.sum(dim=1)  # [B]
+        empty_batches = (per_batch_selected == 0)
+        if empty_batches.any():
+            hard_mask[empty_batches, 0] = 1.0
+            soft_mask[empty_batches, 0] = 1.0
+        
         # STE: 前向用硬掩码，反向用软掩码的梯度
         if self.training and not hard:
             st_mask = hard_mask - soft_mask.detach() + soft_mask
@@ -1182,9 +1189,12 @@ class GumbelTopKSplitter(nn.Module):
         # 应用排除
         consistent_mask = selected_mask * exclusion_mask
         
-        # I24-14: 确保至少每个 batch 有一个 token
-        # 树一致性可能排除所有选择（极端情况），此时强制选择根节点
-        all_excluded = (consistent_mask.sum(dim=1) == 0)
+        # I24-14 核心修复: 使用硬掩码进行 0 token 检查
+        # 原问题: selected_mask 是 STE 软掩码，sum == 0 的浮点比较不可靠
+        # 解决: 先转布尔再比较，确保整数比较准确
+        hard_consistent = (consistent_mask > 0.5)  # 转布尔
+        per_batch_count = hard_consistent.sum(dim=1)  # 整数统计
+        all_excluded = (per_batch_count == 0)  # 整数比较，准确
         if all_excluded.any():
             # 对于被完全排除的 batch，强制选中根节点
             consistent_mask = consistent_mask.clone()
@@ -1233,15 +1243,17 @@ class GumbelTopKSplitter(nn.Module):
             final_selected[empty_batches, 0] = True
             num_selected_per_batch = final_selected.sum(dim=1)
         
-        # I24-14: 防御性断言 - 确保保护生效
-        # 如果仍有空 batch，发出警告并使用 clamp 强制最小值为 1
-        if (num_selected_per_batch == 0).any():
+        # I24-14 核心修复: 最终防御 - 确保 nonzero 不返回空
+        # 这应该永远不触发，但作为最后防线
+        total_selected = final_selected.sum()
+        if total_selected == 0:
             import warnings
             warnings.warn(
-                "GumbelTopKSplitter: Empty batch detected after root fallback. "
-                "Using clamp to ensure min 1 token per batch."
+                "GumbelTopKSplitter: All selections excluded! Forcing root selection for all batches."
             )
-            num_selected_per_batch = num_selected_per_batch.clamp(min=1)
+            final_selected = torch.zeros_like(final_selected)
+            final_selected[:, 0] = True  # 每个 batch 选中根节点
+            num_selected_per_batch = torch.ones(B, dtype=torch.long, device=device)
         
         # 一次性获取所有选中位置 [total_selected, 2] -> (batch_idx, candidate_idx)
         selected_positions = final_selected.nonzero(as_tuple=False)  # [total, 2]
