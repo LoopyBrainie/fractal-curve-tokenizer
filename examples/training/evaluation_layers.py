@@ -475,6 +475,21 @@ class TokenizerEvaluator:
                 output = tokenizer.tokenize(imgs)
                 padded_tokens, lengths = output.get_padded_tokens()
                 
+                # I24-12: 防御性检查 - 确保 lengths 是合理的 token 数量
+                if lengths.min() < 1:
+                    import warnings
+                    warnings.warn(
+                        f"L2 Tokenizer: lengths.min()={lengths.min().item()} < 1. "
+                        "This may indicate a bug in tokenizer or data."
+                    )
+                if lengths.max() > padded_tokens.shape[1]:
+                    import warnings
+                    warnings.warn(
+                        f"L2 Tokenizer: lengths.max()={lengths.max().item()} > "
+                        f"padded_tokens.shape[1]={padded_tokens.shape[1]}. "
+                        "This may indicate inconsistent token counting."
+                    )
+                
                 # 收集 token 数量
                 for i in range(B):
                     n_tokens = lengths[i].item()
@@ -553,7 +568,15 @@ class TokenizerEvaluator:
         
         # 每类 token 统计
         for c, counts in per_class_tokens.items():
-            metrics.per_class_avg_tokens[c] = float(np.mean(counts))
+            avg = float(np.mean(counts))
+            # I24-12: 健壮性检查 - 检测异常模式
+            if avg < 1.0:
+                import warnings
+                warnings.warn(
+                    f"L2 Tokenizer: per_class_avg_tokens[{c}]={avg:.2f} < 1.0. "
+                    "Token count should be at least 1."
+                )
+            metrics.per_class_avg_tokens[c] = avg
         
         return metrics
 
@@ -588,6 +611,9 @@ class AttentionEvaluator:
         
         metrics = L3AttentionMetrics()
         
+        # I24-11: 启用注意力权重存储
+        self._enable_attn_storage(model)
+        
         # 注册 hook 捕获注意力
         self._attention_maps = []
         self._register_attention_hooks(model)
@@ -614,8 +640,23 @@ class AttentionEvaluator:
             
         finally:
             self._remove_hooks()
+            # I24-11: 恢复注意力权重存储状态
+            self._disable_attn_storage(model)
         
         return metrics
+    
+    def _enable_attn_storage(self, model: nn.Module):
+        """I24-11: 启用所有注意力层的权重存储"""
+        for module in model.modules():
+            if hasattr(module, 'store_attn_weights'):
+                module.store_attn_weights = True
+    
+    def _disable_attn_storage(self, model: nn.Module):
+        """I24-11: 禁用所有注意力层的权重存储并清理缓存"""
+        for module in model.modules():
+            if hasattr(module, 'store_attn_weights'):
+                module.store_attn_weights = False
+                module._last_attn_weights = None
     
     def _register_attention_hooks(self, model: nn.Module):
         """注册注意力捕获 hook"""

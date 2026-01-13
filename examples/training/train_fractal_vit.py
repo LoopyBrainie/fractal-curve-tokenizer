@@ -119,11 +119,17 @@ P12 内部向量化优化 (2025-12-29)
     # CIFAR-10 快速测试
     python train_fractal_vit.py --quick-test --use-amp
     
-    # Tiny ImageNet 完整训练 (推荐配置 - 含 P10 优化)
-    python train_fractal_vit.py --dataset tiny-imagenet --epochs 100 --dim 384 \\
-        --depth 12 --heads 8 --dropout 0.1 --drop-path 0.15 --use-amp \\
-        --gradient-checkpoint --compile --channels-last \\
+    # Tiny ImageNet 完整训练 (I24-1 优化配置 - 增强正则化)
+    python train_fractal_vit.py --dataset tiny-imagenet --epochs 100 --dim 320 \\
+        --depth 12 --heads 8 --dropout 0.2 --drop-path 0.2 --weight-decay 0.1 \\
+        --use-amp --gradient-checkpoint --compile --channels-last \\
         --include-soft-entropy --include-elastic-budget
+    
+    # 小数据集推荐配置 (I24-1: 减少过拟合)
+    python train_fractal_vit.py --dataset tiny-imagenet --epochs 150 \\
+        --dim 256 --depth 8 --heads 6 \\
+        --dropout 0.25 --drop-path 0.25 --weight-decay 0.1 \\
+        --freeze-tokenizer --use-amp
     
     # 自定义 P10 参数
     python train_fractal_vit.py --dataset tiny-imagenet --epochs 100 \\
@@ -322,6 +328,10 @@ class TrainingConfig:
     # GumbelTopKSplitter (Scheme D) 参数
     K_min: int  # 最小 token 数量 (硬下界约束)
     K_max: int  # 最大 token 数量 (软上界约束)
+    
+    # I24-1: Tokenizer 冻结选项
+    freeze_tokenizer: bool  # 是否冻结 tokenizer 可学习参数
+    freeze_tokenizer_epochs: int  # 前 N 个 epoch 冻结 (0=全程冻结)
     
     # P6-1: 深度缩放参数
     depth_scale_range: Optional[Tuple[float, float]]  # (σ_min, σ_max)，默认 (0.5, 2.0)
@@ -1476,7 +1486,9 @@ def train_epoch(
             splitter_metrics = {}
             if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
                 splitter = model.tokenizer.splitter
-                if hasattr(splitter, 'get_auxiliary_losses'):
+                # I24-ALIGN: 确保 _last_features 存在 (forward 后应已设置)
+                last_features = getattr(model.tokenizer, '_last_features', None)
+                if hasattr(splitter, 'get_auxiliary_losses') and last_features is not None:
                     # I14-1 D1: 计算 batch 中的平均 token 数用于崩溃检测
                     actual_token_count = None
                     if aux_infos is not None and len(aux_infos) > 0:
@@ -1485,7 +1497,7 @@ def train_epoch(
                             actual_token_count = int(sum(token_counts) / len(token_counts))
                     
                     aux_losses = splitter.get_auxiliary_losses(
-                        features=model.tokenizer._last_features,
+                        features=last_features,
                         image_size=(imgs.shape[2], imgs.shape[3]),
                         include_elastic_budget=config.include_elastic_budget,
                         include_soft_entropy=config.include_soft_entropy,
@@ -2194,6 +2206,12 @@ def main():
     parser.add_argument("--K-max", type=int, default=64,
                        help="Maximum token count (soft upper bound, default: 64)")
     
+    # I24-1: Tokenizer 参数冻结选项 (减少小数据集过拟合)
+    parser.add_argument("--freeze-tokenizer", action="store_true",
+                       help="I24-1: Freeze tokenizer learnable params (thresholds, quota) to reduce overfitting")
+    parser.add_argument("--freeze-tokenizer-epochs", type=int, default=0,
+                       help="I24-1: Freeze tokenizer for first N epochs only (0=freeze all, default: 0)")
+    
     # P6-1: 深度缩放参数
     parser.add_argument("--depth-scale-min", type=float, default=0.5,
                        help="Minimum depth scale σ_min (default: 0.5)")
@@ -2258,13 +2276,14 @@ def main():
     # 训练
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.03,
-                       help="Weight decay (default: 0.03)")
-    parser.add_argument("--dropout", type=float, default=0.1,
-                       help="Dropout rate (default: 0.1)")
-    parser.add_argument("--emb-dropout", type=float, default=0.1)
-    parser.add_argument("--drop-path", type=float, default=0.1,
-                       help="Drop path (stochastic depth) rate")
+    parser.add_argument("--weight-decay", type=float, default=0.1,
+                       help="Weight decay for L2 regularization (default: 0.1, I24-1 tuned)")
+    parser.add_argument("--dropout", type=float, default=0.2,
+                       help="Dropout rate (default: 0.2, I24-1 tuned for small datasets)")
+    parser.add_argument("--emb-dropout", type=float, default=0.15,
+                       help="Embedding dropout rate (default: 0.15)")
+    parser.add_argument("--drop-path", type=float, default=0.2,
+                       help="Drop path (stochastic depth) rate (default: 0.2, I24-1 tuned)")
     parser.add_argument("--label-smoothing", type=float, default=0.1,
                        help="Label smoothing factor (default: 0.1)")
     parser.add_argument("--gradient-clip", type=float, default=1.0)
@@ -2352,6 +2371,9 @@ def main():
         # GumbelTopKSplitter (Scheme D) 参数
         K_min=args.K_min,
         K_max=args.K_max,
+        # I24-1: Tokenizer 冻结配置
+        freeze_tokenizer=args.freeze_tokenizer,
+        freeze_tokenizer_epochs=args.freeze_tokenizer_epochs,
         # P6-1: 深度缩放配置
         depth_scale_range=(args.depth_scale_min, args.depth_scale_max) if not args.no_learnable_depth_scale else None,
         # P6-2: LCA 温度配置
@@ -2450,8 +2472,21 @@ def main():
     
     model = FractalCurveViT(**model_kwargs).to(device)
     
+    # I24-1: Tokenizer 参数冻结 (减少小数据集过拟合)
+    frozen_tokenizer_params = []
+    if config.freeze_tokenizer:
+        for name, param in model.tokenizer.named_parameters():
+            # 冻结 splitter 中的可学习参数 (thresholds, quota, temperature)
+            if 'threshold' in name or 'quota' in name or 'temperature' in name:
+                param.requires_grad = False
+                frozen_tokenizer_params.append(name)
+        if frozen_tokenizer_params:
+            freeze_mode = "permanent" if config.freeze_tokenizer_epochs == 0 else f"first {config.freeze_tokenizer_epochs} epochs"
+            print(f"[I24-1] Frozen tokenizer params ({freeze_mode}): {frozen_tokenizer_params}")
+    
     # 打印模型信息
     params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     split_info = f"GumbelTopKSplitter (K∈[{config.K_min}, {config.K_max}])"
     tokenizer_name = f'StreamingFractalTokenizerV3 ({split_info})'
     
@@ -2468,7 +2503,9 @@ def main():
     print(f"Hilbert Bias: LCA (only mode after P11-8 cleanup)")
     print(f"  - Depth Scale (P6-1): {depth_scale_info}")
     print(f"  - LCA Temperature (P6-2): {temp_info}")
-    print(f"Parameters: {params:,}")
+    print(f"Parameters: {params:,} (trainable: {trainable_params:,})")
+    if config.freeze_tokenizer:
+        print(f"  - Tokenizer Frozen (I24-1): {len(frozen_tokenizer_params)} params")
     print(f"Gradient Checkpoint: {config.gradient_checkpoint}")
     print(f"Compile Model: {config.compile_model}")
     print(f"Channels Last: {config.channels_last}")
@@ -2784,6 +2821,15 @@ def main():
         gc.collect()
         if device.type == 'cuda':
             torch.cuda.empty_cache()
+        
+        # I24-1: 可选的 tokenizer 参数解冻 (在指定 epoch 后)
+        if config.freeze_tokenizer and config.freeze_tokenizer_epochs > 0:
+            if epoch == config.freeze_tokenizer_epochs + 1:
+                # 解冻 tokenizer 可学习参数
+                for name, param in model.tokenizer.named_parameters():
+                    if 'threshold' in name or 'quota' in name or 'temperature' in name:
+                        param.requires_grad = True
+                print(f"[I24-1] Epoch {epoch}: Unfreezing tokenizer params (warm start phase complete)")
         
         # P7-7 + P10-15: 温度退火和偏置退火调度 (同步控制)
         # 说明: 温度退火已在训练开始前通过 enable_temperature_annealing() 启用

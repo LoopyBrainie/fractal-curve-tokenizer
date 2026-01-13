@@ -9,17 +9,15 @@
 #    -------------------------
 #    Tiny-ImageNet: N_train = 100,000 samples, C = 200 classes
 #    
-#    经验法则 (考虑正则化):
-#      P_target ∈ [N/10, N/5] × regularization_factor
-#               = [10M, 20M] × 1.5 = [15M, 30M]
+#    双倍下降理论最优区间 (Belkin et al., 2019):
+#      P_target ∈ [N/2, 2N] = [50K, 200K] 参数 (插值阈值后)
+#      考虑正则化: 可扩展到 ~30M
 #    
-#    选择: dim=320, depth=12, heads=8 → θ ≈ 20M
+#    选择: dim=384, depth=12, heads=8 → θ ≈ 30M
 #    验证:
-#      P_attn = 4 × 320² + 4 × 320 = 410,880
-#      P_ffn(SwiGLU) = 3 × 320 × 1280 + 1600 = 1,230,400
-#      P_layer = 1,641,280
-#      P_transformer = 12 × 1,641,280 ≈ 19.7M
-#      P_total ≈ 20M ✓
+#      P_transformer = 12 × (4×384² + 3×384×1536) ≈ 28M
+#      P_tokenizer + P_head ≈ 2M
+#      P_total ≈ 30M ✓
 #
 # 2. I21 深度平衡机制 (自动启用)
 #    -----------------------------------
@@ -72,14 +70,14 @@ uv run python examples/training/train_fractal_vit.py `
   --epochs 100 `
   `
   <# ====================================================================== #> `
-  <# 模型架构 (~20M 参数 - I21 优化容量)                                     #> `
-  <# 验证: dim=320, depth=12, heads=8 → P ≈ 20M                             #> `
-  <# dim_head = dim / heads = 320 / 8 = 40                                   #> `
+  <# 模型架构 (~30M 参数 - 数学推导最优)                                     #> `
+  <# 验证: dim=384, depth=12, heads=8 → P ≈ 30M                             #> `
+  <# dim_head = dim / heads = 384 / 8 = 48                                   #> `
   <# ====================================================================== #> `
-  --dim 320 `
+  --dim 384 `
   --depth 12 `
   --heads 8 `
-  --dim-head 40 `
+  --dim-head 48 `
   --max-level 3 `
   --pool cls `
   --ffn-type swiglu_level `
@@ -87,32 +85,33 @@ uv run python examples/training/train_fractal_vit.py `
   <# ====================================================================== #> `
   <# Scheme D: GumbelTopKSplitter 配置                                      #> `
   <#   num_scales=4 → max_depth=3 → 候选数=85                               #> `
-  <#   K_min=16, K_max=64 (token 数硬约束)                               #> `
+  <#   K_min=12 (信息论: √C/2 ≈ 7, 取 12 安全余量)                          #> `
+  <#   K_max=64 (token 数软上限)                                            #> `
   <#   I21 深度平衡: 自动启用 (constants.py 默认值)                          #> `
   <# ====================================================================== #> `
   --tokenizer-type streaming_v3 `
   --num-scales 4 `
-  --K-min 16 `
+  --K-min 12 `
   --K-max 64 `
   `
   <# ====================================================================== #> `
   <# 训练配置 (batch_size=192 最大化 GPU 利用率)                            #> `
-  <#   lr = 1.2e-3 (线性缩放 + 保守调整 0.8×)                               #> `
-  <# ====================================================================== #> `
-  <# 学习率: lr = 5e-4 × (192/256) = 3.75e-4                                #> `
+  <#   lr_base = 3e-4 @ batch_size=256                                      #> `
+  <#   lr = lr_base × (B/256) = 3e-4 × 0.75 ≈ 2.5e-4 (考虑 mixup 补偿)      #> `
   <# ====================================================================== #> `
   --batch-size 192 `
   --num-workers 4 `
-  --lr 3.75e-4 `
-  --weight-decay 0.05 `
+  --lr 2.5e-4 `
+  --weight-decay 0.1 `
   --warmup-epochs 10 `
   `
   <# ====================================================================== #> `
-  <# 正则化 (较强 - 防止 200 类 × 500 样本/类 过拟合)                       #> `
+  <# 正则化 (适应 30M 模型 + 100K 样本的过拟合风险)                         #> `
+  <#   drop_path = 0.1 + 0.1 × log2(12/6) = 0.2                              #> `
   <# ====================================================================== #> `
-  --dropout 0.15 `
-  --emb-dropout 0.1 `
-  --drop-path 0.15 `
+  --dropout 0.2 `
+  --emb-dropout 0.15 `
+  --drop-path 0.2 `
   --label-smoothing 0.1 `
   `
   <# ====================================================================== #> `
@@ -132,20 +131,26 @@ uv run python examples/training/train_fractal_vit.py `
   --soft-entropy-mode maximize `
   --soft-entropy-weight 0.1 `
   --include-elastic-budget `
-  --elastic-N-min 16 `
-  --elastic-N-max 96 `
+  --elastic-N-min 12 `
+  --elastic-N-max 80 `
   --elastic-lambda-over 0.1 `
   --elastic-lambda-under 0.01 `
   --elastic-lambda-collapse 1.0 `
   `
   <# ====================================================================== #> `
-  <# Splitter 温度退火 (P10-11 安全下界 T_end=0.3)                          #> `
-  <#   公式: T(t) = T_start × (T_end / T_start)^(t / S_post)                #> `
-  <#   Warmup=10 epochs 期间固定 T=T_start                                  #> `
+  <# Splitter 温度退火 (cosine schedule)                                    #> `
+  <#   T(t) = T_end + (T_start - T_end) × (1 + cos(πt/T)) / 2               #> `
+  <#   T_end=0.5 保持梯度流 (Jang et al., 2017)                             #> `
   <# ====================================================================== #> `
   --splitter-temp-start 1.0 `
-  --splitter-temp-end 0.3 `
-  --splitter-temp-warmup 10 `
+  --splitter-temp-end 0.5 `
+  --splitter-temp-warmup 5 `
+  `
+  <# ====================================================================== #> `
+  <# LCA Hilbert Bias (P6-2)                                                #> `
+  <#   τ=1.5 提供 SNR=1.5 的位置偏置                                        #> `
+  <# ====================================================================== #> `
+  --lca-temperature 1.5 `
   `
   <# ====================================================================== #> `
   <# 性能优化 (4070 Laptop 最大化)                                          #> `
@@ -167,4 +172,4 @@ uv run python examples/training/train_fractal_vit.py `
   --patience 15 `
   --min-delta 0.001 `
   --progressive-aug `
-  --exp-name tiny_imagenet_i21_320d_12l_bs192
+  --exp-name tiny_imagenet_optimal_384d_12l_bs192
