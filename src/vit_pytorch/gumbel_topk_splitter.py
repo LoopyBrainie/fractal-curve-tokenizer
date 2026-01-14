@@ -95,6 +95,9 @@ from .constants import (
     QUOTA_MIN_PER_DEPTH,
     QUOTA_INIT_LOGITS,
     QUOTA_ENTROPY_WEIGHT,
+    # I29-2: 阈值方差正则化
+    THRESHOLD_VAR_REG_ENABLED,
+    THRESHOLD_VAR_REG_WEIGHT,
 )
 
 
@@ -1206,10 +1209,6 @@ class GumbelTopKSplitter(nn.Module):
         性能优化 (P-OPT-1):
             使用向量化操作替换 Python for 循环，避免 B 次小张量操作。
             通过 nonzero() + scatter 一次性处理所有 batch。
-            
-        I24-14 torch.compile 兼容性:
-            使用无条件张量操作替代数据依赖的 if 语句，
-            确保编译图包含所有防御路径。
         """
         B, N = consistent_mask.shape
         device = consistent_mask.device
@@ -1217,17 +1216,17 @@ class GumbelTopKSplitter(nn.Module):
         # 使用硬阈值选择最终区域
         final_selected = (consistent_mask > 0.5)  # [B, N]
         
-        # I24-14: 无条件保证根节点被选中 (torch.compile 安全)
-        # 使用纯张量操作，避免 inplace 赋值
-        # 创建 one-hot 根节点掩码: [B, N] 其中 [:, 0] = True
-        root_indices = torch.zeros(B, 1, dtype=torch.long, device=device)  # [B, 1] 全是 0
-        root_mask = torch.zeros(B, N, dtype=torch.bool, device=device)
-        root_mask = root_mask.scatter(1, root_indices, True)  # 非 inplace scatter
-        final_selected = final_selected | root_mask  # 无条件添加根节点
-        
         # P-OPT-1: 向量化收集选中区域
-        # 计算每个 batch 的选中数量 (现在保证 >= 1)
+        # 计算每个 batch 的选中数量
         num_selected_per_batch = final_selected.sum(dim=1)  # [B]
+        
+        # 确保每个 batch 至少有一个 token (根节点)
+        empty_batches = (num_selected_per_batch == 0)
+        if empty_batches.any():
+            # 对空 batch 强制选中根节点 (index 0)
+            final_selected = final_selected.clone()
+            final_selected[empty_batches, 0] = True
+            num_selected_per_batch = final_selected.sum(dim=1)
         
         # 一次性获取所有选中位置 [total_selected, 2] -> (batch_idx, candidate_idx)
         selected_positions = final_selected.nonzero(as_tuple=False)  # [total, 2]
@@ -1417,6 +1416,15 @@ class GumbelTopKSplitter(nn.Module):
         if LEARNABLE_QUOTA_ENABLED and self.quota_logits is not None:
             quota_entropy_loss = self.get_quota_entropy_loss(weight=QUOTA_ENTROPY_WEIGHT)
             losses['quota_entropy_loss'] = quota_entropy_loss
+        
+        # ====================================================================
+        # I29-2: 阈值方差正则化损失
+        # 数学: L_threshold = λ × Var(τ)
+        # 目的: 防止某个深度的阈值极端偏离，导致选择偏差
+        # ====================================================================
+        if THRESHOLD_VAR_REG_ENABLED:
+            threshold_var_loss = torch.var(self.threshold_offsets) * THRESHOLD_VAR_REG_WEIGHT
+            losses['threshold_var_loss'] = threshold_var_loss
         
         # ====================================================================
         # I23-5-FIX: 最终 NaN/Inf 检查与清理

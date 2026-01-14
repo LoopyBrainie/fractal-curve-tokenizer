@@ -108,6 +108,10 @@ class FractalCurveViT(nn.Module):
         # I23-2: Token 数量约束
         K_min: int = 8,
         K_max: int = 64,
+        # I27: 子模块 Dropout 配置
+        # 设计原理: 允许统一控制正则化强度，避免硬编码值
+        splitter_dropout: Optional[float] = None,  # None = 跟随主 dropout
+        pos_dropout: Optional[float] = None,       # None = 跟随主 dropout * 0.5
     ) -> None:
         """初始化 FractalCurveViT。
         
@@ -138,6 +142,12 @@ class FractalCurveViT(nn.Module):
             learnable_temperature: (P6-2) 是否使温度可学习
             K_min: (I23-2) GumbelTopKSplitter 最小 token 数量硬下界
             K_max: (I23-2) GumbelTopKSplitter 最大 token 数量
+            splitter_dropout: (I27) Splitter MLP dropout
+                - None: 自动 = min(dropout, 0.15)  # Splitter 不宜过高
+                - float: 显式指定
+            pos_dropout: (I27) Position Embedding dropout
+                - None: 自动 = dropout * 0.5  # 信息瓶颈需保守
+                - float: 显式指定
         """
         super().__init__()
 
@@ -154,6 +164,20 @@ class FractalCurveViT(nn.Module):
         self._is_streaming = True  # 现在所有 tokenizer 都是 streaming 模式
         self.lca_temperature = lca_temperature
         self.learnable_temperature = learnable_temperature
+        
+        # ====================================================================
+        # I27: 子模块 Dropout 配置 (避免硬编码)
+        # ====================================================================
+        # 数学依据:
+        #   - Splitter MLP 敏感: 过高 dropout 导致分割决策不稳定
+        #   - Position Embedding 是信息瓶颈: 需保守正则化
+        # 
+        # 推导公式:
+        #   splitter_dropout = min(dropout, 0.15)  # cap at 0.15
+        #   pos_dropout = dropout * 0.5            # half of main dropout
+        # ====================================================================
+        effective_splitter_dropout = splitter_dropout if splitter_dropout is not None else min(dropout, 0.15)
+        effective_pos_dropout = pos_dropout if pos_dropout is not None else (dropout * 0.5)
 
         # === Tokenizer 选择逻辑 ===
         if tokenizer is not None:
@@ -162,6 +186,7 @@ class FractalCurveViT(nn.Module):
         elif tokenizer_type == "streaming_v3":
             base_ps = min_patch_size[0]
             max_depth_v3 = num_scales - 1  # num_scales 个尺度对应 max_depth = num_scales - 1
+            # I27: 传递 splitter_dropout 到 Tokenizer
             tokenizer = StreamingFractalTokenizerV3(
                 image_size=self.image_size,
                 channels=channels,
@@ -170,6 +195,7 @@ class FractalCurveViT(nn.Module):
                 max_depth=max_depth_v3,
                 K_min=K_min,
                 K_max=K_max,
+                splitter_dropout=effective_splitter_dropout,  # I27: 可配置
             )
         else:
             raise ValueError(f"Unknown tokenizer_type: {tokenizer_type}. Use 'streaming_v3'.")
@@ -193,6 +219,7 @@ class FractalCurveViT(nn.Module):
         self.token_processor = None
 
         # 高级分形位置编码
+        # I27: 传递 pos_dropout 到 Position Embedding
         if position_embedding is None:
             position_embedding = FractalPositionEmbedding(
                 dim=dim,
@@ -200,6 +227,7 @@ class FractalCurveViT(nn.Module):
                 max_seq_len=10000,
                 use_hilbert_encoding=use_hilbert_encoding,
                 use_spatial_encoding=use_spatial_encoding,
+                dropout=effective_pos_dropout,  # I27: 可配置
             )
 
         self.pos_embedding = position_embedding

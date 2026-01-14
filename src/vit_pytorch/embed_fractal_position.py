@@ -59,6 +59,22 @@ class FractalPositionEmbedding(nn.Module):
     
     P11-2 修复: max_level 参数现在应传入与 tokenizer.max_depth 一致的值，
     确保 Embedding 表大小与实际使用的深度范围匹配，减少约 90% 的参数浪费。
+    
+    I27-2 修复: 添加 dropout 参数，允许统一控制正则化强度。
+    
+    数学依据 (Dropout in Position Embedding)
+    =========================================
+    Position Embedding 是信息瓶颈，需要保持信号完整性。
+    
+    推荐配置:
+        dropout ∈ [0.05, 0.15]
+        
+    分析:
+        - 过高 dropout (>0.2): 位置信息丢失 → 模型无法学习空间关系
+        - 过低 dropout (<0.05): 过拟合到特定位置模式
+        
+    经验公式:
+        p_pos ≈ 0.5 × p_transformer  (位置编码应比主干更保守)
     """
 
     def __init__(
@@ -68,6 +84,8 @@ class FractalPositionEmbedding(nn.Module):
         max_seq_len: int = 10000,
         use_hilbert_encoding: bool = True,
         use_spatial_encoding: bool = True,
+        # I27-2: 可配置 Dropout (默认 0.1，约为 transformer dropout 的一半)
+        dropout: float = 0.1,
     ):
         super().__init__()
         self.dim = dim
@@ -75,6 +93,7 @@ class FractalPositionEmbedding(nn.Module):
         self.max_seq_len = max_seq_len
         self.use_hilbert_encoding = use_hilbert_encoding
         self.use_spatial_encoding = use_spatial_encoding
+        self.dropout_rate = dropout  # I27-2: 保存用于调试
 
         # 1. 深度编码 (Depth Embedding)
         self.depth_embedding = nn.Embedding(max_level + 1, dim)
@@ -87,11 +106,12 @@ class FractalPositionEmbedding(nn.Module):
 
         # 3. 融合网络 (简化版)
         # 输入: Depth Emb + Path Emb
+        # I27-2: 使用可配置 dropout 替代硬编码
         self.fusion_network = nn.Sequential(
             nn.Linear(dim, dim),
             nn.LayerNorm(dim),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),  # I27-2: 使用传入的 dropout 参数
         )
 
         # P11-5: 删除了 level_attention_bias，注意力偏置由 LCAHilbertBias 统一提供

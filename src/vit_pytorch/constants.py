@@ -126,6 +126,8 @@ TEMPERATURE_MIN: float = 0.1
 
 #: Log-Compensation 是否启用
 #: 数学: b_d = log(N_total / N_d) 实现期望均衡
+#: I29-3: 当 LEARNABLE_QUOTA_ENABLED=True 时，此选项被忽略
+#:        分层 Top-K 已通过配额保证深度分布，无需 Log-Compensation
 LOG_COMPENSATION_ENABLED: bool = True
 
 #: I23-1 方案C: 深度方差归一化是否启用
@@ -173,7 +175,8 @@ LEARNABLE_QUOTA_ENABLED: bool = True
 
 #: 每个深度的最小配额 (防止死区)
 #: 数学: K_d >= K_MIN_PER_DEPTH 保证梯度流
-QUOTA_MIN_PER_DEPTH: int = 1
+#: I26-1: 从 1 增加到 2，防止 tree consistency 后完全清空
+QUOTA_MIN_PER_DEPTH: int = 2
 
 #: 配额初始化 (对数空间，softmax 后 = DEPTH_QUOTA_TARGET)
 #: 计算: φ_d = log(p_d) - mean(log(p))
@@ -194,6 +197,17 @@ THRESHOLD_VAR_REG_ENABLED: bool = True
 #: 阈值方差正则化权重
 #: 设计: 0.3 使梯度量级与其他辅助损失匹配
 THRESHOLD_VAR_REG_WEIGHT: float = 0.3
+
+# ==================== I26-1: 重叠惩罚常量 ====================
+
+#: 是否启用父子重叠惩罚 (默认关闭)
+#: 数学: L_overlap = λ × Σ(parent_selected × child_selected) / K
+#: 用途: 当父子共存导致冗余时启用
+OVERLAP_PENALTY_ENABLED: bool = False
+
+#: 重叠惩罚权重
+#: 推导: 若典型重叠率 ρ ≈ 0.1，weight = 0.1 使 L ≈ 0.01 (轻量正则)
+OVERLAP_PENALTY_WEIGHT: float = 0.1
 
 #: Subset Softmax 是否启用
 #: 数学: 将 STE softmax 从 N=85 缩小到 K=32，梯度增强 ~2.7x

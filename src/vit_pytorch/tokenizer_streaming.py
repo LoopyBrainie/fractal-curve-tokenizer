@@ -120,6 +120,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # I20: Gumbel-Top-K 参数
         K_min: int = 8,
         K_max: int = 64,
+        # I27-1: Splitter Dropout 配置
+        # 数学依据: Splitter MLP 规模 ~64×128，推荐 p ∈ [0.1, 0.15]
+        # 过高 dropout 会降低分割决策质量，过低则正则化不足
+        splitter_dropout: float = 0.1,
     ) -> None:
         super().__init__()
         
@@ -168,6 +172,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # =====================================================================
         from .gumbel_topk_splitter import GumbelTopKSplitter
         
+        # I27-1: 使用传入的 splitter_dropout 而非硬编码值
+        # 允许训练器统一控制正则化强度
         self.splitter = GumbelTopKSplitter(
             feature_dim=d_model,
             max_depth=max_depth,
@@ -176,7 +182,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             temperature=learnable_temperature,
             K_min=K_min,
             K_max=K_max,
-            dropout=0.1,
+            dropout=splitter_dropout,  # I27-1: 可配置
             use_dynamic_k=True,
             image_size=image_size,
         )
