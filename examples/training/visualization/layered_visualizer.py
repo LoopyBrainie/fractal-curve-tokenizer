@@ -53,6 +53,8 @@ from .layer_attention import L3AttentionVisualizer
 from .layer_representation import L4RepresentationVisualizer
 from .layer_efficiency import L5EfficiencyVisualizer
 from .layer_stability import L6StabilityVisualizer
+from .layer_splitter import L7SplitterVisualizer
+from .layer_gradient import L8GradientFlowVisualizer
 
 
 @dataclass
@@ -72,6 +74,8 @@ class LayeredVisualizationReport:
         "L4_Representation",
         "L5_Efficiency",
         "L6_Stability",
+        "L7_Splitter",
+        "L8_GradientFlow",
     ])
     
     @property
@@ -150,6 +154,8 @@ class LayeredVisualizer:
         self.L4 = L4RepresentationVisualizer(self.config)
         self.L5 = L5EfficiencyVisualizer(self.config)
         self.L6 = L6StabilityVisualizer(self.config)
+        self.L7 = L7SplitterVisualizer(self.config)
+        self.L8 = L8GradientFlowVisualizer(self.config)
         
         self._layer_map = {
             "L1_Classification": self.L1,
@@ -158,6 +164,8 @@ class LayeredVisualizer:
             "L4_Representation": self.L4,
             "L5_Efficiency": self.L5,
             "L6_Stability": self.L6,
+            "L7_Splitter": self.L7,
+            "L8_GradientFlow": self.L8,
         }
     
     def visualize_all(
@@ -267,6 +275,30 @@ class LayeredVisualizer:
             print(f"    Generated {len(vis_report.results['L6_Stability'])} figures")
         except Exception as e:
             print(f"    [WARN] L6 visualization failed: {e}")
+        
+        # L7: Splitter 可视化（如果有）
+        if hasattr(report, 'L7_splitter') and report.L7_splitter is not None:
+            print("\n[L7] Splitter Metrics...")
+            try:
+                vis_report.results["L7_Splitter"] = self.L7.visualize(
+                    report.L7_splitter,
+                    **kwargs.get("L7", {}),
+                )
+                print(f"    Generated {len(vis_report.results['L7_Splitter'])} figures")
+            except Exception as e:
+                print(f"    [WARN] L7 visualization failed: {e}")
+        
+        # L8: 梯度流可视化（如果有）
+        if hasattr(report, 'L8_gradient_flow') and report.L8_gradient_flow is not None:
+            print("\n[L8] Gradient Flow...")
+            try:
+                vis_report.results["L8_GradientFlow"] = self.L8.visualize(
+                    report.L8_gradient_flow,
+                    **kwargs.get("L8", {}),
+                )
+                print(f"    Generated {len(vis_report.results['L8_GradientFlow'])} figures")
+            except Exception as e:
+                print(f"    [WARN] L8 visualization failed: {e}")
         
         print("\n" + "=" * 60)
         print(f"Total: {vis_report.total_figures} figures generated")

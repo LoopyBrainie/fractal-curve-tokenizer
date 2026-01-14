@@ -45,6 +45,7 @@ from .base import (
     VisualizationLayer,
     VisualizationResult,
     compute_entropy,
+    safe_tight_layout,
 )
 
 # 尝试导入 evaluation_layers 中的数据类
@@ -144,7 +145,37 @@ class L3AttentionVisualizer(VisualizationLayer):
             result.names.append("L3_lca_bias")
             result.descriptions.append("LCA Hilbert Bias 热图")
         
-        # 5. 综合摘要
+        # 5. LCA-注意力相关性分析（如果有）
+        if lca_bias_matrix is not None and attention_weights is not None:
+            fig = self._plot_lca_attention_correlation(
+                lca_bias_matrix,
+                attention_weights,
+            )
+            result.figures.append(fig)
+            result.names.append("L3_lca_correlation")
+            result.descriptions.append("LCA Bias 与注意力权重相关性")
+        
+        # 6. Per-Depth 注意力分析（如果有）
+        if token_depths is not None and attention_weights is not None:
+            fig = self._plot_per_depth_attention(
+                attention_weights,
+                token_depths,
+            )
+            result.figures.append(fig)
+            result.names.append("L3_per_depth_attention")
+            result.descriptions.append("不同深度 Token 的注意力模式")
+        
+        # 7. Hilbert 局部性分析（如果有）
+        if hasattr(metrics, 'hilbert_locality_score'):
+            fig = self._plot_hilbert_locality(
+                metrics.hilbert_locality_score,
+                metrics.hilbert_locality_by_layer if hasattr(metrics, 'hilbert_locality_by_layer') else None,
+            )
+            result.figures.append(fig)
+            result.names.append("L3_hilbert_locality")
+            result.descriptions.append("Hilbert 局部性评分")
+        
+        # 8. 综合摘要
         fig = self._plot_summary(metrics)
         result.figures.append(fig)
         result.names.append("L3_summary")
@@ -209,7 +240,7 @@ class L3AttentionVisualizer(VisualizationLayer):
                 ha='center', fontsize=10, style='italic')
         
         fig.suptitle("L3: Attention Entropy Analysis", fontsize=14, fontweight='bold')
-        plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+        safe_tight_layout(rect=[0, 0.05, 1, 0.95])
         return fig
     
     def _plot_head_utilization(
@@ -281,7 +312,7 @@ class L3AttentionVisualizer(VisualizationLayer):
         ax2.set_title("Mean Utilization", fontsize=12, fontweight='bold')
         
         fig.suptitle("L3: Multi-Head Attention Utilization", fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_cls_attention(
@@ -364,7 +395,7 @@ class L3AttentionVisualizer(VisualizationLayer):
         ax2.set_title("CLS Attention Distribution (Last Layer)", fontsize=12, fontweight='bold')
         
         fig.suptitle("L3: CLS Token Attention Analysis", fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_lca_bias(
@@ -391,7 +422,7 @@ class L3AttentionVisualizer(VisualizationLayer):
         cbar = plt.colorbar(im, ax=ax1, fraction=0.046, pad=0.04)
         cbar.set_label('LCA Bias Value', fontsize=10)
         
-        ax1.set_title(f"LCA Hilbert Bias Matrix\n({n_tokens} × {n_tokens})",
+        ax1.set_title(f"LCA Hilbert Bias Matrix\n({n_tokens} x {n_tokens})",
                      fontsize=12, fontweight='bold')
         
         # 2. 偏置分布 + 深度关系
@@ -420,40 +451,440 @@ class L3AttentionVisualizer(VisualizationLayer):
         
         fig.suptitle("L3: LCA (Lowest Common Ancestor) Hilbert Bias",
                     fontsize=14, fontweight='bold')
-        plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+        safe_tight_layout(rect=[0, 0.05, 1, 0.95])
         return fig
     
+    def _plot_lca_attention_correlation(
+        self,
+        lca_bias_matrix: np.ndarray,
+        attention_weights: List[np.ndarray],
+    ) -> Figure:
+        """绘制 LCA Bias 与注意力权重的相关性
+        
+        数学形式：
+            ρ = corr(LCA_bias(i,j), A(i,j))
+            高相关性表示注意力遵循 Hilbert 局部性
+        
+        Args:
+            lca_bias_matrix: LCA 偏置矩阵 [N, N]
+            attention_weights: 每层注意力权重
+        """
+        n_layers = len(attention_weights)
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        
+        # 提取 LCA 偏置的非对角元素
+        n_tokens = lca_bias_matrix.shape[0]
+        mask = ~np.eye(n_tokens, dtype=bool)
+        lca_flat = lca_bias_matrix[mask]
+        
+        correlations = []
+        
+        # 1. 散点图（最后一层）
+        ax1 = axes[0]
+        if len(attention_weights) > 0:
+            last_attn = attention_weights[-1]
+            # 平均多头
+            if len(last_attn.shape) == 3:
+                last_attn = last_attn.mean(axis=0)
+            # 确保形状匹配
+            if last_attn.shape[0] == n_tokens:
+                attn_flat = last_attn[mask]
+                
+                # 散点图
+                ax1.scatter(lca_flat, attn_flat, alpha=0.3, s=5, c='#3498db')
+                
+                # 线性拟合
+                if len(lca_flat) > 10:
+                    try:
+                        z = np.polyfit(lca_flat, attn_flat, 1)
+                        p = np.poly1d(z)
+                        x_line = np.linspace(lca_flat.min(), lca_flat.max(), 100)
+                        ax1.plot(x_line, p(x_line), 'r-', linewidth=2, label='Linear Fit')
+                        
+                        # 计算相关系数，防止 NaN
+                        corr = np.corrcoef(lca_flat, attn_flat)[0, 1]
+                        if np.isfinite(corr):
+                            ax1.text(0.05, 0.95, f'rho = {corr:.3f}', transform=ax1.transAxes,
+                                    fontsize=12, fontweight='bold', va='top')
+                    except Exception:
+                        pass  # 忽略拟合失败
+                    
+                ax1.legend()
+        
+        ax1.set_xlabel("LCA Bias", fontsize=11)
+        ax1.set_ylabel("Attention Weight", fontsize=11)
+        ax1.set_title("LCA-Attention Correlation (Last Layer)", fontsize=12, fontweight='bold')
+        
+        # 2. 每层相关系数
+        ax2 = axes[1]
+        for l, attn in enumerate(attention_weights):
+            if len(attn.shape) == 3:
+                attn = attn.mean(axis=0)
+            if attn.shape[0] == n_tokens:
+                attn_flat = attn[mask]
+                try:
+                    corr = np.corrcoef(lca_flat, attn_flat)[0, 1]
+                    if not np.isfinite(corr):
+                        corr = 0.0
+                except Exception:
+                    corr = 0.0
+                correlations.append(corr)
+            else:
+                correlations.append(0.0)
+        
+        layers = np.arange(n_layers)
+        colors = ['#2ecc71' if c > 0.3 else '#f39c12' if c > 0.1 else '#e74c3c' 
+                 for c in correlations]
+        ax2.bar(layers, correlations, color=colors, edgecolor='white')
+        ax2.axhline(0.3, color='green', linestyle='--', alpha=0.5, label='Good (0.3)')
+        ax2.axhline(0.1, color='orange', linestyle='--', alpha=0.5, label='Weak (0.1)')
+        ax2.set_xlabel("Layer", fontsize=11)
+        ax2.set_ylabel("Correlation ρ", fontsize=11)
+        ax2.set_xticks(layers)
+        ax2.legend(loc='lower right', fontsize=9)
+        ax2.set_title("LCA-Attention Correlation per Layer", fontsize=12, fontweight='bold')
+        
+        # 3. 相关性仪表盘
+        ax3 = axes[2]
+        valid_corrs = [c for c in correlations if np.isfinite(c)]
+        avg_corr = np.mean(valid_corrs) if valid_corrs else 0.0
+        self._draw_correlation_gauge(ax3, avg_corr)
+        ax3.set_title("Average LCA Correlation", fontsize=12, fontweight='bold')
+        
+        fig.suptitle("L3: LCA Bias - Attention Weight Correlation Analysis",
+                    fontsize=14, fontweight='bold')
+        safe_tight_layout()
+        return fig
+    
+    def _draw_correlation_gauge(self, ax, value: float):
+        """绘制相关性仪表盘"""
+        ax.set_xlim(-1.5, 1.5)
+        ax.set_ylim(-0.5, 1.5)
+        ax.set_aspect('equal')
+        ax.axis('off')
+        
+        # 半圆仪表
+        theta = np.linspace(0, np.pi, 100)
+        r = 1.0
+        
+        # 背景弧（分三段颜色）
+        segments = [
+            (0, np.pi/3, '#e74c3c'),       # 红色：低相关
+            (np.pi/3, 2*np.pi/3, '#f39c12'), # 橙色：中等
+            (2*np.pi/3, np.pi, '#2ecc71'),   # 绿色：高相关
+        ]
+        
+        for start, end, color in segments:
+            t = np.linspace(start, end, 30)
+            ax.fill_between(r * np.cos(t), [0]*len(t), r * np.sin(t),
+                           color=color, alpha=0.3)
+            ax.plot(r * np.cos(t), r * np.sin(t), color=color, linewidth=3)
+        
+        # 指针
+        # 值范围 -1 到 1，映射到 0 到 π
+        angle = np.pi * (1 - (value + 1) / 2)  # 反转方向
+        pointer_len = 0.85
+        ax.arrow(0, 0, pointer_len * np.cos(angle), pointer_len * np.sin(angle),
+                head_width=0.08, head_length=0.05, fc='black', ec='black')
+        
+        # 数值显示
+        ax.text(0, 0.3, f'{value:.3f}', ha='center', va='center',
+               fontsize=20, fontweight='bold')
+        
+        # 状态文字
+        if value > 0.3:
+            status = "Strong Locality"
+            color = '#2ecc71'
+        elif value > 0.1:
+            status = "Moderate"
+            color = '#f39c12'
+        else:
+            status = "Weak Locality"
+            color = '#e74c3c'
+        
+        ax.text(0, -0.3, status, ha='center', va='center',
+               fontsize=12, fontweight='bold', color=color)
+        
+        # 标签
+        ax.text(-1.2, 0, '-1', ha='center', fontsize=10)
+        ax.text(1.2, 0, '1', ha='center', fontsize=10)
+        ax.text(0, 1.2, '0', ha='center', fontsize=10)
+    
+    def _plot_per_depth_attention(
+        self,
+        attention_weights: List[np.ndarray],
+        token_depths: np.ndarray,
+    ) -> Figure:
+        """绘制不同深度 Token 的注意力模式
+        
+        数学形式：
+            A_{d→d'} = mean_{i:depth(i)=d, j:depth(j)=d'} A(i,j)
+            展示 token 在不同 Quadtree 深度间的注意力交互
+        
+        Args:
+            attention_weights: 每层注意力权重
+            token_depths: 每个 token 的深度
+        """
+        unique_depths = np.unique(token_depths)
+        n_depths = len(unique_depths)
+        n_layers = len(attention_weights)
+        
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        
+        # 1. 深度间注意力热图（最后一层）
+        ax1 = axes[0]
+        depth_attn_matrix = np.zeros((n_depths, n_depths))
+        
+        if len(attention_weights) > 0:
+            last_attn = attention_weights[-1]
+            if len(last_attn.shape) == 3:
+                last_attn = last_attn.mean(axis=0)
+            
+            for i, d_i in enumerate(unique_depths):
+                for j, d_j in enumerate(unique_depths):
+                    mask_i = token_depths == d_i
+                    mask_j = token_depths == d_j
+                    
+                    # 提取对应区块
+                    block = last_attn[np.ix_(mask_i, mask_j)]
+                    if block.size > 0:
+                        depth_attn_matrix[i, j] = block.mean()
+        
+        im = ax1.imshow(depth_attn_matrix, cmap='Blues', aspect='auto')
+        ax1.set_xlabel("Target Depth", fontsize=11)
+        ax1.set_ylabel("Source Depth", fontsize=11)
+        ax1.set_xticks(np.arange(n_depths))
+        ax1.set_yticks(np.arange(n_depths))
+        ax1.set_xticklabels([f"d={d}" for d in unique_depths])
+        ax1.set_yticklabels([f"d={d}" for d in unique_depths])
+        
+        # 数值标注
+        for i in range(n_depths):
+            for j in range(n_depths):
+                ax1.text(j, i, f'{depth_attn_matrix[i, j]:.3f}',
+                        ha='center', va='center', fontsize=9)
+        
+        plt.colorbar(im, ax=ax1, fraction=0.046, pad=0.04)
+        ax1.set_title("Depth-to-Depth Attention (Last Layer)", fontsize=12, fontweight='bold')
+        
+        # 2. 每层深度注意力演化（堆叠面积图）
+        ax2 = axes[1]
+        
+        # 计算每层每深度的平均接收注意力
+        depth_receiving = np.zeros((n_layers, n_depths))
+        for l, attn in enumerate(attention_weights):
+            if len(attn.shape) == 3:
+                attn = attn.mean(axis=0)
+            for i, d in enumerate(unique_depths):
+                mask = token_depths == d
+                if mask.sum() > 0 and attn.shape[0] > mask.sum():
+                    depth_receiving[l, i] = attn[:, mask].sum(axis=1).mean()
+        
+        # 堆叠面积图
+        layers_x = np.arange(n_layers)
+        colors = plt.get_cmap('viridis')(np.linspace(0, 1, n_depths))
+        
+        ax2.stackplot(layers_x, depth_receiving.T, labels=[f'd={d}' for d in unique_depths],
+                     colors=colors, alpha=0.8)
+        ax2.set_xlabel("Layer", fontsize=11)
+        ax2.set_ylabel("Total Attention Received", fontsize=11)
+        ax2.legend(loc='upper left', fontsize=9)
+        ax2.set_title("Attention Flow by Depth", fontsize=12, fontweight='bold')
+        
+        # 3. 深度 Token 分布
+        ax3 = axes[2]
+        depth_counts = [np.sum(token_depths == d) for d in unique_depths]
+        colors = plt.get_cmap('viridis')(np.linspace(0, 1, n_depths))
+        
+        bars = ax3.bar(unique_depths, depth_counts, color=colors, edgecolor='white')
+        for bar, count in zip(bars, depth_counts):
+            ax3.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                    str(count), ha='center', fontsize=10)
+        
+        ax3.set_xlabel("Quadtree Depth", fontsize=11)
+        ax3.set_ylabel("Token Count", fontsize=11)
+        ax3.set_title("Token Distribution by Depth", fontsize=12, fontweight='bold')
+        
+        fig.suptitle("L3: Per-Depth Attention Analysis", fontsize=14, fontweight='bold')
+        safe_tight_layout()
+        return fig
+    
+    def _plot_hilbert_locality(
+        self,
+        locality_score: float,
+        locality_by_layer: Optional[List[float]] = None,
+    ) -> Figure:
+        """绘制 Hilbert 局部性评分
+        
+        数学形式：
+            Locality = mean_{i,j: |h(i)-h(j)|<k} A(i,j) / mean A
+            其中 h(i) 是 token i 在 Hilbert 曲线上的位置
+        
+        Args:
+            locality_score: 整体局部性评分
+            locality_by_layer: 每层局部性评分
+        """
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # 1. 整体局部性仪表
+        ax1 = axes[0]
+        self._draw_locality_gauge(ax1, locality_score)
+        ax1.set_title("Overall Hilbert Locality", fontsize=12, fontweight='bold')
+        
+        # 2. 每层局部性
+        ax2 = axes[1]
+        if locality_by_layer:
+            n_layers = len(locality_by_layer)
+            layers = np.arange(n_layers)
+            
+            colors = ['#2ecc71' if s > 0.7 else '#f39c12' if s > 0.4 else '#e74c3c'
+                     for s in locality_by_layer]
+            
+            bars = ax2.bar(layers, locality_by_layer, color=colors, edgecolor='white')
+            ax2.axhline(0.7, color='green', linestyle='--', alpha=0.5, label='Good (0.7)')
+            ax2.axhline(0.4, color='orange', linestyle='--', alpha=0.5, label='Weak (0.4)')
+            
+            for bar, score in zip(bars, locality_by_layer):
+                ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
+                        f'{score:.2f}', ha='center', fontsize=9)
+            
+            ax2.set_xlabel("Layer", fontsize=11)
+            ax2.set_ylabel("Locality Score", fontsize=11)
+            ax2.set_xticks(layers)
+            ax2.set_ylim(0, 1.1)
+            ax2.legend(loc='lower right', fontsize=9)
+        else:
+            ax2.text(0.5, 0.5, f"Overall Locality: {locality_score:.3f}\n\n(Per-layer data not available)",
+                    ha='center', va='center', fontsize=12, transform=ax2.transAxes,
+                    bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8))
+        
+        ax2.set_title("Locality by Layer", fontsize=12, fontweight='bold')
+        
+        # 说明
+        fig.text(0.5, 0.02,
+                "Hilbert Locality: Higher values indicate attention respects space-filling curve proximity",
+                ha='center', fontsize=10, style='italic')
+        
+        fig.suptitle("L3: Hilbert Curve Locality Analysis", fontsize=14, fontweight='bold')
+        safe_tight_layout(rect=[0, 0.05, 1, 0.95])
+        return fig
+    
+    def _draw_locality_gauge(self, ax, value: float):
+        """绘制局部性评分仪表盘"""
+        ax.set_xlim(-1.5, 1.5)
+        ax.set_ylim(-0.5, 1.5)
+        ax.set_aspect('equal')
+        ax.axis('off')
+        
+        # 半圆仪表
+        theta = np.linspace(0, np.pi, 100)
+        r = 1.0
+        
+        # 背景弧（分三段颜色）
+        segments = [
+            (0, np.pi/3, '#e74c3c'),        # 红色：低
+            (np.pi/3, 2*np.pi/3, '#f39c12'), # 橙色：中
+            (2*np.pi/3, np.pi, '#2ecc71'),    # 绿色：高
+        ]
+        
+        for start, end, color in segments:
+            t = np.linspace(start, end, 30)
+            ax.fill_between(r * np.cos(t), [0]*len(t), r * np.sin(t),
+                           color=color, alpha=0.3)
+            ax.plot(r * np.cos(t), r * np.sin(t), color=color, linewidth=3)
+        
+        # 指针（值范围 0 到 1，映射到 π 到 0）
+        angle = np.pi * (1 - value)
+        pointer_len = 0.85
+        ax.arrow(0, 0, pointer_len * np.cos(angle), pointer_len * np.sin(angle),
+                head_width=0.08, head_length=0.05, fc='black', ec='black')
+        
+        # 数值显示
+        ax.text(0, 0.3, f'{value:.3f}', ha='center', va='center',
+               fontsize=20, fontweight='bold')
+        
+        # 状态文字
+        if value > 0.7:
+            status = "Strong Locality"
+            color = '#2ecc71'
+        elif value > 0.4:
+            status = "Moderate"
+            color = '#f39c12'
+        else:
+            status = "Weak Locality"
+            color = '#e74c3c'
+        
+        ax.text(0, -0.3, status, ha='center', va='center',
+               fontsize=12, fontweight='bold', color=color)
+        
+        # 标签
+        ax.text(-1.2, 0, '0', ha='center', fontsize=10)
+        ax.text(1.2, 0, '1', ha='center', fontsize=10)
+        ax.text(0, 1.2, '0.5', ha='center', fontsize=10)
+
     def _plot_summary(self, metrics: Any) -> Figure:
         """绘制 L3 注意力机制摘要"""
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(12, 8))
         ax.axis('off')
         
         # 构建摘要表格
         n_layers = len(metrics.per_layer_entropy) if metrics.per_layer_entropy else 0
         n_heads = len(metrics.head_utilization[0]) if metrics.head_utilization else 0
         
+        # 获取 LCA 和 Hilbert 局部性信息
+        lca_correlation = getattr(metrics, 'lca_attention_correlation', None)
+        hilbert_locality = getattr(metrics, 'hilbert_locality_score', None)
+        
+        lca_str = f"{lca_correlation:>8.4f}" if lca_correlation is not None else "    N/A "
+        locality_str = f"{hilbert_locality:>8.4f}" if hilbert_locality is not None else "    N/A "
+        
+        # 状态判定
+        def get_status(value, thresholds, labels):
+            if value is None:
+                return "N/A", "gray"
+            for thresh, label, color in thresholds:
+                if value >= thresh:
+                    return label, color
+            return labels[-1][0], labels[-1][1]
+        
+        entropy_status, entropy_color = get_status(
+            metrics.avg_entropy,
+            [(0.5, "Balanced", "#2ecc71"), (0.2, "Focused", "#f39c12")],
+            [("Very Focused", "#e74c3c")]
+        )
+        
+        dead_head_status, dh_color = get_status(
+            1 - metrics.dead_head_ratio,
+            [(0.9, "Healthy", "#2ecc71"), (0.7, "Moderate", "#f39c12")],
+            [("Concerning", "#e74c3c")]
+        )
+        
         summary_text = f"""
-┌─────────────────────────────────────────────────┐
-│           L3 Attention Mechanism Summary         │
-├─────────────────────────────────────────────────┤
-│  Architecture                                    │
-│    • Layers: {n_layers:>3}                                    │
-│    • Heads per Layer: {n_heads:>3}                           │
-│    • Total Heads: {n_layers * n_heads:>5}                              │
-├─────────────────────────────────────────────────┤
-│  Attention Entropy                               │
-│    • Average Entropy: {metrics.avg_entropy:>8.4f}                   │
-│    • Min Layer Entropy: {min(metrics.per_layer_entropy) if metrics.per_layer_entropy else 0:>8.4f}                 │
-│    • Max Layer Entropy: {max(metrics.per_layer_entropy) if metrics.per_layer_entropy else 0:>8.4f}                 │
-├─────────────────────────────────────────────────┤
-│  Head Utilization                                │
-│    • Dead Head Ratio: {metrics.dead_head_ratio:>8.1%}                   │
-│    • Active Heads: {int((1 - metrics.dead_head_ratio) * n_layers * n_heads):>5} / {n_layers * n_heads}                  │
-├─────────────────────────────────────────────────┤
-│  CLS Token Analysis                              │
-│    • CLS Coverage: {metrics.cls_attention_coverage:>8.1%}                     │
-│    • CLS Entropy: {metrics.cls_attention_entropy:>8.4f}                    │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│              L3 Attention Mechanism Summary                  │
+├─────────────────────────────────────────────────────────────┤
+│  Architecture                                                │
+│    • Layers: {n_layers:>3}                                                │
+│    • Heads per Layer: {n_heads:>3}                                       │
+│    • Total Heads: {n_layers * n_heads:>5}                                          │
+├─────────────────────────────────────────────────────────────┤
+│  Attention Entropy                          [{entropy_status:^12}]   │
+│    • Average Entropy: {metrics.avg_entropy:>8.4f}                               │
+│    • Min Layer Entropy: {min(metrics.per_layer_entropy) if metrics.per_layer_entropy else 0:>8.4f}                             │
+│    • Max Layer Entropy: {max(metrics.per_layer_entropy) if metrics.per_layer_entropy else 0:>8.4f}                             │
+├─────────────────────────────────────────────────────────────┤
+│  Head Utilization                           [{dead_head_status:^12}]   │
+│    • Dead Head Ratio: {metrics.dead_head_ratio:>8.1%}                               │
+│    • Active Heads: {int((1 - metrics.dead_head_ratio) * n_layers * n_heads):>5} / {n_layers * n_heads}                                  │
+├─────────────────────────────────────────────────────────────┤
+│  CLS Token Analysis                                          │
+│    • CLS Coverage: {metrics.cls_attention_coverage:>8.1%}                                 │
+│    • CLS Entropy: {metrics.cls_attention_entropy:>8.4f}                                │
+├─────────────────────────────────────────────────────────────┤
+│  Hilbert Locality Analysis (NEW)                             │
+│    • LCA-Attention Correlation: {lca_str}                          │
+│    • Hilbert Locality Score: {locality_str}                             │
+└─────────────────────────────────────────────────────────────┘
         """
         
         ax.text(0.5, 0.5, summary_text, transform=ax.transAxes,

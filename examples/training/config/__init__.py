@@ -56,7 +56,37 @@ class DataConfig:
 
 @dataclass
 class ModelConfig:
-    """模型配置"""
+    """模型配置
+    
+    I27 Dropout 配置指南
+    ====================
+    
+    数学依据:
+        根据 Rademacher 复杂度理论，正则化强度应与模型容量/数据量比例相关:
+        
+        p_opt ≈ k × √(params / samples)
+        
+        对于 31.66M 参数、100K 样本:
+        p_opt ≈ k × √(31.66M / 100K) ≈ k × 17.8
+        
+    推荐配置 (Tiny-ImageNet, 100K samples):
+        | 组件 | 推荐值 | 数学依据 |
+        |------|--------|---------|
+        | dropout | 0.15-0.25 | 主干正则化 |
+        | attention_dropout | 0.10-0.15 | Attention 更敏感 |
+        | splitter_dropout | 0.10-0.15 | 分割决策质量 |
+        | pos_dropout | 0.05-0.10 | 信息瓶颈需保守 |
+        
+    过拟合诊断:
+        若 train_acc - val_acc > 15%:
+            → dropout += 0.05
+            → weight_decay *= 1.5
+            
+    欠拟合诊断:
+        若 train_acc < 50% @ epoch 50:
+            → dropout -= 0.05
+            → learning_rate *= 1.5
+    """
     name: str = "fractal_vit"
     
     # 核心参数
@@ -70,14 +100,21 @@ class ModelConfig:
     # MLP
     mlp_ratio: float = 4.0
     
-    # Dropout
+    # Dropout (I27: 添加数学注释)
+    # 主 Transformer dropout，传递到 FFN 和 Attention 输出
     dropout: float = 0.1
+    # Attention 内部 dropout (对 softmax(QK^T/√d) 应用)
     attention_dropout: float = 0.1
     
     # Hilbert Curve 特定
     max_depth: int = 4
     splitter_hidden_dim: int = 128
+    # I27: Splitter MLP dropout
+    # 推荐: min(dropout, 0.15)，过高会导致分割决策不稳定
     splitter_dropout: float = 0.1
+    # I27: Position Embedding Fusion Network dropout
+    # 推荐: dropout * 0.5，信息瓶颈需保守正则化
+    pos_dropout: float = 0.05
 
 
 @dataclass
@@ -89,17 +126,80 @@ class LossConfig:
     - "focal": Focal Loss (Lin et al., 2017)
     - "class_balanced": Class-Balanced CE (Cui et al., 2019)
     - "focal_cb": Focal + Class-Balanced 组合
+    
+    I25-1 Focal Loss 数学指南
+    =========================
+    
+    标准 Cross-Entropy:
+        L_CE = -log(p_t)
+        
+    Focal Loss:
+        L_FL = -α_t (1 - p_t)^γ log(p_t)
+        
+    梯度对比 (γ=2):
+        | p_t | CE梯度 | FL梯度 | 比例 |
+        |-----|--------|--------|------|
+        | 0.9 | 0.11   | 0.0011 | 100x |
+        | 0.5 | 1.0    | 0.25   | 4x   |
+        | 0.1 | 10.0   | 8.1    | 1.2x |
+        
+    效果: 易分类样本梯度降低 100x，难分类样本梯度基本保持
+    
+    推荐配置:
+        - 类别不均衡严重 (accuracy std > 15%): 启用 Focal Loss
+        - γ = 2.0: 平衡配置
+        - γ = 2.5: 推荐值 (I28-1 优化，难/易比 243x)
+        - γ = 3.0-5.0: 极端不均衡时使用
+        - 同时启用 class_balanced 以获得 α_t 权重
+        
+    I28-1 γ 参数优化形式化分析
+    ==========================
+    
+    问题数据 (实验 20260114):
+        - Worst class 准确率: 8-10% (p_t ≈ 0.10)
+        - Best class 准确率: 82-92% (p_t ≈ 0.90)
+        - accuracy_std: 17.81%
+        
+    梯度权重公式:
+        w(p_t) = (1 - p_t)^γ
+        
+    难/易梯度比:
+        R(γ) = w(0.10) / w(0.90) = 0.90^γ / 0.10^γ = 9^γ
+        
+        | γ   | 难/易比 |
+        |-----|---------|
+        | 2.0 | 81x     |
+        | 2.5 | 243x    | ← 推荐
+        | 3.0 | 729x    |
+        
+    稳定性约束:
+        中等样本梯度保留率 = 0.5^γ
+        γ = 2.5 时保留 71%，γ = 3.0 时仅保留 50%
+        
+    最优解推导:
+        max R(γ) s.t. 0.5^γ ≥ 0.15
+        → γ ≤ ln(0.15)/ln(0.5) = 2.74
+        → 推荐 γ = 2.5
     """
     type: str = "cross_entropy"
     
     # Focal Loss 参数
-    focal_gamma: float = 2.0
+    # γ (gamma): 聚焦参数，控制对易分类样本的抑制强度
+    # γ = 0: 退化为标准 CE
+    # γ = 2.5: 推荐值 (I28-1 优化，243x 抑制易分类样本梯度)
+    # γ = 5: 极端聚焦 (仅对非常难的样本有梯度)
+    focal_gamma: float = 2.5  # I28-1: 从 2.0 提升到 2.5
     focal_alpha: Optional[List[float]] = None  # None = 自动计算
     
     # Class-Balanced 参数
+    # β (beta): 有效样本数衰减因子
+    # β → 1: 权重更平滑
+    # β → 0: 权重差异更大
     cb_beta: float = 0.9999
     
     # Label Smoothing
+    # ε: 平滑因子，y'_c = (1-ε)y_c + ε/C
+    # 推荐: 0.1 (轻微正则化), 0.2 (强正则化)
     label_smoothing: float = 0.0
 
 
@@ -215,6 +315,83 @@ class WandBConfig:
 
 
 @dataclass
+class EvaluationConfig:
+    """分层评估配置
+    
+    控制评估器的行为和资源使用。
+    
+    数学形式化
+    ==========
+    评估采样策略:
+        N_eval = min(N_dataset, max_samples)
+    
+    分层控制:
+        enabled_layers ⊆ {L1, L2, L3, L4, L5, L6}
+    
+    ECE 计算:
+        ECE = Σ_{m=1}^{n_bins} (|B_m|/N) |acc(B_m) - conf(B_m)|
+    
+    示例
+    ----
+    >>> config = EvaluationConfig(
+    ...     enabled_layers=["L1", "L2", "L5"],
+    ...     max_samples=5000,
+    ...     eval_interval=5,
+    ... )
+    """
+    
+    # 总体开关
+    enabled: bool = True
+    
+    # 启用的评估层
+    enabled_layers: List[str] = field(
+        default_factory=lambda: ["L1", "L2", "L3", "L4", "L5", "L6"]
+    )
+    
+    # 评估频率 (每 N 个 epoch 执行一次分层评估)
+    eval_interval: int = 10  # 默认每 10 个 epoch
+    eval_on_best: bool = True  # 当模型达到新的 best 时评估
+    
+    # 采样限制
+    max_samples: int = 10000  # 最大评估样本数
+    batch_size: int = 64
+    
+    # L1 分类配置
+    l1_ece_n_bins: int = 15  # ECE 计算的 bin 数量
+    l1_top_k: List[int] = field(default_factory=lambda: [1, 5])
+    l1_confusion_top_n: int = 10  # 保留前 N 个混淆对
+    
+    # L2 Tokenizer 配置
+    l2_max_batches: int = 50  # Tokenizer 评估的最大批次数
+    l2_compute_correlation: bool = True  # 是否计算内容-token 相关性
+    
+    # L3 注意力配置
+    l3_max_batches: int = 20
+    l3_entropy_threshold_low: float = 0.1  # 低熵阈值 (dead head)
+    l3_entropy_threshold_high: float = 5.0  # 高熵阈值
+    l3_capture_attention: bool = True  # 是否捕获注意力权重
+    
+    # L4 表示配置
+    l4_max_samples: int = 2000  # Fisher 比计算的最大样本数
+    
+    # L5 效率配置
+    l5_warmup_runs: int = 10
+    l5_timing_runs: int = 50
+    l5_measure_components: bool = True  # 是否分解组件延迟
+    
+    # L6 稳定性配置
+    l6_check_splitter: bool = True  # 是否检查分割器健康
+    
+    # 输出配置
+    save_report: bool = True
+    report_format: str = "json"  # "json" or "yaml"
+    report_dir: Optional[str] = None  # 默认保存到 checkpoint 目录
+    
+    # 可视化
+    generate_visualizations: bool = False  # 是否生成可视化图表
+
+
+@dataclass
 class ExperimentConfig:
     """完整实验配置"""
     # 元信息
@@ -231,6 +408,7 @@ class ExperimentConfig:
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     wandb: WandBConfig = field(default_factory=WandBConfig)
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
 
 # ============================================================================
@@ -374,6 +552,7 @@ class ConfigLoader:
             scheduler=_dict_to_dataclass(config.get("scheduler", {}), SchedulerConfig),
             training=_dict_to_dataclass(config.get("training", {}), TrainingConfig),
             wandb=_dict_to_dataclass(config.get("wandb", {}), WandBConfig),
+            evaluation=_dict_to_dataclass(config.get("evaluation", {}), EvaluationConfig),
         )
     
     def from_dict(self, config: Dict[str, Any]) -> ExperimentConfig:
@@ -441,6 +620,7 @@ __all__ = [
     "SchedulerConfig",
     "TrainingConfig",
     "WandBConfig",
+    "EvaluationConfig",
     "ExperimentConfig",
     # 工具
     "ConfigLoader",

@@ -48,6 +48,7 @@ from .base import (
     FigureConfig,
     VisualizationLayer,
     VisualizationResult,
+    safe_tight_layout,
     truncate_labels,
 )
 
@@ -135,7 +136,7 @@ class L4RepresentationVisualizer(VisualizationLayer):
             result.descriptions.append("类别中心距离矩阵")
         
         # 4. 特征范数分布
-        if features is not None:
+        if features is not None and len(features) > 0:
             fig = self._plot_feature_norm_distribution(features, labels, class_names)
             result.figures.append(fig)
             result.names.append("L4_feature_norms")
@@ -212,7 +213,7 @@ class L4RepresentationVisualizer(VisualizationLayer):
         # 网格
         ax.grid(alpha=0.3)
         
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_class_separability(
@@ -319,7 +320,7 @@ class L4RepresentationVisualizer(VisualizationLayer):
             title = f"Class Separability (Top/Bottom {n_show} of {n_classes})"
         ax.set_title(title, fontsize=12, fontweight='bold')
         
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_class_distance_matrix(
@@ -393,7 +394,7 @@ class L4RepresentationVisualizer(VisualizationLayer):
             title = f"Class Center Distance Matrix (Sampled {n_classes} of {n_classes_total})"
         ax.set_title(title, fontsize=12, fontweight='bold')
         
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_feature_norm_distribution(
@@ -465,7 +466,7 @@ class L4RepresentationVisualizer(VisualizationLayer):
             ax2.axis('off')
         
         fig.suptitle("L4: Feature Norm Analysis", fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_summary(self, metrics: Any) -> Figure:
@@ -540,5 +541,5 @@ class L4RepresentationVisualizer(VisualizationLayer):
         ax3.set_title("Separability Distribution", fontsize=12, fontweight='bold')
         
         fig.suptitle("L4 Feature Representation Summary", fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        safe_tight_layout()
         return fig

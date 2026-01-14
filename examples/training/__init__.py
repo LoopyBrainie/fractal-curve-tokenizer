@@ -111,6 +111,7 @@ from .config import (
     SchedulerConfig,
     TrainingConfig,
     WandBConfig,
+    EvaluationConfig,
     ExperimentConfig,
     ConfigLoader,
     save_config,
@@ -123,6 +124,34 @@ from .callbacks import (
     WandBCallback,
     SplitterHealthConfig,
     SplitterHealthCallback,
+    LayeredEvaluationCallbackConfig,
+    LayeredEvaluationCallback,
+)
+
+# Evaluation
+from .evaluation_layers import (
+    L1ClassificationMetrics,
+    L2TokenizerMetrics,
+    L3AttentionMetrics,
+    L4RepresentationMetrics,
+    L5EfficiencyMetrics,
+    L6StabilityMetrics,
+    L7SplitterMetrics,
+    L8GradientFlowMetrics,
+    LayeredEvaluationReport,
+    ClassificationEvaluator,
+    TokenizerEvaluator,
+    AttentionEvaluator,
+    RepresentationEvaluator,
+    EfficiencyEvaluator,
+    StabilityEvaluator,
+    SplitterEvaluator,
+    GradientFlowEvaluator,
+)
+
+from .layered_evaluator import (
+    LayeredEvaluator,
+    create_evaluator,
 )
 
 # Visualization
@@ -193,6 +222,7 @@ __all__ = [
     "SchedulerConfig",
     "TrainingConfig",
     "WandBConfig",
+    "EvaluationConfig",
     "ExperimentConfig",
     "ConfigLoader",
     "save_config",
@@ -202,6 +232,28 @@ __all__ = [
     "WandBCallback",
     "SplitterHealthConfig",
     "SplitterHealthCallback",
+    "LayeredEvaluationCallbackConfig",
+    "LayeredEvaluationCallback",
+    # Evaluation
+    "L1ClassificationMetrics",
+    "L2TokenizerMetrics",
+    "L3AttentionMetrics",
+    "L4RepresentationMetrics",
+    "L5EfficiencyMetrics",
+    "L6StabilityMetrics",
+    "L7SplitterMetrics",
+    "L8GradientFlowMetrics",
+    "LayeredEvaluationReport",
+    "ClassificationEvaluator",
+    "TokenizerEvaluator",
+    "AttentionEvaluator",
+    "RepresentationEvaluator",
+    "EfficiencyEvaluator",
+    "StabilityEvaluator",
+    "SplitterEvaluator",
+    "GradientFlowEvaluator",
+    "LayeredEvaluator",
+    "create_evaluator",
     # Visualization
     "plot_per_class_accuracy",
     "plot_confusion_matrix",

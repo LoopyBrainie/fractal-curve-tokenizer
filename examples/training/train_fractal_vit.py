@@ -252,6 +252,7 @@ if str(EXAMPLES_PATH) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_PATH))
 
 from vit_pytorch import FractalCurveViT
+from vit_pytorch.constants import SPLITTER_TEMP_START, SPLITTER_TEMP_END
 
 # Fractal Training 模块 (I15) - 现在位于 examples/training
 from training import (
@@ -2229,12 +2230,12 @@ def main():
                        help="Use fixed (non-learnable) LCA temperature")
     
     # P7-7: GumbelTopKSplitter 温度退火调度参数
-    # P10-11 更新: 将 T_end 默认值从 0.1 提升到 0.3，防止梯度消失
-    # 参考: constants.py SPLITTER_TEMP_END = 0.3
-    parser.add_argument("--splitter-temp-start", type=float, default=1.0,
-                       help="Learnable splitter initial temperature (default: 1.0)")
-    parser.add_argument("--splitter-temp-end", type=float, default=0.3,
-                       help="Learnable splitter final temperature (default: 0.3, P10-11 optimized)")
+    # I29-1 修复: 从 constants.py 导入常量，确保一致性
+    # I24-7 分析: T_end=0.5 保持探索能力，T=0.3 过低会导致梯度消失
+    parser.add_argument("--splitter-temp-start", type=float, default=SPLITTER_TEMP_START,
+                       help=f"Learnable splitter initial temperature (default: {SPLITTER_TEMP_START})")
+    parser.add_argument("--splitter-temp-end", type=float, default=SPLITTER_TEMP_END,
+                       help=f"Learnable splitter final temperature (default: {SPLITTER_TEMP_END}, I24-7 optimized)")
     parser.add_argument("--splitter-temp-warmup", type=int, default=5,
                        help="Warmup epochs with fixed T_start (default: 5)")
     

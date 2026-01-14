@@ -93,12 +93,16 @@ from evaluation_layers import (
     L4RepresentationMetrics,
     L5EfficiencyMetrics,
     L6StabilityMetrics,
+    L7SplitterMetrics,
+    L8GradientFlowMetrics,
     ClassificationEvaluator,
     TokenizerEvaluator,
     AttentionEvaluator,
     RepresentationEvaluator,
     EfficiencyEvaluator,
     StabilityEvaluator,
+    SplitterEvaluator,
+    GradientFlowEvaluator,
 )
 
 
@@ -771,6 +775,36 @@ class LayeredEvaluator:
             print(f"  - Feature mean norm: {report.L4_representation.feature_mean_norm:.2f}")
             print(f"  - Avg separability: {report.L4_representation.avg_separability:.2f}")
         
+        # L7: 分割器专项评估
+        if 'L7' not in skip_layers:
+            print("\n[L7] Splitter Evaluation...")
+            splitter_eval = SplitterEvaluator()
+            report.L7_splitter = splitter_eval.evaluate(
+                self.model, eval_loader, self.device
+            )
+            if report.L7_splitter.temperature > 0:
+                print(f"  - Temperature: {report.L7_splitter.temperature:.3f}")
+                print(f"  - Selection prob mean: {report.L7_splitter.selection_prob_mean:.3f}")
+                print(f"  - Decision confidence: {report.L7_splitter.decision_confidence_mean:.3f}")
+                if report.L7_splitter.quotas:
+                    print(f"  - Quotas: {report.L7_splitter.quotas}")
+            else:
+                print("  - (Splitter metrics not available)")
+        
+        # L8: 梯度流评估 (需要一个 sample batch)
+        if 'L8' not in skip_layers:
+            print("\n[L8] Gradient Flow Evaluation...")
+            gradient_eval = GradientFlowEvaluator()
+            sample_batch = next(iter(eval_loader))
+            sample_imgs, sample_labels = sample_batch[0][:4], sample_batch[1][:4]
+            report.L8_gradient_flow = gradient_eval.evaluate(
+                self.model, sample_imgs, sample_labels, self.device
+            )
+            print(f"  - Total grad norm: {report.L8_gradient_flow.total_grad_norm:.4f}")
+            print(f"  - Max grad norm: {report.L8_gradient_flow.max_grad_norm:.4f}")
+            print(f"  - Vanishing gradients: {len(report.L8_gradient_flow.vanishing_gradients)}")
+            print(f"  - Exploding gradients: {len(report.L8_gradient_flow.exploding_gradients)}")
+        
         # 完成
         report.evaluation_time_sec = time.time() - start_time
         
@@ -814,6 +848,62 @@ class LayeredEvaluator:
             summary['warnings'].append("Low class separability in feature space")
             summary['recommendations'].append("Consider more training or stronger augmentation")
         
+        # L2: 深度坍缩检测
+        if report.L2_tokenizer.depth_collapse_detected:
+            summary['warnings'].append(
+                f"Depth collapse detected! KL={report.L2_tokenizer.depth_kl_from_uniform:.2f}, "
+                f"entropy_ratio={report.L2_tokenizer.depth_entropy_ratio:.2f}"
+            )
+            summary['recommendations'].append(
+                "Enable LOG_COMPENSATION or increase DEPTH_KL_WEIGHT in constants.py"
+            )
+            if summary['overall_health'] != 'critical':
+                summary['overall_health'] = 'warning'
+        
+        # L3: LCA 利用率
+        if report.L3_attention.lca_attention_correlation is not None:
+            if abs(report.L3_attention.lca_attention_correlation) < 0.1:
+                summary['warnings'].append(
+                    "Low LCA-attention correlation - Hilbert locality not utilized"
+                )
+                summary['recommendations'].append(
+                    "Check LCA bias learning, may need to adjust lca_temperature"
+                )
+        
+        # L7: 分割器健康
+        if report.L7_splitter is not None:
+            if report.L7_splitter.decision_confidence_mean < 0.3:
+                summary['warnings'].append(
+                    f"Low splitter confidence: {report.L7_splitter.decision_confidence_mean:.2f}"
+                )
+                summary['recommendations'].append(
+                    "Splitter is uncertain - consider lower temperature or more training"
+                )
+            
+            if report.L7_splitter.quota_entropy > 0 and report.L7_splitter.quota_entropy < 0.5:
+                summary['warnings'].append("Quotas collapsing to single depth")
+                summary['recommendations'].append("Increase quota regularization")
+        
+        # L8: 梯度流
+        if report.L8_gradient_flow is not None:
+            if len(report.L8_gradient_flow.vanishing_gradients) > 5:
+                summary['warnings'].append(
+                    f"{len(report.L8_gradient_flow.vanishing_gradients)} parameters with vanishing gradients"
+                )
+                summary['recommendations'].append("Check residual connections and initialization")
+            
+            if len(report.L8_gradient_flow.exploding_gradients) > 0:
+                summary['warnings'].append(
+                    f"{len(report.L8_gradient_flow.exploding_gradients)} parameters with exploding gradients"
+                )
+                summary['recommendations'].append("Reduce learning rate or add gradient clipping")
+                if summary['overall_health'] != 'critical':
+                    summary['overall_health'] = 'warning'
+        
+        # 更新报告的 warnings/recommendations
+        report.warnings = summary['warnings']
+        report.recommendations = summary['recommendations']
+        
         return summary
     
     def save_report(
@@ -831,6 +921,63 @@ class LayeredEvaluator:
             json.dump(report_dict, f, indent=2, ensure_ascii=False, cls=NumpyEncoder)
         
         print(f"Report saved to: {output_path}")
+
+
+# ============================================================================
+# 工厂函数
+# ============================================================================
+
+def create_evaluator(
+    checkpoint_path: str,
+    dataset_name: str = "cifar10",
+    config: Optional['EvaluationConfig'] = None,
+    **kwargs,
+) -> LayeredEvaluator:
+    """创建分层评估器的工厂函数
+    
+    提供便捷的评估器创建接口，支持从 EvaluationConfig 配置类创建。
+    
+    参数
+    ----
+    checkpoint_path : str
+        模型 checkpoint 路径
+    dataset_name : str
+        数据集名称
+    config : EvaluationConfig, optional
+        评估配置，如果提供则覆盖 kwargs 中的对应参数
+    **kwargs : dict
+        传递给 LayeredEvaluator 的其他参数
+    
+    返回
+    ----
+    LayeredEvaluator
+        配置好的评估器实例
+    
+    示例
+    ----
+    >>> from examples.training import EvaluationConfig, create_evaluator
+    >>> 
+    >>> # 使用默认配置
+    >>> evaluator = create_evaluator("checkpoint.pt", "cifar10")
+    >>> 
+    >>> # 使用自定义配置
+    >>> config = EvaluationConfig(
+    ...     max_samples=5000,
+    ...     enabled_layers=["L1", "L2", "L5"],
+    ... )
+    >>> evaluator = create_evaluator("checkpoint.pt", "tiny-imagenet", config=config)
+    >>> report = evaluator.run_full_evaluation(skip_layers=["L3", "L4", "L6"])
+    """
+    # 从 config 提取参数
+    if config is not None:
+        if 'batch_size' not in kwargs:
+            kwargs['batch_size'] = config.batch_size
+    
+    return LayeredEvaluator(
+        checkpoint_path=checkpoint_path,
+        dataset_name=dataset_name,
+        **kwargs,
+    )
 
 
 # ============================================================================

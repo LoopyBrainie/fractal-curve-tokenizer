@@ -16,6 +16,7 @@ Fractal Training Callbacks Module
 from __future__ import annotations
 import os
 import sys
+import time
 import warnings
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -589,4 +590,404 @@ __all__ = [
     "WandBCallback",
     "SplitterHealthConfig",
     "SplitterHealthCallback",
+    "LayeredEvaluationCallback",
 ]
+
+
+# ============================================================================
+# 分层评估回调
+# ============================================================================
+
+@dataclass
+class LayeredEvaluationCallbackConfig:
+    """分层评估回调配置
+    
+    用于配置训练过程中自动执行的分层评估。
+    
+    数学形式化
+    ==========
+    评估触发条件:
+        trigger = (epoch % eval_interval == 0) ∨ is_new_best ∨ is_final_epoch
+    
+    评估层选择:
+        layers = enabled_layers ∩ available_layers
+    """
+    
+    # 启用开关
+    enabled: bool = True
+    
+    # 评估层
+    enabled_layers: List[str] = field(
+        default_factory=lambda: ["L1", "L2", "L4", "L5", "L6"]
+    )  # L3 默认禁用（需要额外开销）
+    
+    # 触发条件
+    eval_interval: int = 10  # 每 N 个 epoch 评估一次
+    eval_on_best: bool = True  # 新 best 时评估
+    eval_on_final: bool = True  # 最后一个 epoch 评估
+    
+    # 采样
+    max_samples: int = 5000
+    batch_size: int = 64
+    
+    # 日志
+    log_to_wandb: bool = True
+    log_to_console: bool = True
+    
+    # 保存
+    save_report: bool = True
+    report_format: str = "json"
+
+
+class LayeredEvaluationCallback:
+    """分层评估训练回调
+    
+    在训练过程中自动执行分层评估，为模型架构改进提供数据分析支持。
+    
+    功能
+    ====
+    1. 周期性分层评估 (L1-L6)
+    2. 新 best 模型时自动评估
+    3. 评估结果记录到 WandB
+    4. 生成详细的 JSON 报告
+    
+    评估层说明
+    ==========
+    - L1 (分类): Top-1/5 准确率、MCA、ECE、混淆分析
+    - L2 (Tokenizer): Token 数统计、深度分布、空间覆盖
+    - L3 (注意力): 注意力熵、Head 利用率 (开销较大)
+    - L4 (表示): Fisher 判别比、类别可分性
+    - L5 (效率): 延迟、吞吐量、内存
+    - L6 (稳定性): 权重范数、NaN/Inf 检测
+    
+    使用方法
+    ========
+    >>> callback = LayeredEvaluationCallback(
+    ...     config=LayeredEvaluationCallbackConfig(
+    ...         eval_interval=5,
+    ...         enabled_layers=["L1", "L2", "L5"],
+    ...     ),
+    ... )
+    >>> trainer = ModularTrainer(..., callbacks=[callback])
+    
+    数据分析输出
+    ============
+    评估报告包含以下用于架构改进的关键指标:
+    
+    1. **Tokenizer 效率分析** (L2):
+       - 深度分布熵 H_d → 检测深度坍缩
+       - Token-内容相关性 ρ → 验证自适应性
+    
+    2. **表示质量分析** (L4):
+       - Fisher 判别比 FDR → 类间分离度
+       - 类别可分性 → 识别难分类
+    
+    3. **资源效率分析** (L5):
+       - 组件延迟分解 → 定位瓶颈
+       - Accuracy/Token → 效率优化方向
+    """
+    
+    priority = 90  # 在 CheckpointCallback 之后
+    
+    def __init__(
+        self,
+        config: Optional[LayeredEvaluationCallbackConfig] = None,
+        val_loader=None,
+        num_classes: int = 10,
+    ):
+        """
+        Args:
+            config: 评估回调配置
+            val_loader: 验证数据加载器 (可在 on_train_begin 时设置)
+            num_classes: 类别数
+        """
+        self.config = config or LayeredEvaluationCallbackConfig()
+        self.val_loader = val_loader
+        self.num_classes = num_classes
+        
+        # 运行时状态
+        self._last_eval_epoch = -1
+        self._last_best_metric = float("-inf")
+        self._evaluators = {}
+        self._reports = []
+    
+    def on_train_begin(self, trainer: 'ModularTrainer', state: 'TrainerState') -> None:
+        """训练开始时初始化评估器"""
+        if not self.config.enabled:
+            return
+        
+        # 尝试从 trainer 获取 val_loader
+        if self.val_loader is None and hasattr(trainer, 'val_loader'):
+            self.val_loader = trainer.val_loader
+        
+        # 获取 num_classes
+        if hasattr(trainer, 'num_classes'):
+            self.num_classes = trainer.num_classes
+        elif hasattr(trainer, 'config') and hasattr(trainer.config, 'num_classes'):
+            self.num_classes = trainer.config.num_classes
+        
+        # 延迟导入评估器
+        try:
+            from ..evaluation_layers import (
+                ClassificationEvaluator,
+                TokenizerEvaluator,
+                AttentionEvaluator,
+                RepresentationEvaluator,
+                EfficiencyEvaluator,
+                StabilityEvaluator,
+            )
+            
+            # 初始化评估器
+            self._evaluators = {
+                "L1": ClassificationEvaluator(self.num_classes),
+                "L2": TokenizerEvaluator(),
+                "L3": AttentionEvaluator(),
+                "L4": RepresentationEvaluator(),
+                "L5": EfficiencyEvaluator(),
+                "L6": StabilityEvaluator(),
+            }
+            
+            if self.config.log_to_console:
+                enabled = ", ".join(self.config.enabled_layers)
+                print(f"[LayeredEval] Initialized with layers: {enabled}")
+                
+        except ImportError as e:
+            warnings.warn(f"[LayeredEval] Failed to import evaluators: {e}")
+            self.config.enabled = False
+    
+    def on_epoch_end(self, trainer: 'ModularTrainer', ctx: 'CallbackContext') -> None:
+        """Epoch 结束时检查是否需要评估"""
+        if not self.config.enabled or not self._evaluators:
+            return
+        
+        should_eval = False
+        eval_reason = ""
+        
+        # 条件1: 周期性评估
+        if ctx.epoch > 0 and ctx.epoch % self.config.eval_interval == 0:
+            should_eval = True
+            eval_reason = f"periodic (epoch {ctx.epoch})"
+        
+        # 条件2: 新 best
+        if self.config.eval_on_best and ctx.metrics:
+            current_metric = ctx.metrics.get("val_accuracy", 0)
+            if current_metric > self._last_best_metric:
+                self._last_best_metric = current_metric
+                should_eval = True
+                eval_reason = f"new best ({current_metric:.2f}%)"
+        
+        if should_eval and ctx.epoch != self._last_eval_epoch:
+            self._run_evaluation(trainer, ctx, eval_reason)
+            self._last_eval_epoch = ctx.epoch
+    
+    def on_train_end(self, trainer: 'ModularTrainer', state: 'TrainerState') -> None:
+        """训练结束时执行最终评估"""
+        if not self.config.enabled or not self.config.eval_on_final:
+            return
+        
+        # 构造一个 ctx
+        ctx = type('CallbackContext', (), {
+            'epoch': state.epoch,
+            'global_step': state.global_step,
+            'metrics': {'val_accuracy': state.best_metric},
+            'batch_idx': 0,
+            'loss': 0.0,
+        })()
+        
+        if state.epoch != self._last_eval_epoch:
+            self._run_evaluation(trainer, ctx, "final")
+    
+    def _run_evaluation(
+        self,
+        trainer: 'ModularTrainer',
+        ctx: 'CallbackContext',
+        reason: str,
+    ) -> None:
+        """执行分层评估"""
+        import time
+        from ..evaluation_layers import LayeredEvaluationReport
+        
+        start_time = time.time()
+        
+        if self.config.log_to_console:
+            print(f"\n{'='*60}")
+            print(f"[LayeredEval] Running evaluation (reason: {reason})")
+            print(f"{'='*60}")
+        
+        model = trainer.model
+        device = next(model.parameters()).device
+        
+        # 确保模型在 eval 模式
+        was_training = model.training
+        model.eval()
+        
+        # 创建报告
+        report = LayeredEvaluationReport(
+            checkpoint_path=f"epoch_{ctx.epoch}",
+            dataset_name=getattr(trainer, 'dataset_name', 'unknown'),
+            num_samples=len(self.val_loader.dataset) if self.val_loader else 0,
+            num_classes=self.num_classes,
+            device=str(device),
+        )
+        
+        metrics_for_logging = {}
+        
+        try:
+            # L6: 稳定性 (最先，检查模型健康)
+            if "L6" in self.config.enabled_layers and "L6" in self._evaluators:
+                report.L6_stability = self._evaluators["L6"].evaluate(model)
+                metrics_for_logging.update({
+                    "eval/L6_health_score": report.L6_stability.gradient_health_score,
+                    "eval/L6_has_nan": int(report.L6_stability.has_nan_weights),
+                    "eval/L6_splitter_health": report.L6_stability.splitter_health_score,
+                })
+                if self.config.log_to_console:
+                    print(f"  L6: health={report.L6_stability.gradient_health_score:.2f}")
+            
+            # L5: 效率
+            if "L5" in self.config.enabled_layers and "L5" in self._evaluators:
+                if self.val_loader:
+                    sample_input = next(iter(self.val_loader))[0][:8].to(device)
+                    report.L5_efficiency = self._evaluators["L5"].evaluate(
+                        model, sample_input, device
+                    )
+                    metrics_for_logging.update({
+                        "eval/L5_latency_ms": report.L5_efficiency.avg_latency_ms,
+                        "eval/L5_throughput": report.L5_efficiency.throughput_samples_per_sec,
+                        "eval/L5_memory_mb": report.L5_efficiency.peak_memory_mb,
+                        "eval/L5_tokenizer_latency_ms": report.L5_efficiency.tokenizer_latency_ms,
+                        "eval/L5_transformer_latency_ms": report.L5_efficiency.transformer_latency_ms,
+                    })
+                    if self.config.log_to_console:
+                        print(f"  L5: latency={report.L5_efficiency.avg_latency_ms:.1f}ms, "
+                              f"throughput={report.L5_efficiency.throughput_samples_per_sec:.0f}/s")
+            
+            # L1: 分类性能
+            if "L1" in self.config.enabled_layers and "L1" in self._evaluators:
+                if self.val_loader:
+                    report.L1_classification = self._evaluators["L1"].evaluate(
+                        model, self.val_loader, device
+                    )
+                    metrics_for_logging.update({
+                        "eval/L1_top1_acc": report.L1_classification.top1_accuracy,
+                        "eval/L1_top5_acc": report.L1_classification.top5_accuracy,
+                        "eval/L1_mca": report.L1_classification.mean_class_accuracy,
+                        "eval/L1_ece": report.L1_classification.ece,
+                    })
+                    if self.config.log_to_console:
+                        print(f"  L1: top1={report.L1_classification.top1_accuracy:.2f}%, "
+                              f"mca={report.L1_classification.mean_class_accuracy:.2f}%")
+            
+            # L2: Tokenizer
+            if "L2" in self.config.enabled_layers and "L2" in self._evaluators:
+                if self.val_loader:
+                    report.L2_tokenizer = self._evaluators["L2"].evaluate(
+                        model, self.val_loader, device
+                    )
+                    metrics_for_logging.update({
+                        "eval/L2_avg_tokens": report.L2_tokenizer.avg_tokens,
+                        "eval/L2_depth_entropy": report.L2_tokenizer.depth_entropy,
+                        "eval/L2_spatial_coverage": report.L2_tokenizer.spatial_coverage_ratio,
+                        "eval/L2_content_correlation": report.L2_tokenizer.content_token_correlation,
+                    })
+                    if self.config.log_to_console:
+                        print(f"  L2: tokens={report.L2_tokenizer.avg_tokens:.1f}, "
+                              f"entropy={report.L2_tokenizer.depth_entropy:.3f}")
+            
+            # L3: 注意力 (开销较大，默认禁用)
+            if "L3" in self.config.enabled_layers and "L3" in self._evaluators:
+                if self.val_loader:
+                    report.L3_attention = self._evaluators["L3"].evaluate(
+                        model, self.val_loader, device, max_batches=10
+                    )
+                    metrics_for_logging.update({
+                        "eval/L3_avg_entropy": report.L3_attention.avg_entropy,
+                        "eval/L3_dead_head_ratio": report.L3_attention.dead_head_ratio,
+                    })
+                    if self.config.log_to_console:
+                        print(f"  L3: entropy={report.L3_attention.avg_entropy:.3f}")
+            
+            # L4: 表示
+            if "L4" in self.config.enabled_layers and "L4" in self._evaluators:
+                if self.val_loader:
+                    report.L4_representation = self._evaluators["L4"].evaluate(
+                        model, self.val_loader, device
+                    )
+                    metrics_for_logging.update({
+                        "eval/L4_fisher_ratio": report.L4_representation.fisher_discriminant_ratio,
+                        "eval/L4_avg_separability": report.L4_representation.avg_separability,
+                    })
+                    if self.config.log_to_console:
+                        print(f"  L4: FDR={report.L4_representation.fisher_discriminant_ratio:.2f}")
+        
+        except Exception as e:
+            warnings.warn(f"[LayeredEval] Evaluation error: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        finally:
+            # 恢复训练模式
+            if was_training:
+                model.train()
+        
+        # 记录到 WandB
+        if self.config.log_to_wandb:
+            self._log_to_wandb(metrics_for_logging, ctx.global_step)
+        
+        # 保存报告
+        if self.config.save_report:
+            report.evaluation_time_sec = time.time() - start_time
+            self._save_report(trainer, report, ctx.epoch)
+        
+        self._reports.append(report)
+        
+        if self.config.log_to_console:
+            elapsed = time.time() - start_time
+            print(f"[LayeredEval] Completed in {elapsed:.1f}s")
+            print(f"{'='*60}\n")
+    
+    def _log_to_wandb(self, metrics: Dict[str, float], step: int) -> None:
+        """记录指标到 WandB"""
+        if not _check_wandb_available():
+            return
+        
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.log(metrics, step=step)
+        except Exception as e:
+            warnings.warn(f"[LayeredEval] WandB logging failed: {e}")
+    
+    def _save_report(
+        self,
+        trainer: 'ModularTrainer',
+        report,
+        epoch: int,
+    ) -> None:
+        """保存评估报告"""
+        try:
+            import json
+            
+            # 确定保存路径
+            if hasattr(trainer, 'config') and hasattr(trainer.config, 'checkpoint_dir'):
+                save_dir = Path(trainer.config.checkpoint_dir)
+            else:
+                save_dir = Path("./checkpoints")
+            
+            save_dir = save_dir / "evaluations"
+            save_dir.mkdir(parents=True, exist_ok=True)
+            
+            report_path = save_dir / f"layered_eval_epoch_{epoch:04d}.json"
+            
+            with open(report_path, 'w', encoding='utf-8') as f:
+                json.dump(report.to_dict(), f, indent=2, ensure_ascii=False, default=str)
+            
+            if self.config.log_to_console:
+                print(f"  Report saved: {report_path}")
+                
+        except Exception as e:
+            warnings.warn(f"[LayeredEval] Failed to save report: {e}")
+    
+    def get_reports(self) -> List:
+        """获取所有评估报告"""
+        return self._reports

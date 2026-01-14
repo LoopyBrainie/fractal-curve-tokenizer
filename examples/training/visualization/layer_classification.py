@@ -31,6 +31,7 @@ Date: 2026-01-11
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
@@ -41,6 +42,7 @@ from .base import (
     FigureConfig,
     VisualizationLayer,
     VisualizationResult,
+    safe_tight_layout,
     truncate_labels,
 )
 
@@ -278,10 +280,7 @@ class L1ClassificationVisualizer(VisualizationLayer):
             title += f" (Top/Bottom {n_show} of {n_classes})"
         ax.set_title(title, fontsize=13, fontweight='bold')
         
-        try:
-            plt.tight_layout()
-        except Exception:
-            pass  # Ignore layout warnings for complex charts
+        safe_tight_layout()
         return fig
     
     def _plot_confusion_matrix(
@@ -362,7 +361,7 @@ class L1ClassificationVisualizer(VisualizationLayer):
             title = f"Confusion Matrix (Sampled {n_classes} of {n_classes_total})\nMean Recall: {mean_recall:.1%}"
         ax.set_title(title, fontsize=13, fontweight='bold')
         
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_calibration_curve(
@@ -435,7 +434,7 @@ class L1ClassificationVisualizer(VisualizationLayer):
         ax.set_title("Reliability Diagram (Calibration Curve)", 
                     fontsize=13, fontweight='bold')
         
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_top_confused_pairs(
@@ -466,7 +465,7 @@ class L1ClassificationVisualizer(VisualizationLayer):
                 pred_name = class_names[pred_c] if pred_c < len(class_names) else f"C{pred_c}"
             else:
                 true_name, pred_name = f"C{true_c}", f"C{pred_c}"
-            labels.append(f"{true_name[:12]} → {pred_name[:12]}")
+            labels.append(f"{true_name[:12]} -> {pred_name[:12]}")
             counts.append(count)
         
         # 条形图
@@ -484,10 +483,10 @@ class L1ClassificationVisualizer(VisualizationLayer):
             ax.text(bar.get_width() + 0.5, bar.get_y() + bar.get_height() / 2,
                    str(count), va='center', fontsize=9)
         
-        ax.set_title("Top Confused Class Pairs (True → Predicted)",
+        ax.set_title("Top Confused Class Pairs (True -> Predicted)",
                     fontsize=13, fontweight='bold')
         
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_hardest_classes(
@@ -532,10 +531,7 @@ class L1ClassificationVisualizer(VisualizationLayer):
         ax.set_title("Hardest Classes (Highest Error Rate)",
                     fontsize=13, fontweight='bold')
         
-        try:
-            plt.tight_layout()
-        except Exception:
-            pass  # Ignore layout warnings for complex charts
+        safe_tight_layout()
         return fig
     
     def _plot_summary(self, metrics: Any) -> Figure:
@@ -594,8 +590,5 @@ class L1ClassificationVisualizer(VisualizationLayer):
         ax3.set_title("Per-Class Accuracy Dist.", fontsize=12, fontweight='bold')
         
         fig.suptitle("L1 Classification Performance Summary", fontsize=14, fontweight='bold')
-        try:
-            plt.tight_layout(rect=[0, 0, 1, 0.96])  # Leave room for suptitle
-        except Exception:
-            pass  # Ignore layout warnings
+        safe_tight_layout(rect=[0, 0, 1, 0.96])  # Leave room for suptitle
         return fig

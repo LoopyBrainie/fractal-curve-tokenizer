@@ -110,6 +110,8 @@ from .layer_attention import L3AttentionVisualizer
 from .layer_representation import L4RepresentationVisualizer
 from .layer_efficiency import L5EfficiencyVisualizer
 from .layer_stability import L6StabilityVisualizer
+from .layer_splitter import L7SplitterVisualizer
+from .layer_gradient import L8GradientFlowVisualizer
 from .layered_visualizer import LayeredVisualizer, LayeredVisualizationReport
 
 __all__ = [
@@ -147,6 +149,8 @@ __all__ = [
     "L4RepresentationVisualizer",
     "L5EfficiencyVisualizer",
     "L6StabilityVisualizer",
+    "L7SplitterVisualizer",
+    "L8GradientFlowVisualizer",
     "LayeredVisualizer",
     "LayeredVisualizationReport",
 ]

@@ -98,6 +98,9 @@ class FocalLoss(nn.Module):
             self.alpha = None
         elif isinstance(alpha, (float, int)):
             self.alpha = float(alpha)
+        elif isinstance(alpha, torch.Tensor):
+            # 如果已经是 Tensor，使用 clone().detach() 避免警告
+            self.alpha = alpha.clone().detach().to(dtype=torch.float32)
         else:
             self.alpha = torch.tensor(alpha, dtype=torch.float32)
     
@@ -120,15 +123,41 @@ class FocalLoss(nn.Module):
         ----
         loss : Tensor
             Focal Loss 值
+            
+        数学形式化 (I25-1 修复)
+        =======================
+        
+        Focal Loss 定义:
+            FL(p_t) = -α_t (1 - p_t)^γ log(p_t)
+            
+        其中:
+            p_t = p_{y*}  (目标类别的预测概率，y* 是真实标签)
+            
+        关键数学约束:
+            1. p_t 必须使用**原始目标类别**的概率，而非平滑后的期望概率
+               原因: (1-p_t)^γ 衡量的是对真实目标的置信度
+               
+            2. Label Smoothing 仅影响 CE loss 的计算，不影响 p_t
+               CE_smooth = -Σ_c y'_c log(p_c)
+               但 p_t = p_{y*} (不变)
+               
+            3. Alpha 权重必须使用原始整数 targets 索引
         """
+        # 保存原始整数目标 (用于 p_t 和 alpha 索引)
+        # I25-1: 修复 label_smoothing 时 targets 被覆盖导致的 gather 失败
+        original_targets = targets.clone()
+        
         # 计算概率
         p = F.softmax(logits, dim=-1)  # [N, C]
         
         # 标签平滑
         if self.label_smoothing > 0:
-            targets = self._smooth_labels(targets, logits.size(-1))
-            ce_loss = -torch.sum(targets * torch.log_softmax(logits, dim=-1), dim=-1)  # [N]
-            p_t = torch.sum(p * targets, dim=-1)  # [N]
+            smooth_targets = self._smooth_labels(targets, logits.size(-1))
+            ce_loss = -torch.sum(smooth_targets * torch.log_softmax(logits, dim=-1), dim=-1)  # [N]
+            # I25-1 修复: p_t 必须使用原始目标类别的概率
+            # 数学: p_t = p_{y*}，其中 y* 是真实标签
+            # 错误做法: p_t = Σ p_c × y'_c (这是期望值，不是目标概率)
+            p_t = p.gather(1, original_targets.unsqueeze(1)).squeeze(1)  # [N]
         else:
             # 提取目标类别的概率 p_t
             ce_loss = F.cross_entropy(logits, targets, reduction="none")  # [N]
@@ -143,7 +172,8 @@ class FocalLoss(nn.Module):
                 # 每个类别不同的权重
                 if self.alpha.device != logits.device:
                     self.alpha = self.alpha.to(logits.device)
-                alpha_t = self.alpha.gather(0, targets)  # [N]
+                # I25-1: 使用原始整数目标索引
+                alpha_t = self.alpha.gather(0, original_targets)  # [N]
             else:
                 # 统一权重
                 alpha_t = self.alpha

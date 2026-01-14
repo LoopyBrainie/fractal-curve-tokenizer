@@ -50,6 +50,7 @@ from .base import (
     VisualizationLayer,
     VisualizationResult,
     compute_entropy,
+    safe_tight_layout,
     truncate_labels,
 )
 
@@ -147,7 +148,28 @@ class L2TokenizerVisualizer(VisualizationLayer):
             result.names.append("L2_spatial_coverage")
             result.descriptions.append("Token 空间覆盖可视化")
         
-        # 5. 综合摘要
+        # 5. 深度坍缩诊断 (新增)
+        if hasattr(metrics, 'depth_kl_from_uniform'):
+            fig = self._plot_depth_collapse_diagnosis(metrics)
+            result.figures.append(fig)
+            result.names.append("L2_depth_collapse")
+            result.descriptions.append("深度坍缩诊断")
+        
+        # 6. Token 利用效率 (新增)
+        if hasattr(metrics, 'token_utilization_score'):
+            fig = self._plot_token_utilization(metrics)
+            result.figures.append(fig)
+            result.names.append("L2_token_utilization")
+            result.descriptions.append("Token 利用效率分析")
+        
+        # 7. 深度贡献分析 (新增)
+        if hasattr(metrics, 'depth_contribution') and metrics.depth_contribution:
+            fig = self._plot_depth_contribution(metrics.depth_contribution)
+            result.figures.append(fig)
+            result.names.append("L2_depth_contribution")
+            result.descriptions.append("深度贡献度分析")
+        
+        # 8. 综合摘要
         fig = self._plot_summary(metrics)
         result.figures.append(fig)
         result.names.append("L2_summary")
@@ -220,7 +242,7 @@ class L2TokenizerVisualizer(VisualizationLayer):
         ax2.set_title("Depth Proportion", fontsize=12, fontweight='bold')
         
         fig.suptitle("L2: Token Depth (Scale) Analysis", fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_token_distribution(
@@ -249,7 +271,7 @@ class L2TokenizerVisualizer(VisualizationLayer):
                    label=f'Mean: {avg:.1f}')
         ax1.axvline(avg - std, color='orange', linestyle=':', alpha=0.7)
         ax1.axvline(avg + std, color='orange', linestyle=':', alpha=0.7,
-                   label=f'±1 Std: {std:.1f}')
+                   label=f'+/-1 Std: {std:.1f}')
         
         ax1.set_xlabel("Token Count per Sample", fontsize=11)
         ax1.set_ylabel("Density", fontsize=11)
@@ -288,7 +310,7 @@ class L2TokenizerVisualizer(VisualizationLayer):
         ax2.set_title("Token Count Statistics", fontsize=12, fontweight='bold')
         
         fig.suptitle("L2: Token Count Analysis", fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_per_class_tokens(
@@ -395,7 +417,7 @@ class L2TokenizerVisualizer(VisualizationLayer):
             title = f"Average Token Count per Class (Top/Bottom {n_show} of {n_classes})"
         ax.set_title(title, fontsize=12, fontweight='bold')
         
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_spatial_coverage(
@@ -453,7 +475,7 @@ class L2TokenizerVisualizer(VisualizationLayer):
         
         fig.suptitle(f"L2: Spatial Coverage (Overall: {coverage_ratio:.1%})",
                     fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_summary(self, metrics: Any) -> Figure:
@@ -515,7 +537,7 @@ class L2TokenizerVisualizer(VisualizationLayer):
             f"│  Token Std: {metrics.std_tokens:>8.2f}            │\n"
             f"│  Depth Entropy: {metrics.depth_entropy:>8.3f}        │\n"
             f"│  Coverage: {metrics.spatial_coverage_ratio:>8.1%}          │\n"
-            f"│  Content-Token ρ: {metrics.content_token_correlation:>6.3f}      │\n"
+            f"|  Content-Token rho: {metrics.content_token_correlation:>6.3f}      |\n"
             f"└─────────────────────────────────┘"
         )
         
@@ -527,5 +549,213 @@ class L2TokenizerVisualizer(VisualizationLayer):
         ax3.set_title("Key Metrics", fontsize=12, fontweight='bold')
         
         fig.suptitle("L2 Tokenizer Behavior Summary", fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
+    
+    def _plot_depth_collapse_diagnosis(self, metrics: Any) -> Figure:
+        """深度坍缩诊断可视化
+        
+        数学形式：
+            KL_uniform = D_KL(π || U) = Σ_d π_d log(π_d / (1/D))
+            collapse_detected = KL > 1.0 ∨ entropy_ratio < 0.3
+        """
+        fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+        
+        # 1. KL 散度仪表盘
+        ax_kl = axes[0]
+        kl_val = getattr(metrics, 'depth_kl_from_uniform', 0)
+        self._draw_gauge(
+            ax_kl,
+            value=min(kl_val, 3.0),  # 限制显示范围
+            min_val=0,
+            max_val=3.0,
+            title="KL from Uniform",
+            thresholds=[(0.5, 'green'), (1.0, 'yellow'), (2.0, 'red')],
+        )
+        ax_kl.text(0.5, -0.15, f"KL = {kl_val:.3f}\n(阈值: 1.0)",
+                  ha='center', transform=ax_kl.transAxes, fontsize=10)
+        
+        # 2. 熵比率仪表盘
+        ax_entropy = axes[1]
+        entropy_ratio = getattr(metrics, 'depth_entropy_ratio', 0)
+        self._draw_gauge(
+            ax_entropy,
+            value=entropy_ratio,
+            min_val=0,
+            max_val=1.0,
+            title="Entropy Ratio (H/H_max)",
+            thresholds=[(0.3, 'red'), (0.5, 'yellow'), (0.7, 'green')],
+        )
+        ax_entropy.text(0.5, -0.15, f"Ratio = {entropy_ratio:.2%}\n(阈值: 30%)",
+                       ha='center', transform=ax_entropy.transAxes, fontsize=10)
+        
+        # 3. 状态指示
+        ax_status = axes[2]
+        ax_status.axis('off')
+        
+        collapse = getattr(metrics, 'depth_collapse_detected', False)
+        
+        if collapse:
+            status_text = "[!] Depth Collapse"
+            status_color = 'red'
+            detail = "Severe depth distribution imbalance\nMay cause loss of multi-scale features"
+            recommendation = "Recommendations:\n- Enable LOG_COMPENSATION\n- Increase DEPTH_KL_WEIGHT\n- Check splitter training"
+        else:
+            status_text = "[OK] Depth Healthy"
+            status_color = 'green'
+            detail = "Depth distribution is balanced\nMulti-scale features normal"
+            recommendation = ""
+        
+        ax_status.text(0.5, 0.75, status_text, ha='center', va='center',
+                      fontsize=24, fontweight='bold', color=status_color,
+                      transform=ax_status.transAxes)
+        ax_status.text(0.5, 0.50, detail, ha='center', va='center',
+                      fontsize=11, transform=ax_status.transAxes)
+        ax_status.text(0.5, 0.20, recommendation, ha='center', va='center',
+                      fontsize=10, color='gray', transform=ax_status.transAxes)
+        
+        fig.suptitle("Depth Collapse Diagnosis (I21)", fontsize=14, fontweight='bold')
+        safe_tight_layout()
+        self._add_watermark(fig)
+        return fig
+    
+    def _plot_token_utilization(self, metrics: Any) -> Figure:
+        """Token 利用效率分析
+        
+        数学形式：
+            Score = (depth_entropy_ratio + |content_correlation| + adaptive_ratio) / 3
+        """
+        fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+        
+        # 1. 利用效率分数
+        ax_score = axes[0]
+        score = getattr(metrics, 'token_utilization_score', 0)
+        self._draw_gauge(
+            ax_score,
+            value=score,
+            min_val=0,
+            max_val=1.0,
+            title="Token 利用效率",
+            thresholds=[(0.3, 'red'), (0.5, 'yellow'), (0.7, 'green')],
+        )
+        
+        # 2. 冗余比例
+        ax_redund = axes[1]
+        redundancy = getattr(metrics, 'redundancy_ratio', 0)
+        
+        labels = ['有效', '冗余']
+        sizes = [1 - redundancy, redundancy]
+        colors = ['#2ecc71', '#e74c3c']
+        
+        ax_redund.pie(sizes, labels=labels, autopct='%1.1f%%',
+                     colors=colors, startangle=90)
+        ax_redund.set_title(f"Token 冗余估计\n(冗余 = {redundancy:.1%})")
+        
+        # 3. 自适应程度
+        ax_adapt = axes[2]
+        adaptive = getattr(metrics, 'adaptive_ratio', 0)
+        
+        ax_adapt.bar(['Adaptive Ratio'], [adaptive], color='steelblue', edgecolor='black')
+        ax_adapt.axhline(y=0.2, color='green', linestyle='--', label='健康阈值')
+        ax_adapt.set_ylabel("std / mean")
+        ax_adapt.set_title(f"自适应程度\n(std/mean = {adaptive:.3f})")
+        ax_adapt.set_ylim(0, max(adaptive * 1.5, 0.5))
+        ax_adapt.legend()
+        
+        fig.suptitle("Token 利用效率分析", fontsize=14, fontweight='bold')
+        safe_tight_layout()
+        self._add_watermark(fig)
+        return fig
+    
+    def _plot_depth_contribution(self, depth_contribution: Dict) -> Figure:
+        """深度贡献度分析
+        
+        展示各深度对分类的贡献
+        """
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        
+        depths = sorted(depth_contribution.keys())
+        
+        # 1. Token 数量占比
+        ax_tokens = axes[0]
+        token_ratios = [depth_contribution[d].get('token_ratio', 0) for d in depths]
+        colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(depths)))
+        
+        ax_tokens.bar(depths, token_ratios, color=colors, edgecolor='black')
+        ax_tokens.set_xlabel("深度")
+        ax_tokens.set_ylabel("Token 占比")
+        ax_tokens.set_title("各深度 Token 数量占比")
+        ax_tokens.set_xticks(depths)
+        
+        for d, ratio in zip(depths, token_ratios):
+            ax_tokens.text(d, ratio + 0.01, f"{ratio:.1%}", ha='center', fontsize=9)
+        
+        # 2. 估计面积贡献
+        ax_area = axes[1]
+        area_ratios = [depth_contribution[d].get('estimated_area_ratio', 0) for d in depths]
+        
+        # 归一化
+        total_area = sum(area_ratios)
+        if total_area > 0:
+            area_ratios = [a / total_area for a in area_ratios]
+        
+        ax_area.bar(depths, area_ratios, color=colors, edgecolor='black')
+        ax_area.set_xlabel("深度")
+        ax_area.set_ylabel("面积贡献比")
+        ax_area.set_title("各深度估计面积贡献\n(深度越深, patch 越小)")
+        ax_area.set_xticks(depths)
+        
+        for d, ratio in zip(depths, area_ratios):
+            ax_area.text(d, ratio + 0.01, f"{ratio:.1%}", ha='center', fontsize=9)
+        
+        fig.suptitle("深度贡献度分析", fontsize=14, fontweight='bold')
+        safe_tight_layout()
+        self._add_watermark(fig)
+        return fig
+    
+    def _draw_gauge(
+        self,
+        ax: plt.Axes,
+        value: float,
+        min_val: float,
+        max_val: float,
+        title: str,
+        thresholds: list,
+    ) -> None:
+        """绘制仪表盘"""
+        ax.set_xlim(-1.5, 1.5)
+        ax.set_ylim(-0.5, 1.5)
+        ax.set_aspect('equal')
+        ax.axis('off')
+        
+        theta = np.linspace(np.pi, 0, 100)
+        x = np.cos(theta)
+        y = np.sin(theta)
+        ax.plot(x, y, 'lightgray', linewidth=20, solid_capstyle='round')
+        
+        normalized = (value - min_val) / (max_val - min_val + 1e-10)
+        normalized = np.clip(normalized, 0, 1)
+        
+        color = 'gray'
+        for thresh, c in sorted(thresholds):
+            if value <= thresh:
+                color = c
+                break
+        else:
+            color = thresholds[-1][1] if thresholds else 'gray'
+        
+        theta_val = np.linspace(np.pi, np.pi - normalized * np.pi, 50)
+        x_val = np.cos(theta_val)
+        y_val = np.sin(theta_val)
+        ax.plot(x_val, y_val, color=color, linewidth=18, solid_capstyle='round')
+        
+        pointer_angle = np.pi - normalized * np.pi
+        ax.arrow(0, 0, 0.6 * np.cos(pointer_angle), 0.6 * np.sin(pointer_angle),
+                head_width=0.1, head_length=0.05, fc='black', ec='black')
+        ax.scatter([0], [0], s=100, c='black', zorder=5)
+        
+        ax.text(0, -0.2, f"{value:.3f}", ha='center', va='top',
+               fontsize=14, fontweight='bold')
+        ax.text(0, 1.3, title, ha='center', va='bottom', fontsize=12)
+        ax.text(-1.1, 0, f"{min_val}", ha='center', va='center', fontsize=9)
+        ax.text(1.1, 0, f"{max_val}", ha='center', va='center', fontsize=9)

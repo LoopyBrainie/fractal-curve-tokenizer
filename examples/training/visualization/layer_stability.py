@@ -43,6 +43,7 @@ from .base import (
     FigureConfig,
     VisualizationLayer,
     VisualizationResult,
+    safe_tight_layout,
 )
 
 # 尝试导入 evaluation_layers 中的数据类
@@ -169,7 +170,7 @@ class L6StabilityVisualizer(VisualizationLayer):
         ax2.set_title("Weight Norm Range by Module", fontsize=12, fontweight='bold')
         
         fig.suptitle("L6: Weight Norm Analysis", fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_health_check(self, metrics: Any) -> Figure:
@@ -203,7 +204,7 @@ class L6StabilityVisualizer(VisualizationLayer):
             ax.axis('off')
         
         fig.suptitle("L6: Numerical Health Check", fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_training_curves(self, training_history: List[Dict]) -> Figure:
@@ -284,7 +285,7 @@ class L6StabilityVisualizer(VisualizationLayer):
         ax4.set_title("Overfitting Indicator", fontsize=12, fontweight='bold')
         
         fig.suptitle("L6: Training Curves & Stability", fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_summary(self, metrics: Any) -> Figure:

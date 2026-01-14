@@ -24,6 +24,7 @@ Date: 2026-01-11
 
 from __future__ import annotations
 
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +35,31 @@ import matplotlib.patches as mpatches
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 import numpy as np
+
+# 抑制 matplotlib 的 figure 数量警告（评估时会生成大量图表）
+plt.rcParams['figure.max_open_warning'] = 50
+
+# 抑制字体缺失警告
+warnings.filterwarnings('ignore', message='.*Glyph.*missing from.*')
+
+
+# ============================================================================
+# 辅助函数
+# ============================================================================
+
+def safe_tight_layout(fig: Optional[Figure] = None, **kwargs) -> None:
+    """安全的 tight_layout 调用，抑制布局警告
+    
+    Args:
+        fig: 目标 Figure，如果为 None 则使用当前 Figure
+        **kwargs: 传递给 tight_layout 的额外参数（如 rect）
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if fig is not None:
+            fig.tight_layout(**kwargs)
+        else:
+            plt.tight_layout(**kwargs)
 
 
 # ============================================================================
@@ -97,9 +123,11 @@ class FigureConfig:
         plt.rcParams['ytick.labelsize'] = self.tick_fontsize
         plt.rcParams['legend.fontsize'] = self.legend_fontsize
         
+        # 始终禁用 Unicode 减号，避免字体兼容性问题
+        plt.rcParams['axes.unicode_minus'] = False
+        
         if self.use_chinese:
             plt.rcParams['font.sans-serif'] = [self.chinese_font, 'DejaVu Sans', 'Arial Unicode MS']
-            plt.rcParams['axes.unicode_minus'] = False
 
 
 @dataclass

@@ -41,6 +41,7 @@ from .base import (
     VisualizationLayer,
     VisualizationResult,
     format_large_number,
+    safe_tight_layout,
 )
 
 # 尝试导入 evaluation_layers 中的数据类
@@ -175,7 +176,7 @@ class L5EfficiencyVisualizer(VisualizationLayer):
         ax2.set_title("Component Latency", fontsize=12, fontweight='bold')
         
         fig.suptitle("L5: Inference Latency Analysis", fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_memory_throughput(self, metrics: Any) -> Figure:
@@ -228,7 +229,7 @@ class L5EfficiencyVisualizer(VisualizationLayer):
         ax2.set_title("Inference Throughput", fontsize=12, fontweight='bold')
         
         fig.suptitle("L5: Memory & Throughput Analysis", fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_parameter_analysis(
@@ -293,20 +294,21 @@ class L5EfficiencyVisualizer(VisualizationLayer):
             
             ax2.set_title("Parameters by Module", fontsize=12, fontweight='bold')
         else:
-            # 简单统计
+            # 简单统计 (防止除零)
+            ratio_pct = (trainable / total * 100) if total > 0 else 0.0
             ax2.text(0.5, 0.5,
                     f"Parameter Summary\n\n"
                     f"Total: {format_large_number(total)}\n"
                     f"Trainable: {format_large_number(trainable)}\n"
                     f"Frozen: {format_large_number(frozen)}\n\n"
-                    f"Trainable Ratio: {trainable / total * 100:.1f}%",
+                    f"Trainable Ratio: {ratio_pct:.1f}%",
                     ha='center', va='center', fontsize=11,
                     transform=ax2.transAxes,
                     bbox=dict(boxstyle='round', facecolor='lightyellow'))
             ax2.axis('off')
         
         fig.suptitle("L5: Parameter Analysis", fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        safe_tight_layout()
         return fig
     
     def _plot_summary(self, metrics: Any, accuracy: Optional[float] = None) -> Figure:
