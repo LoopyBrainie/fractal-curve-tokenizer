@@ -98,24 +98,26 @@ class TestGumbelTopKSplitter:
     
     def test_tree_consistency(self, splitter, features):
         """
-        测试树一致性: 若子节点被选中，则父节点不被选中。
+        测试深度分布保证: 每个深度都有 token 被选中。
         
-        验证: 遍历所有选中节点，确保其父节点未被选中。
+        I26-1 更新: 移除树一致性约束后，验证配额机制保证深度多样性。
+        父子可以同时被选中，换取深度分布 100% 保证。
         """
         result = splitter(features)
         
         B, N = result.selected_mask.shape
         selected = (result.selected_mask > 0.5)  # 硬决策
         
-        for b in range(B):
-            selected_indices = selected[b].nonzero(as_tuple=True)[0]
-            
-            for idx in selected_indices:
-                parent_idx = splitter.parent_indices[idx].item()
-                if parent_idx >= 0:
-                    # 父节点不应被选中
-                    assert not selected[b, parent_idx], \
-                        f"Tree consistency violated: node {idx} selected but parent {parent_idx} also selected"
+        # 验证每个深度都有 token (配额保证)
+        depths = splitter.candidate_depths
+        max_depth = splitter.max_depth
+        
+        for d in range(max_depth + 1):
+            depth_mask = (depths == d)
+            depth_selected = selected[:, depth_mask].sum()
+            # 每个深度至少有 QUOTA_MIN_PER_DEPTH 个 token
+            assert depth_selected >= 1, \
+                f"Depth {d} should have at least 1 token selected, got {depth_selected}"
     
     def test_dynamic_k_selection(self, splitter, features):
         """
@@ -126,9 +128,8 @@ class TestGumbelTopKSplitter:
         # 检查每个 batch 的选中数量
         for b in range(features.shape[0]):
             num_selected = result.num_selected_per_batch[b].item()
-            # 由于树一致性约束，实际选中可能少于 K
+            # I26-1: 无树一致性约束，选中数量应接近配额总和
             assert num_selected >= 1, "At least 1 token should be selected"
-            # 不检查上界，因为树一致性可能减少 token 数
     
     def test_to_tensor_split_result(self, splitter, features):
         """测试转换为 TensorSplitResult。"""
