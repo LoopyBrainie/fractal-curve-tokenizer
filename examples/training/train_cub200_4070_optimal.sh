@@ -64,9 +64,9 @@ uv run python examples/training/train_fractal_vit.py \
   --tokenizer-type streaming_v3 \
   --num-scales 4 \
   --K-min 12 \
-  --K-max 196 \
-  --batch-size 24 \
-  --accum-steps 8 \
+  --K-max 256 \
+  --batch-size 96 \
+  --accum-steps 2 \
   --lr 2.6e-4 \
   --warmup-epochs 5 \
   --weight-decay 0.20 \

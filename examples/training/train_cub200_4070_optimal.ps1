@@ -72,16 +72,16 @@ uv run python examples/training/train_fractal_vit.py `
   --tokenizer-type streaming_v3 `
   --num-scales 4 `
   --K-min 12 `
-  --K-max 196 `
+  --K-max 256 `
   `
   <# ====================================================================== #> `
   <# 训练配置 (VRAM 修正)                                                   #> `
-  <#   batch_size = 24: 实际每步批量                                        #> `
-  <#   accum_steps = 8: 梯度累积                                            #> `
-  <#   effective_batch = 24 × 8 = 192                                       #> `
+  <#   batch_size = 96: 实际每步批量                                        #> `
+  <#   accum_steps = 2: 梯度累积                                            #> `
+  <#   effective_batch = 96 × 2 = 192                                       #> `
   <# ====================================================================== #> `
-  --batch-size 24 `
-  --accum-steps 8 `
+  --batch-size 96 `
+  --accum-steps 2 `
   --lr 2.6e-4 `
   --warmup-epochs 5 `
   `
