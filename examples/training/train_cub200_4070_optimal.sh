@@ -54,7 +54,7 @@
 uv run python examples/training/train_fractal_vit.py \
   --dataset cub200 \
   --epochs 100 \
-  --num-workers 0 \
+  --num-workers 12 \
   --dim 256 \
   --depth 8 \
   --heads 8 \

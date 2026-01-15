@@ -1371,10 +1371,21 @@ def create_dataloaders(
         mp_context = None
     
     # DataLoader 参数优化
+    # P16-FIX: 容器环境中 pin_memory + persistent_workers 会导致 ConnectionResetError
+    # 解决方案: 在容器环境中禁用 pin_memory，保留 persistent_workers (对性能影响更大)
+    # 非容器环境下仍启用 pin_memory
+    use_pin_memory = (
+        effective_workers > 0 
+        and torch.cuda.is_available() 
+        and not is_container  # P16-FIX: 容器环境禁用 pin_memory
+    )
+    if is_container and effective_workers > 0:
+        print(f"[INFO] 容器环境: 禁用 pin_memory 以避免多进程通信错误")
+    
     loader_kwargs = {
         'batch_size': config.batch_size,
         'num_workers': effective_workers,
-        'pin_memory': effective_workers > 0 and torch.cuda.is_available(),
+        'pin_memory': use_pin_memory,
         'multiprocessing_context': mp_context if effective_workers > 0 else None,
         'persistent_workers': effective_workers > 0,  # 避免每个 epoch 重建进程
         'drop_last': True,  # 避免最后一个小 batch 的性能损失

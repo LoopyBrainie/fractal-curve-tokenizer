@@ -53,6 +53,7 @@
 uv run python examples/training/train_fractal_vit.py `
   --dataset cub200 `
   --epochs 100 `
+  --num-workers 12 `
   `
   <# ====================================================================== #> `
   <# 模型架构 (~8M 参数, Double Descent 优化)                               #> `
