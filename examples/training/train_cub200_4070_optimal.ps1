@@ -84,8 +84,6 @@ uv run python examples/training/train_fractal_vit.py `
   --accum-steps 8 `
   --lr 2.6e-4 `
   --warmup-epochs 5 `
-  --lr-scheduler cosine `
-  --min-lr 1e-6 `
   `
   <# ====================================================================== #> `
   <# 正则化 (小数据集强正则化)                                              #> `
@@ -101,18 +99,12 @@ uv run python examples/training/train_fractal_vit.py `
   <# ====================================================================== #> `
   --mixup-alpha 0.4 `
   --cutmix-alpha 0.6 `
-  --mix-prob 0.5 `
+  --mixup-prob 0.5 `
   `
   <# ====================================================================== #> `
   <# 硬件优化 (RTX 4070 Laptop 8GB VRAM)                                   #> `
   <# ====================================================================== #> `
   --compile `
   --channels-last `
-  --gradient-checkpointing `
-  --amp `
-  `
-  <# ====================================================================== #> `
-  <# 日志与检查点                                                           #> `
-  <# ====================================================================== #> `
-  --log-interval 10 `
-  --save-interval 20 
+  --gradient-checkpoint `
+  --use-amp

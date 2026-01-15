@@ -69,8 +69,6 @@ uv run python examples/training/train_fractal_vit.py \
   --accum-steps 8 \
   --lr 2.6e-4 \
   --warmup-epochs 5 \
-  --lr-scheduler cosine \
-  --min-lr 1e-6 \
   --weight-decay 0.20 \
   --dropout 0.20 \
   --emb-dropout 0.15 \
@@ -78,10 +76,8 @@ uv run python examples/training/train_fractal_vit.py \
   --label-smoothing 0.15 \
   --mixup-alpha 0.4 \
   --cutmix-alpha 0.6 \
-  --mix-prob 0.5 \
+  --mixup-prob 0.5 \
   --compile \
   --channels-last \
-  --gradient-checkpointing \
-  --amp \
-  --log-interval 10 \
-  --save-interval 20 
+  --gradient-checkpoint \
+  --use-amp 
