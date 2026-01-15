@@ -54,6 +54,7 @@
 uv run python examples/training/train_fractal_vit.py \
   --dataset cub200 \
   --epochs 100 \
+  --num-workers 0 \
   --dim 256 \
   --depth 8 \
   --heads 8 \
@@ -65,8 +66,8 @@ uv run python examples/training/train_fractal_vit.py \
   --num-scales 4 \
   --K-min 12 \
   --K-max 256 \
-  --batch-size 96 \
-  --accum-steps 2 \
+  --batch-size 64 \
+  --accum-steps 3 \
   --lr 2.6e-4 \
   --warmup-epochs 5 \
   --weight-decay 0.20 \

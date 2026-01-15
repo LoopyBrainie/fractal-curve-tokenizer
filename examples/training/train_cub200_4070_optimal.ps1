@@ -80,8 +80,8 @@ uv run python examples/training/train_fractal_vit.py `
   <#   accum_steps = 2: 梯度累积                                            #> `
   <#   effective_batch = 96 × 2 = 192                                       #> `
   <# ====================================================================== #> `
-  --batch-size 96 `
-  --accum-steps 2 `
+  --batch-size 64 `
+  --accum-steps 3 `
   --lr 2.6e-4 `
   --warmup-epochs 5 `
   `
