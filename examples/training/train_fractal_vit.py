@@ -1108,7 +1108,8 @@ def download_cub200(data_root: Path) -> bool:
             members = tar.getmembers()
             with tqdm(total=len(members), desc="Extracting", unit="files") as pbar:
                 for member in members:
-                    tar.extract(member, data_root)
+                    # filter='data' 兼容 Python 3.14+ (PEP 706)
+                    tar.extract(member, data_root, filter='data')
                     pbar.update(1)
         print("[OK] Extraction complete")
     except Exception as e:
