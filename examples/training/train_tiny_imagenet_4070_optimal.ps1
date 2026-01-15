@@ -40,8 +40,8 @@
 #
 # 4. 学习率缩放 (Linear Scaling Rule)
 #    ---------------------------------
-#    lr_base = 5e-4 @ batch_size=256
-#    lr = lr_base × (B / 256) = 5e-4 × (192/256) = 3.75e-4
+#    lr_base = 5e-4 @ batch_size=256 (AdamW + ViT 标准)
+#    lr = 5e-4 × (192/256) × 0.85 ≈ 3.2e-4 (Mixup 补偿)
 #
 # 5. VRAM 预算 (8GB - 4070 Laptop)
 #    ------------------------------
@@ -85,32 +85,32 @@ uv run python examples/training/train_fractal_vit.py `
   <# ====================================================================== #> `
   <# Scheme D: GumbelTopKSplitter 配置                                      #> `
   <#   num_scales=4 → max_depth=3 → 候选数=85                               #> `
-  <#   K_min=12 (信息论: √C/2 ≈ 7, 取 12 安全余量)                          #> `
-  <#   K_max=64 (token 数软上限)                                            #> `
+  <#   K_min=16 (信息论: ⌈log₂(200)/1.5⌉×2 ≈ 12 → 16 安全余量)              #> `
+  <#   K_max=64 (token 数软上限, 4:1 压缩比)                                #> `
   <#   I21 深度平衡: 自动启用 (constants.py 默认值)                          #> `
   <# ====================================================================== #> `
   --tokenizer-type streaming_v3 `
   --num-scales 4 `
-  --K-min 12 `
+  --K-min 16 `
   --K-max 64 `
   `
   <# ====================================================================== #> `
   <# 训练配置 (batch_size=192 最大化 GPU 利用率)                            #> `
-  <#   lr_base = 3e-4 @ batch_size=256                                      #> `
-  <#   lr = lr_base × (B/256) = 3e-4 × 0.75 ≈ 2.5e-4 (考虑 mixup 补偿)      #> `
+  <#   lr_base = 5e-4 @ batch_size=256 (AdamW + ViT 标准)                   #> `
+  <#   lr = 5e-4 × (192/256) × 0.85 ≈ 3.2e-4 (Mixup 补偿)                   #> `
   <# ====================================================================== #> `
   --batch-size 192 `
   --num-workers 4 `
-  --lr 2.5e-4 `
+  --lr 3.2e-4 `
   --weight-decay 0.1 `
   --warmup-epochs 10 `
   `
   <# ====================================================================== #> `
   <# 正则化 (适应 30M 模型 + 100K 样本的过拟合风险)                         #> `
-  <#   drop_path = 0.1 + 0.1 × log2(12/6) = 0.2                              #> `
+  <#   drop_path = 0.1 × (depth/6) = 0.1 × (12/6) = 0.2                      #> `
   <# ====================================================================== #> `
-  --dropout 0.2 `
-  --emb-dropout 0.15 `
+  --dropout 0.15 `
+  --emb-dropout 0.1 `
   --drop-path 0.2 `
   --label-smoothing 0.1 `
   `
@@ -124,14 +124,14 @@ uv run python examples/training/train_fractal_vit.py `
   <# ====================================================================== #> `
   <# 辅助损失配置                                                           #> `
   <#   Soft Entropy: 最大化尺度多样性                                        #> `
-  <#   Elastic Budget: Dead Zone [16, 96] 内零惩罚                           #> `
+  <#   Elastic Budget: Dead Zone [16, 80] 内零惩罚                           #> `
   <#   I21 Depth KL: 自动启用 (DEPTH_KL_WEIGHT=0.5)                          #> `
   <# ====================================================================== #> `
   --include-soft-entropy `
   --soft-entropy-mode maximize `
   --soft-entropy-weight 0.1 `
   --include-elastic-budget `
-  --elastic-N-min 12 `
+  --elastic-N-min 16 `
   --elastic-N-max 80 `
   --elastic-lambda-over 0.1 `
   --elastic-lambda-under 0.01 `

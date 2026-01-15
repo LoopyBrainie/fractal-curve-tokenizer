@@ -25,12 +25,12 @@
 # 3. 几何极限约束
 #    image_size=64, num_scales=4 → max_depth=3
 #    候选数: N = 1 + 4 + 16 + 64 = 85
-#    K_min=12 (信息论: √C/2 ≈ 7), K_max=64
-#    弹性预算 Dead Zone: [12, 80]
+#    K_min=16 (信息论: ⌈log₂(200)/1.5⌉×2), K_max=64 (4:1 压缩比)
+#    弹性预算 Dead Zone: [16, 80]
 #
 # 4. 学习率缩放 (Linear Scaling Rule)
-#    lr_base = 3e-4 @ batch_size=256
-#    lr = lr_base × (B/256) = 3e-4 × 0.75 ≈ 2.5e-4 (mixup 补偿)
+#    lr_base = 5e-4 @ batch_size=256 (AdamW + ViT 标准)
+#    lr = 5e-4 × (192/256) × 0.85 ≈ 3.2e-4 (Mixup 补偿)
 #
 # 5. 退火策略 (Jang et al., 2017)
 #    温度: T(t) = T_end + (T_start - T_end) × (1 + cos(πt/T)) / 2
@@ -57,23 +57,23 @@ uv run python examples/training/train_fractal_vit.py \
   \
   `# === Scheme D: GumbelTopKSplitter 配置 ===` \
   `# num_scales=4 → max_depth=3 → 候选数=85` \
-  `# K_min=12 (信息论下界), K_max=64` \
+  `# K_min=16 (信息论: ⌈log₂(200)/1.5⌉×2), K_max=64 (4:1 压缩比)` \
   `# I21 深度平衡: 自动启用 (constants.py)` \
   --tokenizer-type streaming_v3 \
   --num-scales 4 \
-  --K-min 12 \
+  --K-min 16 \
   --K-max 64 \
   \
-  `# === 学习率: lr = 3e-4 × (192/256) ≈ 2.5e-4 ===` \
+  `# === 学习率: lr = 5e-4 × (192/256) × 0.85 ≈ 3.2e-4 (Mixup 补偿) ===` \
   --batch-size 192 \
   --num-workers 4 \
-  --lr 2.5e-4 \
+  --lr 3.2e-4 \
   --weight-decay 0.1 \
   --warmup-epochs 10 \
   \
   `# === 正则化 (适应 30M 模型过拟合风险) ===` \
-  --dropout 0.2 \
-  --emb-dropout 0.15 \
+  --dropout 0.15 \
+  --emb-dropout 0.1 \
   --drop-path 0.2 \
   --label-smoothing 0.1 \
   \
@@ -91,7 +91,7 @@ uv run python examples/training/train_fractal_vit.py \
   --soft-entropy-mode maximize \
   --soft-entropy-weight 0.1 \
   --include-elastic-budget \
-  --elastic-N-min 12 \
+  --elastic-N-min 16 \
   --elastic-N-max 80 \
   --elastic-lambda-over 0.1 \
   --elastic-lambda-under 0.01 \

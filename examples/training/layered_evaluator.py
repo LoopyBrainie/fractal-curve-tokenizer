@@ -517,6 +517,9 @@ class LayeredEvaluator:
             num_scales=num_scales,
             lca_temperature=config.get('lca_temperature', 1.5),
             learnable_temperature=config.get('learnable_temperature', True),
+            # I23-2: Token 数量约束 (需与训练配置对齐)
+            K_min=config.get('K_min', 16),
+            K_max=config.get('K_max', 64),
         )
         
         # 加载权重

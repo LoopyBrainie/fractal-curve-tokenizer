@@ -252,7 +252,11 @@ if str(EXAMPLES_PATH) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_PATH))
 
 from vit_pytorch import FractalCurveViT
-from vit_pytorch.constants import SPLITTER_TEMP_START, SPLITTER_TEMP_END
+from vit_pytorch.constants import (
+    SPLITTER_TEMP_START, 
+    SPLITTER_TEMP_END, 
+    SPLITTER_TEMP_SCHEDULE,  # I29-4: 导入调度策略
+)
 
 # Fractal Training 模块 (I15) - 现在位于 examples/training
 from training import (
@@ -263,6 +267,8 @@ from training import (
     FocalLoss as FTFocalLoss,
     ClassBalancedCE,
     FocalClassBalancedLoss,
+    # I30-2: Hilbert-aware 困难样本挖掘
+    HilbertAwareHardMining,
     # Metrics
     ClassificationMetrics,
     # Schedulers
@@ -271,6 +277,8 @@ from training import (
     FLOPSBudgetLoss,
     DepthWeightedBudgetLoss,
     BudgetScheduler,
+    # 类别权重计算 (修复 T2-5)
+    compute_class_weights_from_targets,
     # Trainer
     ModularTrainer,
     # Config
@@ -391,6 +399,11 @@ class TrainingConfig:
     use_class_balanced: bool  # 是否使用类别平衡损失权重
     class_balance_beta: float  # 类别平衡的 beta 参数，默认 0.9999
     progressive_aug: bool  # 是否使用渐进式数据增强
+    
+    # I30-2: Hilbert-aware 困难样本挖掘
+    use_hilbert_mining: bool  # 是否使用基于 Token 方差的困难样本挖掘
+    hilbert_mining_lambda: float  # 权重缩放系数 λ，默认 0.5
+    hilbert_mining_warmup: int  # EMA 统计预热 batch 数，默认 100
     
     # 系统
     seed: int
@@ -1310,6 +1323,7 @@ def train_epoch(
     loss_fn: Optional[nn.Module] = None,
     class_weights: Optional[torch.Tensor] = None,
     epoch: int = 1,
+    hard_mining: Optional[HilbertAwareHardMining] = None,
 ) -> Tuple[float, float, Dict[str, float]]:
     """训练一个 epoch
     
@@ -1426,7 +1440,14 @@ def train_epoch(
             print(f"[DEBUG] Batch 0: 开始 forward pass, imgs.dtype={imgs.dtype}...", flush=True)
         
         with get_amp_context(device, config.use_amp):
-            outs, aux_infos = model(imgs, return_aux_info=True)  # I14-1 D1: 捕获 aux_info 用于崩溃检测
+            # I30-2: 当启用 Hilbert 困难样本挖掘时，获取 tokens
+            if hard_mining is not None and not use_mixup:
+                outs, tokens, token_lengths = model(imgs, return_tokens=True)
+                aux_infos = None  # return_tokens 和 return_aux_info 不同时支持
+            else:
+                outs, aux_infos = model(imgs, return_aux_info=True)  # I14-1 D1: 捕获 aux_info 用于崩溃检测
+                tokens = None
+                token_lengths = None
             if i == 0 and use_mixup:
                 print(f"[DEBUG] Batch 0: forward 完成，outs.shape={outs.shape}", flush=True)
             
@@ -1458,7 +1479,24 @@ def train_epoch(
             else:
                 # P14: 使用自定义损失函数 (Focal Loss / Class-Balanced Loss)
                 if loss_fn is not None:
-                    ce_loss = loss_fn(outs, labels) / config.accum_steps
+                    # I30-2: 当启用 Hilbert 困难样本挖掘时，需要 unreduced loss
+                    if hard_mining is not None and tokens is not None:
+                        # 临时修改 reduction 获取逐样本损失
+                        old_reduction = getattr(loss_fn, 'reduction', 'mean')
+                        if hasattr(loss_fn, 'reduction'):
+                            loss_fn.reduction = 'none'
+                        base_loss = loss_fn(outs, labels)  # [B]
+                        if hasattr(loss_fn, 'reduction'):
+                            loss_fn.reduction = old_reduction
+                        # 应用 token variance 加权
+                        ce_loss, mining_info = hard_mining(tokens, base_loss, token_lengths)
+                        ce_loss = ce_loss / config.accum_steps
+                        # 记录挖掘统计 (每 100 batch 打印一次)
+                        if i % 100 == 0 and i > 0:
+                            print(f"[MINING] Batch {i}: weight=[{mining_info.get('weight_min', 0):.3f}, {mining_info.get('weight_max', 0):.3f}], "
+                                  f"token_var={mining_info.get('token_var_mean', 0):.2f}")
+                    else:
+                        ce_loss = loss_fn(outs, labels) / config.accum_steps
                 elif class_weights is not None:
                     # 使用类别平衡权重
                     ce_loss = F.cross_entropy(
@@ -2239,12 +2277,6 @@ def main():
     parser.add_argument("--splitter-temp-warmup", type=int, default=5,
                        help="Warmup epochs with fixed T_start (default: 5)")
     
-    # I10-19: 连续松弛参数
-    parser.add_argument("--use-continuous-relaxation", action="store_true", default=False,
-                       help="I10-19: Enable continuous relaxation for fully differentiable forward pass")
-    parser.add_argument("--continuous-max-depth", type=int, default=3,
-                       help="I10-19: Max depth for continuous parallel evaluator (default: 3, 85 candidates)")
-    
     # P10-4/P10-5: 软熵损失参数
     parser.add_argument("--include-soft-entropy", action="store_true", default=True,
                        help="Enable soft entropy loss (default: True, recommended)")
@@ -2317,6 +2349,14 @@ def main():
                        help="Class balance beta parameter (default: 0.9999)")
     parser.add_argument("--progressive-aug", action="store_true",
                        help="Use progressive data augmentation (weaker at start)")
+    
+    # I30-2: Hilbert-aware 困难样本挖掘
+    parser.add_argument("--use-hilbert-mining", action="store_true",
+                       help="Use Token Variance based hard sample mining (I30-2)")
+    parser.add_argument("--hilbert-mining-lambda", type=float, default=0.5,
+                       help="Hard mining weight scaling factor (default: 0.5)")
+    parser.add_argument("--hilbert-mining-warmup", type=int, default=100,
+                       help="Number of batches for EMA statistics warmup (default: 100)")
     
     # 系统
     parser.add_argument("--seed", type=int, default=42)
@@ -2422,6 +2462,10 @@ def main():
         use_class_balanced=args.use_class_balanced,
         class_balance_beta=args.class_balance_beta,
         progressive_aug=args.progressive_aug,
+        # I30-2: Hilbert-aware 困难样本挖掘
+        use_hilbert_mining=getattr(args, 'use_hilbert_mining', False),
+        hilbert_mining_lambda=getattr(args, 'hilbert_mining_lambda', 0.5),
+        hilbert_mining_warmup=getattr(args, 'hilbert_mining_warmup', 100),
         seed=args.seed,
         device=str(device),
     )
@@ -2443,6 +2487,9 @@ def main():
         # GumbelTopKSplitter (Scheme D) 参数
         K_min=config.K_min,
         K_max=config.K_max,
+        # I27: Splitter Dropout (与模型 dropout 对齐)
+        # 数学依据: Splitter MLP 敏感，过高 dropout 导致分割决策不稳定
+        splitter_dropout=min(config.dropout, 0.15),
     )
     
     # 创建模型 (V3 Variable Depth Tokens)
@@ -2622,9 +2669,9 @@ def main():
                 all_labels.extend(labels)
         
         if config.use_class_balanced:
-            # 计算类别平衡权重
-            class_weights = compute_class_weights(
-                labels=all_labels,
+            # 计算类别平衡权重 (T2-5: 使用正确的函数名)
+            class_weights = compute_class_weights_from_targets(
+                targets=all_labels,
                 num_classes=spec.num_classes,
                 beta=config.class_balance_beta,
             ).to(device)
@@ -2654,6 +2701,21 @@ def main():
             
             # Focal Loss 已经使用 class_weights，避免重复
             class_weights = None
+    
+    # I30-2: 创建 Hilbert-aware 困难样本挖掘模块
+    hard_mining: Optional[HilbertAwareHardMining] = None
+    if config.use_hilbert_mining:
+        hard_mining = HilbertAwareHardMining(
+            lambda_weight=config.hilbert_mining_lambda,
+            temperature=1.0,  # 标准 sigmoid
+            momentum=0.1,  # EMA 更新系数
+            warmup_batches=config.hilbert_mining_warmup,
+            enabled=True,
+        ).to(device)
+        print(f"[INFO] Hilbert-Aware Hard Mining (I30-2):")
+        print(f"  - Lambda weight: {config.hilbert_mining_lambda}")
+        print(f"  - Warmup batches: {config.hilbert_mining_warmup}")
+        print(f"  - Expected weight range: [1.0, {1.0 + config.hilbert_mining_lambda:.2f}]")
     
     # 训练
     print("="*70)
@@ -2774,12 +2836,12 @@ def main():
                 total_steps=post_warmup_steps,
                 T_start=config.splitter_temp_start,
                 T_end=config.splitter_temp_end,
-                schedule='exponential',  # 最优的梯度-确定性权衡
+                schedule=SPLITTER_TEMP_SCHEDULE,  # I29-4: 使用常量
             )
             print(f"[OK] 启用自适应分割器温度退火:")
             print(f"     T: {config.splitter_temp_start} → {config.splitter_temp_end}")
             print(f"     Steps: {post_warmup_steps} (after {config.splitter_temp_warmup} warmup epochs)")
-            print(f"     Schedule: exponential")
+            print(f"     Schedule: {SPLITTER_TEMP_SCHEDULE}")  # I29-4: 显示实际使用的调度
             splitter_annealing_enabled = True
         
         # 启用探索偏置退火 (P10-12 + P10-15)
@@ -2857,7 +2919,7 @@ def main():
                         total_steps=post_warmup_steps,
                         T_start=config.splitter_temp_start,
                         T_end=config.splitter_temp_end,
-                        schedule='exponential',
+                        schedule=SPLITTER_TEMP_SCHEDULE,  # I29-4: 使用常量
                     )
                 # P10-15: 同步启用偏置退火 (使用模型默认参数)
                 if hasattr(splitter, 'enable_explore_bias_annealing'):
@@ -2947,6 +3009,7 @@ def main():
             loss_fn=loss_fn,
             class_weights=class_weights,
             epoch=epoch,
+            hard_mining=hard_mining,
         )
         
         # P15: 恢复 CudaPrefetcher 和清理临时 loader

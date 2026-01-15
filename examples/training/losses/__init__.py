@@ -40,6 +40,11 @@ from torch import Tensor
 from .focal_loss import FocalLoss
 from .balanced_ce import ClassBalancedCrossEntropy, compute_class_weights_from_targets
 from .resource_loss import ResourceAwareLoss, compute_depth_entropy, get_weighted_token_count
+from .hilbert_hard_mining import (
+    HilbertAwareHardMining,
+    HilbertMiningWrapper,
+    create_hilbert_mining_loss,
+)
 
 
 # ============================================================================
@@ -203,6 +208,10 @@ __all__ = [
     "ResourceAwareLoss",
     "compute_depth_entropy",
     "get_weighted_token_count",
+    # I30-2: Hilbert-aware 困难样本挖掘
+    "HilbertAwareHardMining",
+    "HilbertMiningWrapper",
+    "create_hilbert_mining_loss",
     # 工具函数
     "compute_class_weights_from_targets",
 ]

@@ -72,6 +72,10 @@ from .losses import (
     compute_depth_entropy,
     get_weighted_token_count,
     compute_class_weights_from_targets,
+    # I30-2: Hilbert-aware 困难样本挖掘
+    HilbertAwareHardMining,
+    HilbertMiningWrapper,
+    create_hilbert_mining_loss,
 )
 
 # Metrics
@@ -192,6 +196,10 @@ __all__ = [
     "compute_depth_entropy",
     "get_weighted_token_count",
     "compute_class_weights_from_targets",
+    # I30-2: Hilbert-aware 困难样本挖掘
+    "HilbertAwareHardMining",
+    "HilbertMiningWrapper",
+    "create_hilbert_mining_loss",
     # Metrics
     "ClassificationMetrics",
     "ResourceMetrics",
