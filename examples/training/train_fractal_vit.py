@@ -551,6 +551,10 @@ DATASETS = {
     "cifar100": DatasetSpec("CIFAR100", 100, 32, 3, (0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762)),
     "mnist": DatasetSpec("MNIST", 10, 28, 1, (0.1307,), (0.3081,)),
     "tiny-imagenet": DatasetSpec("TinyImageNet", 200, 64, 3, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    # CUB-200-2011: 细粒度鸟类分类数据集
+    # 数学形式化: N_train=5994, N_test=5794, C=200, 图像尺寸变长→resize到224
+    # 统计量: mean/std 从 ImageNet 采用 (鸟类图像与 ImageNet 分布相似)
+    "cub200": DatasetSpec("CUB200", 200, 224, 3, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
 }
 
 
@@ -1016,6 +1020,186 @@ def download_tiny_imagenet(data_root: Path) -> bool:
     return True
 
 
+def download_cub200(data_root: Path) -> bool:
+    """下载并设置 CUB-200-2011 细粒度鸟类分类数据集
+    
+    数学形式化分析
+    ================
+    数据集规格:
+        N_train = 5,994 (约 30 张/类)
+        N_test = 5,794 (约 29 张/类)
+        C = 200 类 (鸟类物种)
+        图像尺寸: 变长 → resize 到 224×224
+    
+    细粒度分类特性:
+        - 类间差异小 (同为鸟类)
+        - 类内差异大 (姿态、光照变化)
+        - 需要关注局部细节 (喙、羽毛纹理)
+        → 适合验证 Fractal ViT 的自适应多尺度能力
+    
+    下载源:
+        - Caltech Data: https://data.caltech.edu/records/65de6-vp158
+        - 大小: ~1.2GB
+    
+    目录结构 (转换后):
+        data/CUB_200_2011/
+        ├── train/
+        │   ├── 001.Black_footed_Albatross/
+        │   │   ├── Black_Footed_Albatross_0001_796111.jpg
+        │   │   └── ...
+        │   └── ...
+        └── test/
+            ├── 001.Black_footed_Albatross/
+            │   └── ...
+            └── ...
+    """
+    target_dir = data_root / "CUB_200_2011"
+    
+    # 检查是否已存在并正确组织
+    if (target_dir / "train").exists() and (target_dir / "test").exists():
+        train_classes = len(list((target_dir / "train").iterdir()))
+        test_classes = len(list((target_dir / "test").iterdir()))
+        if train_classes >= 200 and test_classes >= 200:
+            print(f"[OK] CUB-200-2011 already exists at {target_dir}")
+            return True
+    
+    print("\n" + "="*60)
+    print("Downloading CUB-200-2011 Dataset")
+    print("="*60)
+    print(f"  Target: {target_dir}")
+    print(f"  Size: ~1.2GB")
+    print(f"  Classes: 200 bird species")
+    print(f"  Train: ~5,994 images")
+    print(f"  Test: ~5,794 images")
+    print("="*60 + "\n")
+    
+    tgz_path = data_root / "CUB_200_2011.tgz"
+    
+    # 检查已缓存的文件
+    if tgz_path.exists():
+        print(f"[OK] Using cached archive: {tgz_path}")
+    else:
+        # 下载
+        urls = [
+            "https://data.caltech.edu/records/65de6-vp158/files/CUB_200_2011.tgz",
+        ]
+        
+        download_success = False
+        for i, url in enumerate(urls):
+            print(f"[{i+1}/{len(urls)}] Trying: {url}")
+            if download_with_progress(url, tgz_path, "CUB-200-2011"):
+                download_success = True
+                print("[OK] Download complete")
+                break
+            print(f"[WARN] Failed, trying next source...")
+        
+        if not download_success:
+            print("\n[ERROR] Download failed.")
+            print("Please download manually from:")
+            print("  https://data.caltech.edu/records/65de6-vp158/files/CUB_200_2011.tgz")
+            print(f"And place it at: {tgz_path}")
+            return False
+    
+    # 解压
+    print("\nExtracting...")
+    try:
+        import tarfile
+        with tarfile.open(tgz_path, 'r:gz') as tar:
+            members = tar.getmembers()
+            with tqdm(total=len(members), desc="Extracting", unit="files") as pbar:
+                for member in members:
+                    tar.extract(member, data_root)
+                    pbar.update(1)
+        print("[OK] Extraction complete")
+    except Exception as e:
+        print(f"[ERROR] Extraction failed: {e}")
+        return False
+    
+    # 组织为 train/test 目录结构
+    print("\nOrganizing dataset by train/test split...")
+    
+    raw_dir = target_dir
+    images_dir = raw_dir / "images"
+    
+    if not images_dir.exists():
+        print(f"[ERROR] Images directory not found: {images_dir}")
+        return False
+    
+    # 读取 train_test_split.txt
+    split_file = raw_dir / "train_test_split.txt"
+    images_file = raw_dir / "images.txt"
+    
+    if not split_file.exists() or not images_file.exists():
+        print(f"[ERROR] Split files not found")
+        return False
+    
+    # 读取图像列表
+    image_id_to_path = {}
+    with open(images_file, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) == 2:
+                img_id, img_path = parts
+                image_id_to_path[img_id] = img_path
+    
+    # 读取 train/test 划分
+    train_ids = set()
+    test_ids = set()
+    with open(split_file, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) == 2:
+                img_id, is_train = parts
+                if is_train == '1':
+                    train_ids.add(img_id)
+                else:
+                    test_ids.add(img_id)
+    
+    print(f"  Train images: {len(train_ids)}")
+    print(f"  Test images: {len(test_ids)}")
+    
+    # 创建目录并移动文件
+    train_dir = target_dir / "train"
+    test_dir = target_dir / "test"
+    train_dir.mkdir(exist_ok=True)
+    test_dir.mkdir(exist_ok=True)
+    
+    for img_id, img_path in tqdm(image_id_to_path.items(), desc="Organizing"):
+        # img_path 格式: 001.Black_footed_Albatross/Black_Footed_Albatross_0001_796111.jpg
+        class_name = img_path.split('/')[0]
+        img_name = img_path.split('/')[-1]
+        
+        src = images_dir / img_path
+        
+        if img_id in train_ids:
+            dst_dir = train_dir / class_name
+        else:
+            dst_dir = test_dir / class_name
+        
+        dst_dir.mkdir(exist_ok=True)
+        dst = dst_dir / img_name
+        
+        if src.exists() and not dst.exists():
+            shutil.copy2(str(src), str(dst))
+    
+    # 验证
+    train_classes = len(list(train_dir.iterdir()))
+    test_classes = len(list(test_dir.iterdir()))
+    train_images = sum(1 for _ in train_dir.rglob("*.jpg"))
+    test_images = sum(1 for _ in test_dir.rglob("*.jpg"))
+    
+    print(f"\n[OK] Dataset organized:")
+    print(f"  Train: {train_classes} classes, {train_images} images")
+    print(f"  Test: {test_classes} classes, {test_images} images")
+    
+    # 清理 tgz (可选，保留以便重新解压)
+    # if tgz_path.exists():
+    #     tgz_path.unlink()
+    #     print("[OK] Cleaned up archive")
+    
+    return True
+
+
 # ============================================================================
 # 数据加载
 # ============================================================================
@@ -1042,6 +1226,20 @@ def create_dataloaders(
             transforms.ToTensor(),
             transforms.Normalize(spec.mean, spec.std),
             transforms.RandomErasing(p=0.25),  # Cutout-like augmentation
+        ])
+    elif spec.name == "CUB200":
+        # CUB-200-2011 细粒度分类增强策略
+        # 数学形式化: 细粒度分类需要保留局部细节，使用较强的几何变换和颜色增强
+        train_tf = transforms.Compose([
+            transforms.Resize(256),  # 先放大再裁剪，保留更多细节
+            transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),  # 随机裁剪
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(15),  # 小角度旋转
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+            transforms.RandAugment(num_ops=2, magnitude=9),
+            transforms.ToTensor(),
+            transforms.Normalize(spec.mean, spec.std),
+            transforms.RandomErasing(p=0.25),
         ])
     else:
         train_tf = transforms.Compose([
@@ -1077,6 +1275,14 @@ def create_dataloaders(
             raise FileNotFoundError("Failed to download Tiny ImageNet")
         train_dir = data_root / "tiny-imagenet-200" / "train"
         test_dir = data_root / "tiny-imagenet-200" / "val"
+        train_ds = datasets.ImageFolder(str(train_dir), transform=train_tf)
+        test_ds = datasets.ImageFolder(str(test_dir), transform=test_tf)
+    elif spec.name == "CUB200":
+        # CUB-200-2011 细粒度鸟类分类数据集
+        if not download_cub200(data_root):
+            raise FileNotFoundError("Failed to download CUB-200-2011")
+        train_dir = data_root / "CUB_200_2011" / "train"
+        test_dir = data_root / "CUB_200_2011" / "test"
         train_ds = datasets.ImageFolder(str(train_dir), transform=train_tf)
         test_ds = datasets.ImageFolder(str(test_dir), transform=test_tf)
     else:
@@ -2206,7 +2412,7 @@ def main():
     
     # 数据集
     parser.add_argument("--dataset", type=str, default="cifar10", 
-                       choices=["cifar10", "cifar100", "mnist", "tiny-imagenet"])
+                       choices=["cifar10", "cifar100", "mnist", "tiny-imagenet", "cub200"])
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=None,
                        help="Number of workers (auto-detect if not set)")

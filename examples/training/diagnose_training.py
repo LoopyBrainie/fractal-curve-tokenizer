@@ -540,7 +540,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="训练诊断工具")
-    parser.add_argument("--dataset", default="cifar10", choices=["cifar10", "cifar100", "tiny-imagenet"])
+    parser.add_argument("--dataset", default="cifar10", choices=["cifar10", "cifar100", "tiny-imagenet", "cub200"])
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--checkpoint", type=str, default=None, help="要诊断的模型检查点路径")
@@ -564,6 +564,8 @@ def main():
                      "mean": (0.5071, 0.4865, 0.4409), "std": (0.2673, 0.2564, 0.2762)},
         "tiny-imagenet": {"num_classes": 200, "image_size": 64, "channels": 3,
                           "mean": (0.485, 0.456, 0.406), "std": (0.229, 0.224, 0.225)},
+        "cub200": {"num_classes": 200, "image_size": 224, "channels": 3,
+                   "mean": (0.485, 0.456, 0.406), "std": (0.229, 0.224, 0.225)},
     }
     
     spec = DATASETS[args.dataset]
@@ -586,6 +588,12 @@ def main():
         test_dir = data_root / "tiny-imagenet-200" / "val"
         if not test_dir.exists():
             print(f"⚠️  Tiny ImageNet 数据集不存在: {test_dir}")
+            return
+        test_ds = datasets.ImageFolder(str(test_dir), transform=test_tf)
+    elif args.dataset == "cub200":
+        test_dir = data_root / "CUB_200_2011" / "test"
+        if not test_dir.exists():
+            print(f"⚠️  CUB-200-2011 数据集不存在: {test_dir}")
             return
         test_ds = datasets.ImageFolder(str(test_dir), transform=test_tf)
     

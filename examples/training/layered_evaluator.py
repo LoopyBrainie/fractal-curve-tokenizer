@@ -135,6 +135,14 @@ SUPPORTED_DATASETS = {
         'mean': [0.4802, 0.4481, 0.3975],
         'std': [0.2302, 0.2265, 0.2262],
     },
+    # CUB-200-2011: 细粒度鸟类分类数据集
+    # N_train=5994, N_test=5794, C=200
+    'cub200': {
+        'num_classes': 200,
+        'image_size': 224,
+        'mean': [0.485, 0.456, 0.406],
+        'std': [0.229, 0.224, 0.225],
+    },
 }
 
 
@@ -303,6 +311,127 @@ def download_tiny_imagenet(data_root: Path) -> bool:
     return True
 
 
+def download_cub200(data_root: Path) -> bool:
+    """下载并设置 CUB-200-2011 细粒度鸟类分类数据集
+    
+    数学形式化分析
+    ================
+    数据集规格:
+        N_train = 5,994, N_test = 5,794, C = 200
+        图像尺寸: 变长 → resize 到 224×224
+    
+    下载源:
+        - Caltech Data: https://data.caltech.edu/records/65de6-vp158
+        - 大小: ~1.2GB
+    """
+    target_dir = data_root / "CUB_200_2011"
+    
+    # 检查是否已存在并正确组织
+    if (target_dir / "train").exists() and (target_dir / "test").exists():
+        train_classes = len(list((target_dir / "train").iterdir()))
+        test_classes = len(list((target_dir / "test").iterdir()))
+        if train_classes >= 200 and test_classes >= 200:
+            print(f"[OK] CUB-200-2011 already exists at {target_dir}")
+            return True
+    
+    print("\n" + "="*60)
+    print("Downloading CUB-200-2011 Dataset")
+    print("="*60)
+    print(f"  Target: {target_dir}")
+    print(f"  Size: ~1.2GB")
+    print(f"  Classes: 200 bird species")
+    print("="*60 + "\n")
+    
+    tgz_path = data_root / "CUB_200_2011.tgz"
+    
+    # 检查已缓存的文件
+    if tgz_path.exists():
+        print(f"[OK] Using cached archive: {tgz_path}")
+    else:
+        # 下载
+        url = "https://data.caltech.edu/records/65de6-vp158/files/CUB_200_2011.tgz"
+        print(f"Downloading from: {url}")
+        if not download_with_progress(url, tgz_path, "CUB-200-2011"):
+            print("\n[ERROR] Download failed.")
+            print("Please download manually from:")
+            print("  https://data.caltech.edu/records/65de6-vp158/files/CUB_200_2011.tgz")
+            print(f"And place it at: {tgz_path}")
+            return False
+    
+    # 解压
+    print("\nExtracting...")
+    try:
+        import tarfile
+        with tarfile.open(tgz_path, 'r:gz') as tar:
+            members = tar.getmembers()
+            with tqdm(total=len(members), desc="Extracting", unit="files") as pbar:
+                for member in members:
+                    tar.extract(member, data_root)
+                    pbar.update(1)
+        print("[OK] Extraction complete")
+    except Exception as e:
+        print(f"[ERROR] Extraction failed: {e}")
+        return False
+    
+    # 组织为 train/test 目录结构
+    print("\nOrganizing dataset by train/test split...")
+    
+    images_dir = target_dir / "images"
+    split_file = target_dir / "train_test_split.txt"
+    images_file = target_dir / "images.txt"
+    
+    if not images_dir.exists() or not split_file.exists() or not images_file.exists():
+        print(f"[ERROR] Required files not found")
+        return False
+    
+    # 读取图像列表
+    image_id_to_path = {}
+    with open(images_file, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) == 2:
+                img_id, img_path = parts
+                image_id_to_path[img_id] = img_path
+    
+    # 读取 train/test 划分
+    train_ids = set()
+    test_ids = set()
+    with open(split_file, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) == 2:
+                img_id, is_train = parts
+                if is_train == '1':
+                    train_ids.add(img_id)
+                else:
+                    test_ids.add(img_id)
+    
+    # 创建目录并复制文件
+    train_dir = target_dir / "train"
+    test_dir = target_dir / "test"
+    train_dir.mkdir(exist_ok=True)
+    test_dir.mkdir(exist_ok=True)
+    
+    for img_id, img_path in tqdm(image_id_to_path.items(), desc="Organizing"):
+        class_name = img_path.split('/')[0]
+        img_name = img_path.split('/')[-1]
+        src = images_dir / img_path
+        
+        if img_id in train_ids:
+            dst_dir = train_dir / class_name
+        else:
+            dst_dir = test_dir / class_name
+        
+        dst_dir.mkdir(exist_ok=True)
+        dst = dst_dir / img_name
+        
+        if src.exists() and not dst.exists():
+            shutil.copy2(str(src), str(dst))
+    
+    print(f"\n[OK] CUB-200-2011 organized")
+    return True
+
+
 def ensure_dataset_available(dataset_name: str, data_root: Path) -> bool:
     """确保数据集可用，如果不存在则下载
     
@@ -326,6 +455,8 @@ def ensure_dataset_available(dataset_name: str, data_root: Path) -> bool:
         return True
     elif dataset_name == 'tiny-imagenet':
         return download_tiny_imagenet(data_root)
+    elif dataset_name == 'cub200':
+        return download_cub200(data_root)
     else:
         print(f"[WARN] Unknown dataset: {dataset_name}")
         return False
@@ -647,6 +778,20 @@ class LayeredEvaluator:
             
             train_dataset = datasets.ImageFolder(str(train_path), transform=test_transform)
             test_dataset = datasets.ImageFolder(str(val_path), transform=test_transform)
+        
+        elif self.dataset_name == 'cub200':
+            # CUB-200-2011 细粒度鸟类分类
+            train_path = data_root / "CUB_200_2011" / "train"
+            test_path = data_root / "CUB_200_2011" / "test"
+            
+            if not train_path.exists() or not test_path.exists():
+                raise FileNotFoundError(
+                    f"CUB-200-2011 not found at {data_root / 'CUB_200_2011'}. "
+                    "Please download it first."
+                )
+            
+            train_dataset = datasets.ImageFolder(str(train_path), transform=test_transform)
+            test_dataset = datasets.ImageFolder(str(test_path), transform=test_transform)
         else:
             raise ValueError(f"Unknown dataset: {self.dataset_name}")
         

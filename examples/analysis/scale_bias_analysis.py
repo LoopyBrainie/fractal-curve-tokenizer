@@ -330,6 +330,20 @@ def run_analysis(
             print("Tiny-ImageNet 未找到，使用 CIFAR-10")
             dataset = datasets.CIFAR10(data_root, train=True, download=True, transform=transform)
             image_size = 32
+    elif dataset_name == "cub200":
+        # CUB-200-2011 细粒度鸟类分类
+        transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+        ])
+        try:
+            dataset = datasets.ImageFolder(data_root / "CUB_200_2011" / "train", transform=transform)
+            image_size = 224
+        except:
+            print("CUB-200-2011 未找到，使用 CIFAR-10")
+            dataset = datasets.CIFAR10(data_root, train=True, download=True, transform=transform)
+            image_size = 32
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
     
@@ -437,7 +451,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="尺度偏置分析")
-    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "tiny-imagenet"])
+    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "tiny-imagenet", "cub200"])
     parser.add_argument("--samples", type=int, default=100)
     parser.add_argument("--tau0", type=float, default=0.15)
     parser.add_argument("--gamma", type=float, default=0.85)

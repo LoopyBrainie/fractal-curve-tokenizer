@@ -276,6 +276,7 @@ def _get_class_names(dataset_name: str) -> Optional[List[str]]:
         "cifar100": None,  # 100 类，太长不显示
         "mnist": [str(i) for i in range(10)],
         "tiny-imagenet": None,  # 200 类
+        "cub200": None,  # 200 类鸟类
     }
     return DATASET_CLASSES.get(dataset_name.lower())
 
@@ -487,7 +488,7 @@ Examples:
         "--dataset", "-d",
         type=str,
         default="cifar10",
-        choices=["cifar10", "cifar100", "mnist", "tiny-imagenet"],
+        choices=["cifar10", "cifar100", "mnist", "tiny-imagenet", "cub200"],
         help="Dataset name (default: cifar10)",
     )
     parser.add_argument(
