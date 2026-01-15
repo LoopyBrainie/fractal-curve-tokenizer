@@ -544,11 +544,13 @@ class FractalCurveViT(nn.Module):
         return_attention: bool = False,
         return_aux_info: bool = False,
         return_features: bool = False,
+        return_tokens: bool = False,
     ) -> Union[
         torch.Tensor,
         Tuple[torch.Tensor, List[Dict[str, Any]]],
         Tuple[torch.Tensor, List[torch.Tensor]],
         Tuple[torch.Tensor, List[Dict[str, Any]], List[torch.Tensor]],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],  # (logits, tokens, lengths)
     ]:
         """前向传播。
         
@@ -557,12 +559,14 @@ class FractalCurveViT(nn.Module):
             return_attention: 是否返回注意力权重（已弃用）
             return_aux_info: 是否返回辅助信息
             return_features: 是否返回特征
+            return_tokens: 是否返回 transformer 输出 tokens (用于困难样本挖掘)
             
         Returns:
             根据参数返回不同类型：
             - 默认：分类 logits [B, num_classes]
             - return_aux_info=True：(logits, aux_infos)
             - return_features=True：(logits, features)
+            - return_tokens=True: (logits, tokens [B, N, D], lengths [B])
             - 两者都为 True：(logits, aux_infos, features)
         """
         batch_size = img.shape[0]
@@ -589,11 +593,18 @@ class FractalCurveViT(nn.Module):
 
         # 4. Transformer 处理 (P11-3: 传递 regions 和 image_size)
         x = self.transformer(x, padded_levels, attn_mask, regions=regions, image_size=image_size)
+        
+        # I30-2: 保存 transformer 输出用于困难样本挖掘 (排除 CLS token)
+        transformer_tokens = x[:, 1:]  # [B, N, D] 排除 CLS
 
         # 5. 池化
         pooled = self._apply_pooling(x, key_padding_mask)
         pooled = self.to_latent(pooled)
         final_output = self.mlp_head(pooled)
+        
+        # I30-2: Token 输出 (用于 HilbertAwareHardMining)
+        if return_tokens:
+            return final_output, transformer_tokens, lengths
 
         # 6. 辅助输出
         if return_aux_info or return_features:

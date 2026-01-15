@@ -118,17 +118,11 @@ PROB_EPSILON: float = 1e-8
 #: 验证见: workspace/ste_gradient_analysis.py
 TEMPERATURE_MIN: float = 0.1
 
-# ==================== 深度平衡常量 (I21 + I23-1) ====================
+# ==================== 深度平衡常量 (I24-2 方案E) ====================
 # 数学分析: 解决深度分布崩溃问题
 # 问题: 候选数量不平衡 (d=0:1, d=1:4, d=2:16, d=3:64) 导致 Top-K 偏向 depth=3
-# I23-1: 根本原因是 MLP 输出方差与深度相关 (σ_3/σ_0 ≈ 8)，Log-Compensation 只能
-#        补偿期望差异，无法处理方差差异
-
-#: Log-Compensation 是否启用
-#: 数学: b_d = log(N_total / N_d) 实现期望均衡
-#: I29-3: 当 LEARNABLE_QUOTA_ENABLED=True 时，此选项被忽略
-#:        分层 Top-K 已通过配额保证深度分布，无需 Log-Compensation
-LOG_COMPENSATION_ENABLED: bool = True
+# 解决: 方案E (可学习配额 + 分层 Top-K) 通过配额保证深度分布
+# I30-4: 已移除 Log-Compensation (被方案E完全替代)
 
 #: I23-1 方案C: 深度方差归一化是否启用
 #: 数学: z_i^norm = (z_i - μ_d) / σ_d，使各深度 MLP 输出服从 N(0,1)

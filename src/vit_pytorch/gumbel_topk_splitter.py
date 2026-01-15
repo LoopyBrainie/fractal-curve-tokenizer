@@ -1,5 +1,5 @@
 """
-方案 D: Gumbel-Top-K + 树一致性 自适应分割器
+方案 D/E: Gumbel-Top-K + 可学习配额 自适应分割器
 
 数学形式化
 ==========
@@ -11,30 +11,26 @@
     方案 A (BFS+STE):     Hilbert=100%, 梯度=25%, 串行依赖
     方案 B (连续松弛):     Hilbert~70%,  梯度=100%, 无串行依赖
     方案 D (Gumbel-Top-K): Hilbert=100%, 梯度=100%, 无串行依赖 ✓
+    方案 E (可学习配额):   方案D + 分层Top-K + 可学习深度配额 ✓
 
-决策公式:
+决策公式 (方案E - 当前使用):
     1. 并行评估所有 N=85 个候选区域:
-       logits_i = MLP(ROI_i) + b_explore + b_log_d + β·γ^{d_i} - τ_{d_i}
+       logits_i = MLP(ROI_i) + b_explore + β·γ^{d_i} - τ_{d_i}
        
-       I21 深度平衡: b_log_d = log(N_total / N_d) 补偿候选数量不平衡
-           depth=0: b_log = log(85/1)  = 4.44
-           depth=1: b_log = log(85/4)  = 3.06
-           depth=2: b_log = log(85/16) = 1.67
-           depth=3: b_log = log(85/64) = 0.28
+    2. 可学习配额分配 (I24-2):
+       π_d = softmax(φ)  其中 φ 是可学习 logits
+       K_d = max(K_min_per_depth, round(π_d × K_total))
        
-    2. Gumbel 扰动:
+    3. 分层 Top-K 选择:
+       对每个深度 d: selected_d = TopK(logits[depth=d] + g, K_d)
+       
+    4. Gumbel 扰动:
        g_i ~ Gumbel(0, 1)
        perturbed_i = (logits_i + g_i) / τ
        
-    3. Top-K 选择:
-       selected = TopK(perturbed, K)
-       
-    4. 树一致性约束:
-       ∀i ∈ selected: parent(i) ∉ selected
-       
     5. STE (Straight-Through Estimator):
        hard_mask = 1[i ∈ selected]
-       soft_mask = softmax(perturbed)
+       soft_mask = subset_softmax(perturbed)
        st_mask = hard_mask - soft_mask.detach() + soft_mask
 
 Hilbert 局部性保证:
@@ -45,20 +41,19 @@ Hilbert 局部性保证:
 梯度流分析:
     ∂L/∂logits = ∂L/∂st_mask × ∂st_mask/∂logits
                 = ∂L/∂st_mask × ∂softmax/∂logits  (STE 使梯度跳过 TopK)
-    → 所有 85 个候选都有梯度信号
+    → 所有候选都有梯度信号
 
-树一致性约束:
-    向量化实现: O(1) GPU kernel
-    has_child_selected = selected_mask[children_matrix].any(dim=-1)
-    consistent_mask = selected_mask & (~has_child_selected)
+I30-4 更新 (2026-01-15):
+    已移除 Log-Compensation (b_log_d = log(N_total / N_d))
+    方案E的可学习配额 + 分层Top-K 完全替代该机制
 
 动态 K 选择:
     K_opt = clip(estimate_split_count(logits), K_min, K_max)
     estimate 基于 sigmoid(logits) > 0.5 的数量
 
 作者: GitHub Copilot
-日期: 2026-01-09
-版本: 方案 D v1.0
+日期: 2026-01-15
+版本: 方案 E v1.0 (基于方案D演进)
 """
 
 from __future__ import annotations
@@ -73,13 +68,13 @@ import torch.nn.functional as F
 from torch import Tensor
 
 # I12-7: 从 constants 统一导入数值稳定性常量
-# I21: 导入深度平衡常量
+# I24-2: 导入方案E可学习配额常量
 # I23-1: 导入深度方差归一化和软配额常量
+# I30-4: 已移除 LOG_COMPENSATION_ENABLED (被方案E替代)
 from .constants import (
     TEMPERATURE_MIN, 
     GUMBEL_EPSILON, 
     PROB_EPSILON,
-    LOG_COMPENSATION_ENABLED,
     DEPTH_KL_WEIGHT,
     SUBSET_SOFTMAX_ENABLED,
     # I23-1 方案C: 深度方差归一化
@@ -244,13 +239,6 @@ class GumbelTopKSplitter(nn.Module):
         # 深度偏置系数 (可选)
         self.register_buffer('depth_bias_beta', torch.tensor(0.5))
         self.register_buffer('depth_bias_gamma', torch.tensor(0.7))
-        
-        # ====================================================================
-        # I21: Log-Compensation Bias (β方案) - 被 I24-2 方案E 替代
-        # 数学: b_log_d = log(N_total / N_d) 补偿候选数量不平衡
-        # 注: 当 LEARNABLE_QUOTA_ENABLED=True 时，此偏置不再使用
-        # ====================================================================
-        self._precompute_log_compensation_bias()
         
         # ====================================================================
         # I24-2 方案E: 可学习配额 (Learnable Quota)
@@ -419,65 +407,6 @@ class GumbelTopKSplitter(nn.Module):
         
         # 转回 GPU
         self._children_matrix = torch.from_numpy(children_matrix_cpu).to(device)
-    
-    def _precompute_log_compensation_bias(self):
-        """
-        预计算 Log-Compensation Bias (I21 β方案)。
-        
-        数学形式化
-        ==========
-        
-        问题: 候选数量不平衡导致 Top-K 偏向高深度
-            depth=0: N_0=1   (1.2%)
-            depth=1: N_1=4   (4.7%)
-            depth=2: N_2=16  (18.8%)
-            depth=3: N_3=64  (75.3%)
-            
-        解决方案: Log-Compensation Bias
-            b_d^{log} = log(N_total / N_d)
-            
-        效果: 期望上每个深度被选中的概率相等
-            E[π_d] = N_d × softmax(z + b_d^{log})
-                   = N_d × exp(b_d^{log}) / Σ N_k exp(b_k^{log})
-                   = N_d × (N_total/N_d) / Σ N_k (N_total/N_k)
-                   = N_total / (D+1) × N_total  # 每个深度贡献相等
-                   
-        推导验证:
-            Σ_d N_d × exp(log(N_total/N_d)) = Σ_d N_d × (N_total/N_d)
-                                            = Σ_d N_total
-                                            = (D+1) × N_total
-        """
-        # 计算每个深度的候选数量
-        N_total = self.num_candidates
-        counts_per_depth = []
-        
-        for d in range(self.max_depth + 1):
-            N_d = 4 ** d  # depth d 有 4^d 个候选
-            counts_per_depth.append(N_d)
-        
-        # 计算 log-compensation bias: b_d = log(N_total / N_d)
-        log_comp_per_depth = []
-        for d, N_d in enumerate(counts_per_depth):
-            b_d = math.log(N_total / N_d)
-            log_comp_per_depth.append(b_d)
-        
-        # 扩展为每个候选的偏置 [N]
-        log_comp_bias = []
-        for d in range(self.max_depth + 1):
-            N_d = counts_per_depth[d]
-            b_d = log_comp_per_depth[d]
-            log_comp_bias.extend([b_d] * N_d)
-        
-        # 注册为 buffer
-        self.register_buffer(
-            'log_compensation_bias',
-            torch.tensor(log_comp_bias, dtype=torch.float32)
-        )
-        
-        # 打印诊断信息 (仅在初始化时)
-        if not hasattr(self, '_log_comp_initialized'):
-            self._log_comp_initialized = True
-            # 静默初始化，不打印
     
     # ========================================================================
     # I23-1 方案C: 深度方差归一化
@@ -746,9 +675,6 @@ class GumbelTopKSplitter(nn.Module):
         #     
         #     解决: z_i^norm = (z_i - μ_d) / σ_d
         #           使各深度 MLP 输出服从 N(0, 1)
-        #     
-        #     效果: 消除方差差异后，Log-Compensation 理论生效
-        #           预测分布 π ≈ (0.249, 0.246, 0.248, 0.257)
         # ====================================================================
         if DEPTH_VARIANCE_NORM_ENABLED:
             complexity_logits = self._normalize_by_depth(complexity_logits, device, dtype)
@@ -761,28 +687,16 @@ class GumbelTopKSplitter(nn.Module):
         # 固定深度偏置 (可选，用于平滑过渡)
         depth_bias_fixed = self.depth_bias_beta * (self.depth_bias_gamma ** depths.float())
         
-        # ====================================================================
-        # I21 β: Log-Compensation Bias (传统方案)
-        # I24-2: 当启用可学习配额 (方案E) 时，禁用 Log-Compensation
-        #        因为分层 Top-K 已经通过配额保证深度分布
-        # ====================================================================
-        if LEARNABLE_QUOTA_ENABLED and self.quota_logits is not None:
-            # 方案E: 分层 Top-K 不需要 Log-Compensation
-            log_comp = torch.zeros(N, device=device, dtype=dtype)
-        elif LOG_COMPENSATION_ENABLED:
-            log_comp = self.log_compensation_bias  # [N]
-        else:
-            log_comp = torch.zeros(N, device=device, dtype=dtype)
+        # I30-4: 已移除 Log-Compensation (被方案E完全替代)
         
         # 阈值
         taus = self.thresholds[depths]  # [N]
         
         # 总 logits
-        # logits = z + depth_bias + log_compensation + explore_bias - tau
+        # logits = z + depth_bias + explore_bias - tau
         logits = (complexity_logits 
                   + depth_bias_learned.unsqueeze(0)
                   + depth_bias_fixed.unsqueeze(0)
-                  + log_comp.unsqueeze(0)  # I21: Log-Compensation
                   + self.explore_bias
                   - taus.unsqueeze(0))
         

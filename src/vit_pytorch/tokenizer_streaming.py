@@ -114,9 +114,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         gamma: float = 0.85,
         learnable_temperature: float = 1.0,
         use_gumbel: bool = True,
-        # I10-19: 连续松弛参数 (已废弃, 保留向后兼容)
-        use_continuous_relaxation: bool = False,
-        continuous_max_depth: int = 3,
         # I20: Gumbel-Top-K 参数
         K_min: int = 8,
         K_max: int = 64,
@@ -361,21 +358,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             _regions_cache=padded_regions,
             _image_size_cache=self.image_size,
         )
-    
-    def tokenize_tensor(self, images: torch.Tensor) -> TokenizerOutput:
-        """兼容别名: 已弃用，请使用 tokenize().
-        
-        P9-1 方案 D 实施后，tokenize() 已完全向量化。
-        保留此方法仅为向后兼容。
-        """
-        import warnings
-        warnings.warn(
-            "tokenize_tensor() is deprecated. Use tokenize() instead. "
-            "tokenize() is now fully vectorized for LearnableSplitter.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.tokenize(images)
     
     def _embed_with_features(
         self,
@@ -843,29 +825,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 其他分割器类型不支持
         return None
     
-    def get_learnable_split_loss(
-        self,
-        lambda_entropy: float = 0.1,
-        lambda_budget: float = 0.01,
-        target_tokens: int = 64,
-    ) -> Optional[torch.Tensor]:
-        """[DEPRECATED] 获取可学习分割器的辅助损失.
-        
-        此方法仅适用于 LearnableSplitter (Scheme A)，已被 GumbelTopKSplitter 取代。
-        对于 GumbelTopKSplitter，请使用 splitter.get_auxiliary_losses() 代替。
-        
-        Returns:
-            None (始终返回 None，不再支持 LearnableSplitter)
-        """
-        import warnings
-        warnings.warn(
-            "get_learnable_split_loss() is deprecated. "
-            "For GumbelTopKSplitter, use splitter.get_auxiliary_losses() instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return None
-    
     def get_scale_entropy(self) -> Optional[float]:
         """获取尺度分布熵值.
         
@@ -1069,67 +1028,4 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         if self._use_learnable_split:
             # GumbelTopKSplitter 暂无 reset_statistics 方法
             pass
-    
-    def get_temperature_scheduler(
-        self,
-        T_start: float = 1.0,
-        T_end: float = 0.3,
-        schedule: str = 'exponential',
-        warmup_steps: int = 0,
-    ):
-        """[DEPRECATED] 获取温度退火调度器.
-        
-        此方法仅适用于 LearnableSplitter (Scheme A)，已被 GumbelTopKSplitter 取代。
-        对于 GumbelTopKSplitter，温度退火应在训练循环中手动调用:
-        
-            splitter.set_temperature(current_temp)
-            # 或使用 enable_temperature_annealing() API
-        
-        Raises:
-            DeprecationWarning: 此方法已弃用
-        """
-        import warnings
-        warnings.warn(
-            "get_temperature_scheduler() is deprecated. "
-            "For GumbelTopKSplitter, use splitter.enable_temperature_annealing() "
-            "or manual splitter.set_temperature() calls instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        raise NotImplementedError(
-            "Temperature scheduler is only available for LearnableSplitter. "
-            "Use GumbelTopKSplitter.enable_temperature_annealing() instead."
-        )
-
-    def get_multi_layer_depth_loss(
-        self,
-        features: Tensor,
-        image_size: Optional[Tuple[int, int]] = None,
-        max_eval_depth: Optional[int] = None,
-        weight_decay_factor: float = 0.5,
-        target_entropy: float = 0.693,
-        return_details: bool = False,
-    ):
-        """[DEPRECATED] 获取多层可微分深度损失.
-        
-        此方法仅适用于 LearnableSplitter (Scheme A)，已被 GumbelTopKSplitter 取代。
-        GumbelTopKSplitter 使用 I21 深度平衡机制 (log补偿 + KL正则) 替代此方法。
-        
-        对于 GumbelTopKSplitter，请使用:
-            - splitter.get_depth_kl_loss() 获取深度 KL 散度损失
-            - splitter.get_auxiliary_losses() 获取所有辅助损失
-            
-        Returns:
-            (None, {}) 始终返回空值
-        """
-        import warnings
-        warnings.warn(
-            "get_multi_layer_depth_loss() is deprecated. "
-            "For GumbelTopKSplitter, use splitter.get_auxiliary_losses() instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if return_details:
-            return None, {}
-        return None
 
