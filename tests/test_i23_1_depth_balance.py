@@ -22,7 +22,6 @@ from vit_pytorch.constants import (
     DEPTH_QUOTA_TARGET,
     DEPTH_QUOTA_TOLERANCE,
     DEPTH_QUOTA_WEIGHT,
-    LOG_COMPENSATION_ENABLED,
 )
 
 
@@ -46,10 +45,6 @@ class TestI23_1Constants:
         assert DEPTH_QUOTA_TARGET == (0.15, 0.20, 0.25, 0.40)
         assert DEPTH_QUOTA_TOLERANCE == 0.05
         assert DEPTH_QUOTA_WEIGHT == 0.2
-    
-    def test_log_compensation_still_enabled(self):
-        """Log-Compensation 仍然启用"""
-        assert LOG_COMPENSATION_ENABLED is True
 
 
 class TestDepthVarianceNormalization:
@@ -218,10 +213,10 @@ class TestAuxiliaryLossesIntegration:
 
 
 class TestMathematicalValidation:
-    """数学验证测试"""
+    """数学验证测试 - 方案E (Learnable Quota + Stratified Top-K)"""
     
-    def test_log_compensation_bias_values(self):
-        """验证 Log-Compensation 偏置值正确"""
+    def test_candidate_count_by_depth(self):
+        """验证各深度候选数量正确"""
         splitter = GumbelTopKSplitter(
             feature_dim=64,
             max_depth=3,
@@ -231,60 +226,38 @@ class TestMathematicalValidation:
         N_total = splitter.num_candidates
         assert N_total == 85
         
-        # 预期偏置
-        expected = {
-            0: math.log(85 / 1),   # ≈ 4.44
-            1: math.log(85 / 4),   # ≈ 3.06
-            2: math.log(85 / 16),  # ≈ 1.67
-            3: math.log(85 / 64),  # ≈ 0.28
-        }
-        
+        # 验证各深度候选数量
         depths = splitter.candidate_depths
-        bias = splitter.log_compensation_bias
+        expected_counts = {0: 1, 1: 4, 2: 16, 3: 64}
         
-        for d in range(4):
-            mask = (depths == d)
-            bias_d = bias[mask][0].item()
-            assert abs(bias_d - expected[d]) < 0.01, \
-                f"Depth {d}: expected {expected[d]:.2f}, got {bias_d:.2f}"
+        for d, expected in expected_counts.items():
+            actual = (depths == d).sum().item()
+            assert actual == expected, \
+                f"Depth {d}: expected {expected} candidates, got {actual}"
     
-    def test_theoretical_depth_distribution(self):
-        """
-        理论验证: 归一化 + Log-Compensation 后的预期分布
+    def test_stratified_selection_covers_all_depths(self):
+        """验证分层 Top-K 选择覆盖所有深度"""
+        splitter = GumbelTopKSplitter(
+            feature_dim=64,
+            max_depth=3,
+            K_min=8,
+            K_max=32,
+        )
         
-        数学推导:
-            归一化后 z_i ~ N(0, 1)
-            加上 Log-Compensation: z_i + b_d^log
-            
-            对于 Top-K 选择，期望深度分布:
-            π_d ≈ N_d × Φ(b_d^log) / Σ_k N_k × Φ(b_k^log)
-            
-            注意: 这是期望分布，实际 Top-K 选择会因为竞争而有所不同。
-            这里验证 Log-Compensation 的数学正确性。
-        """
-        from scipy.stats import norm
+        # 创建测试输入
+        B, C, H, W = 2, 64, 8, 8
+        features = torch.randn(B, C, H, W)
         
-        N = [1, 4, 16, 64]
-        N_total = sum(N)
-        b_log = [math.log(N_total / n) for n in N]
+        # 运行前向传播
+        splitter.eval()
+        with torch.no_grad():
+            result = splitter(features)
         
-        # Φ(b_d) - 标准正态CDF
-        phi = [norm.cdf(b) for b in b_log]
-        
-        # 验证 Log-Compensation 偏置正确计算
-        # depth=0 应该有最大偏置 (log(85))
-        assert b_log[0] > b_log[1] > b_log[2] > b_log[3]
-        
-        # depth=0 的 CDF 最接近 1
-        assert phi[0] > 0.99, f"Phi(b_0) = {phi[0]:.4f}, expected > 0.99"
-        
-        # 验证 Log-Compensation 设计目标:
-        # 每个深度的有效权重 N_d × Φ(b_d) 应该有补偿效果
-        eff = [N[d] * phi[d] for d in range(4)]
-        
-        # 低深度虽然候选少，但偏置大，应该有合理的有效权重
-        # depth=0 的 eff 应该 > 0
-        assert eff[0] > 0.5, f"eff_0 = {eff[0]:.2f}, expected > 0.5"
+        # 验证至少有 K_min 个 token 被选中
+        for b in range(B):
+            num_selected = result.num_selected_per_batch[b].item()
+            assert num_selected >= splitter.K_min, \
+                f"Batch {b}: expected >= {splitter.K_min} tokens, got {num_selected}"
 
 
 if __name__ == '__main__':

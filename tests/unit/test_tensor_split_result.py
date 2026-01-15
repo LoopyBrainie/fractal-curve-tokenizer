@@ -275,15 +275,15 @@ class TestTokenizerWithTensorResult:
             pytest.skip(f"无法导入所需模块: {e}")
     
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 GPU")
-    def test_tokenize_tensor_basic(self, tokenizer):
-        """测试 tokenize_tensor 基本功能."""
+    def test_tokenize_basic(self, tokenizer):
+        """测试 tokenize 基本功能."""
         device = next(tokenizer.parameters()).device
         
         # 创建测试图像
         images = torch.randn(2, 3, 128, 128, device=device)
         
         # 向量化 tokenization
-        output = tokenizer.tokenize_tensor(images)
+        output = tokenizer.tokenize(images)
         
         # 验证输出
         assert len(output) == 2
@@ -292,39 +292,5 @@ class TestTokenizerWithTensorResult:
             assert seq.tokens.shape[1] == 64  # d_model
             assert "levels" in seq.metadata
     
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 GPU")
-    def test_tokenize_equivalence(self, tokenizer):
-        """测试 tokenize vs tokenize_tensor 输出等价性."""
-        device = next(tokenizer.parameters()).device
-        
-        # 固定随机种子
-        torch.manual_seed(123)
-        images = torch.randn(2, 3, 128, 128, device=device)
-        
-        # 标准 tokenization
-        with torch.no_grad():
-            output_standard = tokenizer.tokenize(images)
-        
-        # 向量化 tokenization (重新创建相同输入)
-        torch.manual_seed(123)
-        images = torch.randn(2, 3, 128, 128, device=device)
-        
-        with torch.no_grad():
-            output_tensor = tokenizer.tokenize_tensor(images)
-        
-        # 比较输出形状
-        for i in range(2):
-            std_tokens = output_standard[i].tokens
-            tensor_tokens = output_tensor[i].tokens
-            
-            # 形状应该接近 (token 数量可能略有不同)
-            assert std_tokens.shape[1] == tensor_tokens.shape[1]  # d_model
-            
-            # 允许 token 数量有一定差异
-            diff = abs(std_tokens.shape[0] - tensor_tokens.shape[0])
-            assert diff < max(5, std_tokens.shape[0] * 0.3), \
-                f"Token 数量差异过大: {std_tokens.shape[0]} vs {tensor_tokens.shape[0]}"
-
-
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
