@@ -1371,29 +1371,39 @@ def create_dataloaders(
         mp_context = None
     
     # DataLoader 参数优化
-    # P16-FIX: 容器环境中 pin_memory + persistent_workers 会导致 ConnectionResetError
-    # 解决方案: 在容器环境中禁用 pin_memory，保留 persistent_workers (对性能影响更大)
-    # 非容器环境下仍启用 pin_memory
+    # P16/P17-FIX: 容器环境中根据共享内存大小决定配置
+    #   - shm >= 2GB: 启用 persistent_workers (高性能)
+    #   - shm >= 1GB: 启用 pin_memory
+    #   - shm < 1GB: 保守配置，禁用两者
+    shm_sufficient = shm_size_gb >= 2.0
+    shm_moderate = shm_size_gb >= 1.0
+    
     use_pin_memory = (
         effective_workers > 0 
         and torch.cuda.is_available() 
-        and not is_container  # P16-FIX: 容器环境禁用 pin_memory
+        and (not is_container or shm_moderate)  # 容器中需要足够共享内存
     )
+    use_persistent_workers = (
+        effective_workers > 0 
+        and (not is_container or shm_sufficient)  # 容器中需要更多共享内存
+    )
+    
     if is_container and effective_workers > 0:
-        print(f"[INFO] 容器环境: 禁用 pin_memory 以避免多进程通信错误")
+        print(f"[INFO] 容器环境 (shm={shm_size_gb:.1f}GB): "
+              f"pin_memory={use_pin_memory}, persistent_workers={use_persistent_workers}")
     
     loader_kwargs = {
         'batch_size': config.batch_size,
         'num_workers': effective_workers,
         'pin_memory': use_pin_memory,
         'multiprocessing_context': mp_context if effective_workers > 0 else None,
-        'persistent_workers': effective_workers > 0,  # 避免每个 epoch 重建进程
+        'persistent_workers': use_persistent_workers,
         'drop_last': True,  # 避免最后一个小 batch 的性能损失
     }
     if effective_workers > 0:
-        # 容器环境使用更大的 prefetch_factor 补偿 I/O 延迟
-        # 增大到 16/8 以最大化 GPU 利用率
-        loader_kwargs['prefetch_factor'] = 16 if is_container else 8
+        # prefetch_factor: 每个 worker 预取的 batch 数
+        # 过大会导致内存问题，使用保守值
+        loader_kwargs['prefetch_factor'] = 4 if is_container else 2
         # 添加 generator 参数以提高多进程随机性
         loader_kwargs['generator'] = torch.Generator().manual_seed(42)
     
