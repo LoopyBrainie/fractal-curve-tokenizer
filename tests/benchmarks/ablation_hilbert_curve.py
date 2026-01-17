@@ -65,7 +65,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "examples" / "training"))
 
-from einops import rearrange, repeat
+from einops import rearrange, repeat, Rearrange
 from vit_pytorch import FractalCurveViT
 
 
@@ -583,12 +583,6 @@ def create_model(config: ExperimentConfig) -> nn.Module:
             # 其他配置 (固定)
             min_patch_size=4,
             max_depth_hard_limit=8,
-            # 确保可复现性
-            gumbel_temp_schedule=(
-                1.0,   # start
-                0.5,   # end
-                0.5,   # fraction
-            ),
         )
 
 
