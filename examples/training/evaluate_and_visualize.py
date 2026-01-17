@@ -13,11 +13,11 @@ FractalCurveViT 统一评估与可视化入口 (Unified Evaluation & Visualizati
 设完整评估-可视化流程为：
 
     Φ: (M, D) → (R, V)
-    
+
 其中：
     M = 训练好的 FractalCurveViT 模型 (checkpoint)
     D = 评估数据集
-    R = LayeredEvaluationReport = (L1, L2, L3, L4, L5, L6) 分层评估报告
+    R = LayeredEvaluationReport = (L1, L2, L3, L4, L5, L6, L7, L8, L9) 分层评估报告
     V = LayeredVisualizationReport = {Figure_i} 可视化图表集合
 
 分层结构：
@@ -27,35 +27,52 @@ FractalCurveViT 统一评估与可视化入口 (Unified Evaluation & Visualizati
     L4: 特征表示 (Representation) - Fisher 判别比、类别可分性
     L5: 资源效率 (Efficiency) - 延迟、吞吐量、内存
     L6: 训练稳定性 (Stability) - 权重范数、数值稳定性
+    L7: 分割器专项 (Splitter) - 决策分析、配额、温度
+    L8: 梯度流分析 (Gradient Flow) - 各组件梯度、STE 有效性
+    L9: 细粒度分类 (Fine-grained) - CUB-200 专用评估（Center Loss、MCA、混淆分析）
 
 使用方式
 =========
 
 命令行::
 
-    # 完整评估与可视化
+    # 完整评估与可视化（支持所有数据集）
     python evaluate_and_visualize.py --checkpoint path/to/best.pth
-    
-    # 指定数据集和输出目录
-    python evaluate_and_visualize.py --checkpoint best.pth --dataset cifar10 --output ./report
-    
+
+    # 指定数据集（CUB-200 自动启用细粒度评估）
+    python evaluate_and_visualize.py --checkpoint best.pth --dataset cub200 --output ./report
+
+    # Tiny-ImageNet 评估
+    python evaluate_and_visualize.py --checkpoint best.pth --dataset tiny-imagenet
+
+    # CUB-200 细粒度评估（自动触发 L9）
+    python evaluate_and_visualize.py --checkpoint best.pth --dataset cub200
+
     # 跳过某些层
     python evaluate_and_visualize.py --checkpoint best.pth --skip-layers L3 L5
-    
+
     # 仅评估，不生成可视化
     python evaluate_and_visualize.py --checkpoint best.pth --eval-only
-    
+
     # 仅可视化（使用已有的 JSON 报告）
     python evaluate_and_visualize.py --report evaluation_report.json --vis-only
 
 编程接口::
 
     from evaluate_and_visualize import run_evaluation_and_visualization
-    
+
+    # 通用评估
     report, vis_report = run_evaluation_and_visualization(
         checkpoint_path="path/to/checkpoint.pth",
         dataset_name="cifar10",
         output_dir="./output",
+    )
+
+    # CUB-200 细粒度评估（自动包含 L9 分析）
+    report, vis_report = run_evaluation_and_visualization(
+        checkpoint_path="path/to/checkpoint.pth",
+        dataset_name="cub200",
+        output_dir="./cub200_report",
     )
 
 Author: GitHub Copilot
@@ -298,12 +315,13 @@ def _load_report_from_json(path: str) -> LayeredEvaluationReport:
         L5EfficiencyMetrics,
         L6StabilityMetrics,
     )
-    
+    from layered_evaluator import L9FinegrainedMetrics
+
     with open(path, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    
+
     report = LayeredEvaluationReport()
-    
+
     # 元信息
     meta = data.get('meta', {})
     report.checkpoint_path = meta.get('checkpoint_path', '')
@@ -312,7 +330,7 @@ def _load_report_from_json(path: str) -> LayeredEvaluationReport:
     report.num_classes = meta.get('num_classes', 0)
     report.device = meta.get('device', '')
     report.evaluation_time_sec = meta.get('evaluation_time_sec', 0.0)
-    
+
     # L1
     if 'L1_classification' in data:
         l1_data = data['L1_classification']
@@ -327,7 +345,7 @@ def _load_report_from_json(path: str) -> LayeredEvaluationReport:
             top_confused_pairs=[tuple(x) for x in l1_data.get('top_confused_pairs', [])],
             hardest_classes=[tuple(x) for x in l1_data.get('hardest_classes', [])],
         )
-    
+
     # L2
     if 'L2_tokenizer' in data:
         l2_data = data['L2_tokenizer']
@@ -342,7 +360,7 @@ def _load_report_from_json(path: str) -> LayeredEvaluationReport:
             content_token_correlation=l2_data.get('content_token_correlation', 0.0),
             per_class_avg_tokens=l2_data.get('per_class_avg_tokens', {}),
         )
-    
+
     # L3
     if 'L3_attention' in data:
         l3_data = data['L3_attention']
@@ -354,7 +372,7 @@ def _load_report_from_json(path: str) -> LayeredEvaluationReport:
             cls_attention_coverage=l3_data.get('cls_attention_coverage', 0.0),
             cls_attention_entropy=l3_data.get('cls_attention_entropy', 0.0),
         )
-    
+
     # L4
     if 'L4_representation' in data:
         l4_data = data['L4_representation']
@@ -365,7 +383,7 @@ def _load_report_from_json(path: str) -> LayeredEvaluationReport:
             per_class_separability=l4_data.get('per_class_separability', {}),
             avg_separability=l4_data.get('avg_separability', 0.0),
         )
-    
+
     # L5
     if 'L5_efficiency' in data:
         l5_data = data['L5_efficiency']
@@ -381,7 +399,7 @@ def _load_report_from_json(path: str) -> LayeredEvaluationReport:
             total_params=l5_data.get('total_params', 0),
             trainable_params=l5_data.get('trainable_params', 0),
         )
-    
+
     # L6
     if 'L6_stability' in data:
         l6_data = data['L6_stability']
@@ -392,7 +410,25 @@ def _load_report_from_json(path: str) -> LayeredEvaluationReport:
             has_inf_weights=l6_data.get('has_inf_weights', False),
             splitter_health_score=l6_data.get('splitter_health_score', 1.0),
         )
-    
+
+    # L9: CUB-200 Fine-grained
+    if 'L9_finegrained' in data:
+        l9_data = data['L9_finegrained']
+        report.L9_finegrained = L9FinegrainedMetrics(
+            top1_accuracy=l9_data.get('top1_accuracy', 0.0),
+            top5_accuracy=l9_data.get('top5_accuracy', 0.0),
+            mean_class_accuracy=l9_data.get('mean_class_accuracy', 0.0),
+            loss=l9_data.get('loss', 0.0),
+            center_loss=l9_data.get('center_loss'),
+            avg_center_distance=l9_data.get('avg_center_distance'),
+            intra_inter_ratio=l9_data.get('intra_inter_ratio'),
+            confusion_entropy=l9_data.get('confusion_entropy'),
+            missing_classes=l9_data.get('missing_classes', []),
+            easy_classes=[tuple(x) for x in l9_data.get('easy_classes', [])],
+            hard_classes=[tuple(x) for x in l9_data.get('hard_classes', [])],
+            most_confused_pairs=[tuple(x) for x in l9_data.get('most_confused_pairs', [])],
+        )
+
     return report
 
 
@@ -401,47 +437,77 @@ def _print_summary(report: LayeredEvaluationReport) -> None:
     print("\n" + "-" * 50)
     print("EVALUATION SUMMARY")
     print("-" * 50)
-    
+
     # L1: 分类性能
     l1 = report.L1_classification
     print(f"\n[L1] Classification:")
     print(f"     Top-1 Accuracy: {l1.top1_accuracy:.2f}%")
     print(f"     Top-5 Accuracy: {l1.top5_accuracy:.2f}%")
     print(f"     ECE: {l1.ece:.2f}%")
-    
+
     # L2: Tokenizer
     l2 = report.L2_tokenizer
     print(f"\n[L2] Tokenizer:")
     print(f"     Avg Tokens: {l2.avg_tokens:.1f}")
     print(f"     Token Range: [{l2.min_tokens}, {l2.max_tokens}]")
     print(f"     Depth Entropy: {l2.depth_entropy:.3f}")
-    
+
     # L3: Attention
     l3 = report.L3_attention
     print(f"\n[L3] Attention:")
     print(f"     Avg Entropy: {l3.avg_entropy:.3f}")
     print(f"     Dead Head Ratio: {l3.dead_head_ratio:.2%}")
-    
+
     # L4: Representation
     l4 = report.L4_representation
     print(f"\n[L4] Representation:")
     print(f"     Fisher Ratio: {l4.fisher_discriminant_ratio:.2f}")
     print(f"     Avg Separability: {l4.avg_separability:.3f}")
-    
+
     # L5: Efficiency
     l5 = report.L5_efficiency
     print(f"\n[L5] Efficiency:")
     print(f"     Latency: {l5.avg_latency_ms:.2f} ms")
     print(f"     Throughput: {l5.throughput_samples_per_sec:.1f} samples/s")
     print(f"     Parameters: {l5.total_params:,}")
-    
+
     # L6: Stability
     l6 = report.L6_stability
     health_status = "✓ Healthy" if not (l6.has_nan_weights or l6.has_inf_weights) else "✗ Issues"
     print(f"\n[L6] Stability:")
     print(f"     Health: {health_status}")
     print(f"     Splitter Score: {l6.splitter_health_score:.2f}")
-    
+
+    # L7: Splitter
+    if hasattr(report, 'L7_splitter') and report.L7_splitter is not None:
+        l7 = report.L7_splitter
+        print(f"\n[L7] Splitter:")
+        if l7.temperature > 0:
+            print(f"     Temperature: {l7.temperature:.3f}")
+            print(f"     Decision Confidence: {l7.decision_confidence_mean:.2f}")
+
+    # L8: Gradient Flow
+    if hasattr(report, 'L8_gradient_flow') and report.L8_gradient_flow is not None:
+        l8 = report.L8_gradient_flow
+        print(f"\n[L8] Gradient Flow:")
+        print(f"     Total Grad Norm: {l8.total_grad_norm:.4f}")
+        print(f"     Vanishing: {len(l8.vanishing_gradients)}, Exploding: {len(l8.exploding_gradients)}")
+
+    # L9: CUB-200 Fine-grained (仅当数据集为 cub200 时显示)
+    if hasattr(report, 'L9_finegrained') and report.L9_finegrained is not None:
+        l9 = report.L9_finegrained
+        print(f"\n[L9] CUB-200 Fine-grained Classification:")
+        print(f"     Top-1 Accuracy: {l9.top1_accuracy:.2f}%")
+        print(f"     Mean Class Acc (MCA): {l9.mean_class_accuracy:.2f}%")
+        if l9.center_loss is not None:
+            print(f"     Center Loss: {l9.center_loss:.4f}")
+        if l9.intra_inter_ratio is not None:
+            print(f"     Intra/Inter Ratio: {l9.intra_inter_ratio:.2f}")
+        if l9.missing_classes:
+            print(f"     Missing Classes: {len(l9.missing_classes)}")
+        if l9.hard_classes:
+            print(f"     Hardest Class: {l9.hard_classes[0][0]} ({l9.hard_classes[0][1]:.1f}%)")
+
     print("-" * 50)
 
 

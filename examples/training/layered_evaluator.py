@@ -61,7 +61,7 @@ import time
 import urllib.request
 import warnings
 import zipfile
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -104,6 +104,304 @@ from evaluation_layers import (
     SplitterEvaluator,
     GradientFlowEvaluator,
 )
+
+# 导入 CUB-200 专用评估器
+try:
+    # 使用完整导入路径以避免相对导入问题
+    from examples.training.trainer.cub200_trainer import (
+        CUB200Trainer,
+        CUB200EvalResult,
+        CUB200TrainingConfig,
+        create_cub200_trainer,
+    )
+    CUB200_AVAILABLE = True
+except ImportError as e:
+    CUB200_AVAILABLE = False
+    CUB200_IMPORT_ERROR = str(e)
+
+
+# ============================================================================
+# CUB-200 细粒度分类专用评估层
+# ============================================================================
+
+@dataclass
+class L9FinegrainedMetrics:
+    """CUB-200 细粒度分类评估指标
+
+    数学形式化:
+        - MCA = (1/C) Σ_c Acc(c)  (平均类准确率)
+        - 类内/类间距离比: intra/inter
+        - Center Loss 统计: 类中心紧凑性
+        - 混淆熵: 衡量分类不确定性
+
+    评估维度:
+        1. 整体性能: Top-1/Top-5, MCA
+        2. 细粒度指标: Center Loss, 类中心距离
+        3. 混淆分析: 最常混淆的类别对
+        4. 类别诊断: 易分/难分/缺失类别
+        5. 特征空间: 类内/类间距离比
+    """
+    # ==================== 基础指标 ====================
+    top1_accuracy: float = 0.0
+    top5_accuracy: float = 0.0
+    mean_class_accuracy: float = 0.0  # MCA
+    loss: float = 0.0
+
+    # ==================== 细粒度专用指标 ====================
+    center_loss: Optional[float] = None
+    avg_center_distance: Optional[float] = None
+
+    # ==================== 逐类别统计 ====================
+    per_class_accuracy: Optional[np.ndarray] = None  # [C] 逐类别准确率
+    per_class_precision: Optional[np.ndarray] = None  # [C] 逐类别精确率
+    per_class_recall: Optional[np.ndarray] = None  # [C] 逐类别召回率
+    confusion_matrix: Optional[np.ndarray] = None  # [C, C] 混淆矩阵
+
+    # ==================== 混淆分析 ====================
+    confused_pairs: Optional[List[Tuple[str, str, int]]] = None  # [(pred, true, count), ...]
+    confusion_entropy: Optional[float] = None  # 混淆熵 (分类不确定性)
+    most_confused_pairs: List[Tuple[str, str, float]] = field(default_factory=list)  # 高度混淆的类别对
+
+    # ==================== 类内/类间距离分析 ====================
+    intra_class_distance: Optional[float] = None  # 平均类内距离
+    inter_class_distance: Optional[float] = None  # 平均类间距离
+    intra_inter_ratio: Optional[float] = None  # 类内/类间距离比 (越小越好)
+    class_centers: Optional[np.ndarray] = None  # [C, D] 类中心
+
+    # ==================== 类别诊断 ====================
+    missing_classes: List[int] = field(default_factory=list)  # 准确率为0的类别
+    easy_classes: List[Tuple[str, float]] = field(default_factory=list)  # [(class_name, acc), ...]
+    hard_classes: List[Tuple[str, float]] = field(default_factory=list)  # [(class_name, acc), ...]
+    unbalanced_classes: List[Tuple[str, float, float]] = field(default_factory=list)  # [(name, acc, ideal)]
+
+    # ==================== 困难样本分析 ====================
+    hard_samples: List[Tuple[int, int, int, float]] = field(default_factory=list)
+    # [(sample_idx, true_label, pred_label, confidence), ...]
+
+    # ==================== 特征统计 ====================
+    feature_stats: Optional[Dict[str, float]] = None
+    feature_mean_norm: Optional[float] = None
+    feature_std_norm: Optional[float] = None
+
+    # ==================== 训练历史摘要 ====================
+    best_epoch: Optional[int] = None
+    total_epochs: int = 0
+    training_time_hours: Optional[float] = None
+
+
+class FinegrainedClassificationEvaluator:
+    """CUB-200 细粒度分类专用评估器
+
+    使用 CUB200Trainer 的 evaluate 方法进行深入评估。
+
+    评估内容:
+        - Top-1/Top-5 准确率
+        - 平均类准确率 (MCA)
+        - 逐类别准确率/精确率/召回率
+        - Center Loss 统计（如果可用）
+        - 混淆分析（最常混淆的类别对）
+        - 类内/类间距离比
+        - 困难样本分析
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 200,
+        class_names: Optional[List[str]] = None,
+    ):
+        """初始化细粒度分类评估器
+
+        Args:
+            num_classes: 类别数 (CUB-200 为 200)
+            class_names: 类别名称列表
+        """
+        self.num_classes = num_classes
+        self.class_names = class_names or [f"class_{i}" for i in range(num_classes)]
+
+    def evaluate(
+        self,
+        model: nn.Module,
+        test_loader: DataLoader,
+        device: torch.device,
+        center_loss_fn: Optional[nn.Module] = None,
+        return_features: bool = True,
+    ) -> L9FinegrainedMetrics:
+        """执行细粒度分类评估
+
+        Args:
+            model: FractalCurveViT 模型
+            test_loader: 测试数据加载器
+            device: 计算设备
+            center_loss_fn: Center Loss 函数（可选，用于计算类中心距离）
+            return_features: 是否返回特征
+
+        Returns:
+            L9FinegrainedMetrics 包含所有评估指标
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        if not CUB200_AVAILABLE:
+            logger.warning("CUB200Trainer 不可用，跳过细粒度评估")
+            return L9FinegrainedMetrics()
+
+        metrics = L9FinegrainedMetrics()
+
+        try:
+            # 使用 CUB200Trainer 进行评估
+            batch_size = test_loader.batch_size or 32
+            config = CUB200TrainingConfig(
+                batch_size=batch_size,
+            )
+
+            trainer = CUB200Trainer(
+                model=model,
+                config=config,
+                device=device,
+            )
+
+            # 执行评估
+            result = trainer.evaluate(test_loader, return_features=return_features)
+
+            # ==================== 基础指标 ====================
+            metrics.top1_accuracy = result.accuracy
+            metrics.top5_accuracy = result.top5_accuracy
+            metrics.mean_class_accuracy = result.mca or 0.0
+            metrics.loss = getattr(result, 'loss', 0.0)
+
+            # ==================== 逐类别准确率 ====================
+            if result.per_class_accuracy is not None:
+                per_class_list = list(result.per_class_accuracy.values())
+                metrics.per_class_accuracy = np.array(per_class_list)
+
+                # 计算理想准确率（均匀分布下每类应有 0.5%）
+                ideal_acc = 100.0 / self.num_classes
+
+                # 分析易分/难分类别
+                valid_acc = [(i, acc) for i, acc in enumerate(per_class_list) if acc > 0]
+                valid_acc.sort(key=lambda x: x[1], reverse=True)
+
+                metrics.easy_classes = [(self.class_names[i], acc) for i, acc in valid_acc[:5]]
+                metrics.hard_classes = [(self.class_names[i], acc) for i, acc in valid_acc[-5:]]
+
+                # 缺失类别（准确率为0）
+                metrics.missing_classes = [i for i, acc in enumerate(per_class_list) if acc == 0]
+
+                # 不平衡类别（准确率与理想值偏差大）
+                for i, acc in enumerate(per_class_list):
+                    if acc > 0:
+                        deviation = abs(acc - ideal_acc)
+                        if deviation > 2 * ideal_acc:  # 偏差超过 2 倍
+                            metrics.unbalanced_classes.append((self.class_names[i], acc, ideal_acc))
+
+            # ==================== Center Loss 统计 ====================
+            if result.feature_stats is not None:
+                metrics.center_loss = result.feature_stats.get('center_loss')
+                metrics.avg_center_distance = result.feature_stats.get('avg_center_distance')
+                metrics.feature_stats = result.feature_stats
+
+            # ==================== 类内/类间距离比 ====================
+            metrics.intra_inter_ratio = result.intra_inter_ratio
+
+            # ==================== 混淆分析 ====================
+            if result.confused_pairs is not None:
+                # 转换混淆对为可读格式
+                metrics.confused_pairs = []
+                for pred_id, true_id, count in result.confused_pairs:
+                    pred_name = self.class_names[pred_id] if pred_id < len(self.class_names) else f"class_{pred_id}"
+                    true_name = self.class_names[true_id] if true_id < len(self.class_names) else f"class_{true_id}"
+                    metrics.confused_pairs.append((pred_name, true_name, count))
+
+                    # 收集高度混淆的类别对
+                    if count >= 3:  # 混淆次数 >= 3
+                        metrics.most_confused_pairs.append((pred_name, true_name, count))
+
+            # ==================== 混淆熵计算 ====================
+            # 从 confused_pairs 计算混淆熵的近似值
+            if result.confused_pairs is not None and len(result.confused_pairs) > 0:
+                total_confusions = sum(count for _, _, count in result.confused_pairs)
+                if total_confusions > 0:
+                    # 计算混淆的均匀程度（越均匀熵越高）
+                    probs = [count / total_confusions for _, _, count in result.confused_pairs]
+                    probs = [p for p in probs if p > 0]
+                    entropy = -sum(p * np.log(p + 1e-10) for p in probs)
+                    # 归一化到 [0, 1]
+                    max_entropy = np.log(min(len(probs), 10))
+                    metrics.confusion_entropy = float(entropy / max_entropy) if max_entropy > 0 else 0.0
+
+            # ==================== 困难样本分析 ====================
+            # 收集预测置信度低的样本（困难样本）
+            if return_features:
+                metrics = self._analyze_hard_samples(metrics, trainer, test_loader, device)
+
+            logger.info(f"CUB-200 细粒度评估完成: Top-1={metrics.top1_accuracy:.2f}%, MCA={metrics.mean_class_accuracy:.2f}%")
+
+        except Exception as e:
+            logger.error(f"CUB-200 评估失败: {e}")
+            import traceback
+            traceback.print_exc()
+
+        return metrics
+
+    def _analyze_hard_samples(
+        self,
+        metrics: L9FinegrainedMetrics,
+        trainer: CUB200Trainer,
+        test_loader: DataLoader,
+        device: torch.device,
+    ) -> L9FinegrainedMetrics:
+        """分析困难样本（低置信度误分类）
+
+        数学形式化:
+            困难样本: confidence < threshold 且 prediction != label
+            置信度: p(y_pred | x) < τ (τ 通常取 0.3-0.5)
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        try:
+            trainer.model.eval()
+            all_labels = []
+            all_preds = []
+            all_probs = []
+
+            with torch.no_grad():
+                for inputs, labels in test_loader:
+                    inputs = inputs.to(device)
+                    labels = labels.to(device)
+
+                    outputs = trainer.model(inputs)
+                    probs = torch.softmax(outputs, dim=1)
+                    preds = outputs.argmax(dim=1)
+
+                    all_labels.extend(labels.cpu().tolist())
+                    all_preds.extend(preds.cpu().tolist())
+                    all_probs.append(probs.cpu())
+
+            all_probs = torch.cat(all_probs, dim=0)
+            all_labels = np.array(all_labels)
+            all_preds = np.array(all_preds)
+
+            # 收集困难样本
+            for i in range(len(all_labels)):
+                true_label = all_labels[i]
+                pred_label = all_preds[i]
+                confidence = all_probs[i, pred_label].item()
+
+                # 误分类且置信度低
+                if pred_label != true_label and confidence < 0.4:
+                    metrics.hard_samples.append((i, int(true_label), int(pred_label), confidence))
+
+            # 按置信度排序，取最难的 10 个
+            metrics.hard_samples.sort(key=lambda x: x[3])
+            metrics.hard_samples = metrics.hard_samples[:10]
+
+            logger.debug(f"发现 {len(metrics.hard_samples)} 个困难样本")
+
+        except Exception as e:
+            logger.warning(f"困难样本分析失败: {e}")
+
+        return metrics
 
 
 # ============================================================================
@@ -953,7 +1251,78 @@ class LayeredEvaluator:
             print(f"  - Max grad norm: {report.L8_gradient_flow.max_grad_norm:.4f}")
             print(f"  - Vanishing gradients: {len(report.L8_gradient_flow.vanishing_gradients)}")
             print(f"  - Exploding gradients: {len(report.L8_gradient_flow.exploding_gradients)}")
-        
+
+        # L9: CUB-200 细粒度分类专用评估（仅当数据集为 cub200 时触发）
+        if self.dataset_name == 'cub200' and 'L9' not in skip_layers:
+            print("\n[L9] CUB-200 Fine-grained Classification Evaluation...")
+            if CUB200_AVAILABLE:
+                # 确保 dataset_config 已设置
+                if self.dataset_config is None:
+                    self.dataset_config = SUPPORTED_DATASETS.get(self.dataset_name, {'num_classes': 200})
+
+                num_classes = self.dataset_config.get('num_classes', 200)
+                finegrained_eval = FinegrainedClassificationEvaluator(
+                    num_classes=num_classes
+                )
+                finegrained_metrics = finegrained_eval.evaluate(
+                    self.model, eval_loader, self.device
+                )
+
+                # ==================== 打印详细结果 ====================
+                print(f"\n  [基础性能]")
+                print(f"    Top-1 Accuracy:  {finegrained_metrics.top1_accuracy:.2f}%")
+                print(f"    Top-5 Accuracy:  {finegrained_metrics.top5_accuracy:.2f}%")
+                print(f"    Mean Class Acc:  {finegrained_metrics.mean_class_accuracy:.2f}%")
+
+                if finegrained_metrics.center_loss is not None:
+                    print(f"\n  [Center Loss 分析]")
+                    print(f"    Center Loss:     {finegrained_metrics.center_loss:.4f}")
+                    print(f"    Avg Center Dist: {finegrained_metrics.avg_center_distance:.2f}")
+
+                if finegrained_metrics.intra_inter_ratio is not None:
+                    print(f"\n  [特征空间分析]")
+                    print(f"    Intra/Inter Ratio: {finegrained_metrics.intra_inter_ratio:.2f} (< 1.0 为佳)")
+
+                if finegrained_metrics.confusion_entropy is not None:
+                    print(f"\n  [混淆分析]")
+                    print(f"    Confusion Entropy: {finegrained_metrics.confusion_entropy:.2f} (越高越均匀)")
+
+                if finegrained_metrics.most_confused_pairs:
+                    print(f"\n  [高度混淆的类别对 (≥3次)]")
+                    for pred_name, true_name, count in finegrained_metrics.most_confused_pairs[:5]:
+                        print(f"    {pred_name} <-> {true_name}: {count}次")
+
+                if finegrained_metrics.unbalanced_classes:
+                    print(f"\n  [不平衡类别 (与理想值偏差大)]")
+                    for name, acc, ideal in finegrained_metrics.unbalanced_classes[:3]:
+                        deviation = acc - ideal
+                        sign = '+' if deviation > 0 else ''
+                        print(f"    {name}: {acc:.1f}% (理想:{ideal:.1f}%, 偏差:{sign}{deviation:.1f}%)")
+
+                if finegrained_metrics.missing_classes:
+                    print(f"\n  [缺失类别 (准确率=0%)]")
+                    missing_count = len(finegrained_metrics.missing_classes)
+                    print(f"    共 {missing_count} 个类别无正确预测")
+
+                if finegrained_metrics.hard_classes:
+                    print(f"\n  [最难分类别 (Top-5)]")
+                    for cls_name, acc in finegrained_metrics.hard_classes[:5]:
+                        print(f"    {cls_name}: {acc:.1f}%")
+
+                if finegrained_metrics.easy_classes:
+                    print(f"\n  [最易分类别 (Top-5)]")
+                    for cls_name, acc in finegrained_metrics.easy_classes[:5]:
+                        print(f"    {cls_name}: {acc:.1f}%")
+
+                if finegrained_metrics.hard_samples:
+                    print(f"\n  [困难样本 (置信度<40%的误分类)]")
+                    for idx, true_label, pred_label, conf in finegrained_metrics.hard_samples[:5]:
+                        true_name = f"class_{true_label}"
+                        pred_name = f"class_{pred_label}"
+                        print(f"    Sample #{idx}: {true_name} -> {pred_name} (conf:{conf:.2f})")
+            else:
+                print(f"  - CUB200Trainer not available: {CUB200_IMPORT_ERROR}")
+
         # 完成
         report.evaluation_time_sec = time.time() - start_time
         
