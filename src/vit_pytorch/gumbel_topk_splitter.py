@@ -1254,16 +1254,17 @@ class GumbelTopKSplitter(nn.Module):
             consistent_mask: [B, N] 树一致的选择掩码
         """
         self._ensure_children_matrix()
-        
+
         B, N = selected_mask.shape
         device = selected_mask.device
-        
-        children_matrix = self._children_matrix  # [N, 4]
-        
+
+        # 确保 children_matrix 在正确设备上
+        children_matrix = self._children_matrix.to(device)  # [N, 4]
+
         # 对于每个节点，检查其子节点是否被选中
         # valid_children: [N, 4] 哪些子节点索引是有效的
         valid_children = children_matrix >= 0
-        
+
         # 安全索引 (将 -1 替换为 0)
         safe_children = children_matrix.clamp(min=0)  # [N, 4]
         

@@ -238,13 +238,15 @@ class StandardViT(nn.Module):
         batch = img.shape[0]
 
         # Patch 嵌入: Conv2d [B, 3, 64, 64] -> [B, dim, h, w]
-        x = self.conv(img)
-        # 展平并应用 LayerNorm: [B, dim, h, w] -> [B, h*w, dim]
-        x = x.flatten(2).transpose(1, 2)  # [B, num_patches, dim]
+        x = self.conv(img)  # [B, dim, h, w]
+        # 展平: [B, dim, h, w] -> [B, dim, h*w]
+        x = x.flatten(2)
+        # 转置: [B, dim, h*w] -> [B, h*w, dim]
+        x = x.transpose(1, 2)
         x = self.ln(x)
 
         # 添加 CLS token
-        cls_tokens = repeat(self.cls_token, "... d -> b ... d", b=batch)
+        cls_tokens = self.cls_token.expand(batch, -1, -1)  # [B, 1, dim]
         x = torch.cat((cls_tokens, x), dim=1)
 
         # 添加位置编码
