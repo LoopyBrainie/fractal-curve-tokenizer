@@ -44,9 +44,12 @@ import argparse
 import json
 import sys
 import time
+import urllib.request
+import zipfile
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -60,6 +63,7 @@ from torchvision import datasets, transforms
 # Handle import paths
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
+sys.path.insert(0, str(PROJECT_ROOT / "examples" / "training"))
 
 from einops import rearrange, repeat
 from vit_pytorch import FractalCurveViT
@@ -338,6 +342,129 @@ class ModeResult:
 
 
 # ============================================================================
+# 数据集下载工具 (从 train_fractal_vit.py 复制)
+# ============================================================================
+
+def download_with_progress(url: str, dest: Path, desc: str = "Downloading") -> bool:
+    """带进度条的下载函数"""
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            total_size = int(response.headers.get('Content-Length', 0))
+
+        downloaded = 0
+        block_size = 8192
+
+        with urllib.request.urlopen(url, timeout=30) as response:
+            with open(dest, 'wb') as f:
+                with tqdm(total=total_size, unit='B', unit_scale=True, desc=desc) as pbar:
+                    while True:
+                        buffer = response.read(block_size)
+                        if not buffer:
+                            break
+                        f.write(buffer)
+                        downloaded += len(buffer)
+                        pbar.update(len(buffer))
+
+        return True
+    except Exception as e:
+        print(f"\n[ERROR] Download failed: {e}")
+        if dest.exists():
+            dest.unlink()
+        return False
+
+
+def download_tiny_imagenet(data_root: Path) -> bool:
+    """下载并设置 Tiny ImageNet (从 train_fractal_vit.py 复制)
+
+    数据集信息:
+    - 200 类，每类 500 张训练图像
+    - 训练集: 100,000 张 64x64 图像
+    - 验证集: 10,000 张图像
+    """
+    target_dir = data_root / "tiny-imagenet-200"
+
+    # 检查是否已存在
+    if (target_dir / "train").exists() and (target_dir / "val").exists():
+        train_classes = len(list((target_dir / "train").iterdir()))
+        val_has_classes = any((target_dir / "val").iterdir())
+        if train_classes >= 200 and val_has_classes:
+            print(f"[OK] Tiny ImageNet already exists at {target_dir}")
+            return True
+
+    print("\n" + "="*60)
+    print("Downloading Tiny ImageNet Dataset")
+    print("="*60)
+    print(f"  Target: {target_dir}")
+    print(f"  Size: ~237MB")
+    print("="*60 + "\n")
+
+    zip_path = data_root / "tiny-imagenet-200.zip"
+
+    # 检查已缓存的 zip 是否有效
+    if zip_path.exists():
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                if zf.testzip() is not None:
+                    raise zipfile.BadZipFile("Corrupted zip file")
+                if len(zf.namelist()) < 100:
+                    raise zipfile.BadZipFile("Incomplete zip file")
+            print(f"[OK] Using cached zip: {zip_path}")
+        except (zipfile.BadZipFile, Exception) as e:
+            print(f"[WARN] Cached zip is invalid: {e}")
+            print("[*] Removing corrupted file and re-downloading...")
+            zip_path.unlink()
+
+    # 尝试多个下载源
+    urls = [
+        "http://cs231n.stanford.edu/tiny-imagenet-200.zip",
+        "https://image-net.org/data/tiny-imagenet-200.zip",
+    ]
+
+    if not zip_path.exists():
+        download_success = False
+        for i, url in enumerate(urls):
+            print(f"[{i+1}/{len(urls)}] Trying: {url}")
+            if download_with_progress(url, zip_path, "Tiny ImageNet"):
+                try:
+                    with zipfile.ZipFile(zip_path, 'r') as zf:
+                        if zf.testzip() is not None:
+                            raise zipfile.BadZipFile("Downloaded file is corrupted")
+                    download_success = True
+                    print("[OK] Download complete and verified")
+                    break
+                except zipfile.BadZipFile as e:
+                    print(f"[WARN] Downloaded file is invalid: {e}")
+                    if zip_path.exists():
+                        zip_path.unlink()
+            print(f"[WARN] Failed, trying next source...")
+
+        if not download_success:
+            print("\n[ERROR] All download sources failed.")
+            print("Please download manually from:")
+            print("  http://cs231n.stanford.edu/tiny-imagenet-200.zip")
+            print(f"And place it at: {zip_path}")
+            return False
+
+    # 解压
+    print(f"[*] Extracting to {target_dir}...")
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(data_root)
+        print("[OK] Extraction complete")
+
+        # 验证解压结果
+        if not (target_dir / "train").exists():
+            raise FileNotFoundError("train directory not found after extraction")
+        if not (target_dir / "val").exists():
+            raise FileNotFoundError("val directory not found after extraction")
+
+        return True
+    except Exception as e:
+        print(f"\n[ERROR] Extraction failed: {e}")
+        return False
+
+
+# ============================================================================
 # 数据加载
 # ============================================================================
 
@@ -346,45 +473,37 @@ def get_tiny_imagenet_loaders(
     image_size: int = 64,
     num_workers: int = 4,
 ) -> Tuple[DataLoader, DataLoader, int]:
-    """获取 Tiny-ImageNet 数据加载器.
-
-    Args:
-        batch_size: 批次大小
-        image_size: 图像尺寸
-        num_workers: 数据加载线程数
+    """获取 Tiny-ImageNet 数据加载器 (复用 train_fractal_vit.py 的数据增强策略)
 
     Returns:
         train_loader, val_loader, num_classes
     """
     data_root = PROJECT_ROOT / "data"
+    data_root.mkdir(exist_ok=True)
 
-    # 下载检查
+    # 下载数据集
+    if not download_tiny_imagenet(data_root):
+        raise FileNotFoundError("Failed to download Tiny ImageNet")
+
     tiny_imagenet_dir = data_root / "tiny-imagenet-200"
-    if not tiny_imagenet_dir.exists():
-        print("Tiny-ImageNet 不存在，正在下载...")
-        print(f"请手动下载: http://cs231n.stanford.edu/tiny-imagenet-200.zip")
-        print(f"解压到: {tiny_imagenet_dir}")
-        raise FileNotFoundError(f"Tiny-ImageNet not found at {tiny_imagenet_dir}")
 
-    # 数据增强 (使用标准策略)
-    normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
-    )
+    # 数据增强 (与 train_fractal_vit.py 一致)
+    mean = [0.4802, 0.4481, 0.3975]
+    std = [0.2302, 0.2265, 0.2262]
 
     train_tf = transforms.Compose([
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomCrop(image_size, padding=8),
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         transforms.ToTensor(),
-        normalize,
+        transforms.Normalize(mean, std),
     ])
 
     val_tf = transforms.Compose([
-        transforms.Resize(image_size + 8),  # 稍微放大
+        transforms.Resize(image_size + 8),
         transforms.CenterCrop(image_size),
         transforms.ToTensor(),
-        normalize,
+        transforms.Normalize(mean, std),
     ])
 
     # 加载数据集
@@ -997,18 +1116,19 @@ def main():
         device = torch.device(args.device)
     print(f"使用设备: {device}")
 
-    # 加载数据
+    # 加载数据 (自动下载)
     print("\n加载 Tiny-ImageNet 数据...")
+    print("  (如需手动下载，请参考 --help)")
     try:
         train_loader, val_loader, num_classes = get_tiny_imagenet_loaders(
             batch_size=args.batch_size,
             image_size=64,
         )
-    except FileNotFoundError as e:
-        print(f"\n❌ 错误: {e}")
+    except (FileNotFoundError, Exception) as e:
+        print(f"\n[ERROR] 数据集准备失败: {e}")
         print("\n请手动下载 Tiny-ImageNet:")
         print("  1. 下载: http://cs231n.stanford.edu/tiny-imagenet-200.zip")
-        print("  2. 解压到: <project_root>/data/tiny-imagenet-200/")
+        print(f"  2. 解压到: {PROJECT_ROOT / 'data' / 'tiny-imagenet-200'}")
         return
 
     print(f"训练集: {len(train_loader.dataset)} 样本")
