@@ -352,7 +352,13 @@ class TrainingConfig:
     # GumbelTopKSplitter (Scheme D) 参数
     K_min: int  # 最小 token 数量 (硬下界约束)
     K_max: int  # 最大 token 数量 (软上界约束)
-    
+
+    # I30-10: 可学习配额参数 (Scheme E)
+    quota_learnable: bool  # 是否启用可学习配额
+    quota_init_logits: Optional[Tuple[float, ...]]  # 配额初始化 logits
+    quota_min_per_depth: int  # 每深度最小配额
+    freeze_quota: bool  # 是否冻结配额参数
+
     # I24-1: Tokenizer 冻结选项
     freeze_tokenizer: bool  # 是否冻结 tokenizer 可学习参数
     freeze_tokenizer_epochs: int  # 前 N 个 epoch 冻结 (0=全程冻结)
@@ -2470,7 +2476,8 @@ def main():
                        help="I30-17: Target minimum patch size for automatic depth computation")
     parser.add_argument("--max-depth-hard-limit", type=int, default=8,
                        help="I30-17: Hard limit on maximum depth to prevent excessive computation")
-    parser.add_argument("--pool", type=str, default="cls", choices=["cls", "mean"])
+    # I30-11: 添加 weighted 池化选项
+    parser.add_argument("--pool", type=str, default="cls", choices=["cls", "mean", "weighted"])
     parser.add_argument("--ffn-type", type=str, default="swiglu_level",
                        choices=["gelu", "swiglu", "swiglu_level"])
     # P11-8: hilbert_bias_mode 已移除，仅使用 LCA 模式
@@ -2499,7 +2506,17 @@ def main():
                        help="Minimum token count (hard lower bound, default: 16)")
     parser.add_argument("--K-max", type=int, default=64,
                        help="Maximum token count (soft upper bound, default: 64)")
-    
+
+    # I30-10: 可学习配额参数 (Scheme E)
+    parser.add_argument("--quota-learnable", type=bool, default=True,
+                       help="I30-10: Enable learnable quota allocation (Scheme E, default: True)")
+    parser.add_argument("--quota-init-logits", type=str, default=None,
+                       help="I30-10: Quota initialization logits as comma-separated values (e.g., '-0.5,-0.2,0.0,0.5')")
+    parser.add_argument("--quota-min-per-depth", type=int, default=2,
+                       help="I30-10: Minimum quota per depth to prevent dead zones (default: 2)")
+    parser.add_argument("--freeze-quota", action="store_true",
+                       help="I30-10: Freeze quota logits to current values (no further learning)")
+
     # I24-1: Tokenizer 参数冻结选项 (减少小数据集过拟合)
     parser.add_argument("--freeze-tokenizer", action="store_true",
                        help="I24-1: Freeze tokenizer learnable params (thresholds, quota) to reduce overfitting")
@@ -2705,6 +2722,11 @@ def main():
         # GumbelTopKSplitter (Scheme D) 参数
         K_min=args.K_min,
         K_max=args.K_max,
+        # I30-10: 可学习配额参数
+        quota_learnable=args.quota_learnable,
+        quota_init_logits=tuple(map(float, args.quota_init_logits.split(','))) if args.quota_init_logits else None,
+        quota_min_per_depth=args.quota_min_per_depth,
+        freeze_quota=args.freeze_quota,
         # I24-1: Tokenizer 冻结配置
         freeze_tokenizer=args.freeze_tokenizer,
         freeze_tokenizer_epochs=args.freeze_tokenizer_epochs,
@@ -2767,6 +2789,17 @@ def main():
     from vit_pytorch.tokenizer_streaming import StreamingFractalTokenizerV3
 
     # I30-17: 使用动态深度计算
+    # I30-10: 创建 SplitterConfig 用于配额参数配置
+    from vit_pytorch.config import create_splitter_config
+    splitter_config = create_splitter_config(
+        enable_learnable_quota=config.quota_learnable,
+        quota_init_logits=config.quota_init_logits,
+        quota_min_per_depth=config.quota_min_per_depth,
+        K_min=config.K_min,
+        K_max=config.K_max,
+        freeze_quota=config.freeze_quota,
+    )
+
     tokenizer = StreamingFractalTokenizerV3(
         image_size=max(spec.image_size, 32),
         channels=spec.channels,
@@ -2779,9 +2812,8 @@ def main():
         depth_scale_range=config.depth_scale_range,
         # P7-7: 可学习分割器温度参数
         learnable_temperature=config.splitter_temp_start,
-        # GumbelTopKSplitter (Scheme D) 参数
-        K_min=config.K_min,
-        K_max=config.K_max,
+        # I30-10: SplitterConfig 统一配置
+        splitter_config=splitter_config,
         # I27: Splitter Dropout (与模型 dropout 对齐)
         # 数学依据: Splitter MLP 敏感，过高 dropout 导致分割决策不稳定
         splitter_dropout=min(config.dropout, 0.15),
@@ -2815,7 +2847,12 @@ def main():
     )
     
     model = FractalCurveViT(**model_kwargs).to(device)
-    
+
+    # I30-10: 配额参数冻结 (独立于 freeze_tokenizer)
+    if config.freeze_quota:
+        model.tokenizer.splitter.set_quota_grad(False)
+        print(f"[I30-10] Frozen quota logits (quota will not learn)")
+
     # I24-1: Tokenizer 参数冻结 (减少小数据集过拟合)
     frozen_tokenizer_params = []
     if config.freeze_tokenizer:
@@ -2831,15 +2868,19 @@ def main():
     # 打印模型信息
     params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    split_info = f"GumbelTopKSplitter (K∈[{config.K_min}, {config.K_max}])"
+    # I30-10: 配额信息添加到 split_info
+    quota_info = "Scheme E" if config.quota_learnable else "Scheme D (no quota)"
+    if config.quota_learnable and config.freeze_quota:
+        quota_info += " (frozen)"
+    split_info = f"GumbelTopKSplitter (K∈[{config.K_min}, {config.K_max}], {quota_info})"
     tokenizer_name = f'StreamingFractalTokenizerV3 ({split_info})'
-    
+
     # P6-1/P6-2 信息
     depth_scale_info = f"range={config.depth_scale_range}" if config.depth_scale_range else "legacy"
     temp_info = f"τ={config.lca_temperature}" if config.lca_temperature else "disabled"
     if config.lca_temperature and config.learnable_temperature:
         temp_info += " (learnable)"
-    
+
     print(f"\n{'='*70}")
     print(f"Model: FractalCurveViT")
     print(f"Tokenizer: {tokenizer_name}")
@@ -2850,6 +2891,8 @@ def main():
     print(f"Parameters: {params:,} (trainable: {trainable_params:,})")
     if config.freeze_tokenizer:
         print(f"  - Tokenizer Frozen (I24-1): {len(frozen_tokenizer_params)} params")
+    if config.freeze_quota:
+        print(f"  - Quota Frozen (I30-10): quota_logits will not learn")
     print(f"Gradient Checkpoint: {config.gradient_checkpoint}")
     print(f"Compile Model: {config.compile_model}")
     print(f"Channels Last: {config.channels_last}")
