@@ -26,34 +26,39 @@ from vit_pytorch.constants import (
 
 class TestLearnableQuotaInit:
     """测试可学习配额初始化"""
-    
+
     def test_quota_logits_initialized(self):
         """验证 quota_logits 参数存在且正确初始化"""
         if not LEARNABLE_QUOTA_ENABLED:
             pytest.skip("LEARNABLE_QUOTA_ENABLED is False")
-        
+
+        # I30-17-EXT: 使用新 API
+        # 64x64 image, max_depth=3 -> min_patch_size = 64 / 2^3 = 8
         splitter = GumbelTopKSplitter(
             feature_dim=256,
-            max_depth=3,
+            min_patch_size=8,
+            max_depth_limit=3,  # max_depth=3 对应 4 层 (0-3)
             image_size=(64, 64),
         )
-        
+
         # 验证参数存在
         assert splitter.quota_logits is not None
         assert splitter.quota_logits.requires_grad
-        
+
         # 验证维度
-        D = splitter.max_depth + 1
+        D = splitter._current_max_depth + 1
         assert splitter.quota_logits.shape == (D,)
-    
+
     def test_quota_init_produces_target_distribution(self):
         """验证初始化配额 softmax 等于目标分布"""
         if not LEARNABLE_QUOTA_ENABLED:
             pytest.skip("LEARNABLE_QUOTA_ENABLED is False")
-        
+
+        # I30-17-EXT: 使用新 API
         splitter = GumbelTopKSplitter(
             feature_dim=256,
-            max_depth=3,
+            min_patch_size=8,
+            max_depth_limit=3,  # max_depth=3 对应 4 层 (0-3)
             image_size=(64, 64),
         )
         
@@ -67,52 +72,59 @@ class TestLearnableQuotaInit:
 
 class TestQuotaAllocation:
     """测试配额分配逻辑"""
-    
+
     def test_quota_sum_equals_k(self):
         """验证配额总和等于 K"""
         if not LEARNABLE_QUOTA_ENABLED:
             pytest.skip("LEARNABLE_QUOTA_ENABLED is False")
-        
+
+        # I30-17-EXT: 使用新 API
         splitter = GumbelTopKSplitter(
             feature_dim=256,
-            max_depth=3,
+            min_patch_size=8,
+            max_depth_limit=3,  # max_depth=3 对应 4 层 (0-3)
             image_size=(64, 64),
         )
-        
+
         for K in [16, 32, 48, 64]:
             quota = splitter._compute_quota_allocation(K)
             # 允许 ±1 的舍入误差
             assert abs(quota.sum().item() - K) <= 1, f"K={K}, quota.sum()={quota.sum()}"
-    
+
     def test_quota_min_per_depth(self):
         """验证每个深度配额满足下界"""
         if not LEARNABLE_QUOTA_ENABLED:
             pytest.skip("LEARNABLE_QUOTA_ENABLED is False")
-        
+
+        # I30-17-EXT: 使用新 API
         splitter = GumbelTopKSplitter(
             feature_dim=256,
-            max_depth=3,
+            min_patch_size=8,
+            max_depth_limit=3,  # max_depth=3 对应 4 层 (0-3)
             image_size=(64, 64),
         )
-        
+
         # 即使 K 很小，也要保证下界
         for K in [4, 8, 16, 32]:
             quota = splitter._compute_quota_allocation(K)
-            for d in range(splitter.max_depth + 1):
+            for d in range(splitter._current_max_depth + 1):
                 assert quota[d].item() >= QUOTA_MIN_PER_DEPTH, \
                     f"K={K}, depth={d}, quota={quota[d]}"
-    
+
     def test_quota_proportional_to_target(self):
         """验证配额近似与目标分布成比例"""
         if not LEARNABLE_QUOTA_ENABLED:
             pytest.skip("LEARNABLE_QUOTA_ENABLED is False")
-        
+
+        # I30-17-EXT: 使用新 API
+        # max_depth_limit=4 对应 max_depth=3 (0-3 共4层)
         splitter = GumbelTopKSplitter(
             feature_dim=256,
-            max_depth=3,
+            min_patch_size=8,
+            max_depth_limit=3,  # 确保 max_depth=3
             image_size=(64, 64),
         )
-        
+
         K = 32
         quota = splitter._compute_quota_allocation(K).float()
         target = torch.tensor(DEPTH_QUOTA_TARGET[:4]) * K
@@ -128,47 +140,51 @@ class TestStratifiedTopK:
         """验证分层选择覆盖所有深度"""
         if not LEARNABLE_QUOTA_ENABLED:
             pytest.skip("LEARNABLE_QUOTA_ENABLED is False")
-        
+
+        # I30-17-EXT: 使用新 API
         splitter = GumbelTopKSplitter(
             feature_dim=256,
-            max_depth=3,
+            min_patch_size=8,
+            max_depth_limit=4,
             image_size=(64, 64),
             K_min=16,
             K_max=48,
         )
         splitter.train()
-        
+
         # 创建测试输入
         B, C, H, W = 2, 256, 16, 16
         features = torch.randn(B, C, H, W)
-        
+
         # 前向传播
         result = splitter(features)
-        
+
         # 检查选中 token 的深度分布
         depths = result.depths
-        D = splitter.max_depth + 1
-        
+        D = splitter._current_max_depth + 1
+
         for d in range(D):
             count = (depths == d).sum().item()
             # 每个深度至少有一些 token (考虑树一致性可能排除一些)
             # 但由于配额保证，应该有显著数量
             # 注意：树一致性约束可能排除一些父节点
             # 所以我们只检查至少有一个深度被选中
-        
+
         # 至少应该有 2 个以上深度有 token
         unique_depths = depths.unique()
         assert len(unique_depths) >= 2, f"Only {len(unique_depths)} depths selected: {unique_depths}"
-    
+
     def test_stratified_vs_global_depth_distribution(self):
         """验证分层 Top-K 选择按配额分配 (树一致性之前)"""
         if not LEARNABLE_QUOTA_ENABLED:
             pytest.skip("LEARNABLE_QUOTA_ENABLED is False")
-        
+
         # 分层模式
+        # I30-17-EXT: 使用新 API
         splitter = GumbelTopKSplitter(
             feature_dim=256,
-            max_depth=3,
+            min_patch_size=8,
+            max_depth_limit=4,
             image_size=(64, 64),
             K_min=16,
             K_max=32,
@@ -187,7 +203,7 @@ class TestStratifiedTopK:
         
         # 计算分层选择后的深度分布 (树一致性之前)
         depths = splitter.candidate_depths
-        D = splitter.max_depth + 1
+        D = splitter._current_max_depth + 1
         
         dist = []
         total = (st_mask > 0.5).float().sum().item()
@@ -209,51 +225,57 @@ class TestStratifiedTopK:
 
 class TestQuotaEntropyLoss:
     """测试配额熵正则化损失"""
-    
+
     def test_entropy_loss_returns_tensor(self):
         """验证熵损失返回有效张量"""
         if not LEARNABLE_QUOTA_ENABLED:
             pytest.skip("LEARNABLE_QUOTA_ENABLED is False")
-        
+
+        # I30-17-EXT: 使用新 API
         splitter = GumbelTopKSplitter(
             feature_dim=256,
-            max_depth=3,
+            min_patch_size=8,
+            max_depth_limit=3,  # max_depth=3 对应 4 层 (0-3)
             image_size=(64, 64),
         )
-        
+
         loss = splitter.get_quota_entropy_loss()
-        
+
         assert isinstance(loss, torch.Tensor)
         assert loss.ndim == 0  # 标量
         assert not torch.isnan(loss)
         assert not torch.isinf(loss)
-    
+
     def test_entropy_loss_gradient_flow(self):
         """验证熵损失梯度流向 quota_logits"""
         if not LEARNABLE_QUOTA_ENABLED:
             pytest.skip("LEARNABLE_QUOTA_ENABLED is False")
-        
+
+        # I30-17-EXT: 使用新 API
         splitter = GumbelTopKSplitter(
             feature_dim=256,
-            max_depth=3,
+            min_patch_size=8,
+            max_depth_limit=3,  # max_depth=3 对应 4 层 (0-3)
             image_size=(64, 64),
         )
-        
+
         loss = splitter.get_quota_entropy_loss(weight=1.0)
         loss.backward()
-        
+
         # 验证梯度存在
         assert splitter.quota_logits.grad is not None
         assert not torch.isnan(splitter.quota_logits.grad).any()
-    
+
     def test_entropy_loss_included_in_auxiliary(self):
         """验证熵损失包含在辅助损失中"""
         if not LEARNABLE_QUOTA_ENABLED:
             pytest.skip("LEARNABLE_QUOTA_ENABLED is False")
-        
+
+        # I30-17-EXT: 使用新 API
         splitter = GumbelTopKSplitter(
             feature_dim=256,
-            max_depth=3,
+            min_patch_size=8,
+            max_depth_limit=3,  # max_depth=3 对应 4 层 (0-3)
             image_size=(64, 64),
         )
         splitter.train()
@@ -283,23 +305,26 @@ class TestMathematicalProperties:
         """验证配额下界保护防止死区"""
         if not LEARNABLE_QUOTA_ENABLED:
             pytest.skip("LEARNABLE_QUOTA_ENABLED is False")
-        
+
+        # I30-17-EXT: 使用新 API
         splitter = GumbelTopKSplitter(
             feature_dim=256,
-            max_depth=3,
+            min_patch_size=8,
+            max_depth_limit=3,  # max_depth=3 对应 4 层 (0-3)
             image_size=(64, 64),
         )
-        
+
         # 模拟极端偏斜的配额 (几乎全给 depth=3)
         with torch.no_grad():
             splitter.quota_logits.fill_(-10)  # 所有都很小
             splitter.quota_logits[3] = 10     # depth=3 极大
-        
+
         # 配额分配仍应保证下界
         K = 32
         quota = splitter._compute_quota_allocation(K)
-        
-        for d in range(splitter.max_depth + 1):
+
+        # I30-17-EXT: 使用 _current_max_depth
+        for d in range(splitter._current_max_depth + 1):
             assert quota[d].item() >= QUOTA_MIN_PER_DEPTH, \
                 f"depth={d} quota={quota[d]} < min={QUOTA_MIN_PER_DEPTH}"
 

@@ -49,12 +49,15 @@ class TestI23_1Constants:
 
 class TestDepthVarianceNormalization:
     """测试方案C: 深度方差归一化"""
-    
+
     @pytest.fixture
     def splitter(self):
+        # I30-17-EXT: 使用新 API
+        # 64x64 image, max_depth=3 -> min_patch_size = 64 / 2^3 = 8
         return GumbelTopKSplitter(
             feature_dim=64,
-            max_depth=3,
+            min_patch_size=8,
+            max_depth_limit=4,
             image_size=(64, 64),
         )
     
@@ -76,23 +79,24 @@ class TestDepthVarianceNormalization:
     def test_normalize_by_depth_statistics(self, splitter):
         """验证归一化后每深度统计量接近 N(0,1)"""
         B, N = 100, splitter.num_candidates
-        
+
         # 模拟不同深度有不同方差的输入
         logits = torch.zeros(B, N)
         depths = splitter.candidate_depths
-        
-        for d in range(splitter.max_depth + 1):
+
+        # I30-17-EXT: 使用 _current_max_depth
+        for d in range(splitter._current_max_depth + 1):
             mask = (depths == d)
             # depth 越大，方差越大 (模拟真实情况)
             sigma = 1.0 + d * 2.0
             logits[:, mask] = torch.randn(B, mask.sum().item()) * sigma
-        
+
         device = logits.device
         dtype = logits.dtype
         normalized = splitter._normalize_by_depth(logits, device, dtype)
-        
+
         # 验证每深度归一化后统计量
-        for d in range(splitter.max_depth + 1):
+        for d in range(splitter._current_max_depth + 1):
             mask = (depths == d)
             values = normalized[:, mask].flatten()
             
@@ -106,12 +110,15 @@ class TestDepthVarianceNormalization:
 
 class TestQuotaLoss:
     """测试方案D: 软配额正则化"""
-    
+
     @pytest.fixture
     def splitter(self):
+        # I30-17-EXT: 使用新 API
+        # 64x64 image, max_depth=3 -> min_patch_size = 64 / 2^3 = 8
         return GumbelTopKSplitter(
             feature_dim=64,
-            max_depth=3,
+            min_patch_size=8,
+            max_depth_limit=4,
             image_size=(64, 64),
         )
     
@@ -158,12 +165,15 @@ class TestQuotaLoss:
 
 class TestAuxiliaryLossesIntegration:
     """测试辅助损失集成"""
-    
+
     @pytest.fixture
     def splitter(self):
+        # I30-17-EXT: 使用新 API
+        # 64x64 image, max_depth=3 -> min_patch_size = 64 / 2^3 = 8
         return GumbelTopKSplitter(
             feature_dim=64,
-            max_depth=3,
+            min_patch_size=8,
+            max_depth_limit=4,
             image_size=(64, 64),
         )
     
@@ -214,34 +224,41 @@ class TestAuxiliaryLossesIntegration:
 
 class TestMathematicalValidation:
     """数学验证测试 - 方案E (Learnable Quota + Stratified Top-K)"""
-    
+
     def test_candidate_count_by_depth(self):
         """验证各深度候选数量正确"""
+        # I30-17-EXT: 使用新 API
+        # 64x64 image, max_depth=3 -> min_patch_size = 64 / 2^3 = 8
         splitter = GumbelTopKSplitter(
             feature_dim=64,
-            max_depth=3,
+            min_patch_size=8,
+            max_depth_limit=4,
+            image_size=(64, 64),
         )
-        
+
         # N_total = 1 + 4 + 16 + 64 = 85
         N_total = splitter.num_candidates
         assert N_total == 85
-        
+
         # 验证各深度候选数量
         depths = splitter.candidate_depths
         expected_counts = {0: 1, 1: 4, 2: 16, 3: 64}
-        
+
         for d, expected in expected_counts.items():
             actual = (depths == d).sum().item()
             assert actual == expected, \
                 f"Depth {d}: expected {expected} candidates, got {actual}"
-    
+
     def test_stratified_selection_covers_all_depths(self):
         """验证分层 Top-K 选择覆盖所有深度"""
+        # I30-17-EXT: 使用新 API
         splitter = GumbelTopKSplitter(
             feature_dim=64,
-            max_depth=3,
+            min_patch_size=8,
+            max_depth_limit=4,
             K_min=8,
             K_max=32,
+            image_size=(64, 64),
         )
         
         # 创建测试输入

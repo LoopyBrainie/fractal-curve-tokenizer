@@ -34,18 +34,18 @@ class TestTokenizerTypeSelection:
             depth=2,
             heads=2,
             mlp_dim=128,
-            min_patch_size=(4, 4),
-            max_level=5,
+            min_patch_size=4,
+            max_level=3,
             tokenizer_type="streaming_v3",
-            num_scales=3,
         )
-        
+
         assert model.tokenizer_type == "streaming_v3"
         assert model._is_streaming
         assert isinstance(model.tokenizer, StreamingFractalTokenizerV3)
 
     def test_default_tokenizer_is_streaming_v3(self) -> None:
         """测试默认 tokenizer 是 streaming_v3."""
+        # I30-17: 向后兼容测试 - 接受 tuple 形式的 min_patch_size
         model = FractalCurveViT(
             image_size=32,
             num_classes=10,
@@ -53,10 +53,10 @@ class TestTokenizerTypeSelection:
             depth=2,
             heads=2,
             mlp_dim=128,
-            min_patch_size=(4, 4),
-            max_level=5,
+            min_patch_size=(4, 4),  # I30-17: 旧 API 仍然支持
+            max_level=3,
         )
-        
+
         assert model.tokenizer_type == "streaming_v3"
         assert model._is_streaming
 
@@ -78,10 +78,9 @@ class TestForwardPass:
             depth=2,
             heads=2,
             mlp_dim=128,
-            min_patch_size=(4, 4),
-            max_level=5,
+            min_patch_size=4,
+            max_level=3,
             tokenizer_type="streaming_v3",
-            num_scales=2,
         )
         
         output = model(batch_input)
