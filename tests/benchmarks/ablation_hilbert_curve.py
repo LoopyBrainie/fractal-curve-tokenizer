@@ -1138,6 +1138,7 @@ def main():
     base_config = ExperimentConfig(
         name="Ablation",
         mode="standard",  # 会被覆盖
+        description="基础配置",
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.lr,
