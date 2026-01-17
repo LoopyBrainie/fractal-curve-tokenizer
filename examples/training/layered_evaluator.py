@@ -997,16 +997,53 @@ class LayeredEvaluator:
         if ckpt_depth is None:
             ckpt_depth = 6  # 默认值
 
+        # 检测 dim_head 和 heads（从 to_qkv.weight 的 shape）
+        # to_qkv.weight shape = [3*dim_head*heads, dim]
+        ckpt_dim_head = config.get('dim_head', None)
+        ckpt_heads = config.get('heads', None)
+        if ckpt_dim_head is None or ckpt_heads is None:
+            for key in state_dict.keys():
+                if 'to_qkv.weight' in key:
+                    qkv_shape = state_dict[key].shape
+                    if len(qkv_shape) == 2:
+                        # qkv_shape[0] = 3 * dim_head * heads
+                        # qkv_shape[1] = dim
+                        total_heads_dimhead = qkv_shape[0] // 3
+                        if qkv_shape[1] == ckpt_dim:
+                            # 尝试常见的 dim_head 值推断 heads
+                            common_dim_heads = [32, 64, 16, 128]
+                            for dh in common_dim_heads:
+                                if total_heads_dimhead % dh == 0:
+                                    detected_heads = total_heads_dimhead // dh
+                                    if 1 <= detected_heads <= 32:  # 合理的 heads 范围
+                                        if ckpt_heads is None:
+                                            ckpt_heads = detected_heads
+                                            print(f"Detected heads={ckpt_heads} from checkpoint key '{key}'")
+                                        if ckpt_dim_head is None:
+                                            ckpt_dim_head = dh
+                                            print(f"Detected dim_head={ckpt_dim_head} from checkpoint key '{key}'")
+                                        break
+                            # 如果还没检测到，直接用总数
+                            if ckpt_heads is None:
+                                ckpt_heads = 8
+                                ckpt_dim_head = total_heads_dimhead // ckpt_heads
+                                print(f"Using computed: heads={ckpt_heads}, dim_head={ckpt_dim_head}")
+                    break
+        if ckpt_dim_head is None:
+            ckpt_dim_head = 64  # 默认值
+        if ckpt_heads is None:
+            ckpt_heads = 8  # 默认值
+
         model = FractalCurveViT(
             image_size=image_size,
             num_classes=num_classes,
             dim=ckpt_dim,
             depth=ckpt_depth,
-            heads=config.get('heads', 8),
+            heads=ckpt_heads,
             mlp_dim=config.get('mlp_dim', ckpt_dim * 4),
             pool=config.get('pool', 'cls'),
             channels=config.get('channels', 3),
-            dim_head=config.get('dim_head', 64),
+            dim_head=ckpt_dim_head,
             dropout=config.get('dropout', 0.1),
             emb_dropout=config.get('emb_dropout', 0.1),
             min_patch_size=min_patch_size,
