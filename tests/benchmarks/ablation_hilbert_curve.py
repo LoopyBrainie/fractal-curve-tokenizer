@@ -66,7 +66,6 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "examples" / "training"))
 
 from einops import rearrange, repeat
-from einops.layers.torch import Rearrange
 from vit_pytorch import FractalCurveViT
 
 
@@ -204,10 +203,9 @@ class StandardViT(nn.Module):
         # Patch 数量和维度
         num_patches = (image_size // patch_size) ** 2
 
-        # Patch 嵌入 (使用 Conv2d + Rearrange)
+        # Patch 嵌入 (使用 Conv2d)
         self.to_patch_embedding = nn.Sequential(
             nn.Conv2d(in_channels, dim, kernel_size=patch_size, stride=patch_size),
-            Rearrange('b d h w -> b (h w) d'),
             nn.LayerNorm(dim),
         )
 
@@ -241,8 +239,9 @@ class StandardViT(nn.Module):
     def forward(self, img: torch.Tensor) -> torch.Tensor:
         batch = img.shape[0]
 
-        # Patch 嵌入
+        # Patch 嵌入 (Conv2d 输出 [B, D, h, w] -> 展平为 [B, h*w, D])
         x = self.to_patch_embedding(img)
+        x = x.flatten(2).transpose(1, 2)  # [B, num_patches, dim]
 
         # 添加 CLS token
         cls_tokens = repeat(self.cls_token, "... d -> b ... d", b=batch)

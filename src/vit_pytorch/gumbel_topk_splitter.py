@@ -657,8 +657,8 @@ class GumbelTopKSplitter(nn.Module):
         # P-OPT-3: 向量化深度方差归一化
         # 使用 one-hot 编码实现批量 scatter/gather 操作
         
-        # 构建深度 one-hot 掩码: [D, N]
-        depth_onehot = F.one_hot(depths, D).float().T  # [D, N]
+        # 构建深度 one-hot 掩码: [D, N] - 确保在正确设备上
+        depth_onehot = F.one_hot(depths.to(device), D).float().T  # [D, N]
         depth_counts = depth_onehot.sum(dim=1)  # [D] 每个深度的候选数量
         
         # 扩展 logits 和掩码用于批量计算
