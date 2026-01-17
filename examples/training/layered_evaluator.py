@@ -915,22 +915,95 @@ class LayeredEvaluator:
         
         # 获取 tokenizer 相关配置
         # 支持旧格式的配置名称映射
-        num_scales = config.get('num_scales', 4)
+        num_scales = config.get('num_scales', None)
         min_patch_size = config.get('min_patch_size', 4)
         if isinstance(min_patch_size, int):
             min_patch_size = (min_patch_size, min_patch_size)
-        
+
         # 从数据集配置获取 num_classes
         num_classes = config.get('num_classes', self.dataset_config['num_classes'])
         image_size = config.get('image_size', self.dataset_config['image_size'])
-        
+
+        # 加载权重以检测缺失的架构参数
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        elif 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            # 直接是 state_dict
+            state_dict = checkpoint
+
+        # 从 checkpoint 推断缺失的架构参数（向后兼容旧检查点）
+        if num_scales is None:
+            # 尝试从 depth_scale_raw 的 shape 检测 num_scales
+            depth_scale_key = None
+            for k in state_dict.keys():
+                if '_depth_scale_raw' in k:
+                    depth_scale_key = k
+                    break
+            if depth_scale_key is not None:
+                num_scales = state_dict[depth_scale_key].shape[0]
+                print(f"Detected num_scales={num_scales} from checkpoint key '{depth_scale_key}'")
+            else:
+                num_scales = 4  # 默认值
+                print(f"Warning: Could not detect num_scales from checkpoint, using default {num_scales}")
+
+        # 检测 num_classes（从 mlp_head 的最后一个 linear 层）
+        if 'mlp_head' in state_dict:
+            for key in reversed(list(state_dict.keys())):
+                if key.startswith('mlp_head') and '.weight' in key:
+                    ckpt_num_classes = state_dict[key].shape[0]
+                    if ckpt_num_classes != num_classes:
+                        print(f"Detected num_classes={ckpt_num_classes} from checkpoint (overriding dataset default {num_classes})")
+                        num_classes = ckpt_num_classes
+                    break
+        elif 'head.4.weight' in state_dict:  # 旧格式
+            ckpt_num_classes = state_dict['head.4.weight'].shape[0]
+            if ckpt_num_classes != num_classes:
+                print(f"Detected num_classes={ckpt_num_classes} from checkpoint (overriding dataset default {num_classes})")
+                num_classes = ckpt_num_classes
+
+        # 检测 dim（从 to_qkv.weight 的 shape: [3*dim, dim]）
+        ckpt_dim = config.get('dim', None)
+        if ckpt_dim is None:
+            for key in state_dict.keys():
+                if 'to_qkv.weight' in key:
+                    # to_qkv.weight shape is [3*dim, dim]
+                    qkv_shape = state_dict[key].shape
+                    if len(qkv_shape) == 2 and qkv_shape[0] == 3 * qkv_shape[1]:
+                        ckpt_dim = qkv_shape[1]
+                        print(f"Detected dim={ckpt_dim} from checkpoint key '{key}'")
+                    break
+        if ckpt_dim is None:
+            ckpt_dim = 256  # 默认值
+
+        # 检测 depth（从 transformer.layers 的数量）
+        ckpt_depth = config.get('depth', None)
+        if ckpt_depth is None:
+            depth_count = 0
+            for key in state_dict.keys():
+                if key.startswith('transformer.layers.'):
+                    # Count unique layer indices
+                    parts = key.split('.')
+                    if len(parts) > 2:
+                        try:
+                            layer_idx = int(parts[2])
+                            depth_count = max(depth_count, layer_idx + 1)
+                        except ValueError:
+                            pass
+            if depth_count > 0:
+                ckpt_depth = depth_count
+                print(f"Detected depth={ckpt_depth} from checkpoint")
+        if ckpt_depth is None:
+            ckpt_depth = 6  # 默认值
+
         model = FractalCurveViT(
             image_size=image_size,
             num_classes=num_classes,
-            dim=config.get('dim', 256),
-            depth=config.get('depth', 6),
+            dim=ckpt_dim,
+            depth=ckpt_depth,
             heads=config.get('heads', 8),
-            mlp_dim=config.get('mlp_dim', config.get('dim', 256) * 4),
+            mlp_dim=config.get('mlp_dim', ckpt_dim * 4),
             pool=config.get('pool', 'cls'),
             channels=config.get('channels', 3),
             dim_head=config.get('dim_head', 64),

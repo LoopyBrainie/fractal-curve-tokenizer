@@ -826,7 +826,9 @@ class CUB200Trainer:
             'val_acc': val_acc,
             'best_metric': self.state.best_metric,
             'best_epoch': self.state.best_epoch,
+            # 完整的模型架构配置（用于评估时正确重建模型）
             'config': {
+                # 训练超参数
                 'batch_size': self.config.batch_size,
                 'num_epochs': self.config.num_epochs,
                 'learning_rate': self.config.learning_rate,
@@ -836,6 +838,27 @@ class CUB200Trainer:
                 'label_smoothing': self.config.label_smoothing,
                 'dropout': self.config.dropout,
                 'patience': self.config.patience,
+                'use_amp': self.config.use_amp,
+                'validate_interval': self.config.validate_interval,
+                'gradient_clip_norm': self.config.gradient_clip_norm,
+                # 模型架构参数
+                'num_classes': self.config.num_classes,
+                'dim': self.config.dim,
+                'depth': self.config.depth,
+                'heads': self.config.heads,
+                'mlp_dim': self.config.mlp_dim,
+                'dim_head': self.config.dim_head,
+                'drop_path_rate': self.config.drop_path_rate,
+                # Tokenizer 参数
+                'num_scales': self.config.num_scales,
+                'min_patch_size': self.config.min_patch_size,
+                'max_level': self.config.max_level,
+                'K_min': self.config.K_min,
+                'K_max': self.config.K_max,
+                'tokenizer_type': self.config.tokenizer_type,
+                'ffn_type': self.config.ffn_type,
+                'use_checkpoint': self.config.use_checkpoint,
+                'channels': self.config.channels,
             },
         }
 
