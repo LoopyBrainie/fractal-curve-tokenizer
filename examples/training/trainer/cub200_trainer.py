@@ -91,6 +91,11 @@ class CUB200TrainingConfig:
     drop_path: float = 0.16
     weight_decay: float = 0.15
 
+    # Mixup/CutMix 数据增强
+    mixup_alpha: float = 0.3
+    cutmix_alpha: float = 0.8
+    mixup_prob: float = 0.4
+
     # Focal Loss（处理困难样本）
     use_focal_loss: bool = True
     focal_gamma: float = 2.0

@@ -2625,9 +2625,18 @@ def main():
     parser.add_argument("--quick-test", action="store_true")
     parser.add_argument("--exp-name", type=str, default=None,
                        help="Custom experiment name (default: auto-generated with timestamp)")
-    
-    args = parser.parse_args()
-    
+
+    # 使用 parse_known_args 忽略未知参数（避免因参数不兼容而报错）
+    args, unknown = parser.parse_known_args()
+
+    # 警告：忽略的未知参数
+    if unknown:
+        print(f"[WARN] 忽略未知命令行参数 ({len(unknown)} 个):")
+        for arg in unknown[:10]:  # 只显示前10个
+            print(f"       {arg}")
+        if len(unknown) > 10:
+            print(f"       ... 还有 {len(unknown) - 10} 个")
+
     # CUB-200 自动启用细粒度模式
     if args.dataset == 'cub200' and not args.finegrained_mode:
         args.finegrained_mode = True
@@ -2844,6 +2853,7 @@ def main():
         train_loader, val_loader, test_loader = create_dataloaders(spec, config)
         
         # 创建 CUB-200 训练配置
+        # 注意: 不传递 mixup/cutmix 参数，因为 CUB200Trainer 未实现这些增强
         cub200_config = CUB200TrainingConfig(
             # 基础训练参数
             batch_size=config.batch_size,
@@ -2868,10 +2878,6 @@ def main():
             dropout=config.dropout,
             drop_path=config.drop_path,
             weight_decay=config.weight_decay,
-            # Mixup/CutMix
-            mixup_alpha=config.mixup_alpha,
-            cutmix_alpha=config.cutmix_alpha,
-            mixup_prob=config.mixup_prob,
             # 早停
             patience=config.patience,
             min_delta=config.min_delta,
