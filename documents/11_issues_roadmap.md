@@ -497,4 +497,220 @@ otin selected$ | ✓ Enforced |
 
 **Conclusion**: Scheme D represents the mathematically correct solution to the adaptive tokenization problem, solving the "Serial Dependency" and "Gradient Sparsity" problems of Scheme A while maintaining the geometric properties that Scheme B lost.
 
-> **Status**: Scheme D is now the default tokenizer strategy.
+## 11.28 Architecture Math Critique (I22)
+
+> **结案日期**: 2026-01-15
+> **状态**: 6/8 完成, 2项合并
+
+### 已完成 Issues
+
+| ID | 问题 | 解决方案 | 状态 |
+|----|------|----------|------|
+| I22-1 | 树一致性 gather 语义错误 | 删除冗余实现，保留 `hard_selected[:, safe_children]` | ✅ |
+| I22-2 | LCA 偏置语义正确性验证 | P11-3 实现已验证正确性 | ✅ |
+| I22-3 | Subset Softmax 梯度增强声称验证 | 理论验证 2.7x 增强 | ✅ |
+| I22-4 | Log-Compensation Bias 公式推导 | 方案E替代实现 | ✅ |
+| I22-6 | 温度参数理论最优值研究 | via I29-1 (τ=0.5 最优) | ✅ |
+
+### 合并至其他 Issue
+
+| ID | 合并目标 | 说明 |
+|----|----------|------|
+| I22-5 | → I25-2 | Hilbert 收益量化实验 |
+| I22-8 | → I25-12 | PseudoHilbert 局部性衰减 |
+
+---
+
+## 11.29 Training Diagnosis (I23)
+
+> **结案日期**: 2026-01-15
+> **状态**: 4/9 完成, 5项待处理
+
+### 已完成 Issues
+
+| ID | 问题 | 解决方案 |
+|----|------|----------|
+| I23-1 | 深度分布崩塌 | 深度方差归一化 + KL权重 0.5 + 软配额正则化 |
+| I23-2 | Token 数量下界失效 | K_max(K, K_min) 修复 + K_90 per-batch 计算 |
+| I23-3 | 训练-测试泛化鸿沟 | 通过 I24-1 正则化增强解决 |
+| I23-4-NaN | splitter_loss NaN/Inf | clamp 顺序修复 + 复杂度 logits 限幅 |
+| I23-7 | 注意力分析模块失效 | 使用 `store_attn_weights` 条件修复 |
+
+### 待处理 Issues
+
+| ID | 优先级 | 问题 |
+|----|--------|------|
+| I23-8 | 🔵 P2 | Scale Distribution 熵过低 |
+| I23-9 | 🔵 P2 | 类别-Token 数量相关性异常 |
+| I23-10 | ⚪ P3 | 代码理论问题修复 |
+
+---
+
+## 11.30 Experiment 20260112 Analysis (I24)
+
+> **结案日期**: 2026-01-15
+> **状态**: 9/12 完成, 3项待处理
+
+### 已完成 Issues
+
+| ID | 问题 | 解决方案 |
+|----|------|----------|
+| I24-1 | 训练-验证泛化鸿沟 | dropout 0.15→0.20 + label_smoothing 0.1→0.15 |
+| I24-2 | Log-Compensation 理论缺陷 | 方案E (可学习配额) 替代 |
+| I24-3 | 类别 1 准确率 0% | 数据清洗 + label_smoothing |
+| I24-9 | 位置编码边界舍入误差 | 现有 clamp 保护已足够 |
+| I24-11 | 评估脚本注意力分析失效 | 与 I23-7 相同修复 |
+| I24-12 | per_class_avg_tokens 数据异常 | 方案A Focal γ=2.5 |
+
+### 合并/待处理
+
+| ID | 状态 | 说明 |
+|----|------|------|
+| I24-10 | → I25-10 | DEPTH_QUOTA_TARGET 参数化 |
+| I24-4 | 🟡 P1 | depth=1 完全缺失 |
+| I24-5 | 🟡 P1 | 深度方差归一化批次统计 |
+
+---
+
+## 11.31 Experiment 20260114 Analysis (I25)
+
+> **结案日期**: 2026-01-17
+> **状态**: 8/13 完成, 5项待处理
+
+### 已完成 Issues
+
+| ID | 问题 | 解决方案/结论 |
+|----|------|---------------|
+| I25-4 | 温度敏感性消融 | I29-1 验证 τ=0.5 最优 |
+| I25-5 | 阈值方差正则化 | threshold_var_loss 已实现 |
+| I25-6 | 整数除法边界象限错误 | 现有逻辑正确 |
+| I25-7 | Scale 多样性正则化 | Scheme E 改善 entropy 至 54.5% |
+| I25-9 | 评估脚本注意力分析修复 | 已完成 |
+
+### 待处理 Issues
+
+| ID | 优先级 | 问题 |
+|----|--------|------|
+| I25-2 | 🔴 P0-Critical | Hilbert vs Raster 消融实验 |
+| I25-8 | 🔵 P2 | 混合池化选择器收益评估 |
+| I25-10 | 🔵 P2 | 配额参数暴露 (含 I24-10) |
+| I25-12 | 🔵 P2 | PseudoHilbert 局部性量化 |
+
+---
+
+## 11.32 Tree Consistency Removal (I26)
+
+> **结案日期**: 2026-01-15
+> **状态**: 2/3 完成, 1项搁置
+
+### 已完成 Issues
+
+| ID | 问题 | 解决方案 |
+|----|------|----------|
+| I26-1 | 移除树一致性约束 | 删除 `_enforce_tree_consistency()` 调用 |
+| I26-2 | threshold_var_loss 缺失 | 已实现 |
+
+### 搁置
+
+| ID | 问题 | 说明 |
+|----|------|------|
+| I26-3 | LCA 语义混合问题 | 需进一步分析 |
+
+---
+
+## 11.33 Class Accuracy Variance (I28)
+
+> **结案日期**: 2026-01-15
+> **状态**: 1/3 完成, 2项延后
+
+### 已完成 Issues
+
+| ID | 问题 | 解决方案 |
+|----|------|----------|
+| I28-1 | Worst Classes 准确率过低 | 方案A: Focal γ=2.5 + label_smoothing |
+
+---
+
+## 11.34 Math Consistency Fix (I29)
+
+> **结案日期**: 2026-01-17
+> **状态**: 4/5 完成, 1项延后
+
+### 已完成 Issues
+
+| ID | 问题 | 解决方案 |
+|----|------|----------|
+| I29-1 | SPLITTER_TEMP_END 常量不一致 | 统一为 0.5 |
+| I29-2 | threshold_var_loss 实现 | 已完成 |
+| I29-3 | LOG_COMPENSATION 条件冗余 | 方案E替代后删除 |
+| I29-4 | 温度调度策略一致化 | 统一温度退火参数 |
+
+### 延后
+
+| ID | 问题 | 说明 |
+|----|------|------|
+| I29-5 | 硬编码 epsilon 常量化 | 低优先级 |
+
+---
+
+## 11.35 Comprehensive Math Critique (I30)
+
+> **结案日期**: 2026-01-17
+> **状态**: 3/17 完成, 14项待处理
+
+### 已完成 Issues
+
+| ID | 问题 | 解决方案 |
+|----|------|----------|
+| I30-3 | 过拟合严重 (Gap=12%) | dropout + label_smoothing 增强 |
+| I30-4 | 类别准确率方差过大 | Focal Loss + 数据清洗 |
+| I30-9 | 弱引用缓存失效 | 使用强引用 + WeakRef 双重保护 |
+
+### 待处理 Issues (按优先级)
+
+| ID | 优先级 | 问题 |
+|----|--------|------|
+| I30-1 | 🔴 P0-Critical | Hilbert vs Raster 核心收益验证 |
+| I30-2 | 🔴 P0-Critical | Subset Softmax 梯度声明与实现矛盾 |
+| I30-5 | 🔴 P0 | levels_info 值域验证 |
+| I30-6 | 🟡 P1 | 小 batch 深度方差归一化 |
+| I30-7 | 🟡 P1 | PseudoHilbert 跳跃界公式 |
+| I30-8 | 🟡 P1 | GUMBEL_EPSILON 过小风险 |
+| I30-10~13 | 🔵 P2 | 代码质量优化 |
+| I30-14~16 | ⚪ P3 | 研究探索 |
+
+---
+
+## 11.36 LCA Pseudo Adaptation (I31)
+
+> **状态**: 3/3 P0-Critical 待实施
+> **结案日期**: 待定
+
+### 待实施 Issues
+
+| ID | 问题 | 优先级 |
+|----|------|--------|
+| I31-1 | 形状-尺度编码器实现 | 🔴 P0-Critical |
+| I31-2 | LCAHilbertBias 扩展 | 🔴 P0-Critical |
+| I31-3 | 面积位置编码补充 | 🔴 P0-Critical |
+
+---
+
+## 附录: Issue ID 索引 (已归档)
+
+| ID | 日期 | 主题 | 归档位置 |
+|----|------|------|----------|
+| I0-I8 | 2025-12 | 早期 P0-P8 Issues | §11.3-§11.12 |
+| I9 | 2025-12 | 训练性能优化 | §11.16 |
+| I10 | 2025-12 | 分割器失效分析 | §11.17 |
+| I11 | 2026-01 | 架构数学审查 | §11.18 |
+| I12 | 2026-01 | 深度数学审查 | §11.19 |
+| I13 | 2026-01 | 全面数学审查 | §11.20 |
+| I14 | 2026-01 | 实验验证 | §11.21 |
+| I15 | 2026-01 | 训练系统重构 | §11.22 |
+| I16 | 2026-01 | 崩塌根因分析 | §11.23 |
+| I17 | 2026-01 | 端到端重构 | §11.24 |
+| I18 | 2026-01 | 代码批判分析 | §11.25 |
+| I19 | 2026-01 | Scheme D 实现 | §11.26 |
+| I20 | 2026-01 | 最终分析总结 | §11.27 |
+| I22-I31 | 2026-01 | 数学批判与诊断 | §11.28-§11.35 |
