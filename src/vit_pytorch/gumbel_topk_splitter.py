@@ -849,7 +849,7 @@ class GumbelTopKSplitter(nn.Module):
         dtype = features.dtype
         
         # 缩放区域坐标到特征图空间
-        regions_feat = self.candidate_regions.clone()
+        regions_feat = self.candidate_regions.to(device).clone()
         regions_feat[:, [0, 2]] *= scale_w  # x
         regions_feat[:, [1, 3]] *= scale_h  # y
         

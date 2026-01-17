@@ -203,17 +203,11 @@ class StandardViT(nn.Module):
 
         # Patch 数量和维度
         num_patches = (image_size // patch_size) ** 2
-        patch_dim = in_channels * patch_size * patch_size
 
-        # Patch 嵌入 (使用 Rearrange 替代 Conv2d)
+        # Patch 嵌入 (使用 Conv2d + Rearrange)
         self.to_patch_embedding = nn.Sequential(
-            Rearrange(
-                "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
-                p1=patch_size,
-                p2=patch_size,
-            ),
-            nn.LayerNorm(patch_dim),
-            nn.Linear(patch_dim, dim),
+            nn.Conv2d(in_channels, dim, kernel_size=patch_size, stride=patch_size),
+            Rearrange('b d h w -> b (h w) d'),
             nn.LayerNorm(dim),
         )
 
