@@ -65,7 +65,8 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "examples" / "training"))
 
-from einops import rearrange, repeat, Rearrange
+from einops import rearrange, repeat
+from einops.layers.torch import Rearrange
 from vit_pytorch import FractalCurveViT
 
 
