@@ -548,8 +548,9 @@ class ModularTrainer:
         for inputs, targets in self.val_loader:
             inputs = inputs.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
-            
-            with torch.amp.autocast('cuda', enabled=self.config.use_amp):
+
+            # 验证禁用 AMP 以确保指标精度
+            with torch.amp.autocast('cuda', enabled=False):
                 outputs = self.model(inputs)
                 loss = self.loss_fn(outputs, targets)
             

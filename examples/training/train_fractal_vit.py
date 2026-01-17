@@ -2604,7 +2604,21 @@ def main():
                        help="Center Loss weight (default: 0.01)")
     parser.add_argument("--finegrained-mode", action="store_true",
                        help="Enable fine-grained classification mode (auto for cub200)")
-    
+
+    # CUB-200 细粒度分类专用参数（独立暴露，避免与通用训练器参数重合）
+    parser.add_argument("--cub-validate-interval", type=int, default=3,
+                       help="CUB200: Validation interval in epochs (default: 3)")
+    parser.add_argument("--cub-center-lr-ratio", type=float, default=50.0,
+                       help="CUB200: Center Loss LR ratio (lr_center / lr_main, default: 50.0)")
+    parser.add_argument("--cub-center-lr", type=float, default=None,
+                       help="CUB200: Center Loss absolute LR (overrides ratio if set)")
+    parser.add_argument("--cub-gradient-clip", type=float, default=1.0,
+                       help="CUB200: Gradient clipping norm (default: 1.0)")
+    parser.add_argument("--cub-no-focal-loss", action="store_true", default=False,
+                       help="CUB200: Disable Focal Loss for hard samples")
+    parser.add_argument("--cub-focal-gamma", type=float, default=2.0,
+                       help="CUB200: Focal Loss gamma (default: 2.0)")
+
     # 系统
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto")
@@ -2837,12 +2851,18 @@ def main():
             learning_rate=config.learning_rate,
             warmup_epochs=config.warmup_epochs,
             accum_steps=config.accum_steps,
+            validate_interval=args.cub_validate_interval,
+            center_lr_ratio=args.cub_center_lr_ratio,
+            center_lr=args.cub_center_lr,
+            gradient_clip_norm=args.cub_gradient_clip,
             # 设备和混合精度
             device=str(device),
             use_amp=config.use_amp,
             # 细粒度特定
             use_center_loss=args.use_center_loss,
             center_loss_weight=args.center_loss_weight,
+            use_focal_loss=not args.cub_no_focal_loss,
+            focal_gamma=args.cub_focal_gamma,
             # 正则化
             label_smoothing=config.label_smoothing,
             dropout=config.dropout,
@@ -2903,16 +2923,30 @@ def main():
                     'batch_size': cub200_config.batch_size,
                     'num_epochs': cub200_config.num_epochs,
                     'learning_rate': cub200_config.learning_rate,
+                    'validate_interval': cub200_config.validate_interval,
+                    'center_lr_ratio': cub200_config.center_lr_ratio,
+                    'center_lr': cub200_config.center_lr,
                     'use_center_loss': cub200_config.use_center_loss,
                     'center_loss_weight': cub200_config.center_loss_weight,
+                    'use_focal_loss': cub200_config.use_focal_loss,
+                    'focal_gamma': cub200_config.focal_gamma,
                 },
             }, f, indent=2)
-        
+
         print(f"[INFO] Experiment directory: {exp_dir}")
         print(f"[INFO] CUB200 Config:")
+        print(f"  - Epochs: {cub200_config.num_epochs}, Batch: {cub200_config.batch_size}")
+        print(f"  - LR: {cub200_config.learning_rate:.2e}, Validate every: {cub200_config.validate_interval} epochs")
         print(f"  - CenterLoss: {'enabled' if cub200_config.use_center_loss else 'disabled'}")
         if cub200_config.use_center_loss:
-            print(f"  - CenterLoss weight: {cub200_config.center_loss_weight}")
+            print(f"    - Weight: {cub200_config.center_loss_weight}, LR ratio: {cub200_config.center_lr_ratio}")
+            if cub200_config.center_lr:
+                print(f"    - Absolute LR: {cub200_config.center_lr}")
+        print(f"  - FocalLoss: {'enabled' if cub200_config.use_focal_loss else 'disabled'}")
+        if cub200_config.use_focal_loss:
+            print(f"    - Gamma: {cub200_config.focal_gamma}")
+        else:
+            print(f"    - Disabled by --cub-no-focal-loss")
         print()
         
         # 执行训练
