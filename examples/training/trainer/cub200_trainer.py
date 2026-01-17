@@ -446,6 +446,25 @@ class CUB200Trainer:
         """
         self.model.eval()
 
+        # 修复: 评估时禁用 persistent_workers 以避免多进程兼容性问题
+        # 使用安全的数据加载方式
+        try:
+            # 尝试获取数据集
+            eval_dataset = loader.dataset
+            # 创建评估用的 DataLoader (禁用多进程)
+            eval_loader = DataLoader(
+                eval_dataset,
+                batch_size=self.config.batch_size,
+                num_workers=0,  # 评估时禁用多进程
+                pin_memory=True,
+                shuffle=False,
+                drop_last=False,
+            )
+            loader = eval_loader
+        except Exception as e:
+            self.logger.warning(f"无法创建安全的评估 DataLoader: {e}，使用原始 loader")
+            # 如果失败，保持原样
+
         total_loss = 0.0
         correct_top1 = 0
         correct_top5 = 0

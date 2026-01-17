@@ -118,17 +118,18 @@ P12 内部向量化优化 (2025-12-29)
 使用示例：
     # CIFAR-10 快速测试
     python train_fractal_vit.py --quick-test --use-amp
-    
-    # Tiny ImageNet 完整训练 (I24-1 优化配置 - 增强正则化)
-    python train_fractal_vit.py --dataset tiny-imagenet --epochs 100 --dim 320 \\
-        --depth 12 --heads 8 --dropout 0.2 --drop-path 0.2 --weight-decay 0.1 \\
-        --use-amp --gradient-checkpoint --compile --channels-last \\
+
+    # Tiny ImageNet 完整训练 (I30-3 优化配置 - 增强正则化缓解过拟合)
+    # 正则化参数: dropout=0.25, drop_path=0.25, weight_decay=0.15
+    python train_fractal_vit.py --dataset tiny-imagenet --epochs 100 --dim 320 \
+        --depth 12 --heads 8 \
+        --use-amp --gradient-checkpoint --compile --channels-last \
         --include-soft-entropy --include-elastic-budget
-    
-    # 小数据集推荐配置 (I24-1: 减少过拟合)
-    python train_fractal_vit.py --dataset tiny-imagenet --epochs 150 \\
-        --dim 256 --depth 8 --heads 6 \\
-        --dropout 0.25 --drop-path 0.25 --weight-decay 0.1 \\
+
+    # 小数据集推荐配置 (I30-3: 进一步增强正则化)
+    python train_fractal_vit.py --dataset tiny-imagenet --epochs 150 \
+        --dim 256 --depth 8 --heads 6 \
+        --dropout 0.3 --drop-path 0.3 --weight-decay 0.2 \
         --freeze-tokenizer --use-amp
     
     # 自定义 P10 参数
@@ -338,13 +339,16 @@ class TrainingConfig:
     mlp_dim: int
     dim_head: int
     max_level: int
-    num_scales: int
     pool: str
     ffn_type: str
-    
+
+    # I30-17: 动态深度配置
+    min_patch_size: int  # 目标最小 patch 大小
+    max_depth_hard_limit: int  # max_depth 硬上限
+
     # Tokenizer 配置 (V3 Variable Depth Tokens)
     tokenizer_type: str  # 'streaming_v3' (唯一支持)
-    
+
     # GumbelTopKSplitter (Scheme D) 参数
     K_min: int  # 最小 token 数量 (硬下界约束)
     K_max: int  # 最大 token 数量 (软上界约束)
@@ -2133,15 +2137,17 @@ def analyze_class_balance(
             print(f"    - Low accuracy (<20%): {low_acc_count}/{len(valid_acc)} ({low_ratio*100:.1f}%)")
             print(f"    - Accuracy range: [{acc_min:.1f}%, {acc_max:.1f}%] (std={acc_std:.1f})")
             print(f"    - Imbalance score: {imbalance_score:.1f}/100 ({severity})")
-            
+
             if zero_acc_count > 0 and epoch > 5:
                 worst_5 = per_class_stats['worst_classes'][:5]
                 worst_acc = [class_acc[c] for c in worst_5]
-                print(f"    - Worst classes (ID:acc): {list(zip(worst_5, [f'{a:.1f}%' for a in worst_acc]))}")
-            
-            # 建议
-            if imbalance_score > 30 and epoch > 10:
-                print(f"    [建议] 考虑启用 --use-focal-loss 和/或 --use-class-balanced")
+                worst_str = ", ".join([f"{c}:{a:.1f}%" for c, a in zip(worst_5, worst_acc)])
+                print(f"    - Worst classes (ID:acc): {worst_str}")
+
+            # I30-4: Focal Loss 和 Class Balanced 现在默认启用 (gamma=3.0)
+            # 建议仅在严重不平衡时考虑调整参数
+            if imbalance_score > 50 and epoch > 20:
+                print("    [建议] 考虑增加 --focal-gamma (当前: 3.0)")
     
     return report
 
@@ -2457,9 +2463,13 @@ def main():
     parser.add_argument("--depth", type=int, default=8)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--dim-head", type=int, default=32)
-    parser.add_argument("--max-level", type=int, default=4)
-    parser.add_argument("--num-scales", type=int, default=5,
-                       help="Number of scales (I16-2: default=5 for max_depth=4, max_tokens=341)")
+    parser.add_argument("--max-level", type=int, default=None,
+                       help="Maximum quadtree level (I30-17: auto-computed from min_patch_size if None)")
+    # I30-17: Replace num_scales with min_patch_size and max_depth_hard_limit
+    parser.add_argument("--min-patch-size", type=int, default=4,
+                       help="I30-17: Target minimum patch size for automatic depth computation")
+    parser.add_argument("--max-depth-hard-limit", type=int, default=8,
+                       help="I30-17: Hard limit on maximum depth to prevent excessive computation")
     parser.add_argument("--pool", type=str, default="cls", choices=["cls", "mean"])
     parser.add_argument("--ffn-type", type=str, default="swiglu_level",
                        choices=["gelu", "swiglu", "swiglu_level"])
@@ -2477,7 +2487,13 @@ def main():
     parser.add_argument("--tokenizer-type", type=str, default="streaming_v3",
                        choices=["streaming_v3"],
                        help="Tokenizer type: streaming_v3 (Variable Depth Tokens, only supported)")
-    
+
+    # I30-1: Hilbert vs Raster 消融实验 - 扫描顺序参数
+    parser.add_argument("--scan-order", type=str, default="hilbert",
+                       choices=["hilbert", "raster", "morton"],
+                       help="I30-1: Token scanning order for Hilbert curve ablation experiment "
+                            "(default: hilbert, options: hilbert/raster/morton)")
+
     # GumbelTopKSplitter (Scheme D) 参数
     parser.add_argument("--K-min", type=int, default=16,
                        help="Minimum token count (hard lower bound, default: 16)")
@@ -2548,14 +2564,14 @@ def main():
     # 训练
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--weight-decay", type=float, default=0.1,
-                       help="Weight decay for L2 regularization (default: 0.1, I24-1 tuned)")
-    parser.add_argument("--dropout", type=float, default=0.2,
-                       help="Dropout rate (default: 0.2, I24-1 tuned for small datasets)")
+    parser.add_argument("--weight-decay", type=float, default=0.15,
+                       help="Weight decay for L2 regularization (default: 0.15, I30-3 tuned for overfitting)")
+    parser.add_argument("--dropout", type=float, default=0.25,
+                       help="Dropout rate (default: 0.25, I30-3 tuned for overfitting)")
     parser.add_argument("--emb-dropout", type=float, default=0.15,
                        help="Embedding dropout rate (default: 0.15)")
-    parser.add_argument("--drop-path", type=float, default=0.2,
-                       help="Drop path (stochastic depth) rate (default: 0.2, I24-1 tuned)")
+    parser.add_argument("--drop-path", type=float, default=0.25,
+                       help="Drop path (stochastic depth) rate (default: 0.25, I30-3 tuned for overfitting)")
     parser.add_argument("--label-smoothing", type=float, default=0.1,
                        help="Label smoothing factor (default: 0.1)")
     parser.add_argument("--gradient-clip", type=float, default=1.0)
@@ -2576,14 +2592,14 @@ def main():
                        help="CutMix alpha (default: 1.0, 0 to disable)")
     parser.add_argument("--mixup-prob", type=float, default=0.5,
                        help="Probability of applying Mixup/CutMix (default: 0.5)")
-    
-    # P14: 长尾效应优化
-    parser.add_argument("--use-focal-loss", action="store_true",
-                       help="Use Focal Loss to handle class imbalance")
-    parser.add_argument("--focal-gamma", type=float, default=2.0,
-                       help="Focal Loss gamma parameter (default: 2.0)")
-    parser.add_argument("--use-class-balanced", action="store_true",
-                       help="Use class-balanced loss weights")
+
+    # P14/I30-4: 长尾效应优化 - 默认启用
+    parser.add_argument("--no-focal-loss", action="store_true",
+                       help="Disable Focal Loss (enabled by default)")
+    parser.add_argument("--focal-gamma", type=float, default=3.0,
+                       help="Focal Loss gamma parameter (default: 3.0, I30-4 tuned)")
+    parser.add_argument("--no-class-balanced", action="store_true",
+                       help="Disable class-balanced loss weights (enabled by default)")
     parser.add_argument("--class-balance-beta", type=float, default=0.9999,
                        help="Class balance beta parameter (default: 0.9999)")
     parser.add_argument("--progressive-aug", action="store_true",
@@ -2679,9 +2695,11 @@ def main():
         mlp_dim=args.dim * 4,
         dim_head=args.dim_head,
         max_level=args.max_level,
-        num_scales=args.num_scales,
         pool=args.pool,
         ffn_type=args.ffn_type,
+        # I30-17: 动态深度配置
+        min_patch_size=args.min_patch_size,
+        max_depth_hard_limit=args.max_depth_hard_limit,
         # Tokenizer 配置 (V3)
         tokenizer_type=args.tokenizer_type,
         # GumbelTopKSplitter (Scheme D) 参数
@@ -2731,10 +2749,10 @@ def main():
         mixup_alpha=args.mixup_alpha,
         cutmix_alpha=args.cutmix_alpha,
         mixup_prob=args.mixup_prob,
-        # P14: 长尾效应优化
-        use_focal_loss=args.use_focal_loss,
+        # P14/I30-4: 长尾效应优化 - 默认启用，取反 no- 前缀参数
+        use_focal_loss=not args.no_focal_loss,
         focal_gamma=args.focal_gamma,
-        use_class_balanced=args.use_class_balanced,
+        use_class_balanced=not args.no_class_balanced,
         class_balance_beta=args.class_balance_beta,
         progressive_aug=args.progressive_aug,
         # I30-2: Hilbert-aware 困难样本挖掘
@@ -2747,13 +2765,15 @@ def main():
     
     # 创建 Tokenizer (默认使用 GumbelTopKSplitter - Scheme D)
     from vit_pytorch.tokenizer_streaming import StreamingFractalTokenizerV3
-    
+
+    # I30-17: 使用动态深度计算
     tokenizer = StreamingFractalTokenizerV3(
         image_size=max(spec.image_size, 32),
         channels=spec.channels,
         d_model=config.dim,
-        base_patch_size=4,
-        max_depth=config.num_scales - 1,
+        base_patch_size=config.min_patch_size,  # I30-17: 使用 min_patch_size
+        min_patch_size=config.min_patch_size,   # I30-17: 目标最小 patch
+        max_depth_hard_limit=config.max_depth_hard_limit,  # I30-17: 硬上限
         use_hilbert_order=True,
         # P6-1: 深度缩放配置
         depth_scale_range=config.depth_scale_range,
@@ -2766,7 +2786,7 @@ def main():
         # 数学依据: Splitter MLP 敏感，过高 dropout 导致分割决策不稳定
         splitter_dropout=min(config.dropout, 0.15),
     )
-    
+
     # 创建模型 (V3 Variable Depth Tokens)
     model_kwargs = dict(
         image_size=max(spec.image_size, 32),
@@ -2781,13 +2801,14 @@ def main():
         dropout=config.dropout,
         emb_dropout=config.emb_dropout,
         drop_path_rate=config.drop_path,
-        min_patch_size=(4, 4),
+        # I30-17: 使用新的动态深度参数
+        min_patch_size=config.min_patch_size,
+        max_depth_hard_limit=config.max_depth_hard_limit,
         max_level=config.max_level,
         use_checkpoint=config.gradient_checkpoint,
         ffn_type=config.ffn_type,
         # 使用自定义 tokenizer (支持高级分割参数)
         tokenizer=tokenizer,
-        num_scales=config.num_scales,
         # P6-2: LCA 温度配置
         lca_temperature=config.lca_temperature,
         learnable_temperature=config.learnable_temperature,
@@ -3292,10 +3313,11 @@ def main():
         
         # =====================================================================
         # I21 深度平衡机制
+        # I30-2: 已移除 Subset Softmax，现使用全局 Softmax
         # =====================================================================
         # GumbelTopKSplitter (Scheme D) 默认启用以下深度平衡组件:
-        #   - β: Log-Compensation Bias (LOG_COMPENSATION_ENABLED=True)
-        #   - δ: Subset Softmax (SUBSET_SOFTMAX_ENABLED=True)  
+        #   - β: Log-Compensation Bias (LOG_COMPENSATION_ENABLED=True) [已移除，被方案E替代]
+        #   - γ: 全局 Softmax (100% 梯度覆盖，替代原 Subset Softmax)
         #   - ε: Depth KL Loss (DEPTH_KL_WEIGHT=0.1)
         #
         # 这些是模型架构的内部设计，遵循 constants.py 中的默认值。
