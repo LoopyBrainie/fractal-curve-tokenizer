@@ -203,11 +203,9 @@ class StandardViT(nn.Module):
         # Patch 数量和维度
         num_patches = (image_size // patch_size) ** 2
 
-        # Patch 嵌入 (使用 Conv2d)
-        self.to_patch_embedding = nn.Sequential(
-            nn.Conv2d(in_channels, dim, kernel_size=patch_size, stride=patch_size),
-            nn.LayerNorm(dim),
-        )
+        # Patch 嵌入 (使用 Conv2d，展平 + LayerNorm)
+        self.conv = nn.Conv2d(in_channels, dim, kernel_size=patch_size, stride=patch_size)
+        self.ln = nn.LayerNorm(dim)
 
         # 位置编码和 CLS token
         self.pos_embedding = nn.Parameter(
@@ -239,9 +237,11 @@ class StandardViT(nn.Module):
     def forward(self, img: torch.Tensor) -> torch.Tensor:
         batch = img.shape[0]
 
-        # Patch 嵌入 (Conv2d 输出 [B, D, h, w] -> 展平为 [B, h*w, D])
-        x = self.to_patch_embedding(img)
+        # Patch 嵌入: Conv2d [B, 3, 64, 64] -> [B, dim, h, w]
+        x = self.conv(img)
+        # 展平并应用 LayerNorm: [B, dim, h, w] -> [B, h*w, dim]
         x = x.flatten(2).transpose(1, 2)  # [B, num_patches, dim]
+        x = self.ln(x)
 
         # 添加 CLS token
         cls_tokens = repeat(self.cls_token, "... d -> b ... d", b=batch)

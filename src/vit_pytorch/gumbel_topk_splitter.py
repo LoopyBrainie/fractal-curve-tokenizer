@@ -651,14 +651,14 @@ class GumbelTopKSplitter(nn.Module):
             normalized: [B, N] 按深度归一化后的 logits
         """
         B, N = logits.shape
-        depths = self.candidate_depths  # [N]
+        depths = self.candidate_depths.to(device)  # [N]
         D = self._current_max_depth + 1
-        
+
         # P-OPT-3: 向量化深度方差归一化
         # 使用 one-hot 编码实现批量 scatter/gather 操作
-        
-        # 构建深度 one-hot 掩码: [D, N] - 确保在正确设备上
-        depth_onehot = F.one_hot(depths.to(device), D).float().T  # [D, N]
+
+        # 构建深度 one-hot 掩码: [D, N]
+        depth_onehot = F.one_hot(depths, D).float().T  # [D, N]
         depth_counts = depth_onehot.sum(dim=1)  # [D] 每个深度的候选数量
         
         # 扩展 logits 和掩码用于批量计算
@@ -889,18 +889,19 @@ class GumbelTopKSplitter(nn.Module):
         if DEPTH_VARIANCE_NORM_ENABLED:
             complexity_logits = self._normalize_by_depth(complexity_logits, device, dtype)
         
-        # 深度嵌入偏置
-        depths = self.candidate_depths  # [N]
+        # 深度嵌入偏置 - 确保在正确设备上
+        depths = self.candidate_depths.to(device)  # [N]
         depth_embed = self.depth_embedding(depths)  # [N, 16]
         depth_bias_learned = self.depth_proj(depth_embed).squeeze(-1)  # [N]
-        
+
         # 固定深度偏置 (可选，用于平滑过渡)
         depth_bias_fixed = self.depth_bias_beta * (self.depth_bias_gamma ** depths.float())
-        
+
         # I30-4: 已移除 Log-Compensation (被方案E完全替代)
-        
-        # 阈值
-        taus = self.thresholds[depths]  # [N]
+
+        # 阈值 - 确保 thresholds 在正确设备上
+        thresholds = self.thresholds.to(device)
+        taus = thresholds[depths]  # [N]
         
         # 总 logits
         # logits = z + depth_bias + explore_bias - tau
@@ -1057,7 +1058,7 @@ class GumbelTopKSplitter(nn.Module):
         B, N = logits.shape
         device = logits.device
         D = self._current_max_depth + 1
-        depths = self.candidate_depths  # [N]
+        depths = self.candidate_depths.to(device)  # [N]
         
         # 计算配额分配
         quota = self._compute_quota_allocation(K)  # [D]
@@ -1349,10 +1350,10 @@ class GumbelTopKSplitter(nn.Module):
         batch_indices = selected_positions[:, 0]  # [total]
         candidate_indices = selected_positions[:, 1]  # [total]
         
-        # 向量化索引所有候选属性
-        regions = self.candidate_regions[candidate_indices]  # [total, 4]
-        depths = self.candidate_depths[candidate_indices]  # [total]
-        hilbert_indices = self.hilbert_indices[candidate_indices]  # [total]
+        # 向量化索引所有候选属性 - 确保在正确设备上
+        regions = self.candidate_regions.to(device)[candidate_indices]  # [total, 4]
+        depths = self.candidate_depths.to(device)[candidate_indices]  # [total]
+        hilbert_indices = self.hilbert_indices.to(device)[candidate_indices]  # [total]
         
         return GumbelTopKResult(
             regions=regions,
@@ -1484,8 +1485,8 @@ class GumbelTopKSplitter(nn.Module):
             if entropy_mode == 'target' and entropy_target is not None:
                 # Target mode: minimize |H - H_target|²
                 B, N = probs.shape
-                depths = self.candidate_depths
-                
+                depths = self.candidate_depths.to(probs.device)
+
                 # 计算当前熵
                 depth_probs = []
                 for d in range(self._current_max_depth + 1):
@@ -1494,7 +1495,7 @@ class GumbelTopKSplitter(nn.Module):
                         p_d = probs[:, mask].mean()
                         depth_probs.append(p_d.clamp(min=PROB_EPSILON))
                     else:
-                        depth_probs.append(torch.tensor(PROB_EPSILON, device=device))
+                        depth_probs.append(torch.tensor(PROB_EPSILON, device=probs.device))
                 
                 depth_probs_t = torch.stack(depth_probs)
                 depth_probs_t = depth_probs_t / depth_probs_t.sum()
@@ -1598,11 +1599,11 @@ class GumbelTopKSplitter(nn.Module):
         """
         if probs is None:
             return torch.tensor(0.0, device=self.candidate_regions.device)
-        
+
         B, N = probs.shape
-        depths = self.candidate_depths  # [N]
+        depths = self.candidate_depths.to(probs.device)  # [N]
         D = self._current_max_depth + 1
-        
+
         # P-OPT-7: 向量化深度平均概率计算 (消除 for 循环)
         # 使用 one-hot 编码计算每个深度的平均概率
         # p_d = mean(probs[:, depths == d]) = sum(probs × mask_d) / count_d
@@ -1670,9 +1671,9 @@ class GumbelTopKSplitter(nn.Module):
         
         B, N = selected_mask.shape
         device = selected_mask.device
-        depths = self.candidate_depths  # [N]
+        depths = self.candidate_depths.to(device)  # [N]
         D = self._current_max_depth + 1  # 深度类别数
-        
+
         # P-OPT-4: 向量化深度计数 (使用 one-hot + einsum 替代 for 循环)
         # 构建深度 one-hot: [N, D]
         depth_onehot = F.one_hot(depths, D).float()  # [N, D]
@@ -1757,9 +1758,9 @@ class GumbelTopKSplitter(nn.Module):
         B, N = selected_mask.shape
         device = selected_mask.device
         dtype = selected_mask.dtype
-        depths = self.candidate_depths  # [N]
+        depths = self.candidate_depths.to(device)  # [N]
         D = self._current_max_depth + 1  # 深度类别数
-        
+
         # P-OPT-5: 向量化深度计数 (消除 for 循环)
         # 使用 one-hot 编码 + einsum 一次性计算所有深度的加权计数
         # depth_counts[d] = Σ_{b,i} selected_mask[b,i] × 1[depths[i] = d]
@@ -1879,9 +1880,9 @@ class GumbelTopKSplitter(nn.Module):
         
         B, N = selected_mask.shape
         device = selected_mask.device
-        depths = self.candidate_depths
+        depths = self.candidate_depths.to(device)
         D = self._current_max_depth + 1
-        
+
         with torch.no_grad():
             # P-OPT-6: 向量化深度分布计算 (消除 for 循环)
             # 使用 one-hot 编码 + einsum 一次性计算
