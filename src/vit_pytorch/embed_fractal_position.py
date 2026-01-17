@@ -44,12 +44,14 @@ P11-5 修复: 删除了未使用的 level_attention_bias 参数和 get_attention
 """
 from __future__ import annotations
 
-from typing import Optional
+import math
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 from .constants import EMBEDDING_INIT_STD, HILBERT_BIAS_SCALE
+from .attn_hilbert_bias import AreaEncoder
 
 
 class FractalPositionEmbedding(nn.Module):
@@ -177,6 +179,135 @@ class FractalPositionEmbedding(nn.Module):
         
         return self.fusion_network(combined_emb)
 
-    # P11-5: 删除了 get_attention_bias 方法
-    # 注意力偏置功能已由 LCAHilbertBias (attn_hilbert_bias.py) 统一提供
-    # 该方法基于 LCA 深度计算偏置，语义更精确 (编码空间距离而非尺度组合)
+from .constants import EMBEDDING_INIT_STD, HILBERT_BIAS_SCALE
+
+
+class AreaEnhancedPositionEmbedding(nn.Module):
+    """面积增强的位置编码 (I31-3)
+
+    数学形式化
+    ==========
+
+    面积增强位置编码:
+        E_pos = Fusion(E_depth + E_path + λ · E_area)
+
+    其中:
+        E_area = AreaEncoder(s)     # 面积嵌入
+        λ = area_scale (零初始化)   # 可学习权重
+
+    与现有 FractalPositionEmbedding 的关系:
+        - 保持原有深度+路径编码
+        - 添加面积编码作为辅助信息
+        - 使用残差连接渐进启用
+
+    属性
+    ----
+    base_embedding : FractalPositionEmbedding
+        基础位置编码
+    area_encoder : AreaEncoder
+        面积编码器 (从 attn_hilbert_bias.py 导入)
+    area_scale : nn.Parameter
+        可学习权重 (零初始化)
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        max_level: int = 8,
+        fourier_levels: int = 4,
+        use_hilbert_encoding: bool = True,
+        use_spatial_encoding: bool = True,
+        dropout: float = 0.1,
+    ):
+        """初始化面积增强位置编码。
+
+        参数
+        ----
+        dim : int
+            嵌入维度
+        max_level : int, optional
+            最大层级，默认 8
+        fourier_levels : int, optional
+            傅里叶频率级别数，默认 4
+        use_hilbert_encoding : bool, optional
+            是否使用 Hilbert 编码，默认 True
+        use_spatial_encoding : bool, optional
+            是否使用空间编码，默认 True
+        dropout : float, optional
+            Dropout 比率，默认 0.1
+        """
+        super().__init__()
+        self.dim = dim
+        self.max_level = max_level
+
+        # 基础位置编码 (深度 + 路径)
+        self.base_embedding = FractalPositionEmbedding(
+            dim=dim,
+            max_level=max_level,
+            use_hilbert_encoding=use_hilbert_encoding,
+            use_spatial_encoding=use_spatial_encoding,
+            dropout=dropout,
+        )
+
+        # 面积编码器 (I31-3)
+        from .attn_hilbert_bias import AreaEncoder
+        self.area_encoder = AreaEncoder(
+            dim=dim,
+            fourier_levels=fourier_levels,
+            hidden_dim=32
+        )
+
+        # 可学习权重 (零初始化)
+        self.area_scale = nn.Parameter(torch.zeros(1))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """初始化权重。"""
+        # Area encoder 权重由其内部初始化
+        pass
+
+    def forward(
+        self,
+        levels_info: torch.Tensor,
+        regions: Optional[torch.Tensor] = None,
+        image_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        """计算面积增强位置编码。
+
+        参数
+        ----
+        levels_info : torch.Tensor
+            层级信息张量，形状 [B, N, InfoDim]
+        regions : torch.Tensor, optional
+            区域边界张量，形状 [B, N, 4]
+        image_size : int, optional
+            图像边长
+
+        返回
+        ----
+        torch.Tensor
+            位置编码，形状 [B, N, dim]
+        """
+        # 1. 基础位置编码
+        pos_emb = self.base_embedding(levels_info)
+
+        # 2. 面积编码 (辅助注入)
+        if regions is not None and image_size is not None and self.area_scale.item() != 0.0:
+            area_emb = self.area_encoder(regions, (image_size, image_size))
+
+            # 处理 CLS token: regions 包含 CLS (全零区域)，但 levels_info 的第一个是 CLS
+            # area_emb 的形状是 [B, N, dim]，需要与 pos_emb 对齐
+            if area_emb.shape[1] == pos_emb.shape[1] + 1:
+                # 跳过 CLS 对应的第一个区域
+                area_emb = area_emb[:, 1:, :]
+
+            # 残差注入
+            pos_emb = pos_emb + self.area_scale * area_emb
+
+        return pos_emb
+
+
+# P11-5: 删除了 get_attention_bias 方法
+# 注意力偏置功能已由 LCAHilbertBias (attn_hilbert_bias.py) 统一提供
+# 该方法基于 LCA 深度计算偏置，语义更精确 (编码空间距离而非尺度组合)

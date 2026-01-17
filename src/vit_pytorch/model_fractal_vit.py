@@ -90,8 +90,13 @@ class FractalCurveViT(nn.Module):
         dim_head: int = 64,
         dropout: float = 0.0,
         emb_dropout: float = 0.0,
-        min_patch_size: Tuple[int, int] = (4, 4),
+        # I30-17: 替换 Tuple[int, int] 为单一 int，并添加 max_depth_hard_limit
+        # 支持 Union[int, Tuple[int, int]] 用于向后兼容
+        min_patch_size: Union[int, Tuple[int, int]] = 4,
+        max_depth_hard_limit: int = 8,
         max_level: Optional[int] = None,  # P11-2: 默认 None，从 tokenizer.max_depth 自动获取
+        # I30-17: 废弃 num_scales 参数，改为动态计算
+        num_scales: Optional[int] = None,  # 已废弃，仅用于向后兼容
         use_hilbert_encoding: bool = True,
         use_spatial_encoding: bool = True,
         use_checkpoint: bool = False,
@@ -101,7 +106,6 @@ class FractalCurveViT(nn.Module):
         position_embedding: Optional[FractalPositionEmbedding] = None,
         # Streaming Tokenizer 配置
         tokenizer_type: TokenizerType = "streaming_v3",
-        num_scales: int = 4,
         # P6-2: LCA 温度配置
         lca_temperature: Optional[float] = 1.5,
         learnable_temperature: bool = True,
@@ -114,7 +118,7 @@ class FractalCurveViT(nn.Module):
         pos_dropout: Optional[float] = None,       # None = 跟随主 dropout * 0.5
     ) -> None:
         """初始化 FractalCurveViT。
-        
+
         Args:
             image_size: 输入图像尺寸（整数或 (H, W) 元组）
             num_classes: 分类类别数
@@ -127,15 +131,16 @@ class FractalCurveViT(nn.Module):
             dim_head: 每个注意力头的维度
             dropout: Dropout 比率
             emb_dropout: 嵌入层 Dropout 比率
-            min_patch_size: 最小 patch 尺寸
+            min_patch_size: (I30-17) 目标最小 patch 大小，用于动态计算 max_depth
+            max_depth_hard_limit: (I30-17) max_depth 硬上限，默认 8
             max_level: 最大递归层级（P11-2: 默认 None，自动从 tokenizer.max_depth 获取）
+            num_scales: (已废弃) 使用 min_patch_size 替代
             use_hilbert_encoding: 是否使用 Hilbert 编码
             use_spatial_encoding: 是否使用空间编码
             ffn_type: FFN 变体 ('gelu', 'swiglu', 'swiglu_level')
             tokenizer: 自定义 tokenizer（可选，若提供则忽略 tokenizer_type）
             position_embedding: 自定义位置编码（可选）
             tokenizer_type: tokenizer 类型 ("streaming_v3" - Variable Depth Tokens)
-            num_scales: 多尺度金字塔层数
             lca_temperature: (P6-2) LCA 偏置温度参数，默认 1.5
                 - None: 不使用温度缩放 (兼容模式)
                 - float: 温度初始值
@@ -148,6 +153,10 @@ class FractalCurveViT(nn.Module):
             pos_dropout: (I27) Position Embedding dropout
                 - None: 自动 = dropout * 0.5  # 信息瓶颈需保守
                 - float: 显式指定
+
+        Note:
+            I30-17: 已废弃 num_scales 参数。现在使用 min_patch_size 动态计算 max_depth:
+                max_depth = min(hard_limit, max(0, floor(log2(min(H, W) / min_patch_size))))
         """
         super().__init__()
 
@@ -179,24 +188,46 @@ class FractalCurveViT(nn.Module):
         effective_splitter_dropout = splitter_dropout if splitter_dropout is not None else min(dropout, 0.15)
         effective_pos_dropout = pos_dropout if pos_dropout is not None else (dropout * 0.5)
 
+        # I30-17: 处理 min_patch_size 的向后兼容
+        # 支持旧 API: min_patch_size=(4, 4)
+        if isinstance(min_patch_size, tuple):
+            effective_min_patch_size = min_patch_size[0]
+        else:
+            effective_min_patch_size = min_patch_size
+
         # === Tokenizer 选择逻辑 ===
         if tokenizer is not None:
             # 用户提供自定义 tokenizer，直接使用
             pass
         elif tokenizer_type == "streaming_v3":
-            base_ps = min_patch_size[0]
-            max_depth_v3 = num_scales - 1  # num_scales 个尺度对应 max_depth = num_scales - 1
-            # I27: 传递 splitter_dropout 到 Tokenizer
-            tokenizer = StreamingFractalTokenizerV3(
-                image_size=self.image_size,
-                channels=channels,
-                d_model=dim,
-                base_patch_size=base_ps,
-                max_depth=max_depth_v3,
-                K_min=K_min,
-                K_max=K_max,
-                splitter_dropout=effective_splitter_dropout,  # I27: 可配置
-            )
+            # I30-17: 使用动态深度计算，废弃 num_scales
+            # 兼容旧代码: 如果显式指定 num_scales，使用 max_depth = num_scales - 1
+            if num_scales is not None:
+                # 向后兼容: 使用 num_scales 计算 max_depth
+                max_depth_v3 = num_scales - 1
+                tokenizer = StreamingFractalTokenizerV3(
+                    image_size=self.image_size,
+                    channels=channels,
+                    d_model=dim,
+                    base_patch_size=effective_min_patch_size,
+                    max_depth=max_depth_v3,  # 使用显式指定的 max_depth
+                    K_min=K_min,
+                    K_max=K_max,
+                    splitter_dropout=effective_splitter_dropout,  # I27: 可配置
+                )
+            else:
+                # I30-17: 新方式，使用 min_patch_size 动态计算 max_depth
+                tokenizer = StreamingFractalTokenizerV3(
+                    image_size=self.image_size,
+                    channels=channels,
+                    d_model=dim,
+                    base_patch_size=effective_min_patch_size,
+                    min_patch_size=effective_min_patch_size,  # I30-17: 目标最小 patch
+                    max_depth_hard_limit=max_depth_hard_limit,  # I30-17: 硬上限
+                    K_min=K_min,
+                    K_max=K_max,
+                    splitter_dropout=effective_splitter_dropout,  # I27: 可配置
+                )
         else:
             raise ValueError(f"Unknown tokenizer_type: {tokenizer_type}. Use 'streaming_v3'.")
 
@@ -236,17 +267,10 @@ class FractalCurveViT(nn.Module):
         # CLS token和dropout
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
         self.dropout = nn.Dropout(emb_dropout)
-        
-        # 混合池化选择器 (用于 pool 不是 'cls' 或 'mean' 时)
-        # 输入: [B, D, N]，输出: [B, 2] 表示 (cls_weight, mean_weight)
-        self.pooling_selector = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),  # [B, D, 1]
-            nn.Flatten(),              # [B, D]
-            nn.Linear(dim, 2),
-            nn.Softmax(dim=-1),
-        )
-        
-        # 策略梯度损失权重 (保留接口兼容性，实际值为0因为使用Gumbel-Softmax)
+
+        # I30-11: 已删除 Mixed Pooling (pooling_selector)
+        # 当前仅支持 cls, mean, weighted 三种池化策略
+        # 保留 aux_loss_weight 缓冲以保持向后兼容性
         self.register_buffer("aux_loss_weight", torch.tensor(0.0))
 
         # 分形Transformer
@@ -456,38 +480,62 @@ class FractalCurveViT(nn.Module):
         self,
         x: torch.Tensor,
         key_padding_mask: torch.Tensor,
+        split_probs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """应用池化策略。
-        
+
+        I30-11: 支持 weighted 池化，利用 GumbelTopKSplitter 的 split_probs 作为权重。
+
         Args:
             x: transformer 输出 [B, Seq, Dim]
             key_padding_mask: padding mask [B, Seq]
-            
+            split_probs: [B, N] 分割概率，用于加权池化
+
         Returns:
             pooled: 池化后的表示 [B, Dim]
         """
         if self.pool == "cls":
             return x[:, 0]
         elif self.pool == "mean":
+            # 标准 mean pooling
             token_x = x[:, 1:]
             token_mask = ~key_padding_mask[:, 1:]
             token_x = token_x * token_mask.unsqueeze(-1).float()
             sum_x = token_x.sum(dim=1)
             valid_counts = token_mask.sum(dim=1, keepdim=True).float().clamp(min=1.0)
             return sum_x / valid_counts
+        elif self.pool == "weighted":
+            # I30-11: 加权池化，利用 split_probs 作为 token 重要性权重
+            # 数学形式: z = sum(w_i * x_i) / sum(w_i), 其中 w_i = split_prob_i
+            if split_probs is None:
+                # 回退到 mean pooling
+                token_x = x[:, 1:]
+                token_mask = ~key_padding_mask[:, 1:]
+                token_x = token_x * token_mask.unsqueeze(-1).float()
+                sum_x = token_x.sum(dim=1)
+                valid_counts = token_mask.sum(dim=1, keepdim=True).float().clamp(min=1.0)
+                return sum_x / valid_counts
+
+            token_x = x[:, 1:]  # [B, N, D] - 排除 CLS
+            token_mask = ~key_padding_mask[:, 1:]  # [B, N] - 排除 CLS
+
+            # I30-11: split_probs 形状为 [B, N]，与 token_x/token_mask 对齐
+            # 无需再切片，直接使用
+            token_probs = split_probs  # [B, N]
+
+            # 有效性 mask
+            token_probs = token_probs * token_mask.float()
+
+            # 权重归一化: w_norm = w / sum(w)
+            weight_sum = token_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            normalized_weights = token_probs / weight_sum  # [B, N]
+
+            # 加权平均: z = sum(w_i * x_i)
+            weighted = (token_x * normalized_weights.unsqueeze(-1)).sum(dim=1)  # [B, D]
+
+            return weighted
         else:
-            # 混合池化
-            pooling_weights = self.pooling_selector(x.transpose(1, 2))
-            cls_pooled = x[:, 0]
-            
-            token_x = x[:, 1:]
-            token_mask = ~key_padding_mask[:, 1:]
-            token_x = token_x * token_mask.unsqueeze(-1).float()
-            sum_x = token_x.sum(dim=1)
-            valid_counts = token_mask.sum(dim=1, keepdim=True).float().clamp(min=1.0)
-            mean_pooled = sum_x / valid_counts
-            
-            return pooling_weights[:, 0:1] * cls_pooled + pooling_weights[:, 1:2] * mean_pooled
+            raise ValueError(f"Unknown pool type: {self.pool}")
 
     def _prepare_auxiliary_output(
         self,
@@ -597,8 +645,11 @@ class FractalCurveViT(nn.Module):
         # I30-2: 保存 transformer 输出用于困难样本挖掘 (排除 CLS token)
         transformer_tokens = x[:, 1:]  # [B, N, D] 排除 CLS
 
+        # I30-11: 获取 split_probs 用于加权池化
+        split_probs = token_output.get_padded_split_probs()  # [B, N] 或 None
+
         # 5. 池化
-        pooled = self._apply_pooling(x, key_padding_mask)
+        pooled = self._apply_pooling(x, key_padding_mask, split_probs)
         pooled = self.to_latent(pooled)
         final_output = self.mlp_head(pooled)
         

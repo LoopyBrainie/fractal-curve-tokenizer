@@ -90,18 +90,25 @@ from .split_adaptive import SplitResult, SplitToken
 
 class HilbertNativePatchEmbed(nn.Module):
     """Hilbert-Native 变深度 Patch Embedding.
-    
+
     满足四个数学约束：
     1. 维度一致性: 所有 region → 相同 dim
     2. 路径一致性: 区域池化保持四叉树路径
     3. 尺度等变性: depth_scale 编码尺度信息
     4. LCA 兼容性: 与现有 LCA bias 无缝工作
-    
+
+    I30-17-EXT: 支持动态深度计算
+        - 新 API: 使用 min_patch_size + max_depth_limit
+        - 旧 API: 直接指定 max_depth (自动转换)
+
     Args:
         channels: 输入图像通道数
         dim: 输出嵌入维度
         base_patch_size: 最细粒度 patch 大小 (共享 Conv 的 stride)
-        max_depth: 最大四叉树深度
+        min_patch_size: [新 API] 目标最小 patch 大小，用于动态计算 max_depth
+        max_depth_limit: [新 API] max_depth 硬上限
+        max_depth: [旧 API] 最大四叉树深度 (直接指定)
+        image_size: [新 API] 输入图像尺寸，用于计算 max_depth
         conv_layers: SharedConv 层数 (1-3)
         use_batch_norm: 是否使用 BatchNorm
         depth_scale_beta: [已废弃] 使用 depth_scale_range 替代
@@ -109,26 +116,45 @@ class HilbertNativePatchEmbed(nn.Module):
                           默认 (0.5, 2.0) 提供 4x 动态范围
                           设为 None 使用旧版固定初始化 (向后兼容)
     """
-    
+
     def __init__(
         self,
         channels: int = 3,
         dim: int = 256,
         base_patch_size: int = 4,
-        max_depth: int = 4,
+        # I30-17-EXT: 新 API 参数
+        min_patch_size: Optional[int] = None,
+        max_depth_limit: int = 8,
+        # 旧 API 参数 (直接指定 max_depth)
+        max_depth: Optional[int] = None,
+        image_size: Optional[Tuple[int, int]] = None,
         conv_layers: int = 2,
         use_batch_norm: bool = True,
         depth_scale_beta: float = 0.2,
         depth_scale_range: Optional[Tuple[float, float]] = (0.5, 2.0),
     ) -> None:
         super().__init__()
-        
+
         self.channels = channels
         self.dim = dim
         self.base_patch_size = base_patch_size
-        self.max_depth = max_depth
         self.depth_scale_beta = depth_scale_beta
         self.depth_scale_range = depth_scale_range
+
+        # I30-17-EXT: 处理新旧 API
+        if max_depth is not None:
+            # 旧 API: 直接使用指定的 max_depth
+            self.max_depth = max_depth
+        elif min_patch_size is not None and image_size is not None:
+            # 新 API: 从 min_patch_size 计算 max_depth
+            from .depth_utils import compute_max_depth
+            H, W = image_size
+            self.max_depth = compute_max_depth(
+                (H, W), min_patch_size, max_depth_limit
+            )
+        else:
+            # 默认值
+            self.max_depth = max_depth_limit
         
         # =====================================================================
         # SharedConv: 统一的特征提取器

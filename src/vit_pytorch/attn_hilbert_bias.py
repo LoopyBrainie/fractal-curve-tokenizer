@@ -38,9 +38,11 @@ P11-8 简化: 移除未使用的 LowRankHilbertBias 和 HierarchicalHilbertBias
 
 from __future__ import annotations
 
+import math
 import weakref
+import warnings
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -50,6 +52,12 @@ from einops import rearrange
 from .constants import HILBERT_BIAS_SCALE, LEVEL_BIAS_SCALE
 from .utils import extract_depths, normalize_levels_info
 from .embed_fractal_path import VectorizedPathEncoder
+from .depth_utils import (
+    compute_region_shape_scale,
+    compute_shape_scale_similarity,
+    compute_normalized_area,
+    compute_area_similarity,
+)
 
 
 class HilbertBiasBase(ABC, nn.Module):
@@ -216,19 +224,15 @@ class LCAHilbertBias(HilbertBiasBase):
         self._init_temperature(lca_temperature, learnable_temperature)
         
         # P11-1 修复: LCA 深度矩阵缓存
-        # 使用 WeakRef 确保原张量仍存在，避免 data_ptr 重用导致的碰撞
-        # 
-        # 原方案 (data_ptr 缓存键) 的问题:
-        # - PyTorch 会重用相同大小的内存块 (测试显示 10 次分配仅 2 个唯一地址)
-        # - 缓存可能跨 batch 持久化，新 batch 可能复用旧地址
-        # - 在 torch.compile 下风险更高
+        # I30-9: 使用 data_ptr + PyTorch 版本校验
+        # 替代原 WeakRef 方案，解决身份检查无法捕获原地修改的问题
         #
-        # 新方案 (WeakRef):
-        # - 通过弱引用检测原张量是否仍存活
-        # - 如果原张量被释放，WeakRef 返回 None，触发重新计算
-        # - 零额外内存开销
-        self._lca_cache_ref: Optional["weakref.ref[torch.Tensor]"] = None
-        self._lca_cache_value: Optional[torch.Tensor] = None
+        # 缓存结构: {data_ptr: (data_ptr, torch_version, lca_depths)}
+        # 缓存命中条件: data_ptr 匹配 AND PyTorch 版本号匹配
+        #
+        # PyTorch 版本号 (._version) 在每次 in-place 操作时自动递增
+        # 数学保证: hit ⇒ V(T_cache) = V(T_input) ⇒ D_cache = f(T_input)
+        self._lca_cache_inputs: Dict[int, Tuple[int, int, torch.Tensor]] = {}
         
         # 初始化: 深度越大（越邻近）偏置越高
         # 使用对数衰减初始化，符合 Hilbert 曲线的 √ 局部性
@@ -345,27 +349,52 @@ class LCAHilbertBias(HilbertBiasBase):
         batch_size, seq_len, info_dim = levels_info.shape
         if info_dim <= 1:
             return None
-        
+
         # 提取四叉树路径: (B, S, Path)
         paths = levels_info[:, :, 1:].long()
-        
-        # P11-1 修复: 使用 WeakRef 检查缓存
-        # WeakRef 确保原张量仍存在，避免 data_ptr 重用导致的碰撞
+
+        # I30-5: 路径值验证 + 警告
+        # 四叉树路径值必须是 0-3 (对应四个象限: 左上, 右上, 左下, 右下)
+        path_min = paths.min().item()
+        path_max = paths.max().item()
+        if path_max > 3 or path_min < 0:
+            warnings.warn(
+                f"[I30-5] levels_info path values out of range: "
+                f"[{path_min}, {path_max}], expected [0, 3]. "
+                f"Clipping will be applied. "
+                f"This may indicate a tokenizer bug.",
+                RuntimeWarning,
+                stacklevel=2
+            )
+        paths = paths.clamp(0, 3)  # 安全保护仍保留
+
+        # I30-9: 使用 data_ptr + PyTorch 版本校验
+        # 解决 WeakRef 身份检查无法捕获原地修改的问题
+        #
+        # 缓存命中条件:
+        #   data_ptr 匹配 AND PyTorch 版本号匹配
+        #
+        # PyTorch 版本号 (._version) 在每次 in-place 操作时自动递增
+        # 这确保了原地修改后的张量能正确触发缓存失效
+        data_ptr = levels_info.data_ptr()
+        torch_version = levels_info._version if hasattr(levels_info, '_version') else 0
         cache_hit = False
-        if self._lca_cache_ref is not None and self._lca_cache_value is not None:
-            cached_tensor = self._lca_cache_ref()  # 尝试获取原张量
-            if cached_tensor is levels_info:
-                # 缓存命中: 原张量仍存在且是同一个对象
+
+        if data_ptr in self._lca_cache_inputs:
+            cached_ptr, cached_version, cached_lca = self._lca_cache_inputs[data_ptr]
+
+            # 双重校验: data_ptr 匹配 AND 版本匹配
+            if cached_ptr == data_ptr and cached_version == torch_version:
                 cache_hit = True
-                lca_depths = self._lca_cache_value
-        
+                lca_depths = cached_lca
+
         if not cache_hit:
             # 缓存未命中，计算 LCA
             lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
             lca_depths = lca_depths.clamp(0, self.max_depth)
-            # 更新缓存: 使用 WeakRef 指向原张量
-            self._lca_cache_ref = weakref.ref(levels_info)
-            self._lca_cache_value = lca_depths
+
+            # 更新缓存: 使用当前 PyTorch 版本号
+            self._lca_cache_inputs[data_ptr] = (data_ptr, torch_version, lca_depths)
         
         # 批量嵌入: (B, S, S, H)
         bias = self.lca_embedding(lca_depths)
@@ -383,17 +412,15 @@ class LCAHilbertBias(HilbertBiasBase):
     
     def clear_cache(self) -> None:
         """清除 LCA 缓存。
-        
+
         在以下情况调用:
         - 开始新的 batch 前
         - 评估/推理前后
         - 内存清理时
-        
-        P11-1: 使用 WeakRef 后，缓存会在原张量被释放时自动失效。
-        此方法仍可用于显式清理或测试目的。
+
+        I30-9: 使用 data_ptr + PyTorch 版本校验后，此方法清空缓存。
         """
-        self._lca_cache_ref = None
-        self._lca_cache_value = None
+        self._lca_cache_inputs.clear()
     
     def forward_from_regions(
         self,
@@ -431,7 +458,10 @@ class LCAHilbertBias(HilbertBiasBase):
             regions = regions.unsqueeze(0)  # [1, N, 4]
         
         B, N, _ = regions.shape
-        
+
+        # 转换为整数坐标 (确保 bit shift 操作正确)
+        regions = regions.long()
+
         # 从 regions 计算四叉树路径
         paths = VectorizedPathEncoder.compute_paths_from_regions(
             regions, image_size, self.max_depth
@@ -490,15 +520,20 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         use_level_scaling: bool = True,
         lca_temperature: Optional[float] = 1.5,
         learnable_temperature: bool = True,
+        # I31-3: 仿射调制参数
+        use_affine_modulation: bool = False,
+        fourier_levels: int = 4,
     ) -> None:
         """初始化 HilbertAwareMultiScaleAttention。
-        
+
         P11-2 修复: 参数 max_level 现在应传入与 tokenizer.max_depth 一致的值，
         而非硬编码的 50。这确保 level_scale 和 relative_pos_embedding 的
         Embedding 表大小与实际使用的深度范围匹配，减少约 90% 的参数浪费。
-        
+
         P11-8 简化: 移除 bias_mode 和 low_rank_r 参数，仅保留 LCA 模式。
-        
+
+        I31-3: 添加仿射调制支持，通过面积信息调制注意力偏置。
+
         Args:
             dim: 输入维度
             heads: 注意力头数
@@ -511,6 +546,8 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                 - None: 不使用温度缩放 (兼容模式)
                 - float: 温度初始值
             learnable_temperature: (P6-2) 是否使温度可学习
+            use_affine_modulation: (I31-3) 是否使用仿射调制偏置，默认 False
+            fourier_levels: (I31-3) 傅里叶频率级别数，默认 4
         """
         super().__init__()
         self.heads = heads
@@ -518,7 +555,8 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         self.max_level = max_level
         self.use_hilbert_bias = use_hilbert_bias
         self.use_level_scaling = use_level_scaling
-        
+        self.use_affine_modulation = use_affine_modulation  # I31-3
+
         # I24-11: 注意力权重存储开关 (默认关闭以节省内存)
         # 评估时设为 True 以支持 attention 可视化和分析
         self.store_attn_weights: bool = False
@@ -540,6 +578,17 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             )
         else:
             self.hilbert_bias_impl = None
+
+        # I31-3: 仿射调制偏置 (可选)
+        if use_affine_modulation:
+            self.affine_modulated_bias: Optional[nn.Module] = AffineModulatedBias(
+                dim=dim,
+                max_depth=max_level,
+                enable_area_modulation=True,
+                fourier_levels=fourier_levels,
+            )
+        else:
+            self.affine_modulated_bias = None
 
         if use_level_scaling:
             # P11-4 修复: 使用 Softplus 约束确保 level_scale > 0
@@ -682,17 +731,44 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             dots = dots * level_scales
 
         if levels_info is not None:
-            hilbert_bias = self._compute_hilbert_bias(
-                levels_info=levels_info,
-                regions=regions,
-                image_size=image_size,
-            )
-            if hilbert_bias is not None:
-                # hilbert_bias: (H, S, S) or (B, H, S, S)
-                if hilbert_bias.dim() == 3:
-                    dots = dots + hilbert_bias.unsqueeze(0) * HILBERT_BIAS_SCALE
-                else:
-                    dots = dots + hilbert_bias * HILBERT_BIAS_SCALE
+            # I31-3: 仿射调制优先 (当启用且 regions 可用时)
+            if self.use_affine_modulation and regions is not None and image_size is not None:
+                affine_bias = self.affine_modulated_bias(regions, image_size)
+                if affine_bias is not None:
+                    # affine_bias: (B, dim, N, N)
+                    # 需要广播到 (B, H, N, N)，dim 维度
+                    # 方法: 对 dim 维度求均值或使用对角线
+                    # 更简单: 将 dim 维度加到 heads 维度
+                    if affine_bias.dim() == 4:
+                        # affine_bias: [B, dim, N, N] -> 需要转换为 [B, H, N, N]
+                        # 由于 dim = head_dim * heads，我们将其拆分
+                        head_dim = self.dim_head
+                        # 取第一个 head_dim 维度作为代表，或平均
+                        affine_bias_4d = affine_bias  # [B, dim, N, N]
+                        # 展并重复 heads 次
+                        affine_bias_expanded = affine_bias_4d.unsqueeze(1).expand(
+                            -1, self.heads, -1, -1, -1
+                        )  # [B, H, dim, N, N]
+                        # 重排: [B, H, dim, N, N] -> [B, H, N, N] 通过求和 dim 维度再取平均
+                        # 或者更简单: 只取与 head_dim 对应的部分
+                        affine_bias_head = affine_bias_expanded.view(
+                            affine_bias.size(0), self.heads, self.dim_head, affine_bias.size(2), affine_bias.size(3)
+                        )  # [B, H, head_dim, N, N]
+                        # 对 head_dim 维度求平均得到 [B, H, N, N]
+                        affine_bias_final = affine_bias_head.mean(dim=2)
+                        dots = dots + affine_bias_final * HILBERT_BIAS_SCALE
+            else:
+                hilbert_bias = self._compute_hilbert_bias(
+                    levels_info=levels_info,
+                    regions=regions,
+                    image_size=image_size,
+                )
+                if hilbert_bias is not None:
+                    # hilbert_bias: (H, S, S) or (B, H, S, S)
+                    if hilbert_bias.dim() == 3:
+                        dots = dots + hilbert_bias.unsqueeze(0) * HILBERT_BIAS_SCALE
+                    else:
+                        dots = dots + hilbert_bias * HILBERT_BIAS_SCALE
 
             level_bias = self._compute_level_bias(levels_info)
             if level_bias is not None:
@@ -717,3 +793,656 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         out = torch.matmul(attn, v)
         out = rearrange(out, "b h n d -> b n (h d)")
         return self.to_out(out)
+
+
+# ==================== I31: 形状-尺度编码器 ====================
+
+
+class ShapeScaleEncoder(nn.Module):
+    """形状-尺度编码器 (I31)
+
+    数学形式化
+    ==========
+
+    将区域的几何特征编码为注意力偏置修正。
+
+    特征定义:
+        纵横比: r = log(w/h)  (对数变换，对称处理)
+        面积:   s = (w/W) * (h/H)  (归一化到 [0, 1])
+
+    门控机制:
+        g = sigmoid(MLP([r; s]))
+        输出: o = r * g + s * (1-g)
+
+    门控选择理由 (I31-1):
+        1. 自适应特征选择: 根据输入决定纵横比/面积的重要性
+        2. 可解释性: g > 0.5 表示纵横比更重要
+        3. 梯度有界: ∂g/∂x = g(1-g) * w ∈ (0, 0.25)
+
+    组合偏置:
+        B_final = B_LCA + τ * B_shape_scale
+        τ = shape_scale_weight (零初始化，渐进启用)
+
+    属性
+    ----
+    aspect_proj : nn.Sequential
+        纵横比投影: 1 -> hidden -> dim/4
+    area_proj : nn.Sequential
+        面积投影: 1 -> hidden -> dim/4
+    gate_net : nn.Sequential
+        门控网络: 2*(dim/4) -> hidden -> 1 (Sigmoid)
+    combine : nn.Linear
+        组合层: dim/2 -> dim
+    shape_scale_weight : nn.Parameter
+        可学习权重 (零初始化)
+    """
+
+    def __init__(self, dim: int, hidden_dim: int = 32):
+        """初始化形状-尺度编码器。
+
+        参数
+        ----
+        dim : int
+            输出嵌入维度
+        hidden_dim : int, optional
+            隐藏层维度，默认 32
+        """
+        super().__init__()
+
+        # 特征投影: 1 -> hidden -> dim/4
+        self.aspect_proj = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim // 4)
+        )
+
+        self.area_proj = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim // 4)
+        )
+
+        # 门控网络: 完整组合特征 -> hidden -> 1
+        # 输入是 ar_emb 和 na_emb 的拼接 [B, N, D/2]，即完整的 32 维 (当 D=64 时)
+        self.gate_net = nn.Sequential(
+            nn.Linear(dim // 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+
+        # 组合层: dim/2 -> dim
+        self.combine = nn.Linear(dim // 2, dim)
+
+        # 可学习权重 (零初始化，渐进启用)
+        self.shape_scale_weight = nn.Parameter(torch.zeros(1))
+
+        # 初始化权重
+        self._init_weights()
+
+    def _init_weights(self):
+        """初始化权重。"""
+        # 初始化所有 Linear 层
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(
+        self,
+        regions: torch.Tensor,
+        image_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        """计算形状-尺度嵌入。
+
+        参数
+        ----
+        regions : torch.Tensor
+            区域边界张量，形状 [B, N, 4]
+            格式: [x1, y1, x2, y2]
+        image_size : Tuple[int, int]
+            (W, H) 图像尺寸
+
+        返回
+        ----
+        torch.Tensor
+            形状-尺度嵌入，形状 [B, N, dim]
+        """
+        B, N, _ = regions.shape
+        W, H = image_size
+
+        # 计算纵横比和面积 [B, N]
+        aspect_ratios, normalized_areas = compute_region_shape_scale(
+            regions, (W, H), epsilon=1e-8
+        )
+
+        # 编码 [B, N, D/4]
+        ar_emb = self.aspect_proj(aspect_ratios.unsqueeze(-1))
+        na_emb = self.area_proj(normalized_areas.unsqueeze(-1))
+
+        # 门控计算 [B, N, D/2]
+        combined = torch.cat([ar_emb, na_emb], dim=-1)
+        gate = self.gate_net(combined)  # [B, N, 1]
+
+        # 门控组合: 分别门控后拼接
+        # gate 控制 ar_emb 和 na_emb 的相对权重
+        # 输出维度保持 D/2，以匹配 combine 层的输入
+        gated_ar = ar_emb * gate  # [B, N, D/4]
+        gated_na = na_emb * (1 - gate)  # [B, N, D/4]
+        gated = torch.cat([gated_ar, gated_na], dim=-1)  # [B, N, D/2]
+
+        # 最终输出 [B, N, D]
+        output = self.combine(gated)
+
+        # 应用可学习权重
+        output = output * self.shape_scale_weight
+
+        return output
+
+
+class LCAHilbertBiasWithShapeScale(nn.Module):
+    """带形状-尺度修正的 LCA Hilbert 偏置 (I31)
+
+    数学形式化
+    ==========
+
+    基础 LCA 偏置:
+        B_LCA[i,j] = LCAEmbed(LCA(i,j))
+
+    形状-尺度偏置:
+        B_SS[i,j] = <ShapeScaleEncoder(c_i), ShapeScaleEncoder(c_j)>
+
+    组合偏置:
+        B_final[i,j] = B_LCA[i,j] + τ * B_SS[i,j]
+        其中 τ = shape_scale_weight (零初始化)
+
+    零初始化保证:
+        τ = 0 时，B_final = B_LCA (退化为标准 LCA 偏置)
+
+    属性
+    ----
+    lca_embedding : nn.Embedding
+        LCA 深度嵌入层
+    shape_scale_encoder : ShapeScaleEncoder
+        形状-尺度编码器
+    shape_scale_weight : nn.Parameter
+        可学习组合权重
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        max_depth: int,
+        lca_embedding_dim: Optional[int] = None,
+        enable_shape_scale: bool = True,
+        shape_scale_dim: Optional[int] = None,
+        shape_scale_hidden_dim: int = 32,
+    ):
+        """初始化带形状-尺度修正的 LCA Hilbert 偏置。
+
+        参数
+        ----
+        dim : int
+            注意力维度
+        max_depth : int
+            最大四叉树深度
+        lca_embedding_dim : int, optional
+            LCA 嵌入维度，默认等于 dim
+        enable_shape_scale : bool, optional
+            是否启用形状-尺度修正，默认 True
+        shape_scale_dim : int, optional
+            形状-尺度嵌入维度，默认等于 dim
+        shape_scale_hidden_dim : int, optional
+            形状-尺度编码器隐藏层维度，默认 32
+        """
+        super().__init__()
+
+        # LCA 嵌入层
+        lca_embed_dim = lca_embedding_dim or dim
+        self.lca_embedding = nn.Embedding(
+            num_embeddings=max_depth + 1,
+            embedding_dim=lca_embed_dim
+        )
+
+        # 形状-尺度编码器
+        self.enable_shape_scale = enable_shape_scale
+        if enable_shape_scale:
+            self.shape_scale_encoder = ShapeScaleEncoder(
+                dim=shape_scale_dim or dim,
+                hidden_dim=shape_scale_hidden_dim
+            )
+
+        # 初始化权重
+        self._init_weights()
+
+    def _init_weights(self):
+        """初始化权重。"""
+        # LCA 嵌入: 深度越大（越邻近）偏置越高
+        with torch.no_grad():
+            for d in range(self.lca_embedding.num_embeddings):
+                # 对数衰减初始化: depth d -> scale log(d+1)
+                scale = 0.1 * (1 + torch.log(torch.tensor(d + 1.0)))
+                self.lca_embedding.weight[d].fill_(scale)
+
+    def forward_from_regions(
+        self,
+        regions: torch.Tensor,
+        image_size: int,
+    ) -> torch.Tensor:
+        """从 regions 计算 LCA Hilbert 偏置。
+
+        参数
+        ----
+        regions : torch.Tensor
+            区域边界张量，形状 [B, N, 4]
+        image_size : int
+            图像边长
+
+        返回
+        ----
+        torch.Tensor
+            偏置矩阵，形状 [B, H, N, N] 或 [B, dim, N, N]
+        """
+        # 委托给现有实现
+        return self._compute_lca_bias_from_regions(regions, image_size)
+
+    def _compute_lca_bias_from_regions(
+        self,
+        regions: torch.Tensor,
+        image_size: int,
+    ) -> torch.Tensor:
+        """从 regions 计算 LCA 偏置 (内部方法)。"""
+        B, N, _ = regions.shape
+
+        if N == 0:
+            return torch.zeros(B, 1, N, N, device=regions.device)
+
+        # 转换为整数坐标 (VectorizedPathEncoder 需要整数)
+        regions_int = regions.long()
+
+        # 从 regions 计算四叉树路径
+        paths = VectorizedPathEncoder.compute_paths_from_regions(
+            regions_int, image_size, self.lca_embedding.num_embeddings - 1
+        )
+
+        # 计算 LCA 深度矩阵
+        lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
+        lca_depths = lca_depths.clamp(0, self.lca_embedding.num_embeddings - 1)
+
+        # 嵌入 [B, N, N, dim]
+        bias = self.lca_embedding(lca_depths)
+
+        # 调整形状 [B, dim, N, N]
+        return bias.permute(0, 3, 1, 2)
+
+    def forward_with_shape_scale(
+        self,
+        regions: torch.Tensor,
+        image_size: int,
+    ) -> torch.Tensor:
+        """带形状-尺度修正的偏置计算。
+
+        参数
+        ----
+        regions : torch.Tensor
+            区域边界张量，形状 [B, N, 4]
+        image_size : int
+            图像边长
+
+        返回
+        ----
+        torch.Tensor
+            组合偏置，形状 [B, dim, N, N]
+        """
+        B, N, _ = regions.shape
+
+        # 1. LCA 偏置 [B, dim, N, N]
+        lca_bias = self._compute_lca_bias_from_regions(regions, image_size)
+
+        if not self.enable_shape_scale:
+            return lca_bias
+
+        # 2. 形状-尺度编码 [B, N, dim]
+        shape_emb = self.shape_scale_encoder(regions, (image_size, image_size))
+
+        # 3. 形状-尺度相似性矩阵 [B, N, N]
+        shape_sim = torch.bmm(shape_emb, shape_emb.transpose(-2, -1))
+
+        # 4. 投影到 dim 维度 [B, dim, N, N]
+        # 复制 shape_sim 到所有 dim 维度
+        shape_sim = shape_sim.unsqueeze(1)  # [B, 1, N, N]
+        shape_sim = shape_sim.expand(-1, lca_bias.size(1), -1, -1)
+
+        # 5. 可学习的组合权重
+        tau = self.shape_scale_encoder.shape_scale_weight  # [1]
+
+        # 组合偏置: B_final = B_LCA + τ * B_SS
+        combined_bias = lca_bias + tau * shape_sim
+
+        return combined_bias
+
+
+# ==================== I31-3: 面积编码与仿射调制 ====================
+
+
+class AreaEncoder(nn.Module):
+    """面积编码器 (I31-3)
+
+    数学形式化
+    ==========
+
+    面积归一化公式 (用户指定):
+
+        .. math::
+            f_{{area}} = \\frac{{\\log(s_{{patch}} + 1)}}{{\\log(S_{{total}} + 1)}}
+
+    傅里叶特征 (NeRF-style):
+        γ(f) = [sin(2^k π f), cos(2^k π f)]_{k=0}^{L-1}
+
+    MLP 投影:
+        E = W_2 · GELU(W_1 · γ(f))
+
+    属性
+    ----
+    fourier_levels : int
+        傅里叶频率级别数，默认 4
+    fourier_dim : int
+        傅里叶特征维度 = 2 × fourier_levels
+    fourier_proj : nn.Linear
+        傅里叶特征投影层
+    mlp : nn.Sequential
+        MLP 投影层
+    area_weight : nn.Parameter
+        可学习权重 (零初始化)
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        fourier_levels: int = 4,
+        hidden_dim: int = 32,
+    ):
+        """初始化面积编码器。
+
+        参数
+        ----
+        dim : int
+            输出嵌入维度
+        fourier_levels : int, optional
+            傅里叶频率级别数，默认 4
+        hidden_dim : int, optional
+            隐藏层维度，默认 32
+        """
+        super().__init__()
+        self.dim = dim
+        self.fourier_levels = fourier_levels
+        self.fourier_dim = fourier_levels * 2  # sin + cos
+
+        # 傅里叶特征投影: 2L -> hidden
+        self.fourier_proj = nn.Linear(self.fourier_dim, hidden_dim)
+
+        # MLP 投影: hidden -> dim
+        self.mlp = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim)
+        )
+
+        # 可学习权重 (零初始化)
+        self.area_weight = nn.Parameter(torch.zeros(1))
+
+        # 初始化权重
+        self._init_weights()
+
+    def _init_weights(self):
+        """初始化权重。"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(
+        self,
+        regions: torch.Tensor,
+        image_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        """计算面积嵌入。
+
+        参数
+        ----
+        regions : torch.Tensor
+            区域边界张量，形状 [B, N, 4]
+            格式: [x1, y1, x2, y2]
+        image_size : Tuple[int, int]
+            (W, H) 图像尺寸
+
+        返回
+        ----
+        torch.Tensor
+            面积嵌入，形状 [B, N, dim]
+        """
+        B, N, _ = regions.shape
+        W, H = image_size
+
+        # 1. 计算归一化面积分数
+        area_scores = compute_normalized_area(regions, image_size, epsilon=1e-8)
+        # area_scores: [B, N]
+
+        # 2. 傅里叶特征编码
+        fourier_features = []
+        for k in range(self.fourier_levels):
+            freq = 2 ** k
+            fourier_features.append(torch.sin(freq * math.pi * area_scores))
+            fourier_features.append(torch.cos(freq * math.pi * area_scores))
+        gamma = torch.stack(fourier_features, dim=-1)  # [B, N, 2L]
+
+        # 3. MLP 投影
+        area_emb = self.mlp(self.fourier_proj(gamma))
+
+        # 4. 应用可学习权重
+        area_emb = area_emb * self.area_weight
+
+        return area_emb
+
+
+class AffineModulatedBias(nn.Module):
+    """仿射调制注意力偏置 (I31-3)
+
+    数学形式化
+    ==========
+
+    仿射调制公式 (用户指定):
+        B_{\text{final}} = γ(s_i, s_j) ⊙ B_{\text{spatial}} + β(s_i, s_j)
+
+    其中:
+        γ(s_i, s_j) = σ(MLP_γ(p_s))     # 缩放因子
+        β(s_i, s_j) = MLP_β(p_s)        # 偏置因子
+        p_s = area_emb[i] · area_emb[j] # 面积相似性
+
+    残差连接:
+        B_{\text{final}} = B_{\text{spatial}} + α · (γ ⊙ B_{\text{spatial}} + β - B_{\text{spatial}})
+
+    属性
+    ----
+    lca_embedding : nn.Embedding
+        LCA 深度嵌入层
+    area_encoder : AreaEncoder
+        面积编码器
+    scale_net : nn.Sequential
+        缩放网络: area_sim → [0, 1]
+    bias_net : nn.Sequential
+        偏置网络: area_sim → (-1, 1)
+    residual_alpha : nn.Parameter
+        残差权重 (零初始化)
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        max_depth: int,
+        enable_area_modulation: bool = True,
+        fourier_levels: int = 4,
+    ):
+        """初始化仿射调制偏置。
+
+        参数
+        ----
+        dim : int
+            注意力维度
+        max_depth : int
+            最大四叉树深度
+        enable_area_modulation : bool, optional
+            是否启用面积调制，默认 True
+        fourier_levels : int, optional
+            傅里叶频率级别数，默认 4
+        """
+        super().__init__()
+        self.dim = dim
+        self.max_depth = max_depth
+        self.enable_area_modulation = enable_area_modulation
+
+        # 空间偏置 (LCA)
+        self.lca_embedding = nn.Embedding(
+            num_embeddings=max_depth + 1,
+            embedding_dim=dim
+        )
+
+        # 面积编码器和调制网络
+        if enable_area_modulation:
+            self.area_encoder = AreaEncoder(
+                dim=dim,
+                fourier_levels=fourier_levels,
+                hidden_dim=32
+            )
+
+            # 傅里叶特征维度
+            fourier_dim = fourier_levels * 2  # sin + cos
+
+            # 缩放网络: fourier_features → [0, 1]
+            self.scale_net = nn.Sequential(
+                nn.Linear(fourier_dim, dim // 4),
+                nn.GELU(),
+                nn.Linear(dim // 4, dim),
+                nn.Sigmoid()  # γ ∈ (0, 1)
+            )
+
+            # 偏置网络: fourier_features → ℝ
+            self.bias_net = nn.Sequential(
+                nn.Linear(fourier_dim, dim // 4),
+                nn.GELU(),
+                nn.Linear(dim // 4, dim),
+                nn.Tanh()  # β ∈ (-1, 1)
+            )
+
+            # 残差权重 (零初始化)
+            self.residual_alpha = nn.Parameter(torch.zeros(1))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """初始化权重。"""
+        # LCA 嵌入: 深度越大（越邻近）偏置越高
+        with torch.no_grad():
+            for d in range(self.lca_embedding.num_embeddings):
+                scale = 0.1 * (1 + torch.log(torch.tensor(d + 1.0)))
+                self.lca_embedding.weight[d].fill_(scale)
+
+    def _compute_lca_bias_from_regions(
+        self,
+        regions: torch.Tensor,
+        image_size: int,
+    ) -> torch.Tensor:
+        """从 regions 计算 LCA 偏置 (内部方法)。"""
+        B, N, _ = regions.shape
+
+        if N == 0:
+            return torch.zeros(B, 1, N, N, device=regions.device)
+
+        # 转换为整数坐标
+        regions_int = regions.long()
+
+        # 从 regions 计算四叉树路径
+        paths = VectorizedPathEncoder.compute_paths_from_regions(
+            regions_int, image_size, self.max_depth
+        )
+
+        # 计算 LCA 深度矩阵
+        lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
+        lca_depths = lca_depths.clamp(0, self.max_depth)
+
+        # 嵌入 [B, N, N, dim]
+        bias = self.lca_embedding(lca_depths)
+
+        # 调整形状 [B, dim, N, N]
+        return bias.permute(0, 3, 1, 2)
+
+    def forward(
+        self,
+        regions: torch.Tensor,
+        image_size: int,
+    ) -> torch.Tensor:
+        """计算仿射调制偏置。
+
+        参数
+        ----
+        regions : torch.Tensor
+            区域边界张量，形状 [B, N, 4]
+        image_size : int
+            图像边长
+
+        返回
+        ----
+        torch.Tensor
+            仿射调制偏置，形状 [B, dim, N, N]
+        """
+        B, N, _ = regions.shape
+
+        # 1. 空间偏置 (LCA) [B, dim, N, N]
+        lca_bias = self._compute_lca_bias_from_regions(regions, image_size)
+
+        if not self.enable_area_modulation:
+            return lca_bias
+
+        # 2. 面积编码 [B, N, dim]
+        area_emb = self.area_encoder(regions, (image_size, image_size))
+
+        # 3. 计算面积相似性矩阵 [B, N, N]
+        # p_s[i,j] = area_emb[i] · area_emb[j]
+        area_sim = torch.bmm(area_emb, area_emb.transpose(-2, -1))
+
+        # 4. 傅里叶特征编码面积相似性
+        fourier_features = []
+        for k in range(self.area_encoder.fourier_levels):
+            freq = 2 ** k
+            fourier_features.append(torch.sin(freq * math.pi * area_sim))
+            fourier_features.append(torch.cos(freq * math.pi * area_sim))
+        gamma_features = torch.stack(fourier_features, dim=-1)  # [B, N, N, 2L]
+
+        # 5. 仿射调制
+        # 展平 [B, N, N, 2L] -> [B*N*N, 2L] 以便通过 Linear 层
+        B, N, N, fourier_dim = gamma_features.shape
+        gamma_flat = gamma_features.view(-1, fourier_dim)
+
+        # 通过网络
+        gamma = self.scale_net(gamma_flat)  # [B*N*N, dim]
+        beta = self.bias_net(gamma_flat)    # [B*N*N, dim]
+
+        # 恢复形状 [B, N, N, dim]
+        gamma = gamma.view(B, N, N, self.dim)
+        beta = beta.view(B, N, N, self.dim)
+
+        # 调整维度以匹配 lca_bias: [B, dim, N, N]
+        gamma = gamma.permute(0, 3, 1, 2)
+        beta = beta.permute(0, 3, 1, 2)
+
+        # 6. 仿射变换
+        modulated = gamma * lca_bias + beta
+
+        # 7. 残差连接
+        combined_bias = lca_bias + self.residual_alpha * (modulated - lca_bias)
+
+        return combined_bias
+

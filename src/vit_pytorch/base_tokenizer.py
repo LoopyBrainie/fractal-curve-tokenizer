@@ -65,20 +65,22 @@ class TokenSequence:
 @dataclass
 class TokenizerOutput:
     """批次 Tokenizer 输出容器。
-    
+
     提供便捷属性访问堆叠的 tokens 和 levels_info，
     同时保持对底层 TokenSequence 列表的完整访问。
-    
+
     P9-5 优化: 支持预填充缓存，避免重复 padding 操作。
     当 Tokenizer 内部已经有 padding 后的张量时，可直接传入缓存，
     消除 model._prepare_tokens 中的 O(B) Python 循环。
-    
+
     P11-3 改进: 新增 _regions_cache 和 _image_size_cache 用于
     直接从区域边界计算正确的四叉树 LCA 偏置。
-    
+
     P12-2 优化: _lengths_cache 存储为 Tensor 而非 List[int]，
     避免 _create_attention_mask 中的 Python 列表到 Tensor 转换开销。
-    
+
+    I30-11: 新增 _split_probs_cache 用于加权池化 (Weighted Mean Pooling)
+
     Attributes:
         sequences: 各样本的 TokenSequence 列表
         _padded_tokens_cache: 预填充的 tokens [B, MaxN, D] (可选缓存)
@@ -86,10 +88,12 @@ class TokenizerOutput:
         _lengths_cache: 每个样本的实际 token 数量 Tensor[B] (可选缓存)
         _regions_cache: (P11-3) 预填充的 regions [B, MaxN, 4] (可选缓存)
         _image_size_cache: (P11-3) 图像边长 (可选缓存)
-        
+        _split_probs_cache: (I30-11) 预填充的分割概率 [B, MaxN] (可选缓存)
+
     Properties:
         tokens: 堆叠的 tokens [B, N, D]（假设所有样本 token 数量相同）
         levels_info: 堆叠的 levels_info [B, N, K] 或 None
+        split_probs: 堆叠的分割概率 [B, N] 或 None (I30-11)
         batch_size: 批次大小
     """
     sequences: List[TokenSequence]
@@ -98,6 +102,7 @@ class TokenizerOutput:
     _lengths_cache: Optional[torch.Tensor] = field(default=None, repr=False)
     _regions_cache: Optional[torch.Tensor] = field(default=None, repr=False)
     _image_size_cache: Optional[int] = field(default=None, repr=False)
+    _split_probs_cache: Optional[torch.Tensor] = field(default=None, repr=False)
 
     def __iter__(self) -> Iterator[TokenSequence]:
         return iter(self.sequences)
@@ -258,10 +263,10 @@ class TokenizerOutput:
 
     def get_padded_regions(self) -> Tuple[Optional[torch.Tensor], Optional[int]]:
         """获取预填充的 regions 和 image_size (P11-3 新增).
-        
+
         用于直接从区域边界计算正确的四叉树 LCA 偏置，
         绕过 levels_info 中全为 0 的路径问题。
-        
+
         Returns:
             (regions, image_size):
             - regions: [B, MaxN, 4] 填充后的 regions，格式 [x1, y1, x2, y2]
@@ -269,6 +274,28 @@ class TokenizerOutput:
             - image_size: 图像边长，或 None
         """
         return self._regions_cache, self._image_size_cache
+
+    @property
+    def split_probs(self) -> Optional[torch.Tensor]:
+        """获取堆叠的分割概率 [B, N] 或 None (I30-11).
+
+        用于 Weighted Mean Pooling，每个 token 的重要性权重。
+
+        Returns:
+            堆叠的分割概率张量或 None
+        """
+        return self._split_probs_cache
+
+    def get_padded_split_probs(self) -> Optional[torch.Tensor]:
+        """获取预填充的分割概率 (I30-11 新增).
+
+        用于加权池化，利用 GumbelTopKSplitter 的分割概率作为权重。
+        如果有缓存，直接返回；否则返回 None。
+
+        Returns:
+            [B, MaxN] 填充后的分割概率，或 None (如果未设置缓存)
+        """
+        return self._split_probs_cache
 
     def to_legacy(self) -> "LegacyTokenizerOutput":
         return LegacyTokenizerOutput(

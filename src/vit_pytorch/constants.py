@@ -95,15 +95,20 @@ LOGITS_CLAMP_MAX: float = 10.0
 # ==================== 数值稳定性常量 (I12-7) ====================
 # 数学分析见: workspace/numerical_constants_analysis.py
 
-#: Gumbel 采样 uniform clamp (FP32)
+#: Gumbel 采样 uniform clamp (FP32 计算中安全边界)
 #: 数学: g = -log(-log(u)), u ∈ [ε, 1-ε]
-#: 验证: ε=1e-10 → g ∈ [-23, 23], 足够表达随机性
-GUMBEL_EPSILON: float = 1e-10
+#: FP32 安全边界: ε >= 1e-10 (FP32 最小 ~1e-38)
+#: FP16 兼容边界: ε >= 1e-8 (FP16 最小正规数 ~6e-8)
+#: 验证: ε=1e-8 → g ∈ [-18.4, 18.4], Gumbel 分布覆盖 99.99%
+#: 注意: gumbel_topk_splitter.py 中已显式使用 FP32 计算
+GUMBEL_EPSILON: float = 1e-8  # I30-8: FP16 安全阈值
 
 #: Log 计算安全 epsilon
 #: 用途: log(p + ε) 防止 log(0)
-#: 验证: 对熵计算误差 < 1e-10
-LOG_EPSILON: float = 1e-10
+#: FP16 安全: ε >= 1e-8
+#: 熵误差: < 1e-8 (可忽略)
+#: I30-8: 提升到 1e-8 与 GUMBEL_EPSILON 统一
+LOG_EPSILON: float = 1e-8
 
 #: 除法安全 epsilon
 #: 用途: x / (sum + ε) 防止除零
@@ -126,11 +131,10 @@ TEMPERATURE_MIN: float = 0.1
 
 #: I23-1 方案C: 深度方差归一化是否启用
 #: 数学: z_i^norm = (z_i - μ_d) / σ_d，使各深度 MLP 输出服从 N(0,1)
-#: I24-5 批判分析: 当启用方案E (分层 Top-K) 时，归一化对选择结果无影响
-#:   证明: TopK(z) = TopK((z-μ)/σ)，因仿射变换保持相对顺序
-#:   结论: 方案E 下禁用归一化，减少计算开销和训练-推理不一致
-#: 状态: 当 LEARNABLE_QUOTA_ENABLED=True 时自动禁用
-DEPTH_VARIANCE_NORM_ENABLED: bool = False  # I24-5: 方案E下禁用
+#: I24-5 批判分析: 原实现 Batch 统计量在小 batch (B=1) 下方差放大 512×，单样本深度 (depth=0) 完全失效
+#: I30-6 修复: 使用 EMA Running Statistics (α=0.1)，有效样本量 10，方差降低 19×
+#: 结论: 启用 EMA 归一化，解决小 batch 稳定性问题，与方案E 配额机制协同保证深度平衡
+DEPTH_VARIANCE_NORM_ENABLED: bool = True  # I30-6: EMA 方案启用
 
 #: 方差归一化的稳定性 epsilon
 DEPTH_VARIANCE_NORM_EPS: float = 1e-6
@@ -202,10 +206,6 @@ OVERLAP_PENALTY_ENABLED: bool = False
 #: 重叠惩罚权重
 #: 推导: 若典型重叠率 ρ ≈ 0.1，weight = 0.1 使 L ≈ 0.01 (轻量正则)
 OVERLAP_PENALTY_WEIGHT: float = 0.1
-
-#: Subset Softmax 是否启用
-#: 数学: 将 STE softmax 从 N=85 缩小到 K=32，梯度增强 ~2.7x
-SUBSET_SOFTMAX_ENABLED: bool = True
 
 # ==================== 信息长度相关常量 ====================
 

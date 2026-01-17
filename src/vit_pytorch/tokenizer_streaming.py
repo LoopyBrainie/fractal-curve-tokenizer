@@ -99,14 +99,19 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         - 无复杂度饱和
         - 可学习阈值
     """
-    
+
     def __init__(
         self,
         image_size: Union[int, Tuple[int, int]] = 224,
         channels: int = 3,
         d_model: int = 256,
         base_patch_size: int = 4,
-        max_depth: int = 4,
+        # I30-17: 替换固定 max_depth 为动态计算
+        # 支持 Union[int, Tuple[int, int]] 用于向后兼容
+        min_patch_size: Union[int, Tuple[int, int]] = 4,
+        max_depth_hard_limit: int = 8,
+        # 保留 max_depth 用于向后兼容 (可选，如果指定则使用该值)
+        max_depth: Optional[int] = None,
         use_hilbert_order: bool = True,
         target_tokens: Optional[int] = None,
         enforce_balance: bool = True,
@@ -121,39 +126,65 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 数学依据: Splitter MLP 规模 ~64×128，推荐 p ∈ [0.1, 0.15]
         # 过高 dropout 会降低分割决策质量，过低则正则化不足
         splitter_dropout: float = 0.1,
+        # I30-10: SplitterConfig 统一配置
+        splitter_config: Optional["SplitterConfig"] = None,
     ) -> None:
         super().__init__()
-        
+
         if isinstance(image_size, int):
             image_size = (image_size, image_size)
-        
+
+        # I30-17: 处理 min_patch_size 的向后兼容
+        if isinstance(min_patch_size, tuple):
+            # 旧 API: min_patch_size=(4, 4)，取第一个值
+            effective_min_patch_size = min_patch_size[0]
+        else:
+            effective_min_patch_size = min_patch_size
+
         self.image_size = image_size
         self.channels = channels
         self.d_model = d_model
         self.base_patch_size = base_patch_size
-        self.max_depth = max_depth
         self.use_hilbert_order = use_hilbert_order
         self._use_learnable_split = True  # Legacy flag, always True
-        
+
+        # I30-17: 动态深度计算
+        self.min_patch_size = effective_min_patch_size  # 存储规范化后的值
+        self.max_depth_hard_limit = max_depth_hard_limit
+
+        # 动态计算 max_depth (用于 splitter)
+        # 公式: L_max = min(hard_limit, max(0, floor(log2(min(H, W) / min_patch_size))))
+        from .depth_utils import compute_max_depth
+        self._computed_max_depth = compute_max_depth(
+            image_size, effective_min_patch_size, max_depth_hard_limit
+        )
+
+        # I30-17-EXT: 确定最终使用的 max_depth
+        # 优先级: 显式指定 max_depth > 动态计算
+        self.max_depth = max_depth if max_depth is not None else self._computed_max_depth
+
         # =====================================================================
         # Hilbert-Native Patch Embedding (包含 SharedConv)
         # =====================================================================
         from .embed_hilbert_patch import HilbertNativePatchEmbed
+        # I30-17-EXT: 使用动态计算的 max_depth
+        # 对于 embedding 层，需要在 __init__ 时确定深度
+        # 使用 self.max_depth (可能由用户显式指定，也可能由动态计算得到)
         self.patch_embed = HilbertNativePatchEmbed(
             channels=channels,
             dim=d_model,
             base_patch_size=base_patch_size,
-            max_depth=max_depth,
+            max_depth=self.max_depth,  # 保持使用计算后的深度
             conv_layers=2,
             use_batch_norm=True,
             depth_scale_range=depth_scale_range,
         )
-        
+
         # =====================================================================
         # I20: GumbelTopKSplitter (替代 LearnableSplitter)
         # =====================================================================
         # 数学形式化分析结论 (2026-01-10):
-        # 
+        #
         # Scheme A (LearnableSplitter/BFS+STE):
         #   - Hilbert 局部性: 100% ✓
         #   - 梯度覆盖: ~25% ✗ (BFS 串行依赖导致深层饥饿)
@@ -168,22 +199,34 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 结论: Scheme D 是 Hilbert Curve ViT 的最优分割器
         # =====================================================================
         from .gumbel_topk_splitter import GumbelTopKSplitter
-        
-        # I27-1: 使用传入的 splitter_dropout 而非硬编码值
-        # 允许训练器统一控制正则化强度
-        self.splitter = GumbelTopKSplitter(
-            feature_dim=d_model,
-            max_depth=max_depth,
-            hidden_dim=64,
-            pool_size=4,
-            temperature=learnable_temperature,
-            K_min=K_min,
-            K_max=K_max,
-            dropout=splitter_dropout,  # I27-1: 可配置
-            use_dynamic_k=True,
-            image_size=image_size,
-        )
-        
+        from .config import SplitterConfig
+
+        # I30-10: 使用 SplitterConfig 或传统参数
+        if splitter_config is not None:
+            # 使用 SplitterConfig
+            self.splitter = GumbelTopKSplitter(
+                config=splitter_config,
+                image_size=image_size,
+            )
+        else:
+            # 使用传统参数（向后兼容）
+            # I27-1: 使用传入的 splitter_dropout 而非硬编码值
+            # 允许训练器统一控制正则化强度
+            # I30-17-EXT: 使用动态计算的 min_patch_size 和 max_depth_limit
+            self.splitter = GumbelTopKSplitter(
+                feature_dim=d_model,
+                min_patch_size=effective_min_patch_size,  # I30-17-EXT: 动态深度计算
+                max_depth_limit=max_depth_hard_limit,
+                hidden_dim=64,
+                pool_size=4,
+                temperature=learnable_temperature,
+                K_min=K_min,
+                K_max=K_max,
+                dropout=splitter_dropout,  # I27-1: 可配置
+                use_dynamic_k=True,
+                image_size=image_size,
+            )
+
         self._last_split_stats: Optional[Dict[str, Any]] = None
         self._last_depth_count_matrix: Optional[torch.Tensor] = None  # P11-9: 向量化缓存
         self._last_features: Optional[torch.Tensor] = None
@@ -264,6 +307,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         )
         
         # I20: GumbelTopKResult → TensorSplitResult 转换
+        # I30-11: raw_probs 在下面直接使用 split_result.probs 获取
         if isinstance(split_result, GumbelTopKResult):
             tensor_result = split_result.to_tensor_split_result()
         elif isinstance(split_result, TensorSplitResult):
@@ -326,7 +370,11 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         }
         
         # 3. 纯张量嵌入
-        tokens, levels_info, padded_regions = self._embed_with_tensor_result(features, tensor_result)
+        # I30-11: 传递 raw_probs 用于构建 padded_split_probs
+        raw_probs = split_result.probs if isinstance(split_result, GumbelTopKResult) else None
+        tokens, levels_info, padded_regions, padded_split_probs = self._embed_with_tensor_result(
+            features, tensor_result, raw_probs
+        )
         
         # 4. 构建输出 (P-OPT-4: 向量化输出构建，避免 Python for 循环)
         # TokenSequence 对象仍需构建，但使用预计算的张量切片
@@ -348,8 +396,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # P9-5/P12-2 优化: 传入已 padding 的张量缓存，避免 model 中重复 padding
         # I20: 简化输出构建
         # I24-14: num_tokens_list 已在前面 clamp 过，直接使用
+        # I30-11: 添加 _split_probs_cache 用于加权池化
         lengths_tensor = torch.tensor(num_tokens_list, dtype=torch.long, device=device)
-        
+
         return TokenizerOutput(
             sequences=sequences,
             _padded_tokens_cache=tokens,
@@ -357,6 +406,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             _lengths_cache=lengths_tensor,
             _regions_cache=padded_regions,
             _image_size_cache=self.image_size,
+            _split_probs_cache=padded_split_probs,
         )
     
     def _embed_with_features(
@@ -634,19 +684,22 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             depth_dists.append(dist)
         
         return depth_dists
-    
+
     def _embed_with_tensor_result(
         self,
         features: torch.Tensor,
         tensor_result: "TensorSplitResult",
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        raw_probs: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """使用 TensorSplitResult 进行嵌入 (P9-1 完全向量化版本).
-        
+
+        I30-11: 额外返回 padded_split_probs 用于加权池化。
+
         P11-3 改进: 额外返回 padded_regions 张量用于正确的 LCA 偏置计算。
-        
+
         数学形式化
         ==========
-        
+
         传统实现:
             T_embed = O(N) Python 循环 + O(N) torch.tensor() 调用
             同步点: ~3N 次 (每个 token 创建 3 个小张量)
@@ -786,8 +839,22 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         
         # P11-3: 分配 regions 到 padded buffer
         padded_regions[batch_indices, token_positions] = tensor_result.regions
-        
-        return self.patch_embed.norm(tokens), levels_info, padded_regions
+
+        # I30-11: 构建 padded_split_probs [B, max_tokens]
+        # 使用 hilbert_indices 将 raw_probs 映射到正确位置
+        padded_split_probs = None
+        if raw_probs is not None and N_total > 0 and max_tokens > 0:
+            # hilbert_indices 给出每个 selected token 在原始 candidate 列表中的索引
+            hilbert_indices = tensor_result.hilbert_indices  # [N_total]
+            split_probs_padded = torch.zeros(B, max_tokens, dtype=raw_probs.dtype, device=device)
+
+            # 向量化分配: split_probs_padded[batch_idx, token_pos] = raw_probs[batch_idx, hilbert_idx]
+            split_probs_padded[batch_indices, token_positions] = raw_probs[
+                batch_indices, hilbert_indices
+            ]
+            padded_split_probs = split_probs_padded
+
+        return self.patch_embed.norm(tokens), levels_info, padded_regions, padded_split_probs
     
     def forward(self, images: torch.Tensor) -> TokenizerOutput:
         """前向传播，等价于 tokenize."""
