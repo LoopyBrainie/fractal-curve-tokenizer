@@ -323,9 +323,9 @@ uv run python examples/training/train_fractal_vit.py `
   --K-min 14 `
   --K-max 256 `
   `
-  <# ===== §5: 训练配置 (Linear Scaling) ===== #> `
-  --batch-size 64 `
-  --accum-steps 3 `
+  <# ===== §5: 训练配置 (显存优化: batch=32, accum=6) ===== #> `
+  --batch-size 32 `
+  --accum-steps 6 `
   --lr 2.8e-4 `
   --warmup-epochs 8 `
   `
