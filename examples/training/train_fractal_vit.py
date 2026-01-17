@@ -292,6 +292,17 @@ from training import (
     # Visualization
     VisualizationConfig,
     ExperimentVisualizer,
+    # CUB-200 细粒度分类专用 (解耦合的训练器)
+    CUB200Trainer,
+    CUB200TrainingConfig,
+    CUB200EvalResult,
+    create_cub200_trainer,
+    get_cub200_augmentation,
+    # CUB-200 细粒度损失函数
+    CenterLoss,
+    AttentionEntropyLoss,
+    FinegrainedLoss,
+    FinegrainedLossConfig,
 )
 
 
@@ -1403,7 +1414,7 @@ def create_dataloaders(
     if effective_workers > 0:
         # prefetch_factor: 每个 worker 预取的 batch 数
         # 过大会导致内存问题，使用保守值
-        loader_kwargs['prefetch_factor'] = 4 if is_container else 2
+        loader_kwargs['prefetch_factor'] = 8 if is_container else 4
         # 添加 generator 参数以提高多进程随机性
         loader_kwargs['generator'] = torch.Generator().manual_seed(42)
     
@@ -2586,6 +2597,14 @@ def main():
     parser.add_argument("--hilbert-mining-warmup", type=int, default=100,
                        help="Number of batches for EMA statistics warmup (default: 100)")
     
+    # CUB-200 细粒度分类专用参数
+    parser.add_argument("--use-center-loss", action="store_true",
+                       help="Use Center Loss for fine-grained classification (CUB-200)")
+    parser.add_argument("--center-loss-weight", type=float, default=0.01,
+                       help="Center Loss weight (default: 0.01)")
+    parser.add_argument("--finegrained-mode", action="store_true",
+                       help="Enable fine-grained classification mode (auto for cub200)")
+    
     # 系统
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto")
@@ -2594,6 +2613,11 @@ def main():
                        help="Custom experiment name (default: auto-generated with timestamp)")
     
     args = parser.parse_args()
+    
+    # CUB-200 自动启用细粒度模式
+    if args.dataset == 'cub200' and not args.finegrained_mode:
+        args.finegrained_mode = True
+        print("[INFO] CUB-200 数据集: 自动启用细粒度分类模式")
     
     # 环境检测
     env = detect_environment()
@@ -2786,6 +2810,145 @@ def main():
     print(f"Compile Model: {config.compile_model}")
     print(f"Channels Last: {config.channels_last}")
     print(f"{'='*70}\n")
+    
+    # =========================================================================
+    # CUB-200 细粒度分类专用训练路径 (解耦合)
+    # =========================================================================
+    # 当 --finegrained-mode 启用时 (CUB-200 自动启用)，使用专用的 CUB200Trainer
+    # CUB200Trainer 特性:
+    #   - CenterLoss: 增强类内紧凑性
+    #   - 细粒度数据增强: 保守增强，保留判别性细节
+    #   - Per-class 准确率评估
+    #   - 困难类别对分析
+    # =========================================================================
+    if args.finegrained_mode:
+        print("=" * 70)
+        print("FINE-GRAINED CLASSIFICATION MODE (CUB-200)")
+        print("=" * 70)
+        
+        # 创建数据加载器
+        train_loader, val_loader, test_loader = create_dataloaders(spec, config)
+        
+        # 创建 CUB-200 训练配置
+        cub200_config = CUB200TrainingConfig(
+            # 基础训练参数
+            batch_size=config.batch_size,
+            num_epochs=config.epochs,
+            learning_rate=config.learning_rate,
+            warmup_epochs=config.warmup_epochs,
+            accum_steps=config.accum_steps,
+            # 设备和混合精度
+            device=str(device),
+            use_amp=config.use_amp,
+            # 细粒度特定
+            use_center_loss=args.use_center_loss,
+            center_loss_weight=args.center_loss_weight,
+            # 正则化
+            label_smoothing=config.label_smoothing,
+            dropout=config.dropout,
+            drop_path=config.drop_path,
+            weight_decay=config.weight_decay,
+            # Mixup/CutMix
+            mixup_alpha=config.mixup_alpha,
+            cutmix_alpha=config.cutmix_alpha,
+            mixup_prob=config.mixup_prob,
+            # 早停
+            patience=config.patience,
+            min_delta=config.min_delta,
+        )
+        
+        # 创建训练器
+        cub200_trainer = CUB200Trainer(
+            model=model,
+            config=cub200_config,
+            num_classes=spec.num_classes,
+            feat_dim=config.dim,
+            device=device,
+        )
+        
+        # 创建优化器
+        use_fused = device.type == 'cuda' and hasattr(torch.optim.AdamW, 'fused')
+        try:
+            optimizer = AdamW(
+                model.parameters(),
+                lr=cub200_config.learning_rate,
+                weight_decay=cub200_config.weight_decay,
+                fused=use_fused
+            )
+        except TypeError:
+            optimizer = AdamW(
+                model.parameters(),
+                lr=cub200_config.learning_rate,
+                weight_decay=cub200_config.weight_decay
+            )
+        
+        # 创建学习率调度器
+        warmup = min(cub200_config.warmup_epochs, cub200_config.num_epochs // 2)
+        warmup_sch = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup)
+        cosine_sch = CosineAnnealingLR(optimizer, T_max=cub200_config.num_epochs - warmup, eta_min=cub200_config.learning_rate * 0.01)
+        scheduler = SequentialLR(optimizer, [warmup_sch, cosine_sch], milestones=[warmup])
+        
+        # 创建实验目录
+        exp_name = args.exp_name if args.exp_name else f"cub200_finegrained_{time.strftime('%Y%m%d_%H%M%S')}"
+        exp_dir = PROJECT_ROOT / "experiments" / exp_name
+        exp_dir.mkdir(parents=True, exist_ok=True)
+        (exp_dir / "checkpoints").mkdir(exist_ok=True)
+        (exp_dir / "logs").mkdir(exist_ok=True)
+        
+        # 保存配置
+        with open(exp_dir / "logs" / "config.json", 'w') as f:
+            json.dump({
+                'training_config': asdict(config),
+                'cub200_config': {
+                    'batch_size': cub200_config.batch_size,
+                    'num_epochs': cub200_config.num_epochs,
+                    'learning_rate': cub200_config.learning_rate,
+                    'use_center_loss': cub200_config.use_center_loss,
+                    'center_loss_weight': cub200_config.center_loss_weight,
+                },
+            }, f, indent=2)
+        
+        print(f"[INFO] Experiment directory: {exp_dir}")
+        print(f"[INFO] CUB200 Config:")
+        print(f"  - CenterLoss: {'enabled' if cub200_config.use_center_loss else 'disabled'}")
+        if cub200_config.use_center_loss:
+            print(f"  - CenterLoss weight: {cub200_config.center_loss_weight}")
+        print()
+        
+        # 执行训练
+        print("=" * 70)
+        print("TRAINING START (CUB200Trainer)")
+        print("=" * 70)
+        print()
+        
+        history = cub200_trainer.train(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            exp_dir=exp_dir,
+        )
+        
+        # 最终测试评估
+        if test_loader is not None:
+            print("\n" + "=" * 70)
+            print("FINAL TEST EVALUATION")
+            print("=" * 70)
+            test_result = cub200_trainer.evaluate(test_loader)
+            print(f"Test Accuracy: {test_result.accuracy:.2f}% (Top-5: {test_result.top5_accuracy:.2f}%)")
+            print(f"Worst Classes: {test_result.confused_pairs[:5] if test_result.confused_pairs else 'N/A'}")
+        
+        # 保存最终历史
+        with open(exp_dir / "logs" / "history.json", 'w') as f:
+            json.dump(history, f, indent=2)
+        
+        print(f"\n[OK] CUB-200 fine-grained training completed!")
+        print(f"[INFO] Results saved to: {exp_dir}")
+        return  # 提前返回，不执行通用训练循环
+    
+    # =========================================================================
+    # 通用分类训练路径 (CIFAR-10, Tiny-ImageNet, ImageNet 等)
+    # =========================================================================
     
     # 数据加载
     train_loader, val_loader, test_loader = create_dataloaders(spec, config)

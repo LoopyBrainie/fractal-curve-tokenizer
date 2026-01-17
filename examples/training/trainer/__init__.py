@@ -697,4 +697,19 @@ __all__ = [
     "ProgressCallback",
     # 训练器
     "ModularTrainer",
+    # CUB-200 细粒度分类训练器
+    "CUB200Trainer",
+    "CUB200TrainingConfig",
+    "CUB200EvalResult",
+    "create_cub200_trainer",
+    "get_cub200_augmentation",
 ]
+
+# 导入 CUB-200 细粒度训练器
+from .cub200_trainer import (
+    CUB200Trainer,
+    CUB200TrainingConfig,
+    CUB200EvalResult,
+    create_cub200_trainer,
+    get_cub200_augmentation,
+)

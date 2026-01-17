@@ -57,6 +57,10 @@ uv run python examples/training/train_fractal_vit.py `
   --cutmix-alpha 0.8 `
   --mixup-prob 0.4 `
   `
+  <# ===== 细粒度分类 (CUB-200) ===== #> `
+  --use-center-loss `
+  --center-loss-weight 0.01 `
+  `
   <# ===== 硬件优化 ===== #> `
   --compile `
   --channels-last `

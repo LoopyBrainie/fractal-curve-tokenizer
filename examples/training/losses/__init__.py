@@ -45,6 +45,14 @@ from .hilbert_hard_mining import (
     HilbertMiningWrapper,
     create_hilbert_mining_loss,
 )
+# 细粒度分类损失
+from .finegrained import (
+    CenterLoss,
+    AttentionEntropyLoss,
+    FinegrainedLoss,
+    FinegrainedLossConfig,
+    create_finegrained_loss,
+)
 
 
 # ============================================================================
@@ -212,6 +220,12 @@ __all__ = [
     "HilbertAwareHardMining",
     "HilbertMiningWrapper",
     "create_hilbert_mining_loss",
+    # 细粒度分类损失
+    "CenterLoss",
+    "AttentionEntropyLoss",
+    "FinegrainedLoss",
+    "FinegrainedLossConfig",
+    "create_finegrained_loss",
     # 工具函数
     "compute_class_weights_from_targets",
 ]

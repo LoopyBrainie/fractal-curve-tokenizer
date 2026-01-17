@@ -76,6 +76,12 @@ from .losses import (
     HilbertAwareHardMining,
     HilbertMiningWrapper,
     create_hilbert_mining_loss,
+    # 细粒度分类损失 (CUB-200)
+    CenterLoss,
+    AttentionEntropyLoss,
+    FinegrainedLoss,
+    FinegrainedLossConfig,
+    create_finegrained_loss,
 )
 
 # Metrics
@@ -103,6 +109,12 @@ from .trainer import (
     LRSchedulerCallback,
     ProgressCallback,
     ModularTrainer,
+    # CUB-200 细粒度分类训练器
+    CUB200Trainer,
+    CUB200TrainingConfig,
+    CUB200EvalResult,
+    create_cub200_trainer,
+    get_cub200_augmentation,
 )
 
 # Config
@@ -200,6 +212,12 @@ __all__ = [
     "HilbertAwareHardMining",
     "HilbertMiningWrapper",
     "create_hilbert_mining_loss",
+    # 细粒度分类损失 (CUB-200)
+    "CenterLoss",
+    "AttentionEntropyLoss",
+    "FinegrainedLoss",
+    "FinegrainedLossConfig",
+    "create_finegrained_loss",
     # Metrics
     "ClassificationMetrics",
     "ResourceMetrics",
@@ -221,6 +239,12 @@ __all__ = [
     "LRSchedulerCallback",
     "ProgressCallback",
     "ModularTrainer",
+    # CUB-200 细粒度分类训练器
+    "CUB200Trainer",
+    "CUB200TrainingConfig",
+    "CUB200EvalResult",
+    "create_cub200_trainer",
+    "get_cub200_augmentation",
     # Config
     "DataConfig",
     "ModelConfig",
