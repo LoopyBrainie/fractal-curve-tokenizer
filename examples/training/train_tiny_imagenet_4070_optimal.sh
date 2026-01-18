@@ -51,9 +51,6 @@ uv run python examples/training/train_fractal_vit.py \
   --image-size 128 \
   --num-classes 200 \
   --epochs 100 \
-  \
-  `# === 模型架构 (27M 参数 - 数学推导最优) ===` \
-  `# 验证: dim=384, depth=12 → P ≈ 27M` \
   --dim 384 \
   --depth 12 \
   --heads 8 \
@@ -61,44 +58,25 @@ uv run python examples/training/train_fractal_vit.py \
   --mlp-dim 1536 \
   --pool cls \
   --ffn-type swiglu_level \
-  \
-  `# === I78 动态分辨率 Tokenizer 配置 ===` \
-  `# image_size=128 (原始尺寸，无需 resize)` \
-  `# min_patch_size=4 (最小 4x4 像素 patch)` \
-  `# max_depth = log2(128/4) = 5 (自动计算)` \
-  `# 候选区域: 1+4+16+64+256+1024 = 1365 (6 尺度)` \
-  `--tokenizer-type streaming_v3 \
+  --tokenizer-type streaming_v3 \
   --min-patch-size 4 \
   --K-min 16 \
   --K-max 64 \
-  \
-  `# === I31 面积编码配置 (2026-01-18) ===` \
-  `# 形状-尺度编码补充离散 Level 的几何信息` \
-  `--use-area-encoding \
+  --use-area-encoding \
   --fourier-levels 4 \
-  \
-  `# === 训练配置 (batch_size=192) ===` \
-  `--batch-size 192 \
+  --batch-size 192 \
   --num-workers 4 \
   --lr 3.2e-4 \
   --weight-decay 0.1 \
   --warmup-epochs 10 \
-  \
-  `# === 正则化 ===` \
-  `--dropout 0.15 \
+  --dropout 0.15 \
   --emb-dropout 0.1 \
   --drop-path 0.2 \
   --label-smoothing 0.1 \
-  \
-  `# === 数据增强 (Mixup + CutMix) ===` \
-  `--mixup-alpha 0.4 \
+  --mixup-alpha 0.4 \
   --cutmix-alpha 1.0 \
   --mixup-prob 0.5 \
-  \
-  `# === 辅助损失配置 ===` \
-  `# Soft Entropy: 最大化尺度多样性` \
-  `# Elastic Budget: Dead Zone [16, 80]` \
-  `--include-soft-entropy \
+  --include-soft-entropy \
   --soft-entropy-mode maximize \
   --soft-entropy-weight 0.1 \
   --include-elastic-budget \
@@ -107,24 +85,15 @@ uv run python examples/training/train_fractal_vit.py \
   --elastic-lambda-over 0.1 \
   --elastic-lambda-under 0.01 \
   --elastic-lambda-collapse 1.0 \
-  \
-  `# === Splitter 温度退火 (cosine, T_end=0.5) ===` \
-  `--splitter-temp-start 1.0 \
+  --splitter-temp-start 1.0 \
   --splitter-temp-end 0.5 \
   --splitter-temp-warmup 10 \
-  \
-  `# === LCA Hilbert Bias (τ=1.5) ===` \
-  `--lca-temperature 1.5 \
-  \
-  `# === 性能优化 (RTX 4070 Laptop) ===` \
-  `--use-amp \
+  --lca-temperature 1.5 \
+  --use-amp \
   --gradient-checkpoint \
   --compile \
   --channels-last \
   --accum-steps 1 \
   --gradient-clip 1.0 \
-  \
-  `# === 早停策略 ===` \
-  `--patience 15 \
-  --min-delta 0.001 \
-  --exp-name tiny_imagenet_i78_i31_384d_12l_bs192
+  --patience 15 \
+  --min-delta 0.001 

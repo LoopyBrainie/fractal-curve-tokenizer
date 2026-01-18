@@ -131,8 +131,6 @@ dmypy.json
 # Workspace and Data
 workspace/*
 !workspace/visualizations/
-workspace/visualizations/*
-!workspace/visualizations/fractal_curves/
 data/
 
 # Machine Learning model files and checkpoints
