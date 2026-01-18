@@ -48,8 +48,6 @@
 
 uv run python examples/training/train_fractal_vit.py \
   --dataset tiny-imagenet \
-  --image-size 128 \
-  --num-classes 200 \
   --epochs 100 \
   --dim 384 \
   --depth 12 \

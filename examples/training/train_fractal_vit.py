@@ -332,7 +332,6 @@ class TrainingConfig:
     dim: int
     depth: int
     heads: int
-    mlp_dim: int
     dim_head: int
     max_level: int
     pool: str
@@ -574,9 +573,8 @@ DATASETS = {
     "mnist": DatasetSpec("MNIST", 10, 28, 1, (0.1307,), (0.3081,)),
     "tiny-imagenet": DatasetSpec("TinyImageNet", 200, 64, 3, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     # CUB-200-2011: 细粒度鸟类分类数据集
-    # 数学形式化: N_train=5994, N_test=5794, C=200, 图像尺寸变长→resize到224
-    # 统计量: mean/std 从 ImageNet 采用 (鸟类图像与 ImageNet 分布相似)
-    "cub200": DatasetSpec("CUB200", 200, 224, 3, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    # 图像尺寸混合，动态获取每张图像的实际尺寸
+    "cub200": DatasetSpec("CUB200", 200, None, 3, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
 }
 
 
@@ -1226,32 +1224,28 @@ def create_dataloaders(
     config: TrainingConfig,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """创建数据加载器"""
-    
-    # 数据增强
+
+    # 数据增强 - 不 resize，保持原始分辨率
     if spec.name == "MNIST":
         train_tf = transforms.Compose([
-            transforms.Resize(32),
             transforms.ToTensor(),
             transforms.Normalize(spec.mean, spec.std),
         ])
     elif spec.name == "TinyImageNet":
         train_tf = transforms.Compose([
             transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(64, padding=8),
-            transforms.RandAugment(num_ops=2, magnitude=9),  # Phase 2: RandAugment
+            transforms.RandomCrop(64, padding=8),  # 原始图像 64x64
+            transforms.RandAugment(num_ops=2, magnitude=9),
             transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
             transforms.ToTensor(),
             transforms.Normalize(spec.mean, spec.std),
-            transforms.RandomErasing(p=0.25),  # Cutout-like augmentation
+            transforms.RandomErasing(p=0.25),
         ])
     elif spec.name == "CUB200":
-        # CUB-200-2011 细粒度分类增强策略
-        # 数学形式化: 细粒度分类需要保留局部细节，使用较强的几何变换和颜色增强
+        # CUB-200-2011 细粒度分类 - 保持原始分辨率
         train_tf = transforms.Compose([
-            transforms.Resize(256),  # 先放大再裁剪，保留更多细节
-            transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),  # 随机裁剪
             transforms.RandomHorizontalFlip(),
-            transforms.RandomRotation(15),  # 小角度旋转
+            transforms.RandomRotation(15),
             transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
             transforms.RandAugment(num_ops=2, magnitude=9),
             transforms.ToTensor(),
@@ -1261,15 +1255,14 @@ def create_dataloaders(
     else:
         train_tf = transforms.Compose([
             transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(spec.image_size, padding=4),
-            transforms.RandAugment(num_ops=2, magnitude=9),  # Phase 2: RandAugment
+            transforms.RandomCrop(spec.image_size, padding=4) if spec.image_size else transforms.RandomHorizontalFlip(),
+            transforms.RandAugment(num_ops=2, magnitude=9),
             transforms.ToTensor(),
             transforms.Normalize(spec.mean, spec.std),
-            transforms.RandomErasing(p=0.25),  # Cutout-like augmentation
+            transforms.RandomErasing(p=0.25),
         ])
-    
+
     test_tf = transforms.Compose([
-        transforms.Resize(max(spec.image_size, 32)),
         transforms.ToTensor(),
         transforms.Normalize(spec.mean, spec.std),
     ])
@@ -2710,7 +2703,6 @@ def main():
         dim=args.dim,
         depth=args.depth,
         heads=args.heads,
-        mlp_dim=args.dim * 4,
         dim_head=args.dim_head,
         max_level=args.max_level,
         pool=args.pool,
@@ -2824,12 +2816,12 @@ def main():
 
     # 创建模型 (V3 Variable Depth Tokens)
     model_kwargs = dict(
-        image_size=max(spec.image_size, 32),
+        image_size=spec.image_size,
         num_classes=spec.num_classes,
         dim=config.dim,
         depth=config.depth,
         heads=config.heads,
-        mlp_dim=config.mlp_dim,
+        mlp_dim=config.dim * 4,
         pool=config.pool,
         channels=spec.channels,
         dim_head=config.dim_head,
@@ -3190,7 +3182,7 @@ def main():
         
         if config.use_focal_loss:
             # 创建 Focal Loss
-            loss_fn = FocalLoss(
+            loss_fn = FTFocalLoss(
                 gamma=config.focal_gamma,
                 alpha=class_weights,  # 可选，如果同时启用 class_balanced
                 label_smoothing=config.label_smoothing,
