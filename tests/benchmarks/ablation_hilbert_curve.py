@@ -437,10 +437,7 @@ class StandardViT(nn.Module):
         self.patch_size = patch_size
         self.num_patches = (image_size // patch_size) ** 2
 
-        self.to_patch_embedding = nn.Sequential(
-            nn.Conv2d(3, dim, patch_size, patch_size),
-            nn.Flatten(2),
-        )
+        self.to_patch_embedding = nn.Conv2d(3, dim, patch_size, patch_size)
 
         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
         self.pos_embedding = nn.Parameter(torch.randn(1, self.num_patches + 1, dim))
