@@ -4,11 +4,11 @@ Hilbert vs Raster 消融实验 (I25-2)
 
 实验设计:
 ┌──────────────┬────────────────────────────────────────────────────────────┐
-│ 模式         │ 说明                                                         │
+│ 模式         │ 说明                                                        │
 ├──────────────┼────────────────────────────────────────────────────────────┤
-│ Standard ViT | 标准 ViT (16x16 patch) - 基线，对比分形 tokenization 收益      │
-│ Hilbert      | FractalCurveViT + Hilbert 排序 - 核心假设验证                  │
-│ Raster       | FractalCurveViT + Raster 排序 - Hilbert 对照组                 │
+│ Standard ViT | 标准 ViT (16x16 patch) - 基线，对比分形 tokenization 收益     │
+│ Hilbert      | FractalCurveViT + Hilbert 排序 - 核心假设验证                │
+│ Raster       | FractalCurveViT + Raster 排序 - Hilbert 对照组              │
 └──────────────┴────────────────────────────────────────────────────────────┘
 
 控制变量:
@@ -17,13 +17,13 @@ Hilbert vs Raster 消融实验 (I25-2)
 
 默认配置 (v3.0 2026-01-18):
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ 模型: dim=384, depth=12 → P=32.7M (Tiny-ImageNet 调优)                      │
-│ 动态分辨率: image_size=None, min_patch_size=4 → max_depth=4                 │
+│ 模型: dim=384, depth=12 → P=32.7M (Tiny-ImageNet 调优)                       │
+│ 动态分辨率: image_size=None, min_patch_size=4 → max_depth=4                  │
 │ Token: K∈[16,64] (4:1 压缩比)                                               │
-│ I31: use_area_encoding=True, fourier_levels=4                               │
+│ I31: use_area_encoding=True, fourier_levels=4                              │
 │ I78 优化: channels-last ✓, torch.compile ✓                                  │
 │ 训练: batch=64, lr=1e-3, epochs=100                                         │
-│ 正则: dropout=0.2, drop_path=0.2, weight_decay=0.1                         │
+│ 正则: dropout=0.2, drop_path=0.2, weight_decay=0.1                          │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 使用示例:
@@ -64,7 +64,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp.autocast_mode import autocast
+from torch.amp.grad_scaler import GradScaler
 from torchvision import datasets, transforms
 
 # Handle import paths
@@ -663,7 +664,7 @@ def train_epoch(
         optimizer.zero_grad()
 
         if scaler is not None:
-            with autocast(device_type=device.type, enabled=(device.type == 'cuda')):
+            with autocast('cuda', enabled=(device.type == 'cuda')):
                 outputs = model(images)
                 loss = F.cross_entropy(outputs, labels)
             scaler.scale(loss).backward()
@@ -770,7 +771,6 @@ def run_experiment(
     """
     from torch.optim import AdamW
     from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-    from torch.cuda.amp import GradScaler
 
     # 设置随机种子
     set_seed(seed)
@@ -819,7 +819,7 @@ def run_experiment(
     # 混合精度训练 (如果可用)
     scaler = None
     if device.type == 'cuda':
-        scaler = GradScaler()
+        scaler = GradScaler('cuda')
 
     # 结果记录
     result = RunResult(run_id=run_id, mode=config.mode, seed=seed)
