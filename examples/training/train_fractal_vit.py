@@ -235,13 +235,9 @@ import logging
 logging.getLogger('torch.fx.experimental.symbolic_shapes').setLevel(logging.ERROR)
 logging.getLogger('torch._dynamo').setLevel(logging.ERROR)
 
-# AMP 兼容层
-try:
-    from torch.amp import autocast, GradScaler
-    _NEW_AMP = True
-except ImportError:
-    from torch.cuda.amp import autocast, GradScaler  # type: ignore
-    _NEW_AMP = False
+# AMP 兼容层 (I78: PyTorch 2.0+ 使用统一 API)
+from torch.amp.autocast_mode import autocast
+from torch.amp.grad_scaler import GradScaler
 
 # 项目路径
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -343,92 +339,97 @@ class TrainingConfig:
     ffn_type: str
 
     # I30-17: 动态深度配置
+    # max_depth 由 min_patch_size 和 image_size 自动计算: floor(log2(min(H, W) / min_patch_size))
     min_patch_size: int  # 目标最小 patch 大小
-    max_depth_hard_limit: int  # max_depth 硬上限
 
     # Tokenizer 配置 (V3 Variable Depth Tokens)
-    tokenizer_type: str  # 'streaming_v3' (唯一支持)
+    tokenizer_type: str = "streaming_v3"  # 'streaming_v3' (唯一支持)
 
     # GumbelTopKSplitter (Scheme D) 参数
-    K_min: int  # 最小 token 数量 (硬下界约束)
-    K_max: int  # 最大 token 数量 (软上界约束)
+    K_min: int = 16  # 最小 token 数量 (硬下界约束)
+    K_max: int = 64  # 最大 token 数量 (软上界约束)
 
     # I30-10: 可学习配额参数 (Scheme E)
-    quota_learnable: bool  # 是否启用可学习配额
-    quota_init_logits: Optional[Tuple[float, ...]]  # 配额初始化 logits
-    quota_min_per_depth: int  # 每深度最小配额
-    freeze_quota: bool  # 是否冻结配额参数
+    quota_learnable: bool = True  # 是否启用可学习配额
+    quota_init_logits: Optional[Tuple[float, ...]] = None  # 配额初始化 logits
+    quota_min_per_depth: int = 2  # 每深度最小配额
+    freeze_quota: bool = False  # 是否冻结配额参数
 
     # I24-1: Tokenizer 冻结选项
-    freeze_tokenizer: bool  # 是否冻结 tokenizer 可学习参数
-    freeze_tokenizer_epochs: int  # 前 N 个 epoch 冻结 (0=全程冻结)
-    
+    freeze_tokenizer: bool = False  # 是否冻结 tokenizer 可学习参数
+    freeze_tokenizer_epochs: int = 0  # 前 N 个 epoch 冻结 (0=全程冻结)
+
     # P6-1: 深度缩放参数
-    depth_scale_range: Optional[Tuple[float, float]]  # (σ_min, σ_max)，默认 (0.5, 2.0)
-    
+    depth_scale_range: Optional[Tuple[float, float]] = None  # (σ_min, σ_max)，默认 (0.5, 2.0)
+
     # P6-2: LCA 温度参数
-    lca_temperature: Optional[float]  # LCA 偏置温度，默认 1.5
-    learnable_temperature: bool  # 是否可学习温度，默认 True
-    
+    lca_temperature: Optional[float] = 1.5  # LCA 偏置温度，默认 1.5
+    learnable_temperature: bool = True  # 是否可学习温度，默认 True
+
+    # I31-3: 面积编码参数
+    use_area_encoding: bool = False  # 启用面积增强位置编码
+    use_affine_modulation: bool = False  # 启用仿射调制注意力偏置
+    fourier_levels: int = 4  # 傅里叶特征级别数
+
     # P7-7: GumbelTopKSplitter 温度退火调度参数
-    splitter_temp_start: float  # 起始温度 T_start
-    splitter_temp_end: float  # 终止温度 T_end
-    splitter_temp_warmup: int  # Warmup epoch 数 (固定 T_start)
-    
+    splitter_temp_start: float = 1.0  # 起始温度 T_start
+    splitter_temp_end: float = 0.5  # 终止温度 T_end
+    splitter_temp_warmup: int = 10  # Warmup epoch 数 (固定 T_start)
+
     # P10-4/P10-5: 软熵损失参数
-    include_soft_entropy: bool  # 是否启用软熵损失（推荐 True）
-    soft_entropy_mode: str  # 熵损失模式: 'maximize'（最大化熵）或 'target'（匹配目标）
-    soft_entropy_weight: float  # 软熵损失权重
-    soft_entropy_target: Optional[float]  # 目标熵值（仅 mode='target' 时使用）
-    
+    include_soft_entropy: bool = True  # 是否启用软熵损失（推荐 True）
+    soft_entropy_mode: str = "maximize"  # 熵损失模式: 'maximize'（最大化熵）或 'target'（匹配目标）
+    soft_entropy_weight: float = 0.1  # 软熵损失权重
+    soft_entropy_target: Optional[float] = None  # 目标熵值（仅 mode='target' 时使用）
+
     # P10-9: 弹性预算损失参数
-    include_elastic_budget: bool  # 是否启用弹性预算损失（推荐 True）
-    elastic_N_min: int  # 弹性预算下界（Dead Zone 左边界）
-    elastic_N_max: int  # 弹性预算上界（Dead Zone 右边界）
-    elastic_lambda_over: float  # 超出上界惩罚权重
-    elastic_lambda_under: float  # 低于下界约束权重
-    elastic_lambda_collapse: float  # I14-1 D1: 崩溃惩罚权重（建议 1.0）
-    
+    include_elastic_budget: bool = True  # 是否启用弹性预算损失（推荐 True）
+    elastic_N_min: int = 16  # 弹性预算下界（Dead Zone 左边界）
+    elastic_N_max: int = 80  # 弹性预算上界（Dead Zone 右边界）
+    elastic_lambda_over: float = 0.1  # 超出上界惩罚权重
+    elastic_lambda_under: float = 0.01  # 低于下界约束权重
+    elastic_lambda_collapse: float = 1.0  # I14-1 D1: 崩溃惩罚权重（建议 1.0）
+
     # 训练
-    epochs: int
-    learning_rate: float
-    weight_decay: float
-    dropout: float
-    emb_dropout: float
-    drop_path: float
-    label_smoothing: float
-    gradient_clip: float
-    use_amp: bool
-    accum_steps: int
-    warmup_epochs: int
-    gradient_checkpoint: bool
-    compile_model: bool
-    channels_last: bool
-    
+    epochs: int = 100
+    learning_rate: float = 3e-4
+    weight_decay: float = 0.1
+    dropout: float = 0.15
+    emb_dropout: float = 0.1
+    drop_path: float = 0.2
+    label_smoothing: float = 0.1
+    gradient_clip: float = 1.0
+    use_amp: bool = False
+    accum_steps: int = 1
+    warmup_epochs: int = 10
+    gradient_checkpoint: bool = False
+    compile_model: bool = False
+    channels_last: bool = False
+
     # 早停
-    patience: int
-    min_delta: float
-    
+    patience: int = 15
+    min_delta: float = 0.001
+
     # Mixup/CutMix
-    mixup_alpha: float
-    cutmix_alpha: float
-    mixup_prob: float
-    
+    mixup_alpha: float = 0.4
+    cutmix_alpha: float = 1.0
+    mixup_prob: float = 0.5
+
     # 长尾效应优化 (P14)
-    use_focal_loss: bool  # 是否使用 Focal Loss
-    focal_gamma: float  # Focal Loss 的 gamma 参数，默认 2.0
-    use_class_balanced: bool  # 是否使用类别平衡损失权重
-    class_balance_beta: float  # 类别平衡的 beta 参数，默认 0.9999
-    progressive_aug: bool  # 是否使用渐进式数据增强
-    
+    use_focal_loss: bool = False  # 是否使用 Focal Loss
+    focal_gamma: float = 2.0  # Focal Loss 的 gamma 参数，默认 2.0
+    use_class_balanced: bool = False  # 是否使用类别平衡损失权重
+    class_balance_beta: float = 0.9999  # 类别平衡的 beta 参数，默认 0.9999
+    progressive_aug: bool = False  # 是否使用渐进式数据增强
+
     # I30-2: Hilbert-aware 困难样本挖掘
-    use_hilbert_mining: bool  # 是否使用基于 Token 方差的困难样本挖掘
-    hilbert_mining_lambda: float  # 权重缩放系数 λ，默认 0.5
-    hilbert_mining_warmup: int  # EMA 统计预热 batch 数，默认 100
-    
+    use_hilbert_mining: bool = False  # 是否使用基于 Token 方差的困难样本挖掘
+    hilbert_mining_lambda: float = 0.5  # 权重缩放系数 λ，默认 0.5
+    hilbert_mining_warmup: int = 100  # EMA 统计预热 batch 数，默认 100
+
     # 系统
-    seed: int
-    device: str
+    seed: int = 42
+    device: str = "cuda"
 
 
 # ============================================================================
@@ -642,19 +643,13 @@ def set_seed(seed: int):
 
 
 def get_amp_context(device: torch.device, enabled: bool):
-    """获取 AMP autocast 上下文"""
-    if _NEW_AMP:
-        return autocast('cuda', enabled=enabled)
-    else:
-        return autocast(enabled=enabled)
+    """获取 AMP autocast 上下文 (I78: 简化 PyTorch 2.0+ API)"""
+    return autocast('cuda', enabled=enabled)
 
 
 def create_grad_scaler(enabled: bool) -> GradScaler:
-    """创建 GradScaler"""
-    if _NEW_AMP:
-        return GradScaler('cuda', enabled=enabled)
-    else:
-        return GradScaler(enabled=enabled)
+    """创建 GradScaler (I78: 简化 PyTorch 2.0+ API)"""
+    return GradScaler('cuda', enabled=enabled)
 
 
 # ============================================================================
@@ -2471,11 +2466,9 @@ def main():
     parser.add_argument("--dim-head", type=int, default=32)
     parser.add_argument("--max-level", type=int, default=None,
                        help="Maximum quadtree level (I30-17: auto-computed from min_patch_size if None)")
-    # I30-17: Replace num_scales with min_patch_size and max_depth_hard_limit
+    # I30-17: Replace num_scales with min_patch_size (max_depth auto-computed)
     parser.add_argument("--min-patch-size", type=int, default=4,
                        help="I30-17: Target minimum patch size for automatic depth computation")
-    parser.add_argument("--max-depth-hard-limit", type=int, default=8,
-                       help="I30-17: Hard limit on maximum depth to prevent excessive computation")
     # I30-11: 添加 weighted 池化选项
     parser.add_argument("--pool", type=str, default="cls", choices=["cls", "mean", "weighted"])
     parser.add_argument("--ffn-type", type=str, default="swiglu_level",
@@ -2500,6 +2493,14 @@ def main():
                        choices=["hilbert", "raster", "morton"],
                        help="I30-1: Token scanning order for Hilbert curve ablation experiment "
                             "(default: hilbert, options: hilbert/raster/morton)")
+
+    # I31-3: 面积编码参数
+    parser.add_argument("--use-area-encoding", action="store_true",
+                       help="I31-3: Enable area-enhanced position encoding")
+    parser.add_argument("--use-affine-modulation", action="store_true",
+                       help="I31-3: Enable affine-modulated attention bias")
+    parser.add_argument("--fourier-levels", type=int, default=4,
+                       help="I31-3: Number of Fourier frequency levels for area encoding (default: 4)")
 
     # GumbelTopKSplitter (Scheme D) 参数
     parser.add_argument("--K-min", type=int, default=16,
@@ -2714,9 +2715,8 @@ def main():
         max_level=args.max_level,
         pool=args.pool,
         ffn_type=args.ffn_type,
-        # I30-17: 动态深度配置
+        # I30-17: 动态深度配置 - max_depth 由 min_patch_size 自动计算
         min_patch_size=args.min_patch_size,
-        max_depth_hard_limit=args.max_depth_hard_limit,
         # Tokenizer 配置 (V3)
         tokenizer_type=args.tokenizer_type,
         # GumbelTopKSplitter (Scheme D) 参数
@@ -2735,6 +2735,10 @@ def main():
         # P6-2: LCA 温度配置
         lca_temperature=None if args.no_lca_temperature else args.lca_temperature,
         learnable_temperature=not args.fixed_lca_temperature,
+        # I31-3: 面积编码配置
+        use_area_encoding=args.use_area_encoding,
+        use_affine_modulation=args.use_affine_modulation,
+        fourier_levels=args.fourier_levels,
         # P7-7: GumbelTopKSplitter 温度退火调度配置
         splitter_temp_start=args.splitter_temp_start,
         splitter_temp_end=args.splitter_temp_end,
@@ -2805,13 +2809,12 @@ def main():
         channels=spec.channels,
         d_model=config.dim,
         base_patch_size=config.min_patch_size,  # I30-17: 使用 min_patch_size
-        min_patch_size=config.min_patch_size,   # I30-17: 目标最小 patch
-        max_depth_hard_limit=config.max_depth_hard_limit,  # I30-17: 硬上限
+        min_patch_size=config.min_patch_size,   # I30-17: 目标最小 patch (max_depth 自动计算)
         use_hilbert_order=True,
         # P6-1: 深度缩放配置
         depth_scale_range=config.depth_scale_range,
-        # P7-7: 可学习分割器温度参数
-        learnable_temperature=config.splitter_temp_start,
+        # P7-7: 可学习分割器温度参数 (I78: 修复参数映射错误)
+        learnable_temperature=config.learnable_temperature,
         # I30-10: SplitterConfig 统一配置
         splitter_config=splitter_config,
         # I27: Splitter Dropout (与模型 dropout 对齐)
@@ -2833,9 +2836,8 @@ def main():
         dropout=config.dropout,
         emb_dropout=config.emb_dropout,
         drop_path_rate=config.drop_path,
-        # I30-17: 使用新的动态深度参数
+        # I30-17: 使用新的动态深度参数 (max_depth 自动从 min_patch_size 计算)
         min_patch_size=config.min_patch_size,
-        max_depth_hard_limit=config.max_depth_hard_limit,
         max_level=config.max_level,
         use_checkpoint=config.gradient_checkpoint,
         ffn_type=config.ffn_type,
@@ -2844,8 +2846,12 @@ def main():
         # P6-2: LCA 温度配置
         lca_temperature=config.lca_temperature,
         learnable_temperature=config.learnable_temperature,
+        # I31-3: 面积编码参数
+        use_area_encoding=config.use_area_encoding,
+        use_affine_modulation=config.use_affine_modulation,
+        fourier_levels=config.fourier_levels,
     )
-    
+
     model = FractalCurveViT(**model_kwargs).to(device)
 
     # I30-10: 配额参数冻结 (独立于 freeze_tokenizer)

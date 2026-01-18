@@ -116,6 +116,13 @@ class ModelConfig:
     # 推荐: dropout * 0.5，信息瓶颈需保守正则化
     pos_dropout: float = 0.05
 
+    # I31: 面积编码配置 (2026-01-18)
+    # 位置编码增强：形状-尺度编码补充离散 Level 的几何信息
+    use_area_encoding: bool = False
+    # 注意力偏置增强：仿射调制基于面积相似性
+    use_affine_modulation: bool = False
+    fourier_levels: int = 4  # 傅里叶特征级别数
+
 
 @dataclass
 class LossConfig:

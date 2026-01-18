@@ -112,6 +112,35 @@ class CUB200TrainingConfig:
     # 日志
     log_level: str = "INFO"
 
+    # I31: 面积编码配置 (2026-01-18)
+    use_area_encoding: bool = False
+    use_affine_modulation: bool = False
+    fourier_levels: int = 4
+
+    # 模型架构参数 (I78: 补充缺失字段)
+    num_classes: int = 200
+    dim: int = 384
+    depth: int = 10
+    heads: int = 8
+    mlp_dim: int = 1536  # embed_dim * mlp_ratio (default 4.0)
+    dim_head: int = 64   # embed_dim / heads
+    drop_path_rate: float = 0.16  # 与 drop_path 一致
+
+    # I78: 动态分辨率支持
+    # image_size=None: 支持任意分辨率输入（无需统一 resize）
+    # image_size=int: 固定分辨率（向后兼容）
+    image_size: Optional[int] = None
+
+    # Tokenizer 参数 (I78: max_depth 由 min_patch_size 自动计算)
+    num_scales: int = 4
+    min_patch_size: int = 4
+    K_min: int = 4
+    K_max: int = 64
+    tokenizer_type: str = "streaming_v3"
+    ffn_type: str = "swiglu_level"
+    use_checkpoint: bool = False
+    channels: int = 3
+
     def __post_init__(self):
         """参数验证 - 数学约束"""
         assert 0 < self.batch_size <= 512, f"batch_size={self.batch_size} 必须在 (0, 512]"

@@ -494,8 +494,8 @@ class ModularTrainer:
                 self.optimizer.zero_grad()
                 self.state.global_step += 1
             
-            # 统计
-            batch_loss = loss.item() * self.config.accumulation_steps
+            # 统计 (I78: 使用 detach().item() 支持 torch.compile)
+            batch_loss = loss.detach().item() * self.config.accumulation_steps
             total_loss += batch_loss
             num_batches += 1
             
@@ -549,12 +549,12 @@ class ModularTrainer:
             inputs = inputs.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
 
-            # 验证禁用 AMP 以确保指标精度
+            # 验证禁用 AMP 以确保指标精度 (I78: 使用 detach().item() 支持 torch.compile)
             with torch.amp.autocast('cuda', enabled=False):
                 outputs = self.model(inputs)
                 loss = self.loss_fn(outputs, targets)
-            
-            total_loss += loss.item()
+
+            total_loss += loss.detach().item()
             num_batches += 1
             
             if self.metrics:

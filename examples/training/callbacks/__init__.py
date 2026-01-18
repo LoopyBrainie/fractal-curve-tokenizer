@@ -23,6 +23,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, List, TYPE_CHECKING
 
+import torch  # I78: 修复 @torch.no_grad() 装饰器依赖
+
 if TYPE_CHECKING:
     from ..trainer import ModularTrainer, TrainerState, CallbackContext
 
@@ -340,8 +342,9 @@ class WandBCallback:
         if self.config.log_model:
             self._maybe_save_model(trainer, ctx)
     
+    @torch.no_grad()
     def _extract_splitter_metrics(self, trainer: 'ModularTrainer') -> Dict[str, float]:
-        """从训练器/模型中提取 Splitter 指标"""
+        """从训练器/模型中提取 Splitter 指标 (I78: 添加 no_grad 支持 torch.compile)"""
         metrics = {}
         
         try:
@@ -360,18 +363,15 @@ class WandBCallback:
             if splitter is None or not hasattr(splitter, 'training') or not splitter.training:
                 return metrics
             
-            # 提取可用指标
+            # 提取可用指标 (I78: 使用 float() 替代 .item() 支持 torch.compile)
             if hasattr(splitter, 'temperature') and splitter.temperature is not None:
-                if hasattr(splitter.temperature, 'item'):
-                    metrics["splitter/temperature"] = splitter.temperature.item()
-                else:
-                    metrics["splitter/temperature"] = float(splitter.temperature)
-            
+                metrics["splitter/temperature"] = float(splitter.temperature)
+
             if hasattr(splitter, 'thresholds') and splitter.thresholds is not None:
                 thresh = splitter.thresholds
                 if hasattr(thresh, 'mean'):
-                    metrics["splitter/threshold_mean"] = thresh.mean().item()
-                    metrics["splitter/threshold_std"] = thresh.std().item()
+                    metrics["splitter/threshold_mean"] = float(thresh.mean())
+                    metrics["splitter/threshold_std"] = float(thresh.std())
             
             # 尝试获取最近的性能统计
             if hasattr(splitter, '_last_perf_stats') and splitter._last_perf_stats:

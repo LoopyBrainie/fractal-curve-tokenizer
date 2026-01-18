@@ -35,6 +35,7 @@ from collections import Counter
 from tqdm import tqdm
 
 
+@torch.no_grad()
 def diagnose_model_collapse(
     model: nn.Module,
     dataloader,
@@ -43,8 +44,8 @@ def diagnose_model_collapse(
     max_batches: int = 10,
 ) -> dict:
     """
-    诊断模型坍缩问题。
-    
+    诊断模型坍缩问题 (I78: 添加 no_grad 支持 torch.compile)。
+
     检查:
     1. 预测分布是否集中在单一类别
     2. Logits 分布是否异常
@@ -77,7 +78,7 @@ def diagnose_model_collapse(
             
             all_predictions.extend(predictions.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
-            all_logits.append(outputs.cpu())
+            all_logits.append(outputs.detach().cpu())  # I78: 使用 detach() 支持 torch.compile
     
     all_predictions = np.array(all_predictions)
     all_labels = np.array(all_labels)
@@ -132,11 +133,11 @@ def diagnose_model_collapse(
     top_prob_classes = torch.argsort(avg_probs, descending=True)[:5]
     for c in top_prob_classes:
         print(f"    类别 {c.item()}: {avg_probs[c].item()*100:.2f}%")
-    
+
     # 检查是否有某个类别概率远超其他
     prob_max = avg_probs.max().item()
     prob_mean = avg_probs.mean().item()
-    
+
     if prob_max > 0.5:  # 50% 以上概率集中在一个类别
         print(f"\n  ⚠️  概率分布异常! 类别 {top_prob_classes[0].item()} 平均概率达到 {prob_max*100:.1f}%")
     
@@ -247,44 +248,45 @@ def diagnose_gradient_flow(model: nn.Module, sample_input: torch.Tensor, sample_
     
     # 反向传播
     loss.backward()
-    
-    # 收集梯度统计
+
+    # 收集梯度统计 (I78: 使用 no_grad 支持 torch.compile)
     grad_stats = []
     zero_grad_layers = []
     nan_grad_layers = []
     small_grad_layers = []
     large_grad_layers = []
-    
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            grad = param.grad
-            grad_norm = grad.norm().item()
-            grad_max = grad.abs().max().item()
-            grad_min = grad.abs().min().item()
-            grad_mean = grad.abs().mean().item()
-            
-            has_nan = torch.isnan(grad).any().item()
-            has_inf = torch.isinf(grad).any().item()
-            is_zero = grad_norm == 0
-            
-            if has_nan or has_inf:
-                nan_grad_layers.append(name)
-            elif is_zero:
-                zero_grad_layers.append(name)
-            elif grad_norm < 1e-8:
-                small_grad_layers.append((name, grad_norm))
-            elif grad_norm > 1000:
-                large_grad_layers.append((name, grad_norm))
-            
-            grad_stats.append({
-                'name': name,
-                'norm': grad_norm,
-                'max': grad_max,
-                'min': grad_min,
-                'mean': grad_mean,
-                'has_nan': has_nan,
-                'has_inf': has_inf,
-            })
+
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                grad = param.grad
+                grad_norm = grad.norm().item()
+                grad_max = grad.abs().max().item()
+                grad_min = grad.abs().min().item()
+                grad_mean = grad.abs().mean().item()
+
+                has_nan = torch.isnan(grad).any().item()
+                has_inf = torch.isinf(grad).any().item()
+                is_zero = grad_norm == 0
+
+                if has_nan or has_inf:
+                    nan_grad_layers.append(name)
+                elif is_zero:
+                    zero_grad_layers.append(name)
+                elif grad_norm < 1e-8:
+                    small_grad_layers.append((name, grad_norm))
+                elif grad_norm > 1000:
+                    large_grad_layers.append((name, grad_norm))
+
+                grad_stats.append({
+                    'name': name,
+                    'norm': grad_norm,
+                    'max': grad_max,
+                    'min': grad_min,
+                    'mean': grad_mean,
+                    'has_nan': has_nan,
+                    'has_inf': has_inf,
+                })
     
     # 报告问题
     total_params = len(grad_stats)
@@ -336,10 +338,11 @@ def diagnose_gradient_flow(model: nn.Module, sample_input: torch.Tensor, sample_
     }
 
 
+@torch.no_grad()
 def diagnose_data_loading(dataloader, num_classes: int, max_batches: int = 10) -> dict:
     """
-    诊断数据加载是否正常。
-    
+    诊断数据加载是否正常 (I78: 添加 no_grad 支持 torch.compile)。
+
     检查:
     1. 数据是否正确归一化
     2. 标签分布是否均匀
