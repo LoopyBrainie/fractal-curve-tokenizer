@@ -592,6 +592,8 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    epoch: int = 0,
+    verbose: bool = True,
 ) -> Tuple[float, float]:
     """训练一个 epoch.
 
@@ -603,7 +605,8 @@ def train_epoch(
     correct = 0
     total = 0
 
-    for images, labels in loader:
+    pbar = tqdm(loader, desc=f"Epoch {epoch} [Train]", disable=not verbose)
+    for i, (images, labels) in enumerate(pbar):
         images, labels = images.to(device), labels.to(device)
 
         optimizer.zero_grad()
@@ -626,6 +629,12 @@ def train_epoch(
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
 
+        # 更新进度条后缀显示当前 loss 和 acc
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'acc': f'{100.*correct/total:.2f}%'
+        })
+
     return total_loss / len(loader), 100.0 * correct / total
 
 
@@ -634,6 +643,8 @@ def evaluate(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
+    epoch: int = 0,
+    verbose: bool = True,
 ) -> Tuple[float, float]:
     """评估模型.
 
@@ -645,7 +656,8 @@ def evaluate(
     correct = 0
     total = 0
 
-    for images, labels in loader:
+    pbar = tqdm(loader, desc=f"Epoch {epoch} [Val]", disable=not verbose)
+    for i, (images, labels) in enumerate(pbar):
         images, labels = images.to(device), labels.to(device)
         outputs = model(images)
         loss = F.cross_entropy(outputs, labels)
@@ -654,6 +666,11 @@ def evaluate(
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
+
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'acc': f'{100.*correct/total:.2f}%'
+        })
 
     return total_loss / len(loader), 100.0 * correct / total
 
@@ -744,8 +761,8 @@ def run_experiment(
             for param_group in optimizer.param_groups:
                 param_group['lr'] = config.learning_rate * (epoch + 1) / config.warmup_epochs
 
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, device, scaler)
-        val_loss, val_acc = evaluate(model, val_loader, device)
+        train_loss, train_acc = train_epoch(model, train_loader, optimizer, device, scaler, epoch=epoch, verbose=verbose)
+        val_loss, val_acc = evaluate(model, val_loader, device, epoch=epoch, verbose=verbose)
 
         # 更新学习率
         if epoch >= config.warmup_epochs:

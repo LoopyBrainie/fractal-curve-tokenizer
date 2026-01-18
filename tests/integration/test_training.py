@@ -43,7 +43,14 @@ class DummyPositional(nn.Module):
         self.dim = dim
         self.called = False
 
-    def forward(self, levels_info: torch.Tensor, sequence_positions: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        levels_info: torch.Tensor,
+        sequence_positions: torch.Tensor | None = None,
+        *,
+        regions: torch.Tensor | None = None,
+        image_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
         self.called = True
         if levels_info.numel() == 0:
             return torch.zeros(0, self.dim, device=levels_info.device)
