@@ -463,12 +463,12 @@ class StandardViT(nn.Module):
         # [B, dim, h_patches, w_patches] -> [B, num_patches, dim]
         x = rearrange(x, 'b d h w -> b (h w) d')
 
-        # 添加位置编码
-        x = x + self.pos_embedding[:, :self.num_patches + 1]
-
-        # 多次迭代后添加 cls token
+        # 添加 cls token (标准 ViT 做法: prepend cls_token)
         cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=x.shape[0])
-        x = torch.cat([cls_tokens, x], dim=1)
+        x = torch.cat([cls_tokens, x], dim=1)  # [B, num_patches+1, dim]
+
+        # 添加位置编码 (在 cls_token 之后)
+        x = x + self.pos_embedding[:, :x.shape[1]]
 
         x = self.transformer(x)
 
