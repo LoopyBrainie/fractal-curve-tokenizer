@@ -18,7 +18,7 @@ Hilbert vs Raster 消融实验 (I25-2)
 默认配置 (v3.0 2026-01-18):
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ 模型: dim=384, depth=12 → P=32.7M (Tiny-ImageNet 调优)                       │
-│ 动态分辨率: image_size=None, min_patch_size=4 → max_depth=4                  │
+│ 动态分辨率: image_size=64, min_patch_size=4 → max_depth=4                    │
 │ Token: K∈[16,64] (4:1 压缩比)                                               │
 │ I31: use_area_encoding=True, fourier_levels=4                              │
 │ I78 优化: channels-last ✓, torch.compile ✓                                  │
@@ -54,9 +54,10 @@ import sys
 import time
 import urllib.request
 import zipfile
+import shutil
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from tqdm import tqdm
 
 import numpy as np
@@ -78,452 +79,54 @@ from vit_pytorch import FractalCurveViT
 
 
 # ============================================================================
-# 自定义数据集：Tiny-ImageNet 验证集 (Format A: 使用 val_annotations.txt)
+# 数据集加载 (复用 examples/training/train_fractal_vit.py 的方法)
 # ============================================================================
 
-class TinyImageNetValDataset(Dataset):
-    """Tiny-ImageNet 验证集 (Format A)
+def organize_tiny_imagenet_val_set(val_dir: Path) -> None:
+    """组织 Tiny-ImageNet 验证集为 ImageFolder 兼容格式
 
-    验证集结构: val/images/*.JPEG + val_annotations.txt
-    需要从 val_annotations.txt 读取正确的类别标签，而不是使用目录名
+    原始结构: val/images/*.JPEG + val/val_annotations.txt
+    目标结构: val/类别名/images/*.JPEG
+
+    这是 examples/training/train_fractal_vit.py 中验证集准备的标准方法
     """
-
-    def __init__(self, root: str, transform=None, debug: bool = False):
-        self.root = Path(root)
-        self.transform = transform
-        self.debug = debug
-
-        # 读取 val_annotations.txt 获取正确的标签映射
-        # 格式: filename \t class_id \t x \t y \t w \t h
-        annotations_file = self.root / "val_annotations.txt"
-        self.samples = []  # (image_path, class_idx)
-        self.class_to_idx = {}
-
-        if not annotations_file.exists():
-            raise FileNotFoundError(f"val_annotations.txt not found at {annotations_file}")
-
-        if self.debug:
-            print(f"[DEBUG] Scanning: {self.root}")
-            print(f"[DEBUG] Annotations file: {annotations_file}")
-
-        # 预扫描所有子目录名（处理目录名与 class_id 不同的情况）
-        subdirs = {d.name: d for d in self.root.iterdir() if d.is_dir()}
-
-        if self.debug:
-            print(f"[DEBUG] Found subdirs: {list(subdirs.keys())[:5]}... (total: {len(subdirs)})")
-
-        # 查找 images 子目录（用于查找文件）
-        images_dir = None
-        if 'images' in subdirs:
-            images_dir = subdirs['images']
-        else:
-            # 尝试直接查找 images 目录
-            potential_images = self.root / "images"
-            if potential_images.exists():
-                images_dir = potential_images
-
-        if self.debug and images_dir:
-            print(f"[DEBUG] Images directory: {images_dir}")
-
-        samples_found = 0
-        with open(annotations_file, 'r') as f:
-            for line in f:
-                parts = line.strip().split('\t')
-                if len(parts) >= 2:
-                    filename = parts[0]
-                    class_id = parts[1]
-
-                    # 建立 class_id 到索引的映射
-                    if class_id not in self.class_to_idx:
-                        self.class_to_idx[class_id] = len(self.class_to_idx)
-
-                    # 图片路径: val/images/文件名 (所有图片在同一目录)
-                    # 根据 val_annotations.txt 中的 class_id 确定标签
-                    img_path = None
-                    if images_dir:
-                        img_path = images_dir / filename
-
-                    if self.debug and samples_found < 3 and img_path:
-                        print(f"[DEBUG] Found: {img_path} (exists: {img_path.exists()})")
-
-                    if img_path is not None and img_path.exists():
-                        class_idx = self.class_to_idx[class_id]
-                        # 转换为字符串路径
-                        self.samples.append((str(img_path), class_idx))
-                        samples_found += 1
-
-        if self.debug:
-            print(f"[DEBUG] Loaded {samples_found} samples from validation set")
-
-        # 创建 classes 列表
-        self.classes = [None] * len(self.class_to_idx)
-        for class_id, idx in self.class_to_idx.items():
-            self.classes[idx] = class_id
-
-        # 如果 samples 为空，尝试回退到 ImageFolder
-        if len(self.samples) == 0:
-            if self.debug:
-                print("[DEBUG] Custom parsing failed, falling back to ImageFolder")
-            self._fallback_to_imagefolder()
-
-    def _fallback_to_imagefolder(self):
-        """回退方案：使用 ImageFolder (仅当 class_id 与目录名匹配时有效)"""
-        try:
-            from torchvision import datasets
-            fallback_ds = datasets.ImageFolder(str(self.root))
-            self.samples = fallback_ds.samples
-            self.classes = fallback_ds.classes
-            if self.debug:
-                print(f"[DEBUG] Fallback loaded {len(self.samples)} samples")
-        except Exception as e:
-            if self.debug:
-                print(f"[DEBUG] Fallback also failed: {e}")
-            raise ValueError(f"Cannot load validation set! Annotations parsing failed and fallback also failed.")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        img_path, target = self.samples[idx]
-
-        # 读取图片
-        img = datasets.folder.default_loader(img_path)
-
-        if self.transform is not None:
-            img = self.transform(img)
-
-        return img, target
-
-
-# ============================================================================
-# Standard ViT 基线模型 (参考: https://github.com/lucidrains/vit-pytorch)
-# ============================================================================
-
-class FeedForward(nn.Module):
-    """前馈网络 (GELU 激活)."""
-
-    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.25):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class Attention(nn.Module):
-    """多头自注意力机制."""
-
-    def __init__(self, dim: int, heads: int = 8, dim_head: int = 64, dropout: float = 0.25):
-        super().__init__()
-        inner_dim = dim_head * heads
-        project_out = not (heads == 1 and dim_head == dim)
-
-        self.heads = heads
-        self.scale = dim_head ** -0.5
-
-        self.norm = nn.LayerNorm(dim)
-        self.attend = nn.Softmax(dim=-1)
-        self.dropout = nn.Dropout(dropout)
-
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
-
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout),
-        ) if project_out else nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.norm(x)
-
-        qkv = self.to_qkv(x).chunk(3, dim=-1)
-        q, k, v = map(
-            lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.heads), qkv
-        )
-
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-
-        attn = self.attend(dots)
-        attn = self.dropout(attn)
-
-        out = torch.matmul(attn, v)
-        out = rearrange(out, "b h n d -> b n (h d)")
-        return self.to_out(out)
-
-
-class Transformer(nn.Module):
-    """Transformer 编码器."""
-
-    def __init__(
-        self,
-        dim: int,
-        depth: int,
-        heads: int,
-        dim_head: int,
-        mlp_dim: int,
-        dropout: float = 0.25,
-    ):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.layers = nn.ModuleList([])
-
-        for _ in range(depth):
-            self.layers.append(
-                nn.ModuleList(
-                    [
-                        Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout),
-                        FeedForward(dim, mlp_dim, dropout=dropout),
-                    ]
-                )
-            )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for attn, ff in self.layers:
-            x = attn(x) + x
-            x = ff(x) + x
-
-        return self.norm(x)
-
-
-class StandardViT(nn.Module):
-    """标准 Vision Transformer (固定 patch 大小).
-
-    参考: https://github.com/lucidrains/vit-pytorch
-
-    特点:
-    - 固定 16x16 patch 划分
-    - 可学习位置编码
-    - CLS token 用于分类
-    - GELU 激活函数
-
-    参数量级别与 Fractal ViT 相当 (~31M)，用于公平对比。
-    """
-
-    def __init__(
-        self,
-        image_size: int = 64,
-        patch_size: int = 16,
-        in_channels: int = 3,
-        num_classes: int = 200,
-        dim: int = 320,
-        depth: int = 12,
-        heads: int = 8,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.25,
-    ):
-        super().__init__()
-
-        self.image_size = image_size
-        self.patch_size = patch_size
-        self.dim = dim
-
-        # 验证图像尺寸可被 patch 整除
-        assert image_size % patch_size == 0, "图像尺寸必须能被 patch 大小整除"
-
-        # Patch 数量和维度
-        num_patches = (image_size // patch_size) ** 2
-
-        # Patch 嵌入 (使用 Conv2d，展平 + LayerNorm)
-        self.conv = nn.Conv2d(in_channels, dim, kernel_size=patch_size, stride=patch_size)
-        self.ln = nn.LayerNorm(dim)
-
-        # 位置编码和 CLS token
-        self.pos_embedding = nn.Parameter(
-            torch.randn(1, num_patches + 1, dim) * 0.02
-        )
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-
-        # Dropout
-        self.dropout = nn.Dropout(dropout)
-
-        # Transformer 编码器
-        mlp_dim = int(dim * mlp_ratio)
-        self.transformer = Transformer(
-            dim, depth, heads, dim // heads, mlp_dim, dropout
-        )
-
-        # 分类头
-        self.mlp_head = nn.Linear(dim, num_classes)
-
-        # 初始化权重
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.normal_(self.pos_embedding, std=0.02)
-        nn.init.normal_(self.cls_token, std=0.02)
-        nn.init.zeros_(self.mlp_head.weight)
-        nn.init.zeros_(self.mlp_head.bias)
-
-    def forward(self, img: torch.Tensor) -> torch.Tensor:
-        batch = img.shape[0]
-
-        # Patch 嵌入: Conv2d [B, 3, 64, 64] -> [B, dim, h, w]
-        x = self.conv(img)  # [B, dim, h, w]
-        # 展平: [B, dim, h, w] -> [B, dim, h*w]
-        x = x.flatten(2)
-        # 转置: [B, dim, h*w] -> [B, h*w, dim]
-        x = x.transpose(1, 2)
-        x = self.ln(x)
-
-        # 添加 CLS token
-        cls_tokens = self.cls_token.expand(batch, -1, -1)  # [B, 1, dim]
-        x = torch.cat((cls_tokens, x), dim=1)
-
-        # 添加位置编码
-        seq_len = x.shape[1]
-        x = x + self.pos_embedding[:, :seq_len]
-        x = self.dropout(x)
-
-        # Transformer 编码
-        x = self.transformer(x)
-
-        # 分类
-        x = x[:, 0]
-        return self.mlp_head(x)
-
-
-# ============================================================================
-# 实验配置
-# ============================================================================
-
-@dataclass
-class ExperimentConfig:
-    """消融实验配置
-
-    I78 动态分辨率:
-    - image_size=None 表示使用动态分辨率，max_depth 由 min_patch_size 自动计算
-    - max_depth = floor(log2(min(H, W) / min_patch_size))
-
-    I31 面积编码:
-    - use_area_encoding=True 启用位置编码增强
-    - fourier_levels=4 控制傅里叶特征级别数
-
-    默认配置优化:
-    - channels-last: 默认启用 (CUDA 环境)
-    - compile: 默认启用 (首次运行后加速)
-    - 适合 RTX 4070 (8GB VRAM) 的 batch_size=64
-    """
-    name: str
-    mode: str  # 'standard', 'hilbert', 'raster'
-    description: str
-
-    # 模型超参数 (最佳实践 - Tiny-ImageNet 调优)
-    dim: int = 384
-    depth: int = 12
-    heads: int = 8
-    mlp_ratio: float = 4.0
-
-    # 正则化 (最佳实践 - I30-3)
-    dropout: float = 0.2
-    drop_path: float = 0.2
-    weight_decay: float = 0.1
-
-    # 训练超参数 (适合 8GB VRAM)
-    epochs: int = 100
-    batch_size: int = 64
-    learning_rate: float = 1e-3
-    min_lr: float = 1e-6
-    warmup_epochs: int = 5
-
-    # 数据集
-    image_size: int = 64
-    num_classes: int = 200
-
-    # I78 动态分辨率 Tokenizer 配置
-    min_patch_size: int = 4  # 最小 patch 大小
-    K_min: int = 16          # Token 数量下限 (信息论: log2(200) × 2 ≈ 16)
-    K_max: int = 64          # Token 数量上限 (4:1 压缩比)
-
-    # I31 面积编码配置 (2026-01-18)
-    use_area_encoding: bool = True
-    fourier_levels: int = 4
-
-    # 性能优化 (I78 - 默认启用)
-    use_channels_last: bool = True   # channels-last 内存格式 (~20% VRAM 节省)
-    use_compile: bool = True         # torch.compile 优化 (~30% 训练加速)
-
-    def __post_init__(self):
-        if self.mode not in ['standard', 'hilbert', 'raster']:
-            raise ValueError(f"Unknown mode: {self.mode}")
-
-
-@dataclass
-class RunResult:
-    """单次运行结果"""
-    run_id: int
-    mode: str
-    seed: int
-
-    # 训练指标
-    train_losses: List[float] = field(default_factory=list)
-    train_accs: List[float] = field(default_factory=list)
-    val_losses: List[float] = field(default_factory=list)
-    val_accs: List[float] = field(default_factory=list)
-
-    # 最终指标
-    best_val_acc: float = 0.0
-    best_epoch: int = 0
-    final_val_acc: float = 0.0
-
-    # 计算指标
-    total_params: int = 0
-    avg_epoch_time: float = 0.0
-    throughput: float = 0.0
-
-
-@dataclass
-class ModeResult:
-    """单个模式的聚合结果"""
-    mode: str
-    results: List[RunResult] = field(default_factory=list)
-
-    # 聚合统计
-    mean_acc: float = 0.0
-    std_acc: float = 0.0
-    best_acc: float = 0.0
-    ci_95: Tuple[float, float] = (0.0, 0.0)
-
-
-# ============================================================================
-# 数据集下载工具 (从 train_fractal_vit.py 复制)
-# ============================================================================
-
-def download_with_progress(url: str, dest: Path, desc: str = "Downloading") -> bool:
-    """带进度条的下载函数"""
-    try:
-        with urllib.request.urlopen(url, timeout=30) as response:
-            total_size = int(response.headers.get('Content-Length', 0))
-
-        downloaded = 0
-        block_size = 8192
-
-        with urllib.request.urlopen(url, timeout=30) as response:
-            with open(dest, 'wb') as f:
-                with tqdm(total=total_size, unit='B', unit_scale=True, desc=desc) as pbar:
-                    while True:
-                        buffer = response.read(block_size)
-                        if not buffer:
-                            break
-                        f.write(buffer)
-                        downloaded += len(buffer)
-                        pbar.update(len(buffer))
-
-        return True
-    except Exception as e:
-        print(f"\n[ERROR] Download failed: {e}")
-        if dest.exists():
-            dest.unlink()
-        return False
+    val_images_dir = val_dir / "images"
+
+    if not val_images_dir.exists():
+        return  # 已经组织好了
+
+    val_annotations = val_dir / "val_annotations.txt"
+    if not val_annotations.exists():
+        print("[WARN] val_annotations.txt not found, skipping validation set organization")
+        return
+
+    print("[INFO] Organizing validation set by class...")
+
+    # 读取标注
+    with open(val_annotations, 'r') as f:
+        lines = f.readlines()
+
+    # 按类别组织
+    for line in tqdm(lines, desc="Organizing"):
+        parts = line.strip().split('\t')
+        if len(parts) >= 2:
+            img_name, class_id = parts[0], parts[1]
+            class_dir = val_dir / class_id / "images"
+            class_dir.mkdir(parents=True, exist_ok=True)
+            src = val_images_dir / img_name
+            dst = class_dir / img_name
+            if src.exists() and not dst.exists():
+                shutil.move(str(src), str(dst))
+
+    # 删除原始 images 文件夹
+    if val_images_dir.exists():
+        shutil.rmtree(val_images_dir)
+
+    print("[OK] Validation set organized")
 
 
 def download_tiny_imagenet(data_root: Path) -> bool:
-    """下载并设置 Tiny ImageNet (从 train_fractal_vit.py 复制)
+    """下载并设置 Tiny ImageNet (从 examples/training/train_fractal_vit.py 复制)
 
     数据集信息:
     - 200 类，每类 500 张训练图像
@@ -538,6 +141,8 @@ def download_tiny_imagenet(data_root: Path) -> bool:
         val_has_classes = any((target_dir / "val").iterdir())
         if train_classes >= 200 and val_has_classes:
             print(f"[OK] Tiny ImageNet already exists at {target_dir}")
+            # 自动组织验证集
+            organize_tiny_imagenet_val_set(target_dir / "val")
             return True
 
     print("\n" + "="*60)
@@ -604,25 +209,73 @@ def download_tiny_imagenet(data_root: Path) -> bool:
         # 验证解压结果
         if not (target_dir / "train").exists():
             raise FileNotFoundError("train directory not found after extraction")
-        if not (target_dir / "val").exists():
-            raise FileNotFoundError("val directory not found after extraction")
 
-        return True
+        # 自动组织验证集
+        organize_tiny_imagenet_val_set(target_dir / "val")
+
+        # 验证
+        train_classes = len(list((target_dir / "train").iterdir()))
+        val_classes = len([d for d in (target_dir / "val").iterdir() if d.is_dir()])
+        print(f"\n[OK] Dataset ready:")
+        print(f"  Train classes: {train_classes}")
+        print(f"  Val classes: {val_classes}")
+
+        # 清理 zip
+        if zip_path.exists():
+            zip_path.unlink()
+            print("[OK] Cleaned up zip file")
+
     except Exception as e:
-        print(f"\n[ERROR] Extraction failed: {e}")
+        print(f"[ERROR] Extraction failed: {e}")
         return False
 
+    return True
 
-# ============================================================================
-# 数据加载
-# ============================================================================
+
+def download_with_progress(url: str, dest: Path, name: str) -> bool:
+    """带进度条下载"""
+    try:
+        print(f"[*] Downloading {name}...")
+
+        # 设置请求头模拟浏览器
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+
+        with urllib.request.urlopen(req, timeout=300) as response:
+            total_size = int(response.headers.get('Content-Length', 0))
+            block_size = 8192
+
+            with open(dest, 'wb') as f:
+                downloaded = 0
+                while True:
+                    buffer = response.read(block_size)
+                    if not buffer:
+                        break
+                    downloaded += len(buffer)
+                    f.write(buffer)
+
+                    if total_size > 0:
+                        percent = 100.0 * downloaded / total_size
+                        print(f"\r  Progress: {percent:.1f}% ({downloaded/1024/1024:.1f}MB)",
+                              end='', flush=True)
+
+        print()  # 换行
+        return dest.exists() and dest.stat().st_size > 0
+
+    except Exception as e:
+        print(f"  Error: {e}")
+        if dest.exists():
+            dest.unlink()
+        return False
+
 
 def get_tiny_imagenet_loaders(
     batch_size: int = 64,
     image_size: int = 64,
     num_workers: int = 4,
 ) -> Tuple[DataLoader, DataLoader, int]:
-    """获取 Tiny-ImageNet 数据加载器 (复用 train_fractal_vit.py 的数据增强策略)
+    """获取 Tiny-ImageNet 数据加载器 (复用 examples/training/train_fractal_vit.py 的方法)
 
     Returns:
         train_loader, val_loader, num_classes
@@ -630,15 +283,15 @@ def get_tiny_imagenet_loaders(
     data_root = PROJECT_ROOT / "data"
     data_root.mkdir(exist_ok=True)
 
-    # 下载数据集
+    # 下载数据集 (自动组织验证集)
     if not download_tiny_imagenet(data_root):
         raise FileNotFoundError("Failed to download Tiny ImageNet")
 
     tiny_imagenet_dir = data_root / "tiny-imagenet-200"
 
-    # 数据增强 (与 train_fractal_vit.py 一致)
-    mean = [0.4802, 0.4481, 0.3975]
-    std = [0.2302, 0.2265, 0.2262]
+    # 数据增强 (与 examples/training/train_fractal_vit.py 一致)
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
 
     train_tf = transforms.Compose([
         transforms.RandomHorizontalFlip(p=0.5),
@@ -655,17 +308,12 @@ def get_tiny_imagenet_loaders(
         transforms.Normalize(mean, std),
     ])
 
-    # 加载数据集
+    # 加载数据集 (直接使用 ImageFolder，验证集已自动组织)
     train_dir = tiny_imagenet_dir / "train"
     val_dir = tiny_imagenet_dir / "val"
 
-    # 训练集使用 ImageFolder (Format B: train/类别名/images/*.JPEG)
     train_ds = datasets.ImageFolder(str(train_dir), transform=train_tf)
-
-    # 验证集使用自定义数据集 (Format A: val_annotations.txt 中有正确的类别标签)
-    # 注意: ImageFolder 会错误地将目录名作为标签，需要使用 val_annotations.txt
-    # 启用 debug 模式以诊断加载问题
-    val_ds = TinyImageNetValDataset(str(val_dir), transform=val_tf, debug=True)
+    val_ds = datasets.ImageFolder(str(val_dir), transform=val_tf)
 
     train_loader = DataLoader(
         train_ds,
@@ -692,7 +340,265 @@ def get_tiny_imagenet_loaders(
     if len(val_ds) == 0:
         raise ValueError("验证集为空!")
 
+    print(f"[INFO] Dataset loaded: train={len(train_ds)}, val={len(val_ds)}")
+
     return train_loader, val_loader, 200
+
+
+# ============================================================================
+# Standard ViT 基线模型 (参考: https://github.com/lucidrains/vit-pytorch)
+# ============================================================================
+
+class FeedForward(nn.Module):
+    """前馈网络 (GELU 激活)."""
+
+    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.25):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class Attention(nn.Module):
+    """多头自注意力."""
+
+    def __init__(self, dim: int, heads: int, dim_head: int, dropout: float = 0.25):
+        super().__init__()
+        inner_dim = dim_head * heads
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        self.norm = nn.LayerNorm(dim)
+        self.attend = nn.Softmax(dim=-1)
+        self.dropout = nn.Dropout(dropout)
+
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.norm(x)
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), qkv)
+
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn = self.attend(dots)
+        attn = self.dropout(attn)
+
+        out = torch.matmul(attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+
+
+class Transformer(nn.Module):
+    """Transformer 编码器."""
+
+    def __init__(self, dim: int, depth: int, heads: int, dim_head: int, mlp_ratio: float, dropout: float = 0.25):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.layers = nn.ModuleList([])
+        hidden_dim = int(dim * mlp_ratio)
+
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                Attention(dim, heads, dim_head, dropout),
+                FeedForward(dim, hidden_dim, dropout),
+            ]))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for attn, ff in self.layers:
+            x = x + attn(x)
+            x = x + ff(x)
+
+        return self.norm(x)
+
+
+class StandardViT(nn.Module):
+    """标准 ViT 基线模型."""
+
+    def __init__(
+        self,
+        image_size: int,
+        patch_size: int,
+        num_classes: int,
+        dim: int,
+        depth: int,
+        heads: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.25,
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.num_patches = (image_size // patch_size) ** 2
+
+        self.to_patch_embedding = nn.Sequential(
+            nn.Conv2d(3, dim, patch_size, patch_size),
+            nn.Flatten(2),
+        )
+
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.num_patches + 1, dim))
+
+        self.transformer = Transformer(
+            dim=dim,
+            depth=depth,
+            heads=heads,
+            dim_head=dim // heads,
+            mlp_ratio=mlp_ratio,
+            dropout=dropout,
+        )
+
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [B, 3, H, W] -> [B, dim, h_patches, w_patches]
+        x = self.to_patch_embedding(x)
+        # [B, dim, h_patches, w_patches] -> [B, num_patches, dim]
+        x = rearrange(x, 'b d h w -> b (h w) d')
+
+        # 添加位置编码
+        x = x + self.pos_embedding[:, :self.num_patches + 1]
+
+        # 多次迭代后添加 cls token
+        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=x.shape[0])
+        x = torch.cat([cls_tokens, x], dim=1)
+
+        x = self.transformer(x)
+
+        # 分类
+        return self.mlp_head(x[:, 0])
+
+
+# ============================================================================
+# 实验配置
+# ============================================================================
+
+@dataclass
+class ExperimentConfig:
+    """消融实验配置
+
+    I78 动态分辨率:
+    - image_size=64 表示固定分辨率
+    - max_depth = floor(log2(64/4)) = 4
+
+    I31 面积编码:
+    - use_area_encoding=True 启用位置编码增强
+    - fourier_levels=4 控制傅里叶特征级别数
+
+    默认配置优化:
+    - channels-last: 默认启用 (CUDA 环境)
+    - compile: 默认启用 (首次运行后加速)
+    - 适合 RTX 4070 (8GB VRAM) 的 batch_size=64
+    """
+    name: str
+    mode: str  # 'standard', 'hilbert', 'raster'
+    description: str
+
+    # 模型超参数 (最佳实践 - Tiny-ImageNet 调优)
+    dim: int = 384
+    depth: int = 12
+    heads: int = 8
+    mlp_ratio: float = 4.0
+
+    # 正则化 (最佳实践 - I30-3)
+    dropout: float = 0.2
+    drop_path: float = 0.2
+    weight_decay: float = 0.1
+
+    # 训练超参数 (适合 8GB VRAM)
+    epochs: int = 100
+    batch_size: int = 64
+    learning_rate: float = 1e-3
+    min_lr: float = 1e-6
+    warmup_epochs: int = 5
+
+    # 数据集
+    image_size: int = 64
+    num_classes: int = 200
+
+    # I78 动态分辨率 Tokenizer 配置
+    min_patch_size: int = 4  # 最小 patch 大小
+    K_min: int = 16          # Token 数量下限 (信息论: log2(200) × 2 ≈ 16)
+    K_max: int = 64          # Token 数量上限 (4:1 压缩比)
+
+    # I31 面积编码配置 (2026-01-18)
+    use_area_encoding: bool = True
+    fourier_levels: int = 4
+
+    # 性能优化 (I78 - 默认启用)
+    use_channels_last: bool = True   # channels-last 内存格式 (~20% VRAM 节省)
+    use_compile: bool = True         # torch.compile 优化 (~30% 训练加速)
+
+    def __post_init__(self):
+        if self.mode not in ['standard', 'hilbert', 'raster']:
+            raise ValueError(f"Unknown mode: {self.mode}")
+
+
+@dataclass
+class RunResult:
+    """单次运行结果"""
+    run_id: int
+    mode: str
+    seed: int
+
+    # 动态字段
+    train_losses: List[float] = field(default_factory=list)
+    train_accs: List[float] = field(default_factory=list)
+    val_losses: List[float] = field(default_factory=list)
+    val_accs: List[float] = field(default_factory=list)
+
+    # 汇总字段
+    best_val_acc: float = 0.0
+    best_epoch: int = 0
+    final_val_acc: float = 0.0
+    avg_epoch_time: float = 0.0
+    throughput: float = 0.0
+    total_params: int = 0
+
+
+@dataclass
+class ModeStatistics:
+    """某个模式的统计结果"""
+    results: List[RunResult]
+
+    @property
+    def mean_val_acc(self) -> float:
+        return np.mean([r.best_val_acc for r in self.results])
+
+    @property
+    def std_val_acc(self) -> float:
+        return np.std([r.best_val_acc for r in self.results])
+
+    @property
+    def mean_train_acc(self) -> float:
+        return np.mean([r.train_accs[-1] if r.train_accs else 0 for r in self.results])
+
+    @property
+    def mean_epoch_time(self) -> float:
+        return np.mean([r.avg_epoch_time for r in self.results])
+
+    @property
+    def throughput(self) -> float:
+        return np.mean([r.throughput for r in self.results])
+
+    @property
+    def best_epoch(self) -> int:
+        epochs = [r.best_epoch for r in self.results]
+        return int(np.mean(epochs)) if epochs else 0
+
+    @property
+    def total_params(self) -> int:
+        return self.results[0].total_params if self.results else 0
 
 
 # ============================================================================
@@ -706,14 +612,6 @@ def create_model(config: ExperimentConfig) -> nn.Module:
     - Standard ViT: 参数量/计算量与 Fractal ViT 同级别 (公平对比基础)
     - Hilbert vs Raster: 唯一区别是 use_hilbert_encoding=True/False (严格控制变量)
 
-    I78 动态分辨率:
-    - image_size=None 表示使用动态分辨率
-    - max_depth = floor(log2(64/4)) = 4 (64x64 图像, min_patch_size=4)
-
-    I31 面积编码:
-    - use_area_encoding=True 启用位置编码增强
-    - fourier_levels=4 控制傅里叶特征级别数
-
     Args:
         config: 实验配置
 
@@ -721,11 +619,10 @@ def create_model(config: ExperimentConfig) -> nn.Module:
         模型实例
     """
     if config.mode == 'standard':
-        # Standard ViT 基线
-        # 参数量级别: ~31M (与 Fractal ViT 相当)
+        # Standard ViT 基线 (参数量与 Fractal ViT 同级别)
         return StandardViT(
             image_size=config.image_size,
-            patch_size=16,  # 固定 16x16 patch
+            patch_size=16,  # 标准 16x16 patch
             num_classes=config.num_classes,
             dim=config.dim,
             depth=config.depth,
@@ -736,8 +633,8 @@ def create_model(config: ExperimentConfig) -> nn.Module:
     else:
         # FractalCurveViT (I78 动态分辨率 + I31 面积编码)
         # Hilbert vs Raster: 唯一区别 use_hilbert_encoding
-        model = FractalCurveViT(
-            image_size=None,  # I78: 动态分辨率，自动计算 max_depth
+        return FractalCurveViT(
+            image_size=config.image_size,
             num_classes=config.num_classes,
             dim=config.dim,
             depth=config.depth,
@@ -758,11 +655,10 @@ def create_model(config: ExperimentConfig) -> nn.Module:
             # 核心变量: 排序方式 (Hilbert vs Raster)
             use_hilbert_encoding=(config.mode == 'hilbert'),
         )
-        return model
 
 
 # ============================================================================
-# 训练与评估
+# 训练与评估 (复用 examples/training/trainer/__init__.py 的 ModularTrainer.validate)
 # ============================================================================
 
 def set_seed(seed: int):
@@ -770,6 +666,120 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
+
+
+def train_one_epoch(
+    model: nn.Module,
+    train_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    use_amp: bool = True,
+    accumulation_steps: int = 1,
+) -> Tuple[float, float]:
+    """单轮训练 (参考 ModularTrainer.train_epoch)
+
+    Returns:
+        (avg_loss, accuracy)
+    """
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    scaler = GradScaler('cuda') if use_amp else None
+
+    for batch_idx, (images, labels) in enumerate(train_loader):
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        # I78: 保持 channels-last 格式
+        if images.dim() == 4:
+            images = images.to(memory_format=torch.channels_last)
+
+        optimizer.zero_grad()
+
+        if scaler is not None:
+            with autocast('cuda', enabled=True):
+                outputs = model(images)
+                loss = F.cross_entropy(outputs, labels)
+                loss = loss / accumulation_steps
+
+            scaler.scale(loss).backward()
+
+            if (batch_idx + 1) % accumulation_steps == 0:
+                if accumulation_steps > 1:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+        else:
+            outputs = model(images)
+            loss = F.cross_entropy(outputs, labels)
+            loss = loss / accumulation_steps
+            loss.backward()
+
+            if (batch_idx + 1) % accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+        # 统计
+        batch_loss = loss.detach().item() * accumulation_steps
+        total_loss += batch_loss
+
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+
+    avg_loss = total_loss / len(train_loader)
+    accuracy = 100.0 * correct / total
+
+    return avg_loss, accuracy
+
+
+@torch.no_grad()
+def validate(
+    model: nn.Module,
+    val_loader: DataLoader,
+    device: torch.device,
+) -> Tuple[float, float, float]:
+    """验证 (完全复制 examples/training/trainer/__init__.py ModularTrainer.validate)
+
+    关键点:
+    1. 验证禁用 AMP (autocast enabled=False) - 确保指标精度
+    2. 使用 detach().item() - 支持 torch.compile
+    3. 禁用 channels-last - 避免精度问题
+
+    Returns:
+        (avg_loss, accuracy, num_batches)
+    """
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    num_batches = 0
+
+    for images, labels in val_loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        # 验证禁用 AMP 以确保指标精度 (I78: 使用 detach().item() 支持 torch.compile)
+        with autocast(device_type=device.type, enabled=False):
+            outputs = model(images)
+            loss = F.cross_entropy(outputs, labels)
+
+        total_loss += loss.detach().item()
+        num_batches += 1
+
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+
+    avg_loss = total_loss / max(num_batches, 1)
+    accuracy = 100.0 * correct / total
+
+    return avg_loss, accuracy, num_batches
 
 
 def run_experiment(
@@ -839,18 +849,13 @@ def run_experiment(
         weight_decay=config.weight_decay,
     )
 
-    # 学习率调度 (余弦退火 + Warmup)
+    # 学习率调度器
     scheduler = CosineAnnealingWarmRestarts(
         optimizer,
         T_0=config.epochs,
         T_mult=1,
         eta_min=config.min_lr,
     )
-
-    # 混合精度训练 (如果可用)
-    scaler = None
-    if device.type == 'cuda':
-        scaler = GradScaler('cuda')
 
     # 结果记录
     result = RunResult(run_id=run_id, mode=config.mode, seed=seed)
@@ -869,86 +874,22 @@ def run_experiment(
             for param_group in optimizer.param_groups:
                 param_group['lr'] = config.learning_rate * (epoch + 1) / config.warmup_epochs
 
-        # 训练
-        model.train()
-        total_loss = 0.0
-        correct = 0
-        total = 0
+        # 训练 (参考 ModularTrainer.train_epoch)
+        train_loss, train_acc = train_one_epoch(
+            model=model,
+            train_loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            use_amp=(device.type == 'cuda'),
+            accumulation_steps=1,
+        )
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs} [Train]", disable=not verbose)
-        for images, labels in pbar:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-
-            # I78: 保持 channels-last 格式
-            if images.dim() == 4:
-                images = images.to(memory_format=torch.channels_last)
-
-            optimizer.zero_grad()
-
-            if scaler is not None:
-                with autocast('cuda', enabled=(device.type == 'cuda')):
-                    outputs = model(images)
-                    loss = F.cross_entropy(outputs, labels)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                outputs = model(images)
-                loss = F.cross_entropy(outputs, labels)
-                loss.backward()
-                optimizer.step()
-
-            total_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'acc': f'{100.*correct/total:.2f}%'
-            })
-
-        train_loss = total_loss / len(train_loader)
-        train_acc = 100.0 * correct / total
-
-        # 验证 (参考 ModularTrainer.validate 实现)
-        model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-        num_val_batches = 0
-
-        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{config.epochs} [Val]", disable=not verbose)
-        with torch.no_grad():
-            for images, labels in val_pbar:
-                images = images.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
-
-                # I78: 保持 channels-last 格式
-                if images.dim() == 4:
-                    images = images.to(memory_format=torch.channels_last)
-
-                # 验证禁用 AMP 以确保指标精度 (参考 ModularTrainer)
-                with autocast(device_type=device.type, enabled=False):
-                    outputs = model(images)
-                    loss = F.cross_entropy(outputs, labels)
-
-                # I78: 使用 detach().item() 支持 torch.compile
-                val_loss += loss.detach().item()
-                num_val_batches += 1
-
-                _, predicted = outputs.max(1)
-                val_total += labels.size(0)
-                val_correct += predicted.eq(labels).sum().item()
-
-                val_pbar.set_postfix({
-                    'loss': f'{loss.detach().item():.4f}',
-                    'acc': f'{100.*val_correct/val_total:.2f}%'
-                })
-
-        val_loss = val_loss / max(num_val_batches, 1)
-        val_acc = 100.0 * val_correct / val_total
+        # 验证 (完全复制 ModularTrainer.validate)
+        val_loss, val_acc, num_batches = validate(
+            model=model,
+            val_loader=val_loader,
+            device=device,
+        )
 
         # 更新学习率
         if epoch >= config.warmup_epochs:
@@ -998,232 +939,58 @@ def run_experiment(
 # 统计分析
 # ============================================================================
 
-def compute_mode_statistics(results: List[RunResult]) -> ModeResult:
-    """计算单个模式的统计信息.
+def compute_mode_statistics(results: List[RunResult]) -> ModeStatistics:
+    """计算某个模式的统计结果"""
+    return ModeStatistics(results=results)
+
+
+def analyze_results(mode_results: Dict[str, ModeStatistics]) -> Dict[str, Dict[str, Any]]:
+    """分析实验结果
 
     Args:
-        results: 该模式下所有运行的结果
+        mode_results: {mode: ModeStatistics}
 
     Returns:
-        ModeResult: 聚合统计结果
+        分析结果字典
     """
-    if not results:
-        return ModeResult(mode="")
+    analysis = {}
 
-    mode_result = ModeResult(mode=results[0].mode)
-
-    # 收集所有最佳验证准确率
-    best_accs = [r.best_val_acc for r in results]
-
-    # 计算统计量
-    mode_result.results = results
-    mode_result.mean_acc = np.mean(best_accs)
-    mode_result.std_acc = np.std(best_accs)
-    mode_result.best_acc = np.max(best_accs)
-
-    # 95% 置信区间
-    if len(best_accs) > 1:
-        from scipy import stats as scipy_stats
-        mean = np.mean(best_accs)
-        std = np.std(best_accs, ddof=1)
-        se = std / np.sqrt(len(best_accs))
-        ci = scipy_stats.t.interval(0.95, df=len(best_accs)-1, loc=mean, scale=se)
-        mode_result.ci_95 = (ci[0], ci[1])
-    else:
-        mode_result.ci_95 = (best_accs[0], best_accs[0])
-
-    return mode_result
-
-
-def compute_effect_size(acc1: List[float], acc2: List[float]) -> float:
-    """计算 Cohen's d 效应量.
-
-    Args:
-        acc1: 第一组的准确率列表
-        acc2: 第二组的准确率列表
-
-    Returns:
-        Cohen's d 值
-    """
-    n1, n2 = len(acc1), len(acc2)
-    if n1 < 2 or n2 < 2:
-        return 0.0
-
-    mean1, mean2 = np.mean(acc1), np.mean(acc2)
-    var1, var2 = np.var(acc1, ddof=1), np.var(acc2, ddof=1)
-
-    # Pooled standard deviation
-    pooled_std = np.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2))
-
-    if pooled_std < 1e-8:
-        return 0.0
-
-    return (mean1 - mean2) / pooled_std
-
-
-def compute_paired_ttest(acc1: List[float], acc2: List[float]) -> float:
-    """计算配对 t-test p 值.
-
-    Args:
-        acc1: 第一组的准确率列表
-        acc2: 第二组的准确率列表
-
-    Returns:
-        p 值
-    """
-    from scipy import stats as scipy_stats
-
-    if len(acc1) != len(acc2) or len(acc1) < 2:
-        return 1.0
-
-    _, p_value = scipy_stats.ttest_rel(acc1, acc2)
-    return p_value if not np.isnan(p_value) else 1.0
-
-
-def analyze_results(
-    mode_results: Dict[str, ModeResult]
-) -> Dict[str, Any]:
-    """分析消融实验结果.
-
-    Args:
-        mode_results: 各模式的聚合结果
-
-    Returns:
-        分析报告字典
-    """
-    analysis = {
-        'summary': {},
-        'comparisons': {},
-        'recommendations': [],
-    }
-
-    # 提取摘要
-    for mode, result in mode_results.items():
-        accs = [r.best_val_acc for r in result.results]
-        analysis['summary'][mode] = {
-            'mean_acc': result.mean_acc,
-            'std_acc': result.std_acc,
-            'best_acc': result.best_acc,
-            'ci_95': result.ci_95,
-            'runs': len(accs),
-            'total_params': result.results[0].total_params if result.results else 0,
-            'throughput': result.results[0].throughput if result.results else 0,
+    for mode, stats in mode_results.items():
+        analysis[mode] = {
+            'mean_val_acc': stats.mean_val_acc,
+            'std_val_acc': stats.std_val_acc,
+            'mean_train_acc': stats.mean_train_acc,
+            'mean_epoch_time': stats.mean_epoch_time,
+            'throughput': stats.throughput,
+            'best_epoch': stats.best_epoch,
+            'total_params': stats.total_params,
         }
-
-    # 模式间比较
-    modes = list(mode_results.keys())
-
-    # Hilbert vs Raster
-    if 'hilbert' in modes and 'raster' in modes:
-        hilbert_accs = [r.best_val_acc for r in mode_results['hilbert'].results]
-        raster_accs = [r.best_val_acc for r in mode_results['raster'].results]
-
-        diff = np.mean(hilbert_accs) - np.mean(raster_accs)
-        p_value = compute_paired_ttest(hilbert_accs, raster_accs)
-        effect = compute_effect_size(hilbert_accs, raster_accs)
-
-        analysis['comparisons']['hilbert_vs_raster'] = {
-            'hilbert_mean': np.mean(hilbert_accs),
-            'raster_mean': np.mean(raster_accs),
-            'improvement': diff,
-            'p_value': p_value,
-            'significant': p_value < 0.05,
-            'cohens_d': effect,
-            'effect_interpretation': '大' if abs(effect) > 0.8 else ('中' if abs(effect) > 0.5 else '小'),
-        }
-
-    # Hilbert vs Standard
-    if 'hilbert' in modes and 'standard' in modes:
-        hilbert_accs = [r.best_val_acc for r in mode_results['hilbert'].results]
-        standard_accs = [r.best_val_acc for r in mode_results['standard'].results]
-
-        diff = np.mean(hilbert_accs) - np.mean(standard_accs)
-        p_value = compute_paired_ttest(hilbert_accs, standard_accs)
-        effect = compute_effect_size(hilbert_accs, standard_accs)
-
-        analysis['comparisons']['hilbert_vs_standard'] = {
-            'hilbert_mean': np.mean(hilbert_accs),
-            'standard_mean': np.mean(standard_accs),
-            'improvement': diff,
-            'p_value': p_value,
-            'significant': p_value < 0.05,
-            'cohens_d': effect,
-            'effect_interpretation': '大' if abs(effect) > 0.8 else ('中' if abs(effect) > 0.5 else '小'),
-        }
-
-    # Raster vs Standard
-    if 'raster' in modes and 'standard' in modes:
-        raster_accs = [r.best_val_acc for r in mode_results['raster'].results]
-        standard_accs = [r.best_val_acc for r in mode_results['standard'].results]
-
-        diff = np.mean(raster_accs) - np.mean(standard_accs)
-        p_value = compute_paired_ttest(raster_accs, standard_accs)
-        effect = compute_effect_size(raster_accs, standard_accs)
-
-        analysis['comparisons']['raster_vs_standard'] = {
-            'raster_mean': np.mean(raster_accs),
-            'standard_mean': np.mean(standard_accs),
-            'improvement': diff,
-            'p_value': p_value,
-            'significant': p_value < 0.05,
-            'cohens_d': effect,
-            'effect_interpretation': '大' if abs(effect) > 0.8 else ('中' if abs(effect) > 0.5 else '小'),
-        }
-
-    # 生成建议
-    if 'hilbert_vs_raster' in analysis['comparisons']:
-        comp = analysis['comparisons']['hilbert_vs_raster']
-        if comp['significant'] and comp['improvement'] > 0.5:
-            analysis['recommendations'].append(
-                f"✅ Hilbert 排序有效: 提升 {comp['improvement']:.2f}%, p={comp['p_value']:.4f}"
-            )
-        elif comp['significant'] and comp['improvement'] < -0.5:
-            analysis['recommendations'].append(
-                f"⚠️ Raster 优于 Hilbert: 差异 {abs(comp['improvement']):.2f}%, p={comp['p_value']:.4f}"
-            )
-        else:
-            analysis['recommendations'].append(
-                f"⚠️ Hilbert vs Raster 无显著差异: {comp['improvement']:+.2f}%, p={comp['p_value']:.4f}"
-            )
 
     return analysis
 
 
-def print_analysis(analysis: Dict[str, Any]) -> None:
-    """打印分析结果."""
-    print("\n" + "="*70)
-    print("                Hilbert vs Raster vs Standard ViT 消融实验报告")
-    print("="*70)
+def print_analysis(analysis: Dict[str, Dict[str, Any]]) -> None:
+    """打印分析结果"""
+    print("\n" + "=" * 60)
+    print("实验结果分析")
+    print("=" * 60)
 
-    # 摘要表格
-    print("\n📊 实验结果摘要:")
-    print("-"*70)
-    print(f"{'模式':<15} {'最佳准确率':>12} {'平均准确率':>12} {'标准差':>10} {'参数量':>12}")
-    print("-"*70)
+    # 排名
+    sorted_modes = sorted(analysis.items(), key=lambda x: x[1]['mean_val_acc'], reverse=True)
+    print("\n总体结果排名 (按验证准确率):")
+    for i, (mode, stats) in enumerate(sorted_modes, 1):
+        print(f"  {i}. {mode.upper()}: {stats['mean_val_acc']:.2f}% ± {stats['std_val_acc']:.2f}%")
 
-    for mode, summary in analysis['summary'].items():
-        mode_name = {'standard': 'Standard ViT', 'hilbert': 'Hilbert', 'raster': 'Raster'}.get(mode, mode)
-        print(f"{mode_name:<15} {summary['best_acc']:>11.2f}% {summary['mean_acc']:>11.2f}% "
-              f"± {summary['std_acc']:>8.2f}% {summary['total_params']:>12,}")
-    print("-"*70)
-
-    # 模式间比较
-    print("\n🔬 统计检验结果:")
-    print("-"*70)
-
-    for name, comp in analysis['comparisons'].items():
-        print(f"\n{name.replace('_', ' ').title()}:")
-        print(f"  差异: {comp['improvement']:+.2f}%")
-        print(f"  p-value: {comp['p_value']:.4f} ({'显著' if comp['significant'] else '不显著'})")
-        print(f"  Cohen's d: {comp['cohens_d']:.2f} ({comp['effect_interpretation']}效应)")
-
-    # 建议
-    print("\n💡 结论与建议:")
-    print("-"*70)
-    for rec in analysis['recommendations']:
-        print(f"  {rec}")
-
-    print("\n" + "="*70)
+    # 详细统计
+    print("\n详细统计:")
+    for mode, stats in analysis.items():
+        print(f"\n  [{mode.upper()}]")
+        print(f"    验证准确率: {stats['mean_val_acc']:.2f}% ± {stats['std_val_acc']:.2f}%")
+        print(f"    训练准确率: {stats['mean_train_acc']:.2f}%")
+        print(f"    平均 Epoch 时间: {stats['mean_epoch_time']:.1f}s")
+        print(f"    吞吐量: {stats['throughput']:.1f} images/sec")
+        print(f"    最佳 epoch: {stats['best_epoch']}")
+        print(f"    参数量: {stats['total_params']:,}")
 
 
 # ============================================================================
@@ -1276,9 +1043,10 @@ def main():
         help='运行所有三种模式 (standard, hilbert, raster)'
     )
     parser.add_argument(
-        '--modes', nargs='+', default=['standard', 'hilbert', 'raster'],
+        '--modes', nargs='+',
         choices=['standard', 'hilbert', 'raster'],
-        help='要运行的模式 (默认: all)'
+        default=['hilbert'],
+        help='运行模式 (默认: hilbert)'
     )
     parser.add_argument(
         '--runs', type=int, default=3,
@@ -1364,6 +1132,10 @@ def main():
         args.runs = 1
         print("快速测试模式: 10 epochs, 1 run per mode")
 
+    # 处理 --all 参数
+    if args.all:
+        args.modes = ['standard', 'hilbert', 'raster']
+
     # 设备选择
     if args.device == 'auto':
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1381,15 +1153,15 @@ def main():
     print(f"  use_area_encoding: {args.use_area_encoding}")
     print(f"  fourier_levels: {args.fourier_levels}")
 
-    # 加载数据 (自动下载)
+    # 加载数据 (自动下载并组织验证集)
     print("\n加载 Tiny-ImageNet 数据...")
-    print("  (如需手动下载，请参考 --help)")
+    print("  (自动组织验证集格式)")
     try:
         train_loader, val_loader, num_classes = get_tiny_imagenet_loaders(
             batch_size=args.batch_size,
             image_size=64,
         )
-    except (FileNotFoundError, Exception) as e:
+    except Exception as e:
         print(f"\n[ERROR] 数据集准备失败: {e}")
         print("\n请手动下载 Tiny-ImageNet:")
         print("  1. 下载: http://cs231n.stanford.edu/tiny-imagenet-200.zip")
@@ -1446,202 +1218,202 @@ def main():
             try:
                 result = run_experiment(
                     config, train_loader, val_loader, device,
-                    run_id=run_id, seed=seed, verbose=True
+                    run_id, seed, verbose=True
                 )
                 all_results[mode].append(result)
             except Exception as e:
-                print(f"\n❌ 运行 {run_id} 失败: {e}")
+                print(f"\n[ERROR] 运行 {run_id} 失败: {e}")
                 import traceback
                 traceback.print_exc()
+                continue
 
-    # 分析结果
-    if all_results and any(len(results) > 0 for results in all_results.values()):
-        mode_results = {}
-        for mode, results in all_results.items():
-            if results:
-                mode_results[mode] = compute_mode_statistics(results)
+    # 统计分析
+    mode_results = {}
+    for mode, results in all_results.items():
+        if results:
+            mode_results[mode] = compute_mode_statistics(results)
 
-        if mode_results:
-            analysis = analyze_results(mode_results)
-            print_analysis(analysis)
+    if mode_results:
+        analysis = analyze_results(mode_results)
+        print_analysis(analysis)
 
-            # 保存结果
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            exp_name = f"ablation_hilbert_{timestamp}"
+        # 保存结果
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        exp_name = f"ablation_hilbert_{timestamp}"
 
-            # 创建 experiments 目录
-            EXPERIMENTS_DIR = PROJECT_ROOT / "experiments"
-            EXPERIMENTS_DIR.mkdir(exist_ok=True)
-            exp_dir = EXPERIMENTS_DIR / exp_name
-            exp_dir.mkdir(exist_ok=True)
+        # 创建 experiments 目录
+        EXPERIMENTS_DIR = PROJECT_ROOT / "experiments"
+        EXPERIMENTS_DIR.mkdir(exist_ok=True)
+        exp_dir = EXPERIMENTS_DIR / exp_name
+        exp_dir.mkdir(exist_ok=True)
 
-            # 保存实验数据 (JSON)
-            output_data = {
-                'config': asdict(base_config),
-                'mode_results': {
-                    mode: {
-                        'statistics': asdict(stat),
-                        'runs': [asdict(r) for r in stat.results]
-                    }
-                    for mode, stat in mode_results.items()
-                },
-                'analysis': analysis,
-                'timestamp': timestamp,
-                'modes': list(args.modes),
-            }
-            data_path = exp_dir / "experiment_data.json"
-            with open(data_path, 'w', encoding='utf-8') as f:
-                json.dump(output_data, f, indent=2, ensure_ascii=False)
-
-            # 保存实验日志
-            log_content = []
-            log_content.append("=" * 60)
-            log_content.append("Hilbert vs Raster 消融实验日志")
-            log_content.append(f"时间戳: {timestamp}")
-            log_content.append("=" * 60)
-            log_content.append(f"\n[I78] 性能优化:")
-            log_content.append(f"  channels-last: {'ON' if args.use_channels_last and device.type == 'cuda' else 'OFF'}")
-            log_content.append(f"  torch.compile: {'ON' if args.use_compile else 'OFF'}")
-            log_content.append(f"\n[I31] 面积编码:")
-            log_content.append(f"  use_area_encoding: {args.use_area_encoding}")
-            log_content.append(f"  fourier_levels: {args.fourier_levels}")
-            log_content.append(f"\n训练配置:")
-            log_content.append(f"  epochs: {args.epochs}")
-            log_content.append(f"  batch_size: {args.batch_size}")
-            log_content.append(f"  learning_rate: {args.lr}")
-            log_content.append(f"  runs per mode: {args.runs}")
-            log_content.append(f"\n运行模式: {', '.join(args.modes)}")
-            log_content.append("\n" + "=" * 60)
-            log_content.append("实验结果分析")
-            log_content.append("=" * 60)
-
-            # 添加分析结果
-            if analysis:
-                log_content.append(f"\n总体结果排名 (按验证准确率):")
-                sorted_modes = sorted(analysis.items(), key=lambda x: x[1]['mean_val_acc'], reverse=True)
-                for i, (mode, stats) in enumerate(sorted_modes, 1):
-                    log_content.append(f"  {i}. {mode.upper()}: {stats['mean_val_acc']:.2f}% ± {stats['std_val_acc']:.2f}%")
-
-                log_content.append(f"\n详细统计:")
-                for mode, stats in analysis.items():
-                    log_content.append(f"\n  [{mode.upper()}]")
-                    log_content.append(f"    验证准确率: {stats['mean_val_acc']:.2f}% ± {stats['std_val_acc']:.2f}%")
-                    log_content.append(f"    训练准确率: {stats['mean_train_acc']:.2f}%")
-                    log_content.append(f"    平均 Epoch 时间: {stats['mean_epoch_time']:.1f}s")
-                    log_content.append(f"    吞吐量: {stats['throughput']:.1f} images/sec")
-                    log_content.append(f"    最佳 epoch: {stats['best_epoch']}")
-                    log_content.append(f"    参数量: {stats['total_params']:,}")
-
-            log_content.append("\n" + "=" * 60)
-            log_content.append("消融实验结论")
-            log_content.append("=" * 60)
-
-            # 生成消融实验结论
-            if 'hilbert' in mode_results and 'raster' in mode_results:
-                hilbert_acc = mode_results['hilbert'].mean_val_acc
-                raster_acc = mode_results['raster'].mean_val_acc
-                diff = hilbert_acc - raster_acc
-
-                log_content.append(f"\n[Hilbert vs Raster 对比]")
-                log_content.append(f"  Hilbert:  {hilbert_acc:.2f}%")
-                log_content.append(f"  Raster:   {raster_acc:.2f}%")
-                log_content.append(f"  差异:     {diff:+.2f}%")
-
-                if diff > 1.0:
-                    log_content.append(f"  结论: Hilbert 排序显著优于 Raster (+{diff:.2f}%)")
-                elif diff < -1.0:
-                    log_content.append(f"  结论: Raster 排序优于 Hilbert ({diff:.2f}%)")
-                else:
-                    log_content.append(f"  结论: Hilbert 与 Raster 差异不显著 (|diff| < 1%)")
-
-            if 'standard' in mode_results:
-                for fractal_mode in ['hilbert', 'raster']:
-                    if fractal_mode in mode_results:
-                        standard_acc = mode_results['standard'].mean_val_acc
-                        fractal_acc = mode_results[fractal_mode].mean_val_acc
-                        diff = fractal_acc - standard_acc
-
-                        log_content.append(f"\n[Standard vs {fractal_mode.upper()}]")
-                        log_content.append(f"  Standard: {standard_acc:.2f}%")
-                        log_content.append(f"  {fractal_mode.upper()}: {fractal_acc:.2f}%")
-                        log_content.append(f"  差异:     {diff:+.2f}%")
-
-                        if diff > 1.0:
-                            log_content.append(f"  结论: 分形 tokenization 提升 {diff:.2f}%")
-                        elif diff < -1.0:
-                            log_content.append(f"  结论: 分形 tokenization 下降 {abs(diff):.2f}%")
-                        else:
-                            log_content.append(f"  结论: 分形 tokenization 差异不显著")
-
-            log_content.append("\n" + "=" * 60)
-
-            # 保存日志
-            log_path = exp_dir / "experiment_log.txt"
-            with open(log_path, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(log_content))
-
-            # 打印日志内容
-            print('\n'.join(log_content))
-
-            print(f"\n实验数据已保存到: {data_path}")
-            print(f"实验日志已保存到: {log_path}")
-
-            # 保存到 args.output (如果指定)
-            if args.output:
-                with open(args.output, 'w', encoding='utf-8') as f:
-                    json.dump(output_data, f, indent=2, ensure_ascii=False)
-                print(f"结果已保存到: {args.output}")
-
-            # 运行最终评估 - 消融实验关键指标对比
-            print("\n" + "=" * 60)
-            print("最终评估报告")
-            print("=" * 60)
-
-            # 计算并输出消融实验所需的关键数据
-            eval_results = {
-                'hilbert_vs_raster': {},
-                'fractal_vs_standard': {},
-            }
-
-            if 'hilbert' in mode_results and 'raster' in mode_results:
-                hilbert = mode_results['hilbert']
-                raster = mode_results['raster']
-                eval_results['hilbert_vs_raster'] = {
-                    'hilbert_val_acc': hilbert.mean_val_acc,
-                    'raster_val_acc': raster.mean_val_acc,
-                    'improvement': hilbert.mean_val_acc - raster.mean_val_acc,
-                    'hilbert_throughput': hilbert.throughput,
-                    'raster_throughput': raster.throughput,
-                    'hilbert_best_epoch': hilbert.best_epoch,
-                    'raster_best_epoch': raster.best_epoch,
+        # 保存实验数据 (JSON)
+        output_data = {
+            'config': asdict(base_config),
+            'mode_results': {
+                mode: {
+                    'statistics': asdict(stat),
+                    'runs': [asdict(r) for r in stat.results]
                 }
-                print(f"\n[Hilbert vs Raster 评估]")
-                print(f"  验证准确率: Hilbert={hilbert.mean_val_acc:.2f}%, Raster={raster.mean_val_acc:.2f}%")
-                print(f"  提升幅度: {hilbert.mean_val_acc - raster.mean_val_acc:+.2f}%")
-                print(f"  吞吐量: Hilbert={hilbert.throughput:.1f}, Raster={raster.throughput:.1f} images/sec")
+                for mode, stat in mode_results.items()
+            },
+            'analysis': analysis,
+            'timestamp': timestamp,
+            'modes': list(args.modes),
+        }
+        data_path = exp_dir / "experiment_data.json"
+        with open(data_path, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, indent=2, ensure_ascii=False)
 
-            if 'standard' in mode_results:
-                for mode in ['hilbert', 'raster']:
-                    if mode in mode_results:
-                        standard = mode_results['standard']
-                        fractal = mode_results[mode]
-                        eval_results['fractal_vs_standard'][mode] = {
-                            f'{mode}_val_acc': fractal.mean_val_acc,
-                            'standard_val_acc': standard.mean_val_acc,
-                            'improvement': fractal.mean_val_acc - standard.mean_val_acc,
-                            f'{mode}_params': fractal.total_params,
-                            'standard_params': standard.total_params,
-                        }
-                        print(f"\n[Standard vs {mode.upper()} 评估]")
-                        print(f"  验证准确率: Standard={standard.mean_val_acc:.2f}%, {mode.upper()}={fractal.mean_val_acc:.2f}%")
-                        print(f"  提升幅度: {fractal.mean_val_acc - standard.mean_val_acc:+.2f}%")
-                        print(f"  参数量: Standard={standard.total_params:,}, {mode.upper()}={fractal.total_params:,}")
+        # 保存实验日志
+        log_content = []
+        log_content.append("=" * 60)
+        log_content.append("Hilbert vs Raster 消融实验日志")
+        log_content.append(f"时间戳: {timestamp}")
+        log_content.append("=" * 60)
+        log_content.append(f"\n[I78] 性能优化:")
+        log_content.append(f"  channels-last: {'ON' if args.use_channels_last and device.type == 'cuda' else 'OFF'}")
+        log_content.append(f"  torch.compile: {'ON' if args.use_compile else 'OFF'}")
+        log_content.append(f"\n[I31] 面积编码:")
+        log_content.append(f"  use_area_encoding: {args.use_area_encoding}")
+        log_content.append(f"  fourier_levels: {args.fourier_levels}")
+        log_content.append(f"\n训练配置:")
+        log_content.append(f"  epochs: {args.epochs}")
+        log_content.append(f"  batch_size: {args.batch_size}")
+        log_content.append(f"  learning_rate: {args.lr}")
+        log_content.append(f"  runs per mode: {args.runs}")
+        log_content.append(f"\n运行模式: {', '.join(args.modes)}")
+        log_content.append("\n" + "=" * 60)
+        log_content.append("实验结果分析")
+        log_content.append("=" * 60)
 
-            # 保存评估结果
-            eval_path = exp_dir / "evaluation_results.json"
-            with open(eval_path, 'w', encoding='utf-8') as f:
-                json.dump(eval_results, f, indent=2, ensure_ascii=False)
-            print(f"\n评估结果已保存到: {eval_path}")
+        # 添加分析结果
+        if analysis:
+            log_content.append(f"\n总体结果排名 (按验证准确率):")
+            sorted_modes = sorted(analysis.items(), key=lambda x: x[1]['mean_val_acc'], reverse=True)
+            for i, (mode, stats) in enumerate(sorted_modes, 1):
+                log_content.append(f"  {i}. {mode.upper()}: {stats['mean_val_acc']:.2f}% ± {stats['std_val_acc']:.2f}%")
+
+            log_content.append(f"\n详细统计:")
+            for mode, stats in analysis.items():
+                log_content.append(f"\n  [{mode.upper()}]")
+                log_content.append(f"    验证准确率: {stats['mean_val_acc']:.2f}% ± {stats['std_val_acc']:.2f}%")
+                log_content.append(f"    训练准确率: {stats['mean_train_acc']:.2f}%")
+                log_content.append(f"    平均 Epoch 时间: {stats['mean_epoch_time']:.1f}s")
+                log_content.append(f"    吞吐量: {stats['throughput']:.1f} images/sec")
+                log_content.append(f"    最佳 epoch: {stats['best_epoch']}")
+                log_content.append(f"    参数量: {stats['total_params']:,}")
+
+        log_content.append("\n" + "=" * 60)
+        log_content.append("消融实验结论")
+        log_content.append("=" * 60)
+
+        # 生成消融实验结论
+        if 'hilbert' in mode_results and 'raster' in mode_results:
+            hilbert_acc = mode_results['hilbert'].mean_val_acc
+            raster_acc = mode_results['raster'].mean_val_acc
+            diff = hilbert_acc - raster_acc
+
+            log_content.append(f"\n[Hilbert vs Raster 对比]")
+            log_content.append(f"  Hilbert:  {hilbert_acc:.2f}%")
+            log_content.append(f"  Raster:   {raster_acc:.2f}%")
+            log_content.append(f"  差异:     {diff:+.2f}%")
+
+            if diff > 1.0:
+                log_content.append(f"  结论: Hilbert 排序显著优于 Raster (+{diff:.2f}%)")
+            elif diff < -1.0:
+                log_content.append(f"  结论: Raster 排序优于 Hilbert ({diff:.2f}%)")
+            else:
+                log_content.append(f"  结论: Hilbert 与 Raster 差异不显著 (|diff| < 1%)")
+
+        if 'standard' in mode_results:
+            for fractal_mode in ['hilbert', 'raster']:
+                if fractal_mode in mode_results:
+                    standard_acc = mode_results['standard'].mean_val_acc
+                    fractal_acc = mode_results[fractal_mode].mean_val_acc
+                    diff = fractal_acc - standard_acc
+
+                    log_content.append(f"\n[Standard vs {fractal_mode.upper()}]")
+                    log_content.append(f"  Standard: {standard_acc:.2f}%")
+                    log_content.append(f"  {fractal_mode.upper()}: {fractal_acc:.2f}%")
+                    log_content.append(f"  差异:     {diff:+.2f}%")
+
+                    if diff > 1.0:
+                        log_content.append(f"  结论: 分形 tokenization 提升 {diff:.2f}%")
+                    elif diff < -1.0:
+                        log_content.append(f"  结论: 分形 tokenization 下降 {abs(diff):.2f}%")
+                    else:
+                        log_content.append(f"  结论: 分形 tokenization 差异不显著")
+
+        log_content.append("\n" + "=" * 60)
+
+        # 保存日志
+        log_path = exp_dir / "experiment_log.txt"
+        with open(log_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(log_content))
+
+        # 打印日志内容
+        print('\n'.join(log_content))
+
+        print(f"\n实验数据已保存到: {data_path}")
+        print(f"实验日志已保存到: {log_path}")
+
+        # 保存到 args.output (如果指定)
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, indent=2, ensure_ascii=False)
+            print(f"结果已保存到: {args.output}")
+
+        # 运行最终评估 - 消融实验关键指标对比
+        print("\n" + "=" * 60)
+        print("最终评估报告")
+        print("=" * 60)
+
+        # 计算并输出消融实验所需的关键数据
+        eval_results = {
+            'hilbert_vs_raster': {},
+            'fractal_vs_standard': {},
+        }
+
+        if 'hilbert' in mode_results and 'raster' in mode_results:
+            hilbert = mode_results['hilbert']
+            raster = mode_results['raster']
+            eval_results['hilbert_vs_raster'] = {
+                'hilbert_val_acc': hilbert.mean_val_acc,
+                'raster_val_acc': raster.mean_val_acc,
+                'improvement': hilbert.mean_val_acc - raster.mean_val_acc,
+                'hilbert_throughput': hilbert.throughput,
+                'raster_throughput': raster.throughput,
+                'hilbert_best_epoch': hilbert.best_epoch,
+                'raster_best_epoch': raster.best_epoch,
+            }
+            print(f"\n[Hilbert vs Raster 评估]")
+            print(f"  验证准确率: Hilbert={hilbert.mean_val_acc:.2f}%, Raster={raster.mean_val_acc:.2f}%")
+            print(f"  提升幅度: {hilbert.mean_val_acc - raster.mean_val_acc:+.2f}%")
+            print(f"  吞吐量: Hilbert={hilbert.throughput:.1f}, Raster={raster.throughput:.1f} images/sec")
+
+        if 'standard' in mode_results:
+            for mode in ['hilbert', 'raster']:
+                if mode in mode_results:
+                    standard = mode_results['standard']
+                    fractal = mode_results[mode]
+                    eval_results['fractal_vs_standard'][mode] = {
+                        f'{mode}_val_acc': fractal.mean_val_acc,
+                        'standard_val_acc': standard.mean_val_acc,
+                        'improvement': fractal.mean_val_acc - standard.mean_val_acc,
+                        f'{mode}_params': fractal.total_params,
+                        'standard_params': standard.total_params,
+                    }
+                    print(f"\n[Standard vs {mode.upper()} 评估]")
+                    print(f"  验证准确率: Standard={standard.mean_val_acc:.2f}%, {mode.upper()}={fractal.mean_val_acc:.2f}%")
+                    print(f"  提升幅度: {fractal.mean_val_acc - standard.mean_val_acc:+.2f}%")
+                    print(f"  参数量: Standard={standard.total_params:,}, {mode.upper()}={fractal.total_params:,}")
+
+        # 保存评估结果
+        eval_path = exp_dir / "evaluation_results.json"
+        with open(eval_path, 'w', encoding='utf-8') as f:
+            json.dump(eval_results, f, indent=2, ensure_ascii=False)
+        print(f"\n评估结果已保存到: {eval_path}")
 
 
 if __name__ == '__main__':
