@@ -56,7 +56,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 from tqdm import tqdm
 
 import numpy as np
@@ -634,105 +634,6 @@ def create_model(config: ExperimentConfig) -> nn.Module:
 # 训练与评估
 # ============================================================================
 
-def train_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    scaler: Optional[GradScaler] = None,
-    epoch: int = 0,
-    verbose: bool = True,
-) -> Tuple[float, float]:
-    """训练一个 epoch.
-
-    I78: 支持 channels-last 内存格式
-    """
-    model.train()
-    total_loss = 0.0
-    correct = 0
-    total = 0
-
-    pbar = tqdm(loader, desc=f"Epoch {epoch} [Train]", disable=not verbose)
-    for i, (images, labels) in enumerate(pbar):
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        # I78: 保持 channels-last 格式
-        if images.dim() == 4:
-            images = images.to(memory_format=torch.channels_last)
-
-        optimizer.zero_grad()
-
-        if scaler is not None:
-            with autocast('cuda', enabled=(device.type == 'cuda')):
-                outputs = model(images)
-                loss = F.cross_entropy(outputs, labels)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            outputs = model(images)
-            loss = F.cross_entropy(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-        total_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-
-        # 更新进度条后缀显示当前 loss 和 acc
-        pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'acc': f'{100.*correct/total:.2f}%'
-        })
-
-    return total_loss / len(loader), 100.0 * correct / total
-
-
-@torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    device: torch.device,
-    epoch: int = 0,
-    verbose: bool = True,
-) -> Tuple[float, float]:
-    """评估模型.
-
-    I78: 支持 channels-last 内存格式，禁用 AMP 确保指标精度
-    """
-    model.eval()
-    total_loss = 0.0
-    correct = 0
-    total = 0
-
-    pbar = tqdm(loader, desc=f"Epoch {epoch} [Val]", disable=not verbose)
-    for i, (images, labels) in enumerate(pbar):
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        # I78: 保持 channels-last 格式
-        if images.dim() == 4:
-            images = images.to(memory_format=torch.channels_last)
-
-        # 验证禁用 AMP 以确保指标精度
-        outputs = model(images)
-        loss = F.cross_entropy(outputs, labels)
-
-        total_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-
-        pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'acc': f'{100.*correct/total:.2f}%'
-        })
-
-    return total_loss / len(loader), 100.0 * correct / total
-
-
 def set_seed(seed: int):
     """设置随机种子以确保可复现性."""
     torch.manual_seed(seed)
@@ -755,7 +656,6 @@ def run_experiment(
     - I78 channels-last 内存格式 (~20% VRAM 节省)
     - I78 torch.compile 优化 (~30% 训练加速)
     - 混合精度训练 (AMP)
-    - Early Stopping
 
     Args:
         config: 实验配置
@@ -828,8 +728,6 @@ def run_experiment(
     epoch_times = []
     best_val_acc = 0.0
     best_epoch = 0
-    patience_counter = 0
-    early_stop_patience = 15
 
     # 训练循环
     for epoch in range(config.epochs):
@@ -840,19 +738,79 @@ def run_experiment(
             for param_group in optimizer.param_groups:
                 param_group['lr'] = config.learning_rate * (epoch + 1) / config.warmup_epochs
 
-        # 训练 - tqdm 始终显示，详细日志每 10 个 epoch
-        train_verbose = verbose  # tqdm 始终显示
-        train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, device, scaler,
-            epoch=epoch + 1, verbose=train_verbose
-        )
+        # 训练
+        model.train()
+        total_loss = 0.0
+        correct = 0
+        total = 0
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs} [Train]", disable=not verbose)
+        for images, labels in pbar:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            # I78: 保持 channels-last 格式
+            if images.dim() == 4:
+                images = images.to(memory_format=torch.channels_last)
+
+            optimizer.zero_grad()
+
+            if scaler is not None:
+                with autocast('cuda', enabled=(device.type == 'cuda')):
+                    outputs = model(images)
+                    loss = F.cross_entropy(outputs, labels)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(images)
+                loss = F.cross_entropy(outputs, labels)
+                loss.backward()
+                optimizer.step()
+
+            total_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'acc': f'{100.*correct/total:.2f}%'
+            })
+
+        train_loss = total_loss / len(train_loader)
+        train_acc = 100.0 * correct / total
 
         # 验证
-        val_verbose = verbose  # tqdm 始终显示
-        val_loss, val_acc = evaluate(
-            model, val_loader, device,
-            epoch=epoch + 1, verbose=val_verbose
-        )
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+
+        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{config.epochs} [Val]", disable=not verbose)
+        for images, labels in val_pbar:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            # I78: 保持 channels-last 格式
+            if images.dim() == 4:
+                images = images.to(memory_format=torch.channels_last)
+
+            outputs = model(images)
+            loss = F.cross_entropy(outputs, labels)
+
+            val_loss += loss.item()
+            _, predicted = outputs.max(1)
+            val_total += labels.size(0)
+            val_correct += predicted.eq(labels).sum().item()
+
+            val_pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'acc': f'{100.*val_correct/val_total:.2f}%'
+            })
+
+        val_loss = val_loss / len(val_loader)
+        val_acc = 100.0 * val_correct / val_total
 
         # 更新学习率
         if epoch >= config.warmup_epochs:
@@ -867,24 +825,16 @@ def run_experiment(
         result.val_losses.append(val_loss)
         result.val_accs.append(val_acc)
 
-        # Early Stopping
-        if val_acc > best_val_acc + 1e-4:
+        # 记录最佳验证准确率
+        if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_epoch = epoch
-            patience_counter = 0
-        else:
-            patience_counter += 1
 
+        # 每10个epoch打印一次汇总信息
         if verbose and (epoch + 1) % 10 == 0:
             print(f"Epoch {epoch+1}/{config.epochs}: "
                   f"Train Loss={train_loss:.4f}, Train Acc={train_acc:.1f}%, "
-                  f"Val Acc={val_acc:.1f}% [{epoch_time:.1f}s]")
-
-        # Early Stopping 检查
-        if patience_counter >= early_stop_patience:
-            if verbose:
-                print(f"\n  [EarlyStopping] 连续 {early_stop_patience} 个 epoch 无改善，提前停止")
-            break
+                  f"Val Loss={val_loss:.4f}, Val Acc={val_acc:.1f}% [{epoch_time:.1f}s]")
 
     # 汇总结果
     result.best_val_acc = best_val_acc
