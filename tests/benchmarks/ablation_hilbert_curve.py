@@ -672,6 +672,8 @@ def train_one_epoch(
     device: torch.device,
     use_amp: bool = True,
     accumulation_steps: int = 1,
+    epoch: int = 0,
+    total_epochs: int = 0,
 ) -> Tuple[float, float]:
     """单轮训练 (参考 ModularTrainer.train_epoch)
 
@@ -685,7 +687,8 @@ def train_one_epoch(
 
     scaler = GradScaler('cuda') if use_amp else None
 
-    for batch_idx, (images, labels) in enumerate(train_loader):
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{total_epochs}", leave=True)
+    for batch_idx, (images, labels) in enumerate(pbar):
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
@@ -729,6 +732,13 @@ def train_one_epoch(
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
 
+        # 更新进度条
+        current_acc = 100.0 * correct / max(total, 1)
+        pbar.set_postfix({
+            'loss': f'{batch_loss:.4f}',
+            'acc': f'{current_acc:.1f}%'
+        })
+
     avg_loss = total_loss / len(train_loader)
     accuracy = 100.0 * correct / total
 
@@ -757,7 +767,8 @@ def validate(
     total = 0
     num_batches = 0
 
-    for images, labels in val_loader:
+    pbar = tqdm(val_loader, desc="Validating", leave=False)
+    for images, labels in pbar:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
@@ -772,6 +783,10 @@ def validate(
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
+
+        # 更新进度条
+        current_acc = 100.0 * correct / max(total, 1)
+        pbar.set_postfix({'acc': f'{current_acc:.1f}%'})
 
     avg_loss = total_loss / max(num_batches, 1)
     accuracy = 100.0 * correct / total
@@ -879,6 +894,8 @@ def run_experiment(
             device=device,
             use_amp=(device.type == 'cuda'),
             accumulation_steps=1,
+            epoch=epoch,
+            total_epochs=config.epochs,
         )
 
         # 验证 (完全复制 ModularTrainer.validate)
