@@ -12,46 +12,38 @@ Hilbert vs Raster 消融实验 (I25-2)
 └──────────────┴────────────────────────────────────────────────────────────┘
 
 控制变量:
-- dropout = 0.25
-- drop_path = 0.25
-- weight_decay = 0.15
-- pool = weighted
-- epochs = 60
-
-严格控制:
 - Hilbert vs Raster: 唯一区别 use_hilbert_encoding=True/False
 - Standard vs Fractal: 参数量/计算量同级别 (公平对比)
 
-I78 动态分辨率 (2026-01-18):
-- image_size=None (自动计算 max_depth)
-- min_patch_size=4 → max_depth = floor(log2(64/4)) = 4
+默认配置 (v3.0 2026-01-18):
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 模型: dim=384, depth=12 → P=32.7M (Tiny-ImageNet 调优)                      │
+│ 动态分辨率: image_size=None, min_patch_size=4 → max_depth=4                 │
+│ Token: K∈[16,64] (4:1 压缩比)                                               │
+│ I31: use_area_encoding=True, fourier_levels=4                               │
+│ I78 优化: channels-last ✓, torch.compile ✓                                  │
+│ 训练: batch=64, lr=1e-3, epochs=100                                         │
+│ 正则: dropout=0.2, drop_path=0.2, weight_decay=0.1                         │
+└─────────────────────────────────────────────────────────────────────────────┘
 
-I31 面积编码:
-- use_area_encoding=True (位置编码增强)
-- fourier_levels=4
+使用示例:
+  # 完整消融实验 (3 模式 × 3 次 = 9 次训练)
+  uv run python tests/benchmarks/ablation_hilbert_curve.py --all --runs 3
 
-性能优化:
-- channels-last 内存格式 (~20% VRAM 节省)
-- torch.compile 优化 (~30% 训练加速)
-- 混合精度训练 (AMP)
+  # 只运行 Hilbert vs Raster (核心假设验证)
+  uv run python tests/benchmarks/ablation_hilbert_curve.py --modes hilbert raster --runs 3
 
-参考实现: https://github.com/lucidrains/vit-pytorch
+  # 快速测试 (10 epochs, 1 run)
+  uv run python tests/benchmarks/ablation_hilbert_curve.py --quick
 
-Usage:
-    # 完整消融实验 (3 模式 × 3 次 = 9 次训练)
-    uv run python tests/benchmarks/ablation_hilbert_curve.py --all --epochs 60
+  # 保存结果到 JSON
+  uv run python tests/benchmarks/ablation_hilbert_curve.py --output results.json
 
-    # 只运行 Hilbert vs Raster (核心对比)
-    uv run python tests/benchmarks/ablation_hilbert_curve.py --modes hilbert raster --runs 3
+  # 禁用性能优化 (CPU 或调试模式)
+  uv run python tests/benchmarks/ablation_hilbert_curve.py --all --no-channels-last --no-compile
 
-    # 快速测试
-    uv run python tests/benchmarks/ablation_hilbert_curve.py --quick
-
-    # 保存结果
-    uv run python tests/benchmarks/ablation_hilbert_curve.py --output results.json
-
-    # 性能优化模式 (channels-last + compile)
-    uv run python tests/benchmarks/ablation_hilbert_curve.py --all --use-channels-last --use-compile
+  # I31 面积编码消融
+  uv run python tests/benchmarks/ablation_hilbert_curve.py --modes hilbert --no-area-encoding
 """
 
 from __future__ import annotations
@@ -73,19 +65,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision import datasets, transforms
 
 # Handle import paths
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
-sys.path.insert(0, str(PROJECT_ROOT / "examples" / "training"))
+sys.path.insert(0, str(PROJECT_ROOT / "examples"))
 
 from einops import rearrange, repeat
 from vit_pytorch import FractalCurveViT
-
-# 导入 ModularTrainer 系统 (I78 性能优化)
-from examples.training import ModularTrainer, TrainerConfig, CheckpointCallback, EarlyStoppingCallback
 
 
 # ============================================================================
@@ -296,24 +284,29 @@ class ExperimentConfig:
     I31 面积编码:
     - use_area_encoding=True 启用位置编码增强
     - fourier_levels=4 控制傅里叶特征级别数
+
+    默认配置优化:
+    - channels-last: 默认启用 (CUDA 环境)
+    - compile: 默认启用 (首次运行后加速)
+    - 适合 RTX 4070 (8GB VRAM) 的 batch_size=64
     """
     name: str
     mode: str  # 'standard', 'hilbert', 'raster'
     description: str
 
-    # 模型超参数 (最佳实践)
-    dim: int = 320
+    # 模型超参数 (最佳实践 - Tiny-ImageNet 调优)
+    dim: int = 384
     depth: int = 12
     heads: int = 8
     mlp_ratio: float = 4.0
 
     # 正则化 (最佳实践 - I30-3)
-    dropout: float = 0.25
-    drop_path: float = 0.25
-    weight_decay: float = 0.15
+    dropout: float = 0.2
+    drop_path: float = 0.2
+    weight_decay: float = 0.1
 
-    # 训练超参数
-    epochs: int = 60
+    # 训练超参数 (适合 8GB VRAM)
+    epochs: int = 100
     batch_size: int = 64
     learning_rate: float = 1e-3
     min_lr: float = 1e-6
@@ -326,15 +319,15 @@ class ExperimentConfig:
     # I78 动态分辨率 Tokenizer 配置
     min_patch_size: int = 4  # 最小 patch 大小
     K_min: int = 16          # Token 数量下限 (信息论: log2(200) × 2 ≈ 16)
-    K_max: int = 64          # Token 数量上限
+    K_max: int = 64          # Token 数量上限 (4:1 压缩比)
 
     # I31 面积编码配置 (2026-01-18)
     use_area_encoding: bool = True
     fourier_levels: int = 4
 
-    # 性能优化 (I78)
-    use_channels_last: bool = False  # channels-last 内存格式 (~20% VRAM 节省)
-    use_compile: bool = False        # torch.compile 优化 (~30% 训练加速)
+    # 性能优化 (I78 - 默认启用)
+    use_channels_last: bool = True   # channels-last 内存格式 (~20% VRAM 节省)
+    use_compile: bool = True         # torch.compile 优化 (~30% 训练加速)
 
     def __post_init__(self):
         if self.mode not in ['standard', 'hilbert', 'raster']:
@@ -645,14 +638,13 @@ def train_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    scaler: Optional[GradScaler] = None,
     epoch: int = 0,
     verbose: bool = True,
 ) -> Tuple[float, float]:
     """训练一个 epoch.
 
-    Returns:
-        avg_loss, accuracy
+    I78: 支持 channels-last 内存格式
     """
     model.train()
     total_loss = 0.0
@@ -661,12 +653,17 @@ def train_epoch(
 
     pbar = tqdm(loader, desc=f"Epoch {epoch} [Train]", disable=not verbose)
     for i, (images, labels) in enumerate(pbar):
-        images, labels = images.to(device), labels.to(device)
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        # I78: 保持 channels-last 格式
+        if images.dim() == 4:
+            images = images.to(memory_format=torch.channels_last)
 
         optimizer.zero_grad()
 
         if scaler is not None:
-            with torch.cuda.amp.autocast():
+            with autocast(device_type=device.type, enabled=(device.type == 'cuda')):
                 outputs = model(images)
                 loss = F.cross_entropy(outputs, labels)
             scaler.scale(loss).backward()
@@ -702,8 +699,7 @@ def evaluate(
 ) -> Tuple[float, float]:
     """评估模型.
 
-    Returns:
-        avg_loss, accuracy
+    I78: 支持 channels-last 内存格式，禁用 AMP 确保指标精度
     """
     model.eval()
     total_loss = 0.0
@@ -712,7 +708,14 @@ def evaluate(
 
     pbar = tqdm(loader, desc=f"Epoch {epoch} [Val]", disable=not verbose)
     for i, (images, labels) in enumerate(pbar):
-        images, labels = images.to(device), labels.to(device)
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        # I78: 保持 channels-last 格式
+        if images.dim() == 4:
+            images = images.to(memory_format=torch.channels_last)
+
+        # 验证禁用 AMP 以确保指标精度
         outputs = model(images)
         loss = F.cross_entropy(outputs, labels)
 
@@ -747,11 +750,11 @@ def run_experiment(
 ) -> RunResult:
     """运行单次实验.
 
-    使用 ModularTrainer 进行训练，支持:
+    使用优化后的训练循环，支持:
     - I78 channels-last 内存格式 (~20% VRAM 节省)
     - I78 torch.compile 优化 (~30% 训练加速)
     - 混合精度训练 (AMP)
-    - Early Stopping 和 Checkpoint 保存
+    - Early Stopping
 
     Args:
         config: 实验配置
@@ -765,13 +768,17 @@ def run_experiment(
     Returns:
         RunResult: 单次运行结果
     """
+    from torch.optim import AdamW
+    from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+    from torch.cuda.amp import GradScaler
+
     # 设置随机种子
     set_seed(seed)
 
     if verbose:
         print(f"\n{'='*60}")
         print(f"运行 {run_id}: {config.name} (mode={config.mode}, seed={seed})")
-        if config.use_channels_last:
+        if config.use_channels_last and device.type == 'cuda':
             print(f"  [I78] channels-last: ON")
         if config.use_compile:
             print(f"  [I78] torch.compile: ON")
@@ -780,7 +787,7 @@ def run_experiment(
     # 创建模型
     model = create_model(config)
 
-    # I78: channels-last 内存格式 (仅支持 CUDA)
+    # I78: channels-last 内存格式 (仅 CUDA 支持)
     if config.use_channels_last and device.type == 'cuda':
         model = model.to(memory_format=torch.channels_last)
         if verbose:
@@ -794,90 +801,99 @@ def run_experiment(
     if verbose:
         print(f"  参数量: {total_params:,}")
 
-    # 创建 ModularTrainer 配置
-    trainer_config = TrainerConfig(
-        device=str(device),
-        num_epochs=config.epochs,
-        gradient_clip_norm=1.0,
-        accumulation_steps=1,
-        log_interval=50,
-        validate_interval=1,
-        checkpoint_dir=f"checkpoints/ablation/{config.mode}/run_{run_id}",
-        save_best_only=True,
-        monitor_metric="val_accuracy",
-        monitor_mode="max",
-        use_amp=(device.type == 'cuda'),
-        debug=False,
+    # 优化器 (使用最佳实践配置)
+    optimizer = AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
     )
 
-    # 创建 callbacks
-    callbacks = [
-        EarlyStoppingCallback(
-            monitor="val_accuracy",
-            patience=15,
-            delta=1e-4,
-            mode="max",
-        ),
-        CheckpointCallback(
-            checkpoint_dir=trainer_config.checkpoint_dir,
-            monitor="val_accuracy",
-            mode="max",
-            save_best_only=True,
-        ),
-    ]
-
-    # 创建 ModularTrainer
-    trainer = ModularTrainer(
-        model=model,
-        config=trainer_config,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        callbacks=callbacks,
+    # 学习率调度 (余弦退火 + Warmup)
+    scheduler = CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=config.epochs,
+        T_mult=1,
+        eta_min=config.min_lr,
     )
 
-    # I78: torch.compile 优化
-    if config.use_compile:
-        if verbose:
-            print("  [I78] 启用 torch.compile...")
-        trainer.model = torch.compile(
-            trainer.model,
-            mode="default",
-            dynamic=True,
-        )
-        if verbose:
-            print("  [I78] torch.compile 完成")
+    # 混合精度训练 (如果可用)
+    scaler = None
+    if device.type == 'cuda':
+        scaler = GradScaler()
 
-    # 训练
-    start_time = time.time()
-    trainer.train()
-    total_time = time.time() - start_time
-
-    # 获取训练历史
-    history = trainer.state.history
-
-    # 构建结果
+    # 结果记录
     result = RunResult(run_id=run_id, mode=config.mode, seed=seed)
     result.total_params = total_params
 
-    # 提取历史数据
-    result.train_losses = history.get("train_loss", [])
-    result.train_accs = history.get("train_accuracy", [])
-    result.val_losses = history.get("val_loss", [])
-    result.val_accs = history.get("val_accuracy", [])
+    epoch_times = []
+    best_val_acc = 0.0
+    best_epoch = 0
+    patience_counter = 0
+    early_stop_patience = 15
 
-    # 计算最佳结果
-    if result.val_accs:
-        best_idx = np.argmax(result.val_accs)
-        result.best_val_acc = result.val_accs[best_idx]
-        result.best_epoch = best_idx
-        result.final_val_acc = result.val_accs[-1]
+    # 训练循环
+    for epoch in range(config.epochs):
+        epoch_start = time.time()
 
-    # 计算性能指标
-    num_epochs = len(result.train_losses) if result.train_losses else 1
-    result.avg_epoch_time = total_time / num_epochs
+        # Warmup 阶段
+        if epoch < config.warmup_epochs:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = config.learning_rate * (epoch + 1) / config.warmup_epochs
+
+        # 训练
+        train_loss, train_acc = train_epoch(
+            model, train_loader, optimizer, device, scaler,
+            epoch=epoch + 1, verbose=verbose and (epoch % 10 == 0)
+        )
+
+        # 验证
+        val_loss, val_acc = evaluate(
+            model, val_loader, device,
+            epoch=epoch + 1, verbose=verbose and (epoch % 10 == 0)
+        )
+
+        # 更新学习率
+        if epoch >= config.warmup_epochs:
+            scheduler.step()
+
+        epoch_time = time.time() - epoch_start
+        epoch_times.append(epoch_time)
+
+        # 记录结果
+        result.train_losses.append(train_loss)
+        result.train_accs.append(train_acc)
+        result.val_losses.append(val_loss)
+        result.val_accs.append(val_acc)
+
+        # Early Stopping
+        if val_acc > best_val_acc + 1e-4:
+            best_val_acc = val_acc
+            best_epoch = epoch
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if verbose and (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch+1}/{config.epochs}: "
+                  f"Train Loss={train_loss:.4f}, Train Acc={train_acc:.1f}%, "
+                  f"Val Acc={val_acc:.1f}% [{epoch_time:.1f}s]")
+
+        # Early Stopping 检查
+        if patience_counter >= early_stop_patience:
+            if verbose:
+                print(f"\n  [EarlyStopping] 连续 {early_stop_patience} 个 epoch 无改善，提前停止")
+            break
+
+    # 汇总结果
+    result.best_val_acc = best_val_acc
+    result.best_epoch = best_epoch
+    result.final_val_acc = result.val_accs[-1] if result.val_accs else 0.0
+    result.avg_epoch_time = np.mean(epoch_times)
 
     # 计算吞吐量
+    num_epochs = len(result.train_losses)
     total_images = len(train_loader.dataset) * num_epochs
+    total_time = sum(epoch_times)
     result.throughput = total_images / total_time if total_time > 0 else 0.0
 
     if verbose:
@@ -1129,21 +1145,35 @@ def main():
         description="Hilbert vs Raster vs Standard ViT 消融实验 (I25-2)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+控制变量实验设计:
+  - Hilbert vs Raster: 唯一区别 use_hilbert_encoding=True/False
+  - Standard vs Fractal: 参数量/计算量同级别
+
+推荐实验流程:
+  1. 快速验证: --quick
+  2. 核心对比: --modes hilbert raster --runs 3
+  3. 完整消融: --all --runs 3
+  4. I31 消融: --modes hilbert --no-area-encoding
+
+性能优化:
+  - 默认启用 channels-last + torch.compile (CUDA)
+  - 使用 --no-channels-last --no-compile 禁用
+
 示例:
   # 完整消融实验 (3 模式 × 3 次 = 9 次训练)
-  uv run python tests/benchmarks/ablation_hilbert_curve.py --all --epochs 60
+  uv run python tests/benchmarks/ablation_hilbert_curve.py --all --runs 3
 
-  # 只运行 Hilbert vs Raster
+  # 只运行 Hilbert vs Raster (核心假设验证)
   uv run python tests/benchmarks/ablation_hilbert_curve.py --modes hilbert raster --runs 3
 
-  # 快速测试
+  # 快速测试 (1 epoch, 1 run)
   uv run python tests/benchmarks/ablation_hilbert_curve.py --quick
 
   # 保存结果
   uv run python tests/benchmarks/ablation_hilbert_curve.py --output results.json
 
-  # 性能优化模式 (channels-last + compile)
-  uv run python tests/benchmarks/ablation_hilbert_curve.py --all --use-channels-last --use-compile
+  # 禁用性能优化 (CPU 或调试模式)
+  uv run python tests/benchmarks/ablation_hilbert_curve.py --all --no-channels-last --no-compile
 
   # I31 面积编码消融
   uv run python tests/benchmarks/ablation_hilbert_curve.py --modes hilbert --no-area-encoding
@@ -1167,8 +1197,8 @@ def main():
 
     # 训练参数
     parser.add_argument(
-        '--epochs', type=int, default=60,
-        help='训练 epochs 数 (默认: 60)'
+        '--epochs', type=int, default=100,
+        help='训练 epochs 数 (默认: 100)'
     )
     parser.add_argument(
         '--batch-size', type=int, default=64,
@@ -1179,19 +1209,31 @@ def main():
         help='学习率 (默认: 1e-3)'
     )
 
-    # I78 性能优化参数
+    # I78 性能优化参数 (默认启用)
     parser.add_argument(
-        '--use-channels-last', action='store_true',
-        help='启用 channels-last 内存格式 (~20% VRAM 节省)'
+        '--channels-last', action='store_true', dest='use_channels_last',
+        help='启用 channels-last 内存格式 (约20%% VRAM 节省)'
     )
     parser.add_argument(
-        '--use-compile', action='store_true',
-        help='启用 torch.compile 优化 (~30% 训练加速)'
+        '--no-channels-last', action='store_false', dest='use_channels_last',
+        help='禁用 channels-last'
+    )
+    parser.add_argument(
+        '--compile', action='store_true', dest='use_compile',
+        help='启用 torch.compile 优化 (约30%% 训练加速)'
+    )
+    parser.add_argument(
+        '--no-compile', action='store_false', dest='use_compile',
+        help='禁用 torch.compile'
     )
 
     # I31 面积编码参数
     parser.add_argument(
-        '--no-area-encoding', action='store_true',
+        '--area-encoding', action='store_true', dest='use_area_encoding',
+        help='启用面积编码 (位置编码增强)'
+    )
+    parser.add_argument(
+        '--no-area-encoding', action='store_false', dest='use_area_encoding',
         help='禁用面积编码 (用于 I31 消融实验)'
     )
     parser.add_argument(
@@ -1217,6 +1259,13 @@ def main():
         help='基础随机种子 (默认: 42)'
     )
 
+    # 设置默认参数
+    parser.set_defaults(
+        use_channels_last=True,
+        use_compile=True,
+        use_area_encoding=True,
+    )
+
     args = parser.parse_args()
 
     # 快速测试模式覆盖
@@ -1233,14 +1282,13 @@ def main():
     print(f"使用设备: {device}")
 
     # I78 性能优化状态
-    print(f"\n[I78] 性能优化配置:")
-    print(f"  channels-last: {'ON' if args.use_channels_last else 'OFF'}")
+    print(f"\n[I78] 性能优化:")
+    print(f"  channels-last: {'ON' if args.use_channels_last and device.type == 'cuda' else 'OFF (CPU)'}")
     print(f"  torch.compile: {'ON' if args.use_compile else 'OFF'}")
 
     # I31 面积编码配置
-    use_area_encoding = not args.no_area_encoding
-    print(f"\n[I31] 面积编码配置:")
-    print(f"  use_area_encoding: {use_area_encoding}")
+    print(f"\n[I31] 面积编码:")
+    print(f"  use_area_encoding: {args.use_area_encoding}")
     print(f"  fourier_levels: {args.fourier_levels}")
 
     # 加载数据 (自动下载)
@@ -1271,10 +1319,10 @@ def main():
         learning_rate=args.lr,
         num_classes=num_classes,
         # I78 性能优化
-        use_channels_last=args.use_channels_last,
+        use_channels_last=args.use_channels_last and device.type == 'cuda',
         use_compile=args.use_compile,
         # I31 面积编码
-        use_area_encoding=use_area_encoding,
+        use_area_encoding=args.use_area_encoding,
         fourier_levels=args.fourier_levels,
     )
 
@@ -1295,10 +1343,10 @@ def main():
             learning_rate=args.lr,
             num_classes=num_classes,
             # I78 性能优化
-            use_channels_last=args.use_channels_last,
+            use_channels_last=args.use_channels_last and device.type == 'cuda',
             use_compile=args.use_compile,
             # I31 面积编码
-            use_area_encoding=use_area_encoding,
+            use_area_encoding=args.use_area_encoding,
             fourier_levels=args.fourier_levels,
         )
 
