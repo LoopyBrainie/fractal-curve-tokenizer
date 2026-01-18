@@ -84,7 +84,7 @@ from vit_pytorch import FractalCurveViT
 class TinyImageNetValDataset(Dataset):
     """Tiny-ImageNet 验证集 (Format A)
 
-    验证集结构: val/类别名/images/*.JPEG + val_annotations.txt
+    验证集结构: val/images/*.JPEG + val_annotations.txt
     需要从 val_annotations.txt 读取正确的类别标签，而不是使用目录名
     """
 
@@ -112,6 +112,19 @@ class TinyImageNetValDataset(Dataset):
         if self.debug:
             print(f"[DEBUG] Found subdirs: {list(subdirs.keys())[:5]}... (total: {len(subdirs)})")
 
+        # 查找 images 子目录（用于查找文件）
+        images_dir = None
+        if 'images' in subdirs:
+            images_dir = subdirs['images']
+        else:
+            # 尝试直接查找 images 目录
+            potential_images = self.root / "images"
+            if potential_images.exists():
+                images_dir = potential_images
+
+        if self.debug and images_dir:
+            print(f"[DEBUG] Images directory: {images_dir}")
+
         samples_found = 0
         with open(annotations_file, 'r') as f:
             for line in f:
@@ -124,20 +137,14 @@ class TinyImageNetValDataset(Dataset):
                     if class_id not in self.class_to_idx:
                         self.class_to_idx[class_id] = len(self.class_to_idx)
 
-                    # 图片路径: val/子目录名/images/文件名
-                    # 优先使用 class_id 作为目录名，如果不存在则查找匹配的子目录
+                    # 图片路径: val/images/文件名 (所有图片在同一目录)
+                    # 根据 val_annotations.txt 中的 class_id 确定标签
                     img_path = None
-                    if class_id in subdirs:
-                        img_path = subdirs[class_id] / "images" / filename
-                        if self.debug and samples_found < 3:
-                            print(f"[DEBUG] Found via class_id: {img_path} (exists: {img_path.exists()})")
-                    else:
-                        # 尝试在所有子目录中查找文件
-                        for subdir_path in subdirs.values():
-                            test_path = subdir_path / "images" / filename
-                            if test_path.exists():
-                                img_path = test_path
-                                break
+                    if images_dir:
+                        img_path = images_dir / filename
+
+                    if self.debug and samples_found < 3 and img_path:
+                        print(f"[DEBUG] Found: {img_path} (exists: {img_path.exists()})")
 
                     if img_path is not None and img_path.exists():
                         class_idx = self.class_to_idx[class_id]
