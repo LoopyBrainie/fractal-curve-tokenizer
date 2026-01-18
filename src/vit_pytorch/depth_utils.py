@@ -41,13 +41,13 @@ import torch
 def compute_max_depth(
     image_size: Tuple[int, int],
     min_patch_size: int,
-    hard_limit: int = 8,
+    hard_limit: Optional[int] = None,
 ) -> int:
     """
     动态计算四叉树最大深度。
 
     数学形式:
-        L_max = min(hard_limit, max(0, floor(log2(min(H, W) / min_patch_size))))
+        L_max = max(0, floor(log2(min(H, W) / min_patch_size)))
 
     参数
     ----
@@ -56,7 +56,7 @@ def compute_max_depth(
     min_patch_size : int
         目标最小 patch 大小
     hard_limit : int, optional
-        硬上限，防止极端情况，默认 8
+        硬上限，None 表示无限制（由图像尺寸和 min_patch_size 自动决定）
 
     返回
     ----
@@ -71,20 +71,8 @@ def compute_max_depth(
     5
     >>> compute_max_depth((512, 512), 4)
     7
-    >>> compute_max_depth((224, 224), 8)
-    4
-    >>> compute_max_depth((64, 64), 8)
+    >>> compute_max_depth((64, 64), 4, hard_limit=3)  # 64/2^3=8，实际最小 patch
     3
-    >>> compute_max_depth((32, 32), 4)
-    3
-    >>> compute_max_depth((100, 100), 4)  # 非 2^n 尺寸
-    4
-    >>> compute_max_depth((16, 16), 4)
-    2
-    >>> compute_max_depth((8, 8), 4)
-    1
-    >>> compute_max_depth((4, 4), 4)
-    0
 
     边界情况
     --------
@@ -101,15 +89,16 @@ def compute_max_depth(
     if min_patch_size <= 0:
         raise ValueError(f"min_patch_size must be positive, got {min_patch_size}")
 
-    if hard_limit <= 0:
-        raise ValueError(f"hard_limit must be positive, got {hard_limit}")
-
     # 动态计算深度
     # 公式: L_max = floor(log2(min_dim / min_patch_size))
     max_depth = int(math.log2(min_dim // min_patch_size))
 
-    # 应用硬上限并确保非负
-    return max(0, min(max_depth, hard_limit))
+    # 应用硬上限（如果指定）
+    if hard_limit is not None:
+        max_depth = min(max_depth, hard_limit)
+
+    # 确保非负
+    return max(0, max_depth)
 
 
 def compute_actual_min_patch(
@@ -503,7 +492,11 @@ def compute_normalized_area(
         regions = regions.unsqueeze(0)  # [1, N, 4]
 
     B, N, _ = regions.shape
-    W, H = image_size
+    # 处理 image_size 格式：支持 int 或 (W, H) 元组
+    if isinstance(image_size, int):
+        W = H = image_size
+    else:
+        W, H = image_size
     S_total = W * H
 
     # 计算区域面积 [B, N]

@@ -133,6 +133,8 @@ class FractalTransformerBlock(nn.Module):
         ffn_type: FFNType = 'swiglu_level',
         lca_temperature: Optional[float] = 1.5,
         learnable_temperature: bool = True,
+        use_affine_modulation: bool = False,
+        fourier_levels: int = 4,
     ):
         super().__init__()
         self.dim = dim
@@ -146,6 +148,8 @@ class FractalTransformerBlock(nn.Module):
             max_level=max_level,
             lca_temperature=lca_temperature,
             learnable_temperature=learnable_temperature,
+            use_affine_modulation=use_affine_modulation,
+            fourier_levels=fourier_levels,
         )
 
         self.ff = AdaptiveFractalFeedForward(
@@ -370,6 +374,8 @@ class FractalTransformer(nn.Module):
         use_checkpoint: bool = False,
         lca_temperature: Optional[float] = 1.5,
         learnable_temperature: bool = True,
+        use_affine_modulation: bool = False,
+        fourier_levels: int = 4,
     ):
         super().__init__()
         self.dim = dim
@@ -394,6 +400,8 @@ class FractalTransformer(nn.Module):
                     ffn_type=ffn_type,
                     lca_temperature=lca_temperature,
                     learnable_temperature=learnable_temperature,
+                    use_affine_modulation=use_affine_modulation,
+                    fourier_levels=fourier_levels,
                 )
                 for i in range(depth)
             ]

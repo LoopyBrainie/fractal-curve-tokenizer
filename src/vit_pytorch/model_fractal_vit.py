@@ -79,7 +79,7 @@ class FractalCurveViT(nn.Module):
     def __init__(
         self,
         *,
-        image_size: Union[int, Tuple[int, int]],
+        image_size: Optional[Union[int, Tuple[int, int]]] = None,
         num_classes: int,
         dim: int = 512,
         depth: int = 6,
@@ -90,10 +90,9 @@ class FractalCurveViT(nn.Module):
         dim_head: int = 64,
         dropout: float = 0.0,
         emb_dropout: float = 0.0,
-        # I30-17: 替换 Tuple[int, int] 为单一 int，并添加 max_depth_hard_limit
-        # 支持 Union[int, Tuple[int, int]] 用于向后兼容
+        # I30-17: 替换 Tuple[int, int] 为单一 int
+        # max_depth 由 min_patch_size 和 image_size 自动计算: floor(log2(min(H, W) / min_patch_size))
         min_patch_size: Union[int, Tuple[int, int]] = 4,
-        max_depth_hard_limit: int = 8,
         max_level: Optional[int] = None,  # P11-2: 默认 None，从 tokenizer.max_depth 自动获取
         # I30-17: 废弃 num_scales 参数，改为动态计算
         num_scales: Optional[int] = None,  # 已废弃，仅用于向后兼容
@@ -116,11 +115,15 @@ class FractalCurveViT(nn.Module):
         # 设计原理: 允许统一控制正则化强度，避免硬编码值
         splitter_dropout: Optional[float] = None,  # None = 跟随主 dropout
         pos_dropout: Optional[float] = None,       # None = 跟随主 dropout * 0.5
+        # I31-3: 面积编码配置
+        use_area_encoding: bool = False,           # 启用面积增强位置编码
+        use_affine_modulation: bool = False,       # 启用仿射调制注意力偏置
+        fourier_levels: int = 4,                   # 傅里叶特征级别数
     ) -> None:
         """初始化 FractalCurveViT。
 
         Args:
-            image_size: 输入图像尺寸（整数或 (H, W) 元组）
+            image_size: 输入图像尺寸（整数或 (H, W) 元组），None 表示动态分辨率
             num_classes: 分类类别数
             dim: 模型嵌入维度
             depth: Transformer 层数
@@ -132,7 +135,7 @@ class FractalCurveViT(nn.Module):
             dropout: Dropout 比率
             emb_dropout: 嵌入层 Dropout 比率
             min_patch_size: (I30-17) 目标最小 patch 大小，用于动态计算 max_depth
-            max_depth_hard_limit: (I30-17) max_depth 硬上限，默认 8
+                max_depth = floor(log2(min(H, W) / min_patch_size))
             max_level: 最大递归层级（P11-2: 默认 None，自动从 tokenizer.max_depth 获取）
             num_scales: (已废弃) 使用 min_patch_size 替代
             use_hilbert_encoding: 是否使用 Hilbert 编码
@@ -153,14 +156,20 @@ class FractalCurveViT(nn.Module):
             pos_dropout: (I27) Position Embedding dropout
                 - None: 自动 = dropout * 0.5  # 信息瓶颈需保守
                 - float: 显式指定
+            use_area_encoding: (I31-3) 启用面积增强位置编码，默认 False
+            use_affine_modulation: (I31-3) 启用仿射调制注意力偏置，默认 False
+            fourier_levels: (I31-3) 傅里叶特征级别数，用于面积编码，默认 4
 
         Note:
             I30-17: 已废弃 num_scales 参数。现在使用 min_patch_size 动态计算 max_depth:
-                max_depth = min(hard_limit, max(0, floor(log2(min(H, W) / min_patch_size))))
+                max_depth = max(0, floor(log2(min(H, W) / min_patch_size)))
+
+            I78: 支持 image_size=None 实现真正的动态分辨率输入。
+                初始化时使用估算的 image_size（基于 min_patch_size），
+                前向传播时根据实际输入尺寸动态调整深度。
         """
         super().__init__()
 
-        self.image_size = pair(image_size)
         self.num_classes = num_classes
         self.dim = dim
         self.pool = pool
@@ -173,14 +182,14 @@ class FractalCurveViT(nn.Module):
         self._is_streaming = True  # 现在所有 tokenizer 都是 streaming 模式
         self.lca_temperature = lca_temperature
         self.learnable_temperature = learnable_temperature
-        
+
         # ====================================================================
         # I27: 子模块 Dropout 配置 (避免硬编码)
         # ====================================================================
         # 数学依据:
         #   - Splitter MLP 敏感: 过高 dropout 导致分割决策不稳定
         #   - Position Embedding 是信息瓶颈: 需保守正则化
-        # 
+        #
         # 推导公式:
         #   splitter_dropout = min(dropout, 0.15)  # cap at 0.15
         #   pos_dropout = dropout * 0.5            # half of main dropout
@@ -194,6 +203,18 @@ class FractalCurveViT(nn.Module):
             effective_min_patch_size = min_patch_size[0]
         else:
             effective_min_patch_size = min_patch_size
+
+        # I78: 处理动态分辨率模式 (必须在使用 effective_min_patch_size 之后)
+        if image_size is None:
+            # 使用 min_patch_size 估算默认图像尺寸用于初始化
+            # 估算公式: min(H, W) ≈ min_patch_size × 2^6 = min_patch_size × 64
+            # max_depth 将由 StreamingFractalTokenizerV3 根据实际输入图像自动计算
+            estimated_size = effective_min_patch_size * 64
+            self.image_size = pair(estimated_size)
+            self._dynamic_image_size = True
+        else:
+            self.image_size = pair(image_size)
+            self._dynamic_image_size = False
 
         # === Tokenizer 选择逻辑 ===
         if tokenizer is not None:
@@ -217,13 +238,13 @@ class FractalCurveViT(nn.Module):
                 )
             else:
                 # I30-17: 新方式，使用 min_patch_size 动态计算 max_depth
+                # max_depth = floor(log2(min(H, W) / min_patch_size))，无硬限制
                 tokenizer = StreamingFractalTokenizerV3(
                     image_size=self.image_size,
                     channels=channels,
                     d_model=dim,
                     base_patch_size=effective_min_patch_size,
                     min_patch_size=effective_min_patch_size,  # I30-17: 目标最小 patch
-                    max_depth_hard_limit=max_depth_hard_limit,  # I30-17: 硬上限
                     K_min=K_min,
                     K_max=K_max,
                     splitter_dropout=effective_splitter_dropout,  # I27: 可配置
@@ -251,15 +272,27 @@ class FractalCurveViT(nn.Module):
 
         # 高级分形位置编码
         # I27: 传递 pos_dropout 到 Position Embedding
+        # I31-3: 支持面积增强位置编码
         if position_embedding is None:
-            position_embedding = FractalPositionEmbedding(
-                dim=dim,
-                max_level=max_level,
-                max_seq_len=10000,
-                use_hilbert_encoding=use_hilbert_encoding,
-                use_spatial_encoding=use_spatial_encoding,
-                dropout=effective_pos_dropout,  # I27: 可配置
-            )
+            if use_area_encoding:
+                from .embed_fractal_position import AreaEnhancedPositionEmbedding
+                position_embedding = AreaEnhancedPositionEmbedding(
+                    dim=dim,
+                    max_level=max_level,
+                    fourier_levels=fourier_levels,
+                    use_hilbert_encoding=use_hilbert_encoding,
+                    use_spatial_encoding=use_spatial_encoding,
+                    dropout=effective_pos_dropout,  # I27: 可配置
+                )
+            else:
+                position_embedding = FractalPositionEmbedding(
+                    dim=dim,
+                    max_level=max_level,
+                    max_seq_len=10000,
+                    use_hilbert_encoding=use_hilbert_encoding,
+                    use_spatial_encoding=use_spatial_encoding,
+                    dropout=effective_pos_dropout,  # I27: 可配置
+                )
 
         self.pos_embedding = position_embedding
         self.position_embedding = position_embedding
@@ -273,7 +306,11 @@ class FractalCurveViT(nn.Module):
         # 保留 aux_loss_weight 缓冲以保持向后兼容性
         self.register_buffer("aux_loss_weight", torch.tensor(0.0))
 
+        # I78: 预分配零损失张量，避免每次调用 get_entropy_loss 时重复分配
+        self.register_buffer("_zero_loss", torch.tensor(0.0))
+
         # 分形Transformer
+        # I31-3: 传递 use_affine_modulation 和 fourier_levels
         self.transformer = FractalTransformer(
             dim=dim,
             depth=depth,
@@ -287,6 +324,8 @@ class FractalCurveViT(nn.Module):
             use_checkpoint=use_checkpoint,
             lca_temperature=lca_temperature,
             learnable_temperature=learnable_temperature,
+            use_affine_modulation=use_affine_modulation,
+            fourier_levels=fourier_levels,
         )
 
         # 分类头
@@ -358,23 +397,26 @@ class FractalCurveViT(nn.Module):
         self, img: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], "TokenizerOutput"]:
         """准备 tokens 和进行 padding。
-        
+
         数学形式化：
             T, L = S(I) where N varies per image in variable_tokens mode
-            
+
         P9-5 优化：
             原实现: O(B) Python 循环进行 padding
             新实现: 使用 TokenizerOutput 的预填充缓存，O(1) 张量操作
-            
+
         P11-3 改进：
             返回 TokenizerOutput 以便后续获取 regions 信息
-            
+
         P12-2 优化：
             lengths 返回 Tensor[B] 而非 List[int]，避免 _create_attention_mask 转换开销
-        
+
+        I78: 动态分辨率支持
+            当 image_size=None 时，根据实际输入图像大小动态更新 tokenizer 候选区域
+
         Args:
             img: 输入图像 [B, C, H, W]
-            
+
         Returns:
             (padded_tokens, padded_levels, lengths, levels_list, token_output):
             - padded_tokens: tokens [B, MaxN, Dim] (padded)
@@ -383,6 +425,11 @@ class FractalCurveViT(nn.Module):
             - levels_list: 原始层级列表（用于辅助输出）
             - token_output: TokenizerOutput (P11-3: 用于获取 regions)
         """
+        # I78: 动态分辨率支持 - 根据实际输入更新 tokenizer 候选区域
+        if self._dynamic_image_size:
+            actual_size = (img.shape[2], img.shape[3])  # (H, W)
+            self.tokenizer.update_candidates(actual_size)
+
         # Streaming tokenizer 直接输出 D-dim embeddings
         token_output = self.tokenizer.tokenize(img)
         
@@ -402,13 +449,17 @@ class FractalCurveViT(nn.Module):
         self,
         padded_tokens: torch.Tensor,
         padded_levels: torch.Tensor,
+        regions: Optional[torch.Tensor] = None,
+        image_size: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """添加位置编码和 CLS token。
-        
+
         Args:
             padded_tokens: 填充后的 tokens [B, MaxLen, Dim]
             padded_levels: 填充后的层级信息 [B, MaxLen, InfoDim]
-            
+            regions: (I31-3) 区域边界张量，形状 [B, N, 4]
+            image_size: (I31-3) 图像尺寸，可以是整数或 (W, H) 元组
+
         Returns:
             (x, padded_levels):
             - x: 带位置编码和 CLS 的序列 [B, 1+MaxLen, Dim]
@@ -417,7 +468,8 @@ class FractalCurveViT(nn.Module):
         batch_size = padded_tokens.shape[0]
         device = padded_tokens.device
 
-        pos_emb = self.pos_embedding(padded_levels)
+        # I31-3: 传递 regions 和 image_size 给位置编码器（用于面积编码）
+        pos_emb = self.pos_embedding(padded_levels, regions=regions, image_size=image_size)
         x = padded_tokens + pos_emb
 
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
@@ -627,7 +679,10 @@ class FractalCurveViT(nn.Module):
         regions, image_size = token_output.get_padded_regions()
 
         # 2. 添加位置编码和 CLS token
-        x, padded_levels = self._apply_position_and_cls(padded_tokens, padded_levels)
+        # I31-3: 传递 regions 和 image_size 用于面积编码
+        x, padded_levels = self._apply_position_and_cls(
+            padded_tokens, padded_levels, regions=regions, image_size=image_size
+        )
         
         # P11-3: 为 regions 添加 CLS 对应的零填充
         if regions is not None:
@@ -691,8 +746,8 @@ class FractalCurveViT(nn.Module):
             torch.Tensor: 零损失（Variable Depth Tokenizer 完全可微分）
         """
         # StreamingFractalTokenizerV3 使用可微分的 Region Pooling
-        # 无需策略梯度损失
-        return torch.tensor(0.0, device=self.aux_loss_weight.device)
+        # 无需策略梯度损失 (I78: 使用预分配零张量避免重复分配)
+        return self._zero_loss.detach().to(self.aux_loss_weight.device)
     
     def clear_tokenizer_cache(self) -> None:
         """清空 tokenizer 的动作缓存，应在每个 batch 结束后调用"""

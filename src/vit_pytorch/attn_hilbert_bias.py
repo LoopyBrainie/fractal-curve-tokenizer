@@ -735,27 +735,15 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             if self.use_affine_modulation and regions is not None and image_size is not None:
                 affine_bias = self.affine_modulated_bias(regions, image_size)
                 if affine_bias is not None:
-                    # affine_bias: (B, dim, N, N)
-                    # 需要广播到 (B, H, N, N)，dim 维度
-                    # 方法: 对 dim 维度求均值或使用对角线
-                    # 更简单: 将 dim 维度加到 heads 维度
+                    # affine_bias: [B, dim, N, N]
+                    # 需要广播到 [B, H, N, N]，通过对 dim 维度求均值
+                    # 因为 dim = heads * head_dim，求均值后形状保持 [B, dim, N, N]
+                    # 然后需要重塑为 [B, H, N, N]
                     if affine_bias.dim() == 4:
-                        # affine_bias: [B, dim, N, N] -> 需要转换为 [B, H, N, N]
-                        # 由于 dim = head_dim * heads，我们将其拆分
-                        head_dim = self.dim_head
-                        # 取第一个 head_dim 维度作为代表，或平均
-                        affine_bias_4d = affine_bias  # [B, dim, N, N]
-                        # 展并重复 heads 次
-                        affine_bias_expanded = affine_bias_4d.unsqueeze(1).expand(
-                            -1, self.heads, -1, -1, -1
-                        )  # [B, H, dim, N, N]
-                        # 重排: [B, H, dim, N, N] -> [B, H, N, N] 通过求和 dim 维度再取平均
-                        # 或者更简单: 只取与 head_dim 对应的部分
-                        affine_bias_head = affine_bias_expanded.view(
-                            affine_bias.size(0), self.heads, self.dim_head, affine_bias.size(2), affine_bias.size(3)
-                        )  # [B, H, head_dim, N, N]
-                        # 对 head_dim 维度求平均得到 [B, H, N, N]
-                        affine_bias_final = affine_bias_head.mean(dim=2)
+                        # 对 dim 维度求平均，得到 [B, dim, N, N]
+                        affine_bias_avg = affine_bias.mean(dim=1, keepdim=True)  # [B, 1, N, N]
+                        # 广播到所有 heads
+                        affine_bias_final = affine_bias_avg.expand(-1, self.heads, -1, -1)  # [B, H, N, N]
                         dots = dots + affine_bias_final * HILBERT_BIAS_SCALE
             else:
                 hilbert_bias = self._compute_hilbert_bias(
@@ -1216,8 +1204,8 @@ class AreaEncoder(nn.Module):
         regions : torch.Tensor
             区域边界张量，形状 [B, N, 4]
             格式: [x1, y1, x2, y2]
-        image_size : Tuple[int, int]
-            (W, H) 图像尺寸
+        image_size : int or Tuple[int, int]
+            图像尺寸，可以是整数或 (W, H) 元组
 
         返回
         ----
@@ -1225,7 +1213,12 @@ class AreaEncoder(nn.Module):
             面积嵌入，形状 [B, N, dim]
         """
         B, N, _ = regions.shape
-        W, H = image_size
+        # 处理 image_size 格式：支持 int 或 (W, H) 元组
+        if isinstance(image_size, int):
+            image_size_tuple = (image_size, image_size)
+        else:
+            image_size_tuple = image_size
+        W, H = image_size_tuple
 
         # 1. 计算归一化面积分数
         area_scores = compute_normalized_area(regions, image_size, epsilon=1e-8)
@@ -1407,7 +1400,8 @@ class AffineModulatedBias(nn.Module):
             return lca_bias
 
         # 2. 面积编码 [B, N, dim]
-        area_emb = self.area_encoder(regions, (image_size, image_size))
+        # image_size 已经是 (W, H) 元组，无需再包装
+        area_emb = self.area_encoder(regions, image_size)
 
         # 3. 计算面积相似性矩阵 [B, N, N]
         # p_s[i,j] = area_emb[i] · area_emb[j]

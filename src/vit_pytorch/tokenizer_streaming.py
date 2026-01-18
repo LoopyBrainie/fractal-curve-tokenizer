@@ -109,7 +109,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # I30-17: 替换固定 max_depth 为动态计算
         # 支持 Union[int, Tuple[int, int]] 用于向后兼容
         min_patch_size: Union[int, Tuple[int, int]] = 4,
-        max_depth_hard_limit: int = 8,
         # 保留 max_depth 用于向后兼容 (可选，如果指定则使用该值)
         max_depth: Optional[int] = None,
         use_hilbert_order: bool = True,
@@ -150,13 +149,12 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         # I30-17: 动态深度计算
         self.min_patch_size = effective_min_patch_size  # 存储规范化后的值
-        self.max_depth_hard_limit = max_depth_hard_limit
 
         # 动态计算 max_depth (用于 splitter)
-        # 公式: L_max = min(hard_limit, max(0, floor(log2(min(H, W) / min_patch_size))))
+        # 公式: L_max = max(0, floor(log2(min(H, W) / min_patch_size)))
         from .depth_utils import compute_max_depth
         self._computed_max_depth = compute_max_depth(
-            image_size, effective_min_patch_size, max_depth_hard_limit
+            image_size, effective_min_patch_size
         )
 
         # I30-17-EXT: 确定最终使用的 max_depth
@@ -212,11 +210,11 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             # 使用传统参数（向后兼容）
             # I27-1: 使用传入的 splitter_dropout 而非硬编码值
             # 允许训练器统一控制正则化强度
-            # I30-17-EXT: 使用动态计算的 min_patch_size 和 max_depth_limit
+            # I30-17-EXT: 使用动态计算的 min_patch_size 和 max_depth
             self.splitter = GumbelTopKSplitter(
                 feature_dim=d_model,
                 min_patch_size=effective_min_patch_size,  # I30-17-EXT: 动态深度计算
-                max_depth_limit=max_depth_hard_limit,
+                max_depth_limit=self._computed_max_depth,
                 hidden_dim=64,
                 pool_size=4,
                 temperature=learnable_temperature,
@@ -344,7 +342,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             
             if tensor_result.num_tokens > 0:
                 count_matrix = torch.zeros(B, max_d, dtype=torch.long, device=device)
-                flat_idx = batch_indices * max_d + depths.clamp(max=max_d - 1)
+                # I78: 添加 min clamp 防止负索引 (M3 修复)
+                flat_idx = batch_indices * max_d + depths.clamp(min=0, max=max_d - 1)
                 ones = torch.ones_like(flat_idx)
                 count_matrix.view(-1).scatter_add_(0, flat_idx, ones)
                 
@@ -734,15 +733,13 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             padded_regions = torch.zeros(B, 1, 4, dtype=torch.long, device=device)
             return self.patch_embed.norm(tokens), levels_info, padded_regions
         
-        # 计算每个 batch 的最大 token 数量
+        # 计算每个 batch 的最大 token 数量 (I78: 优化为张量操作)
         if tensor_result.tokens_per_batch is not None:
-            max_tokens = int(tensor_result.tokens_per_batch.max().item())
+            max_tokens = int(tensor_result.tokens_per_batch.max())
         else:
-            # 回退: 计算每个 batch 的 token 数
-            max_tokens = 0
-            for b in range(B):
-                n = (tensor_result.batch_indices == b).sum()
-                max_tokens = max(max_tokens, int(n.item()))
+            # 回退: 使用 bincount 计算每个 batch 的 token 数
+            token_counts = torch.bincount(tensor_result.batch_indices, minlength=B)
+            max_tokens = int(token_counts.max())
         
         # ====================================================================
         # 构建 ROI boxes (纯张量操作)
@@ -855,11 +852,28 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             padded_split_probs = split_probs_padded
 
         return self.patch_embed.norm(tokens), levels_info, padded_regions, padded_split_probs
-    
+
     def forward(self, images: torch.Tensor) -> TokenizerOutput:
         """前向传播，等价于 tokenize."""
         return self.tokenize(images)
-    
+
+    # I78: 动态分辨率支持
+    def update_candidates(self, image_size: Tuple[int, int]):
+        """根据输入尺寸动态更新候选区域。
+
+        用于支持动态分辨率输入，无需在初始化时指定固定 image_size。
+
+        Args:
+            image_size: (H, W) 输入图像尺寸
+        """
+        from .gumbel_topk_splitter import GumbelTopKSplitter
+
+        if isinstance(self.splitter, GumbelTopKSplitter):
+            self.splitter._update_candidates(image_size)
+            # I78: 重置 EMA 统计量以避免维度不匹配
+            self.splitter._running_mu = None
+            self.splitter._running_sigma = None
+
     @torch.no_grad()
     def get_split_stats(self) -> Optional[Dict[str, Any]]:
         """获取最近一次分割的统计信息."""
@@ -892,11 +906,12 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 其他分割器类型不支持
         return None
     
+    @torch.no_grad()
     def get_scale_entropy(self) -> Optional[float]:
-        """获取尺度分布熵值.
-        
+        """获取尺度分布熵值 (I78: 添加 no_grad 避免梯度计算).
+
         P11-9 优化: 使用向量化计算，避免 O(B × D) Python 循环。
-        
+
         数学形式:
             H = -∑_d p_d log(p_d)
             其中 p_d = count_d / ∑_d' count_d'
@@ -909,9 +924,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             count_matrix = self._last_depth_count_matrix  # [B, max_d]
             total_counts = count_matrix.sum(dim=0).float()  # [max_d]
             total = total_counts.sum()
-            if total == 0:
-                return None
-            probs = total_counts / total
+            # I78: 使用 clamp 防止除零 (M4 修复)
+            total_safe = total.clamp(min=1e-8)
+            probs = total_counts / total_safe
             # 避免 log(0)
             log_probs = torch.log(probs + LOG_EPSILON)
             entropy = -(probs * log_probs).sum().item()

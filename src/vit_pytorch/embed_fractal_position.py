@@ -128,6 +128,9 @@ class FractalPositionEmbedding(nn.Module):
         self,
         levels_info: torch.Tensor,
         sequence_positions: Optional[torch.Tensor] = None,
+        # I31-3: 额外参数用于与 AreaEnhancedPositionEmbedding 接口兼容
+        regions: Optional[torch.Tensor] = None,
+        image_size: Optional[int] = None,
     ) -> torch.Tensor:
         if levels_info.numel() == 0:
             return torch.zeros(0, self.dim, device=levels_info.device, dtype=torch.float32)
@@ -281,8 +284,8 @@ class AreaEnhancedPositionEmbedding(nn.Module):
             层级信息张量，形状 [B, N, InfoDim]
         regions : torch.Tensor, optional
             区域边界张量，形状 [B, N, 4]
-        image_size : int, optional
-            图像边长
+        image_size : int or tuple, optional
+            图像尺寸，可以是整数或 (W, H) 元组
 
         返回
         ----
@@ -294,7 +297,13 @@ class AreaEnhancedPositionEmbedding(nn.Module):
 
         # 2. 面积编码 (辅助注入)
         if regions is not None and image_size is not None and self.area_scale.item() != 0.0:
-            area_emb = self.area_encoder(regions, (image_size, image_size))
+            # 处理 image_size 格式：支持 int 或 (W, H) 元组
+            if isinstance(image_size, int):
+                image_size_tuple = (image_size, image_size)
+            else:
+                image_size_tuple = image_size
+
+            area_emb = self.area_encoder(regions, image_size_tuple)
 
             # 处理 CLS token: regions 包含 CLS (全零区域)，但 levels_info 的第一个是 CLS
             # area_emb 的形状是 [B, N, dim]，需要与 pos_emb 对齐

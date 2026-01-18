@@ -593,8 +593,8 @@ class GumbelTopKSplitter(nn.Module):
                     children_matrix_cpu[parent_idx, slot] = child_idx
                     slot_counts[parent_idx] = slot + 1
         
-        # 转回 GPU
-        self._children_matrix = torch.from_numpy(children_matrix_cpu).to(device)
+        # 转回 GPU (I78: 使用 non_blocking=True 异步传输)
+        self._children_matrix = torch.from_numpy(children_matrix_cpu).to(device, non_blocking=True)
     
     # ========================================================================
     # I23-1 方案C: 深度方差归一化
@@ -651,7 +651,7 @@ class GumbelTopKSplitter(nn.Module):
             normalized: [B, N] 按深度归一化后的 logits
         """
         B, N = logits.shape
-        depths = self.candidate_depths.to(device)  # [N]
+        depths = self.candidate_depths.to(device, non_blocking=True)  # [N] I78: 异步传输
         D = self._current_max_depth + 1
 
         # P-OPT-3: 向量化深度方差归一化
@@ -848,8 +848,8 @@ class GumbelTopKSplitter(nn.Module):
         device = features.device
         dtype = features.dtype
         
-        # 缩放区域坐标到特征图空间
-        regions_feat = self.candidate_regions.to(device).clone()
+        # 缩放区域坐标到特征图空间 (I78: 异步传输 + clone 支持原地修改)
+        regions_feat = self.candidate_regions.to(device, non_blocking=True).clone()
         regions_feat[:, [0, 2]] *= scale_w  # x
         regions_feat[:, [1, 3]] *= scale_h  # y
         
@@ -889,8 +889,8 @@ class GumbelTopKSplitter(nn.Module):
         if DEPTH_VARIANCE_NORM_ENABLED:
             complexity_logits = self._normalize_by_depth(complexity_logits, device, dtype)
         
-        # 深度嵌入偏置 - 确保在正确设备上
-        depths = self.candidate_depths.to(device)  # [N]
+        # 深度嵌入偏置 - 确保在正确设备上 (I78: 异步传输)
+        depths = self.candidate_depths.to(device, non_blocking=True)  # [N]
         depth_embed = self.depth_embedding(depths)  # [N, 16]
         depth_bias_learned = self.depth_proj(depth_embed).squeeze(-1)  # [N]
 
@@ -899,8 +899,8 @@ class GumbelTopKSplitter(nn.Module):
 
         # I30-4: 已移除 Log-Compensation (被方案E完全替代)
 
-        # 阈值 - 确保 thresholds 在正确设备上
-        thresholds = self.thresholds.to(device)
+        # 阈值 - 确保 thresholds 在正确设备上 (I78: 异步传输)
+        thresholds = self.thresholds.to(device, non_blocking=True)
         taus = thresholds[depths]  # [N]
         
         # 总 logits
@@ -1008,19 +1008,29 @@ class GumbelTopKSplitter(nn.Module):
         min_quota = self._quota_min_per_depth
         quota = quota_raw.clamp(min=min_quota)
         
-        # 调整以保证 Σ K_d = K
-        total = quota.sum().item()
-        if total > K:
+        # 调整以保证 Σ K_d = K (I78: 完全移除 .item() 支持 torch.compile)
+        total = quota.sum()  # 保持为张量
+        diff = total - K  # 正值表示超出，负值表示不足
+
+        # 创建比较张量用于向量化操作
+        K_tensor = torch.tensor(K, device=quota.device, dtype=torch.long)
+        min_quota_tensor = torch.tensor(min_quota, device=quota.device, dtype=torch.long)
+
+        if diff > 0:
             # 从最大配额深度扣除
-            excess = total - K
-            d_max = quota.argmax().item()
-            quota[d_max] = max(min_quota, quota[d_max].item() - excess)
-        elif total < K:
+            d_max = quota.argmax()
+            excess = (diff).to(torch.long)
+            # 计算新值：max(min_quota, current - excess)
+            current_val = quota[d_max].unsqueeze(0)
+            proposed = current_val - excess
+            new_value = torch.maximum(min_quota_tensor, proposed)
+            quota = quota.scatter(0, d_max.unsqueeze(0), new_value)
+        elif diff < 0:
             # 给最大配额深度增加
-            deficit = K - total
-            d_max = quota.argmax().item()
-            quota[d_max] += deficit
-        
+            d_max = quota.argmax()
+            deficit = (-diff).to(torch.long)
+            quota[d_max] = quota[d_max] + deficit
+
         return quota
     
     def _stratified_gumbel_topk_ste(
@@ -1058,7 +1068,7 @@ class GumbelTopKSplitter(nn.Module):
         B, N = logits.shape
         device = logits.device
         D = self._current_max_depth + 1
-        depths = self.candidate_depths.to(device)  # [N]
+        depths = self.candidate_depths.to(device, non_blocking=True)  # [N] I78: 异步传输
         
         # 计算配额分配
         quota = self._compute_quota_allocation(K)  # [D]
@@ -1258,8 +1268,8 @@ class GumbelTopKSplitter(nn.Module):
         B, N = selected_mask.shape
         device = selected_mask.device
 
-        # 确保 children_matrix 在正确设备上
-        children_matrix = self._children_matrix.to(device)  # [N, 4]
+        # 确保 children_matrix 在正确设备上 (I78: 异步传输)
+        children_matrix = self._children_matrix.to(device, non_blocking=True)  # [N, 4]
 
         # 对于每个节点，检查其子节点是否被选中
         # valid_children: [N, 4] 哪些子节点索引是有效的
@@ -1351,10 +1361,10 @@ class GumbelTopKSplitter(nn.Module):
         batch_indices = selected_positions[:, 0]  # [total]
         candidate_indices = selected_positions[:, 1]  # [total]
         
-        # 向量化索引所有候选属性 - 确保在正确设备上
-        regions = self.candidate_regions.to(device)[candidate_indices]  # [total, 4]
-        depths = self.candidate_depths.to(device)[candidate_indices]  # [total]
-        hilbert_indices = self.hilbert_indices.to(device)[candidate_indices]  # [total]
+        # 向量化索引所有候选属性 - 确保在正确设备上 (I78: 异步传输)
+        regions = self.candidate_regions.to(device, non_blocking=True)[candidate_indices]  # [total, 4]
+        depths = self.candidate_depths.to(device, non_blocking=True)[candidate_indices]  # [total]
+        hilbert_indices = self.hilbert_indices.to(device, non_blocking=True)[candidate_indices]  # [total]
         
         return GumbelTopKResult(
             regions=regions,
@@ -1672,7 +1682,7 @@ class GumbelTopKSplitter(nn.Module):
         
         B, N = selected_mask.shape
         device = selected_mask.device
-        depths = self.candidate_depths.to(device)  # [N]
+        depths = self.candidate_depths.to(device, non_blocking=True)  # [N] I78: 异步传输
         D = self._current_max_depth + 1  # 深度类别数
 
         # P-OPT-4: 向量化深度计数 (使用 one-hot + einsum 替代 for 循环)
@@ -1759,7 +1769,7 @@ class GumbelTopKSplitter(nn.Module):
         B, N = selected_mask.shape
         device = selected_mask.device
         dtype = selected_mask.dtype
-        depths = self.candidate_depths.to(device)  # [N]
+        depths = self.candidate_depths.to(device, non_blocking=True)  # [N] I78: 异步传输
         D = self._current_max_depth + 1  # 深度类别数
 
         # P-OPT-5: 向量化深度计数 (消除 for 循环)
@@ -1881,7 +1891,7 @@ class GumbelTopKSplitter(nn.Module):
         
         B, N = selected_mask.shape
         device = selected_mask.device
-        depths = self.candidate_depths.to(device)
+        depths = self.candidate_depths.to(device, non_blocking=True)  # I78: 异步传输
         D = self._current_max_depth + 1
 
         with torch.no_grad():
