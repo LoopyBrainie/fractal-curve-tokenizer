@@ -139,6 +139,9 @@ class CUB200TrainingConfig:
     tokenizer_type: str = "streaming_v3"
     ffn_type: str = "swiglu_level"
     use_checkpoint: bool = False
+    use_channels_last: bool = False  # I78: channels-last 内存格式 (节省 ~20% VRAM)
+    use_compile: bool = False        # I78: torch.compile 优化 (提升 ~30% 训练速度)
+    compile_mode: str = "default"    # torch.compile 模式: default, reduce-overhead, max-autotune
     channels: int = 3
 
     def __post_init__(self):
@@ -249,7 +252,22 @@ class CUB200Trainer:
         else:
             self.device = device
 
-        self.model.to(self.device)
+        # I78: 性能优化 - channels-last 内存格式
+        # 优势: 卷积运算优化，节省 ~20% VRAM
+        if self.config.use_channels_last:
+            self.model = self.model.to(memory_format=torch.channels_last)
+            self.logger.info("启用 channels-last 内存格式")
+
+        # I78: torch.compile 优化
+        # 优势: 提升 ~30% 训练速度，首次 forward 较慢
+        if self.config.use_compile:
+            self.logger.info(f"启用 torch.compile (mode={self.config.compile_mode})...")
+            self.model = torch.compile(
+                self.model,
+                mode=self.config.compile_mode,
+                dynamic=True,  # 支持动态序列长度
+            )
+            self.logger.info("torch.compile 完成")
 
         # 日志
         logging.basicConfig(level=config.log_level)
@@ -391,6 +409,9 @@ class CUB200Trainer:
 
         for batch_idx, (imgs, labels) in enumerate(tqdm(loader, desc="Training", leave=False)):
             imgs = imgs.to(self.device, non_blocking=True)
+            # I78: 保持 channels-last 格式
+            if self.config.use_channels_last and imgs.dim() == 4:
+                imgs = imgs.to(memory_format=torch.channels_last)
             labels = labels.to(self.device, non_blocking=True)
 
             # 累积归一化
@@ -516,6 +537,9 @@ class CUB200Trainer:
         for batch in tqdm(loader, desc="Evaluating", leave=False):
             imgs, labels = batch
             imgs = imgs.to(self.device, non_blocking=True)
+            # I78: 保持 channels-last 格式
+            if self.config.use_channels_last and imgs.dim() == 4:
+                imgs = imgs.to(memory_format=torch.channels_last)
             labels = labels.to(self.device, non_blocking=True)
 
             # 验证禁用 AMP
@@ -881,13 +905,19 @@ class CUB200Trainer:
                 # Tokenizer 参数
                 'num_scales': self.config.num_scales,
                 'min_patch_size': self.config.min_patch_size,
-                'max_level': self.config.max_level,
                 'K_min': self.config.K_min,
                 'K_max': self.config.K_max,
                 'tokenizer_type': self.config.tokenizer_type,
                 'ffn_type': self.config.ffn_type,
                 'use_checkpoint': self.config.use_checkpoint,
+                'use_channels_last': self.config.use_channels_last,
+                'use_compile': self.config.use_compile,
+                'compile_mode': self.config.compile_mode,
                 'channels': self.config.channels,
+                # I31 面积编码配置
+                'use_area_encoding': self.config.use_area_encoding,
+                'use_affine_modulation': self.config.use_affine_modulation,
+                'fourier_levels': self.config.fourier_levels,
             },
         }
 

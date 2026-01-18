@@ -1,14 +1,17 @@
 #!/bin/bash
 # ============================================================================
 # CUB-200-2011 最优训练脚本 - Fractal ViT 细粒度分类
-# RTX 4070 Laptop (8GB VRAM) 完整数学形式化推导 v2.1 (2026-01-17)
+# RTX 4070 Laptop (8GB VRAM) 完整数学形式化推导 v3.0 (2026-01-18)
 # ============================================================================
 #
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ 完整数学形式化分析 (启用最新架构设计 + CUB200Trainer)                  ║
+# ║ v3.0 (2026-01-18): I78 动态分辨率 + I31 面积编码                       ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 #
 # 最新架构特性:
+#   ✓ I78: 动态分辨率支持 (image_size=None, 自动计算 max_depth)
+#   ✓ I31: 面积编码 (use_area_encoding, fourier_levels)
 #   ✓ P10-4/P10-5: 软熵损失 (鼓励深度多样性)
 #   ✓ P10-9: 弹性预算损失 (Dead Zone 内零惩罚)
 #   ✓ I24-1: Tokenizer 冻结 (减少小数据集过拟合)
@@ -295,8 +298,10 @@
 # ║ 参数总结表                                                               ║
 # ╠══════════════════════════════════════════════════════════════════════════╣
 # ║ 模型: dim=256, depth=8, heads=8 → P=8.49M, P/N=1417×                    ║
-# ║ Token: max_level=4, num_scales=5, K∈[14,256]                             ║
-# ║ 训练: batch=64, accum=3, lr=2.8e-4, warmup=8                             ║
+# ║ I78: image_size=None, min_patch_size=14 → max_depth=4 (自动计算)        ║
+# ║ Token: K∈[14,256]                                                        ║
+# ║ I31: use_area_encoding, fourier_levels=4                                 ║
+# ║ 训练: batch=32, accum=6, lr=2.8e-4, warmup=8                             ║
 # ║ 正则: wd=0.15, dp=0.22, emb_dp=0.15, drop_path=0.16, ls=0.13            ║
 # ║ 增强: mixup=0.3, cutmix=0.8, prob=0.4                                    ║
 # ║ 架构: 软熵+弹性预算+Hilbert挖掘+Tokenizer冻结+Focal+Center               ║
@@ -314,15 +319,19 @@ uv run python examples/training/train_fractal_vit.py \
   --depth 8 \
   --heads 8 \
   --dim-head 32 \
-  --max-level 4 \
   --pool cls \
   --ffn-type swiglu_level \
   \
-  `# ===== §3: Scheme E Token 配置 (GumbelTopK) ===== ` \
+  `# ===== I78: 动态分辨率 Tokenizer 配置 (自动计算 max_depth) ===== ` \
   --tokenizer-type streaming_v3 \
-  --num-scales 5 \
+  --image-size none \
+  --min-patch-size 14 \
   --K-min 14 \
   --K-max 256 \
+  \
+  `# ===== I31: 面积编码配置 (2026-01-18) ===== ` \
+  --use-area-encoding \
+  --fourier-levels 4 \
   \
   `# ===== §5: 训练配置 (显存优化: batch=32, accum=6) ===== ` \
   --batch-size 32 \

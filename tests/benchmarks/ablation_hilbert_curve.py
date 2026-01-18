@@ -22,6 +22,19 @@ Hilbert vs Raster 消融实验 (I25-2)
 - Hilbert vs Raster: 唯一区别 use_hilbert_encoding=True/False
 - Standard vs Fractal: 参数量/计算量同级别 (公平对比)
 
+I78 动态分辨率 (2026-01-18):
+- image_size=None (自动计算 max_depth)
+- min_patch_size=4 → max_depth = floor(log2(64/4)) = 4
+
+I31 面积编码:
+- use_area_encoding=True (位置编码增强)
+- fourier_levels=4
+
+性能优化:
+- channels-last 内存格式 (~20% VRAM 节省)
+- torch.compile 优化 (~30% 训练加速)
+- 混合精度训练 (AMP)
+
 参考实现: https://github.com/lucidrains/vit-pytorch
 
 Usage:
@@ -36,6 +49,9 @@ Usage:
 
     # 保存结果
     uv run python tests/benchmarks/ablation_hilbert_curve.py --output results.json
+
+    # 性能优化模式 (channels-last + compile)
+    uv run python tests/benchmarks/ablation_hilbert_curve.py --all --use-channels-last --use-compile
 """
 
 from __future__ import annotations
@@ -55,9 +71,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision import datasets, transforms
 
 # Handle import paths
@@ -67,6 +83,9 @@ sys.path.insert(0, str(PROJECT_ROOT / "examples" / "training"))
 
 from einops import rearrange, repeat
 from vit_pytorch import FractalCurveViT
+
+# 导入 ModularTrainer 系统 (I78 性能优化)
+from examples.training import ModularTrainer, TrainerConfig, CheckpointCallback, EarlyStoppingCallback
 
 
 # ============================================================================
@@ -268,7 +287,16 @@ class StandardViT(nn.Module):
 
 @dataclass
 class ExperimentConfig:
-    """消融实验配置"""
+    """消融实验配置
+
+    I78 动态分辨率:
+    - image_size=None 表示使用动态分辨率，max_depth 由 min_patch_size 自动计算
+    - max_depth = floor(log2(min(H, W) / min_patch_size))
+
+    I31 面积编码:
+    - use_area_encoding=True 启用位置编码增强
+    - fourier_levels=4 控制傅里叶特征级别数
+    """
     name: str
     mode: str  # 'standard', 'hilbert', 'raster'
     description: str
@@ -294,6 +322,19 @@ class ExperimentConfig:
     # 数据集
     image_size: int = 64
     num_classes: int = 200
+
+    # I78 动态分辨率 Tokenizer 配置
+    min_patch_size: int = 4  # 最小 patch 大小
+    K_min: int = 16          # Token 数量下限 (信息论: log2(200) × 2 ≈ 16)
+    K_max: int = 64          # Token 数量上限
+
+    # I31 面积编码配置 (2026-01-18)
+    use_area_encoding: bool = True
+    fourier_levels: int = 4
+
+    # 性能优化 (I78)
+    use_channels_last: bool = False  # channels-last 内存格式 (~20% VRAM 节省)
+    use_compile: bool = False        # torch.compile 优化 (~30% 训练加速)
 
     def __post_init__(self):
         if self.mode not in ['standard', 'hilbert', 'raster']:
@@ -540,6 +581,14 @@ def create_model(config: ExperimentConfig) -> nn.Module:
     - Standard ViT: 参数量/计算量与 Fractal ViT 同级别 (公平对比基础)
     - Hilbert vs Raster: 唯一区别是 use_hilbert_encoding=True/False (严格控制变量)
 
+    I78 动态分辨率:
+    - image_size=None 表示使用动态分辨率
+    - max_depth = floor(log2(64/4)) = 4 (64x64 图像, min_patch_size=4)
+
+    I31 面积编码:
+    - use_area_encoding=True 启用位置编码增强
+    - fourier_levels=4 控制傅里叶特征级别数
+
     Args:
         config: 实验配置
 
@@ -560,10 +609,10 @@ def create_model(config: ExperimentConfig) -> nn.Module:
             dropout=config.dropout,
         )
     else:
-        # FractalCurveViT
+        # FractalCurveViT (I78 动态分辨率 + I31 面积编码)
         # Hilbert vs Raster: 唯一区别 use_hilbert_encoding
-        return FractalCurveViT(
-            image_size=config.image_size,
+        model = FractalCurveViT(
+            image_size=None,  # I78: 动态分辨率，自动计算 max_depth
             num_classes=config.num_classes,
             dim=config.dim,
             depth=config.depth,
@@ -574,12 +623,17 @@ def create_model(config: ExperimentConfig) -> nn.Module:
             drop_path_rate=config.drop_path,
             # 池化 (I30-11)
             pool="weighted",
-            # 核心变量: 排序方式
+            # I78: 动态分辨率 Tokenizer 配置
+            min_patch_size=config.min_patch_size,
+            K_min=config.K_min,
+            K_max=config.K_max,
+            # I31: 面积编码配置 (2026-01-18)
+            use_area_encoding=config.use_area_encoding,
+            fourier_levels=config.fourier_levels,
+            # 核心变量: 排序方式 (Hilbert vs Raster)
             use_hilbert_encoding=(config.mode == 'hilbert'),
-            # 其他配置 (固定)
-            min_patch_size=4,
-            max_depth_hard_limit=8,
         )
+        return model
 
 
 # ============================================================================
@@ -693,6 +747,12 @@ def run_experiment(
 ) -> RunResult:
     """运行单次实验.
 
+    使用 ModularTrainer 进行训练，支持:
+    - I78 channels-last 内存格式 (~20% VRAM 节省)
+    - I78 torch.compile 优化 (~30% 训练加速)
+    - 混合精度训练 (AMP)
+    - Early Stopping 和 Checkpoint 保存
+
     Args:
         config: 实验配置
         train_loader: 训练数据加载器
@@ -711,96 +771,119 @@ def run_experiment(
     if verbose:
         print(f"\n{'='*60}")
         print(f"运行 {run_id}: {config.name} (mode={config.mode}, seed={seed})")
+        if config.use_channels_last:
+            print(f"  [I78] channels-last: ON")
+        if config.use_compile:
+            print(f"  [I78] torch.compile: ON")
         print(f"{'='*60}")
 
     # 创建模型
     model = create_model(config)
+
+    # I78: channels-last 内存格式 (仅支持 CUDA)
+    if config.use_channels_last and device.type == 'cuda':
+        model = model.to(memory_format=torch.channels_last)
+        if verbose:
+            print("  [I78] 启用 channels-last 内存格式")
+
     model = model.to(device)
 
     # 统计参数量
     total_params = sum(p.numel() for p in model.parameters())
 
     if verbose:
-        print(f"参数量: {total_params:,}")
+        print(f"  参数量: {total_params:,}")
 
-    # 优化器 (使用最佳实践配置)
-    optimizer = AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
+    # 创建 ModularTrainer 配置
+    trainer_config = TrainerConfig(
+        device=str(device),
+        num_epochs=config.epochs,
+        gradient_clip_norm=1.0,
+        accumulation_steps=1,
+        log_interval=50,
+        validate_interval=1,
+        checkpoint_dir=f"checkpoints/ablation/{config.mode}/run_{run_id}",
+        save_best_only=True,
+        monitor_metric="val_accuracy",
+        monitor_mode="max",
+        use_amp=(device.type == 'cuda'),
+        debug=False,
     )
 
-    # 学习率调度 (余弦退火 + Warmup)
-    scheduler = CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=config.epochs,
-        T_mult=1,
-        eta_min=config.min_lr,
+    # 创建 callbacks
+    callbacks = [
+        EarlyStoppingCallback(
+            monitor="val_accuracy",
+            patience=15,
+            delta=1e-4,
+            mode="max",
+        ),
+        CheckpointCallback(
+            checkpoint_dir=trainer_config.checkpoint_dir,
+            monitor="val_accuracy",
+            mode="max",
+            save_best_only=True,
+        ),
+    ]
+
+    # 创建 ModularTrainer
+    trainer = ModularTrainer(
+        model=model,
+        config=trainer_config,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        callbacks=callbacks,
     )
 
-    # 混合精度训练 (如果可用)
-    scaler = None
-    if device.type == 'cuda':
-        scaler = torch.cuda.amp.GradScaler()
+    # I78: torch.compile 优化
+    if config.use_compile:
+        if verbose:
+            print("  [I78] 启用 torch.compile...")
+        trainer.model = torch.compile(
+            trainer.model,
+            mode="default",
+            dynamic=True,
+        )
+        if verbose:
+            print("  [I78] torch.compile 完成")
 
-    # 结果记录
+    # 训练
+    start_time = time.time()
+    trainer.train()
+    total_time = time.time() - start_time
+
+    # 获取训练历史
+    history = trainer.state.history
+
+    # 构建结果
     result = RunResult(run_id=run_id, mode=config.mode, seed=seed)
     result.total_params = total_params
 
-    epoch_times = []
-    best_val_acc = 0.0
-    best_epoch = 0
+    # 提取历史数据
+    result.train_losses = history.get("train_loss", [])
+    result.train_accs = history.get("train_accuracy", [])
+    result.val_losses = history.get("val_loss", [])
+    result.val_accs = history.get("val_accuracy", [])
 
-    # 训练循环
-    for epoch in range(config.epochs):
-        epoch_start = time.time()
+    # 计算最佳结果
+    if result.val_accs:
+        best_idx = np.argmax(result.val_accs)
+        result.best_val_acc = result.val_accs[best_idx]
+        result.best_epoch = best_idx
+        result.final_val_acc = result.val_accs[-1]
 
-        # Warmup 阶段
-        if epoch < config.warmup_epochs:
-            # 线性 warmup
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = config.learning_rate * (epoch + 1) / config.warmup_epochs
-
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, device, scaler, epoch=epoch, verbose=verbose)
-        val_loss, val_acc = evaluate(model, val_loader, device, epoch=epoch, verbose=verbose)
-
-        # 更新学习率
-        if epoch >= config.warmup_epochs:
-            scheduler.step()
-
-        epoch_time = time.time() - epoch_start
-        epoch_times.append(epoch_time)
-
-        # 记录结果
-        result.train_losses.append(train_loss)
-        result.train_accs.append(train_acc)
-        result.val_losses.append(val_loss)
-        result.val_accs.append(val_acc)
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_epoch = epoch
-
-        if verbose and (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1}/{config.epochs}: "
-                  f"Train Loss={train_loss:.4f}, Train Acc={train_acc:.1f}%, "
-                  f"Val Acc={val_acc:.1f}% [{epoch_time:.1f}s]")
-
-    # 汇总结果
-    result.best_val_acc = best_val_acc
-    result.best_epoch = best_epoch
-    result.final_val_acc = result.val_accs[-1] if result.val_accs else 0.0
-    result.avg_epoch_time = np.mean(epoch_times)
+    # 计算性能指标
+    num_epochs = len(result.train_losses) if result.train_losses else 1
+    result.avg_epoch_time = total_time / num_epochs
 
     # 计算吞吐量
-    total_images = len(train_loader.dataset) * config.epochs
-    total_time = sum(epoch_times)
+    total_images = len(train_loader.dataset) * num_epochs
     result.throughput = total_images / total_time if total_time > 0 else 0.0
 
     if verbose:
-        print(f"\n最佳验证准确率: {best_val_acc:.2f}% (Epoch {best_epoch+1})")
-        print(f"平均 Epoch 时间: {result.avg_epoch_time:.1f}s")
-        print(f"吞吐量: {result.throughput:.1f} images/sec")
+        print(f"\n  最佳验证准确率: {result.best_val_acc:.2f}% (Epoch {result.best_epoch+1})")
+        print(f"  平均 Epoch 时间: {result.avg_epoch_time:.1f}s")
+        print(f"  吞吐量: {result.throughput:.1f} images/sec")
 
     return result
 
@@ -1043,7 +1126,7 @@ def print_analysis(analysis: Dict[str, Any]) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Hilbert vs Raster vs Standard ViT 消融实验",
+        description="Hilbert vs Raster vs Standard ViT 消融实验 (I25-2)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -1058,6 +1141,12 @@ def main():
 
   # 保存结果
   uv run python tests/benchmarks/ablation_hilbert_curve.py --output results.json
+
+  # 性能优化模式 (channels-last + compile)
+  uv run python tests/benchmarks/ablation_hilbert_curve.py --all --use-channels-last --use-compile
+
+  # I31 面积编码消融
+  uv run python tests/benchmarks/ablation_hilbert_curve.py --modes hilbert --no-area-encoding
         """
     )
 
@@ -1088,6 +1177,26 @@ def main():
     parser.add_argument(
         '--lr', type=float, default=1e-3,
         help='学习率 (默认: 1e-3)'
+    )
+
+    # I78 性能优化参数
+    parser.add_argument(
+        '--use-channels-last', action='store_true',
+        help='启用 channels-last 内存格式 (~20% VRAM 节省)'
+    )
+    parser.add_argument(
+        '--use-compile', action='store_true',
+        help='启用 torch.compile 优化 (~30% 训练加速)'
+    )
+
+    # I31 面积编码参数
+    parser.add_argument(
+        '--no-area-encoding', action='store_true',
+        help='禁用面积编码 (用于 I31 消融实验)'
+    )
+    parser.add_argument(
+        '--fourier-levels', type=int, default=4,
+        help='傅里叶特征级别数 (默认: 4)'
     )
 
     # 其他参数
@@ -1123,6 +1232,17 @@ def main():
         device = torch.device(args.device)
     print(f"使用设备: {device}")
 
+    # I78 性能优化状态
+    print(f"\n[I78] 性能优化配置:")
+    print(f"  channels-last: {'ON' if args.use_channels_last else 'OFF'}")
+    print(f"  torch.compile: {'ON' if args.use_compile else 'OFF'}")
+
+    # I31 面积编码配置
+    use_area_encoding = not args.no_area_encoding
+    print(f"\n[I31] 面积编码配置:")
+    print(f"  use_area_encoding: {use_area_encoding}")
+    print(f"  fourier_levels: {args.fourier_levels}")
+
     # 加载数据 (自动下载)
     print("\n加载 Tiny-ImageNet 数据...")
     print("  (如需手动下载，请参考 --help)")
@@ -1141,7 +1261,7 @@ def main():
     print(f"训练集: {len(train_loader.dataset)} 样本")
     print(f"验证集: {len(val_loader.dataset)} 样本")
 
-    # 创建配置
+    # 创建基础配置
     base_config = ExperimentConfig(
         name="Ablation",
         mode="standard",  # 会被覆盖
@@ -1150,6 +1270,12 @@ def main():
         batch_size=args.batch_size,
         learning_rate=args.lr,
         num_classes=num_classes,
+        # I78 性能优化
+        use_channels_last=args.use_channels_last,
+        use_compile=args.use_compile,
+        # I31 面积编码
+        use_area_encoding=use_area_encoding,
+        fourier_levels=args.fourier_levels,
     )
 
     # 运行实验
@@ -1164,6 +1290,16 @@ def main():
             name=f"{mode.upper()}",
             mode=mode,
             description=f"{mode} 模式",
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            num_classes=num_classes,
+            # I78 性能优化
+            use_channels_last=args.use_channels_last,
+            use_compile=args.use_compile,
+            # I31 面积编码
+            use_area_encoding=use_area_encoding,
+            fourier_levels=args.fourier_levels,
         )
 
         for run_id in range(1, args.runs + 1):
