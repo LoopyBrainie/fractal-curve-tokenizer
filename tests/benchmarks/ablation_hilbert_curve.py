@@ -98,6 +98,9 @@ class TinyImageNetValDataset(Dataset):
         self.samples = []  # (image_path, class_idx)
         self.class_to_idx = {}
 
+        # 预扫描所有子目录名（处理目录名与 class_id 不同的情况）
+        subdirs = {d.name: d for d in self.root.iterdir() if d.is_dir()}
+
         with open(annotations_file, 'r') as f:
             for line in f:
                 parts = line.strip().split('\t')
@@ -109,11 +112,23 @@ class TinyImageNetValDataset(Dataset):
                     if class_id not in self.class_to_idx:
                         self.class_to_idx[class_id] = len(self.class_to_idx)
 
-                    # 图片路径: val/类别名/images/文件名
-                    # 注意: 类别名目录可能与 class_id 不同!
-                    image_path = self.root / class_id / "images" / filename
-                    class_idx = self.class_to_idx[class_id]
-                    self.samples.append((str(image_path), class_idx))
+                    # 图片路径: val/子目录名/images/文件名
+                    # 优先使用 class_id 作为目录名，如果不存在则查找匹配的子目录
+                    img_path = None
+                    if class_id in subdirs:
+                        img_path = subdirs[class_id] / "images" / filename
+                    else:
+                        # 尝试在所有子目录中查找文件
+                        for subdir_path in subdirs.values():
+                            test_path = subdir_path / "images" / filename
+                            if test_path.exists():
+                                img_path = test_path
+                                break
+
+                    if img_path is not None:
+                        class_idx = self.class_to_idx[class_id]
+                        # 转换为字符串路径，使用正斜杠
+                        self.samples.append((str(img_path).replace('\\', '/'), class_idx))
 
         # 创建 classes 列表
         self.classes = [None] * len(self.class_to_idx)
