@@ -88,9 +88,10 @@ class TinyImageNetValDataset(Dataset):
     需要从 val_annotations.txt 读取正确的类别标签，而不是使用目录名
     """
 
-    def __init__(self, root: str, transform=None):
+    def __init__(self, root: str, transform=None, debug: bool = False):
         self.root = Path(root)
         self.transform = transform
+        self.debug = debug
 
         # 读取 val_annotations.txt 获取正确的标签映射
         # 格式: filename \t class_id \t x \t y \t w \t h
@@ -98,9 +99,20 @@ class TinyImageNetValDataset(Dataset):
         self.samples = []  # (image_path, class_idx)
         self.class_to_idx = {}
 
+        if not annotations_file.exists():
+            raise FileNotFoundError(f"val_annotations.txt not found at {annotations_file}")
+
+        if self.debug:
+            print(f"[DEBUG] Scanning: {self.root}")
+            print(f"[DEBUG] Annotations file: {annotations_file}")
+
         # 预扫描所有子目录名（处理目录名与 class_id 不同的情况）
         subdirs = {d.name: d for d in self.root.iterdir() if d.is_dir()}
 
+        if self.debug:
+            print(f"[DEBUG] Found subdirs: {list(subdirs.keys())[:5]}... (total: {len(subdirs)})")
+
+        samples_found = 0
         with open(annotations_file, 'r') as f:
             for line in f:
                 parts = line.strip().split('\t')
@@ -117,6 +129,8 @@ class TinyImageNetValDataset(Dataset):
                     img_path = None
                     if class_id in subdirs:
                         img_path = subdirs[class_id] / "images" / filename
+                        if self.debug and samples_found < 3:
+                            print(f"[DEBUG] Found via class_id: {img_path} (exists: {img_path.exists()})")
                     else:
                         # 尝试在所有子目录中查找文件
                         for subdir_path in subdirs.values():
@@ -125,15 +139,39 @@ class TinyImageNetValDataset(Dataset):
                                 img_path = test_path
                                 break
 
-                    if img_path is not None:
+                    if img_path is not None and img_path.exists():
                         class_idx = self.class_to_idx[class_id]
-                        # 转换为字符串路径，使用正斜杠
-                        self.samples.append((str(img_path).replace('\\', '/'), class_idx))
+                        # 转换为字符串路径
+                        self.samples.append((str(img_path), class_idx))
+                        samples_found += 1
+
+        if self.debug:
+            print(f"[DEBUG] Loaded {samples_found} samples from validation set")
 
         # 创建 classes 列表
         self.classes = [None] * len(self.class_to_idx)
         for class_id, idx in self.class_to_idx.items():
             self.classes[idx] = class_id
+
+        # 如果 samples 为空，尝试回退到 ImageFolder
+        if len(self.samples) == 0:
+            if self.debug:
+                print("[DEBUG] Custom parsing failed, falling back to ImageFolder")
+            self._fallback_to_imagefolder()
+
+    def _fallback_to_imagefolder(self):
+        """回退方案：使用 ImageFolder (仅当 class_id 与目录名匹配时有效)"""
+        try:
+            from torchvision import datasets
+            fallback_ds = datasets.ImageFolder(str(self.root))
+            self.samples = fallback_ds.samples
+            self.classes = fallback_ds.classes
+            if self.debug:
+                print(f"[DEBUG] Fallback loaded {len(self.samples)} samples")
+        except Exception as e:
+            if self.debug:
+                print(f"[DEBUG] Fallback also failed: {e}")
+            raise ValueError(f"Cannot load validation set! Annotations parsing failed and fallback also failed.")
 
     def __len__(self):
         return len(self.samples)
@@ -619,7 +657,8 @@ def get_tiny_imagenet_loaders(
 
     # 验证集使用自定义数据集 (Format A: val_annotations.txt 中有正确的类别标签)
     # 注意: ImageFolder 会错误地将目录名作为标签，需要使用 val_annotations.txt
-    val_ds = TinyImageNetValDataset(str(val_dir), transform=val_tf)
+    # 启用 debug 模式以诊断加载问题
+    val_ds = TinyImageNetValDataset(str(val_dir), transform=val_tf, debug=True)
 
     train_loader = DataLoader(
         train_ds,
