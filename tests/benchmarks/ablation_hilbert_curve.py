@@ -840,16 +840,18 @@ def run_experiment(
             for param_group in optimizer.param_groups:
                 param_group['lr'] = config.learning_rate * (epoch + 1) / config.warmup_epochs
 
-        # 训练
+        # 训练 - tqdm 始终显示，详细日志每 10 个 epoch
+        train_verbose = verbose  # tqdm 始终显示
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, device, scaler,
-            epoch=epoch + 1, verbose=verbose and (epoch % 10 == 0)
+            epoch=epoch + 1, verbose=train_verbose
         )
 
         # 验证
+        val_verbose = verbose  # tqdm 始终显示
         val_loss, val_acc = evaluate(
             model, val_loader, device,
-            epoch=epoch + 1, verbose=verbose and (epoch % 10 == 0)
+            epoch=epoch + 1, verbose=val_verbose
         )
 
         # 更新学习率
@@ -1376,21 +1378,182 @@ def main():
             print_analysis(analysis)
 
             # 保存结果
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            exp_name = f"ablation_hilbert_{timestamp}"
+
+            # 创建 experiments 目录
+            EXPERIMENTS_DIR = PROJECT_ROOT / "experiments"
+            EXPERIMENTS_DIR.mkdir(exist_ok=True)
+            exp_dir = EXPERIMENTS_DIR / exp_name
+            exp_dir.mkdir(exist_ok=True)
+
+            # 保存实验数据 (JSON)
+            output_data = {
+                'config': asdict(base_config),
+                'mode_results': {
+                    mode: {
+                        'statistics': asdict(stat),
+                        'runs': [asdict(r) for r in stat.results]
+                    }
+                    for mode, stat in mode_results.items()
+                },
+                'analysis': analysis,
+                'timestamp': timestamp,
+                'modes': list(args.modes),
+            }
+            data_path = exp_dir / "experiment_data.json"
+            with open(data_path, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, indent=2, ensure_ascii=False)
+
+            # 保存实验日志
+            log_content = []
+            log_content.append("=" * 60)
+            log_content.append("Hilbert vs Raster 消融实验日志")
+            log_content.append(f"时间戳: {timestamp}")
+            log_content.append("=" * 60)
+            log_content.append(f"\n[I78] 性能优化:")
+            log_content.append(f"  channels-last: {'ON' if args.use_channels_last and device.type == 'cuda' else 'OFF'}")
+            log_content.append(f"  torch.compile: {'ON' if args.use_compile else 'OFF'}")
+            log_content.append(f"\n[I31] 面积编码:")
+            log_content.append(f"  use_area_encoding: {args.use_area_encoding}")
+            log_content.append(f"  fourier_levels: {args.fourier_levels}")
+            log_content.append(f"\n训练配置:")
+            log_content.append(f"  epochs: {args.epochs}")
+            log_content.append(f"  batch_size: {args.batch_size}")
+            log_content.append(f"  learning_rate: {args.lr}")
+            log_content.append(f"  runs per mode: {args.runs}")
+            log_content.append(f"\n运行模式: {', '.join(args.modes)}")
+            log_content.append("\n" + "=" * 60)
+            log_content.append("实验结果分析")
+            log_content.append("=" * 60)
+
+            # 添加分析结果
+            if analysis:
+                log_content.append(f"\n总体结果排名 (按验证准确率):")
+                sorted_modes = sorted(analysis.items(), key=lambda x: x[1]['mean_val_acc'], reverse=True)
+                for i, (mode, stats) in enumerate(sorted_modes, 1):
+                    log_content.append(f"  {i}. {mode.upper()}: {stats['mean_val_acc']:.2f}% ± {stats['std_val_acc']:.2f}%")
+
+                log_content.append(f"\n详细统计:")
+                for mode, stats in analysis.items():
+                    log_content.append(f"\n  [{mode.upper()}]")
+                    log_content.append(f"    验证准确率: {stats['mean_val_acc']:.2f}% ± {stats['std_val_acc']:.2f}%")
+                    log_content.append(f"    训练准确率: {stats['mean_train_acc']:.2f}%")
+                    log_content.append(f"    平均 Epoch 时间: {stats['mean_epoch_time']:.1f}s")
+                    log_content.append(f"    吞吐量: {stats['throughput']:.1f} images/sec")
+                    log_content.append(f"    最佳 epoch: {stats['best_epoch']}")
+                    log_content.append(f"    参数量: {stats['total_params']:,}")
+
+            log_content.append("\n" + "=" * 60)
+            log_content.append("消融实验结论")
+            log_content.append("=" * 60)
+
+            # 生成消融实验结论
+            if 'hilbert' in mode_results and 'raster' in mode_results:
+                hilbert_acc = mode_results['hilbert'].mean_val_acc
+                raster_acc = mode_results['raster'].mean_val_acc
+                diff = hilbert_acc - raster_acc
+
+                log_content.append(f"\n[Hilbert vs Raster 对比]")
+                log_content.append(f"  Hilbert:  {hilbert_acc:.2f}%")
+                log_content.append(f"  Raster:   {raster_acc:.2f}%")
+                log_content.append(f"  差异:     {diff:+.2f}%")
+
+                if diff > 1.0:
+                    log_content.append(f"  结论: Hilbert 排序显著优于 Raster (+{diff:.2f}%)")
+                elif diff < -1.0:
+                    log_content.append(f"  结论: Raster 排序优于 Hilbert ({diff:.2f}%)")
+                else:
+                    log_content.append(f"  结论: Hilbert 与 Raster 差异不显著 (|diff| < 1%)")
+
+            if 'standard' in mode_results:
+                for fractal_mode in ['hilbert', 'raster']:
+                    if fractal_mode in mode_results:
+                        standard_acc = mode_results['standard'].mean_val_acc
+                        fractal_acc = mode_results[fractal_mode].mean_val_acc
+                        diff = fractal_acc - standard_acc
+
+                        log_content.append(f"\n[Standard vs {fractal_mode.upper()}]")
+                        log_content.append(f"  Standard: {standard_acc:.2f}%")
+                        log_content.append(f"  {fractal_mode.upper()}: {fractal_acc:.2f}%")
+                        log_content.append(f"  差异:     {diff:+.2f}%")
+
+                        if diff > 1.0:
+                            log_content.append(f"  结论: 分形 tokenization 提升 {diff:.2f}%")
+                        elif diff < -1.0:
+                            log_content.append(f"  结论: 分形 tokenization 下降 {abs(diff):.2f}%")
+                        else:
+                            log_content.append(f"  结论: 分形 tokenization 差异不显著")
+
+            log_content.append("\n" + "=" * 60)
+
+            # 保存日志
+            log_path = exp_dir / "experiment_log.txt"
+            with open(log_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(log_content))
+
+            # 打印日志内容
+            print('\n'.join(log_content))
+
+            print(f"\n实验数据已保存到: {data_path}")
+            print(f"实验日志已保存到: {log_path}")
+
+            # 保存到 args.output (如果指定)
             if args.output:
-                output_data = {
-                    'config': asdict(base_config),
-                    'mode_results': {
-                        mode: {
-                            'statistics': asdict(stat),
-                            'runs': [asdict(r) for r in stat.results]
-                        }
-                        for mode, stat in mode_results.items()
-                    },
-                    'analysis': analysis,
-                }
                 with open(args.output, 'w', encoding='utf-8') as f:
                     json.dump(output_data, f, indent=2, ensure_ascii=False)
-                print(f"\n结果已保存到: {args.output}")
+                print(f"结果已保存到: {args.output}")
+
+            # 运行最终评估 - 消融实验关键指标对比
+            print("\n" + "=" * 60)
+            print("最终评估报告")
+            print("=" * 60)
+
+            # 计算并输出消融实验所需的关键数据
+            eval_results = {
+                'hilbert_vs_raster': {},
+                'fractal_vs_standard': {},
+            }
+
+            if 'hilbert' in mode_results and 'raster' in mode_results:
+                hilbert = mode_results['hilbert']
+                raster = mode_results['raster']
+                eval_results['hilbert_vs_raster'] = {
+                    'hilbert_val_acc': hilbert.mean_val_acc,
+                    'raster_val_acc': raster.mean_val_acc,
+                    'improvement': hilbert.mean_val_acc - raster.mean_val_acc,
+                    'hilbert_throughput': hilbert.throughput,
+                    'raster_throughput': raster.throughput,
+                    'hilbert_best_epoch': hilbert.best_epoch,
+                    'raster_best_epoch': raster.best_epoch,
+                }
+                print(f"\n[Hilbert vs Raster 评估]")
+                print(f"  验证准确率: Hilbert={hilbert.mean_val_acc:.2f}%, Raster={raster.mean_val_acc:.2f}%")
+                print(f"  提升幅度: {hilbert.mean_val_acc - raster.mean_val_acc:+.2f}%")
+                print(f"  吞吐量: Hilbert={hilbert.throughput:.1f}, Raster={raster.throughput:.1f} images/sec")
+
+            if 'standard' in mode_results:
+                for mode in ['hilbert', 'raster']:
+                    if mode in mode_results:
+                        standard = mode_results['standard']
+                        fractal = mode_results[mode]
+                        eval_results['fractal_vs_standard'][mode] = {
+                            f'{mode}_val_acc': fractal.mean_val_acc,
+                            'standard_val_acc': standard.mean_val_acc,
+                            'improvement': fractal.mean_val_acc - standard.mean_val_acc,
+                            f'{mode}_params': fractal.total_params,
+                            'standard_params': standard.total_params,
+                        }
+                        print(f"\n[Standard vs {mode.upper()} 评估]")
+                        print(f"  验证准确率: Standard={standard.mean_val_acc:.2f}%, {mode.upper()}={fractal.mean_val_acc:.2f}%")
+                        print(f"  提升幅度: {fractal.mean_val_acc - standard.mean_val_acc:+.2f}%")
+                        print(f"  参数量: Standard={standard.total_params:,}, {mode.upper()}={fractal.total_params:,}")
+
+            # 保存评估结果
+            eval_path = exp_dir / "evaluation_results.json"
+            with open(eval_path, 'w', encoding='utf-8') as f:
+                json.dump(eval_results, f, indent=2, ensure_ascii=False)
+            print(f"\n评估结果已保存到: {eval_path}")
 
 
 if __name__ == '__main__':
