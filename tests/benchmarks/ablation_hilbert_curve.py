@@ -628,6 +628,7 @@ def get_tiny_imagenet_loaders(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=num_workers > 0,
     )
 
     val_loader = DataLoader(
@@ -636,7 +637,14 @@ def get_tiny_imagenet_loaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=num_workers > 0,
     )
+
+    # 验证数据集加载成功
+    if len(train_ds) == 0:
+        raise ValueError("训练集为空!")
+    if len(val_ds) == 0:
+        raise ValueError("验证集为空!")
 
     return train_loader, val_loader, 200
 
@@ -858,11 +866,12 @@ def run_experiment(
         train_loss = total_loss / len(train_loader)
         train_acc = 100.0 * correct / total
 
-        # 验证
+        # 验证 (参考 ModularTrainer.validate 实现)
         model.eval()
         val_loss = 0.0
         val_correct = 0
         val_total = 0
+        num_val_batches = 0
 
         val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{config.epochs} [Val]", disable=not verbose)
         with torch.no_grad():
@@ -874,20 +883,25 @@ def run_experiment(
                 if images.dim() == 4:
                     images = images.to(memory_format=torch.channels_last)
 
-                outputs = model(images)
-                loss = F.cross_entropy(outputs, labels)
+                # 验证禁用 AMP 以确保指标精度 (参考 ModularTrainer)
+                with autocast(device_type=device.type, enabled=False):
+                    outputs = model(images)
+                    loss = F.cross_entropy(outputs, labels)
 
-                val_loss += loss.item()
+                # I78: 使用 detach().item() 支持 torch.compile
+                val_loss += loss.detach().item()
+                num_val_batches += 1
+
                 _, predicted = outputs.max(1)
                 val_total += labels.size(0)
                 val_correct += predicted.eq(labels).sum().item()
 
                 val_pbar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
+                    'loss': f'{loss.detach().item():.4f}',
                     'acc': f'{100.*val_correct/val_total:.2f}%'
                 })
 
-        val_loss = val_loss / len(val_loader)
+        val_loss = val_loss / max(num_val_batches, 1)
         val_acc = 100.0 * val_correct / val_total
 
         # 更新学习率
