@@ -788,26 +788,27 @@ def run_experiment(
         val_total = 0
 
         val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{config.epochs} [Val]", disable=not verbose)
-        for images, labels in val_pbar:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+        with torch.no_grad():
+            for images, labels in val_pbar:
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
 
-            # I78: 保持 channels-last 格式
-            if images.dim() == 4:
-                images = images.to(memory_format=torch.channels_last)
+                # I78: 保持 channels-last 格式
+                if images.dim() == 4:
+                    images = images.to(memory_format=torch.channels_last)
 
-            outputs = model(images)
-            loss = F.cross_entropy(outputs, labels)
+                outputs = model(images)
+                loss = F.cross_entropy(outputs, labels)
 
-            val_loss += loss.item()
-            _, predicted = outputs.max(1)
-            val_total += labels.size(0)
-            val_correct += predicted.eq(labels).sum().item()
+                val_loss += loss.item()
+                _, predicted = outputs.max(1)
+                val_total += labels.size(0)
+                val_correct += predicted.eq(labels).sum().item()
 
-            val_pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'acc': f'{100.*val_correct/val_total:.2f}%'
-            })
+                val_pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'acc': f'{100.*val_correct/val_total:.2f}%'
+                })
 
         val_loss = val_loss / len(val_loader)
         val_acc = 100.0 * val_correct / val_total
