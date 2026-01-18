@@ -63,7 +63,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.amp.autocast_mode import autocast
 from torch.amp.grad_scaler import GradScaler
 from torchvision import datasets, transforms
@@ -75,6 +75,64 @@ sys.path.insert(0, str(PROJECT_ROOT / "examples"))
 
 from einops import rearrange, repeat
 from vit_pytorch import FractalCurveViT
+
+
+# ============================================================================
+# 自定义数据集：Tiny-ImageNet 验证集 (Format A: 使用 val_annotations.txt)
+# ============================================================================
+
+class TinyImageNetValDataset(Dataset):
+    """Tiny-ImageNet 验证集 (Format A)
+
+    验证集结构: val/类别名/images/*.JPEG + val_annotations.txt
+    需要从 val_annotations.txt 读取正确的类别标签，而不是使用目录名
+    """
+
+    def __init__(self, root: str, transform=None):
+        self.root = Path(root)
+        self.transform = transform
+
+        # 读取 val_annotations.txt 获取正确的标签映射
+        # 格式: filename \t class_id \t x \t y \t w \t h
+        annotations_file = self.root / "val_annotations.txt"
+        self.samples = []  # (image_path, class_idx)
+        self.class_to_idx = {}
+
+        with open(annotations_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) >= 2:
+                    filename = parts[0]
+                    class_id = parts[1]
+
+                    # 建立 class_id 到索引的映射
+                    if class_id not in self.class_to_idx:
+                        self.class_to_idx[class_id] = len(self.class_to_idx)
+
+                    # 图片路径: val/类别名/images/文件名
+                    # 注意: 类别名目录可能与 class_id 不同!
+                    image_path = self.root / class_id / "images" / filename
+                    class_idx = self.class_to_idx[class_id]
+                    self.samples.append((str(image_path), class_idx))
+
+        # 创建 classes 列表
+        self.classes = [None] * len(self.class_to_idx)
+        for class_id, idx in self.class_to_idx.items():
+            self.classes[idx] = class_id
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, target = self.samples[idx]
+
+        # 读取图片
+        img = datasets.folder.default_loader(img_path)
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        return img, target
 
 
 # ============================================================================
@@ -541,9 +599,12 @@ def get_tiny_imagenet_loaders(
     train_dir = tiny_imagenet_dir / "train"
     val_dir = tiny_imagenet_dir / "val"
 
-    # 训练集和验证集都使用 ImageFolder (都按类别子目录组织)
+    # 训练集使用 ImageFolder (Format B: train/类别名/images/*.JPEG)
     train_ds = datasets.ImageFolder(str(train_dir), transform=train_tf)
-    val_ds = datasets.ImageFolder(str(val_dir), transform=val_tf)
+
+    # 验证集使用自定义数据集 (Format A: val_annotations.txt 中有正确的类别标签)
+    # 注意: ImageFolder 会错误地将目录名作为标签，需要使用 val_annotations.txt
+    val_ds = TinyImageNetValDataset(str(val_dir), transform=val_tf)
 
     train_loader = DataLoader(
         train_ds,
