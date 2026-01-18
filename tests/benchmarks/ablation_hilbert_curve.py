@@ -541,6 +541,7 @@ def get_tiny_imagenet_loaders(
     train_dir = tiny_imagenet_dir / "train"
     val_dir = tiny_imagenet_dir / "val"
 
+    # 训练集和验证集都使用 ImageFolder (都按类别子目录组织)
     train_ds = datasets.ImageFolder(str(train_dir), transform=train_tf)
     val_ds = datasets.ImageFolder(str(val_dir), transform=val_tf)
 
