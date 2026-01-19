@@ -60,6 +60,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 logger = logging.getLogger(__name__)
@@ -176,22 +177,12 @@ class FractalTransformerBlock(nn.Module):
         # 使用 inverse_sigmoid 反算: sigmoid(x) * 2 = target → x = logit(target/2)
         # target=0.7 → x ≈ -0.36, target=1.0 → x = 0, target=0.65 → x ≈ -0.54
         #
-        # P11-13: 重命名 _level_residual_embedding → _residual_gate
-        # - 明确语义: 这是门控权重，不是嵌入向量
-        self._residual_gate = nn.Embedding(max_level + 1, 2)
-        # I24-6: 基于训练结果的智能初始化
-        # 使用 V 形模式: depth=0 和 depth=3 抑制，中间层保持
-        with torch.no_grad():
-            for d in range(max_level + 1):
-                # V 形抑制: 两端深度抑制，中间保持
-                # depth_ratio: 0 → 0.0, max/2 → 1.0, max → 0.0
-                depth_ratio = 1.0 - abs(2.0 * d / max_level - 1.0)
-                # 目标门控值: 两端 0.7，中间 1.0
-                target_gate = 0.7 + 0.3 * depth_ratio
-                # inverse_sigmoid: sigmoid(x) * 2 = target → x = log(target / (2 - target))
-                import math
-                seed_value = math.log(target_gate / (2.0 - target_gate))
-                self._residual_gate.weight[d] = seed_value
+        # I34-10 修复: 简化为单门控设计
+        # - 降低参数量: 2×D → 1×D (减少50%)
+        # - 零初始化确保训练初期残差路径畅通
+        # - tanh激活支持双向调制 [-1, 1]
+        self._residual_gate = nn.Embedding(max_level + 1, 1)
+        nn.init.zeros_(self._residual_gate.weight)
         
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         
@@ -291,42 +282,38 @@ class FractalTransformerBlock(nn.Module):
         Returns:
             输出张量，形状为 [B, S, D]。
         """
-        # STAB-5 方案 B: 计算层级感知的 residual 门控权重
-        # 当 levels_info 可用时，每个 token 根据其深度获得不同的权重
-        # 当 levels_info 不可用时，使用深度 0 的默认权重
+        # I34-10 修复: 使用单门控设计
+        # gate ∈ [-1, 1] 支持双向调制 (抑制/增强)
         if levels_info is not None and levels_info.numel() > 0:
             depths = extract_depths(levels_info, self.max_level)  # (S,) or (B, S)
-            gate_raw = self._residual_gate(depths)  # (..., 2)
-            gate = torch.sigmoid(gate_raw) * 2  # (..., 2) ∈ [0, 2]
-            
-            # 调整形状以便广播: (B, S, 1) for element-wise multiplication with (B, S, D)
+            gate_raw = self._residual_gate(depths)  # (..., 1)
+            gate = torch.tanh(gate_raw)  # (..., 1) ∈ [-1, 1]
+
+            # 调整形状以便广播: (B, S, 1) for element-wise multiplication
             if gate.dim() == 2:
-                # (S, 2) -> (1, S, 2, 1) for broadcasting
-                w1 = gate[:, 0].view(1, -1, 1)
-                w2 = gate[:, 1].view(1, -1, 1)
-            else:
-                # (B, S, 2) -> w1, w2 each (B, S, 1)
-                w1 = gate[:, :, 0].unsqueeze(-1)
-                w2 = gate[:, :, 1].unsqueeze(-1)
+                # (S, 1) -> (1, S, 1)
+                gate = gate.view(1, -1, 1)
+            # gate 现在是 (B, S, 1) 或 (1, S, 1)
         else:
-            # 无 levels_info 时使用深度 0 的默认权重
-            default_gate = torch.sigmoid(self._residual_gate.weight[0]) * 2
-            w1 = default_gate[0]
-            w2 = default_gate[1]
+            # 无 levels_info 时使用深度 0 的默认权重 (零初始化 → tanh(0) = 0)
+            gate = torch.tanh(self._residual_gate.weight[0])  # scalar ∈ [-1, 1]
+            gate = gate.view(1, 1, 1)  # (1, 1, 1) for broadcasting
 
         norm1_x = self._apply_level_aware_norm(x, levels_info, self.norm1_gamma, self.norm1_beta, self.default_norm1)
         attn_out = self.attention(
-            norm1_x, 
-            levels_info=levels_info, 
+            norm1_x,
+            levels_info=levels_info,
             attention_mask=attention_mask,
             regions=regions,
             image_size=image_size,
         )
-        x = x + self.drop_path(attn_out * w1)
+        # I34-10: 使用单门控 (1 + gate) 确保残差连接始终畅通
+        # gate ∈ [-1, 1] → (1 + gate) ∈ [0, 2]
+        x = x + self.drop_path(attn_out * (1.0 + gate))
 
         norm2_x = self._apply_level_aware_norm(x, levels_info, self.norm2_gamma, self.norm2_beta, self.default_norm2)
         ff_out = self.ff(norm2_x, levels_info)
-        x = x + self.drop_path(ff_out * w2)
+        x = x + self.drop_path(ff_out * (1.0 + gate))
 
         return x
 
@@ -411,25 +398,30 @@ class FractalTransformer(nn.Module):
         # 原因: HilbertAwareMultiScaleAttention 已经保留了 78.9% 的全局注意力权重
         # Hilbert Bias 只是软约束，不需要额外的全局注意力纠正
         
-        # ARCH-R2 方案 B: 真正的层级感知聚合器
+        # ARCH-R2 方案 B: 真正的层级感知聚合器 (I32-11 优化初始化)
         # 数学形式化:
         #   s_ℓ = σ(Embed_level(ℓ)) ∈ (0, 1)^D  — 每个层级的 D 维缩放向量
         #   r = W₂ · ReLU(W₁ · x)               — bottleneck 特征精炼
-        #   x' = x + 0.2 · (r ⊙ s_ℓ)            — 层级感知的残差更新
-        # 
+        #   x' = x + α · (r ⊙ s_ℓ)              — 层级感知的残差更新
+        #
+        # I32-11: 使用 Xavier/He 初始化保证方差一致性
+        #         可学习对数尺度初始化为 softplus(γ) = 1.0
+        #
         # 物理意义:
         #   - 浅层级 (level=0,1,2): 大区域，学习保留全局语义的特征维度
         #   - 深层级 (level=5,6,7): 小区域，学习增强局部细节的特征维度
         self._level_aggregator_scale = nn.Embedding(max_level + 1, dim)
-        nn.init.ones_(self._level_aggregator_scale.weight)  # sigmoid(1) ≈ 0.73
-        
+        nn.init.xavier_uniform_(self._level_aggregator_scale.weight)  # I32-11: Xavier 初始化
+
         self._level_aggregator_bottleneck = nn.Sequential(
             nn.Linear(dim, dim // 2),
             nn.ReLU(),
             nn.Linear(dim // 2, dim),
         )
-        # P3-9: 可学习的残差缩放因子 (初始化为 0.2，类似 ReZero)
-        self._aggregator_scale = nn.Parameter(torch.tensor(0.2))
+        # I32-11: 可学习对数尺度初始化
+        # 目标: softplus(γ) = 1.0 (恒等变换初始)
+        # 解: γ = ln(e^1 - 1) ≈ 1.3133
+        self._aggregator_scale = nn.Parameter(torch.tensor(1.3133))  # softplus(1.3133) ≈ 1.0
         
         self.final_norm = nn.LayerNorm(dim)
 
@@ -492,7 +484,8 @@ class FractalTransformer(nn.Module):
             
             refined = self._level_aggregator_bottleneck(x)  # (B, S, D)
             aggregated = refined * scale  # 层级感知的缩放
-            x = x + aggregated * self._aggregator_scale
+            # I32-11: 使用 softplus 约束 scale ∈ (0, +∞)
+            x = x + F.softplus(self._aggregator_scale) * aggregated
 
         x = self.final_norm(x)
         return x

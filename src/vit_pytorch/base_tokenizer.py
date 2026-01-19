@@ -134,29 +134,36 @@ class TokenizerOutput:
     @property
     def levels_info(self) -> Optional[torch.Tensor]:
         """获取堆叠的 levels_info [B, N, K] 或 None。
-        
+
         如果所有样本都没有 levels 信息，返回 None。
         否则返回堆叠的张量（对缺失的 levels 用零填充）。
-        
+
+        I32-2: 如果有 _padded_levels_cache 缓存，直接返回缓存
+               缓存中 padding 位置使用 -1 sentinel 标识
+
         Returns:
             堆叠的 levels_info 张量或 None
         """
         if len(self.sequences) == 0:
             return None
-        
+
+        # I32-2: 优先使用缓存
+        if self._padded_levels_cache is not None:
+            return self._padded_levels_cache
+
         levels_list = [seq.get_levels() for seq in self.sequences]
-        
+
         # 如果所有 levels 都是 None，返回 None
         if all(l is None for l in levels_list):
             return None
-        
+
         # 找到最大维度
         device = self.sequences[0].device
         max_len = max(l.shape[0] if l is not None else 0 for l in levels_list)
-        
+
         if max_len == 0:
             return None
-        
+
         # 确定 info_dim（处理 1D 和 2D 情况）
         info_dims = [l.shape[1] if l is not None and l.dim() > 1 else 1 for l in levels_list]
         info_dim = max(info_dims)

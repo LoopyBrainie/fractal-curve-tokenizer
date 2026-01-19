@@ -94,6 +94,18 @@ from .constants import (
     # I29-2: 阈值方差正则化
     THRESHOLD_VAR_REG_ENABLED,
     THRESHOLD_VAR_REG_WEIGHT,
+    # I33: 相对预算与自适应覆盖率
+    K_COVERAGE_BASE,
+    K_COVERAGE_MIN,
+    K_COVERAGE_MAX_HARD,
+    K_ADAPTIVE_REFERENCE_SIZE,
+    K_MAX_HARD_LIMIT,
+    K_MIN_HARD_LIMIT,
+    # I33: Elastic Budget 相对预算
+    ELASTIC_COVERAGE_MAX,
+    ELASTIC_COVERAGE_MIN,
+    ELASTIC_LAMBDA_OVER,
+    ELASTIC_LAMBDA_COLLAPSE,
 )
 from .config import SplitterConfig
 
@@ -226,6 +238,14 @@ class GumbelTopKSplitter(nn.Module):
             self._quota_min_per_depth = config.quota_min_per_depth
             self._quota_entropy_weight = config.quota_entropy_weight
             self._freeze_quota = config.freeze_quota
+            # I33: 自适应覆盖率参数
+            self._token_coverage_base = config.token_coverage_base
+            self._token_coverage_min = config.token_coverage_min
+            self._token_coverage_max_hard = config.token_coverage_max_hard
+            self._adaptive_reference_size = config.adaptive_reference_size
+            self._K_min_abs = config.K_min_abs
+            self._K_max_hard = config.K_max_hard
+            self._use_adaptive_coverage = config.use_adaptive_coverage
         else:
             # 使用传统参数（向后兼容）
             self.config = None
@@ -234,6 +254,14 @@ class GumbelTopKSplitter(nn.Module):
             self._quota_min_per_depth = QUOTA_MIN_PER_DEPTH
             self._quota_entropy_weight = QUOTA_ENTROPY_WEIGHT
             self._freeze_quota = False
+            # I33: 默认自适应覆盖率参数
+            self._token_coverage_base = K_COVERAGE_BASE
+            self._token_coverage_min = K_COVERAGE_MIN
+            self._token_coverage_max_hard = K_COVERAGE_MAX_HARD
+            self._adaptive_reference_size = K_ADAPTIVE_REFERENCE_SIZE
+            self._K_min_abs = K_MIN_HARD_LIMIT
+            self._K_max_hard = K_MAX_HARD_LIMIT
+            self._use_adaptive_coverage = True
 
         # I30-17-EXT: 存储配置，不预计算
         self.feature_dim = feature_dim
@@ -339,12 +367,12 @@ class GumbelTopKSplitter(nn.Module):
         self.register_buffer('_bias_step', torch.tensor(0.0))
         self._bias_enabled = False
 
-        # I30-6: EMA Running Statistics 用于深度方差归一化
-        # 数学: μ_EMA(t) = α·μ_batch(t) + (1-α)·μ_EMA(t-1), α=0.1
-        # 有效样本量 N_eff = 1/α = 10，方差降低约 19 倍
-        self._running_mu: Optional[Tensor] = None  # [D], D = max_depth + 1
-        self._running_sigma: Optional[Tensor] = None  # [D]
-        self._ema_momentum = 0.1
+        # I30-6: 深度方差归一化
+        # 使用 Per-batch 统计量替代全局 EMA:
+        # - 无额外内存开销 O(D)
+        # - 自然适应分布偏移
+        # - 梯度自然流动
+        self._depth_var_normalized: Optional[Tensor] = None  # [D]
 
         # 初始化权重
         self._init_weights()
@@ -665,53 +693,43 @@ class GumbelTopKSplitter(nn.Module):
         # logits: [B, N], depth_onehot: [D, N]
         # 目标: 计算每个深度的 mean 和 std
         
+        # I34-12 修复: 改用 Per-batch 归一化，支持动态分辨率
+        # 之前: 全局归一化 (跨 batch) - 稀释效应问题
+        # 现在: Per-batch 归一化 - 自适应不同图像尺寸
+
         # 使用 einsum 高效计算: sum_d = Σ_i (logits_i × mask_{d,i})
         # [B, D] = einsum('bn,dn->bd', logits, depth_onehot)
         depth_sums = torch.einsum('bn,dn->bd', logits, depth_onehot)  # [B, D]
-        
-        # 每个深度的总元素数: B × N_d
-        total_counts = (B * depth_counts).clamp(min=1.0)  # [D]
-        
-        # 全局均值 (跨 batch 和深度内所有候选)
-        batch_depth_sums = depth_sums.sum(dim=0)  # [D]
-        mu = batch_depth_sums / total_counts  # [D]
-        
-        # 计算方差: Var = E[X²] - E[X]²
+
+        # Per-batch 均值: μ_d^(b) = Σ_i logits[b,i] × 1[depth[i]=d] / N_d
+        # depth_counts.unsqueeze(0) = [1, D] broadcasts to [B, D]
+        mu_per_batch = depth_sums / depth_counts.unsqueeze(0)  # [B, D]
+
+        # Per-batch 方差: σ²_d^(b) = E[X²] - E[X]²
         logits_sq = logits ** 2
         depth_sq_sums = torch.einsum('bn,dn->bd', logits_sq, depth_onehot)  # [B, D]
-        batch_depth_sq_sums = depth_sq_sums.sum(dim=0)  # [D]
-        mean_sq = batch_depth_sq_sums / total_counts  # [D]
-        batch_variance = (mean_sq - mu ** 2).clamp(min=0.0)  # [D] 防止数值误差
-        batch_sigma = batch_variance.sqrt() + DEPTH_VARIANCE_NORM_EPS  # [D]
+        mean_sq_per_batch = depth_sq_sums / depth_counts.unsqueeze(0)  # [B, D]
+        variance_per_batch = (mean_sq_per_batch - mu_per_batch ** 2).clamp(min=0.0)  # [B, D]
+        sigma_per_batch = variance_per_batch.sqrt() + DEPTH_VARIANCE_NORM_EPS  # [B, D]
 
-        # I30-6: EMA 更新 (训练时累积统计量)
-        # 数学: μ_EMA(t) = α·μ_batch(t) + (1-α)·μ_EMA(t-1), α=0.1
-        # 有效样本量 N_eff = 1/α = 10，方差降低约 19 倍
-        if self.training:
-            if self._running_mu is None:
-                # 冷启动: 使用当前 batch 统计量初始化
-                self._running_mu = mu.detach().clone()
-                self._running_sigma = batch_sigma.detach().clone()
-            else:
-                # EMA 更新: exponential moving average
-                self._running_mu.mul_(1 - self._ema_momentum).add_(
-                    mu.detach(), alpha=self._ema_momentum
-                )
-                self._running_sigma.mul_(1 - self._ema_momentum).add_(
-                    batch_sigma.detach(), alpha=self._ema_momentum
-                )
+        # 使用 Per-batch 统计量 (不再需要全局 EMA)
+        mu_expanded = mu_per_batch  # [B, D]
+        sigma_expanded = sigma_per_batch  # [B, D]
 
-        # 使用 EMA 统计量 (如果可用)，否则使用 batch 统计量
-        use_mu = self._running_mu if self._running_mu is not None else mu
-        use_sigma = self._running_sigma if self._running_sigma is not None else batch_sigma
+        # 归一化: z^norm = (z - μ_d^(b)) / σ_d^(b)
+        # mu_expanded[batch_idx, depth] 用于对应位置的归一化
+        # 需要扩展到 [B, N] 根据 depths
+        mu_for_normalize = mu_expanded  # [B, D]
+        sigma_for_normalize = sigma_expanded  # [B, D]
 
-        # 广播归一化: z^norm = (z - μ_d(i)) / σ_d(i)
-        # 将 mu, sigma 扩展到 [N] 根据每个候选的深度
-        mu_expanded = use_mu[depths]  # [N]
-        sigma_expanded = use_sigma[depths]  # [N]
+        # 收集每个 batch 每个深度的均值和标准差
+        batch_indices = torch.arange(B, device=device).unsqueeze(1).expand(-1, N)  # [B, N]
+        depth_indices = depths.unsqueeze(0).expand(B, -1)  # [B, N]
+        mu_expanded = mu_for_normalize[batch_indices, depth_indices]  # [B, N]
+        sigma_expanded = sigma_for_normalize[batch_indices, depth_indices]  # [B, N]
 
         # 归一化
-        normalized = (logits - mu_expanded.unsqueeze(0)) / sigma_expanded.unsqueeze(0)
+        normalized = (logits - mu_expanded) / sigma_expanded
 
         return normalized
 
@@ -778,9 +796,9 @@ class GumbelTopKSplitter(nn.Module):
         # Step 2: Gumbel-Top-K 选择
         # I24-2: 使用分层 Top-K (方案E) 或全局 Top-K (传统方案)
         # ====================================================================
-        # 计算动态 K
+        # 计算动态 K (I33: 传递 image_size 用于自适应覆盖率)
         if self.use_dynamic_k:
-            K = self._estimate_optimal_k(probs)
+            K = self._estimate_optimal_k(probs, self._current_image_size)
         else:
             K = (self.K_min + self.K_max) // 2
         
@@ -914,34 +932,111 @@ class GumbelTopKSplitter(nn.Module):
         # 分割概率 (I18-5: 使用 TEMPERATURE_MIN 常量)
         T = self.log_temperature.exp().clamp(min=TEMPERATURE_MIN)
         probs = torch.sigmoid(logits / T)
-        
+
         return logits, probs
-    
-    def _estimate_optimal_k(self, probs: Tensor) -> int:
+
+    # I33: 动态 K 边界方法 (自适应覆盖率)
+    def _get_dynamic_k_bounds(
+        self,
+        candidate_count: int,
+        image_size: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[int, int]:
         """
-        估计最优 K 值。
-        
+        动态计算 K_min 和 K_max (I33 相对预算设计)。
+
+        数学形式化
+        ==========
+
+        相对预算公式:
+            K_min = max(K_min_abs, α × N)
+            K_max = min(K_max_hard, β(H, W) × N)
+
+        自适应覆盖率:
+            β(H, W) = min(β_max, max(3α, β_0 × γ))
+            γ = sqrt(min(H, W) / 224)
+
+        覆盖率分析:
+            | 图像尺寸 | min(H,W) | γ | β(H,W) | K_max覆盖率 | 评估 |
+            |----------|----------|------|--------|-------------|------|
+            | 64×64    | 64       | 0.53 | 0.03   | 3.0%        | ✅ 合理 |
+            | 128×128  | 128      | 0.76 | 0.04   | 3.8%        | ✅ 合理 |
+            | 224×224  | 224      | 1.00 | 0.05   | 5.0%        | ✅ 目标 |
+            | 512×512  | 512      | 1.51 | 0.08   | 8.0%        | ⚠️ 硬上限 |
+
+        Args:
+            candidate_count: N 候选区域数
+            image_size: 图像尺寸 (H, W)，用于自适应覆盖率计算
+
+        Returns:
+            (K_min, K_max): 动态边界元组
+        """
+        # K_min: 相对下界 + 绝对下界保护
+        K_min = max(
+            self._K_min_abs,
+            int(math.ceil(self._token_coverage_min * candidate_count))
+        )
+
+        # K_max: 自适应覆盖率 × N + 硬上限保护
+        if self._use_adaptive_coverage and image_size is not None:
+            H, W = image_size
+            min_dim = min(H, W)
+
+            # 缩放因子 γ
+            gamma = math.sqrt(min_dim / self._adaptive_reference_size)
+
+            # 自适应覆盖率 β(H, W)
+            beta_adaptive = self._token_coverage_base * gamma
+
+            # 应用约束: β ∈ [3α, β_max]
+            beta = min(
+                self._token_coverage_max_hard,
+                max(3 * self._token_coverage_min, beta_adaptive)
+            )
+        else:
+            # 退回到基准覆盖率
+            beta = self._token_coverage_base
+
+        K_max = min(
+            self._K_max_hard,
+            int(math.ceil(beta * candidate_count))
+        )
+
+        return K_min, K_max
+
+    def _estimate_optimal_k(
+        self,
+        probs: Tensor,
+        image_size: Optional[Tuple[int, int]] = None,
+    ) -> int:
+        """
+        估计最优 K 值 (I33 自适应覆盖率版本)。
+
         数学形式化:
             方法 1: K_1 = E_b[count(p_i > 0.5)]  (高概率候选计数)
             方法 2: K_2 = E_b[argmin_k{cumsum(sorted(p)) >= 0.9 × total}]  (90% 累积概率)
             K_opt = clip(max(K_1, K_2), K_min, K_max)
-            
+
         I23-2 修复: 使用 per-batch 计算替代 flatten
             - 原实现: 在 B×N 维度 flatten 后计算 k_90，语义不正确
             - 修复后: 对每个 batch 独立计算 k_90，取平均值
-            
+
+        I33: 使用自适应覆盖率计算 K_min/K_max
+            - β(H, W) = min(β_max, max(3α, β_0 × γ))
+            - γ = sqrt(min(H, W) / 224)
+
         Args:
             probs: [B, N] 分割概率
-            
+            image_size: 图像尺寸 (H, W)，用于自适应覆盖率
+
         Returns:
             K: 最优 token 数量
         """
         with torch.no_grad():
             B, N = probs.shape
-            
+
             # 方法 1: 统计高概率候选数量 (per-batch mean)
             high_prob_count = (probs > 0.5).float().sum(dim=1).mean()
-            
+
             # 方法 2: 使用 90% 累积概率截断 (per-batch 计算)
             # I23-2: 修复 flatten bug，改为 per-batch 计算取平均
             sorted_probs, _ = torch.sort(probs, dim=1, descending=True)  # [B, N]
@@ -951,85 +1046,88 @@ class GumbelTopKSplitter(nn.Module):
             threshold_mask = cumsum < 0.9 * total_prob  # [B, N]
             k_90_per_batch = threshold_mask.sum(dim=1).float() + 1  # [B]
             k_90_mean = k_90_per_batch.mean().item()
-            
+
             # 综合估计: 取两种方法的最大值
             K_est = int(max(high_prob_count.item(), k_90_mean))
-            # I23-3: 确保 K 不超过候选数量 N
-            K = max(self.K_min, min(self.K_max, K_est, N))
-            
+            # I33: 使用动态边界（如果启用）
+            if self.use_dynamic_k:
+                K_min, K_max = self._get_dynamic_k_bounds(N, image_size)
+            K = max(K_min, min(K_max, K_est, N))
+
             return K
     
     def _compute_quota_allocation(self, K: int) -> Tensor:
         """
-        计算可学习配额分配 (I24-2 方案E 核心)。
-        
+        计算可学习配额分配 (I24-2 方案E, I32-3 贪心最优重构)。
+
         数学形式化
         ==========
-        
-        配额分配公式:
-            p_d = softmax(φ)_d
-            K_d^{raw} = round(p_d × K_total)
-            K_d = max(K_min_per_depth, K_d^{raw})
-            
-        配额调整 (保证 Σ K_d = K_total):
-            if Σ K_d > K_total:
-                excess = Σ K_d - K_total
-                d_max = argmax(K)
-                K[d_max] -= excess
-                
-        下界保护证明:
-            设 K_d = 0，则深度 d 无 token 进入 Transformer
-            ∂L/∂φ_d = 0 (死区)
-            因此必须 K_d >= K_min_per_depth >= 1
-            
+
+        问题定义:
+            输入: p = softmax(φ) ∈ Δ^{D-1}, K ∈ ℤ⁺, k_min ∈ ℤ⁺
+            约束: ΣK_d = K, K_d ≥ k_min, K_d ∈ ℤ
+            目标: min Σ|K_d - p_d·K|
+
+        I32-3 改进: 比例缩放 + 贪心微调
+        ------------------------------
+        相比原实现的改进:
+        1. 移除复杂的比例缩放逻辑，简化流程
+        2. 迭代微调时使用偏差驱动而非最大值驱动
+        3. 严格的约束满足保证
+
         Args:
             K: 总 token 配额
-            
+
         Returns:
             quota: [D] 每个深度的配额分配
         """
         D = self._current_max_depth + 1
         device = self.candidate_depths.device
-        
+
         if self.quota_logits is None or not self._enable_learnable_quota:
             # 回退到均匀分配
             quota = torch.full((D,), K // D, dtype=torch.long, device=device)
             quota[D - 1] += K - quota.sum()  # 余数给最后一个深度
             return quota
 
-        # Softmax 计算配额比例
-        quota_probs = F.softmax(self.quota_logits, dim=0)  # [D]
-
-        # 原始配额 (四舍五入)
-        quota_raw = (quota_probs * K).round().long()  # [D]
-
-        # I30-10: 下界保护使用配置值
-        # K_d >= quota_min_per_depth (防止死区)
+        # Softmax 计算配额概率
+        p = F.softmax(self.quota_logits, dim=0)  # [D]
         min_quota = self._quota_min_per_depth
-        quota = quota_raw.clamp(min=min_quota)
-        
-        # 调整以保证 Σ K_d = K (I78: 完全移除 .item() 支持 torch.compile)
-        total = quota.sum()  # 保持为张量
-        diff = total - K  # 正值表示超出，负值表示不足
 
-        # 创建比较张量用于向量化操作
-        K_tensor = torch.tensor(K, device=quota.device, dtype=torch.long)
-        min_quota_tensor = torch.tensor(min_quota, device=quota.device, dtype=torch.long)
+        # 初始四舍五入
+        quota = (p * K).round().long()
 
-        if diff > 0:
-            # 从最大配额深度扣除
-            d_max = quota.argmax()
-            excess = (diff).to(torch.long)
-            # 计算新值：max(min_quota, current - excess)
-            current_val = quota[d_max].unsqueeze(0)
-            proposed = current_val - excess
-            new_value = torch.maximum(min_quota_tensor, proposed)
-            quota = quota.scatter(0, d_max.unsqueeze(0), new_value)
-        elif diff < 0:
-            # 给最大配额深度增加
-            d_max = quota.argmax()
-            deficit = (-diff).to(torch.long)
-            quota[d_max] = quota[d_max] + deficit
+        # 下界钳制
+        quota = quota.clamp(min=min_quota)
+
+        # I32-3: 迭代微调确保 ΣK_d = K (最多 D 次)
+        for _ in range(D):
+            total = quota.sum()
+            diff = K - total  # >0: 不足, <0: 超出
+
+            if diff == 0:
+                break
+
+            if diff > 0:
+                # 不足时：优先从概率最高的深度增加
+                # 保持与 softmax 概率的一致性
+                probs_sorted, indices = torch.sort(p, descending=True)
+                for i in range(min(diff, D)):
+                    quota[indices[i]] += 1
+            else:
+                # 超出时：从概率最低且高于下界的深度扣减
+                mask = quota > min_quota
+                if mask.sum() > 0:
+                    # 获取可扣减的深度及其概率
+                    available_p = p[mask]
+                    available_indices = torch.masked_select(
+                        torch.arange(D, device=device), mask
+                    )
+                    # 优先从概率最低的扣减
+                    _, sorted_idx = torch.sort(available_p, descending=False)
+                    for i in range(min(-diff, len(sorted_idx))):
+                        idx = available_indices[sorted_idx[i]]
+                        quota[idx] -= 1
 
         return quota
     
@@ -1389,11 +1487,6 @@ class GumbelTopKSplitter(nn.Module):
         include_elastic_budget: bool = True,
         include_soft_entropy: bool = True,
         batch_size: int = 1,
-        elastic_N_min: int = 16,
-        elastic_N_max: int = 64,
-        elastic_lambda_over: float = 0.1,
-        elastic_lambda_under: float = 0.01,
-        elastic_lambda_collapse: float = 1.0,
         actual_token_count: Optional[int] = None,
         entropy_target: Optional[float] = None,
         entropy_weight: float = 0.1,
@@ -1402,50 +1495,46 @@ class GumbelTopKSplitter(nn.Module):
     ) -> Dict[str, Tensor]:
         """
         获取所有辅助损失 (与 LearnableSplitter.get_auxiliary_losses 兼容).
-        
-        数学形式化
-        ==========
-        
-        Gumbel-Top-K 的辅助损失:
-        
-        1. Elastic Budget Loss (弹性预算损失):
-           L_elastic = λ_over × max(0, N - N_max)² + λ_under × max(0, N_min - N)²
-           
-        2. Soft Entropy Loss (软熵损失):
-           maximize mode: L_entropy = -weight × H(depth_probs)
-           target mode:   L_entropy = weight × |H - H_target|²
-           
-        3. Collapse Penalty (崩溃惩罚):
-           L_collapse = λ_collapse × 1{N < threshold}
-        
+
+        I33: Elastic Budget 相对预算设计
+        =================================
+
+        核心改进: 与K参数相对预算保持一致
+
+        数学形式化:
+            coverage = N_selected / N_candidates
+            L_elastic = λ_over × max(0, coverage - β_max)² × N_candidates
+
+        梯度分析:
+            ∂L/∂N_selected = 2 × λ_over × max(0, coverage - β_max) / N_candidates
+            → 梯度归一化到 ~0.01 量级，避免跨尺度差异
+
+        崩溃检测 (相对阈值):
+            collapse ⇔ coverage < α_collapse (0.5%)
+
         Args:
             features: 特征图 [B, C, H, W] (可选)
             image_size: 图像尺寸 (可选)
             include_balance: 是否包含平衡损失 (对 GumbelTopK 忽略)
-            include_elastic_budget: 是否包含弹性预算损失
+            include_elastic_budget: 是否包含弹性预算损失 (相对覆盖率版本)
             include_soft_entropy: 是否包含软熵损失
             batch_size: batch 大小
-            elastic_N_min: 最小 token 数
-            elastic_N_max: 最大 token 数
-            elastic_lambda_over: 超出惩罚系数
-            elastic_lambda_under: 不足惩罚系数
-            elastic_lambda_collapse: 崩溃惩罚系数
-            actual_token_count: 实际 token 数 (用于崩溃检测)
+            actual_token_count: 实际 token 数 (用于相对崩溃检测)
             entropy_target: 熵目标值 (target mode)
             entropy_weight: 熵损失权重
             entropy_mode: 'maximize' 或 'target'
             **kwargs: 其他参数 (向前兼容)
-            
+
         Returns:
             Dict[str, Tensor]: 各项损失
         """
         device = self.candidate_regions.device
         losses = {}
-        
+
         # 获取 cached probs 和 selected_mask
         probs = self._last_probs if hasattr(self, '_last_probs') else None
         selected_mask = self._last_selected_mask if hasattr(self, '_last_selected_mask') else None
-        
+
         # I23-4-FIX: NaN 检测与防护
         # 如果缓存的 probs 或 selected_mask 包含 NaN，返回零损失
         # 这可能由上游输入包含 NaN 导致，应在训练脚本中处理根因
@@ -1468,26 +1557,29 @@ class GumbelTopKSplitter(nn.Module):
                 losses['quota_loss'] = zero
             return losses
         
-        # 1. Elastic Budget Loss
+        # 1. Elastic Budget Loss (I33: 相对预算版本)
         # I23-2 方案 B: 简化弹性惩罚
-        # 硬下界修复后 (K = max(K, K_min))，avg_tokens >= K_min 恒成立
-        # 因此 under_loss = max(0, N_min - avg_tokens)² 恒为 0，移除无效项
+        # I33: 改造为相对覆盖率设计，与 _get_dynamic_k_bounds() 统一
         if include_elastic_budget:
             avg_tokens = self._avg_selected
-            
-            # 超出惩罚 (仍有效)
-            over_loss = elastic_lambda_over * torch.relu(avg_tokens - elastic_N_max).pow(2)
-            # 注: under_loss 已移除 (I23-2 分析表明硬下界后恒为 0)
-            
-            elastic_loss = over_loss
-            losses['elastic_budget_loss'] = elastic_loss
-            
-            # 崩溃惩罚 (I14-1 D1)
-            if actual_token_count is not None:
-                collapse_threshold = max(1, elastic_N_min // 2)
-                if actual_token_count < collapse_threshold:
-                    collapse_loss = torch.tensor(elastic_lambda_collapse, device=device)
-                    losses['collapse_loss'] = collapse_loss
+            candidate_count = self.num_candidates
+
+            # 相对覆盖率
+            coverage = avg_tokens / candidate_count
+
+            # 相对损失: L = λ × max(0, coverage - β_max)² × N
+            # 梯度: ∂L/∂N_selected = 2 × λ × max(0, coverage - β_max) / N
+            over_loss = ELASTIC_LAMBDA_OVER * torch.relu(
+                coverage - ELASTIC_COVERAGE_MAX
+            ).pow(2) * candidate_count
+
+            losses['elastic_budget_loss'] = over_loss
+
+            # 崩溃检测 (相对覆盖率 < 0.5%)
+            collapse_threshold = ELASTIC_COVERAGE_MIN * candidate_count
+            if actual_token_count is not None and actual_token_count < collapse_threshold:
+                collapse_loss = torch.tensor(ELASTIC_LAMBDA_COLLAPSE, device=device)
+                losses['collapse_loss'] = collapse_loss
         
         # 2. Soft Entropy Loss
         if include_soft_entropy and probs is not None:
@@ -1519,8 +1611,10 @@ class GumbelTopKSplitter(nn.Module):
             losses['soft_entropy_loss'] = entropy_loss
         
         # ====================================================================
-        # I21 ε: Depth KL Regularization Loss
+        # I21 ε: Depth KL Regularization Loss (A16: 已禁用)
         # 鼓励选中 token 的深度分布趋向均匀
+        # A16 批判分析: Scheme E 配额机制已足够，KL正则化冗余且与软配额冲突
+        # DEPTH_KL_WEIGHT = 0.0 时此分支不执行
         # ====================================================================
         if selected_mask is not None and DEPTH_KL_WEIGHT > 0:
             depth_kl_loss = self.get_depth_kl_loss(
@@ -1528,10 +1622,12 @@ class GumbelTopKSplitter(nn.Module):
                 weight=DEPTH_KL_WEIGHT,
             )
             losses['depth_kl_loss'] = depth_kl_loss
-        
+
         # ====================================================================
-        # I23-1 方案D: 软配额正则化损失
+        # I23-1 方案D: 软配额正则化损失 (A16: 已禁用)
         # 惩罚极端偏离任务最优分布
+        # A16 批判分析: 软配额目标(0.15,0.20,0.25,0.40)与KL目标(均匀分布)冲突
+        # DEPTH_QUOTA_ENABLED = False 时此分支不执行
         # ====================================================================
         if selected_mask is not None and DEPTH_QUOTA_ENABLED:
             quota_loss = self.get_quota_loss(selected_mask=selected_mask)

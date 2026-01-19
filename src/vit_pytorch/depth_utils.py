@@ -89,9 +89,10 @@ def compute_max_depth(
     if min_patch_size <= 0:
         raise ValueError(f"min_patch_size must be positive, got {min_patch_size}")
 
-    # 动态计算深度
-    # 公式: L_max = floor(log2(min_dim / min_patch_size))
-    max_depth = int(math.log2(min_dim // min_patch_size))
+    # 动态计算深度 (I34-5 修复: 使用 ceil 而非 floor)
+    # 公式: L_max = ceil(log2(min_dim / min_patch_size))
+    # 原因: 深度d的patch大小为 min_patch * 2^d，需要满足 >= min_patch_size
+    max_depth = int(math.ceil(math.log2(min_dim / min_patch_size)))
 
     # 应用硬上限（如果指定）
     if hard_limit is not None:

@@ -139,26 +139,29 @@ DEPTH_VARIANCE_NORM_ENABLED: bool = True  # I30-6: EMA 方案启用
 #: 方差归一化的稳定性 epsilon
 DEPTH_VARIANCE_NORM_EPS: float = 1e-6
 
-#: Depth KL 正则化损失权重
+#: Depth KL 正则化损失权重 (A16: 优化方案)
 #: 数学: L_depth = λ × D_KL(π_depth || Uniform)
-#: 目标: 鼓励选中 token 的深度分布趋向均匀
-#: I23-1 方案A: 0.1 → 0.5 (梯度量级分析表明 0.1 太弱，被主任务梯度淹没)
-DEPTH_KL_WEIGHT: float = 0.5
+#: 目标: ~~鼓励选中 token 的深度分布趋向均匀~~ (已移除)
+#: A16 批判分析: Scheme E 配额机制已足够防止深度崩溃，KL正则化冗余
+#: 移除理由: 配额熵(0.1) + 最小配额(2) 已完备，KL(0.5)造成机制冲突
+DEPTH_KL_WEIGHT: float = 0.0  # A16: 移除KL正则化
 
-#: I23-1 方案D: 软配额正则化是否启用
-#: 数学: L_quota = Σ_d ReLU(|π_d - π_d^target| - ε)^2
-#: 效果: 惩罚极端偏离目标分布，允许任务微调
-DEPTH_QUOTA_ENABLED: bool = True
+#: 软配额正则化是否启用 (A16: 优化方案)
+#: ~~I23-1 方案D: 软配额正则化~~ (已移除)
+#: A16 批判分析: 软配额目标(0.15,0.20,0.25,0.40)与KL目标(均匀分布)冲突
+#: 保留配额熵正则化足以防止配额崩溃
+DEPTH_QUOTA_ENABLED: bool = False  # A16: 移除软配额机制
 
-#: 软配额目标分布 (基于信息论分析)
-#: 说明: depth 3 略高是因为高频纹理信息对分类有额外贡献
+#: 软配额目标分布 (保留定义，DEPTH_QUOTA_ENABLED=False时忽略)
+#: ~~说明: depth 3 略高是因为高频纹理信息对分类有额外贡献~~
 DEPTH_QUOTA_TARGET: tuple = (0.15, 0.20, 0.25, 0.40)
 
 #: 软配额容忍带 ε (±5%)
 DEPTH_QUOTA_TOLERANCE: float = 0.05
 
-#: 软配额损失权重
-DEPTH_QUOTA_WEIGHT: float = 0.2
+#: 软配额损失权重 (A16: 优化方案)
+#: ~~数学: L_quota = Σ_d ReLU(|π_d - π_d^target| - ε)^2~~
+DEPTH_QUOTA_WEIGHT: float = 0.0  # A16: 移除软配额权重
 
 # ==================== 方案 E: 可学习配额常量 (I24-2) ====================
 # 数学分析: 解决 Log-Compensation 对 Top-K 理论无效的问题
@@ -184,6 +187,66 @@ QUOTA_INIT_LOGITS: tuple = (-0.495, -0.207, 0.016, 0.486)
 #: 配额熵正则化权重 (鼓励分布多样性)
 #: 数学: L_entropy = -λ × H(K/K_total)
 QUOTA_ENTROPY_WEIGHT: float = 0.1
+
+# ==================== I33: 相对预算与自适应覆盖率常量 ====================
+# 数学分析: 动态深度下 K_max 与 K_min 应随图像尺寸自适应
+# 原理:
+#   1. 覆盖率 = K / N_candidates 应保持尺度不变性
+#   2. β(H, W) = β_0 × sqrt(min(H, W) / 224) 实现线性尺度调整
+#   3. 硬上限约束防止大分辨率下的显存溢出
+
+#: 基准覆盖率 (224×224 图像的目标覆盖率)
+#: 数学: β_0 = 0.05 表示目标采样 5% 的候选区域
+K_COVERAGE_BASE: float = 0.05
+
+#: 最小覆盖率 (防止欠采样)
+#: 数学: α = 0.01 保证最小 1% 覆盖率
+K_COVERAGE_MIN: float = 0.01
+
+#: 最大覆盖率硬上限 (防止大分辨率下的显存溢出)
+#: 数学: β_max = 0.08 防止 K 增长过快
+K_COVERAGE_MAX_HARD: float = 0.08
+
+#: 覆盖率自适应参考尺寸
+#: 数学: γ = sqrt(min(H, W) / 224) 缩放因子
+K_ADAPTIVE_REFERENCE_SIZE: int = 224
+
+#: K_min 绝对下限 (保证最小表达能力)
+K_MIN_HARD_LIMIT: int = 8
+
+#: K_max 显存硬上限 (防止 OOM)
+#: 数学: K=4096 时 attention 矩阵 ≈ 64MB (batch=8)，可接受
+K_MAX_HARD_LIMIT: int = 4096
+
+#: K_max 采样比例 (K_max = ceil(K_MAX_SAMPLE_RATIO × N))
+#: 数学: α = 0.05 表示最多采样 5% 的候选区域
+K_MAX_SAMPLE_RATIO: float = 0.05
+
+#: K_min 采样比例 (K_min = ceil(K_MIN_SAMPLE_RATIO × N))
+#: 数学: β = 0.005 表示最少采样 0.5% 的候选区域
+K_MIN_SAMPLE_RATIO: float = 0.005
+
+# ==================== I33: Elastic Budget 相对预算常量 ====================
+# 设计原则: 与K参数相对预算保持一致
+# 数学分析:
+#   1. 相对覆盖率保证尺度不变性
+#   2. 与 _get_dynamic_k_bounds() 统一设计
+
+#: Elastic Budget 相对覆盖率硬上限
+#: 数学: coverage_max = 0.08 防止过度采样
+ELASTIC_COVERAGE_MAX: float = 0.08
+
+#: Elastic Budget 相对覆盖率下界 (用于崩溃检测)
+#: 数学: coverage_min = 0.005 低于此值触发崩溃检测
+ELASTIC_COVERAGE_MIN: float = 0.005
+
+#: Elastic Budget 损失权重
+#: 数学: λ = 0.1 使损失量级与其他辅助损失匹配
+ELASTIC_LAMBDA_OVER: float = 0.1
+
+#: 崩溃检测损失权重
+#: 数学: λ_collapse = 1.0 确保崩溃时强惩罚
+ELASTIC_LAMBDA_COLLAPSE: float = 1.0
 
 # ==================== I24-8: 阈值正则化常量 ====================
 

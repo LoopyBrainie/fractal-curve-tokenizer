@@ -35,6 +35,13 @@ from .constants import (
     LEVEL_BIAS_SCALE,
     SPLITTER_TEMP_START,
     SPLITTER_TEMP_END,
+    # I33: 相对预算常量
+    K_COVERAGE_BASE,
+    K_COVERAGE_MIN,
+    K_COVERAGE_MAX_HARD,
+    K_ADAPTIVE_REFERENCE_SIZE,
+    K_MAX_HARD_LIMIT,
+    K_MIN_HARD_LIMIT,
 )
 
 
@@ -49,6 +56,18 @@ class SplitterConfig:
     - enable_learnable_quota: impact=1.0 (离散) → 必须暴露
     - quota_init_logits: impact=0.01×0.1=0.001 → 建议暴露
     - quota_min_per_depth: impact=0.1×0.05=0.005 → 可选暴露
+
+    I33: 相对预算设计
+    ================
+    绝对预算 K=64 的问题:
+    - 64×64: 覆盖率 = 64/256 = 25% (过高)
+    - 224×224: 覆盖率 = 64/4096 = 1.6% (不足)
+    - 512×512: 覆盖率 = 64/16384 = 0.4% (严重不足)
+
+    相对预算公式:
+    - K_min = max(K_min_abs, α × N)
+    - K_max = min(K_max_hard, β × N)
+    - β(H, W) = β_0 × sqrt(min(H, W) / 224) 实现尺度不变性
     """
     # 核心架构参数
     feature_dim: int = 256
@@ -58,10 +77,26 @@ class SplitterConfig:
     intermediate_dim: int = 64
     pool_size: int = 4
 
-    # Top-K 参数
-    K_min: int = 8
-    K_max: int = 64
+    # Top-K 参数 (I33: 已废弃绝对值，保留兼容)
+    K_min: int = 8  # 废弃，使用 K_min_abs
+    K_max: int = 64  # 废弃，使用相对预算
     use_dynamic_k: bool = True
+
+    # I33: 相对预算参数 (替代绝对 K_min/K_max)
+    # 基准覆盖率 (224×224 目标 5%)
+    token_coverage_base: float = K_COVERAGE_BASE
+    # 最小覆盖率 (防止欠采样)
+    token_coverage_min: float = K_COVERAGE_MIN
+    # 最大覆盖率硬上限 (防止 OOM)
+    token_coverage_max_hard: float = K_COVERAGE_MAX_HARD
+    # 自适应参考尺寸
+    adaptive_reference_size: int = K_ADAPTIVE_REFERENCE_SIZE
+    # 绝对下界保护
+    K_min_abs: int = K_MIN_HARD_LIMIT
+    # 显存硬上限
+    K_max_hard: int = K_MAX_HARD_LIMIT
+    # 是否启用自适应覆盖率
+    use_adaptive_coverage: bool = True
 
     # 正则化参数
     dropout: float = 0.1
@@ -278,6 +313,14 @@ def create_splitter_config(
     K_min: Optional[int] = None,
     K_max: Optional[int] = None,
     freeze_quota: Optional[bool] = None,
+    # I33: 相对预算参数
+    token_coverage_base: Optional[float] = None,
+    token_coverage_min: Optional[float] = None,
+    token_coverage_max_hard: Optional[float] = None,
+    adaptive_reference_size: Optional[int] = None,
+    K_min_abs: Optional[int] = None,
+    K_max_hard: Optional[int] = None,
+    use_adaptive_coverage: Optional[bool] = None,
     **kwargs,
 ) -> SplitterConfig:
     """
@@ -285,6 +328,13 @@ def create_splitter_config(
 
     数学保证:
         配置参数影响度经过消融实验验证
+
+    I33: 相对预算设计
+    ================
+    相对预算公式:
+        K_min = max(K_min_abs, α × N)
+        K_max = min(K_max_hard, β × N)
+        β(H, W) = β_0 × sqrt(min(H, W) / 224)
     """
     config = SplitterConfig()
 
@@ -300,6 +350,22 @@ def create_splitter_config(
         config.K_max = K_max
     if freeze_quota is not None:
         config.freeze_quota = freeze_quota
+
+    # I33: 相对预算参数
+    if token_coverage_base is not None:
+        config.token_coverage_base = token_coverage_base
+    if token_coverage_min is not None:
+        config.token_coverage_min = token_coverage_min
+    if token_coverage_max_hard is not None:
+        config.token_coverage_max_hard = token_coverage_max_hard
+    if adaptive_reference_size is not None:
+        config.adaptive_reference_size = adaptive_reference_size
+    if K_min_abs is not None:
+        config.K_min_abs = K_min_abs
+    if K_max_hard is not None:
+        config.K_max_hard = K_max_hard
+    if use_adaptive_coverage is not None:
+        config.use_adaptive_coverage = use_adaptive_coverage
 
     # 应用额外参数
     for key, value in kwargs.items():

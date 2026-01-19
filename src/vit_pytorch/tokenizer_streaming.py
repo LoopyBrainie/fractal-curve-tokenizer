@@ -46,6 +46,7 @@ Note:
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -54,7 +55,7 @@ import torch.nn as nn
 
 from .base_tokenizer import BaseTokenizer, TokenizerOutput, TokenSequence
 from .config_fractal import FractalConfig
-from .constants import LOG_EPSILON, PROB_EPSILON  # I12-7: 数值稳定性常量
+from .constants import LOG_EPSILON, PROB_EPSILON, LEARNABLE_QUOTA_ENABLED  # I12-7: 数值稳定性常量
 from .embed_fractal_path import VectorizedPathEncoder  # I12-3: 用于计算路径
 
 
@@ -127,6 +128,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         splitter_dropout: float = 0.1,
         # I30-10: SplitterConfig 统一配置
         splitter_config: Optional["SplitterConfig"] = None,
+        # I24-2: 可学习配额控制 (显式传递以覆盖常量默认值)
+        enable_learnable_quota: Optional[bool] = None,
     ) -> None:
         super().__init__()
 
@@ -201,7 +204,20 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         # I30-10: 使用 SplitterConfig 或传统参数
         if splitter_config is not None:
-            # 使用 SplitterConfig
+            # I34-6: 修复 feature_dim 不匹配问题
+            # 必须确保 feature_dim = d_model，否则 MLP 和 ROI-Align 维度不匹配
+            config_dict = dataclasses.asdict(splitter_config)
+            if config_dict.get('feature_dim') != d_model:
+                config_dict['feature_dim'] = d_model
+            splitter_config = SplitterConfig(**config_dict)
+
+            # I24-2: 如果显式提供了 enable_learnable_quota，覆盖 config 中的设置
+            if enable_learnable_quota is not None:
+                # 创建一个新的 config 副本以避免修改原始对象
+                config_dict = dataclasses.asdict(splitter_config)
+                config_dict['enable_learnable_quota'] = enable_learnable_quota
+                splitter_config = SplitterConfig(**config_dict)
+
             self.splitter = GumbelTopKSplitter(
                 config=splitter_config,
                 image_size=image_size,
@@ -211,17 +227,25 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             # I27-1: 使用传入的 splitter_dropout 而非硬编码值
             # 允许训练器统一控制正则化强度
             # I30-17-EXT: 使用动态计算的 min_patch_size 和 max_depth
-            self.splitter = GumbelTopKSplitter(
+            # I24-2: 如果显式提供了 enable_learnable_quota，通过 config 传递
+            legacy_config = SplitterConfig(
                 feature_dim=d_model,
-                min_patch_size=effective_min_patch_size,  # I30-17-EXT: 动态深度计算
+                min_patch_size=effective_min_patch_size,
                 max_depth_limit=self._computed_max_depth,
                 hidden_dim=64,
+                intermediate_dim=64,
                 pool_size=4,
-                temperature=learnable_temperature,
                 K_min=K_min,
                 K_max=K_max,
-                dropout=splitter_dropout,  # I27-1: 可配置
                 use_dynamic_k=True,
+                dropout=splitter_dropout,
+                enable_learnable_quota=(
+                    enable_learnable_quota if enable_learnable_quota is not None
+                    else LEARNABLE_QUOTA_ENABLED
+                ),
+            )
+            self.splitter = GumbelTopKSplitter(
+                config=legacy_config,
                 image_size=image_size,
             )
 
@@ -729,7 +753,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         N_total = tensor_result.num_tokens
         if N_total == 0:
             tokens = torch.zeros(B, 1, dim, device=device, dtype=dtype)
-            levels_info = torch.zeros(B, 1, self.max_depth + 1, dtype=torch.long, device=device)
+            # I32-2: 使用-1 sentinel标识padding token，避免与有效depth=0混淆
+            levels_info = torch.full((B, 1, self.max_depth + 1), -1, dtype=torch.long, device=device)
             padded_regions = torch.zeros(B, 1, 4, dtype=torch.long, device=device)
             return self.patch_embed.norm(tokens), levels_info, padded_regions
         
@@ -776,7 +801,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # ====================================================================
         # 深度编码 (向量化)
         # ====================================================================
-        depths = tensor_result.depths.clamp(max=self.max_depth)
+        # I34-7 Fix: Add min=0 boundary protection to prevent negative depth index errors
+        depths = tensor_result.depths.clamp(min=0, max=self.max_depth)
         scales = self.patch_embed.depth_scale[depths]  # [N]
         embeds = self.patch_embed.depth_embed(depths)   # [N, D]
         all_tokens = pooled * scales.unsqueeze(-1) + embeds  # [N, D]
@@ -785,7 +811,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 向量化分配到输出 buffer
         # ====================================================================
         tokens = torch.zeros(B, max_tokens, dim, device=device, dtype=dtype)
-        levels_info = torch.zeros(B, max_tokens, self.max_depth + 1, dtype=torch.long, device=device)
+        # I32-2: 使用-1 sentinel标识padding token，避免与有效depth=0混淆
+        levels_info = torch.full((B, max_tokens, self.max_depth + 1), -1, dtype=torch.long, device=device)
         padded_regions = torch.zeros(B, max_tokens, 4, dtype=torch.long, device=device)  # P11-3
         
         # 计算每个 token 在其 batch 内的索引
@@ -870,9 +897,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         if isinstance(self.splitter, GumbelTopKSplitter):
             self.splitter._update_candidates(image_size)
-            # I78: 重置 EMA 统计量以避免维度不匹配
-            self.splitter._running_mu = None
-            self.splitter._running_sigma = None
+            # I78: 重置深度方差统计量以避免维度不匹配
+            self.splitter._depth_var_normalized = None
 
     @torch.no_grad()
     def get_split_stats(self) -> Optional[Dict[str, Any]]:

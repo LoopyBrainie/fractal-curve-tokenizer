@@ -119,6 +119,10 @@ class FractalCurveViT(nn.Module):
         use_area_encoding: bool = False,           # 启用面积增强位置编码
         use_affine_modulation: bool = False,       # 启用仿射调制注意力偏置
         fourier_levels: int = 4,                   # 傅里叶特征级别数
+        # I24-2: 可学习配额控制
+        # None = 使用常量 LEARNABLE_QUOTA_ENABLED 的默认值
+        # True/False = 显式覆盖
+        quota_learnable: Optional[bool] = None,
     ) -> None:
         """初始化 FractalCurveViT。
 
@@ -235,6 +239,7 @@ class FractalCurveViT(nn.Module):
                     K_min=K_min,
                     K_max=K_max,
                     splitter_dropout=effective_splitter_dropout,  # I27: 可配置
+                    enable_learnable_quota=quota_learnable,  # I24-2: 可学习配额控制
                 )
             else:
                 # I30-17: 新方式，使用 min_patch_size 动态计算 max_depth
@@ -248,6 +253,7 @@ class FractalCurveViT(nn.Module):
                     K_min=K_min,
                     K_max=K_max,
                     splitter_dropout=effective_splitter_dropout,  # I27: 可配置
+                    enable_learnable_quota=quota_learnable,  # I24-2: 可学习配额控制
                 )
         else:
             raise ValueError(f"Unknown tokenizer_type: {tokenizer_type}. Use 'streaming_v3'.")
