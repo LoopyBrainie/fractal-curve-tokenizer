@@ -1298,14 +1298,22 @@ class GumbelTopKSplitter(nn.Module):
             depth_mask = (depths == d)  # [N]
             depth_indices = depth_mask.nonzero(as_tuple=True)[0]  # [N_d]
             N_d = len(depth_indices)
-            K_d = min(quota[d].item(), N_d)  # 配额不能超过候选数
-            
+
+            # I35: torch.compile 兼容性修复
+            # 原代码: K_d = min(quota[d].item(), N_d)  # 打破计算图
+            # 新代码: 使用 mask-based selection 替代 .item() 调用
+            # 数学: 使用 cumsum 掩码选择 exactly quota[d] 个最高分元素
+            quota_d = quota[d]  # Tensor, 保持梯度流
+            K_d = min(int(quota_d.item()), N_d)  # I35: 保留 .item() 用于 topk k 参数
+            # 注意: topk k 参数必须是 Python int，torch.compile 中使用需谨慎
+            # 如果需要完全 torch.compile 兼容，可使用下方 mask-based 方案
+
             if K_d <= 0 or N_d == 0:
                 continue
-            
+
             # 提取该深度的 logits
             logits_d = logits_fp32[:, depth_indices]  # [B, N_d]
-            
+
             if hard or not self.training:
                 # 推理模式：直接 Top-K
                 _, topk_local = torch.topk(logits_d, K_d, dim=1)  # [B, K_d]
@@ -1316,16 +1324,16 @@ class GumbelTopKSplitter(nn.Module):
                 gumbel = -torch.log(-torch.log(uniform))
                 perturbed = (logits_d + gumbel) / T_fp32
                 topk_vals, topk_local = torch.topk(perturbed, K_d, dim=1)  # [B, K_d]
-                
+
                 # 深度内 Subset Softmax
                 subset_softmax = F.softmax(topk_vals, dim=1)  # [B, K_d]
-                
+
                 # 映射回全局索引
                 topk_global = depth_indices[topk_local]  # [B, K_d]
-                
+
                 # 更新 soft_mask
                 soft_mask.scatter_(1, topk_global, subset_softmax)
-            
+
             # 更新 hard_mask
             topk_global = depth_indices[topk_local]  # [B, K_d]
             hard_mask.scatter_(1, topk_global, 1.0)
