@@ -41,8 +41,220 @@ from tqdm import tqdm
 import numpy as np
 
 from ..losses.finegrained import FinegrainedLoss, FinegrainedLossConfig
+from ..config import ModelArchitectureConfig  # I36: 统一架构配置
+from vit_pytorch import FractalCurveViT  # I36: 模型创建
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# CUB-200-2011 鸟类类别名称 (200 类)
+# ============================================================================
+# 官方类别列表: http://www.vision.caltech.edu/visipedia/CUB-200-2011.html
+# 数据集包含 200 种北美鸟类，涵盖 5550 张训练图像和 5784 张测试图像
+
+CUB200_BIRD_CLASSES = [
+    "Black-footed Albatross",  # 1. 黑脚信天翁
+    "Laysan Albatross",        # 2. 莱桑信天翁
+    "Sooty Albatross",         # 3. 烟色信天翁
+    "Groove-billed Ani",       # 4. 沟嘴犀鹃
+    "Crested Auklet",          # 5. 冠海鸦
+    "Least Auklet",            # 6. 小海鸦
+    "Parakeet Auklet",         # 7. 鹦鹉海鸦
+    "Rhinoceros Auklet",       # 8. 角海鸦
+    "Brewer Blackbird",        # 9. 布鲁尔黑鹂
+    "Red-winged Blackbird",    # 10. 红翅黑鹂
+    "Rusty Blackbird",         # 11. 锈色黑鹂
+    "Yellow-headed Blackbird", # 12. 黄头黑鹂
+    "Bobolink",                # 13. 稻田雀
+    "Indigo Bunting",          # 14. 靛蓝雀
+    "Lazuli Bunting",          # 15. 天蓝雀
+    "Painted Bunting",         # 16. 彩雀
+    "Cardinal",                # 17. 红雀
+    "Spotted Catbird",         # 18. 斑猫鸟
+    "Gray Catbird",            # 19. 灰猫鸟
+    "Black Catbird",           # 20. 黑猫鸟
+    "Yellow-breasted Chat",    # 21. 黄胸鹟
+    "Eastern Towhee",          # 22. 东方斑雀
+    "Spotted Towhee",          # 23. 斑翅斑雀
+    "Chuck-will's Widow",      # 24. 夜鹰
+    "Whip-poor-will",          # 25. 夜鹰
+    "Barn Owl",                # 26. 谷仓猫头鹰
+    "Screech Owl",             # 27. 鸣角鸮
+    "Great Horned Owl",        # 28. 大角鸮
+    "Snowy Owl",               # 29. 雪鸮
+    "Northern Hawk Owl",       # 30. 北方鹰鸮
+    "Northern Pygmy Owl",      # 31. 北方侏儒猫头鹰
+    "Burrowing Owl",           # 32. 穴居猫头鹰
+    "Barred Owl",              # 33. 横纹林鸮
+    "Great Gray Owl",          # 34. 大灰林鸮
+    "Long-eared Owl",          # 35. 长耳林鸮
+    "Shorteared Owl",          # 36. 短耳鸮
+    "Northern Saw-whet Owl",   # 37. 北方锯嘴猫头鹰
+    "Belted Kingfisher",       # 38. 带状翠鸟
+    "Ringed Kingfisher",       # 39. 环状翠鸟
+    "Pied Kingfisher",         # 40. 斑鱼狗
+    "Green Kingfisher",        # 41. 绿色翠鸟
+    "Common Nighthawk",        # 42. 常见夜鹰
+    "Antillean Nighthawk",     # 43. 安地列斯夜鹰
+    "Common Poorwill",         # 44. 夜鹰
+    "Chuck-will's-widow",      # 45. 夜鹰
+    "Whip-poor-will",          # 46. 夜鹰
+    "Swainson's Warbler",      # 47. 斯温森莺
+    "Worm-eating Warbler",     # 48. 蠕虫食虫莺
+    "Louisiana Waterthrush",   # 49. 路易斯安那水鸫
+    "Northern Waterthrush",    # 50. 北方水鸫
+    "Golden-winged Warbler",   # 51. 金翅莺
+    "Tennessee Warbler",       # 52. 田纳西莺
+    "Orange-crowned Warbler",  # 53. 橙冠莺
+    "Nashville Warbler",       # 54. 纳什维尔莺
+    "Connecticut Warbler",     # 55. 康涅狄格莺
+    "MacGillivray's Warbler",  # 56. 麦氏林莺
+    "Mourning Warbler",        # 57. 丧服莺
+    "Kentucky Warbler",        # 58. 肯塔基莺
+    "Common Yellowthroat",     # 59. 常见黄喉莺
+    "Hooded Warbler",          # 60. 兜帽莺
+    "Wilson's Warbler",        # 61. 威尔逊莺
+    "Canada Warbler",          # 62. 加拿大莺
+    "Red-faced Warbler",       # 63. 红脸莺
+    "Painted Redstart",        # 64. 彩红尾鸲
+    "Golden-fronted Woodpecker",  # 65. 金额啄木鸟
+    "Red-bellied Woodpecker",  # 66. 红腹啄木鸟
+    "Red-headed Woodpecker",   # 67. 红头啄木鸟
+    "Downy Woodpecker",        # 68. 绒毛啄木鸟
+    "Hairy Woodpecker",        # 69. 毛发啄木鸟
+    "White-headed Woodpecker", # 70. 白头啄木鸟
+    "American Three-toed Woodpecker",  # 71. 美洲三趾啄木鸟
+    "Pileated Woodpecker",     # 72. 冠啄木鸟
+    "Northern Flicker",        # 73. 北方扑翅鴷
+    "Phaeochrome Woodpecker",  # 74. 褐色啄木鸟
+    "Gila Woodpecker",         # 75. 吉拉啄木鸟
+    "Golden-fronted Woodpecker",  # 76. 金额啄木鸟
+    "Acorn Woodpecker",        # 77. 橡子啄木鸟
+    "Black-backed Woodpecker", # 78. 黑背啄木鸟
+    "American Kestrel",        # 79. 美洲红隼
+    "Merlin",                  # 80. 灰背隼
+    "Peregrine Falcon",        # 81. 游隼
+    "Prairie Falcon",          # 82. 草原隼
+    "Yellow-billed Cuckoo",    # 83. 黄嘴杜鹃
+    "Black-billed Cuckoo",     # 84. 黑嘴杜鹃
+    "Mourning Dove",           # 85. 哀鸽
+    "Rock Dove",               # 86. 岩鸽
+    "Band-tailed Pigeon",      # 87. 带尾鸽
+    "Spotted Dove",            # 88. 斑鸠
+    "Inca Dove",               # 89. 印加鸠
+    "Common Ground Dove",      # 90. 常见地鸠
+    "White-tipped Dove",       # 91. 白梢鸠
+    "White-winged Dove",       # 92. 白翅鸠
+    "Budgerigar",              # 93. 虎皮鹦鹉
+    "Northern Cardinal",       # 94. 北方红雀
+    "Pyrrhuloxia",             # 95. 冠红雀
+    "Caspian Tern",            # 96. 里海燕鸥
+    "Royal Tern",              # 97. 皇家燕鸥
+    "Roseate Tern",            # 98. 粉红燕鸥
+    "Least Tern",              # 99. 最小燕鸥
+    "Sooty Tern",              # 100. 烟色燕鸥
+    "Black Tern",              # 101. 黑燕鸥
+    "Black Skimmer",           # 102. 黑剪嘴鸥
+    "Laughing Gull",           # 103. 笑鸥
+    "Franklin's Gull",         # 104. 富兰克林鸥
+    "Bonaparte's Gull",        # 105. 博纳帕特鸥
+    "Ring-billed Gull",        # 106. 环嘴鸥
+    "Herring Gull",            # 107. 银鸥
+    "Thayer's Gull",           # 108. 泰尔鸥
+    "Western Gull",            # 109. 西方鸥
+    "California Gull",         # 110. 加州鸥
+    "Glaucous-winged Gull",    # 111. 淡翅鸥
+    "Great Black-backed Gull", # 112. 大黑背鸥
+    "Black-legged Kittiwake",  # 113. 黑腿三趾鸥
+    "Ivory Gull",              # 114. 象牙鸥
+    "Fulvous Whistling-Duck",  # 115. 棕褐树鸭
+    "Snow Goose",              # 116. 雪雁
+    "Canada Goose",            # 117. 加拿大雁
+    "Cackling Goose",          # 118. 小加拿大雁
+    "Barnacle Goose",          # 119. 苔原雁
+    "Brant",                   # 120. 黑雁
+    "Egyptian Goose",          # 121. 埃及雁
+    "Muscovy Duck",            # 122. 麝香鸭
+    "Wood Duck",               # 123. 林鸳鸯
+    "American Wigeon",         # 124. 美洲赤颈鸭
+    "Mallard",                 # 125. 绿头鸭
+    "Northern Shoveler",       # 126. 北方铲嘴鸭
+    "Northern Pintail",        # 127. 北方针尾鸭
+    "Green-winged Teal",       # 128. 绿翅鸭
+    "Canvasback",              # 129. 红头潜鸭
+    "Redhead",                 # 130. 红头鸭
+    "Ring-necked Duck",        # 131. 环颈潜鸭
+    "Greater Scaup",           # 132. 较大潜鸭
+    "Lesser Scaup",            # 133. 较小潜鸭
+    "Harlequin Duck",          # 134. 海番鸭
+    "Oldsquaw",                # 35. 长尾鸭
+    "Black Scoter",            # 136. 黑海番鸭
+    "Surf Scoter",             # 137. 冲浪海番鸭
+    "White-winged Scoter",     # 138. 白翅海番鸭
+    "Common Goldeneye",        # 139. 普通鹊鸭
+    "Barrow's Goldeneye",      # 140. 巴罗鹊鸭
+    "Bufflehead",              # 141. 巨头潜鸭
+    "Hooded Merganser",        # 142. 冠秋沙鸭
+    "Common Merganser",        # 143. 普通秋沙鸭
+    "Red-breasted Merganser",  # 144. 红胸秋沙鸭
+    "Ruddy Duck",              # 145. 棕硬尾鸭
+    "Turkey Vulture",          # 146. 土耳其秃鹫
+    "Black Vulture",           # 147. 黑秃鹫
+    "California Condor",       # 148. 加州神鹫
+    "Osprey",                  # 149. 鱼鹰
+    "Bald Eagle",              # 150. 白头海雕
+    "Northern Harrier",        # 151. 北方灰泽鹞
+    "Sharp-shinned Hawk",      # 152. Sharp-shinned Hawk
+    "Cooper's Hawk",           # 153. Cooper's Hawk
+    "Northern Goshawk",        # 154. Northern Goshawk
+    "Red-shouldered Hawk",     # 155. Red-shouldered Hawk
+    "Broad-winged Hawk",       # 156. Broad-winged Hawk
+    "Swainson's Hawk",         # 157. Swainson's Hawk
+    "Red-tailed Hawk",         # 158. Red-tailed Hawk
+    "Rough-legged Hawk",       # 159. Rough-legged Hawk
+    "Golden Eagle",            # 160. Golden Eagle
+    "American Dipper",         # 161. American Dipper
+    "Horned Lark",             # 162. Horned Lark
+    "Purple Martin",           # 163. Purple Martin
+    "Tree Swallow",            # 164. Tree Swallow
+    "Violet-green Swallow",    # 165. Violet-green Swallow
+    "Northern Rough-winged Swallow",  # 166. Northern Rough-winged Swallow
+    "Bank Swallow",            # 167. Bank Swallow
+    "Cliff Swallow",           # 168. Cliff Swallow
+    "Barn Swallow",            # 169. Barn Swallow
+    "Blue Jay",                # 170. Blue Jay
+    "American Crow",           # 171. American Crow
+    "Fish Crow",               # 172. Fish Crow
+    "Common Raven",            # 173. Common Raven
+    "Black-capped Chickadee",  # 174. Black-capped Chickadee
+    "Boreal Chickadee",        # 175. Boreal Chickadee
+    "Carolina Chickadee",      # 176. Carolina Chickadee
+    "Mountain Chickadee",      # 177. Mountain Chickadee
+    "Chestnut-backed Chickadee",  # 178. Chestnut-backed Chickadee
+    "Plain Chickadee",         # 179. Plain Chickadee
+    "Tufted Titmouse",         # 180. Tufted Titmouse
+    "Black-crested Titmouse",  # 181. Black-crested Titmouse
+    "Verdin",                  # 182. Verdin
+    "Bushtit",                 # 183. Bushtit
+    "Red-breasted Nuthatch",   # 184. Red-breasted Nuthatch
+    "White-breasted Nuthatch", # 185. White-breasted Nuthatch
+    "Pygmy Nuthatch",          # 186. Pygmy Nuthatch
+    "Brown Creeper",           # 187. Brown Creeper
+    "Cactus Wren",             # 188. Cactus Wren
+    "Rock Wren",               # 189. Rock Wren
+    "Canyon Wren",             # 190. Canyon Wren
+    "Carolina Wren",           # 191. Carolina Wren
+    "Bewick's Wren",           # 192. Bewick's Wren
+    "House Wren",              # 193. House Wren
+    "Winter Wren",             # 194. Winter Wren
+    "Sedge Wren",              # 195. Sedge Wren
+    "Marsh Wren",              # 196. Marsh Wren
+    "American Robin",          # 197. American Robin
+    "Wood Thrush",             # 198. Wood Thrush
+    "Hermit Thrush",           # 199. Hermit Thrush
+    "Swainson's Thrush",       # 200. Swainson's Thrush
+]
 
 
 @dataclass
@@ -54,6 +266,9 @@ class CUB200TrainingConfig:
         2. Center Loss 学习率: lr_center = lr_main × center_lr_ratio
         3. 正则化: scale = √(N_ref / N) ≈ 1.5-2.0
 
+    I36: 架构参数移至 ModelArchitectureConfig，此处仅保留训练策略参数。
+         模型创建请使用 arch_config = ModelArchitectureConfig(...)
+
     Attributes:
         batch_size: 批次大小（有效批次 = batch_size × accum_steps）
         num_epochs: 训练轮数
@@ -63,6 +278,7 @@ class CUB200TrainingConfig:
         validate_interval: 验证间隔（每 N 个 epoch）
         center_lr_ratio: Center Loss 学习率与主学习率的比率（论文推荐 50）
         center_lr: Center Loss 绝对学习率（若设置则优先使用）
+        arch_config: 模型架构配置（I36 统一配置）
     """
     # 基础训练配置
     batch_size: int = 64
@@ -88,7 +304,7 @@ class CUB200TrainingConfig:
     # 正则化（比通用分类更强）
     label_smoothing: float = 0.13  # 0.1 × (1 + log₁₀(200/100))
     dropout: float = 0.22
-    drop_path: float = 0.16
+    drop_path_rate: float = 0.16  # 统一命名: drop_path → drop_path_rate
     weight_decay: float = 0.15
 
     # Mixup/CutMix 数据增强
@@ -117,32 +333,35 @@ class CUB200TrainingConfig:
     use_affine_modulation: bool = False
     fourier_levels: int = 4
 
-    # 模型架构参数 (I78: 补充缺失字段)
-    num_classes: int = 200
-    dim: int = 384
-    depth: int = 10
-    heads: int = 8
-    mlp_dim: int = 1536  # embed_dim * mlp_ratio (default 4.0)
-    dim_head: int = 64   # embed_dim / heads
-    drop_path_rate: float = 0.16  # 与 drop_path 一致
+    # P7-7: 温度退火参数
+    splitter_temp_start: float = 1.0
+    splitter_temp_end: float = 0.5
+    splitter_temp_warmup: int = 8
 
-    # I78: 动态分辨率支持
-    # image_size=None: 支持任意分辨率输入（无需统一 resize）
-    # image_size=int: 固定分辨率（向后兼容）
-    image_size: Optional[int] = None
+    # M1: 辅助损失权重 (I36)
+    splitter_sparsity_weight: float = 0.01  # 稀疏性损失权重
+    elastic_budget_weight: float = 0.01     # 弹性预算损失权重
+    depth_kl_weight: float = 0.5            # 深度KL散度损失权重
 
-    # Tokenizer 参数 (I78: max_depth 由 min_patch_size 自动计算)
-    num_scales: int = 4
-    min_patch_size: int = 4
-    K_min: int = 4
-    K_max: int = 64
-    tokenizer_type: str = "streaming_v3"
-    ffn_type: str = "swiglu_level"
+    # =========================================================================
+    # I36: 模型架构配置 (使用 ModelArchitectureConfig)
+    # =========================================================================
+    # 架构参数统一通过 arch_config 指定，确保与 ModelArchitectureConfig 一致
+    arch_config: ModelArchitectureConfig = field(default_factory=lambda: ModelArchitectureConfig(
+        num_classes=200,
+        dim=384,
+        depth=8,
+        heads=6,
+        image_size=None,  # I78: 动态分辨率
+        min_patch_size=4,
+    ))
+
+    # 训练策略参数（可覆盖 arch_config 中的默认值）
+    learning_rate: float = 2.7e-4  # 可覆盖 arch_config 中的学习率
     use_checkpoint: bool = False
     use_channels_last: bool = False  # I78: channels-last 内存格式 (节省 ~20% VRAM)
     use_compile: bool = False        # I78: torch.compile 优化 (提升 ~30% 训练速度)
     compile_mode: str = "default"    # torch.compile 模式: default, reduce-overhead, max-autotune
-    channels: int = 3
 
     def __post_init__(self):
         """参数验证 - 数学约束"""
@@ -156,12 +375,65 @@ class CUB200TrainingConfig:
             f"validate_interval={self.validate_interval} 无效"
         assert 0 <= self.label_smoothing < 1.0, f"label_smoothing={self.label_smoothing} 必须在 [0, 1)"
         assert 0 <= self.dropout < 1.0, f"dropout={self.dropout} 必须在 [0, 1)"
-        assert 0 <= self.drop_path < 1.0, f"drop_path={self.drop_path} 必须在 [0, 1)"
+        assert 0 <= self.drop_path_rate < 1.0, f"drop_path_rate={self.drop_path_rate} 必须在 [0, 1)"
         assert self.center_loss_weight >= 0, f"center_loss_weight={self.center_loss_weight} 必须 >= 0"
         assert 0 < self.center_lr_ratio <= 1000, f"center_lr_ratio={self.center_lr_ratio} 必须在 (0, 1000]"
 
         # 日志级别
         self.log_level = getattr(logging, self.log_level.upper(), logging.INFO)
+
+    # =========================================================================
+    # I36: 便捷属性（从 arch_config 获取，保持向后兼容）
+    # =========================================================================
+    @property
+    def num_classes(self) -> int:
+        """从 arch_config 获取类别数"""
+        return self.arch_config.num_classes
+
+    @property
+    def dim(self) -> int:
+        """从 arch_config 获取嵌入维度"""
+        return self.arch_config.dim
+
+    @property
+    def depth(self) -> int:
+        """从 arch_config 获取 Transformer 层数"""
+        return self.arch_config.depth
+
+    @property
+    def heads(self) -> int:
+        """从 arch_config 获取注意力头数"""
+        return self.arch_config.heads
+
+    @property
+    def mlp_dim(self) -> int:
+        """从 arch_config 获取 FFN 维度"""
+        return self.arch_config.mlp_dim
+
+    @property
+    def image_size(self) -> Optional[int]:
+        """从 arch_config 获取图像尺寸"""
+        return self.arch_config.image_size
+
+    @property
+    def min_patch_size(self) -> int:
+        """从 arch_config 获取最小 patch 大小"""
+        return self.arch_config.min_patch_size
+
+    @property
+    def use_area_encoding(self) -> bool:
+        """从 arch_config 获取面积编码配置"""
+        return self.arch_config.use_area_encoding
+
+    @property
+    def use_affine_modulation(self) -> bool:
+        """从 arch_config 获取仿射调制配置"""
+        return self.arch_config.use_affine_modulation
+
+    @property
+    def fourier_levels(self) -> int:
+        """从 arch_config 获取傅里叶级别数"""
+        return self.arch_config.fourier_levels
 
 
 @dataclass
@@ -292,8 +564,8 @@ class CUB200Trainer:
         # 训练状态
         self.state = CUB200TrainerState()
 
-        # 混合精度 scaler
-        self.scaler: Optional[GradScaler] = GradScaler('cuda', enabled=config.use_amp)
+        # I35: 混合精度 scaler - 使用 device 关键字参数替代废弃的 positional 参数
+        self.scaler: Optional[GradScaler] = GradScaler(device='cuda', enabled=config.use_amp)
 
         self.logger.info(f"CUB200Trainer 初始化完成: device={self.device}, num_classes={num_classes}")
 
@@ -334,6 +606,79 @@ class CUB200Trainer:
         )
 
         self.logger.info(f"Center Loss 优化器初始化完成: lr={self._center_lr}")
+
+    # A21: 温度退火设置方法
+    def _setup_temperature_annealing(self, train_loader: DataLoader) -> None:
+        """设置温度退火 (A21 修复)
+
+        使用 GumbelTopKSplitter 内置退火 API 替代手动计算。
+        温度将以 batch 粒度自动更新，而非 epoch 粒度。
+
+        Args:
+            train_loader: 训练数据加载器
+        """
+        if not hasattr(self.model, 'tokenizer') or not hasattr(self.model.tokenizer, 'splitter'):
+            self.logger.info("[A21] 模型无 tokenizer 或 splitter，跳过温度退火设置")
+            return
+
+        splitter = self.model.tokenizer.splitter
+
+        # 检查是否支持退火 API
+        if not hasattr(splitter, 'enable_temperature_annealing'):
+            self.logger.info("[A21] Splitter 不支持温度退火 API")
+            return
+
+        # 计算每 epoch 的步数
+        batches_per_epoch = len(train_loader) // self.config.accum_steps
+
+        # warmup 后的步数用于退火
+        post_warmup_steps = max(1, (self.config.num_epochs - self.config.splitter_temp_warmup) * batches_per_epoch)
+
+        # 启用退火 (warmup 期间使用 T_start)
+        splitter.enable_temperature_annealing(
+            total_steps=post_warmup_steps,
+            T_start=self.config.splitter_temp_start,
+            T_end=self.config.splitter_temp_end,
+            schedule="exponential",
+        )
+
+        self.logger.info(f"[A21 OK] 温度退火已启用: {self.config.splitter_temp_start} → {self.config.splitter_temp_end}")
+        self.logger.info(f"     步数: {post_warmup_steps} (warmup: {self.config.splitter_temp_warmup} epochs)")
+
+    # A21: Warmup 处理方法
+    def _handle_warmup(self, epoch: int) -> None:
+        """处理 warmup 期间的温度/偏置 (A21)
+
+        在 warmup 期间禁用退火，固定 T_start。
+        warmup 结束后重新启用退火。
+
+        Args:
+            epoch: 当前 epoch
+        """
+        if not hasattr(self.model, 'tokenizer') or not hasattr(self.model.tokenizer, 'splitter'):
+            return
+
+        splitter = self.model.tokenizer.splitter
+
+        if epoch <= self.config.splitter_temp_warmup:
+            # Warmup: 禁用退火，固定 T_start
+            if hasattr(splitter, 'disable_temperature_annealing'):
+                splitter.disable_temperature_annealing()
+            splitter.set_temperature(self.config.splitter_temp_start)
+        elif epoch == self.config.splitter_temp_warmup + 1:
+            # Warmup 结束: 重新启用退火
+            if hasattr(self, 'train_loader'):
+                batches_per_epoch = len(self.train_loader) // self.config.accum_steps
+                post_warmup_steps = max(1, (self.config.num_epochs - self.config.splitter_temp_warmup) * batches_per_epoch)
+
+                if hasattr(splitter, 'enable_temperature_annealing'):
+                    splitter.enable_temperature_annealing(
+                        total_steps=post_warmup_steps,
+                        T_start=self.config.splitter_temp_start,
+                        T_end=self.config.splitter_temp_end,
+                        schedule="exponential",
+                    )
+                    self.logger.info(f"[A21] Warmup 结束，重新启用温度退火")
 
     def _get_warmup_lr(self, epoch: int) -> float:
         """计算学习率（包含预热）
@@ -399,6 +744,9 @@ class CUB200Trainer:
         """
         self.model.train()
 
+        # A21: 温度退火由 _handle_warmup 在每个 epoch 开始时自动处理
+        # 不再需要手动温度计算
+
         total_loss = 0.0
         total_center_loss = 0.0
         correct = 0
@@ -418,11 +766,16 @@ class CUB200Trainer:
             scale_factor = 1.0 / accum_steps
 
             with autocast(device_type=self.device.type, enabled=self.config.use_amp):
-                # 获取 logits
-                logits = self.model(imgs)
-
-                # 计算损失
-                loss, stats = self.compute_loss(logits, labels)
+                # M2: 获取 logits 和 features（用于 Center Loss）
+                if self.config.use_center_loss:
+                    # I35: 模型返回 (logits, features_list)，其中 features_list 是 List[Tensor]
+                    # 每个元素是单个样本的 pooled 表示，需要 stack 成 [B, D]
+                    logits, features_list = self.model(imgs, return_features=True)
+                    features = torch.stack(features_list)  # [B, D]
+                    loss, stats = self.compute_loss(logits, labels, features=features)
+                else:
+                    logits = self.model(imgs)
+                    loss, stats = self.compute_loss(logits, labels)
 
                 # 累积归一化
                 loss = loss * scale_factor
@@ -544,7 +897,13 @@ class CUB200Trainer:
 
             # 验证禁用 AMP
             with autocast(device_type=self.device.type, enabled=False):
-                outs = self.model(imgs)
+                # M2: 统一使用 forward(return_features=True) 提取特征
+                if return_features:
+                    outs, features = self.model(imgs, return_features=True)
+                    all_features.append(features[0].cpu() if isinstance(features, list) else features.cpu())
+                    all_labels.append(labels.cpu())
+                else:
+                    outs = self.model(imgs)
 
                 # 检查 NaN/Inf
                 if torch.isnan(outs).any() or torch.isinf(outs).any():
@@ -552,12 +911,6 @@ class CUB200Trainer:
                     continue
 
                 loss = F.cross_entropy(outs, labels)
-
-                # 收集特征
-                if return_features and hasattr(self.model, 'get_features'):
-                    features = self.model.get_features(imgs)
-                    all_features.append(features.cpu())
-                    all_labels.append(labels.cpu())
 
             if not (torch.isnan(loss) or torch.isinf(loss)):
                 total_loss += loss.item() * labels.size(0)
@@ -749,6 +1102,9 @@ class CUB200Trainer:
         # 初始化 Center Loss 优化器
         self.initialize_center_optimizer(optimizer)
 
+        # A21: 设置温度退火 (使用内置 API)
+        self._setup_temperature_annealing(train_loader)
+
         # 创建检查点目录
         checkpoint_dir = None
         if exp_dir is not None:
@@ -761,6 +1117,10 @@ class CUB200Trainer:
 
         for epoch in range(1, self.config.num_epochs + 1):
             self.state.epoch = epoch
+
+            # A21: 处理 warmup 期间的温度/偏置
+            self._handle_warmup(epoch)
+
             epoch_start = time.time()
 
             # 学习率预热
@@ -1067,29 +1427,246 @@ def get_cub200_augmentation(
 
 
 def create_cub200_trainer(
-    model: nn.Module,
-    num_classes: int = 200,
+    config: Optional[CUB200TrainingConfig] = None,
+    arch_config: Optional[ModelArchitectureConfig] = None,
     feat_dim: int = 256,
-    device: Optional[torch.device] = None,
+    data_dir: str = "./data",
+    output_dir: str = "./checkpoints",
     **kwargs,
-) -> CUB200Trainer:
-    """创建 CUB-200 训练器的便捷工厂函数
+) -> Tuple[CUB200Trainer, 'FractalCurveViT', DataLoader, DataLoader]:
+    """创建 CUB-200 训练器的便捷工厂函数 (I36 统一配置)
+
+    设计原则:
+        1. 通过 arch_config 统一指定模型架构参数
+        2. 通过 config 指定训练策略参数
+        3. 自动创建模型、训练器、数据加载器
 
     Args:
-        model: Fractal ViT 模型
-        num_classes: 类别数
-        feat_dim: 特征维度
-        device: 设备
-        **kwargs: 传递给 CUB200TrainingConfig 的参数
+        config: 训练配置 (可选，默认使用 CUB200TrainingConfig)
+        arch_config: 模型架构配置 (可选，默认使用 ModelArchitectureConfig)
+        feat_dim: Center Loss 特征维度
+        data_dir: 数据集目录
+        output_dir: 输出目录
+        **kwargs: 传递给 config 的参数（会覆盖默认值）
 
     Returns:
-        CUB200Trainer 实例
+        (trainer, model, train_loader, val_loader) 元组
+
+    用法:
+        ```python
+        from examples.training.trainer import create_cub200_trainer
+        from examples.training.config import ModelArchitectureConfig
+
+        # 推荐方式：使用统一的架构配置
+        arch_config = ModelArchitectureConfig(
+            num_classes=200,
+            dim=384,
+            depth=8,
+            heads=6,
+        )
+        trainer, model, train_loader, val_loader = create_cub200_trainer(
+            arch_config=arch_config,
+            batch_size=16,
+            learning_rate=0.0003,
+        )
+        ```
     """
-    config = CUB200TrainingConfig(**kwargs)
-    return CUB200Trainer(
+    # 合并配置
+    if arch_config is not None:
+        # 合并 arch_config 到 kwargs
+        arch_dict = {
+            'num_classes': arch_config.num_classes,
+            'dim': arch_config.dim,
+            'depth': arch_config.depth,
+            'heads': arch_config.heads,
+            'mlp_dim': arch_config.mlp_dim,
+            'image_size': arch_config.image_size,
+            'min_patch_size': arch_config.min_patch_size,
+            'use_area_encoding': arch_config.use_area_encoding,
+            'use_affine_modulation': arch_config.use_affine_modulation,
+            'fourier_levels': arch_config.fourier_levels,
+        }
+        kwargs.update(arch_dict)
+
+    # 创建训练配置
+    if config is None:
+        config = CUB200TrainingConfig(**kwargs)
+
+    # I36: 使用 config.arch_config 创建模型
+    model = FractalCurveViT(
+        num_classes=config.arch_config.num_classes,
+        dim=config.arch_config.dim,
+        depth=config.arch_config.depth,
+        heads=config.arch_config.heads,
+        mlp_dim=config.arch_config.mlp_dim,
+        image_size=config.arch_config.image_size,
+        min_patch_size=config.arch_config.min_patch_size,
+        use_area_encoding=config.arch_config.use_area_encoding,
+        use_affine_modulation=config.arch_config.use_affine_modulation,
+        fourier_levels=config.arch_config.fourier_levels,
+        # 从 config 获取训练策略参数
+        dropout=config.dropout,
+        drop_path_rate=config.drop_path_rate,
+        use_checkpoint=config.use_checkpoint,
+    )
+
+    # 创庺训练器
+    trainer = CUB200Trainer(
         model=model,
         config=config,
-        num_classes=num_classes,
+        num_classes=config.arch_config.num_classes,
         feat_dim=feat_dim,
-        device=device,
     )
+
+    return trainer, model
+
+
+# ============================================================================
+# I36: CUB200Trainer 继承版本 (基于 ModularTrainer)
+# ============================================================================
+
+def _import_modular_trainer():
+    """延迟导入 ModularTrainer，避免循环导入"""
+    from . import ModularTrainer, TrainerConfig
+    return ModularTrainer, TrainerConfig
+
+
+class CUB200ModularTrainer:
+    """CUB-200 细粒度分类训练器 - 基于 ModularTrainer (I36)
+
+    设计原则:
+        1. 复用 ModularTrainer 的通用组件（优化器、调度器、Callback）
+        2. 通过 FractalModelProtocol 配置模型，不直接访问内部实现
+        3. 保持 CUB-200 特有功能（Center Loss、细粒度评估）
+
+    数学形式:
+        总损失: L_total = L_ce + λ_center × L_center + λ_aux × L_aux
+
+    用法:
+        ```python
+        from examples.training.trainer import CUB200ModularTrainer, CUB200TrainingConfig
+        from vit_pytorch import FractalCurveViT
+
+        model = FractalCurveViT(num_classes=200, dim=384, depth=8, heads=6)
+        config = CUB200TrainingConfig(
+            batch_size=16,
+            learning_rate=0.0003,
+            depth_kl_weight=0.1,
+        )
+
+        trainer = CUB200ModularTrainer(model, config)
+        trainer.fit()
+        ```
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        config: 'CUB200TrainingConfig',
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        feat_dim: int = 256,
+    ):
+        """
+        Args:
+            model: FractalCurveViT 模型（需实现 FractalModelProtocol）
+            config: CUB200TrainingConfig 配置
+            train_loader: 训练数据加载器
+            val_loader: 验证数据加载器
+            feat_dim: Center Loss 特征维度
+        """
+        self.model = model
+        self.config = config
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.feat_dim = feat_dim
+        self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+
+        # 延迟导入 ModularTrainer
+        ModularTrainer, TrainerConfig = _import_modular_trainer()
+
+        # 1. 通过 FractalModelProtocol 配置模型 (I36-2 解耦)
+        self.model.configure_training({
+            'temperature_annealing': True,
+            'temp_start': config.splitter_temp_start,
+            'temp_end': config.splitter_temp_end,
+            'aux_loss_weights': {
+                'sparsity': config.splitter_sparsity_weight,
+                'elastic': config.elastic_budget_weight,
+                'depth_kl': config.depth_kl_weight,
+            }
+        })
+
+        # 2. 初始化 ModularTrainer 通用组件
+        trainer_config = TrainerConfig(
+            device=self.device.type,
+            num_epochs=config.num_epochs,
+            gradient_clip_norm=config.gradient_clip_norm,
+            accumulation_steps=config.accum_steps,
+            validate_interval=config.validate_interval,
+            checkpoint_dir=config.checkpoint_dir,
+            save_best_only=True,
+            monitor_metric="val_accuracy",
+            monitor_mode="max",
+            use_amp=config.use_amp,
+        )
+
+        # 优化器
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+
+        # 损失函数
+        loss_fn = FinegrainedLoss(config=FinegrainedLossConfig(
+            num_classes=config.num_classes,
+            label_smoothing=config.label_smoothing,
+        ))
+
+        # 初始化 ModularTrainer
+        self.trainer = ModularTrainer(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            optimizer=optimizer,
+            loss_fn=loss_fn,
+            config=trainer_config,
+        )
+
+        # 3. CUB-200 特有组件 (Center Loss)
+        self._setup_center_loss(feat_dim)
+
+    def _setup_center_loss(self, feat_dim: int):
+        """设置 Center Loss"""
+        self.center_loss_fn = nn.CrossEntropyLoss()
+        self.center_features: List[torch.Tensor] = []
+        self.center_labels: List[torch.Tensor] = []
+
+        # Center Loss 参数
+        self._center_lr = self.config.center_lr or (self.config.learning_rate / self.config.center_lr_ratio)
+
+        # 可学习的类别中心
+        self.register_buffer('center_bank', torch.zeros(self.config.num_classes, feat_dim))
+
+        # Center 优化器
+        self.center_optimizer = torch.optim.SGD(
+            [self.center_bank],
+            lr=self._center_lr,
+        )
+
+    def fit(self) -> Dict[str, List[float]]:
+        """完整训练流程
+
+        Returns:
+            训练历史记录
+        """
+        return self.trainer.fit()
+
+    def evaluate(self) -> CUB200EvalResult:
+        """评估模型
+
+        Returns:
+            CUB200EvalResult 评估结果
+        """
+        return self.trainer.validate()

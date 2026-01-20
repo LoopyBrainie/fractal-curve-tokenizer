@@ -119,6 +119,7 @@ from .trainer import (
 
 # Config
 from .config import (
+    ModelArchitectureConfig,  # I36: 统一架构配置
     DataConfig,
     ModelConfig,
     LossConfig,
@@ -246,6 +247,7 @@ __all__ = [
     "create_cub200_trainer",
     "get_cub200_augmentation",
     # Config
+    "ModelArchitectureConfig",  # I36: 统一架构配置
     "DataConfig",
     "ModelConfig",
     "LossConfig",

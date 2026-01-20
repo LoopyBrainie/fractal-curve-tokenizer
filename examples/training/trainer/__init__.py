@@ -23,7 +23,7 @@ Modular Trainer System for Fractal Curve ViT
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, Any, Optional, List, Callable, Protocol, Union
+from typing import Dict, Any, Optional, List, Callable, Protocol, Union, Tuple
 from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
@@ -31,6 +31,13 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 import time
 import json
+import warnings
+
+# I36: 导入 BaseTokenizer 用于 FractalModelProtocol
+try:
+    from vit_pytorch.tokenizer_streaming import BaseTokenizer
+except ImportError:
+    BaseTokenizer = None  # type: ignore
 
 
 # ============================================================================
@@ -43,6 +50,94 @@ class ModelProtocol(Protocol):
     def parameters(self): ...
     def train(self, mode: bool = True) -> 'ModelProtocol': ...
     def eval(self) -> 'ModelProtocol': ...
+
+
+# I36: Fractal ViT 模型扩展协议
+class FractalModelProtocol(ModelProtocol):
+    """Fractal ViT 模型协议 - 扩展基础模型协议
+
+    设计原则: 模型定义"我能做什么"，训练器决定"我怎么用你"
+
+    数学形式化:
+        - get_extra_info() 返回辅助信息用于损失计算和监控
+        - configure_training() 接收训练配置，保持模型内部逻辑独立
+        - get_splitter_diagnostics() 返回分割器诊断信息
+    """
+
+    @property
+    def tokenizer(self) -> Optional[BaseTokenizer]:
+        """返回 tokenizer 实例"""
+        ...
+
+    def get_extra_info(
+        self,
+        img: torch.Tensor,
+        return_aux_info: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[List[Dict[str, Any]]]]:
+        """获取辅助信息
+
+        Args:
+            img: 输入图像 [B, C, H, W]
+            return_aux_info: 是否返回 aux_info
+
+        Returns:
+            logits: 分类输出 [B, num_classes]
+            aux_infos: 辅助信息列表，每个元素对应一个样本
+                - num_tokens: int - Token 数量
+                - levels_used: List[int] - 使用的深度列表
+                - splitter_diagnostics: Dict - 分割器诊断信息
+        """
+        ...
+
+    def configure_training(self, config: Dict[str, Any]) -> None:
+        """配置训练相关参数
+
+        Args:
+            config: 配置字典，包含:
+                - temperature_annealing: bool - 是否启用温度退火
+                - temp_start: float - 起始温度
+                - temp_end: float - 结束温度
+                - aux_loss_weights: Dict[str, float] - 辅助损失权重
+        """
+        ...
+
+    def get_splitter_diagnostics(self) -> Dict[str, Any]:
+        """获取分割器诊断信息
+
+        Returns:
+            诊断字典，包含:
+                - current_temperature: float - 当前温度
+                - depth_distribution: Dict[int, float] - 深度分布
+                - quota_allocation: List[float] - 配额分配
+                - num_selected: int - 选中的 token 数
+        """
+        ...
+
+    def get_model_info(self) -> Dict[str, Any]:
+        """获取模型诊断信息 (I36-7)
+
+        Returns:
+            完整诊断信息:
+                - architecture: Dict - 架构参数
+                - tokenizer: Dict - tokenizer 配置
+                - splitter: Dict - splitter 参数
+                - total_params: int - 总参数量
+                - trainable_params: int - 可训练参数量
+        """
+        ...
+
+
+@dataclass
+class ExtraInfoProtocol:
+    """辅助信息协议 - 规范 extra_info 的键名约定
+
+    警告: 此协议仅用于文档目的，实际返回为字典
+    """
+    num_tokens: int                      # Token 数量
+    levels_used: List[int]               # 使用的深度列表
+    splitter_diagnostics: Dict[str, Any] # 分割器诊断信息
+    token_selection_entropy: float       # 分割不确定性
+    depth_distribution: Dict[int, float] # 深度分布
 
 
 class MetricsProtocol(Protocol):
@@ -688,6 +783,10 @@ __all__ = [
     # 配置
     "TrainerConfig",
     "TrainerState",
+    # 协议
+    "ModelProtocol",
+    "FractalModelProtocol",
+    "ExtraInfoProtocol",
     # Callbacks
     "Callback",
     "CallbackContext",
@@ -711,6 +810,7 @@ from .cub200_trainer import (
     CUB200Trainer,
     CUB200TrainingConfig,
     CUB200EvalResult,
+    CUB200ModularTrainer,  # I36: 新增继承版本
     create_cub200_trainer,
     get_cub200_augmentation,
 )

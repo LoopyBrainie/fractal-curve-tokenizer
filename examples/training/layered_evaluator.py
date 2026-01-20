@@ -365,12 +365,19 @@ class FinegrainedClassificationEvaluator:
             all_preds = []
             all_probs = []
 
+            # I35: 使用 get_extra_info API 获取 logits 和辅助信息
             with torch.no_grad():
                 for inputs, labels in test_loader:
                     inputs = inputs.to(device)
                     labels = labels.to(device)
 
-                    outputs = trainer.model(inputs)
+                    # I35: 优先使用 get_extra_info API（支持分词器诊断信息收集）
+                    if hasattr(trainer.model, 'get_extra_info'):
+                        outputs, aux_infos = trainer.model.get_extra_info(inputs)
+                    else:
+                        outputs = trainer.model(inputs)
+                        aux_infos = None
+
                     probs = torch.softmax(outputs, dim=1)
                     preds = outputs.argmax(dim=1)
 
@@ -435,11 +442,13 @@ SUPPORTED_DATASETS = {
     },
     # CUB-200-2011: 细粒度鸟类分类数据集
     # N_train=5994, N_test=5794, C=200
+    # I35: 使用动态分辨率 (image_size=None) 支持可变尺寸输入
     'cub200': {
         'num_classes': 200,
-        'image_size': 224,
+        'image_size': None,  # 动态分辨率，从数据集中获取实际尺寸
         'mean': [0.485, 0.456, 0.406],
         'std': [0.229, 0.224, 0.225],
+        'dynamic_resolution': True,  # I35: 标记为动态分辨率数据集
     },
 }
 
@@ -816,15 +825,16 @@ class LayeredEvaluator:
         num_workers: int = 4,
         device: Optional[str] = None,
         data_root: Optional[str] = None,
+        exp_config: Optional[Dict[str, Any]] = None,  # 实验配置（从 config.json 加载）
     ):
         """初始化分层评估器
-        
+
         Parameters
         ----------
         checkpoint_path : str
             模型 checkpoint 文件路径
         dataset_name : str
-            数据集名称 (cifar10, cifar100, mnist, tiny-imagenet)
+            数据集名称 (cifar10, cifar100, mnist, tiny-imagenet, cub200)
         batch_size : int
             评估批次大小
         num_workers : int
@@ -833,27 +843,30 @@ class LayeredEvaluator:
             设备 (cuda/cpu)，默认自动检测
         data_root : str, optional
             数据根目录，默认为项目 data 目录
+        exp_config : dict, optional
+            从 config.json 加载的实验配置
         """
         self.checkpoint_path = Path(checkpoint_path)
         self.dataset_name = dataset_name.lower()
         self.batch_size = batch_size
         self.num_workers = num_workers
-        
+        self.exp_config = exp_config or {}  # 保存实验配置
+
         # 设备设置
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.device = torch.device(device)
-        
+
         # 数据路径
         if data_root is None:
             self.data_root = PROJECT_ROOT / "data"
         else:
             self.data_root = Path(data_root)
-        
+
         # 验证
         self._validate_config()
-        
+
         # 加载模型和数据
         self.model = None
         self.train_loader = None
@@ -923,6 +936,17 @@ class LayeredEvaluator:
         # 从数据集配置获取 num_classes
         num_classes = config.get('num_classes', self.dataset_config['num_classes'])
         image_size = config.get('image_size', self.dataset_config['image_size'])
+
+        # I35: 动态分辨率支持 - 对于支持动态分辨率的数据集，使用 None
+        if self.dataset_config.get('dynamic_resolution', False):
+            if image_size is not None and not isinstance(image_size, int):
+                # 如果配置中是具体值但数据集标记为动态分辨率，使用 None
+                image_size = None
+                print("Using dynamic resolution (image_size=None) for variable-size dataset")
+        elif image_size is None:
+            # 传统数据集不能使用动态分辨率，使用默认值 224
+            image_size = 224
+            print(f"Warning: Fixed-size dataset but image_size is None, using default {image_size}")
 
         # 加载权重以检测缺失的架构参数
         if 'model_state_dict' in checkpoint:
@@ -1226,14 +1250,17 @@ class LayeredEvaluator:
     def run_full_evaluation(
         self,
         skip_layers: Optional[List[str]] = None,
+        evaluate_train: bool = False,  # 是否评估训练集（CUB-200 专用）
     ) -> LayeredEvaluationReport:
         """执行完整分层评估
-        
+
         Parameters
         ----------
         skip_layers : list of str, optional
             跳过的层，例如 ['L3', 'L5']
-            
+        evaluate_train : bool
+            是否评估训练集（用于过拟合诊断，仅 CUB-200 支持）
+
         Returns
         -------
         LayeredEvaluationReport
@@ -1241,17 +1268,17 @@ class LayeredEvaluator:
         """
         start_time = time.time()
         skip_layers = skip_layers or []
-        
+
         print("=" * 60)
         print("FractalCurveViT Layered Evaluation")
         print("=" * 60)
-        
+
         # 加载模型和数据
         self.model = self._load_model()
         self.train_loader, self.val_loader, self.test_loader = self._load_data()
-        
+
         eval_loader = self.test_loader or self.val_loader
-        
+
         # 创建报告
         report = LayeredEvaluationReport(
             checkpoint_path=str(self.checkpoint_path),
@@ -1260,6 +1287,33 @@ class LayeredEvaluator:
             num_classes=self.dataset_config['num_classes'],
             device=str(self.device),
         )
+
+        # ====================================================================
+        # L9-Train: 训练集评估（CUB-200 专用，用于过拟合诊断）
+        # ====================================================================
+        train_finegrained_metrics = None
+        if evaluate_train and self.dataset_name == 'cub200' and self.train_loader is not None:
+            if CUB200_AVAILABLE:
+                print("\n[L9-Train] CUB-200 Training Set Evaluation...")
+                num_classes = self.dataset_config.get('num_classes', 200)
+                train_finegrained_eval = FinegrainedClassificationEvaluator(
+                    num_classes=num_classes
+                )
+                train_finegrained_metrics = train_finegrained_eval.evaluate(
+                    self.model, self.train_loader, self.device
+                )
+
+                # 打印训练集结果
+                print(f"\n  [训练集性能]")
+                print(f"    Top-1 Accuracy:  {train_finegrained_metrics.top1_accuracy:.2f}%")
+                print(f"    Top-5 Accuracy:  {train_finegrained_metrics.top5_accuracy:.2f}%")
+                print(f"    Mean Class Acc:  {train_finegrained_metrics.mean_class_accuracy:.2f}%")
+
+                # 保存到报告（如果支持）
+                if hasattr(report, 'L9_train'):
+                    report.L9_train = train_finegrained_metrics
+            else:
+                print(f"  - CUB200Trainer not available: {CUB200_IMPORT_ERROR}")
         
         # L6: 稳定性评估 (最先进行，检查模型健康)
         if 'L6' not in skip_layers:
@@ -1432,6 +1486,64 @@ class LayeredEvaluator:
                         print(f"    Sample #{idx}: {true_name} -> {pred_name} (conf:{conf:.2f})")
             else:
                 print(f"  - CUB200Trainer not available: {CUB200_IMPORT_ERROR}")
+
+        # ====================================================================
+        # L9-Compare: 训练集与测试集对比分析（CUB-200 过拟合诊断）
+        # ====================================================================
+        if train_finegrained_metrics is not None and finegrained_metrics is not None:
+            print("\n[L9-Compare] Train vs Test Comparison (Overfitting Diagnosis)")
+
+            # 计算对比指标
+            train_top1 = train_finegrained_metrics.top1_accuracy
+            test_top1 = finegrained_metrics.top1_accuracy
+            train_mca = train_finegrained_metrics.mean_class_accuracy
+            test_mca = finegrained_metrics.mean_class_accuracy
+            train_top5 = train_finegrained_metrics.top5_accuracy
+            test_top5 = finegrained_metrics.top5_accuracy
+
+            overfit_ratio = train_top1 / max(test_top1, 0.01)
+            mca_gap = train_mca - test_mca
+            top5_gap = train_top5 - test_top5
+
+            # 打印对比结果
+            print(f"\n  [基础指标对比]")
+            print(f"    {'指标':<15} {'训练集':>10} {'测试集':>10} {'差值':>10}")
+            print(f"    {'-'*45}")
+            print(f"    {'Top-1 Acc':<15} {train_top1:>9.2f}% {test_top1:>9.2f}% {test_top1 - train_top1:>+9.2f}%")
+            print(f"    {'MCA':<15} {train_mca:>9.2f}% {test_mca:>9.2f}% {test_mca - train_mca:>+9.2f}%")
+            print(f"    {'Top-5 Acc':<15} {train_top5:>9.2f}% {test_top5:>9.2f}% {test_top5 - train_top5:>+9.2f}%")
+
+            print(f"\n  [过拟合诊断]")
+            print(f"    Overfit Ratio: {overfit_ratio:.3f} (训练/测试, >1.15 表示过拟合)")
+            print(f"    MCA Gap: {mca_gap:+.2f}%")
+
+            # 过拟合警告
+            if overfit_ratio > 1.15:
+                print(f"\n    ⚠️  过拟合警告: 训练准确率比测试高 {(overfit_ratio - 1) * 100:.1f}%")
+                summary['warnings'].append(
+                    f"Overfitting detected: overfit_ratio={overfit_ratio:.3f}"
+                )
+                summary['recommendations'].append(
+                    "Consider stronger regularization, data augmentation, or early stopping"
+                )
+                if summary['overall_health'] != 'critical':
+                    summary['overall_health'] = 'warning'
+
+            # 保存对比结果到报告
+            if not hasattr(report, 'L9_comparison'):
+                report.L9_comparison = {}
+
+            report.L9_comparison = {
+                'train_top1': train_top1,
+                'test_top1': test_top1,
+                'train_mca': train_mca,
+                'test_mca': test_mca,
+                'train_top5': train_top5,
+                'test_top5': test_top5,
+                'overfit_ratio': overfit_ratio,
+                'mca_gap': mca_gap,
+                'top5_gap': top5_gap,
+            }
 
         # 完成
         report.evaluation_time_sec = time.time() - start_time

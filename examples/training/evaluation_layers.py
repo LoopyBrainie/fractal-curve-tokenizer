@@ -117,17 +117,23 @@ class L1ClassificationMetrics:
     mean_class_accuracy: float = 0.0
     per_class_accuracy: Dict[int, float] = field(default_factory=dict)
     avg_loss: float = 0.0
-    
+
     # 校准误差
     ece: float = 0.0  # Expected Calibration Error
     mce: float = 0.0  # Maximum Calibration Error
-    
+
     # 混淆分析
     top_confused_pairs: List[Tuple[int, int, int]] = field(default_factory=list)  # (true, pred, count)
-    
+
     # 难样本分析
     hardest_classes: List[Tuple[int, float]] = field(default_factory=list)  # (class_id, error_rate)
-    
+
+    # I35: Tokenizer 诊断信息 (从 get_extra_info 收集)
+    avg_num_tokens: float = 0.0
+    min_num_tokens: int = 0
+    max_num_tokens: int = 0
+    tokenizer_depth_distribution: Dict[int, float] = field(default_factory=dict)  # 聚合的深度分布
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -505,24 +511,40 @@ class ClassificationEvaluator:
         all_preds = []
         all_labels = []
         all_probs = []
+        all_num_tokens: List[int] = []  # I35: 收集 token 数量
+        all_depth_distributions: List[Dict[int, float]] = []  # I35: 收集深度分布
         total_loss = 0.0
         
         with torch.no_grad():
             for imgs, labels in tqdm(data_loader, desc="L1: Classification"):
                 imgs = imgs.to(device)
                 labels = labels.to(device)
-                
-                outputs = model(imgs)
-                if isinstance(outputs, tuple):
-                    outputs = outputs[0]
-                
+
+                # I35: 使用 get_extra_info API 获取 logits 和辅助信息
+                if hasattr(model, 'get_extra_info'):
+                    outputs, aux_infos = model.get_extra_info(imgs)
+                else:
+                    outputs = model(imgs)
+                    if isinstance(outputs, tuple):
+                        outputs = outputs[0]
+                    aux_infos = None
+
                 loss = F.cross_entropy(outputs, labels)
                 probs = F.softmax(outputs, dim=1)
-                
+
                 all_preds.append(outputs.argmax(dim=1).cpu())
                 all_labels.append(labels.cpu())
                 all_probs.append(probs.cpu())
                 total_loss += loss.item()
+
+                # I35: 收集 tokenizer 诊断信息
+                if aux_infos is not None:
+                    for aux_info in aux_infos:
+                        if isinstance(aux_info, dict):
+                            if 'num_tokens' in aux_info:
+                                all_num_tokens.append(aux_info['num_tokens'])
+                            if 'depth_distribution' in aux_info:
+                                all_depth_distributions.append(aux_info['depth_distribution'])
         
         all_preds = torch.cat(all_preds)
         all_labels = torch.cat(all_labels)
@@ -588,7 +610,26 @@ class ClassificationEvaluator:
                 error_rates.append((c, error_rate * 100))
         error_rates.sort(key=lambda x: x[1], reverse=True)
         metrics.hardest_classes = error_rates[:10]
-        
+
+        # I35: 计算 tokenizer 诊断信息
+        if all_num_tokens:
+            metrics.avg_num_tokens = np.mean(all_num_tokens)
+            metrics.min_num_tokens = int(np.min(all_num_tokens))
+            metrics.max_num_tokens = int(np.max(all_num_tokens))
+
+        # 聚合深度分布
+        if all_depth_distributions:
+            depth_counts: Dict[int, float] = defaultdict(float)
+            total_depth = 0.0
+            for dist in all_depth_distributions:
+                for d, p in dist.items():
+                    depth_counts[d] += p
+                    total_depth += p
+            if total_depth > 0:
+                metrics.tokenizer_depth_distribution = {
+                    d: count / total_depth for d, count in depth_counts.items()
+                }
+
         return metrics
     
     def _compute_calibration_error(

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -283,32 +283,37 @@ class FinegrainedLoss(nn.Module):
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
-        features: Optional[torch.Tensor] = None,
+        features: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
         attention_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         计算组合损失
-        
+
         Args:
             logits: 分类 logits [B, C]
             labels: 标签 [B]
-            features: 特征向量 [B, D]（用于 Center Loss）
+            features: 特征向量 [B, D] 或 List[Tensor]（每个样本一个tensor）
             attention_weights: 注意力权重（用于熵正则化）
-            
+
         Returns:
             total_loss: 总损失
             stats: 各损失分量统计
         """
         stats = {}
-        
+
         # 主分类损失
         ce_loss = self.ce_loss(logits, labels)
         stats['ce_loss'] = ce_loss.item()
         total_loss = ce_loss
-        
+
         # Center Loss
         if self.center_loss is not None and features is not None:
-            center_loss, center_stats = self.center_loss(features, labels)
+            # I35: 处理 List[Tensor] 或 Tensor 输入
+            if isinstance(features, list):
+                features_tensor = torch.stack(features)  # List -> [B, D]
+            else:
+                features_tensor = features
+            center_loss, center_stats = self.center_loss(features_tensor, labels)
             total_loss = total_loss + self.config.center_loss_weight * center_loss
             stats.update(center_stats)
         

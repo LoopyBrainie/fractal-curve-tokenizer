@@ -112,6 +112,96 @@ from visualization import (
     FigureConfig,
 )
 
+# 导入 CUB-200 鸟类类别名称
+try:
+    from trainer.cub200_trainer import CUB200_BIRD_CLASSES
+except ImportError:
+    CUB200_BIRD_CLASSES = None
+
+
+# ============================================================================
+# 实验配置加载函数
+# ============================================================================
+
+def load_config_from_experiment(checkpoint_path: str) -> Dict[str, Any]:
+    """从实验目录自动加载 config.json
+
+    查找路径优先级:
+        1. checkpoints/best.pth → ../logs/config.json
+        2. checkpoints/best.pth → ../../config.json
+
+    数学形式化:
+        config_path = argmax_{p ∈ candidates} exists(p)
+
+    Returns:
+        Dict 包含训练配置和 CUB200 配置
+    """
+    checkpoint = Path(checkpoint_path)
+
+    # 候选路径
+    candidates = [
+        checkpoint.parent.parent / "logs" / "config.json",  # experiments/exp/logs/config.json
+        checkpoint.parent.parent / "config.json",            # experiments/exp/config.json
+    ]
+
+    for config_path in candidates:
+        if config_path.exists():
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                print(f"[INFO] Loaded config from: {config_path}")
+                return config
+            except Exception as e:
+                print(f"[WARN] Failed to load config from {config_path}: {e}")
+
+    print(f"[INFO] No config.json found for checkpoint: {checkpoint_path}")
+    return {}
+
+
+def merge_evaluation_config(
+    base_config: Dict[str, Any],
+    exp_config: Dict[str, Any],
+    dataset_name: str,
+) -> Dict[str, Any]:
+    """合并评估配置（命令行参数优先）
+
+    数学形式化:
+        final_config = argmax_{source} priority(source)
+        where priority(cli) > priority(config.json) > priority(default)
+
+    Args:
+        base_config: 命令行基础配置
+        exp_config: 从 config.json 加载的配置
+        dataset_name: 数据集名称
+
+    Returns:
+        合并后的配置
+    """
+    merged = base_config.copy()
+
+    # 从实验配置中提取对应数据集的配置
+    if dataset_name == 'cub200' and 'cub200_config' in exp_config:
+        cub200_cfg = exp_config['cub200_config']
+        # 仅覆盖未在命令行指定的参数
+        for key, value in cub200_cfg.items():
+            if key and key not in merged or (key in merged and merged[key] is None):
+                merged[key] = value
+
+    # 提取训练配置（通用参数）
+    if 'training_config' in exp_config:
+        training_cfg = exp_config['training_config']
+        for key, value in training_cfg.items():
+            if key:  # 确保 key 不是 None
+                # 映射旧配置名称到新名称
+                key_mapping = {
+                    'drop_path': 'drop_path_rate',
+                }
+                mapped_key = key_mapping.get(key, key)
+                if mapped_key not in merged or merged[mapped_key] is None:
+                    merged[mapped_key] = value
+
+    return merged
+
 
 # ============================================================================
 # 核心函数
@@ -132,22 +222,26 @@ def run_evaluation_and_visualization(
     save_figures: bool = True,
     generate_html: bool = True,
     figure_config: Optional[FigureConfig] = None,
+    # 新增参数
+    evaluate_train: bool = False,       # 是否评估训练集（CUB-200 专用）
+    use_config_json: bool = True,       # 是否自动从 config.json 加载参数
+    exp_config: Optional[Dict[str, Any]] = None,  # 预加载的实验配置
 ) -> Tuple[LayeredEvaluationReport, Optional[LayeredVisualizationReport]]:
     """执行完整的分层评估与可视化
-    
+
     数学形式化：
         Φ: (checkpoint, dataset) → (EvalReport, VisReport)
-        
+
     其中：
         EvalReport = (L1_metrics, L2_metrics, ..., L6_metrics)
         VisReport = {figures} ∪ {html_report}
-    
+
     Parameters
     ----------
     checkpoint_path : str
         模型 checkpoint 文件路径
     dataset_name : str
-        数据集名称 (cifar10, cifar100, mnist, tiny-imagenet)
+        数据集名称 (cifar10, cifar100, mnist, tiny-imagenet, cub200)
     output_dir : str, optional
         输出目录，默认为 checkpoint 同级目录下的 layered_report/
     batch_size : int
@@ -172,7 +266,13 @@ def run_evaluation_and_visualization(
         是否生成 HTML 报告
     figure_config : FigureConfig, optional
         可视化配置
-        
+    evaluate_train : bool
+        是否评估训练集（CUB-200 专用，用于过拟合诊断）
+    use_config_json : bool
+        是否自动从 config.json 加载参数
+    exp_config : dict, optional
+        预加载的实验配置（与 use_config_json 配合使用）
+
     Returns
     -------
     Tuple[LayeredEvaluationReport, LayeredVisualizationReport]
@@ -180,7 +280,15 @@ def run_evaluation_and_visualization(
     """
     start_time = time.time()
     checkpoint_path = Path(checkpoint_path)
-    
+
+    # 从 config.json 加载实验配置
+    loaded_exp_config: Dict[str, Any] = {}
+    if use_config_json and exp_config is None:
+        loaded_exp_config = load_config_from_experiment(str(checkpoint_path))
+        exp_config = loaded_exp_config
+    elif exp_config is None:
+        exp_config = {}
+
     # 设置输出目录
     # 默认在实验目录下创建 evaluation/ 文件夹
     # 例如: experiments/fractal_vit_xxx/checkpoints/best.pth -> experiments/fractal_vit_xxx/evaluation/
@@ -189,20 +297,21 @@ def run_evaluation_and_visualization(
         output_dir = exp_dir / "evaluation"
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     print("\n" + "=" * 70)
     print("FractalCurveViT Unified Evaluation & Visualization")
     print("=" * 70)
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Dataset: {dataset_name}")
+    print(f"Evaluate Train: {evaluate_train}")
     print(f"Output: {output_dir}")
     print("=" * 70)
-    
+
     # ========================================================================
     # 阶段 1: 分层评估
     # ========================================================================
     eval_report: LayeredEvaluationReport
-    
+
     if vis_only and report_path:
         # 仅可视化模式：从 JSON 加载已有报告
         print("\n[Phase 1] Loading existing evaluation report...")
@@ -211,17 +320,21 @@ def run_evaluation_and_visualization(
     else:
         # 正常评估模式
         print("\n[Phase 1] Running Layered Evaluation...")
-        
+
         evaluator = LayeredEvaluator(
             checkpoint_path=str(checkpoint_path),
             dataset_name=dataset_name,
             batch_size=batch_size,
             num_workers=num_workers,
             device=device,
+            exp_config=exp_config,  # 传递实验配置
         )
-        
-        eval_report = evaluator.run_full_evaluation(skip_layers=skip_layers)
-        
+
+        eval_report = evaluator.run_full_evaluation(
+            skip_layers=skip_layers,
+            evaluate_train=evaluate_train,  # 传递训练集评估参数
+        )
+
         # 保存 JSON 报告
         if save_json:
             json_path = output_dir / "evaluation_report.json"
@@ -285,6 +398,9 @@ def run_evaluation_and_visualization(
 
 def _get_class_names(dataset_name: str) -> Optional[List[str]]:
     """获取数据集的类别名称"""
+    # 导入 CUB-200 鸟类类别名称
+    global CUB200_BIRD_CLASSES
+
     DATASET_CLASSES = {
         "cifar10": [
             'airplane', 'automobile', 'bird', 'cat', 'deer',
@@ -293,7 +409,7 @@ def _get_class_names(dataset_name: str) -> Optional[List[str]]:
         "cifar100": None,  # 100 类，太长不显示
         "mnist": [str(i) for i in range(10)],
         "tiny-imagenet": None,  # 200 类
-        "cub200": None,  # 200 类鸟类
+        "cub200": CUB200_BIRD_CLASSES,  # 200 类鸟类（使用真实名称）
     }
     return DATASET_CLASSES.get(dataset_name.lower())
 
@@ -635,14 +751,26 @@ Examples:
         default=[12, 10],
         help="Figure size (width height, default: 12 10)",
     )
-    
+
+    # CUB-200 专用参数
+    parser.add_argument(
+        "--evaluate-train",
+        action="store_true",
+        help="Also evaluate training set (CUB-200 only, for overfitting diagnosis)",
+    )
+    parser.add_argument(
+        "--no-config-json",
+        action="store_true",
+        help="Do not auto-load config.json from experiment directory",
+    )
+
     return parser.parse_args()
 
 
 def main():
     """主函数"""
     args = parse_args()
-    
+
     # 验证参数
     if args.vis_only:
         if not args.report:
@@ -658,13 +786,18 @@ def main():
         if not Path(args.checkpoint).exists():
             print(f"[ERROR] Checkpoint not found: {args.checkpoint}")
             sys.exit(1)
-    
+
     # 创建图表配置
     figure_config = FigureConfig(
         dpi=args.dpi,
         figsize=tuple(args.figsize),
     )
-    
+
+    # 从 config.json 加载实验配置（如果启用且可用）
+    exp_config = None
+    if not args.no_config_json and not args.vis_only:
+        exp_config = load_config_from_experiment(str(args.checkpoint))
+
     # 运行评估与可视化
     try:
         run_evaluation_and_visualization(
@@ -682,6 +815,10 @@ def main():
             save_figures=not args.no_figures,
             generate_html=not args.no_html,
             figure_config=figure_config,
+            # 新增参数
+            evaluate_train=args.evaluate_train,
+            use_config_json=not args.no_config_json,
+            exp_config=exp_config,
         )
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user")

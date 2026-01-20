@@ -38,6 +38,7 @@ from torch import Tensor
 
 # 导入已有的实现
 from .focal_loss import FocalLoss
+from .adaptive_focal_loss import AdaptiveFocalLossWrapper, create_adaptive_focal_loss
 from .balanced_ce import ClassBalancedCrossEntropy, compute_class_weights_from_targets
 from .resource_loss import ResourceAwareLoss, compute_depth_entropy, get_weighted_token_count
 from .hilbert_hard_mining import (
@@ -208,6 +209,8 @@ class CompositeLoss(nn.Module):
 __all__ = [
     # 核心损失函数
     "FocalLoss",
+    "AdaptiveFocalLossWrapper",
+    "create_adaptive_focal_loss",
     "ClassBalancedCE",
     "ClassBalancedCrossEntropy",  # 别名
     "FocalClassBalancedLoss",

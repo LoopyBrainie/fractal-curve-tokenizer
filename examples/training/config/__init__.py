@@ -21,9 +21,103 @@ from pathlib import Path
 import yaml
 import json
 import copy
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 T = TypeVar("T")
+
+
+# ============================================================================
+# I36: 统一模型架构配置 (2026-01-20)
+# ============================================================================
+
+@dataclass
+class ModelArchitectureConfig:
+    """统一模型架构配置
+
+    设计原则:
+        - 所有模型架构参数集中定义，避免重复
+        - 训练配置 (CUB200TrainingConfig) 只包含训练策略参数
+        - 与 ModelConfig 保持一致，但更专注于 Fractal ViT 特有参数
+
+    数学参数:
+        - dim: 嵌入维度
+        - depth: Transformer 层数
+        - heads: 注意力头数
+        - mlp_dim: FFN 维度 = dim × mlp_ratio
+        - dim_head: 每头维度 = dim / heads
+
+    Tokenizer 参数:
+        - num_scales: 四叉树深度级别数
+        - min_patch_size: 最小 patch 大小
+        - K_min/K_max: Token 数量范围 (I33: 相对预算)
+        - max_depth: 最大分割深度
+    """
+    # 核心架构参数
+    num_classes: int = 200
+    dim: int = 384
+    depth: int = 8
+    heads: int = 6
+    mlp_dim: int = 1536  # dim * mlp_ratio (default 4.0)
+    dim_head: int = 64   # dim / heads
+
+    # 输入配置
+    image_size: int = 224  # None 表示动态分辨率 (I78)
+    patch_size: int = 8
+    channels: int = 3
+
+    # I78: 动态分辨率支持
+    # image_size=None 时支持任意分辨率输入
+    # 固定分辨率时用于初始化，兼容旧 API
+
+    # Tokenizer 参数 (I33: 相对预算设计)
+    num_scales: int = 4
+    min_patch_size: int = 4
+    # I33: 相对预算参数 (替代绝对 K_min/K_max)
+    token_coverage_min: float = 0.01   # α = 1% 最小覆盖率
+    token_coverage_max: float = 0.05   # β = 5% 最大覆盖率
+    K_min_abs: int = 8                 # 绝对下界保护
+    max_depth_hard_limit: int = 8      # 最大分割深度硬上限
+
+    # FFN 类型
+    ffn_type: str = "swiglu_level"  # "swiglu", "swiglu_level"
+
+    # 性能优化选项
+    use_checkpoint: bool = False
+    use_channels_last: bool = False  # I78: channels-last 内存格式
+    use_compile: bool = False        # I78: torch.compile 优化
+    compile_mode: str = "default"    # torch.compile 模式
+
+    # I31: 形状-尺度编码配置
+    use_area_encoding: bool = False
+    use_affine_modulation: bool = True  # A17: 默认为 True
+
+    def __post_init__(self):
+        """参数验证 - 数学约束"""
+        assert self.dim > 0, f"dim={self.dim} 必须 > 0"
+        assert self.depth >= 1, f"depth={self.depth} 必须 >= 1"
+        assert self.heads >= 1, f"heads={self.heads} 必须 >= 1"
+        assert self.num_classes >= 1, f"num_classes={self.num_classes} 必须 >= 1"
+
+        # 验证 dim_head 一致性
+        expected_dim_head = self.dim // self.heads
+        if self.dim_head != expected_dim_head:
+            logger.warning(
+                f"dim_head={self.dim_head} != dim/heads={expected_dim_head}, "
+                f"将使用 dim_head={expected_dim_head}"
+            )
+            self.dim_head = expected_dim_head
+
+        # 验证 mlp_ratio
+        expected_mlp_dim = int(self.dim * (self.mlp_dim / self.dim)) if self.mlp_dim != self.dim else int(self.dim * 4.0)
+        # mlp_dim 已经是绝对值，不需要重新计算
+
+    @property
+    def mlp_ratio(self) -> float:
+        """返回 mlp_ratio (用于向后兼容)"""
+        return self.mlp_dim / self.dim if self.dim > 0 else 4.0
 
 
 # ============================================================================
@@ -197,7 +291,20 @@ class LossConfig:
     # γ = 5: 极端聚焦 (仅对非常难的样本有梯度)
     focal_gamma: float = 2.5  # I28-1: 从 2.0 提升到 2.5
     focal_alpha: Optional[List[float]] = None  # None = 自动计算
-    
+
+    # A23: Adaptive Focal Loss 参数 (L2: 尚未实现，保留接口)
+    # 自适应模式:
+    # - "fixed": 固定 γ (退化为标准 FocalLoss)
+    # - "difficulty": 基于样本难度调整
+    # - "annealing": 基于训练进度退火
+    # - "combined": 综合 difficulty 和 annealing
+    # TODO: 实现自适应 Focal Loss 以支持动态 γ 调整
+    adaptive_focal_mode: str = "combined"
+    adaptive_base_gamma: float = 2.0  # 基础 γ
+    adaptive_gamma_min: float = 1.0   # γ 最小值
+    adaptive_gamma_max: float = 5.0   # γ 最大值
+    use_adaptive_focal: bool = False  # 是否使用自适应模式 (L2: 当前未使用)
+
     # Class-Balanced 参数
     # β (beta): 有效样本数衰减因子
     # β → 1: 权重更平滑
@@ -618,6 +725,8 @@ def create_default_configs(output_dir: Union[str, Path] = "configs") -> None:
 # ============================================================================
 
 __all__ = [
+    # I36: 统一模型架构配置
+    "ModelArchitectureConfig",
     # 配置类
     "DataConfig",
     "ModelConfig",

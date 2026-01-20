@@ -26,20 +26,22 @@
 
 分割方案 (Split Schemes)
 -------------------------
-使用 Scheme D (GumbelTopKSplitter) - 唯一支持的分割器:
+使用 Scheme D (GumbelTopKSplitter) - 推荐使用的分割器:
 
-+------------------+----------------------------------+-------------------------+
-| 方案              | 数学描述                          | 特点                     |
-+==================+==================================+=========================+
-| Scheme D         | selected = TopK(logits + g, K)   | 端到端学习, 100%梯度覆盖 |
-| (GumbelTopK)     | 树一致性约束 + STE               | 硬 K 约束, 并行评估      |
-+------------------+----------------------------------+-------------------------+
++------------------+----------------------------------+---------------------------+
+| 方案              | 数学描述                          | 特点                       |
++==================+==================================+===========================+
+| Scheme D         | selected = TopK(logits + g, K)   | 端到端学习, ~K/N梯度覆盖   |
+| (GumbelTopK)     | 树一致性约束 + STE               | 硬 K 约束, 并行评估        |
++------------------+----------------------------------+---------------------------+
 
 Scheme D 优势:
-- 100% 梯度覆盖 (STE 使所有候选都有梯度)
+- ~K/N 梯度覆盖 (约 37.6%，K=32,N=85) - Top-K 后只有 K 个候选有显著梯度
 - 硬 K 约束 [K_min, K_max] 消除死锁风险
 - O(1) 并行评估所有候选
-- 树一致性向量化约束保证 Hilbert 100%
+- 树一致性向量化约束保证 Hilbert 空间局部性
+
+**注意**: 100% 梯度覆盖需要 Subset Softmax（每个深度独立 softmax），已在 I30-2 中移除。
 
 P9 性能优化 (2025-12-28)
 -------------------------
@@ -183,6 +185,56 @@ import torch._dynamo
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
+
+# =========================================================================
+# I35: CUDA 优化配置 - 必须在第一次 torch 调用前设置
+# =========================================================================
+
+def _configure_cuda_optimizations():
+    """配置 CUDA 优化以获得最佳性能 (I35)。
+
+    设置包括：
+    1. TF32: Ampere+ GPU 的快速精度模式
+    2. cuDNN benchmark: 自动选择最优 kernel
+    3. cuDNN deterministic: 允许非确定性以提高性能
+    4. SDPA 后端: 启用 Flash/Memory-Efficient/cuDNN Attention
+    """
+    if not torch.cuda.is_available():
+        return
+
+    # TF32 (Ampere+ GPU) - 加速矩阵运算
+    if hasattr(torch.backends.cuda, 'matmul') and hasattr(torch.backends.cuda.matmul, 'allow_tf32'):
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    if hasattr(torch.backends, 'cudnn') and hasattr(torch.backends.cudnn, 'allow_tf32'):
+        torch.backends.cudnn.allow_tf32 = True
+
+    # cuDNN auto-tuning - 选择最优卷积算法
+    if hasattr(torch.backends, 'cudnn'):
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False  # 允许非确定性以提高性能
+
+    # 启用所有 SDPA 后端 (Flash / Memory-Efficient / cuDNN)
+    # PyTorch 2.0+ 自动选择最优实现
+    if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+        torch.backends.cuda.enable_flash_sdp(True)
+
+    if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+
+    if hasattr(torch.backends.cuda, 'enable_cudnn_sdp'):
+        torch.backends.cuda.enable_cudnn_sdp(True)
+
+    # 打印当前优化状态
+    print("[I35] CUDA 优化配置:")
+    print(f"  TF32: {torch.backends.cuda.matmul.allow_tf32 if hasattr(torch.backends.cuda.matmul, 'allow_tf32') else 'N/A'}")
+    print(f"  cuDNN benchmark: {torch.backends.cudnn.benchmark if hasattr(torch.backends, 'cudnn') else 'N/A'}")
+    print(f"  Flash Attention: {torch.backends.cuda.flash_sdp_enabled() if hasattr(torch.backends.cuda, 'flash_sdp_enabled') else 'N/A'}")
+    print(f"  Memory-Efficient: {torch.backends.cuda.mem_efficient_sdp_enabled() if hasattr(torch.backends.cuda, 'mem_efficient_sdp_enabled') else 'N/A'}")
+    print(f"  cuDNN Attention: {torch.backends.cuda.cudnn_sdp_enabled() if hasattr(torch.backends.cuda, 'cudnn_sdp_enabled') else 'N/A'}")
+
+# 在导入后立即配置
+_configure_cuda_optimizations()
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, SubsetRandomSampler, Subset
 from torchvision import datasets, transforms
@@ -381,13 +433,9 @@ class TrainingConfig:
     soft_entropy_weight: float = 0.1  # 软熵损失权重
     soft_entropy_target: Optional[float] = None  # 目标熵值（仅 mode='target' 时使用）
 
-    # P10-9: 弹性预算损失参数
+    # P10-9: 弹性预算损失参数 (I33: 已改造为相对预算，使用常量)
     include_elastic_budget: bool = True  # 是否启用弹性预算损失（推荐 True）
-    elastic_N_min: int = 16  # 弹性预算下界（Dead Zone 左边界）
-    elastic_N_max: int = 80  # 弹性预算上界（Dead Zone 右边界）
-    elastic_lambda_over: float = 0.1  # 超出上界惩罚权重
-    elastic_lambda_under: float = 0.01  # 低于下界约束权重
-    elastic_lambda_collapse: float = 1.0  # I14-1 D1: 崩溃惩罚权重（建议 1.0）
+    # 注: elastic_N_* 参数已移除，使用 ELASTIC_COVERAGE_* 常量保证跨尺度一致性
 
     # 训练
     epochs: int = 100
@@ -395,7 +443,7 @@ class TrainingConfig:
     weight_decay: float = 0.1
     dropout: float = 0.15
     emb_dropout: float = 0.1
-    drop_path: float = 0.2
+    drop_path_rate: float = 0.2  # 统一命名: drop_path → drop_path_rate
     label_smoothing: float = 0.1
     gradient_clip: float = 1.0
     use_amp: bool = False
@@ -1778,12 +1826,8 @@ def train_epoch(
                         include_elastic_budget=config.include_elastic_budget,
                         include_soft_entropy=config.include_soft_entropy,
                         batch_size=imgs.shape[0],
-                        elastic_N_min=config.elastic_N_min,
-                        elastic_N_max=config.elastic_N_max,
-                        elastic_lambda_over=config.elastic_lambda_over,
-                        elastic_lambda_under=config.elastic_lambda_under,
-                        elastic_lambda_collapse=config.elastic_lambda_collapse,  # I14-1 D1
-                        actual_token_count=actual_token_count,  # I14-1 D1: 用于崩溃检测
+                        # I33: elastic_N_* 参数已移除，使用 ELASTIC_COVERAGE_* 常量
+                        actual_token_count=actual_token_count,
                         entropy_target=config.soft_entropy_target,
                         entropy_weight=config.soft_entropy_weight,
                         entropy_mode=config.soft_entropy_mode,
@@ -2561,17 +2605,8 @@ def main():
                        help="Enable elastic budget loss (default: True, recommended)")
     parser.add_argument("--no-elastic-budget", action="store_false", dest="include_elastic_budget",
                        help="Disable elastic budget loss")
-    parser.add_argument("--elastic-N-min", type=int, default=32,
-                       help="Elastic budget lower bound (I16-2: must < max_tokens)")
-    parser.add_argument("--elastic-N-max", type=int, default=256,
-                       help="Elastic budget upper bound (I16-2: default=256 for num_scales=5)")
-    parser.add_argument("--elastic-lambda-over", type=float, default=0.1,
-                       help="Penalty weight for exceeding upper bound (default: 0.1)")
-    parser.add_argument("--elastic-lambda-under", type=float, default=0.01,
-                       help="Penalty weight for falling below lower bound (default: 0.01)")
-    parser.add_argument("--elastic-lambda-collapse", type=float, default=1.0,
-                       help="I14-1 D1: Collapse penalty weight (default: 1.0, triggers when actual_tokens < 2)")
-    
+    # I33: elastic-N-* CLI 参数已移除，使用 ELASTIC_COVERAGE_* 常量保证跨尺度一致性
+
     # 训练
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=5e-4)
@@ -2740,20 +2775,16 @@ def main():
         soft_entropy_mode=args.soft_entropy_mode,
         soft_entropy_weight=args.soft_entropy_weight,
         soft_entropy_target=args.soft_entropy_target,
-        # P10-9: 弹性预算损失配置
+        # P10-9: 弹性预算损失配置 (I33: 已改造为相对预算，使用常量)
         include_elastic_budget=args.include_elastic_budget,
-        elastic_N_min=args.elastic_N_min,
-        elastic_N_max=args.elastic_N_max,
-        elastic_lambda_over=args.elastic_lambda_over,
-        elastic_lambda_under=args.elastic_lambda_under,
-        elastic_lambda_collapse=args.elastic_lambda_collapse,  # I14-1 D1
+        # 注: elastic_N_* 参数已移除
         # 训练配置
         epochs=args.epochs,
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
         dropout=args.dropout,
         emb_dropout=args.emb_dropout,
-        drop_path=args.drop_path,
+        drop_path_rate=args.drop_path,
         label_smoothing=args.label_smoothing,
         gradient_clip=args.gradient_clip,
         use_amp=args.use_amp,
@@ -2827,7 +2858,7 @@ def main():
         dim_head=config.dim_head,
         dropout=config.dropout,
         emb_dropout=config.emb_dropout,
-        drop_path_rate=config.drop_path,
+        drop_path_rate=config.drop_path_rate,
         # I30-17: 使用新的动态深度参数 (max_depth 自动从 min_patch_size 计算)
         min_patch_size=config.min_patch_size,
         max_level=config.max_level,
@@ -2938,7 +2969,7 @@ def main():
             # 正则化
             label_smoothing=config.label_smoothing,
             dropout=config.dropout,
-            drop_path=config.drop_path,
+            drop_path_rate=config.drop_path_rate,
             weight_decay=config.weight_decay,
             # 早停
             patience=config.patience,
@@ -3358,7 +3389,7 @@ def main():
         # =====================================================================
         # GumbelTopKSplitter (Scheme D) 默认启用以下深度平衡组件:
         #   - β: Log-Compensation Bias (LOG_COMPENSATION_ENABLED=True) [已移除，被方案E替代]
-        #   - γ: 全局 Softmax (100% 梯度覆盖，替代原 Subset Softmax)
+        #   - γ: 全局 Softmax (~K/N 梯度覆盖，约 37.6%，替代原 Subset Softmax)
         #   - ε: Depth KL Loss (DEPTH_KL_WEIGHT=0.1)
         #
         # 这些是模型架构的内部设计，遵循 constants.py 中的默认值。
