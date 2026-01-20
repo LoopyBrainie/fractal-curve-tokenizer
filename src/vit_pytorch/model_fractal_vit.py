@@ -637,12 +637,18 @@ class FractalCurveViT(nn.Module):
             for i in range(batch_size):
                 l = levels_list[i]
                 if l.numel() > 0:
-                    depths = l[:, 0]
                     # P-OPT-5: unique 操作在 GPU 上执行，结果再转 CPU
-                    unique = depths.unique().to('cpu', non_blocking=True).tolist()
+                    # I78: torch.compile 兼容 - 确保 depths 是 1 维非负整数
+                    depths = l[:, 0].to(dtype=torch.int64, device='cpu')
+                    depths = depths[depths >= 0]  # 移除负值（如果有）
+                    unique = depths.unique().tolist()
 
-                    # M3: 计算深度分布
-                    depth_counts = depths.bincount(minlength=int(depths.max().item()) + 1)
+                    # I78: torch.compile 兼容 - 使用向量化操作替代 bincount
+                    # bincount 在动态 shape 下可能失败，使用 scatter_add 更安全
+                    max_depth = depths.max().item() if depths.numel() > 0 else 0
+                    depth_counts = torch.zeros(max_depth + 1, dtype=torch.float32, device='cpu')
+                    for d in unique:
+                        depth_counts[d] = (depths == d).sum().item()
                     total = depth_counts.sum().item()
                     for d in range(len(depth_counts)):
                         if depth_counts[d] > 0:

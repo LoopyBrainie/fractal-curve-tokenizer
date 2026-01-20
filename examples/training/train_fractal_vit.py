@@ -190,6 +190,9 @@ from torch.optim import AdamW
 # I35: CUDA 优化配置 - 必须在第一次 torch 调用前设置
 # =========================================================================
 
+# 全局标志：防止重复配置
+_CUDA_OPTIMIZATIONS_CONFIGURED = False
+
 def _configure_cuda_optimizations():
     """配置 CUDA 优化以获得最佳性能 (I35)。
 
@@ -199,6 +202,13 @@ def _configure_cuda_optimizations():
     3. cuDNN deterministic: 允许非确定性以提高性能
     4. SDPA 后端: 启用 Flash/Memory-Efficient/cuDNN Attention
     """
+    global _CUDA_OPTIMIZATIONS_CONFIGURED
+
+    # 防止重复配置
+    if _CUDA_OPTIMIZATIONS_CONFIGURED:
+        return
+    _CUDA_OPTIMIZATIONS_CONFIGURED = True
+
     if not torch.cuda.is_available():
         return
 
@@ -3121,11 +3131,9 @@ def main():
         # 启用内存池，减少分配/释放开销
         os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
     
-    # CUDA 优化
-    if device.type == 'cuda':
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    # CUDA 优化 (I35: 已在模块导入时配置，此处仅记录)
+    # 注意: _configure_cuda_optimizations() 在文件顶部已调用
+    # 重复设置无影响，仅跳过以避免重复日志
     
     # Channels Last 内存格式 (卷积加速)
     if config.channels_last and device.type == 'cuda':
