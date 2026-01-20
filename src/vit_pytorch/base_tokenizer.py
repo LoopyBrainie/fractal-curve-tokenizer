@@ -81,8 +81,11 @@ class TokenizerOutput:
 
     I30-11: 新增 _split_probs_cache 用于加权池化 (Weighted Mean Pooling)
 
+    P-OPT-11 Phase 9: 延迟构造 TokenSequence。
+    支持 sequences=None 创建，首次访问时从缓存构造。
+
     Attributes:
-        sequences: 各样本的 TokenSequence 列表
+        sequences: 各样本的 TokenSequence 列表 (可为 None，实现延迟构造)
         _padded_tokens_cache: 预填充的 tokens [B, MaxN, D] (可选缓存)
         _padded_levels_cache: 预填充的 levels [B, MaxN, info_dim] (可选缓存)
         _lengths_cache: 每个样本的实际 token 数量 Tensor[B] (可选缓存)
@@ -96,40 +99,83 @@ class TokenizerOutput:
         split_probs: 堆叠的分割概率 [B, N] 或 None (I30-11)
         batch_size: 批次大小
     """
-    sequences: List[TokenSequence]
+    sequences: Optional[List[TokenSequence]] = None
     _padded_tokens_cache: Optional[torch.Tensor] = field(default=None, repr=False)
     _padded_levels_cache: Optional[torch.Tensor] = field(default=None, repr=False)
     _lengths_cache: Optional[torch.Tensor] = field(default=None, repr=False)
     _regions_cache: Optional[torch.Tensor] = field(default=None, repr=False)
     _image_size_cache: Optional[int] = field(default=None, repr=False)
     _split_probs_cache: Optional[torch.Tensor] = field(default=None, repr=False)
+    _lazy_sequences_built: bool = field(default=False, repr=False)
+
+    def _build_sequences_from_cache(self) -> None:
+        """从缓存张量构造 TokenSequence 列表 (P-OPT-11 Phase 9).
+
+        当 sequences=None 但有 _padded_tokens_cache 时，
+        延迟构造 TokenSequence 列表供迭代使用。
+        """
+        if self.sequences is not None or self._padded_tokens_cache is None:
+            return  # 已有序列或无缓存
+
+        B = self._padded_tokens_cache.shape[0]
+        self.sequences = []
+
+        for b in range(B):
+            # 从 padded tensor 提取该样本的 tokens
+            token_count = int(self._lengths_cache[b]) if self._lengths_cache is not None else self._padded_tokens_cache.shape[1]
+            tokens_b = self._padded_tokens_cache[b, :token_count]
+
+            # 构建 metadata
+            metadata: Dict[str, Any] = {}
+            if self._padded_levels_cache is not None:
+                levels_b = self._padded_levels_cache[b, :token_count]
+                metadata["levels"] = levels_b
+
+            seq = TokenSequence(tokens=tokens_b, metadata=metadata)
+            self.sequences.append(seq)
+
+        self._lazy_sequences_built = True
 
     def __iter__(self) -> Iterator[TokenSequence]:
-        return iter(self.sequences)
+        # P-OPT-11: 延迟构造 sequences
+        if self.sequences is None and self._padded_tokens_cache is not None:
+            self._build_sequences_from_cache()
+        return iter(self.sequences) if self.sequences else iter([])
 
     def __len__(self) -> int:
-        return len(self.sequences)
-    
+        # P-OPT-11: 支持延迟构造时的长度获取
+        if self.sequences is not None:
+            return len(self.sequences)
+        elif self._padded_tokens_cache is not None:
+            return self._padded_tokens_cache.shape[0]
+        return 0
+
     @property
     def batch_size(self) -> int:
         """获取批次大小。"""
-        return len(self.sequences)
+        return len(self)
     
     @property
     def tokens(self) -> torch.Tensor:
         """获取堆叠的 tokens [B, N, D]。
-        
+
         假设所有样本的 token 数量相同（padding 后）。
-        
+
+        P-OPT-11: 优先使用 _padded_tokens_cache，避免从 sequences 堆叠。
+
         Returns:
             堆叠的 tokens 张量，形状为 [B, N, D]
-            
+
         Raises:
             ValueError: 当序列为空时
         """
-        if len(self.sequences) == 0:
+        # P-OPT-11: 优先使用缓存
+        if self._padded_tokens_cache is not None:
+            return self._padded_tokens_cache
+
+        if len(self) == 0:
             raise ValueError("Cannot get tokens from empty TokenizerOutput")
-        return torch.stack([seq.tokens for seq in self.sequences])
+        return torch.stack([seq.tokens for seq in self])
     
     @property
     def levels_info(self) -> Optional[torch.Tensor]:
@@ -141,24 +187,31 @@ class TokenizerOutput:
         I32-2: 如果有 _padded_levels_cache 缓存，直接返回缓存
                缓存中 padding 位置使用 -1 sentinel 标识
 
+        P-OPT-11: 支持 sequences=None 时的 lazy 构建。
+
         Returns:
             堆叠的 levels_info 张量或 None
         """
-        if len(self.sequences) == 0:
+        if len(self) == 0:
             return None
 
         # I32-2: 优先使用缓存
         if self._padded_levels_cache is not None:
             return self._padded_levels_cache
 
-        levels_list = [seq.get_levels() for seq in self.sequences]
+        # P-OPT-11: 使用迭代器 (会自动触发 lazy 构建)
+        levels_list = [seq.get_levels() for seq in self]
 
         # 如果所有 levels 都是 None，返回 None
         if all(l is None for l in levels_list):
             return None
 
         # 找到最大维度
-        device = self.sequences[0].device
+        # P-OPT-11: 使用 _padded_tokens_cache 获取 device，避免依赖 sequences
+        if self._padded_tokens_cache is not None:
+            device = self._padded_tokens_cache.device
+        else:
+            device = next(iter(self)).device
         max_len = max(l.shape[0] if l is not None else 0 for l in levels_list)
 
         if max_len == 0:
@@ -167,10 +220,10 @@ class TokenizerOutput:
         # 确定 info_dim（处理 1D 和 2D 情况）
         info_dims = [l.shape[1] if l is not None and l.dim() > 1 else 1 for l in levels_list]
         info_dim = max(info_dims)
-        
+
         # 创建填充后的张量
         stacked = torch.zeros(
-            len(self.sequences), max_len, info_dim,
+            len(self), max_len, info_dim,
             dtype=torch.long, device=device
         )
         
@@ -184,7 +237,8 @@ class TokenizerOutput:
         return stacked
 
     def tokens_list(self) -> List[torch.Tensor]:
-        return [seq.tokens for seq in self.sequences]
+        # P-OPT-11: 使用迭代器 (会自动触发 lazy 构建)
+        return [seq.tokens for seq in self]
 
     def get_padded_tokens(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """获取预填充的 tokens 和长度张量 (P9-5/P12-2 优化).
@@ -245,8 +299,12 @@ class TokenizerOutput:
         # 回退: 使用 levels_info 属性 (包含 Python 循环)
         levels = self.levels_info
         if levels is None:
-            B = len(self.sequences)
-            device = self.sequences[0].device if B > 0 else torch.device('cpu')
+            B = len(self)
+            # P-OPT-11: 使用 _padded_tokens_cache 获取 device
+            if self._padded_tokens_cache is not None:
+                device = self._padded_tokens_cache.device
+            else:
+                device = next(iter(self)).device if B > 0 else torch.device('cpu')
             return torch.zeros(B, 1, info_dim, dtype=torch.long, device=device)
         
         if levels.shape[2] >= info_dim:
@@ -259,8 +317,9 @@ class TokenizerOutput:
             return padded
 
     def levels_list(self) -> List[torch.Tensor]:
+        # P-OPT-11: 使用迭代器 (会自动触发 lazy 构建)
         result: List[torch.Tensor] = []
-        for seq in self.sequences:
+        for seq in self:
             levels = seq.get_levels()
             if levels is None:
                 result.append(torch.empty(0, dtype=torch.long, device=seq.device))

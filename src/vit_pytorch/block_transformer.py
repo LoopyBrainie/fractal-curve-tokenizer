@@ -134,7 +134,7 @@ class FractalTransformerBlock(nn.Module):
         ffn_type: FFNType = 'swiglu_level',
         lca_temperature: Optional[float] = 1.5,
         learnable_temperature: bool = True,
-        use_affine_modulation: bool = False,
+        use_affine_modulation: bool = True,  # A17: 启用 ShapeScaleEncoder
         fourier_levels: int = 4,
     ):
         super().__init__()
@@ -361,7 +361,7 @@ class FractalTransformer(nn.Module):
         use_checkpoint: bool = False,
         lca_temperature: Optional[float] = 1.5,
         learnable_temperature: bool = True,
-        use_affine_modulation: bool = False,
+        use_affine_modulation: bool = True,  # A17: 启用 ShapeScaleEncoder
         fourier_levels: int = 4,
     ):
         super().__init__()

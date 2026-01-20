@@ -295,8 +295,8 @@ class AreaEnhancedPositionEmbedding(nn.Module):
         # 1. 基础位置编码
         pos_emb = self.base_embedding(levels_info)
 
-        # 2. 面积编码 (辅助注入)
-        if regions is not None and image_size is not None and self.area_scale.item() != 0.0:
+        # 2. 面积编码 (直接计算，无需零检查，数学等价)
+        if regions is not None and image_size is not None:
             # 处理 image_size 格式：支持 int 或 (W, H) 元组
             if isinstance(image_size, int):
                 image_size_tuple = (image_size, image_size)

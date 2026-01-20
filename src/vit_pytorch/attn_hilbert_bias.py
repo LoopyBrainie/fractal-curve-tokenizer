@@ -264,7 +264,8 @@ class LCAHilbertBias(HilbertBiasBase):
         if lca_temperature is None:
             # 兼容模式: 无温度缩放
             self._lca_temp_raw: Optional[nn.Parameter] = None
-            self._lca_temp_fixed: Optional[float] = None
+            # I34-16: 使用 buffer 自动跟踪设备
+            self.register_buffer('_lca_temp_fixed', None)
         elif learnable:
             # 可学习模式: per-head 温度
             # I24-ALIGN: 数值稳定的 softplus 逆变换
@@ -281,11 +282,14 @@ class LCAHilbertBias(HilbertBiasBase):
             self._lca_temp_raw = nn.Parameter(
                 torch.full((self.heads,), init_raw)
             )
-            self._lca_temp_fixed = None
+            # I34-16: 使用 buffer 自动跟踪设备
+            self.register_buffer('_lca_temp_fixed', None)
         else:
             # 固定模式
+            # I34-16: 使用 buffer 自动跟踪设备，避免 CPU→GPU 传输
             self._lca_temp_raw = None
-            self._lca_temp_fixed = lca_temperature
+            self.register_buffer('_lca_temp_fixed',
+                torch.full((self.heads,), lca_temperature))
     
     @property
     def lca_temperature(self) -> Optional[torch.Tensor]:
@@ -298,8 +302,8 @@ class LCAHilbertBias(HilbertBiasBase):
             # 可学习: softplus 确保正值
             return F.softplus(self._lca_temp_raw)
         elif self._lca_temp_fixed is not None:
-            # 固定值
-            return torch.tensor(self._lca_temp_fixed)
+            # I34-16: buffer 自动跟踪设备，直接返回
+            return self._lca_temp_fixed
         else:
             # 禁用
             return None
@@ -406,6 +410,12 @@ class LCAHilbertBias(HilbertBiasBase):
         if not cache_hit:
             # 缓存未命中，计算 LCA
             lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
+            # I34-13: LCA 钳位警告 - 静默钳位可能隐藏计算 bug
+            if (lca_depths < 0).any() or (lca_depths > self.max_depth).any():
+                warnings.warn(
+                    f"LCA depth clamped to [0, {self.max_depth}]. "
+                    f"Min: {lca_depths.min().item():.2f}, Max: {lca_depths.max().item():.2f}"
+                )
             lca_depths = lca_depths.clamp(0, self.max_depth)
 
             # 更新缓存: 使用当前 PyTorch 版本号
@@ -491,6 +501,12 @@ class LCAHilbertBias(HilbertBiasBase):
         
         # 计算 LCA 深度矩阵
         lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
+        # I34-13: LCA 钳位警告 - 静默钳位可能隐藏计算 bug
+        if (lca_depths < 0).any() or (lca_depths > self.max_depth).any():
+            warnings.warn(
+                f"LCA depth clamped to [0, {self.max_depth}]. "
+                f"Min: {lca_depths.min().item():.2f}, Max: {lca_depths.max().item():.2f}"
+            )
         lca_depths = lca_depths.clamp(0, self.max_depth)  # [B, N, N]
         
         # 批量嵌入: (B, N, N, H)
@@ -623,8 +639,10 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         else:
             self._level_scale_raw = None
 
-        # P11-7 修复: 初始化使 softplus(0.54) ≈ 1.0，与 level_scale 保持一致
-        self._scale_weights_raw = nn.Parameter(torch.full((heads,), 0.54))
+        # A19: 移除可学习 scale_weights，保留标准 1/√d_k
+        # 理由: LayerNorm 已将 Q,K 方差控制在 1，1/√d_k 已足够
+        # 双重缩放导致 Var(dots) ≈ 0.69 而非理论最优的 1.0
+        self._scale_weights_raw = None
         self.relative_pos_embedding = nn.Embedding(2 * max_level + 1, heads)
 
         self.attend = nn.Softmax(dim=-1)
@@ -733,24 +751,19 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.heads), qkv)
 
         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        # STAB-3: 使用 softplus 约束 scale_weights 在 (0, +∞)，防止负数或过大
-        # softplus(0) ≈ 0.69，接近 1.0，且训练中可学习调整
-        scale_weights = F.softplus(self._scale_weights_raw)
-        dots = dots * scale_weights.view(1, -1, 1, 1)
+        # A19: 移除可学习 scale_weights，仅使用标准 1/√d_k
+        # Var(dots) = 1.0 (理论最优)，softmax 输入在 O(1) 量级
 
         if self.use_level_scaling and levels_info is not None and levels_info.numel() > 0:
             # Type guard: guaranteed non-None when use_level_scaling is True
             assert self._level_scale_raw is not None
             
             depths = extract_depths(levels_info, self.max_level)
-            if levels_info.dim() == 2:
-                # P11-4: Softplus 约束确保 level_scales ∈ (0, +∞)
-                level_scales = F.softplus(self._level_scale_raw(depths))
-                level_scales = level_scales.transpose(0, 1).unsqueeze(0).unsqueeze(-1)
-            else:
-                level_scales = F.softplus(self._level_scale_raw(depths))  # (B, S, H)
-                level_scales = level_scales.permute(0, 2, 1).unsqueeze(-1)  # (B, H, S, 1)
-            
+            # I34-15: 移除 2D 分支死代码，levels_info 始终为 3D
+            # P11-4: Softplus 约束确保 level_scales ∈ (0, +∞)
+            level_scales = F.softplus(self._level_scale_raw(depths))  # (B, S, H)
+            level_scales = level_scales.permute(0, 2, 1).unsqueeze(-1)  # (B, H, S, 1)
+
             dots = dots * level_scales
 
         if levels_info is not None:
@@ -768,8 +781,11 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                         # Reshape to: [B, heads, head_dim, N, N]
                         # Mean over head_dim to get: [B, heads, N, N]
                         N = affine_bias.shape[-1]
+                        # I35 Fix: Dynamically compute head_dim from affine_bias shape
+                        # This handles cases where dim_head was initialized with default=64
+                        actual_head_dim = affine_bias.shape[1] // self.heads
                         affine_bias_avg = affine_bias.reshape(
-                            batch, self.heads, self.dim_head, N, N
+                            batch, self.heads, actual_head_dim, N, N
                         ).mean(dim=2)
                         dots = dots + affine_bias_avg * HILBERT_BIAS_SCALE
             else:
@@ -798,11 +814,11 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             dots.masked_fill_(~attention_mask.bool(), mask_value)
 
         attn = self.attend(dots)
-        
+
         # I24-11: 条件存储注意力权重 (评估时启用)
         if self.store_attn_weights:
             self._last_attn_weights = attn.detach()
-        
+
         attn = self.dropout(attn)
 
         out = torch.matmul(attn, v)
@@ -1359,7 +1375,7 @@ class AreaEncoder(nn.Module):
         area_scores: torch.Tensor,
         L_norm: torch.Tensor,
     ) -> torch.Tensor:
-        """计算动态频率傅里叶特征 (I32-7 核心改进)。
+        """计算动态频率傅里叶特征 (I32-7 核心改进, P-OPT-5 向量化)。
 
         数学形式化
         ==========
@@ -1386,6 +1402,11 @@ class AreaEncoder(nn.Module):
             .. math::
                 \\gamma_k(f) = g_k \\cdot [\\sin(f_k \\cdot f), \\cos(f_k \\cdot f)]
 
+        P-OPT-5 向量化改进:
+            - 消除 Python for 循环，使用张量广播一次性计算所有频率
+            - 复杂度: O(L) → O(1) 次 kernel 调用
+            - 内存: 相同 (B, N, 2L)
+
         参数
         ----
         area_scores : torch.Tensor
@@ -1401,44 +1422,54 @@ class AreaEncoder(nn.Module):
         B, N = area_scores.shape
 
         # Nyquist 频率: ω_Nyquist = π / L_norm
-        omega_nyquist = math.pi / (L_norm + 1e-8)  # [B, N]
+        # [B, N] -> [B, N, 1] 用于广播
+        omega_nyquist = (math.pi / (L_norm + 1e-8)).unsqueeze(-1)  # [B, N, 1]
 
         # 截止频率: 80% Nyquist
-        omega_cutoff = omega_nyquist * 0.8  # [B, N]
+        # [B, N] -> [B, N, 1]
+        omega_cutoff = omega_nyquist * 0.8  # [B, N, 1]
 
-        # 预计算频率序列
-        base_freqs = [math.pi * (self.freq_base ** k) for k in range(self.fourier_levels)]
+        # P-OPT-5: 预计算所有频率序列 (向量化关键)
+        # [L] -> [1, 1, L]
+        base_freqs = torch.tensor(
+            [math.pi * (self.freq_base ** k) for k in range(self.fourier_levels)],
+            device=area_scores.device,
+            dtype=area_scores.dtype,
+        ).view(1, 1, self.fourier_levels)  # [1, 1, L]
 
-        # 计算每个频率的门控和特征
-        all_features = []
-        for freq_k in base_freqs:
-            # Cosine 软截断门控
-            # gate = 1 if freq_k <= omega_cutoff
-            # gate = 0.5 * (1 + cos(...)) if omega_cutoff < freq_k < omega_nyquist
-            # gate = 0 if freq_k >= omega_nyquist
+        # P-OPT-5: 一次性计算所有频率的门控 (向量化)
+        # freq_k: [1, 1, L], omega_cutoff: [B, N, 1], omega_nyquist: [B, N, 1]
+        # gate: [B, N, L]
 
-            # 门控计算
-            gate = torch.where(
-                freq_k <= omega_cutoff,
-                torch.ones_like(omega_nyquist),
-                torch.where(
-                    freq_k < omega_nyquist,
-                    0.5 * (1 + torch.cos(
-                        math.pi * (freq_k - omega_cutoff) / (omega_nyquist - omega_cutoff + 1e-8)
-                    )),
-                    torch.zeros_like(omega_nyquist)
-                )
+        # 门控计算: 向量化 where 操作
+        # gate = 1 if freq_k <= omega_cutoff (广播)
+        # gate = 0.5 * (1 + cos(...)) if omega_cutoff < freq_k < omega_nyquist
+        # gate = 0 if freq_k >= omega_nyquist
+        gate_full = torch.where(
+            base_freqs <= omega_cutoff,
+            torch.ones(1, device=area_scores.device, dtype=area_scores.dtype),
+            torch.where(
+                base_freqs < omega_nyquist,
+                0.5 * (1 + torch.cos(
+                    math.pi * (base_freqs - omega_cutoff) /
+                    (omega_nyquist - omega_cutoff + 1e-8)
+                )),
+                torch.zeros(1, device=area_scores.device, dtype=area_scores.dtype)
             )
+        )  # [B, N, L]
 
-            # 计算带门控的傅里叶特征
-            sin_feat = torch.sin(freq_k * area_scores) * gate
-            cos_feat = torch.cos(freq_k * area_scores) * gate
+        # P-OPT-5: 一次性计算所有频率的傅里叶特征 (向量化)
+        # area_scores: [B, N, 1] -> [B, N, L]
+        area_expanded = area_scores.unsqueeze(-1)  # [B, N, 1]
+        freq_times_area = base_freqs * area_expanded  # [B, N, L]
 
-            all_features.append(sin_feat)
-            all_features.append(cos_feat)
+        # sin 和 cos 一次性计算
+        sin_all = torch.sin(freq_times_area) * gate_full  # [B, N, L]
+        cos_all = torch.cos(freq_times_area) * gate_full  # [B, N, L]
 
-        # 堆叠特征: [B, N, 2L]
-        gamma = torch.stack(all_features, dim=-1)
+        # P-OPT-5: 交错 sin/cos 并展平 (消除 Python list append)
+        # [B, N, L] + [B, N, L] -> [B, N, 2L]
+        gamma = torch.stack([sin_all, cos_all], dim=-1).view(B, N, 2 * self.fourier_levels)
 
         return gamma
 
@@ -1487,6 +1518,10 @@ class AreaEncoder(nn.Module):
 
         # 5. 应用可学习权重
         area_emb = area_emb * self.area_weight
+
+        # I34-11: L2 归一化
+        # 防止点积值域过大导致 sin 产生高频噪声
+        area_emb = F.normalize(area_emb, p=2, dim=-1)
 
         return area_emb
 

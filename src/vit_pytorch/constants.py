@@ -120,8 +120,9 @@ PROB_EPSILON: float = 1e-8
 
 #: 温度参数下界 (Gumbel-Softmax/Top-K)
 #: 数学分析: T < 0.1 时 softmax 梯度趋近于 0
-#: 验证见: workspace/ste_gradient_analysis.py
-TEMPERATURE_MIN: float = 0.1
+#: I35 改进: 从 0.1 提升到 0.3，保持更健康的梯度流
+#: 验证: T=0.3 时 softmax 梯度仍有效 (∂p/∂z ≈ 1/τ)
+TEMPERATURE_MIN: float = 0.3
 
 # ==================== 深度平衡常量 (I24-2 方案E) ====================
 # 数学分析: 解决深度分布崩溃问题
@@ -139,29 +140,10 @@ DEPTH_VARIANCE_NORM_ENABLED: bool = True  # I30-6: EMA 方案启用
 #: 方差归一化的稳定性 epsilon
 DEPTH_VARIANCE_NORM_EPS: float = 1e-6
 
-#: Depth KL 正则化损失权重 (A16: 优化方案)
-#: 数学: L_depth = λ × D_KL(π_depth || Uniform)
-#: 目标: ~~鼓励选中 token 的深度分布趋向均匀~~ (已移除)
-#: A16 批判分析: Scheme E 配额机制已足够防止深度崩溃，KL正则化冗余
-#: 移除理由: 配额熵(0.1) + 最小配额(2) 已完备，KL(0.5)造成机制冲突
-DEPTH_KL_WEIGHT: float = 0.0  # A16: 移除KL正则化
-
-#: 软配额正则化是否启用 (A16: 优化方案)
-#: ~~I23-1 方案D: 软配额正则化~~ (已移除)
-#: A16 批判分析: 软配额目标(0.15,0.20,0.25,0.40)与KL目标(均匀分布)冲突
-#: 保留配额熵正则化足以防止配额崩溃
-DEPTH_QUOTA_ENABLED: bool = False  # A16: 移除软配额机制
-
-#: 软配额目标分布 (保留定义，DEPTH_QUOTA_ENABLED=False时忽略)
-#: ~~说明: depth 3 略高是因为高频纹理信息对分类有额外贡献~~
-DEPTH_QUOTA_TARGET: tuple = (0.15, 0.20, 0.25, 0.40)
-
-#: 软配额容忍带 ε (±5%)
-DEPTH_QUOTA_TOLERANCE: float = 0.05
-
-#: 软配额损失权重 (A16: 优化方案)
-#: ~~数学: L_quota = Σ_d ReLU(|π_d - π_d^target| - ε)^2~~
-DEPTH_QUOTA_WEIGHT: float = 0.0  # A16: 移除软配额权重
+#: EMA 归一化的平滑系数 (I35: 新增)
+#: 数学: α = 0.1, 有效样本量 ≈ 10, 方差降低 19× vs per-batch
+#: 效果: 稳定小 batch (B=1) 下的方差估计，避免 sqrt(0) NaN
+DEPTH_EMA_ALPHA: float = 0.1
 
 # ==================== 方案 E: 可学习配额常量 (I24-2) ====================
 # 数学分析: 解决 Log-Compensation 对 Top-K 理论无效的问题

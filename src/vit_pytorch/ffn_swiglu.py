@@ -8,6 +8,21 @@ SwiGLU FFN (LLaMA/PaLM 风格):
     SwiGLU(x) = W_out · (Swish(W_gate · x) ⊙ (W_value · x))
     其中 Swish(x) = x · σ(x), σ 是 sigmoid
 
+### SiLU 与 Swish 等价性
+**SiLU (Sigmoid Linear Unit)** 和 **Swish** 是同一激活函数的两个名称：
+
+$$\text{SiLU}(x) = \text{Swish}(x) = x \cdot \sigma(x) = \frac{x}{1 + e^{-x}}$$
+
+其中 $\sigma(x) = \frac{1}{1 + e^{-x}}$ 是 sigmoid 函数。
+
+**PyTorch 实现**:
+- `F.silu(x)` - PyTorch 内置 SiLU 激活函数
+- `nn.SiLU()` - SiLU 模块
+
+**使用场景**:
+- SwiGLU 中的 gate 分支: `F.silu(self.w_gate(x))` (第112行)
+- Adapter 中的非线性: `nn.SiLU()` (第193行)
+
 层级自适应 (Level Adaptation):
     Output = (1 - α_d) · FFN(x) + α_d · Adapter([x; E_level(d)])
     其中:
@@ -30,7 +45,7 @@ AdaptiveFractalFeedForward (with level adaptation):
     时间: O(B · N · D · D_ff) + O(B · N · D)  — FFN + Level Adapter
     空间: O(B · N · D_ff) + O(L_max · D)      — 中间张量 + level embedding
 
-其中: B=batch, N=seq_len, D=dim, D_ff=hidden_dim (SwiGLU: 2/3 × hidden_dim)
+其中: B=batch, N=seq_len, D=dim, D_ff (SwiGLU: 4 × dim, LLaMA 风格)
 
 类对照表
 ----------
@@ -166,11 +181,9 @@ class AdaptiveFractalFeedForward(nn.Module):
         
         # ========== FFN 主网络 ==========
         if ffn_type in ('swiglu', 'swiglu_level'):
-            # SwiGLU: 调整 hidden_dim 以保持参数量相当
-            # 原始 GELU: dim -> hidden_dim -> dim (2 * dim * hidden_dim 参数)
-            # SwiGLU: dim -> swiglu_hidden * 3 线性层 (3 * dim * swiglu_hidden 参数)
-            # 为匹配参数量: swiglu_hidden = hidden_dim * 2 / 3
-            swiglu_hidden = (hidden_dim * 2) // 3
+            # I34-19: LLaMA 风格 SwiGLU - Dff = 4 * dim
+            # 移除与 GELU 的参数匹配约束，简化设计
+            swiglu_hidden = dim * 4
             self.swiglu = SwiGLUFFN(dim, swiglu_hidden, dropout, bias=bias)
             self.main_net = None
         else:
@@ -188,8 +201,8 @@ class AdaptiveFractalFeedForward(nn.Module):
         if self.use_level_adaptation:
             self.level_embedding: Optional[nn.Embedding] = nn.Embedding(max_level + 1, dim)
             
-            # 根据 FFN 类型选择 adapter 的 hidden_dim
-            adapter_hidden = (hidden_dim * 2) // 3 // 2 if ffn_type == 'swiglu_level' else hidden_dim // 2
+            # I34-19: LLaMA 风格 adapter - D_adapter = dim / 2
+            adapter_hidden = dim // 2 if ffn_type == 'swiglu_level' else hidden_dim // 2
             self.shared_level_adapter: Optional[nn.Sequential] = nn.Sequential(
                 nn.Linear(dim * 2, adapter_hidden),
                 nn.SiLU() if ffn_type == 'swiglu_level' else nn.ReLU(),

@@ -1663,7 +1663,8 @@ class LearnableSplitter(nn.Module):
         C3 (可微分): Gumbel-Softmax + STE
     
     复杂度分析:
-        时间: O(B × max_tokens × D_{max} × k²) for ROI-Align
+        时间: O(B × max_tokens × C × k²) for ROI-Align
+        其中 C = feature_dim = dim (特征通道数)
         空间: O(B × C × H × W) for feature maps
     """
     

@@ -69,23 +69,19 @@ from torch import Tensor
 
 # I12-7: 从 constants 统一导入数值稳定性常量
 # I24-2: 导入方案E可学习配额常量
-# I23-1: 导入深度方差归一化和软配额常量
+# I23-1: 导入深度方差归一化常量
 # I30-4: 已移除 LOG_COMPENSATION_ENABLED (被方案E替代)
 # I30-2: 已移除 SUBSET_SOFTMAX_ENABLED (改用全局 Softmax)
 # I30-10: 导入 SplitterConfig
+# I35: 移除死代码 DEPTH_KL_*, DEPTH_QUOTA_* 常量
 from .constants import (
     TEMPERATURE_MIN,
     GUMBEL_EPSILON,
     PROB_EPSILON,
-    DEPTH_KL_WEIGHT,
     # I23-1 方案C: 深度方差归一化
     DEPTH_VARIANCE_NORM_ENABLED,
     DEPTH_VARIANCE_NORM_EPS,
-    # I23-1 方案D: 软配额正则化
-    DEPTH_QUOTA_ENABLED,
-    DEPTH_QUOTA_TARGET,
-    DEPTH_QUOTA_TOLERANCE,
-    DEPTH_QUOTA_WEIGHT,
+    DEPTH_EMA_ALPHA,  # I35: EMA 系数
     # I24-2 方案E: 可学习配额
     LEARNABLE_QUOTA_ENABLED,
     QUOTA_MIN_PER_DEPTH,
@@ -296,8 +292,18 @@ class GumbelTopKSplitter(nn.Module):
         )
 
         # I30-17-EXT: 深度嵌入使用上界维度
-        self.depth_embedding = nn.Embedding(max_depth_limit + 1, 16)
-        self.depth_proj = nn.Linear(16, 1)
+        # I20: 深度嵌入维度基于信息论下界自适应选择
+        # 数学: E = max(4, min(8, ceil(log2(D)))) 确保 E >= log2(D)
+        # 理由: depth_bias 是标量输出，16维过度冗余
+        def _compute_depth_embed_dim(max_depth_limit: int) -> int:
+            """计算深度嵌入维度，基于信息论下界"""
+            D = max_depth_limit + 1
+            min_required = math.ceil(math.log2(D)) if D > 1 else 1
+            return min(8, max(4, min_required))
+
+        depth_embed_dim = _compute_depth_embed_dim(max_depth_limit)
+        self.depth_embedding = nn.Embedding(max_depth_limit + 1, depth_embed_dim)
+        self.depth_proj = nn.Linear(depth_embed_dim, 1)
 
         # I30-17-EXT: 可学习阈值使用上界维度
         self.threshold_offsets = nn.Parameter(torch.zeros(max_depth_limit + 1))
@@ -368,11 +374,17 @@ class GumbelTopKSplitter(nn.Module):
         self._bias_enabled = False
 
         # I30-6: 深度方差归一化
-        # 使用 Per-batch 统计量替代全局 EMA:
-        # - 无额外内存开销 O(D)
-        # - 自然适应分布偏移
-        # - 梯度自然流动
+        # I35 改进: 使用 EMA Running Statistics:
+        # - 稳定小 batch (B=1) 下的方差估计
+        # - 避免 sqrt(0) 在反向传播产生 NaN
+        # - α=0.1, 有效样本量 ≈ 10
         self._depth_var_normalized: Optional[Tensor] = None  # [D]
+
+        # I35: EMA Running Statistics buffers (max_depth_limit + 1 维度)
+        D = max_depth_limit + 1
+        self.register_buffer('_depth_ema_mean', torch.zeros(D))
+        self.register_buffer('_depth_ema_var', torch.ones(D))
+        self._depth_ema_initialized = False  # 标记是否已初始化
 
         # 初始化权重
         self._init_weights()
@@ -443,7 +455,30 @@ class GumbelTopKSplitter(nn.Module):
 
     def _generate_candidates_internal(self, image_size: Tuple[int, int], max_depth: int):
         """
-        生成候选区域的内部方法。
+        生成候选区域的内部方法 (P-OPT-7 向量化版本)。
+
+        数学形式化
+        ==========
+
+        问题: 原始实现使用 3 层嵌套 for 循环，O(Σ 4^d) Python 迭代
+        优化: 使用 torch.meshgrid + 张量广播，O(D) 次张量操作
+
+        向量化公式:
+            对每个深度 d:
+            - grid_size = 2^d
+            - region_h = H / grid_size, region_w = W / grid_size
+            - 使用 meshgrid 生成 [grid_size, grid_size] 坐标网格
+            - 批量计算: y0 = i * region_h, x0 = j * region_w
+
+        父节点索引计算:
+            parent_idx[depth, i, j] = global_idx_at(depth-1, i//2, j//2)
+
+        Hilbert 索引计算:
+            center_x = (x0 + x1) // 2
+            center_y = (y0 + y1) // 2
+            hilbert_d = HilbertCurve.xy_to_d(grid_size, center_x, center_y)
+
+        注意: 初始化时使用 CPU 张量，设备由后续的 .to(device) 处理
 
         Args:
             image_size: (H, W) 图像尺寸
@@ -453,63 +488,105 @@ class GumbelTopKSplitter(nn.Module):
 
         H_img, W_img = image_size
 
-        regions_list = []
-        depths_list = []
-        parent_idx_list = []
-        hilbert_idx_list = []
+        # P-OPT-7: 初始化时使用 CPU，张量在模型移动到 GPU 时自动跟进
+        # 获取设备（如果已存在 buffer），否则使用 CPU
+        try:
+            device = self.candidate_regions.device if hasattr(self, 'candidate_regions') else torch.device('cpu')
+        except AttributeError:
+            device = torch.device('cpu')
 
-        # 节点索引映射
-        node_to_idx = {}
-        global_idx = 0
+        all_regions = []      # [N, 4] 各深度的区域坐标
+        all_depths = []       # [N] 各区域的深度
+        all_parent_idx = []   # [N] 父节点索引
+        all_hilbert_idx = []  # [N] Hilbert 索引
+
+        # 记录每个深度的起始索引，用于父节点计算
+        # depth_start_idx[d] = depth d 的起始全局索引
+        depth_start_idx = [0]  # depth=0 的起始索引
 
         for depth in range(max_depth + 1):
             grid_size = 2 ** depth
             region_h = H_img / grid_size
             region_w = W_img / grid_size
 
-            for i in range(grid_size):
-                for j in range(grid_size):
-                    # 区域坐标
-                    y0 = int(i * region_h)
-                    x0 = int(j * region_w)
-                    y1 = int((i + 1) * region_h)
-                    x1 = int((j + 1) * region_w)
+            # P-OPT-7: 向量化坐标生成
+            # 使用 torch.arange 生成索引
+            i_idx = torch.arange(grid_size, device=device)
+            j_idx = torch.arange(grid_size, device=device)
 
-                    regions_list.append([x0, y0, x1, y1])
-                    depths_list.append(depth)
+            # meshgrid 生成网格 [grid_size, grid_size]
+            grid_i, grid_j = torch.meshgrid(i_idx, j_idx, indexing='ij')
 
-                    # 父节点
-                    if depth == 0:
-                        parent_idx = -1
-                    else:
-                        parent_key = (depth - 1, i // 2, j // 2)
-                        parent_idx = node_to_idx[parent_key]
+            # 批量计算区域坐标 [grid_size, grid_size]
+            y0 = (grid_i * region_h).long()
+            x0 = (grid_j * region_w).long()
+            y1 = ((grid_i + 1) * region_h).long()
+            x1 = ((grid_j + 1) * region_w).long()
 
-                    parent_idx_list.append(parent_idx)
+            # 堆叠为 [N, 4] 张量
+            regions_depth = torch.stack([x0, y0, x1, y1], dim=-1).view(-1, 4)
+            all_regions.append(regions_depth)
 
-                    # Hilbert 索引
-                    center_x = (x0 + x1) // 2
-                    center_y = (y0 + y1) // 2
-                    grid_x = min(int((center_x / W_img) * grid_size), grid_size - 1)
-                    grid_y = min(int((center_y / H_img) * grid_size), grid_size - 1)
-                    hilbert_d = HilbertCurve.xy_to_d(grid_size, grid_x, grid_y) if grid_size > 0 else 0
-                    hilbert_idx_list.append(hilbert_d)
+            # 深度标签
+            N_depth = grid_size * grid_size
+            all_depths.extend([depth] * N_depth)
 
-                    node_to_idx[(depth, i, j)] = global_idx
-                    global_idx += 1
+            # P-OPT-7: 批量计算 Hilbert 索引
+            # 计算每个区域的中心坐标
+            center_x = (x0 + x1) // 2
+            center_y = (y0 + y1) // 2
+
+            # 归一化到 grid_size 坐标系
+            grid_x = ((center_x.float() / W_img) * grid_size).clamp(max=grid_size - 1).long()
+            grid_y = ((center_y.float() / H_img) * grid_size).clamp(max=grid_size - 1).long()
+
+            # P-OPT-7/P-OPT-8: 使用 xy_to_d_batch 批量计算 Hilbert 索引
+            # 向量化实现: O(N) 张量操作替代 Python 循环
+            if grid_size > 0:
+                # 展平坐标为张量 [N]
+                grid_x_flat = grid_x.view(-1)
+                grid_y_flat = grid_y.view(-1)
+
+                # 批量计算 Hilbert 距离（使用 xy_to_d_batch 向量化）
+                hilbert_d = HilbertCurve.xy_to_d_batch(grid_size, grid_x_flat, grid_y_flat)
+            else:
+                hilbert_d = torch.zeros(N_depth, device=device, dtype=torch.long)
+            all_hilbert_idx.append(hilbert_d)
+
+            # P-OPT-7: 批量计算父节点索引
+            if depth == 0:
+                parent_idx_depth = torch.full((N_depth,), -1, device=device, dtype=torch.long)
+            else:
+                # 计算父节点的 grid 坐标 (i//2, j//2)
+                parent_i = (grid_i // 2).view(-1)
+                parent_j = (grid_j // 2).view(-1)
+
+                # 父深度的大小
+                parent_grid_size = 2 ** (depth - 1)
+                # 父节点在全局索引中的位置 = 父深度起始索引 + 局部索引
+                # depth_start_idx[depth - 1] 是父深度 (depth-1) 的起始索引
+                parent_global_idx = depth_start_idx[depth - 1] + (parent_i * parent_grid_size + parent_j)
+                parent_idx_depth = parent_global_idx.long()
+
+            all_parent_idx.append(parent_idx_depth)
+
+            # 记录下一个深度的起始索引
+            depth_start_idx.append(depth_start_idx[-1] + N_depth)
+
+        # 合并所有深度的数据
+        candidate_regions = torch.cat(all_regions, dim=0).float()
+        candidate_depths = torch.tensor(all_depths, device=device, dtype=torch.long)
+        parent_indices = torch.cat(all_parent_idx, dim=0)
+        hilbert_indices = torch.cat(all_hilbert_idx, dim=0)
 
         # 计算候选数量
         self.num_candidates = sum(4 ** d for d in range(max_depth + 1))
 
-        # 注册为 buffer
-        self.register_buffer('candidate_regions',
-                             torch.tensor(regions_list, dtype=torch.float32))
-        self.register_buffer('candidate_depths',
-                             torch.tensor(depths_list, dtype=torch.long))
-        self.register_buffer('parent_indices',
-                             torch.tensor(parent_idx_list, dtype=torch.long))
-        self.register_buffer('hilbert_indices',
-                             torch.tensor(hilbert_idx_list, dtype=torch.long))
+        # 注册为 buffer (设备由 model.to() 控制)
+        self.register_buffer('candidate_regions', candidate_regions)
+        self.register_buffer('candidate_depths', candidate_depths)
+        self.register_buffer('parent_indices', parent_indices)
+        self.register_buffer('hilbert_indices', hilbert_indices)
 
     def _generate_candidates(self, max_depth: int):
         """兼容方法: 使用当前 image_size 生成指定深度的候选区域。"""
@@ -635,46 +712,53 @@ class GumbelTopKSplitter(nn.Module):
         dtype: torch.dtype,
     ) -> Tensor:
         """
-        按深度分组归一化 MLP 输出 (I23-1 方案C 核心修复)。
-        
+        按深度分组归一化 MLP 输出 (I23-1 方案C 核心修复, I35 EMA 改进)。
+
         数学形式化
         ==========
-        
+
         问题分析:
             ROI 信息量与深度相关，导致 MLP 输出方差不一致:
             - Depth 0: ROI = 64×64，特征是全局平均，σ_0 较小
             - Depth 3: ROI = 16×16，特征保留局部变化，σ_3 较大
-            
+
             量化估计: σ_3 / σ_0 ≈ 8 (基于 ROI 面积采样点推导)
-            
+
         Top-K 偏好分析:
             Top-K 选择偏好高方差分布 (更容易产生极值)
             有效竞争力: eff_d = N_d × σ_d
             结果: eff_3 : eff_0 = 64×1 : 1×0.125 = 512:1
-            
-        解决方案:
-            z_i^{norm} = (z_i - μ_d) / (σ_d + ε)
-            
-            其中 μ_d, σ_d 是 batch 内深度 d 候选的统计量
-            
+
+        解决方案 (I35 EMA 改进):
+            z_i^{norm} = (z_i - μ_d^{EMA}) / (σ_d^{EMA} + ε)
+
+            其中 μ_d^{EMA}, σ_d^{EMA} 是 EMA 累积的 Running Statistics:
+            - μ_d^{EMA}(t) = α × μ_d^{batch}(t) + (1-α) × μ_d^{EMA}(t-1)
+            - σ_d^{EMA}(t) = α × σ_d^{batch}(t) + (1-α) × σ_d^{EMA}(t-1)
+
+        I35 EMA 优势:
+            - 稳定小 batch (B=1) 下的方差估计 (per-batch 方差放大 512×)
+            - 避免 sqrt(0) 在反向传播产生 NaN
+            - α=0.1, 有效样本量 ≈ 10，方差降低 19×
+
         归一化后效果:
             所有 z_i^{norm} ~ N(0, 1)
             Log-Compensation 可以正确补偿候选数量差异
             预测深度分布 π ≈ (0.249, 0.246, 0.248, 0.257)
-        
+
         复杂度:
             时间: O(B × N × D) ≈ O(B × 85 × 4)
             空间: O(D) = O(4)
-            
+
         P-OPT-3 向量化:
             使用 scatter_add + one-hot 编码替代 Python for 循环
             避免 D 次索引操作，改为单次批量计算
-            
+
         Args:
             logits: [B, N] MLP 输出 (未归一化)
             device: 设备
             dtype: 数据类型
-            
+
         Returns:
             normalized: [B, N] 按深度归一化后的 logits
         """
@@ -688,14 +772,10 @@ class GumbelTopKSplitter(nn.Module):
         # 构建深度 one-hot 掩码: [D, N]
         depth_onehot = F.one_hot(depths, D).float().T  # [D, N]
         depth_counts = depth_onehot.sum(dim=1)  # [D] 每个深度的候选数量
-        
+
         # 扩展 logits 和掩码用于批量计算
         # logits: [B, N], depth_onehot: [D, N]
         # 目标: 计算每个深度的 mean 和 std
-        
-        # I34-12 修复: 改用 Per-batch 归一化，支持动态分辨率
-        # 之前: 全局归一化 (跨 batch) - 稀释效应问题
-        # 现在: Per-batch 归一化 - 自适应不同图像尺寸
 
         # 使用 einsum 高效计算: sum_d = Σ_i (logits_i × mask_{d,i})
         # [B, D] = einsum('bn,dn->bd', logits, depth_onehot)
@@ -710,23 +790,49 @@ class GumbelTopKSplitter(nn.Module):
         depth_sq_sums = torch.einsum('bn,dn->bd', logits_sq, depth_onehot)  # [B, D]
         mean_sq_per_batch = depth_sq_sums / depth_counts.unsqueeze(0)  # [B, D]
         variance_per_batch = (mean_sq_per_batch - mu_per_batch ** 2).clamp(min=0.0)  # [B, D]
-        sigma_per_batch = variance_per_batch.sqrt() + DEPTH_VARIANCE_NORM_EPS  # [B, D]
 
-        # 使用 Per-batch 统计量 (不再需要全局 EMA)
-        mu_expanded = mu_per_batch  # [B, D]
-        sigma_expanded = sigma_per_batch  # [B, D]
+        # I35: 使用 EMA Running Statistics
+        # 只在训练模式下更新 EMA，评估时使用累积的统计量
+        if self.training:
+            # 计算当前深度的 batch 均值/方差 (跨 batch 平均)
+            mu_depth = mu_per_batch.mean(dim=0)  # [D]
+            var_depth = variance_per_batch.mean(dim=0)  # [D]
 
-        # 归一化: z^norm = (z - μ_d^(b)) / σ_d^(b)
-        # mu_expanded[batch_idx, depth] 用于对应位置的归一化
-        # 需要扩展到 [B, N] 根据 depths
-        mu_for_normalize = mu_expanded  # [B, D]
-        sigma_for_normalize = sigma_expanded  # [B, D]
+            if not self._depth_ema_initialized:
+                # I35: 保守初始化 - 使用 batch 统计量但添加安全边界
+                # 当 batch_size 很小时（特别是 B=1），单批次统计量可能非常极端
+                # 使用保守的方差下界来避免数值问题
+                safe_var = var_depth.detach().clamp(min=DEPTH_VARIANCE_NORM_EPS)
+
+                # 对于小 batch，使用更大的安全边界
+                if B <= 2:
+                    # B=1 或 B=2 时，方差估计不可靠，使用保守值
+                    safe_var = safe_var.clamp(min=0.1)  # 保守下界
+                    print(f"Warning: Small batch (B={B}), using conservative EMA variance initialization")
+
+                self._depth_ema_mean[:D] = mu_depth.detach()
+                self._depth_ema_var[:D] = safe_var
+                self._depth_ema_initialized = True
+            else:
+                # EMA 更新: μ_new = α × μ_batch + (1-α) × μ_old
+                self._depth_ema_mean[:D] = (
+                    DEPTH_EMA_ALPHA * mu_depth.detach() +
+                    (1 - DEPTH_EMA_ALPHA) * self._depth_ema_mean[:D]
+                )
+                self._depth_ema_var[:D] = (
+                    DEPTH_EMA_ALPHA * var_depth.detach() +
+                    (1 - DEPTH_EMA_ALPHA) * self._depth_ema_var[:D]
+                ).clamp(min=DEPTH_VARIANCE_NORM_EPS)
+
+        # 使用 EMA 统计量进行归一化
+        mu_ema = self._depth_ema_mean[:D]  # [D]
+        sigma_ema = (self._depth_ema_var[:D] + DEPTH_VARIANCE_NORM_EPS).sqrt()  # [D]
 
         # 收集每个 batch 每个深度的均值和标准差
         batch_indices = torch.arange(B, device=device).unsqueeze(1).expand(-1, N)  # [B, N]
         depth_indices = depths.unsqueeze(0).expand(B, -1)  # [B, N]
-        mu_expanded = mu_for_normalize[batch_indices, depth_indices]  # [B, N]
-        sigma_expanded = sigma_for_normalize[batch_indices, depth_indices]  # [B, N]
+        mu_expanded = mu_ema[depth_indices]  # [B, N] - 使用 EMA 均值
+        sigma_expanded = sigma_ema[depth_indices]  # [B, N] - 使用 EMA 标准差
 
         # 归一化
         normalized = (logits - mu_expanded) / sigma_expanded
@@ -1091,7 +1197,9 @@ class GumbelTopKSplitter(nn.Module):
             return quota
 
         # Softmax 计算配额概率
-        p = F.softmax(self.quota_logits, dim=0)  # [D]
+        # I35 Fix: 切片到当前深度维度，避免 quota_logits (max_depth+1) 与
+        # _current_max_depth+1 不匹配的问题
+        p = F.softmax(self.quota_logits[:D], dim=0)  # [D]
         min_quota = self._quota_min_per_depth
 
         # 初始四舍五入
@@ -1551,10 +1659,7 @@ class GumbelTopKSplitter(nn.Module):
                 losses['elastic_budget_loss'] = zero
             if include_soft_entropy:
                 losses['soft_entropy_loss'] = zero
-            if DEPTH_KL_WEIGHT > 0:
-                losses['depth_kl_loss'] = zero
-            if DEPTH_QUOTA_ENABLED:
-                losses['quota_loss'] = zero
+            # I35: 移除死代码 DEPTH_KL_WEIGHT, DEPTH_QUOTA_ENABLED
             return losses
         
         # 1. Elastic Budget Loss (I33: 相对预算版本)
@@ -1609,30 +1714,7 @@ class GumbelTopKSplitter(nn.Module):
                 entropy_loss = entropy_weight * (current_entropy - entropy_target).pow(2)
             
             losses['soft_entropy_loss'] = entropy_loss
-        
-        # ====================================================================
-        # I21 ε: Depth KL Regularization Loss (A16: 已禁用)
-        # 鼓励选中 token 的深度分布趋向均匀
-        # A16 批判分析: Scheme E 配额机制已足够，KL正则化冗余且与软配额冲突
-        # DEPTH_KL_WEIGHT = 0.0 时此分支不执行
-        # ====================================================================
-        if selected_mask is not None and DEPTH_KL_WEIGHT > 0:
-            depth_kl_loss = self.get_depth_kl_loss(
-                selected_mask=selected_mask,
-                weight=DEPTH_KL_WEIGHT,
-            )
-            losses['depth_kl_loss'] = depth_kl_loss
 
-        # ====================================================================
-        # I23-1 方案D: 软配额正则化损失 (A16: 已禁用)
-        # 惩罚极端偏离任务最优分布
-        # A16 批判分析: 软配额目标(0.15,0.20,0.25,0.40)与KL目标(均匀分布)冲突
-        # DEPTH_QUOTA_ENABLED = False 时此分支不执行
-        # ====================================================================
-        if selected_mask is not None and DEPTH_QUOTA_ENABLED:
-            quota_loss = self.get_quota_loss(selected_mask=selected_mask)
-            losses['quota_loss'] = quota_loss
-        
         # ====================================================================
         # I24-2 方案E: 配额熵正则化损失
         # I30-10: 使用配置值
@@ -1729,177 +1811,7 @@ class GumbelTopKSplitter(nn.Module):
         # 最大化熵 → 最小化负熵
         loss = -weight * entropy
         return loss
-    
-    def get_depth_kl_loss(
-        self,
-        selected_mask: Optional[Tensor] = None,
-        weight: float = DEPTH_KL_WEIGHT,
-    ) -> Tensor:
-        """
-        计算深度 KL 散度正则化损失 (I21 ε方案)。
-        
-        数学形式化
-        ==========
-        
-        问题: 选中 token 的深度分布 π_d 崩溃到单一深度
-        目标: 鼓励 π_d 趋向均匀分布 U(D+1)
-        
-        定义:
-            π_d = Σ_{i: depth(i)=d} mask_i / Σ_i mask_i
-                = (该深度选中数量) / (总选中数量)
-                
-            U_d = 1 / (D+1)  均匀分布
-            
-        KL 散度:
-            D_KL(π || U) = Σ_d π_d log(π_d / U_d)
-                         = Σ_d π_d log(π_d) + log(D+1)
-                         = -H(π) + log(D+1)
-                         
-        损失:
-            L_depth = λ × D_KL(π || U)
-            
-        梯度流:
-            ∂L/∂mask_i = λ × (log(π_{d(i)}) + 1 - log(1/(D+1)))
-                       = λ × (log(π_{d(i)}) + 1 + log(D+1))
-                       
-        效果:
-            - 深度 d 过多选中 → π_d 高 → 梯度为正 → 降低该深度 logits
-            - 深度 d 选中不足 → π_d 低 → 梯度为负 → 提高该深度 logits
-        
-        Args:
-            selected_mask: [B, N] STE 选择掩码 (有梯度)
-            weight: KL 损失权重 (默认 DEPTH_KL_WEIGHT=0.1)
-            
-        Returns:
-            loss: 标量 KL 损失
-        """
-        if selected_mask is None:
-            return torch.tensor(0.0, device=self.candidate_regions.device)
-        
-        B, N = selected_mask.shape
-        device = selected_mask.device
-        depths = self.candidate_depths.to(device, non_blocking=True)  # [N] I78: 异步传输
-        D = self._current_max_depth + 1  # 深度类别数
 
-        # P-OPT-4: 向量化深度计数 (使用 one-hot + einsum 替代 for 循环)
-        # 构建深度 one-hot: [N, D]
-        depth_onehot = F.one_hot(depths, D).float()  # [N, D]
-        
-        # 批量计算每个深度的选中数量: [D]
-        # depth_counts[d] = Σ_{b,i} selected_mask[b,i] × 1[depth[i]=d]
-        depth_counts = torch.einsum('bn,nd->d', selected_mask, depth_onehot)  # [D]
-        total_count = depth_counts.sum()
-        
-        # 防止除零
-        total_count = total_count.clamp(min=PROB_EPSILON)
-        
-        # 深度分布 π_d
-        pi = depth_counts / total_count  # [D]
-        pi = pi.clamp(min=PROB_EPSILON)  # 数值稳定
-        
-        # 均匀分布
-        uniform = torch.ones(D, device=device) / D
-        
-        # KL 散度: D_KL(π || U) = Σ π_d log(π_d / U_d)
-        kl_div = (pi * (pi.log() - uniform.log())).sum()
-        
-        # 损失
-        loss = weight * kl_div
-        
-        return loss
-    
-    # ========================================================================
-    # I23-1 方案D: 软配额正则化
-    # ========================================================================
-    
-    def get_quota_loss(
-        self,
-        selected_mask: Optional[Tensor] = None,
-        target: tuple = DEPTH_QUOTA_TARGET,
-        tolerance: float = DEPTH_QUOTA_TOLERANCE,
-        weight: float = DEPTH_QUOTA_WEIGHT,
-    ) -> Tensor:
-        """
-        计算软配额正则化损失 (I23-1 方案D)。
-        
-        数学形式化
-        ==========
-        
-        动机:
-            KL 正则化鼓励均匀分布，但对于视觉任务可能不是最优的。
-            不同深度的判别信息量不同:
-            - 全局形状 (depth 0-1): 类别识别
-            - 局部纹理 (depth 3): 细粒度区分
-            
-        目标分布 (基于信息论分析):
-            π^{target} = (0.15, 0.20, 0.25, 0.40)
-            
-            说明: depth 3 略高是因为高频纹理信息对分类有额外贡献
-            
-        软配额损失:
-            L_{quota} = Σ_d ReLU(|π_d - π_d^{target}| - ε)²
-            
-            其中 ε = 0.05 是容忍带，允许 ±5% 的偏差
-            
-        梯度流:
-            当 |π_d - π_d^{target}| > ε 时:
-            ∂L/∂π_d = 2 × sign(π_d - π_d^{target}) × (|π_d - π_d^{target}| - ε)
-            
-        与 KL 损失的互补性:
-            - KL 损失: 惩罚偏离均匀分布
-            - 软配额: 惩罚极端偏离任务最优分布
-            二者共同作用，既保持多样性，又允许任务微调
-            
-        Args:
-            selected_mask: [B, N] STE 选择掩码 (有梯度)
-            target: 目标深度分布 (D,)
-            tolerance: 容忍带 ε
-            weight: 损失权重 λ_{quota}
-            
-        Returns:
-            loss: 标量软配额损失
-        """
-        if selected_mask is None or not DEPTH_QUOTA_ENABLED:
-            return torch.tensor(0.0, device=self.candidate_regions.device)
-        
-        B, N = selected_mask.shape
-        device = selected_mask.device
-        dtype = selected_mask.dtype
-        depths = self.candidate_depths.to(device, non_blocking=True)  # [N] I78: 异步传输
-        D = self._current_max_depth + 1  # 深度类别数
-
-        # P-OPT-5: 向量化深度计数 (消除 for 循环)
-        # 使用 one-hot 编码 + einsum 一次性计算所有深度的加权计数
-        # depth_counts[d] = Σ_{b,i} selected_mask[b,i] × 1[depths[i] = d]
-        depth_onehot = F.one_hot(depths, D).float()  # [N, D]
-        depth_counts = torch.einsum('bn,nd->d', selected_mask, depth_onehot)  # [D]
-        total_count = depth_counts.sum().clamp(min=PROB_EPSILON)
-        pi = depth_counts / total_count  # [D]
-        
-        # I23-4-FIX: 动态调整目标分布以匹配实际深度数量 D
-        # 当 len(target) != D 时，重新归一化或扩展目标分布
-        target_list = list(target)
-        if len(target_list) < D:
-            # 扩展: 用均匀分布填充新增深度
-            extra = D - len(target_list)
-            fill_val = (1.0 - sum(target_list)) / extra if extra > 0 else 1.0 / D
-            target_list.extend([max(fill_val, 0.01)] * extra)
-        elif len(target_list) > D:
-            # 截断: 只取前 D 个
-            target_list = target_list[:D]
-        # 归一化确保和为 1
-        target_sum = sum(target_list)
-        target_list = [t / target_sum for t in target_list]
-        
-        target_tensor = torch.tensor(target_list, device=device, dtype=dtype)
-        
-        # 软配额损失: Σ ReLU(|π - target| - ε)²
-        deviation = (pi - target_tensor).abs()
-        excess = F.relu(deviation - tolerance)
-        loss = weight * (excess ** 2).sum()
-        
-        return loss
-    
     def get_quota_entropy_loss(
         self,
         weight: float = QUOTA_ENTROPY_WEIGHT,
@@ -1970,21 +1882,20 @@ class GumbelTopKSplitter(nn.Module):
     ) -> Dict[str, Any]:
         """
         获取当前深度分布统计信息 (用于监控)。
-        
+
         Returns:
             dict: {
                 'pi': [D] 深度分布,
                 'entropy': 熵,
                 'kl_from_uniform': KL(π || U),
-                'quota_deviation': |π - target|,
             }
         """
         if selected_mask is None:
             selected_mask = getattr(self, '_last_selected_mask', None)
-        
+
         if selected_mask is None:
             return {'pi': None, 'entropy': None, 'kl_from_uniform': None}
-        
+
         B, N = selected_mask.shape
         device = selected_mask.device
         depths = self.candidate_depths.to(device, non_blocking=True)  # I78: 异步传输
@@ -1997,35 +1908,20 @@ class GumbelTopKSplitter(nn.Module):
             depth_counts = torch.einsum('bn,nd->d', selected_mask, depth_onehot)  # [D]
             total = depth_counts.sum().clamp(min=1.0)
             pi = depth_counts / total
-            
+
             # 熵
             pi_safe = pi.clamp(min=PROB_EPSILON)
             entropy = -(pi_safe * pi_safe.log()).sum().item()
-            
+
             # KL from uniform
             uniform = torch.ones(D, device=device) / D
             kl = (pi_safe * (pi_safe.log() - uniform.log())).sum().item()
-            
-            # 配额偏差 (I23-4-FIX: 动态调整目标分布长度)
-            target_list = list(DEPTH_QUOTA_TARGET)
-            if len(target_list) < D:
-                extra = D - len(target_list)
-                fill_val = (1.0 - sum(target_list)) / extra if extra > 0 else 1.0 / D
-                target_list.extend([max(fill_val, 0.01)] * extra)
-            elif len(target_list) > D:
-                target_list = target_list[:D]
-            target_sum = sum(target_list)
-            target_list = [t / target_sum for t in target_list]
-            
-            target = torch.tensor(target_list, device=device)
-            deviation = (pi - target).abs().tolist()
-            
+
             return {
                 'pi': pi.tolist(),
                 'entropy': entropy,
                 'max_entropy': math.log(D),
                 'kl_from_uniform': kl,
-                'quota_deviation': deviation,
             }
     
     # ========================================================================

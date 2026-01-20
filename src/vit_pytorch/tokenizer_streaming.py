@@ -293,27 +293,36 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
     
     def tokenize(self, images: torch.Tensor) -> TokenizerOutput:
         """Variable Depth tokenization (P9-1 方案 D: 完全向量化).
-        
+
         数学形式化:
             1. F = SharedConv(I)                    # 特征提取
             2. TensorResult = Splitter.forward(F)   # 纯张量分割 (P9-1)
             3. T = _embed_with_tensor_result(F, TensorResult)  # 纯张量嵌入
-            
+
         性能特性 (GumbelTopKSplitter - I20):
             - 100% Hilbert 局部性
             - 100% 梯度覆盖 (STE)
             - 无串行依赖
             - 预期加速: ~8x (vs Python 循环)
+
+        I35: 支持 channels_last 内存格式以优化卷积性能
         """
         if images.dim() != 4:
             raise ValueError(
                 f"StreamingFractalTokenizerV3.tokenize expects 4D input [B, C, H, W], "
                 f"got {images.dim()}D tensor."
             )
-        
+
         B, C, H, W = images.shape
         device = images.device
-        
+
+        # I35: 转换为 channels_last 以优化卷积性能
+        # 检测当前内存格式，如果不是 channels_last 则转换
+        if (images.stride(1) != images.stride(2) and
+            images.dim() == 4 and
+            images.shape[1] == C):  # 确保是正确格式
+            images = images.to(memory_format=torch.channels_last)
+
         # 1. 提取共享特征图
         features = self.shared_conv(images)  # [B, d_model, H/p, W/p]
         self._last_features = features

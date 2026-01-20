@@ -33,7 +33,7 @@ Tokenizer 选项
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 import torch.nn as nn
@@ -44,6 +44,7 @@ from .tokenizer_streaming import StreamingFractalTokenizerV3
 from .base_tokenizer import BaseTokenizer, TokenizerOutput
 from .block_transformer import FractalTransformer, FFNType
 from .utils import pair
+from .constants import DIVISION_EPSILON, PROB_EPSILON
 
 
 # Tokenizer 类型定义
@@ -117,7 +118,7 @@ class FractalCurveViT(nn.Module):
         pos_dropout: Optional[float] = None,       # None = 跟随主 dropout * 0.5
         # I31-3: 面积编码配置
         use_area_encoding: bool = False,           # 启用面积增强位置编码
-        use_affine_modulation: bool = False,       # 启用仿射调制注意力偏置
+        use_affine_modulation: bool = True,        # A17: 启用 ShapeScaleEncoder 仿射调制注意力偏置
         fourier_levels: int = 4,                   # 傅里叶特征级别数
         # I24-2: 可学习配额控制
         # None = 使用常量 LEARNABLE_QUOTA_ENABLED 的默认值
@@ -560,7 +561,7 @@ class FractalCurveViT(nn.Module):
             token_mask = ~key_padding_mask[:, 1:]
             token_x = token_x * token_mask.unsqueeze(-1).float()
             sum_x = token_x.sum(dim=1)
-            valid_counts = token_mask.sum(dim=1, keepdim=True).float().clamp(min=1.0)
+            valid_counts = token_mask.sum(dim=1, keepdim=True).float().clamp(min=DIVISION_EPSILON)
             return sum_x / valid_counts
         elif self.pool == "weighted":
             # I30-11: 加权池化，利用 split_probs 作为 token 重要性权重
@@ -571,7 +572,7 @@ class FractalCurveViT(nn.Module):
                 token_mask = ~key_padding_mask[:, 1:]
                 token_x = token_x * token_mask.unsqueeze(-1).float()
                 sum_x = token_x.sum(dim=1)
-                valid_counts = token_mask.sum(dim=1, keepdim=True).float().clamp(min=1.0)
+                valid_counts = token_mask.sum(dim=1, keepdim=True).float().clamp(min=DIVISION_EPSILON)
                 return sum_x / valid_counts
 
             token_x = x[:, 1:]  # [B, N, D] - 排除 CLS
@@ -585,7 +586,7 @@ class FractalCurveViT(nn.Module):
             token_probs = token_probs * token_mask.float()
 
             # 权重归一化: w_norm = w / sum(w)
-            weight_sum = token_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            weight_sum = token_probs.sum(dim=-1, keepdim=True).clamp(min=PROB_EPSILON)
             normalized_weights = token_probs / weight_sum  # [B, N]
 
             # 加权平均: z = sum(w_i * x_i)
@@ -603,9 +604,10 @@ class FractalCurveViT(nn.Module):
         pooled: torch.Tensor,
         return_aux_info: bool,
         return_features: bool,
+        split_probs: Optional[torch.Tensor] = None,
     ) -> Tuple[List[Dict[str, Any]], List[torch.Tensor]]:
         """准备辅助输出。
-        
+
         Args:
             batch_size: batch 大小
             lengths: Tensor[B] 有效 token 数量
@@ -613,10 +615,11 @@ class FractalCurveViT(nn.Module):
             pooled: 池化后的表示
             return_aux_info: 是否返回辅助信息
             return_features: 是否返回特征
-            
+            split_probs: Tensor[B, N] 分割概率（可选）
+
         Returns:
             (aux_infos, features_list)
-            
+
         性能优化 (P-OPT-5):
             - aux_info 仅在验证/调试时使用，保持简单实现
             - 使用 non_blocking 转移减少同步等待
@@ -625,24 +628,104 @@ class FractalCurveViT(nn.Module):
         features_list: List[torch.Tensor] = []
 
         if return_aux_info:
+            # M3: 添加缺失字段 (token_selection_entropy, depth_distribution)
             # P-OPT-5: 批量获取 lengths 到 CPU，避免多次 .item() 调用
             lengths_cpu = lengths.to('cpu', non_blocking=True)
-            
+
+            # 计算深度分布
+            depth_distribution: Dict[int, float] = {}
             for i in range(batch_size):
                 l = levels_list[i]
                 if l.numel() > 0:
                     depths = l[:, 0]
                     # P-OPT-5: unique 操作在 GPU 上执行，结果再转 CPU
                     unique = depths.unique().to('cpu', non_blocking=True).tolist()
-                    aux_infos.append({"num_tokens": int(lengths_cpu[i].item()), "levels_used": unique})
+
+                    # M3: 计算深度分布
+                    depth_counts = depths.bincount(minlength=int(depths.max().item()) + 1)
+                    total = depth_counts.sum().item()
+                    for d in range(len(depth_counts)):
+                        if depth_counts[d] > 0:
+                            depth_distribution[d] = depth_counts[d].item() / total
+
+                    aux_info = {
+                        "num_tokens": int(lengths_cpu[i].item()),
+                        "levels_used": unique,
+                        "depth_distribution": depth_distribution,
+                    }
+
+                    # M3: 计算选择熵 (token_selection_entropy)
+                    if split_probs is not None:
+                        probs_i = split_probs[i, :lengths[i]]
+                        # 避免 log(0)
+                        probs_safe = probs_i.clamp(min=PROB_EPSILON)
+                        entropy = -(probs_safe * torch.log(probs_safe)).sum().item()
+                        aux_info["token_selection_entropy"] = entropy
+
+                    aux_infos.append(aux_info)
                 else:
-                    aux_infos.append({"num_tokens": 0})
-        
+                    aux_infos.append({
+                        "num_tokens": 0,
+                        "depth_distribution": {},
+                        "token_selection_entropy": 0.0,
+                    })
+
         if return_features:
             # 直接返回 pooled 表示作为每个样本的特征
             features_list = [pooled[i] for i in range(pooled.shape[0])]
 
         return aux_infos, features_list
+
+    # H2: Protocol compliance - overload signatures for type checkers
+    @overload
+    def forward(
+        self,
+        img: torch.Tensor,
+        return_attention: bool = ...,
+        return_aux_info: bool = False,
+        return_features: bool = False,
+        return_tokens: bool = False,
+    ) -> torch.Tensor: ...
+
+    @overload
+    def forward(
+        self,
+        img: torch.Tensor,
+        return_attention: bool = ...,
+        return_aux_info: bool = True,
+        return_features: bool = False,
+        return_tokens: bool = False,
+    ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]: ...
+
+    @overload
+    def forward(
+        self,
+        img: torch.Tensor,
+        return_attention: bool = ...,
+        return_aux_info: bool = False,
+        return_features: bool = True,
+        return_tokens: bool = False,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]: ...
+
+    @overload
+    def forward(
+        self,
+        img: torch.Tensor,
+        return_attention: bool = ...,
+        return_aux_info: bool = True,
+        return_features: bool = True,
+        return_tokens: bool = False,
+    ) -> Tuple[torch.Tensor, List[Dict[str, Any]], List[torch.Tensor]]: ...
+
+    @overload
+    def forward(
+        self,
+        img: torch.Tensor,
+        return_attention: bool = ...,
+        return_aux_info: bool = False,
+        return_features: bool = False,
+        return_tokens: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
 
     def forward(
         self,
@@ -721,7 +804,8 @@ class FractalCurveViT(nn.Module):
         # 6. 辅助输出
         if return_aux_info or return_features:
             aux_infos, features_list = self._prepare_auxiliary_output(
-                batch_size, lengths, levels_list, pooled, return_aux_info, return_features
+                batch_size, lengths, levels_list, pooled, return_aux_info, return_features,
+                split_probs=split_probs
             )
             
             if return_aux_info and return_features:
@@ -827,6 +911,221 @@ class FractalCurveViT(nn.Module):
                 }
 
             return analysis
+
+    # =========================================================================
+    # I36: FractalModelProtocol 接口实现
+    # =========================================================================
+
+    def get_extra_info(
+        self,
+        img: torch.Tensor,
+        return_aux_info: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[List[Dict[str, Any]]]]:
+        """获取辅助信息 (I36-3: FractalModelProtocol 实现)
+
+        Args:
+            img: 输入图像 [B, C, H, W]
+            return_aux_info: 是否返回 aux_info
+
+        Returns:
+            logits: 分类输出 [B, num_classes]
+            aux_infos: 辅助信息列表，每个元素对应一个样本
+        """
+        return self.forward(img, return_aux_info=return_aux_info)
+
+    def configure_training(self, config: Dict[str, Any]) -> None:
+        """配置训练相关参数 (I36-2: 解耦设计)
+
+        设计原则: 训练器通过协议接口配置，不直接访问内部实现
+
+        Args:
+            config: 配置字典，包含:
+                - temperature_annealing: bool - 是否启用温度退火
+                - temp_start: float - 起始温度
+                - temp_end: float - 结束温度
+                - aux_loss_weights: Dict[str, float] - 辅助损失权重
+        """
+        # 温度退火配置
+        if config.get('temperature_annealing'):
+            if hasattr(self, 'tokenizer') and hasattr(self.tokenizer, 'splitter'):
+                splitter = self.tokenizer.splitter
+                if hasattr(splitter, 'enable_temperature_annealing'):
+                    # 计算步数
+                    total_steps = config.get('total_steps', 10000)
+                    splitter.enable_temperature_annealing(
+                        total_steps=total_steps,
+                        T_start=config.get('temp_start', 1.0),
+                        T_end=config.get('temp_end', 0.5),
+                        schedule=config.get('schedule', 'exponential'),
+                    )
+
+        # 辅助损失权重配置
+        if 'aux_loss_weights' in config:
+            weights = config['aux_loss_weights']
+            # 可以在此处更新内部辅助损失权重
+            # 目前使用默认值，留作扩展接口
+
+    def get_splitter_diagnostics(self) -> Dict[str, Any]:
+        """获取分割器诊断信息 (I36-3: FractalModelProtocol 实现)
+
+        Returns:
+            诊断字典，包含:
+                - current_temperature: float - 当前温度
+                - depth_distribution: Dict[int, float] - 深度分布 (L3: 优化类型)
+                - quota_allocation: List[float] - 配额分配
+                - num_selected: int - 选中的 token 数
+                - has_splitter: bool - 是否有分割器 (L3: 新增)
+                - splitter_type: str - 分割器类型 (L3: 新增)
+        """
+        diagnostics: Dict[str, Any] = {
+            'current_temperature': 1.0,
+            'depth_distribution': {},  # Dict[int, float]
+            'quota_allocation': [],   # List[float]
+            'num_selected': 0,
+            'has_splitter': False,
+            'splitter_type': 'None',
+        }
+
+        if hasattr(self, 'tokenizer') and hasattr(self.tokenizer, 'splitter'):
+            splitter = self.tokenizer.splitter
+            diagnostics['has_splitter'] = True
+            diagnostics['splitter_type'] = type(splitter).__name__
+
+            # 当前温度
+            if hasattr(splitter, 'get_current_temperature'):
+                diagnostics['current_temperature'] = splitter.get_current_temperature()
+
+            # 深度分布
+            if hasattr(splitter, 'get_depth_distribution'):
+                diagnostics['depth_distribution'] = splitter.get_depth_distribution()
+
+            # 配额分配
+            if hasattr(splitter, 'quota_logits') and hasattr(splitter, '_current_max_depth'):
+                D = splitter._current_max_depth + 1
+                quota = torch.softmax(splitter.quota_logits[:D], dim=0)
+                diagnostics['quota_allocation'] = quota.detach().cpu().tolist()
+
+            # 选中的 token 数
+            if hasattr(splitter, '_avg_selected'):
+                diagnostics['num_selected'] = int(splitter._avg_selected)
+
+        return diagnostics
+
+    def get_model_info(self) -> Dict[str, Any]:
+        """获取模型诊断信息 (I36-7: 完整诊断)
+
+        Returns:
+            完整诊断信息:
+                - architecture: Dict - 架构参数
+                - tokenizer: Dict - tokenizer 配置
+                - splitter: Dict - splitter 参数
+                - total_params: int - 总参数量
+                - trainable_params: int - 可训练参数量
+        """
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+        # 架构参数
+        architecture = {
+            'num_classes': self.num_classes,
+            'dim': self.dim,
+            'depth': self.depth,
+            'heads': self.heads,
+            'mlp_dim': self.mlp_dim,
+            'pool': self.pool,
+        }
+
+        # Tokenizer 配置
+        tokenizer_info: Dict[str, Any] = {}
+        if hasattr(self, 'tokenizer'):
+            t = self.tokenizer
+            tokenizer_info = {
+                'type': type(t).__name__,
+            }
+            if hasattr(t, 'max_depth'):
+                tokenizer_info['max_depth'] = t.max_depth
+            if hasattr(t, 'K_min'):
+                tokenizer_info['K_min'] = t.K_min
+            if hasattr(t, 'K_max'):
+                tokenizer_info['K_max'] = t.K_max
+
+        # Splitter 参数
+        splitter_info: Dict[str, Any] = {}
+        if hasattr(self, 'tokenizer') and hasattr(self.tokenizer, 'splitter'):
+            s = self.tokenizer.splitter
+            splitter_info = {
+                'type': type(s).__name__,
+            }
+            if hasattr(s, 'quota_logits'):
+                splitter_info['quota_dim'] = s.quota_logits.shape[0]
+            if hasattr(s, 'enable_temperature_annealing'):
+                splitter_info['has_temp_annealing'] = True
+
+        return {
+            'architecture': architecture,
+            'tokenizer': tokenizer_info,
+            'splitter': splitter_info,
+            'total_params': total_params,
+            'trainable_params': trainable_params,
+        }
+
+    # =========================================================================
+    # I35: torch.compile 优化支持
+    # =========================================================================
+
+    def compile(
+        self,
+        mode: str = "max-autotune",
+        dynamic: bool = False,
+        fullgraph: bool = False,
+    ) -> "FractalCurveViT":
+        """编译模型以获得最佳性能 (I35)。
+
+        使用 torch.compile 优化模型，支持多种优化模式：
+        - "default": 基础优化
+        - "reduce-overhead": 减少开销优化
+        - "max-autotune": 自动调优最优 kernel (推荐)
+
+        Args:
+            mode: 编译模式
+            dynamic: 是否启用动态形状支持 (用于可变分辨率)
+            fullgraph: 是否要求完整图编译
+
+        Returns:
+            编译后的模型
+
+        Example:
+            >>> model = FractalCurveViT(image_size=224, num_classes=1000)
+            >>> model = model.compile(mode="max-autotune")
+            >>> # 或对于动态分辨率
+            >>> model = model.compile(mode="reduce-overhead", dynamic=True)
+        """
+        import torch
+
+        # 配置 inductor 优化
+        torch._inductor.config.max_autotune = True
+        torch._inductor.config.cudnn_sdp = True  # 启用 cuDNN attention
+        torch._inductor.config.coordinate_descent_tuning = True
+
+        # 编译模型
+        self = torch.compile(self, mode=mode, dynamic=dynamic, fullgraph=fullgraph)
+
+        return self
+
+    def enable_channels_last(self) -> "FractalCurveViT":
+        """启用 channels_last 内存格式以优化卷积性能 (I35)。
+
+        将模型和输入转换为 channels_last 格式，可提升卷积操作性能。
+
+        Returns:
+            配置后的模型
+
+        Note:
+            训练循环中需手动将输入转换为 channels_last:
+                x = x.to(memory_format=torch.channels_last)
+        """
+        self.to(memory_format=torch.channels_last)
+        return self
 
 
 # 保持向后兼容性的别名
