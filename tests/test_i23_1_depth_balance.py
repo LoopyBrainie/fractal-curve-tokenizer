@@ -1,12 +1,18 @@
 """
-I23-1 深度分布崩塌修复验证测试
+I23-1 深度分布崩塌修复验证测试 (I35 优化后)
 
 测试内容:
-1. 常量导入正确性
-2. 深度方差归一化功能
-3. 软配额损失计算
+1. 常量导入正确性 (DEPTH_KL_*, DEPTH_QUOTA_* 已移除)
+2. 深度方差归一化功能 (EMA 改进)
+3. Scheme E 配额熵正则化
 4. get_auxiliary_losses 集成
 5. 深度分布统计
+
+I35 优化总结:
+- DEPTH_KL_WEIGHT, DEPTH_QUOTA_* 常量已完全移除
+- DEPTH_EMA_ALPHA = 0.1 (新增 EMA 系数)
+- 保留: QUOTA_ENTROPY_WEIGHT=0.1 (Scheme E核心机制)
+- 深度方差归一化使用 EMA Running Statistics
 """
 
 import pytest
@@ -15,36 +21,48 @@ import math
 
 from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
 from vit_pytorch.constants import (
-    DEPTH_KL_WEIGHT,
     DEPTH_VARIANCE_NORM_ENABLED,
     DEPTH_VARIANCE_NORM_EPS,
-    DEPTH_QUOTA_ENABLED,
-    DEPTH_QUOTA_TARGET,
-    DEPTH_QUOTA_TOLERANCE,
-    DEPTH_QUOTA_WEIGHT,
+    DEPTH_EMA_ALPHA,
+    QUOTA_ENTROPY_WEIGHT,
+    QUOTA_MIN_PER_DEPTH,
 )
 
 
 class TestI23_1Constants:
-    """测试 I23-1 相关常量配置"""
-    
-    def test_depth_kl_weight_increased(self):
-        """方案A: KL权重从 0.1 提升到 0.5"""
-        assert DEPTH_KL_WEIGHT == 0.5, f"Expected 0.5, got {DEPTH_KL_WEIGHT}"
-    
+    """测试 I23-1 相关常量配置 (I35 优化后)"""
+
+    def test_depth_kl_constants_removed(self):
+        """I35: DEPTH_KL_WEIGHT 常量已移除"""
+        with pytest.raises(ImportError):
+            from vit_pytorch.constants import DEPTH_KL_WEIGHT
+
+    def test_depth_quota_constants_removed(self):
+        """I35: DEPTH_QUOTA_* 常量已移除"""
+        with pytest.raises(ImportError):
+            from vit_pytorch.constants import DEPTH_QUOTA_ENABLED
+        with pytest.raises(ImportError):
+            from vit_pytorch.constants import DEPTH_QUOTA_TARGET
+        with pytest.raises(ImportError):
+            from vit_pytorch.constants import DEPTH_QUOTA_TOLERANCE
+        with pytest.raises(ImportError):
+            from vit_pytorch.constants import DEPTH_QUOTA_WEIGHT
+
+    def test_ema_alpha_configurable(self):
+        """I35: EMA 系数可配置"""
+        assert DEPTH_EMA_ALPHA == 0.1
+
     def test_variance_norm_configurable(self):
-        """方案C: 深度方差归一化可配置 (当前默认禁用，通过实验发现可能导致不稳定)"""
-        # I24-13: 更新测试以匹配当前设计决策
-        # DEPTH_VARIANCE_NORM_ENABLED 默认为 False，因为实验显示可能导致批次统计不稳定 (I24-5)
+        """方案C: 深度方差归一化可配置"""
         assert DEPTH_VARIANCE_NORM_ENABLED in (True, False)  # 允许两种配置
         assert DEPTH_VARIANCE_NORM_EPS == 1e-6
-    
-    def test_quota_enabled(self):
-        """方案D: 软配额正则化默认启用"""
-        assert DEPTH_QUOTA_ENABLED is True
-        assert DEPTH_QUOTA_TARGET == (0.15, 0.20, 0.25, 0.40)
-        assert DEPTH_QUOTA_TOLERANCE == 0.05
-        assert DEPTH_QUOTA_WEIGHT == 0.2
+
+    def test_scheme_e_core_preserved(self):
+        """A16: 保留 Scheme E 核心机制"""
+        # 配额熵正则化：防止配额logits崩溃到单一深度
+        assert QUOTA_ENTROPY_WEIGHT == 0.1
+        # 最小配额：硬保证每深度至少2个token
+        assert QUOTA_MIN_PER_DEPTH == 2
 
 
 class TestDepthVarianceNormalization:
@@ -98,14 +116,21 @@ class TestDepthVarianceNormalization:
         # 验证每深度归一化后统计量
         for d in range(splitter._current_max_depth + 1):
             mask = (depths == d)
+            count_per_depth = mask.sum().item()
+
+            # I35 Fix: 跳过每深度只有1个候选的深度 (per-batch 方差无意义)
+            # 数学: 当 N_d = 1 时，μ = x_1, σ = 0，归一化后值恒为 0
+            if count_per_depth < 2:
+                continue
+
             values = normalized[:, mask].flatten()
-            
             mu = values.mean().item()
             sigma = values.std().item()
-            
-            # 期望: μ ≈ 0, σ ≈ 1
-            assert abs(mu) < 0.1, f"Depth {d}: mean = {mu:.4f}, expected ~0"
-            assert abs(sigma - 1.0) < 0.15, f"Depth {d}: std = {sigma:.4f}, expected ~1"
+
+            # I35: 使用 EMA 统计量，std 可能略有偏差
+            # 期望: μ ≈ 0, σ ≈ 1 (放宽容忍度以适应 EMA)
+            assert abs(mu) < 0.15, f"Depth {d}: mean = {mu:.4f}, expected ~0"
+            assert abs(sigma - 1.0) < 0.25, f"Depth {d}: std = {sigma:.4f}, expected ~1"
 
 
 class TestQuotaLoss:
@@ -121,46 +146,10 @@ class TestQuotaLoss:
             max_depth_limit=4,
             image_size=(64, 64),
         )
-    
-    def test_get_quota_loss_method_exists(self, splitter):
-        """验证方法存在"""
-        assert hasattr(splitter, 'get_quota_loss')
-    
-    def test_quota_loss_zero_for_target_distribution(self, splitter):
-        """目标分布时损失很小"""
-        B, N = 4, splitter.num_candidates
-        depths = splitter.candidate_depths
-        
-        # 构造精确匹配目标分布的 mask
-        K = 32
-        target = torch.tensor(DEPTH_QUOTA_TARGET)
-        tokens_per_depth = (target * K).round().int()
-        
-        selected_mask = torch.zeros(B, N)
-        for d in range(4):
-            mask = (depths == d)
-            indices = torch.where(mask)[0][:tokens_per_depth[d]]
-            selected_mask[:, indices] = 1.0
-        
-        loss = splitter.get_quota_loss(selected_mask)
-        
-        # 在容忍带内，损失应该很小（可能有舍入误差）
-        assert loss.item() < 0.01, f"Expected ~0, got {loss.item()}"
-    
-    def test_quota_loss_positive_for_collapsed_distribution(self, splitter):
-        """崩塌分布时损失为正"""
-        B, N = 4, splitter.num_candidates
-        depths = splitter.candidate_depths
-        
-        # 所有 token 都来自 depth=3 (崩塌)
-        mask_d3 = (depths == 3)
-        selected_mask = torch.zeros(B, N)
-        selected_mask[:, mask_d3] = 1.0
-        
-        loss = splitter.get_quota_loss(selected_mask)
-        
-        # 崩塌时损失应该明显大于 0
-        assert loss.item() > 0.01, f"Expected >0.01, got {loss.item()}"
+
+    def test_quota_loss_method_removed(self, splitter):
+        """I35: get_quota_loss 方法已移除 (死代码清理)"""
+        assert not hasattr(splitter, 'get_quota_loss'), "方法应已移除"
 
 
 class TestAuxiliaryLossesIntegration:
@@ -178,22 +167,26 @@ class TestAuxiliaryLossesIntegration:
         )
     
     def test_forward_and_get_losses(self, splitter):
-        """完整前向传播和损失获取"""
+        """A16: 完整前向传播和损失获取 (KL和软配额已禁用)"""
         B, C, H, W = 2, 64, 16, 16
         x = torch.randn(B, C, H, W)
-        
+
         # 前向传播
         result = splitter(x)
-        
+
         assert result.regions.shape[0] > 0
-        
+
         # 获取损失
         losses = splitter.get_auxiliary_losses()
-        
-        # 验证新增的损失项
-        assert 'depth_kl_loss' in losses, "Missing depth_kl_loss"
-        assert 'quota_loss' in losses, "Missing quota_loss"
-        
+
+        # A16: depth_kl_loss 和 quota_loss 应不在损失字典中 (已禁用)
+        assert 'depth_kl_loss' not in losses, "depth_kl_loss 应被禁用"
+        assert 'quota_loss' not in losses, "quota_loss 应被禁用"
+
+        # A16: 保留的损失项 (Scheme E 核心机制)
+        assert 'quota_entropy_loss' in losses, "Missing quota_entropy_loss (Scheme E核心)"
+        assert 'soft_entropy_loss' in losses, "Missing soft_entropy_loss"
+
         # 验证损失有梯度
         total_loss = sum(losses.values())
         assert total_loss.requires_grad or total_loss.item() >= 0
@@ -202,22 +195,22 @@ class TestAuxiliaryLossesIntegration:
         """测试深度分布监控功能"""
         B, C, H, W = 4, 64, 16, 16
         x = torch.randn(B, C, H, W)
-        
+
         _ = splitter(x)
-        
+
         stats = splitter.get_depth_distribution()
-        
+
         assert 'pi' in stats
         assert 'entropy' in stats
         assert 'max_entropy' in stats
         assert 'kl_from_uniform' in stats
-        assert 'quota_deviation' in stats
-        
+        # I35: 移除 quota_deviation (DEPTH_QUOTA_TARGET 已移除)
+
         # 验证分布有效
         pi = stats['pi']
         assert len(pi) == 4
         assert abs(sum(pi) - 1.0) < 1e-5, f"Distribution sums to {sum(pi)}"
-        
+
         # 熵应该在有效范围内
         assert 0 <= stats['entropy'] <= stats['max_entropy']
 
@@ -252,12 +245,14 @@ class TestMathematicalValidation:
     def test_stratified_selection_covers_all_depths(self):
         """验证分层 Top-K 选择覆盖所有深度"""
         # I30-17-EXT: 使用新 API
+        # A1: 设置 use_dynamic_k=False 以使用静态 K 边界
         splitter = GumbelTopKSplitter(
             feature_dim=64,
             min_patch_size=8,
             max_depth_limit=4,
             K_min=8,
             K_max=32,
+            use_dynamic_k=False,  # 使用静态边界而非动态计算
             image_size=(64, 64),
         )
         

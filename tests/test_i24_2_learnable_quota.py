@@ -20,8 +20,10 @@ from vit_pytorch.constants import (
     QUOTA_MIN_PER_DEPTH,
     QUOTA_INIT_LOGITS,
     QUOTA_ENTROPY_WEIGHT,
-    DEPTH_QUOTA_TARGET,
 )
+
+# DEPTH_QUOTA_TARGET 硬编码值 (原常量已移除，I35 死代码清理)
+DEPTH_QUOTA_TARGET = (0.15, 0.20, 0.25, 0.40)
 
 
 class TestLearnableQuotaInit:
@@ -105,11 +107,24 @@ class TestQuotaAllocation:
         )
 
         # 即使 K 很小，也要保证下界
-        for K in [4, 8, 16, 32]:
+        # 注意: K 必须满足 K >= D * min_quota 才有可行解
+        # I34-2 修复: 当 K < D * min_quota 时，动态调整下界为 max(1, K // D)
+        for K in [8, 16, 32]:  # K=4 不满足 K >= D * min_quota = 8 的约束
             quota = splitter._compute_quota_allocation(K)
             for d in range(splitter._current_max_depth + 1):
                 assert quota[d].item() >= QUOTA_MIN_PER_DEPTH, \
                     f"K={K}, depth={d}, quota={quota[d]}"
+
+        # 额外测试: K=4 时验证动态下界调整
+        K = 4
+        quota = splitter._compute_quota_allocation(K)
+        D = splitter._current_max_depth + 1  # D=4
+        # 当 K=4, D=4, min_quota=2 时，约束 K >= D*min_quota 不满足
+        # I34-2 动态调整: effective_min_quota = max(1, K//D) = 1
+        expected_min = max(1, K // D)
+        for d in range(D):
+            assert quota[d].item() >= expected_min, \
+                f"K={K}: depth={d}, quota={quota[d]}, expected_min={expected_min}"
 
     def test_quota_proportional_to_target(self):
         """验证配额近似与目标分布成比例"""

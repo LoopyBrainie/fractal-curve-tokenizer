@@ -530,6 +530,7 @@ class TestI21DepthBalance:
 
         # I30-17-EXT: 使用新 API
         # 64x64 image, max_depth=3 -> min_patch_size = 64 / 2^3 = 8
+        # A1: 设置 use_dynamic_k=False 以使用静态 K 边界进行测试
         return GumbelTopKSplitter(
             feature_dim=64,
             min_patch_size=8,
@@ -539,6 +540,7 @@ class TestI21DepthBalance:
             temperature=1.0,
             K_min=8,
             K_max=32,
+            use_dynamic_k=False,  # 使用静态边界而非动态计算
             image_size=(64, 64),
         )
     
@@ -547,55 +549,29 @@ class TestI21DepthBalance:
         """创建测试特征。"""
         B, C, H, W = 2, 64, 16, 16
         return torch.randn(B, C, H, W)
-    
+
     # I30-4: 已移除 test_log_compensation_bias_shape
-    # I30-4: 已移除 test_log_compensation_bias_values  
+    # I30-4: 已移除 test_log_compensation_bias_values
     # I30-4: 已移除 test_log_compensation_monotonicity
     # Log-Compensation 已被方案E (可学习配额 + 分层Top-K) 完全替代
 
-    def test_depth_kl_loss_returns_tensor(self, splitter, features):
-        """测试 get_depth_kl_loss 返回有效张量。"""
-        splitter.train()
-        result = splitter(features)
-        
-        kl_loss = splitter.get_depth_kl_loss(
-            selected_mask=result.selected_mask
-        )
-        
-        assert isinstance(kl_loss, torch.Tensor)
-        assert kl_loss.dim() == 0  # 标量
-        assert kl_loss.item() >= 0  # KL 散度非负
-    
-    def test_depth_kl_loss_gradient_flow(self, splitter, features):
-        """测试 Depth KL Loss 有梯度流。"""
-        splitter.train()
-        result = splitter(features)
-        
-        kl_loss = splitter.get_depth_kl_loss(
-            selected_mask=result.selected_mask
-        )
-        
-        # 反向传播
-        kl_loss.backward()
-        
-        # 验证 MLP 参数有梯度
-        for name, param in splitter.complexity_mlp.named_parameters():
-            if param.requires_grad:
-                assert param.grad is not None, f"No gradient for {name}"
-    
-    def test_auxiliary_losses_includes_depth_kl(self, splitter, features):
-        """测试 get_auxiliary_losses 包含 depth_kl_loss。"""
+    def test_depth_kl_loss_method_removed(self, splitter):
+        """I35: get_depth_kl_loss 方法已移除 (死代码清理)。"""
+        assert not hasattr(splitter, 'get_depth_kl_loss'), "方法应已移除"
+
+    def test_auxiliary_losses_excludes_depth_kl(self, splitter, features):
+        """I35: 测试 get_auxiliary_losses 不包含 depth_kl_loss (已移除)。"""
         splitter.train()
         _ = splitter(features)  # 缓存 selected_mask
-        
+
         losses = splitter.get_auxiliary_losses(
             include_elastic_budget=True,
             include_soft_entropy=True,
         )
-        
-        assert 'depth_kl_loss' in losses
-        assert losses['depth_kl_loss'].item() >= 0
-    
+
+        # depth_kl_loss 应不在 losses 中
+        assert 'depth_kl_loss' not in losses, "depth_kl_loss 应被移除"
+
     def test_global_softmax_gradient_coverage(self, splitter, features):
         """
         测试全局 Softmax 梯度覆盖率 (I30-2)。

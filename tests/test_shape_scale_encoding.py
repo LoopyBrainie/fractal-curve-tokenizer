@@ -193,7 +193,8 @@ class TestShapeScaleEncoder:
         loss.backward()
 
         assert encoder.shape_scale_weight.grad is not None
-        assert encoder.shape_scale_weight.item() == 0.0  # 零初始化
+        # I35-2: 非零初始化 τ=0.1 确保训练初期有梯度回传
+        assert abs(encoder.shape_scale_weight.item() - 0.1) < 1e-6
 
     def test_zero_weight_disables_effect(self):
         """测试零权重禁用效果。"""
@@ -315,11 +316,12 @@ class TestLCAHilbertBiasWithShapeScale:
         )
 
         # 禁用时应该直接使用 LCA 偏置
-        # 注意: 由于 ShapeScaleEncoder 权重为 0，两者在数学上应该相等
+        # 注意: 由于 I35-2 使用非零初始化 (τ=0.1)，需要手动设为 0 进行比较
+        bias_module_ss.shape_scale_encoder.shape_scale_weight.data.fill_(0.0)
         bias_ss = bias_module_ss.forward_with_shape_scale(regions, image_size)
         bias_no_ss = bias_module_no_ss.forward_with_shape_scale(regions, image_size)
 
-        # 初始时两者应该相等 (因为 shape_scale_weight = 0)
+        # 设置 shape_scale_weight=0 后两者应该相等
         assert torch.allclose(bias_ss, bias_no_ss, atol=1e-6)
 
     def test_combined_bias_output(self):
@@ -339,8 +341,8 @@ class TestLCAHilbertBiasWithShapeScale:
 
         assert combined_bias.shape == (B, dim, N, N)
 
-    def test_zero_init_weight(self):
-        """测试零初始化权重。"""
+    def test_nonzero_init_weight(self):
+        """测试非零初始化权重 (I35-2: τ=0.1 确保梯度回传)。"""
         dim = 64
         max_depth = 8
 
@@ -352,7 +354,8 @@ class TestLCAHilbertBiasWithShapeScale:
 
         weight = bias_module.shape_scale_encoder.shape_scale_weight.item()
 
-        assert weight == 0.0
+        # I35-2: 非零初始化 τ=0.1 确保训练初期有梯度回传
+        assert abs(weight - 0.1) < 1e-6
 
     def test_gradient_flow_combined(self):
         """测试组合偏置的梯度流。"""
