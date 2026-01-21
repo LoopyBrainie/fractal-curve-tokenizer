@@ -981,31 +981,36 @@ class LayeredEvaluator:
         # 从 checkpoint 推断缺失的架构参数（向后兼容旧检查点）
         # I30-17: 使用 max_depth_limit 替代已废弃的 num_scales
         # 注意: FractalCurveViT 使用 num_scales 参数（兼容性），需要转换
+        # P11-2: 优先从检查点推断架构参数，忽略配置文件中的值（除非显式指定）
         num_scales = None  # 用于创建模型
-        if max_depth_limit is None:
-            # 尝试从 threshold_offsets 的 shape 检测 max_depth_limit
-            # threshold_offsets shape = max_depth_limit + 1
-            threshold_key = None
+
+        # 尝试从 threshold_offsets 的 shape 检测 max_depth_limit
+        # threshold_offsets shape = max_depth_limit + 1
+        threshold_key = None
+        for k in state_dict.keys():
+            if 'threshold_offsets' in k:
+                threshold_key = k
+                break
+        if threshold_key is not None:
+            detected_max_depth = state_dict[threshold_key].shape[0] - 1
+            print(f"Detected max_depth_limit={detected_max_depth} from checkpoint key '{threshold_key}'")
+            # 优先使用检测到的值（从检查点加载时）
+            max_depth_limit = detected_max_depth
+        else:
+            # 兼容旧检查点：尝试从 depth_scale_raw 推断
+            depth_scale_key = None
             for k in state_dict.keys():
-                if 'threshold_offsets' in k:
-                    threshold_key = k
+                if '_depth_scale_raw' in k:
+                    depth_scale_key = k
                     break
-            if threshold_key is not None:
-                max_depth_limit = state_dict[threshold_key].shape[0] - 1
-                print(f"Detected max_depth_limit={max_depth_limit} from checkpoint key '{threshold_key}'")
+            if depth_scale_key is not None:
+                # 旧格式: num_scales = max_depth_limit + 1
+                num_scales_old = state_dict[depth_scale_key].shape[0]
+                max_depth_limit = num_scales_old - 1
+                print(f"Detected max_depth_limit={max_depth_limit} (from legacy num_scales={num_scales_old})")
             else:
-                # 兼容旧检查点：尝试从 depth_scale_raw 推断
-                depth_scale_key = None
-                for k in state_dict.keys():
-                    if '_depth_scale_raw' in k:
-                        depth_scale_key = k
-                        break
-                if depth_scale_key is not None:
-                    # 旧格式: num_scales = max_depth_limit + 1
-                    num_scales_old = state_dict[depth_scale_key].shape[0]
-                    max_depth_limit = num_scales_old - 1
-                    print(f"Detected max_depth_limit={max_depth_limit} (from legacy num_scales={num_scales_old})")
-                else:
+                # 使用配置文件中的值或默认值
+                if max_depth_limit is None:
                     max_depth_limit = 4  # 默认值 (对应旧 num_scales=5)
                     print(f"Warning: Could not detect max_depth_limit from checkpoint, using default {max_depth_limit}")
 
