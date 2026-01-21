@@ -405,9 +405,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         
         # 3. 纯张量嵌入
         # I30-11: 传递 raw_probs 用于构建 padded_split_probs
-        raw_probs = split_result.probs if isinstance(split_result, GumbelTopKResult) else None
+        # I78: 传递 max_tokens (continuous_tokens.shape[1]) 修复未定义错误
         tokens, levels_info, padded_regions, padded_split_probs = self._embed_with_tensor_result(
-            features, tensor_result, raw_probs
+            features, tensor_result, raw_probs, max_tokens=max_tokens
         )
         
         # 4. 构建输出 (P-OPT-4: 向量化输出构建，避免 Python for 循环)
@@ -730,6 +730,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         features: torch.Tensor,
         tensor_result: "TensorSplitResult",
         raw_probs: Optional[torch.Tensor] = None,
+        max_tokens: int = 1,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """使用 TensorSplitResult 进行嵌入 (P9-1 完全向量化版本).
 
@@ -753,7 +754,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         Args:
             features: [B, C, H', W'] 预计算的特征图
             tensor_result: TensorSplitResult 纯张量分割结果
-            
+            max_tokens: int 实际输出的 token 数量 (来自 get_continuous_tokens)
+
         Returns:
             (tokens, levels_info, padded_regions):
             - tokens: [B, MaxN, D] 嵌入后的 tokens
@@ -775,8 +777,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             padded_regions = torch.zeros(B, 1, 4, dtype=torch.long, device=device)
             return self.patch_embed.norm(tokens), levels_info, padded_regions
 
-        # I78: max_tokens 已在调用 get_continuous_tokens 后确定 (见第 658 行)
-        # 无需重新计算
+        # I78: max_tokens 由调用者从 continuous_tokens.shape[1] 传入
+        # 避免重复计算，确保与实际输出形状一致
 
         # ====================================================================
         # 构建 ROI boxes (纯张量操作)
