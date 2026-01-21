@@ -404,7 +404,19 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         }
 
         # I78: 计算 max_tokens 用于 _embed_with_tensor_result
-        max_tokens = max(num_tokens_list) if num_tokens_list else 1
+        # I78 FIX: 添加断言确保 max_tokens >= 1
+        if not num_tokens_list:
+            max_tokens = 1
+        else:
+            max_tokens = max(num_tokens_list)
+            if max_tokens <= 0:
+                max_tokens = 1  # 确保至少为1
+
+        # I78 DEBUG: 打印诊断信息
+        import sys
+        debug_mode = getattr(sys, '_fractal_debug', False)
+        if debug_mode:
+            print(f"[DEBUG] tokenize: B={B}, N_total={N_total}, num_tokens_list={num_tokens_list}, max_tokens={max_tokens}")
 
         # 3. 纯张量嵌入
         # I30-11: 传递 raw_probs 用于构建 padded_split_probs
