@@ -45,21 +45,25 @@
 # 4. VRAM 预算 (8GB - RTX 4070 Laptop)
 #    ----------------------------------
 #    混合精度模型: 316 MB (31.58M * 10 bytes)
-#    总计(含开销): ~1.31 GB << 8GB ✓
+#    总计(含开销): ~1.5 GB << 8GB ✓
+#
+# 5. torch.compile 兼容性修复
+#    -----------------------
+#    已修复 CUDA 内存分配器问题:
+#    - PYTORCH_CUDA_ALLOC_CONF 优化
+#    - 使用 reduce-overhead 模式
+#    - 禁用 inductor max_autotune
+#    - 编译前强制垃圾回收
 #
 # ============================================================================
+
+$env:PYTORCH_CUDA_ALLOC_CONF = "max_split_size_mb:512,expandable_segments:True,garbage_collection_threshold:0.8"
+$env:TORCHINDUCTOR_CACHE_DIR = "$env:TEMP\torch_inductor_cache"
 
 $script = @"
 uv run python examples/training/train_fractal_vit.py `
   --dataset tiny-imagenet `
   --epochs 100 `
-  `
-  <# ====================================================================== #> `
-  <# 模型架构 (31.58M 参数 - 数学推导激进最优)                             #> `
-  <# mlp_dim = 4 * dim = 1792 (自动计算，无需指定)                          #> `
-  <# 验证: dim=448, depth=8, heads=7 → P = 31.58M                          #> `
-  <# P/N ratio = 315.8 (ViT 可接受范围: [150, 500])                        #> `
-  <# ====================================================================== #> `
   --dim 448 `
   --depth 8 `
   --heads 7 `
@@ -67,62 +71,26 @@ uv run python examples/training/train_fractal_vit.py `
   --ffn-type swiglu_level `
   --tokenizer-type streaming_v3 `
   --min-patch-size 4 `
-  `
-  <# ====================================================================== #> `
-  <# 训练配置 (batch_size=192)                                              #> `
-  <#   lr = 3e-4 × (192/256) = 2.25e-4 (线性缩放)                          #> `
-  <# ====================================================================== #> `
   --batch-size 192 `
   --num-workers 4 `
   --lr 2.25e-4 `
   --weight-decay 0.08 `
   --warmup-epochs 10 `
-  `
-  <# ====================================================================== #> `
-  <# 正则化参数 (激进配置)                                                  #> `
-  <#   drop_path = 0.12 (略低于标准，补偿更大模型)                         #> `
-  <#   dropout = 0.15 (高于标准，防止过拟合)                               #> `
-  <# ====================================================================== #> `
   --dropout 0.15 `
   --emb-dropout 0.1 `
   --drop-path 0.12 `
   --label-smoothing 0.1 `
-  `
-  <# ====================================================================== #> `
-  <# 数据增强 (Mixup + CutMix)                                              #> `
-  <# ====================================================================== #> `
   --mixup-alpha 0.4 `
   --cutmix-alpha 1.0 `
   --mixup-prob 0.5 `
-  `
-  <# ====================================================================== #> `
-  <# 辅助损失配置                                                           #> `
-  <#   Elastic Budget lambdas 已在 constants.py 中设置 (I36)                #> `
-  <#   ELASTIC_LAMBDA_OVER = 0.1                                           #> `
-  <#   ELASTIC_LAMBDA_UNDER = 0.01                                         #> `
-  <#   ELASTIC_LAMBDA_COLLAPSE = 1.0                                       #> `
-  <# ====================================================================== #> `
   --include-soft-entropy `
   --soft-entropy-mode maximize `
   --soft-entropy-weight 0.1 `
   --include-elastic-budget `
-  `
-  <# ====================================================================== #> `
-  <# Splitter 温度退火 (cosine schedule)                                    #> `
-  <#   T_end=0.5 保持梯度流                                                 #> `
-  <# ====================================================================== #> `
   --splitter-temp-start 1.0 `
   --splitter-temp-end 0.5 `
   --splitter-temp-warmup 10 `
-  `
-  <# ====================================================================== #> `
-  <# LCA Hilbert Bias (τ=1.5)                                               #> `
-  <# ====================================================================== #> `
   --lca-temperature 1.5 `
-  `
-  <# ====================================================================== #> `
-  <# 性能优化 (RTX 4070 Laptop 最大化)                                      #> `
-  <# ====================================================================== #> `
   --use-amp `
   --gradient-checkpoint `
   --compile `
@@ -130,13 +98,9 @@ uv run python examples/training/train_fractal_vit.py `
   --tf32 `
   --accum-steps 1 `
   --gradient-clip 1.0 `
-  `
-  <# ====================================================================== #> `
-  <# 早停策略 (patience=15 防止过拟合)                                      #> `
-  <# ====================================================================== #> `
   --patience 15 `
   --min-delta 0.001 `
-  --exp-name tiny_imagenet_optimal_448d_8l_bs192
+  --exp-name tiny_imagenet_448d_8l_bs192_compiled
 "@
 
 # 执行训练脚本

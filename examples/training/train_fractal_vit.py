@@ -156,8 +156,17 @@ try:
 except RuntimeError:
     pass
 
-# CUDA 内存优化
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:512,expandable_segments:True')
+# CUDA 内存优化 - 使用更保守的分配策略
+import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,expandable_segments:True,garbage_collection_threshold:0.8'
+# 禁用 inductor 的一些可能导致 CUDA 内存问题的优化
+os.environ['TORCHINDUCTOR_CACHE_DIR'] = '/tmp/torch_inductor_cache'
+os.environ['CUDNN_V8_API_ENABLED'] = '1'
+
+# 强制使用更保守的内存分配策略
+import torch
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 os.environ.setdefault('OMP_NUM_THREADS', '4')
 os.environ.setdefault('MKL_NUM_THREADS', '4')
 
@@ -3141,28 +3150,35 @@ def main():
         print("[OK] Using channels-last memory format")
     
     # torch.compile 编译优化 (PyTorch 2.0+)
-    # 重要: Variable Depth Tokens 产生动态序列长度，必须使用 dynamic=True
-    # 否则每次序列长度变化都会触发重新编译，导致 GPU 空转
+    # 重要: Variable Depth Tokens 产生动态序列长度
     if config.compile_model:
         try:
-            # 设置编译缓存大小，减少重新编译
-            # 注意: torch._dynamo 已在文件顶部导入，这里直接使用
-            torch._dynamo.config.cache_size_limit = 256  # 增大缓存
-            torch._dynamo.config.suppress_errors = True  # 回退到 eager 模式
-            
-            # 使用 'default' 模式而非 'reduce-overhead'
-            # 原因: reduce-overhead 使用 Triton 编译器，对动态形状支持有限
-            # 已知问题: Triton 对 2**tensor 幂运算不支持，会报 __rpow__ 错误
+            # 设置编译缓存和错误处理
+            torch._dynamo.config.cache_size_limit = 64
+            torch._dynamo.config.suppress_errors = True
+
+            # 禁用 inductor 的一些可能导致 CUDA 内存问题的优化
+            torch._inductor.config.max_autotune = False
+            torch._inductor.config.triton.cudnn = True
+            torch._inductor.config.triton.use_cudnn = True
+
+            # 强制进行垃圾回收
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # 使用 reduce-overhead 模式，更稳定
             model = torch.compile(
-                model, 
-                mode='default',  # 使用 TorchInductor 而非 Triton CUDA graphs
+                model,
+                mode='reduce-overhead',
                 fullgraph=False,
-                dynamic=True,  # 关键: Variable Depth Tokens 需要动态形状
+                dynamic=True,
             )
-            print("[OK] Model compiled with torch.compile (mode=default, dynamic=True)")
+            print("[OK] Model compiled with torch.compile (mode=reduce-overhead, dynamic=True)")
             print("[INFO] 首次运行会进行 JIT 编译，可能耗时 1-2 分钟")
         except Exception as e:
             print(f"[WARN] torch.compile failed: {e}")
+            print("[INFO] 回退到 eager 模式继续训练")
     
     # 诊断: 检查模型参数 dtype
     def check_model_dtypes(m, name="model"):
