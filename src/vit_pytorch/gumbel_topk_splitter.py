@@ -81,10 +81,14 @@ from .constants import (
     # I23-1 方案C: 深度方差归一化
     DEPTH_VARIANCE_NORM_ENABLED,
     DEPTH_VARIANCE_NORM_EPS,
+    DEPTH_VARIANCE_INIT_EPS,  # I96-1: EMA 初始化下界
     DEPTH_EMA_ALPHA,  # I35: EMA 系数
+    SOFT_EXCLUSION_MARGIN,  # I96-4: 树一致性软排除边距
     # I24-2 方案E: 可学习配额
     LEARNABLE_QUOTA_ENABLED,
     QUOTA_MIN_PER_DEPTH,
+    QUOTA_MIN_RATIO,  # I96-7: 自适应深度下界最小采样比例
+    QUOTA_MIN_LAMBDA,  # I96-7: 下界软正则化权重
     QUOTA_INIT_LOGITS,
     QUOTA_ENTROPY_WEIGHT,
     # I29-2: 阈值方差正则化
@@ -164,19 +168,26 @@ class GumbelTopKSplitter(nn.Module):
 
     核心优势:
         1. 100% Hilbert 局部性: 每个 token 精确对应一个四叉树区域
-        2. 100% 梯度覆盖: STE 使所有候选都有梯度
+        2. K/N 有效梯度覆盖 (~37.6%): STE 使所有候选有梯度信号，但未选中 token 梯度衰减约 20 倍
         3. 无串行依赖: 并行评估所有 85 个候选
         4. 树一致性: 向量化 O(1) 约束
 
     I30-10: 支持 SplitterConfig 统一配置
 
+    数学说明 (I96-6):
+        STE 前向: st_mask = hard_mask - soft_mask.detach() + soft_mask
+        梯度计算: ∂st_mask_i/∂z_i = p_i(1-p_i)，其中 p_i = softmax(z)_i
+        量化分析 (K=32, N=85):
+            - 选中 token: p_i ≈ 0.38, 梯度 ~ 0.24
+            - 未选中 token: p_i ≈ 0.012, 梯度 ~ 0.012 (衰减 ~20x)
+
     与 LearnableSplitter 对比:
-        | 指标 | LearnableSplitter | GumbelTopKSplitter |
-        |------|-------------------|-------------------|
-        | Hilbert 局部性 | 100% | 100% |
-        | 梯度覆盖 | ~25% (BFS 串行) | 100% (并行) |
-        | 串行依赖 | 有 | 无 |
-        | 计算开销 | 1.0x | ~4x |
+        | 指标               | LearnableSplitter | GumbelTopKSplitter |
+        |--------------------|-------------------|--------------------|
+        | Hilbert 局部性     | 100%              | 100%               |
+        | 有效梯度覆盖       | ~25%              | ~37.6% (K/N)       |
+        | 串行依赖           | 有                | 无                 |
+        | 计算开销           | 1.0x              | ~4x                |
     """
 
     def __init__(
@@ -806,9 +817,10 @@ class GumbelTopKSplitter(nn.Module):
 
                 # 对于小 batch，使用更大的安全边界
                 if B <= 2:
-                    # B=1 或 B=2 时，方差估计不可靠，使用保守值
-                    safe_var = safe_var.clamp(min=0.1)  # 保守下界
-                    print(f"Warning: Small batch (B={B}), using conservative EMA variance initialization")
+                    # I96-1: 使用 DEPTH_VARIANCE_INIT_EPS 替代硬编码 0.1
+                    # 5个数量级差异确保初始化bias不会持续存在
+                    safe_var = safe_var.clamp(min=DEPTH_VARIANCE_INIT_EPS)
+                    print(f"Warning: Small batch (B={B}), using conservative EMA variance initialization (eps={DEPTH_VARIANCE_INIT_EPS})")
 
                 self._depth_ema_mean[:D] = mu_depth.detach()
                 self._depth_ema_var[:D] = safe_var
@@ -926,7 +938,8 @@ class GumbelTopKSplitter(nn.Module):
         # ====================================================================
         # Step 3: 树一致性约束
         # ====================================================================
-        consistent_mask = self._enforce_tree_consistency(selected_mask, topk_indices)
+        # I96-4: 传递 training 参数以区分软边距/硬边距
+        consistent_mask = self._enforce_tree_consistency(selected_mask, topk_indices, training=self.training)
         # consistent_mask: [B, N] (排除有子节点被选中的父节点)
         
         # ====================================================================
@@ -1200,13 +1213,16 @@ class GumbelTopKSplitter(nn.Module):
         # I35 Fix: 切片到当前深度维度，避免 quota_logits (max_depth+1) 与
         # _current_max_depth+1 不匹配的问题
         p = F.softmax(self.quota_logits[:D], dim=0)  # [D]
-        min_quota = self._quota_min_per_depth
 
         # 初始四舍五入
         quota = (p * K).round().long()
 
-        # 下界钳制
-        quota = quota.clamp(min=min_quota)
+        # I96-7 FIX: 移除硬下界约束，改用软正则化
+        # 原因: 硬约束 (K_d >= 2) 存在数学问题:
+        #   1. 深度 0: N_0=1 < K_0^min=2 (不可行)
+        #   2. 浅层过度表示: 深度 1 采样率是深度 4 的 64 倍
+        # 解决方案: 不使用硬下界，下界通过 _compute_quota_loss 中的软正则化实现
+        # quota = quota.clamp(min=min_quota)  # 已移除
 
         # I32-3: 迭代微调确保 ΣK_d = K (最多 D 次)
         for _ in range(D):
@@ -1223,8 +1239,9 @@ class GumbelTopKSplitter(nn.Module):
                 for i in range(min(diff, D)):
                     quota[indices[i]] += 1
             else:
-                # 超出时：从概率最低且高于下界的深度扣减
-                mask = quota > min_quota
+                # 超出时：从概率最低的深度扣减（无硬下界）
+                # I96-7: 允许扣减到 0，下界通过软正则化实现
+                mask = quota > 0
                 if mask.sum() > 0:
                     # 获取可扣减的深度及其概率
                     available_p = p[mask]
@@ -1238,7 +1255,83 @@ class GumbelTopKSplitter(nn.Module):
                         quota[idx] -= 1
 
         return quota
-    
+
+    def _compute_quota_loss(self, K: int) -> Tensor:
+        """
+        计算软配额正则化损失 (I96-3 方案F)。
+
+        数学形式化
+        ==========
+
+        问题定义:
+            在 STE 框架下，K_d 的离散选择不参与梯度计算
+            需要通过额外损失为 quota_logits 提供梯度
+
+        解决方案:
+            L_quota = λ × MSE(K_soft, K_hard)
+            其中:
+                K_soft = π_d × K (软配额，有梯度)
+                K_hard = round(K_soft) (硬配额，用于实际选择)
+
+        梯度流:
+            ∂L_quota/∂φ_d = 2λ × (K_soft_d - K_hard_d) × K
+
+        优势:
+            - 配额参数 φ 通过损失回传梯度
+            - 不改变硬选择逻辑（保持 Hilbert 局部性）
+            - 实现简单，无需修改核心代码
+
+        Args:
+            K: 总 token 配额
+
+        Returns:
+            quota_loss: 标量张量，软配额正则化损失
+        """
+        D = self._current_max_depth + 1
+
+        # 如果未启用可学习配额，返回 0
+        if self.quota_logits is None or not self._enable_learnable_quota:
+            return torch.tensor(0.0, device=self.candidate_depths.device)
+
+        # 计算软配额 (有梯度)
+        p = F.softmax(self.quota_logits[:D], dim=0)  # [D], 有梯度
+        K_soft = p * K  # [D], 软配额
+
+        # 计算硬配额 (无梯度，用于比较)
+        K_hard = K_soft.detach().round().long()  # [D], .detach() 避免双重计算
+
+        # I96-8: 使用相对 MSE 损失实现跨深度可比
+        # 问题: 绝对 MSE 损失使深层 (K_d ≈ 1) 惩罚过轻，浅层 (K_d ≈ 16) 惩罚过重
+        # 解决方案: L_rel = Σ ((K_soft - K_hard) / (K_soft + ε))²
+        eps = 1e-6
+        relative_diff = (K_soft - K_hard.float()) / (K_soft.abs() + eps)
+        loss = (relative_diff ** 2).mean()
+
+        # I96-3: 乘以权重系数，与主损失量级匹配
+        loss = loss * QUOTA_ENTROPY_WEIGHT  # 使用已有的常量
+
+        # I96-7: 软下界正则化损失
+        # 数学: L_min = λ × Σ max(0, K_d^min - K_d)²
+        # 其中 K_d^min = max(1, α × N_d), N_d = 4^d
+        # 目的: 鼓励但不强制深度下界，软约束允许模型学习最优分布
+        # 优势: 无约束满足问题，梯度完整，保持 Hilbert 曲线局部性
+        K_soft_float = K_soft.float()  # 转换为浮点用于计算
+        K_min_targets = []
+        for d in range(D):
+            N_d = 4 ** d  # 深度 d 的候选数量
+            K_min_d = max(1, int(QUOTA_MIN_RATIO * N_d))
+            K_min_targets.append(K_min_d)
+        K_min_tensor = torch.tensor(K_min_targets, device=K_soft.device, dtype=K_soft_float.dtype)
+
+        # 计算下界违反: max(0, K_min - K_soft)
+        violation = (K_min_tensor - K_soft_float).clamp(min=0)
+        min_loss = (violation ** 2).mean()
+
+        # 添加软下界损失 (使用独立的 QUOTA_MIN_LAMBDA 权重)
+        loss = loss + min_loss * QUOTA_MIN_LAMBDA
+
+        return loss
+
     def _stratified_gumbel_topk_ste(
         self,
         logits: Tensor,
@@ -1458,22 +1551,24 @@ class GumbelTopKSplitter(nn.Module):
         self,
         selected_mask: Tensor,
         topk_indices: Tensor,
+        training: bool = True,
     ) -> Tensor:
         """
         强制树一致性约束 (向量化)。
-        
+
         数学形式化:
             约束: ∀i ∈ selected: parent(i) ∉ selected
             即: 若子节点被选中，则父节点不应被选中
-            
+
         向量化实现:
             1. 对每个节点，检查其任意子节点是否被选中
             2. 若有子节点被选中，则该节点不能被选中
-            
+
         Args:
             selected_mask: [B, N] STE 选择掩码
             topk_indices: [B, K] 硬选择索引
-            
+            training: 是否在 training 模式 (软边距 vs 硬边距)
+
         Returns:
             consistent_mask: [B, N] 树一致的选择掩码
         """
@@ -1491,42 +1586,53 @@ class GumbelTopKSplitter(nn.Module):
 
         # 安全索引 (将 -1 替换为 0)
         safe_children = children_matrix.clamp(min=0)  # [N, 4]
-        
+
         # ====================================================================
         # I22-1 方案A+: 向量化树一致性检查
-        # 
+        # I96-4 改进: 软边距排除机制
+        #
         # 数学约束: ∀i ∈ selected: parent(i) ∉ selected
         # 等价表述: 若任意子节点被选中，则父节点不应被选中
-        # 
-        # 注: 使用 hard_selected 进行约束检查是正确的，因为树一致性
-        #     是后处理约束，不需要梯度反向传播到排除决策本身。
-        #     梯度应该流向子节点的选择决策，而非父节点的排除。
-        # 
-        # 未来改进 (方案C): 可考虑对 exclusion_mask 应用 STE，
-        #     使梯度可以流向父节点决策，见 IMPROVEMENT_PLAN.md I22-1-C
+        #
+        # I96-4 软边距机制:
+        #   - 仅在 training 模式下使用软边距
+        #   - inference 模式下使用硬边距 (0)，保证 0/1 输出
+        #   - 使用 .detach() 避免排除决策接收梯度 (避免梯度双计)
+        #   - 软边距: clamp(min=SOFT_EXCLUSION_MARGIN) 保持最小梯度流 (10%)
+        #   - 数学: p_out = p × max(1 - Σ child_signal, ε)
+        #   - 梯度: ∂p_out/∂p_i ≥ ε > 0，确保父节点有梯度回传
+        #
+        # 对比原实现:
+        #   原: exclusion_mask = 1.0 - has_child_selected (梯度=0)
+        #   新: exclusion_mask.clamp(min=ε) (梯度≥ε) - 仅 training 模式
         # ====================================================================
-        
-        # 使用硬掩码进行约束检查
-        hard_selected = (selected_mask > 0.5).float()
-        
+
+        # 使用硬掩码进行约束检查 (I96-4: 添加 .detach() 避免梯度双计)
+        hard_selected = (selected_mask > 0.5).float().detach()
+
         # 获取所有子节点的选择状态
         # safe_children: [N, 4], 值范围 [0, N-1]
         # hard_selected[:, safe_children]: [B, N, 4]
         children_selected_status = hard_selected[:, safe_children]  # [B, N, 4]
-        
+
         # 将无效子节点的状态设为 0
         valid_children_mask = valid_children.unsqueeze(0).expand(B, -1, -1)  # [B, N, 4]
         children_selected_status = children_selected_status * valid_children_mask.float()
-        
-        # 检查是否有任意子节点被选中
-        has_child_selected = (children_selected_status.sum(dim=2) > 0)  # [B, N]
-        
-        # 树一致性: 若有子节点被选中，则该节点不被选中
-        exclusion_mask = 1.0 - has_child_selected.float()  # [B, N]
-        
+
+        # 计算子节点选中信号 (累积而非 max，保持更多信息)
+        child_signal = children_selected_status.sum(dim=2).clamp(max=1.0)  # [B, N]
+
+        # I96-4: 仅在 training 模式下使用软边距
+        if training:
+            # 软边距排除: p_out = p × max(1 - child_signal, ε)
+            exclusion_mask = (1.0 - child_signal).clamp(min=SOFT_EXCLUSION_MARGIN)  # [B, N]
+        else:
+            # Inference 模式: 硬边距，保证 0/1 输出
+            exclusion_mask = 1.0 - child_signal  # [B, N]
+
         # 应用排除
         consistent_mask = selected_mask * exclusion_mask
-        
+
         return consistent_mask
     
     def _build_result(

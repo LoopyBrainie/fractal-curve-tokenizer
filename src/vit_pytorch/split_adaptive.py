@@ -479,33 +479,41 @@ class SplitResult:
 class ShallowCandidateProbs:
     """
     I10-19: 浅层并行评估的候选概率信息
-    
+
     数学形式化
     ==========
-    
+
     连续松弛需要:
         1. 候选区域坐标 (预计算)
         2. 分割概率 p_split
         3. 累积概率 α(R) = ∏_{ancestors} p_split
-        
+
     与TensorSplitResult的区别:
         - TensorSplitResult: 离散决策后的叶节点
         - ShallowCandidateProbs: 所有候选的概率信息
-        
+
     用途:
         在FractalTokenizer中计算embeddings并融合连续tokens
+
+    I78-2 扩展: 添加 selected_mask 支持
+        - 允许直接使用 GumbelTopKSplitter 的选择结果
+        - 替换旧的 threshold 机制
     """
-    
+
     candidate_regions: Tensor      # [N_candidates, 4] 所有候选区域坐标
     candidate_depths: Tensor       # [N_candidates] 候选深度
     probs: Tensor                  # [B, N_candidates] 分割概率
     cumulative_probs: Tensor       # [B, N_candidates] 累积概率
     parent_indices: Tensor         # [N_candidates] 父节点索引 (-1=root)
     hilbert_indices: Tensor        # [N_candidates] Hilbert索引
-    
+
+    # I78-2 扩展: GumbelTopKSplitter 选择结果 (可选字段)
+    selected_mask: Optional[Tensor] = None  # [B, N_candidates] STE 选择掩码
+    num_selected_per_batch: Optional[Tensor] = None  # [B] 每个 batch 选中的 token 数
+
     # 元信息
-    max_depth_parallel: int        # 并行评估深度
-    image_size: Tuple[int, int]    # 图像尺寸
+    max_depth_parallel: int = 0        # 并行评估深度
+    image_size: Tuple[int, int] = (64, 64)    # 图像尺寸
     
     @property
     def device(self) -> torch.device:

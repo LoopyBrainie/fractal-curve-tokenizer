@@ -411,9 +411,12 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         # 3. 纯张量嵌入
         # I30-11: 传递 raw_probs 用于构建 padded_split_probs
+        # I78-2: 传递 selected_mask 用于替换 threshold 机制
         raw_probs = split_result.probs if isinstance(split_result, GumbelTopKResult) else None
+        selected_mask = split_result.selected_mask if isinstance(split_result, GumbelTopKResult) else None
         tokens, levels_info, padded_regions, padded_split_probs = self._embed_with_tensor_result(
-            features, tensor_result, raw_probs, max_tokens=max_tokens
+            features, tensor_result, raw_probs, max_tokens=max_tokens,
+            selected_mask=selected_mask
         )
         
         # 4. 构建输出 (P-OPT-4: 向量化输出构建，避免 Python for 循环)
@@ -637,62 +640,101 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         candidate_embeddings = pooled * scales.unsqueeze(0).unsqueeze(-1) + embeds.unsqueeze(0)
         
         # =====================================================================
-        # Step 2: 连续加权融合
-        # 使用ShallowParallelEvaluator的get_continuous_tokens方法
+        # Step 2: I78-2 修复 - 使用 GumbelTopKSplitter.selected_mask 而非 threshold
         #
-        # I10-18增强: 传递threshold参数控制token数量
-        # I18-3修复: 提高训练threshold从0.01到0.1
-        #   - threshold=0.01 导致所有85个候选都通过 (cumulative_prob > 0.01)
-        #   - threshold=0.1 可以有效过滤低权重候选，预期30-60 tokens
-        #   - 梯度流通过累积概率保持，无需所有候选都显式保留
+        # 数学正确性:
+        #   - selected_mask 来自 GumbelTopKSplitter，精确对应 K 预算约束
+        #   - 直接索引 candidate_embeddings，保持 Hilbert 序
+        #   - 梯度流完整通过 STE
+        #
+        # 替换旧的 threshold 机制:
+        #   threshold = 0.1
+        #   continuous_tokens = self.splitter.shallow_evaluator.get_continuous_tokens(...)
         # =====================================================================
-        threshold = 0.1 if self.training else 0.1  # 训练和推理使用相同阈值保证一致性
+        # 检查 probs_result 是否包含 selected_mask (来自 GumbelTopKSplitter)
+        if hasattr(probs_result, 'selected_mask') and probs_result.selected_mask is not None:
+            # 新路径 (I78-2): 直接使用 GumbelTopKSplitter.selected_mask
+            selected_mask = probs_result.selected_mask  # [B, N_candidates]
+            num_tokens_per_batch = probs_result.num_selected_per_batch  # [B]
 
-        # I78: 使用 get_continuous_tokens 的实际输出形状确定 max_tokens
-        # 修复之前的 bug：使用 tensor_result.tokens_per_batch.max() 但 get_continuous_tokens
-        # 可能输出更多/更少的 token，导致 padded_tokens 形状与 lengths 不匹配
-        continuous_tokens, token_weights = self.splitter.shallow_evaluator.get_continuous_tokens(
-            features=features,                          # [B, C, H_feat, W_feat]
-            embeddings=candidate_embeddings,            # [B, N_candidates, D]
-            probs=probs_result.probs,                   # [B, N_candidates]
-            cumulative_probs=probs_result.cumulative_probs,  # [B, N_candidates]
-            embed_dim=dim,                              # D
-            threshold=threshold,
-        )  # [B, N_output, D], [B, N_output]
+            B_out, N_out = selected_mask.shape
+            max_K = int(num_tokens_per_batch.max().item())
 
-        # I78: 从实际输出形状获取 max_tokens，修复 token 数量不匹配问题
-        max_tokens = continuous_tokens.shape[1]
-        
-        # N_output 是实际输出token数量 (通常小于N_candidates)
-        B_out, N_output, D_out = continuous_tokens.shape
-        assert B_out == B and D_out == dim
-        
-        # =====================================================================
-        # Step 3: 构建输出
-        # I18-3 修复: 使用实际有效token数而非输出张量维度
-        # =====================================================================
-        # 从 evaluator 缓存获取每个batch的有效token数
-        if hasattr(self.splitter.shallow_evaluator, '_last_valid_counts'):
-            valid_counts = self.splitter.shallow_evaluator._last_valid_counts  # [B]
-            num_tokens_list = valid_counts.tolist()
+            # 构建输出张量 [B, max_K, D]
+            continuous_tokens = torch.zeros(
+                B, max_K, dim, device=device, dtype=candidate_embeddings.dtype
+            )
+            token_weights = torch.zeros(B, max_K, device=device, dtype=torch.float32)
+
+            for b in range(B):
+                # 提取选中的 token indices
+                selected_indices = selected_mask[b].nonzero(as_tuple=True)[0]  # [K_b]
+                K_b = len(selected_indices)
+
+                if K_b > 0:
+                    # 填充选中的 embeddings
+                    continuous_tokens[b, :K_b] = candidate_embeddings[b, selected_indices]
+                    token_weights[b, :K_b] = 1.0
+
+            # 更新 N_output 用于后续步骤
+            N_output = max_K
+            num_tokens_list = num_tokens_per_batch.cpu().tolist()
+
+            # 构建 levels_info [B, max_K, max_depth+1]
+            levels_info = torch.zeros(
+                B, max_K, self.max_depth + 1, dtype=torch.long, device=device
+            )
+
+            # 填充深度信息
+            candidate_depths = probs_result.candidate_depths  # [N_candidates]
+            for b in range(B):
+                selected_indices = selected_mask[b].nonzero(as_tuple=True)[0]
+                K_b = len(selected_indices)
+                if K_b > 0:
+                    levels_info[b, :K_b, 0] = candidate_depths[selected_indices].clamp(max=self.max_depth)
+
+            # 构建 padded_regions [B, max_K, 4]
+            padded_regions = torch.zeros(B, max_K, 4, dtype=torch.long, device=device)
+            for b in range(B):
+                selected_indices = selected_mask[b].nonzero(as_tuple=True)[0]
+                K_b = len(selected_indices)
+                if K_b > 0:
+                    padded_regions[b, :K_b] = candidate_regions[selected_indices]
         else:
-            # Fallback: 使用 token_weights 计算有效数量
-            # 有效token的weight > 0 (非padding)
-            num_tokens_list = (token_weights > PROB_EPSILON).sum(dim=1).tolist()
-        
-        # levels_info: 使用evaluator缓存的深度信息
-        # I10-18增强: 从get_continuous_tokens获取实际深度
-        levels_info = torch.zeros(B, N_output, self.max_depth + 1, dtype=torch.long, device=device)
-        
-        if hasattr(self.splitter.shallow_evaluator, '_last_token_depths'):
-            token_depths = self.splitter.shallow_evaluator._last_token_depths  # [B, N_output]
-            # levels_info[:, :, 0] 存储深度值
-            levels_info[:, :, 0] = token_depths.clamp(max=self.max_depth)
-        
-        # padded_regions: 使用候选区域的前N_output个
-        padded_regions = torch.zeros(B, N_output, 4, dtype=torch.long, device=device)
-        padded_regions[:, :, :] = candidate_regions[:N_output].unsqueeze(0).expand(B, -1, -1)
-        
+            # 旧路径 (回退): 使用 threshold 机制
+            # 注意: 这条路径应该不再使用，保留仅用于兼容
+            threshold = 0.1 if self.training else 0.1
+
+            continuous_tokens, token_weights = self.splitter.shallow_evaluator.get_continuous_tokens(
+                features=features,
+                embeddings=candidate_embeddings,
+                probs=probs_result.probs,
+                cumulative_probs=probs_result.cumulative_probs,
+                embed_dim=dim,
+                threshold=threshold,
+            )
+
+            max_tokens = continuous_tokens.shape[1]
+            B_out, N_output, D_out = continuous_tokens.shape
+            assert B_out == B and D_out == dim
+
+            # 从 evaluator 缓存获取每个batch的有效token数
+            if hasattr(self.splitter.shallow_evaluator, '_last_valid_counts'):
+                valid_counts = self.splitter.shallow_evaluator._last_valid_counts
+                num_tokens_list = valid_counts.tolist()
+            else:
+                num_tokens_list = (token_weights > PROB_EPSILON).sum(dim=1).tolist()
+
+            # levels_info
+            levels_info = torch.zeros(B, N_output, self.max_depth + 1, dtype=torch.long, device=device)
+            if hasattr(self.splitter.shallow_evaluator, '_last_token_depths'):
+                token_depths = self.splitter.shallow_evaluator._last_token_depths
+                levels_info[:, :, 0] = token_depths.clamp(max=self.max_depth)
+
+            # padded_regions
+            padded_regions = torch.zeros(B, N_output, 4, dtype=torch.long, device=device)
+            padded_regions[:, :, :] = candidate_regions[:N_output].unsqueeze(0).expand(B, -1, -1)
+
         return continuous_tokens, levels_info, padded_regions, num_tokens_list
     
     def _build_depth_dists_lazy(self, B: int) -> List[Dict[int, int]]:
@@ -737,6 +779,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         tensor_result: "TensorSplitResult",
         raw_probs: Optional[torch.Tensor] = None,
         max_tokens: int = 1,
+        selected_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """使用 TensorSplitResult 进行嵌入 (P9-1 完全向量化版本).
 

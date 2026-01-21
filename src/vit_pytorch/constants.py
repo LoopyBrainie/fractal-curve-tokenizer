@@ -137,13 +137,25 @@ TEMPERATURE_MIN: float = 0.3
 #: 结论: 启用 EMA 归一化，解决小 batch 稳定性问题，与方案E 配额机制协同保证深度平衡
 DEPTH_VARIANCE_NORM_ENABLED: bool = True  # I30-6: EMA 方案启用
 
-#: 方差归一化的稳定性 epsilon
+#: 方差归一化的稳定性 epsilon (更新下界)
+#: 用途: EMA 更新时的最小方差下界，允许统计量收敛到真实方差
 DEPTH_VARIANCE_NORM_EPS: float = 1e-6
+
+#: I96-1: EMA 初始化下界 (小 batch 保守初始化)
+#: 用途: B≤2 时单批次方差估计不可靠，使用保守下界避免极端值
+#: 数学: 5个数量级差异 (0.1 vs 1e-6) 确保初始化bias不会持续存在
+DEPTH_VARIANCE_INIT_EPS: float = 0.1
 
 #: EMA 归一化的平滑系数 (I35: 新增)
 #: 数学: α = 0.1, 有效样本量 ≈ 10, 方差降低 19× vs per-batch
 #: 效果: 稳定小 batch (B=1) 下的方差估计，避免 sqrt(0) NaN
 DEPTH_EMA_ALPHA: float = 0.1
+
+#: I96-4: 树一致性软排除边距
+#: 用途: 保持最小梯度流 (10%)，避免父节点梯度被完全切断
+#: 数学: p_out = p × max(1 - Σ child_signal, ε)，ε = 0.1
+#: 梯度分析: ∂p_out/∂p_i ≥ ε > 0，确保父节点有梯度回传
+SOFT_EXCLUSION_MARGIN: float = 0.1
 
 # ==================== 方案 E: 可学习配额常量 (I24-2) ====================
 # 数学分析: 解决 Log-Compensation 对 Top-K 理论无效的问题
@@ -159,7 +171,21 @@ LEARNABLE_QUOTA_ENABLED: bool = True
 #: 每个深度的最小配额 (防止死区)
 #: 数学: K_d >= K_MIN_PER_DEPTH 保证梯度流
 #: I26-1: 从 1 增加到 2，防止 tree consistency 后完全清空
+#: I96-7: 已弃用，改为使用自适应比例 QUOTA_MIN_RATIO
 QUOTA_MIN_PER_DEPTH: int = 2
+
+#: I96-7: 最小采样比例 (自适应深度下界软目标)
+#: 数学: K_d^min = max(1, ceil(α × N_d))，其中 N_d = 4^d
+#: 注意: 仅作为软目标，不硬性约束
+#: 优势: 解决深度 0 问题 (N_0=1, K_0^min=1)，跨深度采样比例恒定
+#: 量化 (α=0.02): 深度 1 采样 25%，深度 4 采样 ~2.3%
+QUOTA_MIN_RATIO: float = 0.02
+
+#: I96-7: 下界软正则化权重
+#: 数学: L_min = λ × Σ max(0, K_d^min - K_d)²
+#: 用途: 鼓励但不强制深度下界，软约束允许模型学习最优分布
+#: 优势: 无约束满足问题，梯度完整，保持 Hilbert 曲线局部性
+QUOTA_MIN_LAMBDA: float = 0.1
 
 #: 配额初始化 (对数空间，softmax 后 = DEPTH_QUOTA_TARGET)
 #: 计算: φ_d = log(p_d) - mean(log(p))
