@@ -404,8 +404,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         }
 
         # I78: 计算 max_tokens 用于 _embed_with_tensor_result
-        # I78 FIX: 直接从 N_total 计算，确保与实际 token 数量一致
-        # N_total 来自 tensor_result.num_tokens，表示实际选择的 token 数量
+        # I78 FIX: 直接从 tensor_result.num_tokens 计算，确保与实际 token 数量一致
+        # N_total 是实际选择的 token 总数
+        N_total = tensor_result.num_tokens
         max_tokens = max(N_total, 1)  # 确保至少为1
 
         # 3. 纯张量嵌入
