@@ -521,8 +521,9 @@ class ClassificationEvaluator:
                 labels = labels.to(device)
 
                 # I35: 使用 get_extra_info API 获取 logits 和辅助信息
+                # I78: 显式传递 return_aux_info=True，与训练器接口对齐
                 if hasattr(model, 'get_extra_info'):
-                    outputs, aux_infos = model.get_extra_info(imgs)
+                    outputs, aux_infos = model.get_extra_info(imgs, return_aux_info=True)
                 else:
                     outputs = model(imgs)
                     if isinstance(outputs, tuple):
@@ -1019,13 +1020,12 @@ class AttentionEvaluator:
                 def make_hook(layer_name, idx):
                     def hook(m, inp, out):
                         # 获取注意力权重 (attn_hilbert_bias.py L712-713)
+                        # I78: 移除不存在的 _last_lca_depths 收集
+                        # LCA 深度信息不在 attention 模块中存储，无需收集
                         if hasattr(m, '_last_attn_weights') and m._last_attn_weights is not None:
                             self._attention_maps.append(
                                 (idx, layer_name, m._last_attn_weights.detach().cpu())
                             )
-                        # 获取 LCA 深度信息 (HilbertAwareAttention)
-                        if hasattr(m, '_last_lca_depths') and m._last_lca_depths is not None:
-                            self._lca_depths.append(m._last_lca_depths.detach().cpu())
                     return hook
                 
                 h = module.register_forward_hook(make_hook(name, layer_idx))
@@ -1079,27 +1079,11 @@ class AttentionEvaluator:
             if not hasattr(metrics, '_effective_token_counts'):
                 metrics._effective_token_counts = []
             metrics._effective_token_counts.append(effective_count.item())
-        
-        # LCA-Attention 相关性分析
-        if self._lca_depths and self._attention_maps:
-            for lca_depth in self._lca_depths:
-                for layer_idx, _, attn_weights in self._attention_maps:
-                    if attn_weights.dim() == 3:
-                        attn_weights = attn_weights.unsqueeze(1)
-                    
-                    # 平均所有 heads
-                    avg_attn = attn_weights.mean(dim=1)  # [B, N, N]
-                    
-                    # 只取上三角 (避免重复)
-                    for b in range(min(avg_attn.shape[0], lca_depth.shape[0])):
-                        N = min(avg_attn.shape[1], lca_depth.shape[0])
-                        for i in range(N):
-                            for j in range(i + 1, N):
-                                if j < lca_depth.shape[0]:
-                                    self._lca_attention_pairs.append(
-                                        (lca_depth[j].item(), avg_attn[b, i, j].item())
-                                    )
-        
+
+        # I78: 移除 LCA-Attention 相关性分析
+        # _last_lca_depths 在 HilbertAwareMultiScaleAttention 中不存在
+        # 此功能需要从 LCAHilbertBias._lca_cache_inputs 中提取，暂不实现
+
         # 按深度统计接收的注意力
         if self._token_depths and self._attention_maps:
             for depths_tensor in self._token_depths:
@@ -1670,9 +1654,8 @@ class StabilityEvaluator:
         # 分割器健康
         if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
             splitter = model.tokenizer.splitter
-            if hasattr(splitter, 'get_health_score'):
-                metrics.splitter_health_score = splitter.get_health_score()
-            
+            # I78: 移除 get_health_score dead code - GumbelTopKSplitter 没有此方法
+
             # 温度状态
             if hasattr(splitter, 'current_temperature'):
                 metrics.splitter_temperature = splitter.current_temperature
