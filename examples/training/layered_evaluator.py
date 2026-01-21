@@ -944,12 +944,20 @@ class LayeredEvaluator:
         from vit_pytorch import FractalCurveViT
 
         # 获取 tokenizer 相关配置
-        # I30-17: 废弃 num_scales，改为 min_patch_size + max_depth_limit
-        # 支持旧格式的向后兼容
+        # I30-17: 优先使用 checkpoint 中保存的配置
+        # 优先级：checkpoint config > state_dict 推断 > 默认值
         max_depth_limit = config.get('max_depth_limit', None)
+        num_scales_from_config = config.get('num_scales', None)
+
         # 兼容旧检查点：max_depth_hard_limit -> max_depth_limit
         if max_depth_limit is None:
             max_depth_limit = config.get('max_depth_hard_limit', None)
+
+        # 如果 config 中有 num_scales，优先使用
+        if num_scales_from_config is not None and max_depth_limit is None:
+            max_depth_limit = num_scales_from_config - 1
+            print(f"Using num_scales={num_scales_from_config} from checkpoint config")
+
         min_patch_size = config.get('min_patch_size', 4)
         if isinstance(min_patch_size, int):
             min_patch_size = (min_patch_size, min_patch_size)
@@ -996,33 +1004,33 @@ class LayeredEvaluator:
                 tokenizer_type = 'streaming_v3'
                 print("Detected tokenizer_type='streaming_v3' from checkpoint (new format)")
 
-        # 2. 检测 num_scales（从所有深度相关参数的 shape 中取最大值）
-        # I78: 修复混合版本 checkpoint 问题 - 某些参数可能是旧版本 (num_scales=9)
-        num_scales = None
-        max_depth_limit = None
-        depth_related_keys = []
+        # 2. 检测 num_scales（仅当 config 中没有配置时）
+        # I78: 修复混合版本 checkpoint 问题
+        if max_depth_limit is None:
+            from collections import Counter
+            depth_related_keys = []
 
-        for k in state_dict.keys():
-            # 收集所有与深度相关的参数
-            if any(pattern in k for pattern in [
-                'threshold_offsets', 'quota_logits', '_depth_ema_mean', '_depth_ema_var',
-                'depth_embedding', '_depth_scale_raw', 'depth_embed'
-            ]):
-                param_shape = state_dict[k].shape
-                # 处理 torch.Size 对象（支持索引访问）
-                if hasattr(param_shape, '__len__') and len(param_shape) > 0:
-                    depth_related_keys.append((k, int(param_shape[0])))
+            for k in state_dict.keys():
+                # 收集所有与深度相关的参数
+                if any(pattern in k for pattern in [
+                    'threshold_offsets', 'quota_logits', '_depth_ema_mean', '_depth_ema_var',
+                    'depth_embedding', '_depth_scale_raw', 'depth_embed'
+                ]):
+                    param_shape = state_dict[k].shape
+                    # 处理 torch.Size 对象（支持索引访问）
+                    if hasattr(param_shape, '__len__') and len(param_shape) > 0:
+                        depth_related_keys.append((k, int(param_shape[0])))
 
-        if depth_related_keys:
-            # 取所有深度相关参数的最大维度
-            detected_num_scales = max(dim for _, dim in depth_related_keys)
-            num_scales = detected_num_scales
-            max_depth_limit = detected_num_scales - 1
-            print(f"Detected num_scales={num_scales} (max_depth_limit={max_depth_limit}) from {len(depth_related_keys)} depth-related parameters")
-            for k, dim in depth_related_keys[:5]:
-                print(f"  - {k}: shape=({dim},)")
-            if len(depth_related_keys) > 5:
-                print(f"  ... and {len(depth_related_keys) - 5} more")
+            if depth_related_keys:
+                # 统计各维度的出现次数，取众数（出现最频繁的维度）
+                dim_counts = Counter(dim for _, dim in depth_related_keys)
+                detected_num_scales = dim_counts.most_common(1)[0][0]
+                max_depth_limit = detected_num_scales - 1
+
+                # 打印维度分布
+                dims_summary = ', '.join([f"{dim}×{count}" for dim, count in dim_counts.most_common()])
+                print(f"Detected num_scales={detected_num_scales} (max_depth_limit={max_depth_limit}) from {len(depth_related_keys)} depth-related parameters")
+                print(f"  Dimension distribution: {dims_summary}")
 
         # 3. 从 num_scales 反推 min_patch_size（与训练器逻辑一致）
         # 公式: min_patch_size = image_size / 2^max_depth
