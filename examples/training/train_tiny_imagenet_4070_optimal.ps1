@@ -47,18 +47,14 @@
 #    混合精度模型: 316 MB (31.58M * 10 bytes)
 #    总计(含开销): ~1.5 GB << 8GB ✓
 #
-# 5. torch.compile 兼容性修复
+# 5. torch.compile 兼容性说明
 #    -----------------------
-#    已修复 CUDA 内存分配器问题:
-#    - PYTORCH_CUDA_ALLOC_CONF 优化
-#    - 使用 reduce-overhead 模式
-#    - 禁用 inductor max_autotune
-#    - 编译前强制垃圾回收
+#    ⚠️ torch.compile 已禁用 - 与动态 token 数量不兼容
+#    原因: CUDA 内存分配器与 torch.compile 存在已知问题
+#    替代方案: gradient-checkpoint + channels-last + AMP
+#    性能损失: 约 10-15% 但更稳定
 #
 # ============================================================================
-
-$env:PYTORCH_CUDA_ALLOC_CONF = "max_split_size_mb:512,expandable_segments:True,garbage_collection_threshold:0.8"
-$env:TORCHINDUCTOR_CACHE_DIR = "$env:TEMP\torch_inductor_cache"
 
 $script = @"
 uv run python examples/training/train_fractal_vit.py `
@@ -93,14 +89,13 @@ uv run python examples/training/train_fractal_vit.py `
   --lca-temperature 1.5 `
   --use-amp `
   --gradient-checkpoint `
-  --compile `
   --channels-last `
   --tf32 `
   --accum-steps 1 `
   --gradient-clip 1.0 `
   --patience 15 `
   --min-delta 0.001 `
-  --exp-name tiny_imagenet_448d_8l_bs192_compiled
+  --exp-name tiny_imagenet_448d_8l_bs192
 "@
 
 # 执行训练脚本
