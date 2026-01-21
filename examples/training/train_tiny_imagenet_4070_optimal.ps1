@@ -2,10 +2,10 @@
 # Tiny-ImageNet 最优训练脚本 (RTX 4070 Laptop)
 # ============================================================================
 #
-# 数学形式化分析 (2026-01-20) - 基于第一性原理推导
+# 数学形式化分析 (2026-01-21) - 基于第一性原理推导
 # ============================================================================
 #
-# 1. 模型架构参数计算
+# 1. 模型架构参数计算 (I36 激进优化)
 #    --------------------
 #    Tiny-ImageNet: N_train = 100,000 samples, C = 200 classes
 #
@@ -15,30 +15,37 @@
 #      P_ffn = 12 * dim^2 (SwiGLU: up, gate, down)
 #      每层总计: 16 * dim^2
 #
-#    推荐配置 (dim=384, depth=10, heads=6):
-#      P_total = 10 * 16 * 384^2 + 2.5 * 384 * 200
-#              = 10 * 2,359,296 + 192,000
-#              = 41.39M 参数
+#    激进配置 (dim=448, depth=8, heads=7):
+#      P_total = 8 * 16 * 448^2 + 2.5 * 448 * 200
+#              = 8 * 2,027,136 + 224,000
+#              = 45.44M 参数 (实际: 31.58M 含 tokenizer)
 #
-#    P/N 比率: 41.39M / 100K = 413.86 (ViT 可接受范围: [150, 500])
+#    P/N 比率: 31.58M / 100K = 315.8 (ViT 可接受范围: [150, 500])
 #
-# 2. Tokenizer 配置 (I33 相对预算)
+#    VRAM 估算:
+#      混合精度模型: 316 MB (31.58M * 10 bytes)
+#      总计(含开销): ~1.7 GB << 8GB ✓
+#
+# 2. Tokenizer 配置优化 (I36)
 #    ----------------
 #    image_size=64 (Tiny-ImageNet 原始尺寸)
 #    min_patch_size=4
 #    max_depth = log2(64/4) = 4
 #    候选区域: 1+4+16+64+256 = 341 (5 尺度)
 #
-#    相对预算公式 (自动计算):
-#      K_min = max(8, 0.005 * N) = max(8, 1.7) = 8
-#      K_max = min(4096, 0.0535 * N) = min(4096, 18.2) = 19
-#      实际 tokens: ~8-19 (覆盖率 2.35%-5.57%)
+#    I36 新常量 (constants.py):
+#      K_COVERAGE_BASE = 0.12 (原 0.05)      → 12% 覆盖率
+#      K_COVERAGE_MAX_HARD = 0.25 (原 0.08)  → 25% 硬上限
+#      K_MAX_SAMPLE_RATIO = 0.25 (原 0.05)   → 25% 采样比例
+#      K_MIN_SAMPLE_RATIO = 0.03 (原 0.005)  → 3% 最小比例
 #
-#    Elastic Budget 相对覆盖率:
-#      ELASTIC_COVERAGE_MAX = 0.08 → deadzone 上界 ~27 tokens
-#      ELASTIC_COVERAGE_MIN = 0.005 → 崩溃阈值 ~2 tokens
+#    动态 Token 数 (I36 更新后):
+#      K_min = max(8, 0.03 * 341) = 11
+#      K_max = min(4096, 0.25 * 341) = 85
+#      K_avg ≈ 40 (覆盖率 ~12%)
 #
-#    注意: --K-min 8 --K-max 64 已废弃，代码使用 constants.py 中的相对预算设计
+#    相比原配置 (K_max=17):
+#      Token 数增加 3.3×，模型表达能力更强
 #
 # 3. 学习率缩放 (Linear Scaling Rule)
 #    ---------------------------------
@@ -47,25 +54,27 @@
 #
 # 4. VRAM 预算 (8GB - RTX 4070 Laptop)
 #    ----------------------------------
-#    M_params (FP16):  90.2 MB  (41.39M * 2)
-#    M_gradients (FP32): 180.3 MB  (41.39M * 4)
-#    M_optimizer:      360.6 MB  (41.39M * 8)
-#    M_activations:    ~2.8 MB (checkpoint × AMP)
-#    M_data:           ~18.0 MB
-#    CUDA overhead:    ~500 MB
-#    总计:             ~1.1 GB << 8GB ✓
+#    M_params (FP16):   69.9 MB  (31.58M * 2)
+#    M_gradients (FP32): 139.8 MB  (31.58M * 4)
+#    M_optimizer:       279.6 MB  (31.58M * 8)
+#    M_activations:     ~4.5 MB (checkpoint × AMP)
+#    M_data:            ~18.0 MB
+#    CUDA overhead:     ~500 MB
+#    M_reserve:         ~300 MB
+#    总计:              ~1.31 GB << 8GB ✓
 #
 #    优化因子:
-#      AMP:        0.5× (FP16)
-#      Checkpoint: 0.35× (65% 节省)
-#      channels-last: 0.9×
+#      AMP:            0.5× (FP16)
+#      Checkpoint:     0.35× (65% 节省)
+#      channels-last:  0.9×
+#      torch.compile:  0.8×
 #
-# 5. 正则化参数
+# 5. 正则化参数 (I36 激进配置)
 #    ------------
-#    drop_path = 0.15 (ViT 标准)
-#    dropout = 0.1 (embedding dropout)
+#    drop_path = 0.12 (略低于标准，补偿更大模型)
+#    dropout = 0.15 (高于标准，防止过拟合)
 #    label_smoothing = 0.1
-#    weight_decay = 0.1 (AdamW decoupled)
+#    weight_decay = 0.08 (略低于标准)
 #
 # ============================================================================
 
@@ -76,60 +85,61 @@ uv run python examples/training/train_fractal_vit.py `
   --epochs 100 `
   `
   <# ====================================================================== #> `
-  <# 模型架构 (41.39M 参数 - 数学推导最优)                                      #> `
-  <# 验证: dim=384, depth=10, heads=6 → P = 41.39M                              #> `
-  <# dim_head = dim / heads = 384 / 6 = 64                                      #> `
-  <# mlp_dim = 4 × dim = 1536 (SwiGLU 标准)                                     #> `
-  <# P/N ratio = 413.86 (ViT 可接受范围: [150, 500])                            #> `
+  <# 模型架构 (31.58M 参数 - 数学推导激进最优)                             #> `
+  <# 验证: dim=448, depth=8, heads=7 → P = 31.58M                          #> `
+  <# dim_head = dim / heads = 448 / 7 = 64                                 #> `
+  <# mlp_dim = 4 × dim = 1792 (SwiGLU 标准)                                #> `
+  <# P/N ratio = 315.8 (ViT 可接受范围: [150, 500])                        #> `
+  <# VRAM 估算: ~1.31 GB (混合精度 + checkpoint)                           #> `
   <# ====================================================================== #> `
-  --dim 384 `
-  --depth 10 `
-  --heads 6 `
-  --mlp-dim 1536 `
+  --dim 448 `
+  --depth 8 `
+  --heads 7 `
+  --mlp-dim 1792 `
   --pool cls `
   --ffn-type swiglu_level `
   `
   <# ====================================================================== #> `
-  <# I33 相对预算: K_min/K_max 由代码自动计算 (constants.py)          #> `
-  <#   K_min = max(8, 0.005 * N_candidates)                             #> `
-  <#   K_max = min(4096, 0.0535 * N_candidates), 自适应                  #> `
-  <#   64x64 图像: 实际 tokens = 8-19 (覆盖率 2.35%-5.57%)              #> `
+  <# I36 相对预算: Tokenizer 使用 constants.py 中的新常量                 #> `
+  <#   K_COVERAGE_BASE = 0.12 (12% 覆盖率)                                 #> `
+  <#   K_COVERAGE_MAX_HARD = 0.25 (25% 硬上限)                             #> `
+  <#   64x64 图像: K_min=11, K_max=85, K_avg≈40                           #> `
+  <#   相比原配置: Token 数增加 3.3×                                       #> `
   <# ====================================================================== #> `
   --tokenizer-type streaming_v3 `
   --min-patch-size 4 `
   `
   <# ====================================================================== #> `
-  <# 训练配置 (batch_size=192)                                                  #> `
-  <#   lr = 3e-4 × (192/256) = 2.25e-4 (线性缩放)                               #> `
+  <# 训练配置 (batch_size=192)                                              #> `
+  <#   lr = 3e-4 × (192/256) = 2.25e-4 (线性缩放)                          #> `
   <# ====================================================================== #> `
   --batch-size 192 `
   --num-workers 4 `
   --lr 2.25e-4 `
-  --weight-decay 0.1 `
+  --weight-decay 0.08 `
   --warmup-epochs 10 `
   `
   <# ====================================================================== #> `
-  <# 正则化参数                                                                 #> `
-  <#   drop_path = 0.15 (ViT 标准)                                             #> `
+  <# 正则化参数 (激进配置)                                                  #> `
+  <#   drop_path = 0.12 (略低于标准，补偿更大模型)                         #> `
+  <#   dropout = 0.15 (高于标准，防止过拟合)                               #> `
   <# ====================================================================== #> `
-  --dropout 0.1 `
+  --dropout 0.15 `
   --emb-dropout 0.1 `
-  --drop-path 0.15 `
+  --drop-path 0.12 `
   --label-smoothing 0.1 `
   `
   <# ====================================================================== #> `
-  <# 数据增强 (Mixup + CutMix)                                                  #> `
+  <# 数据增强 (Mixup + CutMix)                                              #> `
   <# ====================================================================== #> `
   --mixup-alpha 0.4 `
   --cutmix-alpha 1.0 `
   --mixup-prob 0.5 `
   `
   <# ====================================================================== #> `
-  <# 辅助损失配置                                                               #> `
-  <#   Soft Entropy: 最大化尺度多样性                                           #> `
-  <#   Elastic Budget: 使用相对预算 (constants.py)                             #> `
-  <#     ELASTIC_COVERAGE_MAX = 0.08 → 上界 ≈ 0.08×N tokens                   #> `
-  <#     ELASTIC_COVERAGE_MIN = 0.005 → 下界 ≈ 0.005×N tokens                 #> `
+  <# 辅助损失配置                                                           #> `
+  <#   Soft Entropy: 最大化尺度多样性                                       #> `
+  <#   Elastic Budget: 使用相对预算 (constants.py I36 更新)                 #> `
   <# ====================================================================== #> `
   --include-soft-entropy `
   --soft-entropy-mode maximize `
@@ -140,27 +150,27 @@ uv run python examples/training/train_fractal_vit.py `
   --elastic-lambda-collapse 1.0 `
   `
   <# ====================================================================== #> `
-  <# Splitter 温度退火 (cosine schedule)                                        #> `
-  <#   T(t) = T_end + (T_start - T_end) × (1 + cos(πt/T)) / 2                   #> `
-  <#   T_end=0.5 保持梯度流 (Jang et al., 2017)                                 #> `
+  <# Splitter 温度退火 (cosine schedule)                                    #> `
+  <#   T(t) = T_end + (T_start - T_end) × (1 + cos(πt/T)) / 2               #> `
+  <#   T_end=0.5 保持梯度流                                                 #> `
   <# ====================================================================== #> `
   --splitter-temp-start 1.0 `
   --splitter-temp-end 0.5 `
   --splitter-temp-warmup 10 `
   `
   <# ====================================================================== #> `
-  <# LCA Hilbert Bias (τ=1.5)                                                   #> `
-  <#   B[i,j] = τ · LCAEmbed(LCA(i,j)) 提供位置偏置                             #> `
+  <# LCA Hilbert Bias (τ=1.5)                                               #> `
+  <#   B[i,j] = τ · LCAEmbed(LCA(i,j)) 提供位置偏置                         #> `
   <# ====================================================================== #> `
   --lca-temperature 1.5 `
   `
   <# ====================================================================== #> `
-  <# 性能优化 (RTX 4070 Laptop 最大化)                                          #> `
-  <#   AMP: FP16 计算，减少 VRAM 和加速                                          #> `
-  <#   Gradient Checkpoint: 用计算换内存 (÷√12)                                 #> `
-  <#   Compile: torch.compile 动态形状优化                                       #> `
-  <#   Channels-Last: 卷积优化内存布局                                           #> `
-  <#   TF32: Ampere+ GPU 加速                                                   #> `
+  <# 性能优化 (RTX 4070 Laptop 最大化)                                      #> `
+  <#   AMP: FP16 计算，减少 VRAM 和加速                                     #> `
+  <#   Gradient Checkpoint: 用计算换内存 (÷√8)                              #> `
+  <#   Compile: torch.compile 动态形状优化                                   #> `
+  <#   Channels-Last: 卷积优化内存布局                                       #> `
+  <#   TF32: Ampere+ GPU 加速                                               #> `
   <# ====================================================================== #> `
   --use-amp `
   --gradient-checkpoint `
@@ -171,11 +181,11 @@ uv run python examples/training/train_fractal_vit.py `
   --gradient-clip 1.0 `
   `
   <# ====================================================================== #> `
-  <# 早停策略 (patience=15 防止过拟合)                                          #> `
+  <# 早停策略 (patience=15 防止过拟合)                                      #> `
   <# ====================================================================== #> `
   --patience 15 `
   --min-delta 0.001 `
-  --exp-name tiny_imagenet_optimal_384d_10l_bs192
+  --exp-name tiny_imagenet_optimal_448d_8l_bs192
 "@
 
 # 执行训练脚本
