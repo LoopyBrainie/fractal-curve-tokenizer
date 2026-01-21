@@ -3148,11 +3148,19 @@ def main():
     if config.channels_last and device.type == 'cuda':
         model = model.to(memory_format=torch.channels_last)
         print("[OK] Using channels-last memory format")
-    
+
     # torch.compile 编译优化 (PyTorch 2.0+)
-    # 重要: Variable Depth Tokens 产生动态序列长度
+    # 重要: 编译前强制清理所有 CUDA 缓存
     if config.compile_model:
         try:
+            # 强制进行全面的垃圾回收和 CUDA 内存清理
+            import gc
+            gc.collect()
+            gc.collect()
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
             # 设置编译缓存和错误处理
             torch._dynamo.config.cache_size_limit = 64
             torch._dynamo.config.suppress_errors = True
@@ -3161,11 +3169,6 @@ def main():
             torch._inductor.config.max_autotune = False
             torch._inductor.config.triton.cudnn = True
             torch._inductor.config.triton.use_cudnn = True
-
-            # 强制进行垃圾回收
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
 
             # 使用 reduce-overhead 模式，更稳定
             model = torch.compile(
