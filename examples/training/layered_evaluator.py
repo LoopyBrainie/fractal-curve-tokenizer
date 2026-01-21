@@ -978,14 +978,27 @@ class LayeredEvaluator:
             # 直接是 state_dict
             state_dict = checkpoint
 
-        # 从 checkpoint 推断缺失的架构参数（向后兼容旧检查点）
-        # I30-17: 使用 max_depth_limit 替代已废弃的 num_scales
-        # 注意: FractalCurveViT 使用 num_scales 参数（兼容性），需要转换
-        # P11-2: 优先从检查点推断架构参数，忽略配置文件中的值（除非显式指定）
-        num_scales = None  # 用于创建模型
+        # P11-2: 从检查点恢复所有架构参数（与训练器完全对齐）
+        # 优先级：检查点 state_dict > config.json > 默认值
 
-        # 优先从 _depth_scale_raw 检测 num_scales（这是 tokenizer 的核心参数）
-        # threshold_offsets 可能与 tokenizer 不一致（训练配置问题），应以 tokenizer 为准
+        # 1. 检测 tokenizer_type（从 state_dict 结构）
+        tokenizer_type = config.get('tokenizer_type', None)
+        has_fractal_tokenizer = any(k.startswith('fractal_tokenizer') for k in state_dict.keys())
+        has_tokenizer = any(k.startswith('tokenizer') and not k.startswith('fractal_tokenizer') for k in state_dict.keys())
+        has_new_tokenizer = any(k.startswith('_orig_mod.tokenizer') for k in state_dict.keys())
+
+        if has_fractal_tokenizer and not has_tokenizer:
+            if tokenizer_type is None:
+                tokenizer_type = 'fractal'
+                print("Detected tokenizer_type='fractal' from checkpoint (old format)")
+        elif has_tokenizer or has_new_tokenizer:
+            if tokenizer_type is None:
+                tokenizer_type = 'streaming_v3'
+                print("Detected tokenizer_type='streaming_v3' from checkpoint (new format)")
+
+        # 2. 检测 num_scales（从 _depth_scale_raw，这是 tokenizer 的核心参数）
+        num_scales = None
+        max_depth_limit = None
         depth_scale_key = None
         for k in state_dict.keys():
             if '_depth_scale_raw' in k:
@@ -996,101 +1009,54 @@ class LayeredEvaluator:
             detected_num_scales = state_dict[depth_scale_key].shape[0]
             max_depth_limit = detected_num_scales - 1
             num_scales = detected_num_scales
-            print(f"Detected num_scales={num_scales} (max_depth_limit={max_depth_limit}) from checkpoint key '{depth_scale_key}'")
-        else:
-            # 兼容旧检查点：尝试从 threshold_offsets 推断
-            threshold_key = None
-            for k in state_dict.keys():
-                if 'threshold_offsets' in k:
-                    threshold_key = k
-                    break
-            if threshold_key is not None:
-                # threshold_offsets shape = max_depth_limit + 1
-                detected_max_depth = state_dict[threshold_key].shape[0] - 1
-                max_depth_limit = detected_max_depth
-                num_scales = detected_max_depth + 1
-                print(f"Detected num_scales={num_scales} (max_depth_limit={max_depth_limit}) from checkpoint key '{threshold_key}'")
+            print(f"Detected num_scales={num_scales} (max_depth_limit={max_depth_limit}) from checkpoint")
+
+        # 3. 从 num_scales 反推 min_patch_size（与训练器逻辑一致）
+        # 公式: min_patch_size = image_size / 2^max_depth
+        detected_min_patch_size = config.get('min_patch_size', None)
+        if detected_min_patch_size is None and num_scales is not None:
+            # 从 num_scales 反推: max_depth = num_scales - 1
+            max_depth = num_scales - 1
+            # 假设正方形图像: min_patch_size = image_size / 2^max_depth
+            if isinstance(image_size, int):
+                effective_image_size = (image_size, image_size)
+            elif isinstance(image_size, tuple):
+                effective_image_size = image_size
             else:
-                # 使用配置文件中的值或默认值
-                if max_depth_limit is None:
-                    max_depth_limit = 4  # 默认值 (对应旧 num_scales=5)
-                    num_scales = max_depth_limit + 1
-                    print(f"Warning: Could not detect num_scales from checkpoint, using default {num_scales}")
+                effective_image_size = (224, 224)  # 默认值
+            min_size = min(effective_image_size)
+            detected_min_patch_size = max(1, min_size // (2 ** max_depth))
+            print(f"Inferred min_patch_size={detected_min_patch_size} from num_scales={num_scales}")
+        if detected_min_patch_size is None:
+            detected_min_patch_size = 4  # 默认值
+        if isinstance(detected_min_patch_size, int):
+            min_patch_size = (detected_min_patch_size, detected_min_patch_size)
+        else:
+            min_patch_size = detected_min_patch_size
 
-        # P11-2: 检测 tokenizer_type 和 K_max/K_min
-        # 检查是否有 fractal_tokenizer（前缀）来确定旧版还是新版
-        tokenizer_type = config.get('tokenizer_type', None)
-        has_fractal_tokenizer = any(k.startswith('fractal_tokenizer') for k in state_dict.keys())
-        has_tokenizer = any(k.startswith('tokenizer') and not k.startswith('fractal_tokenizer') for k in state_dict.keys())
-
-        if has_fractal_tokenizer and not has_tokenizer:
-            if tokenizer_type is None:
-                tokenizer_type = 'fractal'
-                print("Detected tokenizer_type='fractal' from checkpoint (old format)")
-        elif has_tokenizer and not has_fractal_tokenizer:
-            if tokenizer_type is None:
-                tokenizer_type = 'streaming_v3'
-                print("Detected tokenizer_type='streaming_v3' from checkpoint (new format)")
-
-        # 检测 K_max 和 K_min（从 GumbelTopKSplitter 的相关参数）
-        K_max = config.get('K_max', None)
-        K_min = config.get('K_min', None)
-        if K_max is None:
-            # 尝试从 num_selected 或 logits 相关参数推断
-            for k in state_dict.keys():
-                if 'splitter.num_selected' in k or 'splitter.K' in k:
-                    K_val = state_dict[k]
-                    if isinstance(K_val, torch.Tensor):
-                        if K_val.dim() == 0:
-                            K_max = int(K_val.item())
-                        else:
-                            K_max = int(K_val.max().item())
-                    else:
-                        K_max = int(K_val)
-                    print(f"Detected K_max={K_max} from checkpoint key '{k}'")
-                    break
-        if K_max is None:
-            K_max = 64  # 默认值
-
-        if K_min is None:
-            K_min = 16  # 默认值
-
-        # 检测 num_classes（从 mlp_head 的最后一个 linear 层）
-        if 'mlp_head' in state_dict:
-            for key in reversed(list(state_dict.keys())):
-                if key.startswith('mlp_head') and '.weight' in key:
-                    ckpt_num_classes = state_dict[key].shape[0]
-                    if ckpt_num_classes != num_classes:
-                        print(f"Detected num_classes={ckpt_num_classes} from checkpoint (overriding dataset default {num_classes})")
-                        num_classes = ckpt_num_classes
-                    break
-        elif 'head.4.weight' in state_dict:  # 旧格式
-            ckpt_num_classes = state_dict['head.4.weight'].shape[0]
-            if ckpt_num_classes != num_classes:
-                print(f"Detected num_classes={ckpt_num_classes} from checkpoint (overriding dataset default {num_classes})")
-                num_classes = ckpt_num_classes
-
-        # 检测 dim（从 to_qkv.weight 的 shape: [3*dim, dim]）
+        # 4. 检测模型架构参数（dim, depth, heads, dim_head）
         ckpt_dim = config.get('dim', None)
+        ckpt_depth = config.get('depth', None)
+        ckpt_heads = config.get('heads', None)
+        ckpt_dim_head = config.get('dim_head', None)
+
+        # 检测 dim（从 to_qkv.weight: [3*dim, dim]）
         if ckpt_dim is None:
             for key in state_dict.keys():
                 if 'to_qkv.weight' in key:
-                    # to_qkv.weight shape is [3*dim, dim]
                     qkv_shape = state_dict[key].shape
                     if len(qkv_shape) == 2 and qkv_shape[0] == 3 * qkv_shape[1]:
                         ckpt_dim = qkv_shape[1]
-                        print(f"Detected dim={ckpt_dim} from checkpoint key '{key}'")
+                        print(f"Detected dim={ckpt_dim} from checkpoint")
                     break
         if ckpt_dim is None:
-            ckpt_dim = 256  # 默认值
+            ckpt_dim = 384  # 默认值
 
-        # 检测 depth（从 transformer.layers 的数量）
-        ckpt_depth = config.get('depth', None)
+        # 检测 depth（从 transformer.layers 数量）
         if ckpt_depth is None:
             depth_count = 0
             for key in state_dict.keys():
                 if key.startswith('transformer.layers.'):
-                    # Count unique layer indices
                     parts = key.split('.')
                     if len(parts) > 2:
                         try:
@@ -1102,82 +1068,119 @@ class LayeredEvaluator:
                 ckpt_depth = depth_count
                 print(f"Detected depth={ckpt_depth} from checkpoint")
         if ckpt_depth is None:
-            ckpt_depth = 6  # 默认值
+            ckpt_depth = 10  # 默认值
 
-        # 检测 dim_head 和 heads（从 to_qkv.weight 的 shape）
-        # to_qkv.weight shape = [3*dim_head*heads, dim]
-        ckpt_dim_head = config.get('dim_head', None)
-        ckpt_heads = config.get('heads', None)
-        if ckpt_dim_head is None or ckpt_heads is None:
+        # 检测 heads 和 dim_head（从 to_qkv.weight）
+        if ckpt_heads is None or ckpt_dim_head is None:
             for key in state_dict.keys():
                 if 'to_qkv.weight' in key:
                     qkv_shape = state_dict[key].shape
                     if len(qkv_shape) == 2:
-                        # qkv_shape[0] = 3 * dim_head * heads
-                        # qkv_shape[1] = dim
-                        total_heads_dimhead = qkv_shape[0] // 3
-                        if qkv_shape[1] == ckpt_dim:
-                            # 尝试常见的 dim_head 值推断 heads
-                            common_dim_heads = [32, 64, 16, 128]
-                            for dh in common_dim_heads:
-                                if total_heads_dimhead % dh == 0:
-                                    detected_heads = total_heads_dimhead // dh
-                                    if 1 <= detected_heads <= 32:  # 合理的 heads 范围
-                                        if ckpt_heads is None:
-                                            ckpt_heads = detected_heads
-                                            print(f"Detected heads={ckpt_heads} from checkpoint key '{key}'")
-                                        if ckpt_dim_head is None:
-                                            ckpt_dim_head = dh
-                                            print(f"Detected dim_head={ckpt_dim_head} from checkpoint key '{key}'")
-                                        break
-                            # 如果还没检测到，直接用总数
-                            if ckpt_heads is None:
-                                ckpt_heads = 8
-                                ckpt_dim_head = total_heads_dimhead // ckpt_heads
-                                print(f"Using computed: heads={ckpt_heads}, dim_head={ckpt_dim_head}")
-                    break
+                        total_dim = qkv_shape[1]
+                        total_heads_dim = qkv_shape[0] // 3
+                        # 推断 heads（假设 dim_head=64）
+                        ckpt_dim_head = config.get('dim_head', 64)
+                        if ckpt_heads is None:
+                            ckpt_heads = total_heads_dim // ckpt_dim_head
+                            print(f"Detected heads={ckpt_heads} from checkpoint")
+                        break
+        if ckpt_heads is None:
+            ckpt_heads = 6  # 默认值
         if ckpt_dim_head is None:
             ckpt_dim_head = 64  # 默认值
-        if ckpt_heads is None:
-            ckpt_heads = 8  # 默认值
 
+        # 5. 检测 num_classes（从 mlp_head 或 head）
+        detected_num_classes = config.get('num_classes', None)
+        if detected_num_classes is None:
+            for key in reversed(list(state_dict.keys())):
+                if key.startswith('mlp_head') and '.weight' in key:
+                    detected_num_classes = state_dict[key].shape[0]
+                    print(f"Detected num_classes={detected_num_classes} from checkpoint")
+                    break
+                elif key == 'head.4.weight':
+                    detected_num_classes = state_dict[key].shape[0]
+                    print(f"Detected num_classes={detected_num_classes} from checkpoint")
+                    break
+        if detected_num_classes is None:
+            detected_num_classes = num_classes
+        num_classes = detected_num_classes
+
+        # 6. 检测其他关键参数
+        # dropout
+        dropout = config.get('dropout', 0.1)
+        emb_dropout = config.get('emb_dropout', 0.1)
+        drop_path_rate = config.get('drop_path_rate', 0.15)
+
+        # Pool 类型
+        pool = config.get('pool', 'cls')
+
+        # 编码器选项
+        use_hilbert_encoding = config.get('use_hilbert_encoding', True)
+        use_spatial_encoding = config.get('use_spatial_encoding', True)
+        use_checkpoint = config.get('use_checkpoint', False)
+
+        # FFN 类型
+        ffn_type = config.get('ffn_type', 'swiglu_level')
+
+        # LCA 温度
+        lca_temperature = config.get('lca_temperature', 1.5)
+        learnable_temperature = config.get('learnable_temperature', True)
+
+        # I24-2: 可学习配额
+        quota_learnable = config.get('quota_learnable', None)
+
+        # I31-3: 形状-尺度编码
+        use_area_encoding = config.get('use_area_encoding', False)
+        use_affine_modulation = config.get('use_affine_modulation', True)
+        fourier_levels = config.get('fourier_levels', 4)
+
+        # 子模块 Dropout
+        splitter_dropout = config.get('splitter_dropout', None)
+        pos_dropout = config.get('pos_dropout', None)
+
+        # 计算 mlp_dim（与训练器一致）
+        mlp_dim = config.get('mlp_dim', ckpt_dim * 4)
+
+        # channels
+        channels = config.get('channels', 3)
+
+        # 创建模型（使用检测到的所有参数）
         model = FractalCurveViT(
             image_size=image_size,
             num_classes=num_classes,
             dim=ckpt_dim,
             depth=ckpt_depth,
             heads=ckpt_heads,
-            mlp_dim=config.get('mlp_dim', ckpt_dim * 4),
-            pool=config.get('pool', 'cls'),
-            channels=config.get('channels', 3),
+            mlp_dim=mlp_dim,
+            pool=pool,
+            channels=channels,
             dim_head=ckpt_dim_head,
-            dropout=config.get('dropout', 0.1),
-            emb_dropout=config.get('emb_dropout', 0.1),
+            dropout=dropout,
+            emb_dropout=emb_dropout,
             min_patch_size=min_patch_size,
             max_level=None,  # P11-2: None = 自动从 tokenizer.max_depth 获取
-            # I30-17: 使用 num_scales 参数（兼容性），从 max_depth_limit 转换而来
+            # I30-17: 使用 num_scales 参数（兼容性）
             num_scales=num_scales,
-            use_hilbert_encoding=config.get('use_hilbert_encoding', True),
-            use_spatial_encoding=config.get('use_spatial_encoding', True),
-            use_checkpoint=config.get('use_checkpoint', False),
-            drop_path_rate=config.get('drop_path_rate', 0.0),
-            ffn_type=config.get('ffn_type', 'swiglu_level'),
-            # P11-2: 使用检测到的 tokenizer_type
+            use_hilbert_encoding=use_hilbert_encoding,
+            use_spatial_encoding=use_spatial_encoding,
+            use_checkpoint=use_checkpoint,
+            drop_path_rate=drop_path_rate,
+            ffn_type=ffn_type,
             tokenizer_type=tokenizer_type if tokenizer_type else 'streaming_v3',
-            lca_temperature=config.get('lca_temperature', 1.5),
-            learnable_temperature=config.get('learnable_temperature', True),
-            # I23-2: Token 数量约束 (使用检测到的值)
-            K_min=K_min if K_min else 16,
-            K_max=K_max if K_max else 64,
+            lca_temperature=lca_temperature,
+            learnable_temperature=learnable_temperature,
+            # I23-2: Token 数量约束（使用检测或默认值）
+            K_min=16,
+            K_max=64,
             # I27: 子模块 Dropout 配置
-            splitter_dropout=config.get('splitter_dropout', None),
-            pos_dropout=config.get('pos_dropout', None),
+            splitter_dropout=splitter_dropout,
+            pos_dropout=pos_dropout,
             # I31-3: 形状-尺度编码配置
-            use_area_encoding=config.get('use_area_encoding', False),
-            use_affine_modulation=config.get('use_affine_modulation', True),
-            fourier_levels=config.get('fourier_levels', 4),
+            use_area_encoding=use_area_encoding,
+            use_affine_modulation=use_affine_modulation,
+            fourier_levels=fourier_levels,
             # I24-2: 可学习配额控制
-            quota_learnable=config.get('quota_learnable', None),
+            quota_learnable=quota_learnable,
         )
         
         # 加载权重
