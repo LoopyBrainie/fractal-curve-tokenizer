@@ -204,16 +204,18 @@ QUOTA_ENTROPY_WEIGHT: float = 0.1
 #   3. 硬上限约束防止大分辨率下的显存溢出
 
 #: 基准覆盖率 (224×224 图像的目标覆盖率)
-#: 数学: β_0 = 0.05 表示目标采样 5% 的候选区域
-K_COVERAGE_BASE: float = 0.05
+#: 数学: β_0 = 0.12 表示目标采样 12% 的候选区域
+#: I36 优化: 64×64 小图像需更高覆盖率，原 0.05 → 0.12
+K_COVERAGE_BASE: float = 0.12
 
 #: 最小覆盖率 (防止欠采样)
 #: 数学: α = 0.01 保证最小 1% 覆盖率
 K_COVERAGE_MIN: float = 0.01
 
 #: 最大覆盖率硬上限 (防止大分辨率下的显存溢出)
-#: 数学: β_max = 0.08 防止 K 增长过快
-K_COVERAGE_MAX_HARD: float = 0.08
+#: 数学: β_max = 0.25 防止 K 增长过快 (原 0.08 → 0.25)
+#: I36 优化: 小图像需更高上限以支持更多 tokens
+K_COVERAGE_MAX_HARD: float = 0.25
 
 #: 覆盖率自适应参考尺寸
 #: 数学: γ = sqrt(min(H, W) / 224) 缩放因子
@@ -227,12 +229,14 @@ K_MIN_HARD_LIMIT: int = 8
 K_MAX_HARD_LIMIT: int = 4096
 
 #: K_max 采样比例 (K_max = ceil(K_MAX_SAMPLE_RATIO × N))
-#: 数学: α = 0.05 表示最多采样 5% 的候选区域
-K_MAX_SAMPLE_RATIO: float = 0.05
+#: 数学: α = 0.25 表示最多采样 25% 的候选区域 (原 0.05 → 0.25)
+#: I36 优化: 提高以支持 64×64 小图像更多 tokens
+K_MAX_SAMPLE_RATIO: float = 0.25
 
 #: K_min 采样比例 (K_min = ceil(K_MIN_SAMPLE_RATIO × N))
-#: 数学: β = 0.005 表示最少采样 0.5% 的候选区域
-K_MIN_SAMPLE_RATIO: float = 0.005
+#: 数学: β = 0.03 表示最少采样 3% 的候选区域 (原 0.005 → 0.03)
+#: I36 优化: 提高以保证小图像最小 tokens
+K_MIN_SAMPLE_RATIO: float = 0.03
 
 # ==================== I33: Elastic Budget 相对预算常量 ====================
 # 设计原则: 与K参数相对预算保持一致
@@ -241,12 +245,14 @@ K_MIN_SAMPLE_RATIO: float = 0.005
 #   2. 与 _get_dynamic_k_bounds() 统一设计
 
 #: Elastic Budget 相对覆盖率硬上限
-#: 数学: coverage_max = 0.08 防止过度采样
-ELASTIC_COVERAGE_MAX: float = 0.08
+#: 数学: coverage_max = 0.25 防止过度采样 (原 0.08 → 0.25)
+#: I36 优化: 与 K_COVERAGE_MAX_HARD 保持一致
+ELASTIC_COVERAGE_MAX: float = 0.25
 
 #: Elastic Budget 相对覆盖率下界 (用于崩溃检测)
-#: 数学: coverage_min = 0.005 低于此值触发崩溃检测
-ELASTIC_COVERAGE_MIN: float = 0.005
+#: 数学: coverage_min = 0.03 低于此值触发崩溃检测 (原 0.005 → 0.03)
+#: I36 优化: 与 K_MIN_SAMPLE_RATIO 保持一致
+ELASTIC_COVERAGE_MIN: float = 0.03
 
 #: Elastic Budget 损失权重
 #: 数学: λ = 0.1 使损失量级与其他辅助损失匹配
