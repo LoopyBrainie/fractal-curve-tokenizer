@@ -980,6 +980,8 @@ class LayeredEvaluator:
 
         # 从 checkpoint 推断缺失的架构参数（向后兼容旧检查点）
         # I30-17: 使用 max_depth_limit 替代已废弃的 num_scales
+        # 注意: FractalCurveViT 使用 num_scales 参数（兼容性），需要转换
+        num_scales = None  # 用于创建模型
         if max_depth_limit is None:
             # 尝试从 threshold_offsets 的 shape 检测 max_depth_limit
             # threshold_offsets shape = max_depth_limit + 1
@@ -1006,6 +1008,12 @@ class LayeredEvaluator:
                 else:
                     max_depth_limit = 4  # 默认值 (对应旧 num_scales=5)
                     print(f"Warning: Could not detect max_depth_limit from checkpoint, using default {max_depth_limit}")
+
+        # 转换为 num_scales 用于 FractalCurveViT（兼容性参数）
+        # num_scales = max_depth_limit + 1
+        if max_depth_limit is not None:
+            num_scales = max_depth_limit + 1
+            print(f"Using num_scales={num_scales} (max_depth_limit={max_depth_limit})")
 
         # 检测 num_classes（从 mlp_head 的最后一个 linear 层）
         if 'mlp_head' in state_dict:
@@ -1107,9 +1115,8 @@ class LayeredEvaluator:
             emb_dropout=config.get('emb_dropout', 0.1),
             min_patch_size=min_patch_size,
             max_level=None,  # P11-2: None = 自动从 tokenizer.max_depth 获取
-            # I30-17: 废弃 num_scales，使用 max_depth_limit
-            # num_scales 参数保留用于向后兼容，但实际由 max_depth_limit 控制
-            max_depth_limit=max_depth_limit,
+            # I30-17: 使用 num_scales 参数（兼容性），从 max_depth_limit 转换而来
+            num_scales=num_scales,
             use_hilbert_encoding=config.get('use_hilbert_encoding', True),
             use_spatial_encoding=config.get('use_spatial_encoding', True),
             use_checkpoint=config.get('use_checkpoint', False),
