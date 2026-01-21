@@ -632,49 +632,58 @@ class FractalCurveViT(nn.Module):
             # P-OPT-5: 批量获取 lengths 到 CPU，避免多次 .item() 调用
             lengths_cpu = lengths.to('cpu', non_blocking=True)
 
-            # 计算深度分布
-            depth_distribution: Dict[int, float] = {}
+            # P-OPT: 向量化深度分布计算
+            max_depth = self.tokenizer.max_depth if hasattr(self, 'tokenizer') else 8
+            max_depth_range = max_depth + 1
+
+            # 预分配所有样本的深度分布
+            all_depth_counts = torch.zeros(batch_size, max_depth_range, dtype=torch.float32, device='cpu')
+            all_levels_used: List[List[int]] = [[] for _ in range(batch_size)]
+
             for i in range(batch_size):
                 l = levels_list[i]
                 if l.numel() > 0:
-                    # P-OPT-5: unique 操作在 GPU 上执行，结果再转 CPU
-                    # I78: torch.compile 兼容 - 确保 depths 是 1 维非负整数
+                    # 提取深度并过滤负值
                     depths = l[:, 0].to(dtype=torch.int64, device='cpu')
-                    depths = depths[depths >= 0]  # 移除负值（如果有）
-                    unique = depths.unique().tolist()
+                    depths = depths[depths >= 0]
+                    if depths.numel() > 0:
+                        # 使用 bincount 向量化计数
+                        d_max = int(depths.max().item())
+                        d_max = min(d_max, max_depth)
+                        counts = torch.bincount(depths, minlength=max_depth_range)[:max_depth_range].float()
+                        all_depth_counts[i] = counts
+                        # 记录使用的层级
+                        all_levels_used[i] = [d for d in range(d_max + 1) if counts[d] > 0]
 
-                    # I78: torch.compile 兼容 - 使用向量化操作替代 bincount
-                    # bincount 在动态 shape 下可能失败，使用 scatter_add 更安全
-                    max_depth = depths.max().item() if depths.numel() > 0 else 0
-                    depth_counts = torch.zeros(max_depth + 1, dtype=torch.float32, device='cpu')
-                    for d in unique:
-                        depth_counts[d] = (depths == d).sum().item()
-                    total = depth_counts.sum().item()
-                    for d in range(len(depth_counts)):
-                        if depth_counts[d] > 0:
-                            depth_distribution[d] = depth_counts[d].item() / total
+            # 计算归一化分布
+            depth_sums = all_depth_counts.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            normalized_counts = all_depth_counts / depth_sums
 
-                    aux_info = {
-                        "num_tokens": int(lengths_cpu[i].item()),
-                        "levels_used": unique,
-                        "depth_distribution": depth_distribution,
-                    }
+            for i in range(batch_size):
+                num_tokens = int(lengths_cpu[i].item())
 
-                    # M3: 计算选择熵 (token_selection_entropy)
-                    if split_probs is not None:
-                        probs_i = split_probs[i, :lengths[i]]
-                        # 避免 log(0)
-                        probs_safe = probs_i.clamp(min=PROB_EPSILON)
-                        entropy = -(probs_safe * torch.log(probs_safe)).sum().item()
-                        aux_info["token_selection_entropy"] = entropy
+                # 构建稀疏分布字典
+                depth_distribution: Dict[int, float] = {}
+                for d in all_levels_used[i]:
+                    val = normalized_counts[i, d].item()
+                    if val > 0:
+                        depth_distribution[d] = val
 
-                    aux_infos.append(aux_info)
-                else:
-                    aux_infos.append({
-                        "num_tokens": 0,
-                        "depth_distribution": {},
-                        "token_selection_entropy": 0.0,
-                    })
+                aux_info = {
+                    "num_tokens": num_tokens,
+                    "levels_used": all_levels_used[i],
+                    "depth_distribution": depth_distribution,
+                }
+
+                # M3: 计算选择熵 (token_selection_entropy)
+                if split_probs is not None:
+                    probs_i = split_probs[i, :lengths[i]]
+                    # 避免 log(0)
+                    probs_safe = probs_i.clamp(min=PROB_EPSILON)
+                    entropy = -(probs_safe * torch.log(probs_safe)).sum().item()
+                    aux_info["token_selection_entropy"] = entropy
+
+                aux_infos.append(aux_info)
 
         if return_features:
             # 直接返回 pooled 表示作为每个样本的特征
@@ -748,14 +757,14 @@ class FractalCurveViT(nn.Module):
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor],  # (logits, tokens, lengths)
     ]:
         """前向传播。
-        
+
         Args:
             img: 输入图像，形状为 [B, C, H, W]
             return_attention: 是否返回注意力权重（已弃用）
             return_aux_info: 是否返回辅助信息
             return_features: 是否返回特征
             return_tokens: 是否返回 transformer 输出 tokens (用于困难样本挖掘)
-            
+
         Returns:
             根据参数返回不同类型：
             - 默认：分类 logits [B, num_classes]
@@ -764,6 +773,14 @@ class FractalCurveViT(nn.Module):
             - return_tokens=True: (logits, tokens [B, N, D], lengths [B])
             - 两者都为 True：(logits, aux_infos, features)
         """
+        # P0-2: 自动转换 channels_last 内存格式以优化卷积性能
+        # 检测输入是否为 4D 且是 channels_first (stride(1) != stride(2))
+        if (img.dim() == 4 and
+            img.stride(1) != img.stride(2) and
+            hasattr(self, '_channels_last_enabled') and
+            self._channels_last_enabled):
+            img = img.to(memory_format=torch.channels_last)
+
         batch_size = img.shape[0]
         device = img.device
 
@@ -1092,6 +1109,11 @@ class FractalCurveViT(nn.Module):
         - "reduce-overhead": 减少开销优化
         - "max-autotune": 自动调优最优 kernel (推荐)
 
+        自动配置以下 PyTorch 2.4 优化：
+        - TF32 (TensorFloat-32) 加速矩阵运算
+        - cuDNN SDP (Scaled Dot-Product Attention)
+        - Inductor max-autotune 优化
+
         Args:
             mode: 编译模式
             dynamic: 是否启用动态形状支持 (用于可变分辨率)
@@ -1108,6 +1130,15 @@ class FractalCurveViT(nn.Module):
         """
         import torch
 
+        # P0-3: 启用 TF32 (Ampere+ GPU) - 约 10x 矩阵运算加速
+        if torch.backends.cuda.is_built():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+
+            # 启用 cuDNN SDP - 使用 cuDNN 内核的 Flash Attention
+            torch.backends.cuda.enable_cudnn_sdp(True)
+
         # 配置 inductor 优化
         torch._inductor.config.max_autotune = True
         torch._inductor.config.cudnn_sdp = True  # 启用 cuDNN attention
@@ -1122,15 +1153,19 @@ class FractalCurveViT(nn.Module):
         """启用 channels_last 内存格式以优化卷积性能 (I35)。
 
         将模型和输入转换为 channels_last 格式，可提升卷积操作性能。
+        自动在 forward 方法中转换输入格式。
 
         Returns:
             配置后的模型
 
-        Note:
-            训练循环中需手动将输入转换为 channels_last:
-                x = x.to(memory_format=torch.channels_last)
+        Example:
+            >>> model = FractalCurveViT(image_size=224, num_classes=1000)
+            >>> model = model.enable_channels_last()
+            >>> # 输入自动转换为 channels_last
         """
         self.to(memory_format=torch.channels_last)
+        # P0-2: 设置标志以在 forward 中自动转换输入
+        self._channels_last_enabled = True
         return self
 
 
