@@ -1006,6 +1006,7 @@ class LayeredEvaluator:
 
         # 2. 检测 num_scales（仅当 config 中没有配置时）
         # I78: 修复混合版本 checkpoint 问题
+        num_scales = None  # 初始化，确保在 if 块外可用
         if max_depth_limit is None:
             from collections import Counter
             depth_related_keys = []
@@ -1025,12 +1026,19 @@ class LayeredEvaluator:
                 # 统计各维度的出现次数，取众数（出现最频繁的维度）
                 dim_counts = Counter(dim for _, dim in depth_related_keys)
                 detected_num_scales = dim_counts.most_common(1)[0][0]
+                num_scales = detected_num_scales
                 max_depth_limit = detected_num_scales - 1
 
                 # 打印维度分布
                 dims_summary = ', '.join([f"{dim}×{count}" for dim, count in dim_counts.most_common()])
-                print(f"Detected num_scales={detected_num_scales} (max_depth_limit={max_depth_limit}) from {len(depth_related_keys)} depth-related parameters")
+                print(f"Detected num_scales={num_scales} (max_depth_limit={max_depth_limit}) from {len(depth_related_keys)} depth-related parameters")
                 print(f"  Dimension distribution: {dims_summary}")
+        elif num_scales_from_config is not None:
+            # 如果 max_depth_limit 来自 config，使用 num_scales_from_config
+            num_scales = num_scales_from_config
+        elif max_depth_limit is not None:
+            # 如果 max_depth_limit 有值但 num_scales 未设置，从 max_depth_limit 推断
+            num_scales = max_depth_limit + 1
 
         # 3. 从 num_scales 反推 min_patch_size（与训练器逻辑一致）
         # 公式: min_patch_size = image_size / 2^max_depth
