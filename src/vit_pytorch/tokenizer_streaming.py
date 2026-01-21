@@ -633,7 +633,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # =====================================================================
         # Step 2: 连续加权融合
         # 使用ShallowParallelEvaluator的get_continuous_tokens方法
-        # 
+        #
         # I10-18增强: 传递threshold参数控制token数量
         # I18-3修复: 提高训练threshold从0.01到0.1
         #   - threshold=0.01 导致所有85个候选都通过 (cumulative_prob > 0.01)
@@ -641,7 +641,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         #   - 梯度流通过累积概率保持，无需所有候选都显式保留
         # =====================================================================
         threshold = 0.1 if self.training else 0.1  # 训练和推理使用相同阈值保证一致性
-        
+
+        # I78: 使用 get_continuous_tokens 的实际输出形状确定 max_tokens
+        # 修复之前的 bug：使用 tensor_result.tokens_per_batch.max() 但 get_continuous_tokens
+        # 可能输出更多/更少的 token，导致 padded_tokens 形状与 lengths 不匹配
         continuous_tokens, token_weights = self.splitter.shallow_evaluator.get_continuous_tokens(
             features=features,                          # [B, C, H_feat, W_feat]
             embeddings=candidate_embeddings,            # [B, N_candidates, D]
@@ -650,6 +653,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             embed_dim=dim,                              # D
             threshold=threshold,
         )  # [B, N_output, D], [B, N_output]
+
+        # I78: 从实际输出形状获取 max_tokens，修复 token 数量不匹配问题
+        max_tokens = continuous_tokens.shape[1]
         
         # N_output 是实际输出token数量 (通常小于N_candidates)
         B_out, N_output, D_out = continuous_tokens.shape
@@ -768,15 +774,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             levels_info = torch.full((B, 1, self.max_depth + 1), -1, dtype=torch.long, device=device)
             padded_regions = torch.zeros(B, 1, 4, dtype=torch.long, device=device)
             return self.patch_embed.norm(tokens), levels_info, padded_regions
-        
-        # 计算每个 batch 的最大 token 数量 (I78: 优化为张量操作)
-        if tensor_result.tokens_per_batch is not None:
-            max_tokens = int(tensor_result.tokens_per_batch.max())
-        else:
-            # 回退: 使用 bincount 计算每个 batch 的 token 数
-            token_counts = torch.bincount(tensor_result.batch_indices, minlength=B)
-            max_tokens = int(token_counts.max())
-        
+
+        # I78: max_tokens 已在调用 get_continuous_tokens 后确定 (见第 658 行)
+        # 无需重新计算
+
         # ====================================================================
         # 构建 ROI boxes (纯张量操作)
         # ====================================================================
