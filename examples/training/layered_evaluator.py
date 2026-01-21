@@ -1008,18 +1008,19 @@ class LayeredEvaluator:
                 'threshold_offsets', 'quota_logits', '_depth_ema_mean', '_depth_ema_var',
                 'depth_embedding', '_depth_scale_raw', 'depth_embed'
             ]):
-                shape = state_dict[k].shape
-                if len(shape) > 0:
-                    depth_related_keys.append((k, shape[0]))
+                param_shape = state_dict[k].shape
+                # 处理 torch.Size 对象（支持索引访问）
+                if hasattr(param_shape, '__len__') and len(param_shape) > 0:
+                    depth_related_keys.append((k, int(param_shape[0])))
 
         if depth_related_keys:
             # 取所有深度相关参数的最大维度
-            detected_num_scales = max(shape[0] for _, shape in depth_related_keys)
+            detected_num_scales = max(dim for _, dim in depth_related_keys)
             num_scales = detected_num_scales
             max_depth_limit = detected_num_scales - 1
             print(f"Detected num_scales={num_scales} (max_depth_limit={max_depth_limit}) from {len(depth_related_keys)} depth-related parameters")
-            for k, shape in depth_related_keys[:5]:
-                print(f"  - {k}: shape={tuple(shape)}")
+            for k, dim in depth_related_keys[:5]:
+                print(f"  - {k}: shape=({dim},)")
             if len(depth_related_keys) > 5:
                 print(f"  ... and {len(depth_related_keys) - 5} more")
 
