@@ -18,6 +18,7 @@ from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
 from vit_pytorch.constants import (
     LEARNABLE_QUOTA_ENABLED,
     QUOTA_MIN_PER_DEPTH,
+    QUOTA_MIN_RATIO,  # I96-7: 自适应深度下界最小采样比例
     QUOTA_INIT_LOGITS,
     QUOTA_ENTROPY_WEIGHT,
 )
@@ -106,25 +107,20 @@ class TestQuotaAllocation:
             image_size=(64, 64),
         )
 
-        # 即使 K 很小，也要保证下界
-        # 注意: K 必须满足 K >= D * min_quota 才有可行解
-        # I34-2 修复: 当 K < D * min_quota 时，动态调整下界为 max(1, K // D)
-        for K in [8, 16, 32]:  # K=4 不满足 K >= D * min_quota = 8 的约束
+        # I96-7 改进: 软正则化替代硬下界约束
+        # 验证: 配额总和仍等于 K (约束满足)
+        # 注意: 允许某些深度 K_d=0，软下界通过损失函数实现
+        for K in [8, 16, 32, 64]:
             quota = splitter._compute_quota_allocation(K)
-            for d in range(splitter._current_max_depth + 1):
-                assert quota[d].item() >= QUOTA_MIN_PER_DEPTH, \
-                    f"K={K}, depth={d}, quota={quota[d]}"
+            # 核心验证: 总和必须等于 K
+            assert quota.sum().item() == K, \
+                f"K={K}, actual sum={quota.sum().item()}"
 
-        # 额外测试: K=4 时验证动态下界调整
-        K = 4
-        quota = splitter._compute_quota_allocation(K)
-        D = splitter._current_max_depth + 1  # D=4
-        # 当 K=4, D=4, min_quota=2 时，约束 K >= D*min_quota 不满足
-        # I34-2 动态调整: effective_min_quota = max(1, K//D) = 1
-        expected_min = max(1, K // D)
-        for d in range(D):
-            assert quota[d].item() >= expected_min, \
-                f"K={K}: depth={d}, quota={quota[d]}, expected_min={expected_min}"
+        # I96-7 验证: 软下界损失计算正确
+        K = 16
+        min_loss = splitter._compute_quota_loss(K)
+        assert min_loss.item() >= 0, "损失应为非负"
+        assert not torch.isnan(min_loss), "损失不应为 NaN"
 
     def test_quota_proportional_to_target(self):
         """验证配额近似与目标分布成比例"""
@@ -317,7 +313,18 @@ class TestMathematicalProperties:
         torch.testing.assert_close(probs, target, atol=1e-2, rtol=1e-2)
     
     def test_quota_gradient_dead_zone_protection(self):
-        """验证配额下界保护防止死区"""
+        """验证梯度流通过软下界正则化 (I96-7 方案C')
+
+        数学形式化
+        ==========
+        I96-7 改进: 从硬下界约束改为软正则化
+        - 硬约束: K_d >= K_min (阻断梯度，数学问题)
+        - 软正则化: L_min = λ × Σ max(0, K_d^min - K_d)²
+
+        测试验证:
+        1. 极端偏斜的配额产生非零软下界损失
+        2. 梯度正确流过 quota_logits
+        """
         if not LEARNABLE_QUOTA_ENABLED:
             pytest.skip("LEARNABLE_QUOTA_ENABLED is False")
 
@@ -334,14 +341,22 @@ class TestMathematicalProperties:
             splitter.quota_logits.fill_(-10)  # 所有都很小
             splitter.quota_logits[3] = 10     # depth=3 极大
 
-        # 配额分配仍应保证下界
         K = 32
         quota = splitter._compute_quota_allocation(K)
 
-        # I30-17-EXT: 使用 _current_max_depth
-        for d in range(splitter._current_max_depth + 1):
-            assert quota[d].item() >= QUOTA_MIN_PER_DEPTH, \
-                f"depth={d} quota={quota[d]} < min={QUOTA_MIN_PER_DEPTH}"
+        # I96-7 验证: 软下界损失应非零 (因为某些深度配额很低)
+        min_loss = splitter._compute_quota_loss(K)
+        assert min_loss.item() >= 0, "损失应为非负"
+        # 极端偏斜时损失应该更大
+        assert min_loss.item() > 0, "极端偏斜时应有非零损失"
+
+        # I96-7 验证: 梯度流通过 quota_logits
+        splitter.quota_logits.requires_grad_(True)
+        loss = splitter._compute_quota_loss(K)
+        loss.backward()
+
+        assert splitter.quota_logits.grad is not None, "应存在梯度"
+        assert not torch.all(splitter.quota_logits.grad == 0), "梯度不应全为零"
 
 
 if __name__ == '__main__':
