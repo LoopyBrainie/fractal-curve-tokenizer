@@ -984,41 +984,76 @@ class LayeredEvaluator:
         # P11-2: 优先从检查点推断架构参数，忽略配置文件中的值（除非显式指定）
         num_scales = None  # 用于创建模型
 
-        # 尝试从 threshold_offsets 的 shape 检测 max_depth_limit
-        # threshold_offsets shape = max_depth_limit + 1
-        threshold_key = None
+        # 优先从 _depth_scale_raw 检测 num_scales（这是 tokenizer 的核心参数）
+        # threshold_offsets 可能与 tokenizer 不一致（训练配置问题），应以 tokenizer 为准
+        depth_scale_key = None
         for k in state_dict.keys():
-            if 'threshold_offsets' in k:
-                threshold_key = k
+            if '_depth_scale_raw' in k:
+                depth_scale_key = k
                 break
-        if threshold_key is not None:
-            detected_max_depth = state_dict[threshold_key].shape[0] - 1
-            print(f"Detected max_depth_limit={detected_max_depth} from checkpoint key '{threshold_key}'")
-            # 优先使用检测到的值（从检查点加载时）
-            max_depth_limit = detected_max_depth
+        if depth_scale_key is not None:
+            # _depth_scale_raw shape = num_scales
+            detected_num_scales = state_dict[depth_scale_key].shape[0]
+            max_depth_limit = detected_num_scales - 1
+            num_scales = detected_num_scales
+            print(f"Detected num_scales={num_scales} (max_depth_limit={max_depth_limit}) from checkpoint key '{depth_scale_key}'")
         else:
-            # 兼容旧检查点：尝试从 depth_scale_raw 推断
-            depth_scale_key = None
+            # 兼容旧检查点：尝试从 threshold_offsets 推断
+            threshold_key = None
             for k in state_dict.keys():
-                if '_depth_scale_raw' in k:
-                    depth_scale_key = k
+                if 'threshold_offsets' in k:
+                    threshold_key = k
                     break
-            if depth_scale_key is not None:
-                # 旧格式: num_scales = max_depth_limit + 1
-                num_scales_old = state_dict[depth_scale_key].shape[0]
-                max_depth_limit = num_scales_old - 1
-                print(f"Detected max_depth_limit={max_depth_limit} (from legacy num_scales={num_scales_old})")
+            if threshold_key is not None:
+                # threshold_offsets shape = max_depth_limit + 1
+                detected_max_depth = state_dict[threshold_key].shape[0] - 1
+                max_depth_limit = detected_max_depth
+                num_scales = detected_max_depth + 1
+                print(f"Detected num_scales={num_scales} (max_depth_limit={max_depth_limit}) from checkpoint key '{threshold_key}'")
             else:
                 # 使用配置文件中的值或默认值
                 if max_depth_limit is None:
                     max_depth_limit = 4  # 默认值 (对应旧 num_scales=5)
-                    print(f"Warning: Could not detect max_depth_limit from checkpoint, using default {max_depth_limit}")
+                    num_scales = max_depth_limit + 1
+                    print(f"Warning: Could not detect num_scales from checkpoint, using default {num_scales}")
 
-        # 转换为 num_scales 用于 FractalCurveViT（兼容性参数）
-        # num_scales = max_depth_limit + 1
-        if max_depth_limit is not None:
-            num_scales = max_depth_limit + 1
-            print(f"Using num_scales={num_scales} (max_depth_limit={max_depth_limit})")
+        # P11-2: 检测 tokenizer_type 和 K_max/K_min
+        # 检查是否有 fractal_tokenizer（前缀）来确定旧版还是新版
+        tokenizer_type = config.get('tokenizer_type', None)
+        has_fractal_tokenizer = any(k.startswith('fractal_tokenizer') for k in state_dict.keys())
+        has_tokenizer = any(k.startswith('tokenizer') and not k.startswith('fractal_tokenizer') for k in state_dict.keys())
+
+        if has_fractal_tokenizer and not has_tokenizer:
+            if tokenizer_type is None:
+                tokenizer_type = 'fractal'
+                print("Detected tokenizer_type='fractal' from checkpoint (old format)")
+        elif has_tokenizer and not has_fractal_tokenizer:
+            if tokenizer_type is None:
+                tokenizer_type = 'streaming_v3'
+                print("Detected tokenizer_type='streaming_v3' from checkpoint (new format)")
+
+        # 检测 K_max 和 K_min（从 GumbelTopKSplitter 的相关参数）
+        K_max = config.get('K_max', None)
+        K_min = config.get('K_min', None)
+        if K_max is None:
+            # 尝试从 num_selected 或 logits 相关参数推断
+            for k in state_dict.keys():
+                if 'splitter.num_selected' in k or 'splitter.K' in k:
+                    K_val = state_dict[k]
+                    if isinstance(K_val, torch.Tensor):
+                        if K_val.dim() == 0:
+                            K_max = int(K_val.item())
+                        else:
+                            K_max = int(K_val.max().item())
+                    else:
+                        K_max = int(K_val)
+                    print(f"Detected K_max={K_max} from checkpoint key '{k}'")
+                    break
+        if K_max is None:
+            K_max = 64  # 默认值
+
+        if K_min is None:
+            K_min = 16  # 默认值
 
         # 检测 num_classes（从 mlp_head 的最后一个 linear 层）
         if 'mlp_head' in state_dict:
@@ -1127,12 +1162,13 @@ class LayeredEvaluator:
             use_checkpoint=config.get('use_checkpoint', False),
             drop_path_rate=config.get('drop_path_rate', 0.0),
             ffn_type=config.get('ffn_type', 'swiglu_level'),
-            tokenizer_type=config.get('tokenizer_type', 'streaming_v3'),
+            # P11-2: 使用检测到的 tokenizer_type
+            tokenizer_type=tokenizer_type if tokenizer_type else 'streaming_v3',
             lca_temperature=config.get('lca_temperature', 1.5),
             learnable_temperature=config.get('learnable_temperature', True),
-            # I23-2: Token 数量约束 (需与训练配置对齐)
-            K_min=config.get('K_min', 16),
-            K_max=config.get('K_max', 64),
+            # I23-2: Token 数量约束 (使用检测到的值)
+            K_min=K_min if K_min else 16,
+            K_max=K_max if K_max else 64,
             # I27: 子模块 Dropout 配置
             splitter_dropout=config.get('splitter_dropout', None),
             pos_dropout=config.get('pos_dropout', None),
