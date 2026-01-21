@@ -834,7 +834,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         
         # 计算每个 token 在其 batch 内的索引
         # P12-3: 利用 batch_indices 已按 (batch_idx, hilbert_idx) 排序的特性
-        # 使用 cummax 传播段起始位置，实现 O(N) 单次遍历的向量化计算
+        # I78 FIX: 使用 cumsum 替代 cummax，更可靠地计算段起始位置
         if N_total == 0:
             token_positions = torch.zeros(0, dtype=torch.long, device=device)
         else:
@@ -843,15 +843,19 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 torch.ones(1, device=device, dtype=torch.long),
                 (batch_indices[1:] != batch_indices[:-1]).long()
             ])
-            
-            # 全局位置索引
-            global_positions = torch.arange(N_total, device=device)
-            
-            # 段起始位置传播: cummax(i * S_i) 获取每个位置所属段的起始索引
-            segment_start_indices = (global_positions * segment_starts).cummax(dim=0)[0]
-            
-            # 段内位置 = 全局位置 - 段起始位置
-            token_positions = global_positions - segment_start_indices
+
+            # 计算每个段的起始全局位置: cumsum(S) - S
+            segment_start_global = segment_starts.cumsum(dim=0) - segment_starts
+
+            # 使用 F.pad 实现左移 (segment_start_global[1:] 移到最后)
+            # 等价于 cumsum_shift，但更直观
+            segment_start_global_shifted = torch.cat([
+                torch.zeros(1, device=device, dtype=torch.long),
+                segment_start_global[:-1]
+            ])
+
+            # 段内位置 = 全局位置 - 段起始全局位置
+            token_positions = torch.arange(N_total, device=device) - segment_start_global_shifted
         
         # 向量化分配
         tokens[batch_indices, token_positions] = all_tokens.to(dtype)
