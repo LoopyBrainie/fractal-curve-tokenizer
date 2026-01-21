@@ -402,10 +402,11 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             'num_tokens': num_tokens_list,
             'depth_distributions': depth_dists,
         }
-        
+
         # 3. 纯张量嵌入
         # I30-11: 传递 raw_probs 用于构建 padded_split_probs
         # I78: 传递 max_tokens (continuous_tokens.shape[1]) 修复未定义错误
+        raw_probs = split_result.probs if isinstance(split_result, GumbelTopKResult) else None
         tokens, levels_info, padded_regions, padded_split_probs = self._embed_with_tensor_result(
             features, tensor_result, raw_probs, max_tokens=max_tokens
         )
