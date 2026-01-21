@@ -209,6 +209,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             config_dict = dataclasses.asdict(splitter_config)
             if config_dict.get('feature_dim') != d_model:
                 config_dict['feature_dim'] = d_model
+            # I78: 使用动态计算的 max_depth 覆盖 config 中的值（修复混合 checkpoint 问题）
+            config_dict['max_depth_limit'] = self._computed_max_depth
             splitter_config = SplitterConfig(**config_dict)
 
             # I24-2: 如果显式提供了 enable_learnable_quota，覆盖 config 中的设置

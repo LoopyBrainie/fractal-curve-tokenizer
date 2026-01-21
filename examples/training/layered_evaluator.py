@@ -1225,12 +1225,33 @@ class LayeredEvaluator:
         if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
             print("Detected torch.compile() checkpoint, stripping '_orig_mod.' prefix...")
             state_dict = {
-                k.replace('_orig_mod.', ''): v 
+                k.replace('_orig_mod.', ''): v
                 for k, v in state_dict.items()
             }
-        
-        # 加载权重 (strict=False 以处理可能的细微差异)
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+
+        # I78: 过滤掉形状不匹配的参数（处理混合版本 checkpoint）
+        # 即使 strict=False，shape mismatch 仍会抛出错误
+        filtered_state_dict = {}
+        skipped_mismatches = []
+        for k, v in state_dict.items():
+            if k in model.state_dict():
+                model_param = model.state_dict()[k]
+                if v.shape == model_param.shape:
+                    filtered_state_dict[k] = v
+                else:
+                    skipped_mismatches.append((k, v.shape, model_param.shape))
+            # else: 参数不存在于模型中，忽略（strict=False 会处理）
+
+        if skipped_mismatches:
+            print(f"Warning: Skipped {len(skipped_mismatches)} parameters with shape mismatch:")
+            for k, ckpt_shape, model_shape in skipped_mismatches[:5]:
+                print(f"  - {k}: checkpoint {tuple(ckpt_shape)} vs model {tuple(model_shape)}")
+            if len(skipped_mismatches) > 5:
+                print(f"  ... and {len(skipped_mismatches) - 5} more")
+            print(f"  (This indicates a mixed-version or corrupted checkpoint)")
+
+        # 加载过滤后的权重
+        missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
         
         if missing_keys:
             print(f"Warning: Missing {len(missing_keys)} keys in state_dict")
