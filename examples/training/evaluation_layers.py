@@ -686,6 +686,12 @@ class TokenizerEvaluator:
     ) -> L2TokenizerMetrics:
         """执行 Tokenizer 行为评估"""
         model.eval()
+        # I78: 添加存在性检查，避免非 Fractal 模型崩溃
+        if not hasattr(model, 'tokenizer'):
+            raise ValueError(
+                f"L2 Tokenizer Evaluator requires model to have 'tokenizer' attribute. "
+                f"Model type: {type(model).__name__}"
+            )
         tokenizer = model.tokenizer
         
         token_counts = []

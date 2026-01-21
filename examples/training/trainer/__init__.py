@@ -82,10 +82,12 @@ class FractalModelProtocol(ModelProtocol):
 
         Returns:
             logits: 分类输出 [B, num_classes]
-            aux_infos: 辅助信息列表，每个元素对应一个样本
+            aux_infos: 辅助信息列表，每个元素对应一个样本（I78: 修复后对齐实现）
                 - num_tokens: int - Token 数量
                 - levels_used: List[int] - 使用的深度列表
-                - splitter_diagnostics: Dict - 分割器诊断信息
+                - depth_distribution: Dict[int, float] - 深度分布（归一化）
+                - splitter_diagnostics: Dict[str, Any] - 分割器诊断信息
+                - token_selection_entropy: float - 分割概率熵（可选，仅当 split_probs 可用时）
         """
         ...
 
@@ -95,6 +97,7 @@ class FractalModelProtocol(ModelProtocol):
         Args:
             config: 配置字典，包含:
                 - temperature_annealing: bool - 是否启用温度退火
+                - total_steps: int - 总训练步数（用于温度退火调度）
                 - temp_start: float - 起始温度
                 - temp_end: float - 结束温度
                 - aux_loss_weights: Dict[str, float] - 辅助损失权重

@@ -673,6 +673,8 @@ class FractalCurveViT(nn.Module):
                     "num_tokens": num_tokens,
                     "levels_used": all_levels_used[i],
                     "depth_distribution": depth_distribution,
+                    # I78: 添加缺失的 splitter_diagnostics 字段（与 FractalModelProtocol 对齐）
+                    "splitter_diagnostics": self.get_splitter_diagnostics(),
                 }
 
                 # M3: 计算选择熵 (token_selection_entropy)
@@ -964,6 +966,7 @@ class FractalCurveViT(nn.Module):
         Args:
             config: 配置字典，包含:
                 - temperature_annealing: bool - 是否启用温度退火
+                - total_steps: int - 总训练步数（必须提供，否则使用默认值可能不正确）
                 - temp_start: float - 起始温度
                 - temp_end: float - 结束温度
                 - aux_loss_weights: Dict[str, float] - 辅助损失权重
@@ -973,7 +976,16 @@ class FractalCurveViT(nn.Module):
             if hasattr(self, 'tokenizer') and hasattr(self.tokenizer, 'splitter'):
                 splitter = self.tokenizer.splitter
                 if hasattr(splitter, 'enable_temperature_annealing'):
-                    # 计算步数
+                    # I78: 修复 - 必须明确要求 total_steps，避免使用错误的默认值
+                    if 'total_steps' not in config:
+                        import warnings
+                        warnings.warn(
+                            "configure_training: 'total_steps' not in config. "
+                            "Using default 10000 which may be incorrect for your training run. "
+                            "Please pass total_steps explicitly.",
+                            UserWarning,
+                            stacklevel=2
+                        )
                     total_steps = config.get('total_steps', 10000)
                     splitter.enable_temperature_annealing(
                         total_steps=total_steps,
