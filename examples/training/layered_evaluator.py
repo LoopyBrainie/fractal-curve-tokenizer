@@ -996,20 +996,32 @@ class LayeredEvaluator:
                 tokenizer_type = 'streaming_v3'
                 print("Detected tokenizer_type='streaming_v3' from checkpoint (new format)")
 
-        # 2. 检测 num_scales（从 _depth_scale_raw，这是 tokenizer 的核心参数）
+        # 2. 检测 num_scales（从所有深度相关参数的 shape 中取最大值）
+        # I78: 修复混合版本 checkpoint 问题 - 某些参数可能是旧版本 (num_scales=9)
         num_scales = None
         max_depth_limit = None
-        depth_scale_key = None
+        depth_related_keys = []
+
         for k in state_dict.keys():
-            if '_depth_scale_raw' in k:
-                depth_scale_key = k
-                break
-        if depth_scale_key is not None:
-            # _depth_scale_raw shape = num_scales
-            detected_num_scales = state_dict[depth_scale_key].shape[0]
-            max_depth_limit = detected_num_scales - 1
+            # 收集所有与深度相关的参数
+            if any(pattern in k for pattern in [
+                'threshold_offsets', 'quota_logits', '_depth_ema_mean', '_depth_ema_var',
+                'depth_embedding', '_depth_scale_raw', 'depth_embed'
+            ]):
+                shape = state_dict[k].shape
+                if len(shape) > 0:
+                    depth_related_keys.append((k, shape[0]))
+
+        if depth_related_keys:
+            # 取所有深度相关参数的最大维度
+            detected_num_scales = max(shape[0] for _, shape in depth_related_keys)
             num_scales = detected_num_scales
-            print(f"Detected num_scales={num_scales} (max_depth_limit={max_depth_limit}) from checkpoint")
+            max_depth_limit = detected_num_scales - 1
+            print(f"Detected num_scales={num_scales} (max_depth_limit={max_depth_limit}) from {len(depth_related_keys)} depth-related parameters")
+            for k, shape in depth_related_keys[:5]:
+                print(f"  - {k}: shape={tuple(shape)}")
+            if len(depth_related_keys) > 5:
+                print(f"  ... and {len(depth_related_keys) - 5} more")
 
         # 3. 从 num_scales 反推 min_patch_size（与训练器逻辑一致）
         # 公式: min_patch_size = image_size / 2^max_depth
