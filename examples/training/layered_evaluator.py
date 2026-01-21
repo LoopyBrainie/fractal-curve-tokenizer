@@ -888,29 +888,46 @@ class LayeredEvaluator:
     def _load_model(self) -> nn.Module:
         """加载模型 checkpoint"""
         print(f"Loading checkpoint: {self.checkpoint_path}")
-        
+
         checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
-        
+
         # 获取模型配置
+        raw_config = None
         if 'config' in checkpoint:
-            config = checkpoint['config']
+            raw_config = checkpoint['config']
         elif 'model_config' in checkpoint:
-            config = checkpoint['model_config']
+            raw_config = checkpoint['model_config']
         else:
             # 尝试从同目录加载 config.json
             config_path = self.checkpoint_path.parent / "config.json"
             if config_path.exists():
                 with open(config_path) as f:
-                    config = json.load(f)
+                    raw_config = json.load(f)
             else:
                 raise ValueError("Cannot find model config in checkpoint or config.json")
-        
+
         # 将配置转为字典 (如果是 dataclass 或 namespace)
-        if hasattr(config, '__dict__'):
-            config = vars(config)
-        elif hasattr(config, '_asdict'):
-            config = config._asdict()
-        
+        if hasattr(raw_config, '__dict__'):
+            raw_config = vars(raw_config)
+        elif hasattr(raw_config, '_asdict'):
+            raw_config = raw_config._asdict()
+
+        # 处理嵌套配置结构 (ExperimentConfig 保存为 {"model": {...}, "training": {...}, ...})
+        # 优先使用 model 子配置，fallback 到扁平结构
+        if 'model' in raw_config and isinstance(raw_config['model'], dict):
+            config = raw_config['model']
+            print("[INFO] Using 'model' section from nested config")
+        else:
+            config = raw_config
+
+        # 合并 experiment_config 中的训练配置 (如果存在)
+        if 'training' in raw_config and isinstance(raw_config['training'], dict):
+            # 训练配置中的参数可能与模型配置互补
+            training_config = raw_config['training']
+            for key, value in training_config.items():
+                if key not in config or config[key] is None:
+                    config[key] = value
+
         # 从 checkpoint 的 config 中检测数据集，如果与用户指定不同则警告
         ckpt_dataset = config.get('dataset', self.dataset_name)
         if ckpt_dataset != self.dataset_name:
@@ -919,16 +936,20 @@ class LayeredEvaluator:
             self.dataset_name = ckpt_dataset
             if self.dataset_name not in SUPPORTED_DATASETS:
                 raise ValueError(f"Dataset '{self.dataset_name}' from checkpoint is not supported")
-        
+
         # 更新 dataset_config
         self.dataset_config = SUPPORTED_DATASETS[self.dataset_name]
-        
+
         # 构建模型
         from vit_pytorch import FractalCurveViT
-        
+
         # 获取 tokenizer 相关配置
-        # 支持旧格式的配置名称映射
-        num_scales = config.get('num_scales', None)
+        # I30-17: 废弃 num_scales，改为 min_patch_size + max_depth_limit
+        # 支持旧格式的向后兼容
+        max_depth_limit = config.get('max_depth_limit', None)
+        # 兼容旧检查点：max_depth_hard_limit -> max_depth_limit
+        if max_depth_limit is None:
+            max_depth_limit = config.get('max_depth_hard_limit', None)
         min_patch_size = config.get('min_patch_size', 4)
         if isinstance(min_patch_size, int):
             min_patch_size = (min_patch_size, min_patch_size)
@@ -958,19 +979,33 @@ class LayeredEvaluator:
             state_dict = checkpoint
 
         # 从 checkpoint 推断缺失的架构参数（向后兼容旧检查点）
-        if num_scales is None:
-            # 尝试从 depth_scale_raw 的 shape 检测 num_scales
-            depth_scale_key = None
+        # I30-17: 使用 max_depth_limit 替代已废弃的 num_scales
+        if max_depth_limit is None:
+            # 尝试从 threshold_offsets 的 shape 检测 max_depth_limit
+            # threshold_offsets shape = max_depth_limit + 1
+            threshold_key = None
             for k in state_dict.keys():
-                if '_depth_scale_raw' in k:
-                    depth_scale_key = k
+                if 'threshold_offsets' in k:
+                    threshold_key = k
                     break
-            if depth_scale_key is not None:
-                num_scales = state_dict[depth_scale_key].shape[0]
-                print(f"Detected num_scales={num_scales} from checkpoint key '{depth_scale_key}'")
+            if threshold_key is not None:
+                max_depth_limit = state_dict[threshold_key].shape[0] - 1
+                print(f"Detected max_depth_limit={max_depth_limit} from checkpoint key '{threshold_key}'")
             else:
-                num_scales = 4  # 默认值
-                print(f"Warning: Could not detect num_scales from checkpoint, using default {num_scales}")
+                # 兼容旧检查点：尝试从 depth_scale_raw 推断
+                depth_scale_key = None
+                for k in state_dict.keys():
+                    if '_depth_scale_raw' in k:
+                        depth_scale_key = k
+                        break
+                if depth_scale_key is not None:
+                    # 旧格式: num_scales = max_depth_limit + 1
+                    num_scales_old = state_dict[depth_scale_key].shape[0]
+                    max_depth_limit = num_scales_old - 1
+                    print(f"Detected max_depth_limit={max_depth_limit} (from legacy num_scales={num_scales_old})")
+                else:
+                    max_depth_limit = 4  # 默认值 (对应旧 num_scales=5)
+                    print(f"Warning: Could not detect max_depth_limit from checkpoint, using default {max_depth_limit}")
 
         # 检测 num_classes（从 mlp_head 的最后一个 linear 层）
         if 'mlp_head' in state_dict:
@@ -1071,19 +1106,30 @@ class LayeredEvaluator:
             dropout=config.get('dropout', 0.1),
             emb_dropout=config.get('emb_dropout', 0.1),
             min_patch_size=min_patch_size,
-            max_level=config.get('max_level', None),
+            max_level=None,  # P11-2: None = 自动从 tokenizer.max_depth 获取
+            # I30-17: 废弃 num_scales，使用 max_depth_limit
+            # num_scales 参数保留用于向后兼容，但实际由 max_depth_limit 控制
+            max_depth_limit=max_depth_limit,
             use_hilbert_encoding=config.get('use_hilbert_encoding', True),
             use_spatial_encoding=config.get('use_spatial_encoding', True),
             use_checkpoint=config.get('use_checkpoint', False),
             drop_path_rate=config.get('drop_path_rate', 0.0),
             ffn_type=config.get('ffn_type', 'swiglu_level'),
             tokenizer_type=config.get('tokenizer_type', 'streaming_v3'),
-            num_scales=num_scales,
             lca_temperature=config.get('lca_temperature', 1.5),
             learnable_temperature=config.get('learnable_temperature', True),
             # I23-2: Token 数量约束 (需与训练配置对齐)
             K_min=config.get('K_min', 16),
             K_max=config.get('K_max', 64),
+            # I27: 子模块 Dropout 配置
+            splitter_dropout=config.get('splitter_dropout', None),
+            pos_dropout=config.get('pos_dropout', None),
+            # I31-3: 形状-尺度编码配置
+            use_area_encoding=config.get('use_area_encoding', False),
+            use_affine_modulation=config.get('use_affine_modulation', True),
+            fourier_levels=config.get('fourier_levels', 4),
+            # I24-2: 可学习配额控制
+            quota_learnable=config.get('quota_learnable', None),
         )
         
         # 加载权重

@@ -93,6 +93,15 @@ class ModelArchitectureConfig:
     # I31: 形状-尺度编码配置
     use_area_encoding: bool = False
     use_affine_modulation: bool = True  # A17: 默认为 True
+    fourier_levels: int = 4             # 傅里叶特征级别数
+
+    # I27: 子模块 Dropout 配置
+    splitter_dropout: Optional[float] = None  # None = 自动 = min(dropout, 0.15)
+    pos_dropout: Optional[float] = None       # None = 自动 = dropout * 0.5
+
+    # I24-2: 可学习配额控制
+    # None = 使用常量默认值, True/False = 显式覆盖
+    quota_learnable: Optional[bool] = None
 
     def __post_init__(self):
         """参数验证 - 数学约束"""
