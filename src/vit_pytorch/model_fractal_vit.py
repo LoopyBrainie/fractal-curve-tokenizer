@@ -218,9 +218,11 @@ class FractalCurveViT(nn.Module):
             estimated_size = effective_min_patch_size * 64
             self.image_size = pair(estimated_size)
             self._dynamic_image_size = True
+            self._cached_image_size = None  # 用于缓存上次更新的尺寸
         else:
             self.image_size = pair(image_size)
             self._dynamic_image_size = False
+            self._cached_image_size = None
 
         # I98-2: 优先级 - 使用注入的组件 > 动态参数创建 > 默认配置
         # 依赖注入模式: 检查是否提供了 injected 组件
@@ -493,9 +495,12 @@ class FractalCurveViT(nn.Module):
             - token_output: TokenizerOutput (P11-3: 用于获取 regions)
         """
         # I78: 动态分辨率支持 - 根据实际输入更新 splitter 候选区域
+        # I99-10: 仅在尺寸变化时更新，避免不必要的计算
         if self._dynamic_image_size:
             actual_size = (img.shape[2], img.shape[3])  # (H, W)
-            self.splitter._update_candidates(actual_size)
+            if actual_size != self._cached_image_size:
+                self.splitter._update_candidates(actual_size)
+                self._cached_image_size = actual_size
 
         # I98-1: Pipeline 架构 - 先调用 Splitter，再调用 Tokenizer
         # Splitter 决策哪些区域需要细分
@@ -1062,9 +1067,13 @@ class FractalCurveViT(nn.Module):
         return self.forward(img, return_aux_info=return_aux_info)
 
     def configure_training(self, config: Dict[str, Any]) -> None:
-        """配置训练相关参数 (I36-2: 解耦设计)
+        """配置训练相关参数 (I36-2: 解耦设计, I99-对齐修复)
 
         设计原则: 训练器通过协议接口配置，不直接访问内部实现
+
+        I99修复: 统一 Splitter 访问路径，同时支持:
+            - 新架构: self.splitter (I98-2 依赖注入模式)
+            - 旧架构: self.tokenizer.splitter
 
         Args:
             config: 配置字典，包含:
@@ -1074,28 +1083,36 @@ class FractalCurveViT(nn.Module):
                 - temp_end: float - 结束温度
                 - aux_loss_weights: Dict[str, float] - 辅助损失权重
         """
+        # 统一 Splitter 访问路径 (I99-对齐修复)
+        splitter = None
+
+        # 优先检查新架构: self.splitter (I98-2 依赖注入模式)
+        if hasattr(self, 'splitter'):
+            splitter = self.splitter
+        # 兼容旧架构: self.tokenizer.splitter
+        elif hasattr(self, 'tokenizer') and hasattr(self.tokenizer, 'splitter'):
+            splitter = self.tokenizer.splitter
+
         # 温度退火配置
-        if config.get('temperature_annealing'):
-            if hasattr(self, 'tokenizer') and hasattr(self.tokenizer, 'splitter'):
-                splitter = self.tokenizer.splitter
-                if hasattr(splitter, 'enable_temperature_annealing'):
-                    # I78: 修复 - 必须明确要求 total_steps，避免使用错误的默认值
-                    if 'total_steps' not in config:
-                        import warnings
-                        warnings.warn(
-                            "configure_training: 'total_steps' not in config. "
-                            "Using default 10000 which may be incorrect for your training run. "
-                            "Please pass total_steps explicitly.",
-                            UserWarning,
-                            stacklevel=2
-                        )
-                    total_steps = config.get('total_steps', 10000)
-                    splitter.enable_temperature_annealing(
-                        total_steps=total_steps,
-                        T_start=config.get('temp_start', 1.0),
-                        T_end=config.get('temp_end', 0.5),
-                        schedule=config.get('schedule', 'exponential'),
+        if config.get('temperature_annealing') and splitter is not None:
+            if hasattr(splitter, 'enable_temperature_annealing'):
+                # I78: 修复 - 必须明确要求 total_steps，避免使用错误的默认值
+                if 'total_steps' not in config:
+                    import warnings
+                    warnings.warn(
+                        "configure_training: 'total_steps' not in config. "
+                        "Using default 10000 which may be incorrect for your training run. "
+                        "Please pass total_steps explicitly.",
+                        UserWarning,
+                        stacklevel=2
                     )
+                total_steps = config.get('total_steps', 10000)
+                splitter.enable_temperature_annealing(
+                    total_steps=total_steps,
+                    T_start=config.get('temp_start', 1.0),
+                    T_end=config.get('temp_end', 0.5),
+                    schedule=config.get('schedule', 'exponential'),
+                )
 
         # 辅助损失权重配置
         if 'aux_loss_weights' in config:
@@ -1104,7 +1121,11 @@ class FractalCurveViT(nn.Module):
             # 目前使用默认值，留作扩展接口
 
     def get_splitter_diagnostics(self) -> Dict[str, Any]:
-        """获取分割器诊断信息 (I36-3: FractalModelProtocol 实现)
+        """获取分割器诊断信息 (I36-3: FractalModelProtocol 实现, I99-对齐修复)
+
+        I99修复: 统一 Splitter 访问路径，同时支持:
+            - 新架构: self.splitter (I98-2 依赖注入模式)
+            - 旧架构: self.tokenizer.splitter
 
         Returns:
             诊断字典，包含:
@@ -1124,8 +1145,17 @@ class FractalCurveViT(nn.Module):
             'splitter_type': 'None',
         }
 
-        if hasattr(self, 'tokenizer') and hasattr(self.tokenizer, 'splitter'):
+        # 统一 Splitter 访问路径 (I99-对齐修复)
+        splitter = None
+
+        # 优先检查新架构: self.splitter (I98-2 依赖注入模式)
+        if hasattr(self, 'splitter'):
+            splitter = self.splitter
+        # 兼容旧架构: self.tokenizer.splitter
+        elif hasattr(self, 'tokenizer') and hasattr(self.tokenizer, 'splitter'):
             splitter = self.tokenizer.splitter
+
+        if splitter is not None:
             diagnostics['has_splitter'] = True
             diagnostics['splitter_type'] = type(splitter).__name__
 

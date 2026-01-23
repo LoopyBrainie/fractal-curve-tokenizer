@@ -91,7 +91,7 @@ class BaseSplitter(Protocol):
         根据输入尺寸动态更新候选区域。
 
         数学形式:
-            min(max_depth_limit, floor(log2(min(H L(X) =, W) / min_patch_size)))
+            L_max = min(max_depth_limit, max(0, floor(log2(min(H, W) / min_patch_size))))
 
         Args:
             image_size: (H, W) 输入图像尺寸
@@ -285,6 +285,8 @@ class SplitResult:
             Tensor: [B] 每个 batch 的 token 数量
         """
         import torch
+        if self.batch_indices.numel() == 0:
+            return torch.zeros(1, dtype=torch.long, device=self.batch_indices.device)
         return torch.bincount(
             self.batch_indices,
             minlength=int(self.batch_indices.max().item() + 1)
