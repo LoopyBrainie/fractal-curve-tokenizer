@@ -445,7 +445,7 @@ class GumbelTopKSplitter(nn.Module):
         # I99-1: 修改为 3D Buffer [B_max, D] 实现 per-sample EMA
         #         每个样本独立累积 EMA，完全消除 batch 依赖
         D = max_depth_limit + 1
-        self._max_batch_size = 32  # I99-1: 预设最大 batch size
+        self._max_batch_size = 256  # I99-1: 预设最大 batch size (支持 batch=192)
         self.register_buffer('_depth_ema_mean', torch.zeros(self._max_batch_size, D))  # [B_max, D]
         self.register_buffer('_depth_ema_var', torch.ones(self._max_batch_size, D))   # [B_max, D]
         self._depth_ema_initialized = False  # 标记是否已初始化
@@ -802,7 +802,8 @@ class GumbelTopKSplitter(nn.Module):
         if self.training:
             # 训练模式: Per-sample EMA 更新
             # 对每个样本独立更新 EMA，不跨 batch 平均
-            for b in range(B):
+            B_effective = min(B, self._max_batch_size)  # 边界保护
+            for b in range(B_effective):
                 mu_b = mu_per_batch[b]  # [D]
                 var_b = variance_per_batch[b]  # [D]
 
