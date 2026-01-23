@@ -2836,16 +2836,8 @@ def main():
     from vit_pytorch.tokenizer_streaming import StreamingFractalTokenizerV3
 
     # I30-17: 使用动态深度计算
-    # I30-10: 创建 SplitterConfig 用于配额参数配置
-    from vit_pytorch.config import create_splitter_config
-    splitter_config = create_splitter_config(
-        enable_learnable_quota=config.quota_learnable,
-        quota_init_logits=config.quota_init_logits,
-        quota_min_per_depth=config.quota_min_per_depth,
-        K_min=config.K_min,
-        K_max=config.K_max,
-        freeze_quota=config.freeze_quota,
-    )
+    # Note: Splitter 由模型内部创建 GumbelTopKSplitter 时自动处理，
+    #       无需在此处单独配置 splitter_config
 
     tokenizer = StreamingFractalTokenizerV3(
         image_size=max(spec.image_size, 32),
@@ -2856,13 +2848,8 @@ def main():
         use_hilbert_order=True,
         # P6-1: 深度缩放配置
         depth_scale_range=config.depth_scale_range,
-        # P7-7: 可学习分割器温度参数 (I78: 修复参数映射错误)
-        learnable_temperature=config.learnable_temperature,
-        # I30-10: SplitterConfig 统一配置
-        splitter_config=splitter_config,
-        # I27: Splitter Dropout (与模型 dropout 对齐)
-        # 数学依据: Splitter MLP 敏感，过高 dropout 导致分割决策不稳定
-        splitter_dropout=min(config.dropout, 0.15),
+        # Note: Splitter 参数 (splitter_config, splitter_dropout, learnable_temperature)
+        # 已由模型在内部创建 GumbelTopKSplitter 时处理，不在此处传递
     )
 
     # 创建模型 (V3 Variable Depth Tokens)
