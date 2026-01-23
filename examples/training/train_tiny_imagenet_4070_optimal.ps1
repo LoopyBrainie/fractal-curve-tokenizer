@@ -5,7 +5,7 @@
 # 数学形式化分析 (2026-01-21) - 基于第一性原理推导
 # ============================================================================
 #
-# 1. 模型架构参数计算 (I36 激进优化)
+# 1. 模型架构参数计算 (I36 保守优化)
 #    --------------------
 #    Tiny-ImageNet: N_train = 100,000 samples, C = 200 classes
 #
@@ -13,11 +13,11 @@
 #      P_total = depth * 16 * dim^2 + 2.5 * dim * num_classes
 #      mlp_dim = 4 * dim (自动计算)
 #
-#    激进配置 (dim=448, depth=8, heads=7):
-#      mlp_dim = 4 * 448 = 1792
-#      P_total = 8 * 16 * 448^2 + 2.5 * 448 * 200 = 45.44M (实际: 31.58M)
+#    保守配置 (dim=384, depth=8, heads=6):
+#      mlp_dim = 4 * 384 = 1536
+#      P_total = 8 * 16 * 384^2 + 2.5 * 384 * 200 = 23.2M
 #
-#    P/N 比率: 31.58M / 100K = 315.8 (ViT 可接受范围: [150, 500])
+#    P/N 比率: 23.2M / 100K = 232 (ViT 可接受范围: [150, 500])
 #
 # 2. Tokenizer 配置优化 (I36)
 #    ----------------
@@ -40,13 +40,13 @@
 # 3. 学习率缩放 (Linear Scaling Rule)
 #    ---------------------------------
 #    lr_base = 3e-4 @ batch_size=256
-#    lr = 3e-4 * (96/256) = 1.125e-4 ≈ 1.1e-4
+#    lr = 3e-4 * (128/256) = 1.5e-4 (effective batch=128 with accum-steps=2)
 #
 # 4. VRAM 预算 (8GB - RTX 4070 Laptop)
 #    ----------------------------------
-#    混合精度模型: batch=96, dim=448, depth=8
-#    VRAM 估算: ~0.8 GB (安全余量)
-#    梯度累计: accum-steps=2 → effective batch=192
+#    混合精度模型: batch=64, dim=384, depth=8
+#    VRAM 估算: ~0.6 GB (安全余量)
+#    梯度累计: accum-steps=2 → effective batch=128
 #
 # 5. torch.compile 状态
 #    -----------------
@@ -59,16 +59,16 @@ $script = @"
 uv run python src/training/train_fractal_vit.py `
   --dataset tiny-imagenet `
   --epochs 100 `
-  --dim 448 `
+  --dim 384 `
   --depth 8 `
-  --heads 7 `
+  --heads 6 `
   --pool cls `
   --ffn-type swiglu_level `
   --tokenizer-type streaming_v3 `
   --min-patch-size 4 `
-  --batch-size 96 `
+  --batch-size 64 `
   --num-workers 4 `
-  --lr 1.1e-4 `
+  --lr 1.5e-4 `
   --accum-steps 2 `
   --weight-decay 0.08 `
   --warmup-epochs 10 `
@@ -95,7 +95,7 @@ uv run python src/training/train_fractal_vit.py `
   --gradient-clip 1.0 `
   --patience 15 `
   --min-delta 0.001 `
-  --exp-name tiny_imagenet_448d_8l_bs96_x2
+  --exp-name tiny_imagenet_384d_8l_bs64_x2
 "@
 
 # 执行训练脚本
