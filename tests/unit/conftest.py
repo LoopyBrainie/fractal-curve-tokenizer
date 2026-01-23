@@ -1,0 +1,105 @@
+# -*- coding: utf-8 -*-
+"""
+Unit Test Fixtures
+
+模块级 fixtures 用于单元测试.
+
+包含:
+- splitter_base: 基础 GumbelTopKSplitter
+- splitter_with_quota: 启用了可学习配额的 splitter
+- splitter_for_ema: 用于 EMA 测试的 splitter
+- features_2d: 2D 特征张量
+- features_4d: 4D 特征张量
+"""
+
+import pytest
+import torch
+
+
+@pytest.fixture
+def splitter_base():
+    """基础 GumbelTopKSplitter (无特定配置).
+
+    用于测试 splitter 的基础功能.
+    """
+    from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+
+    return GumbelTopKSplitter(
+        feature_dim=64,
+        min_patch_size=4,
+        max_depth_limit=3,
+        image_size=(32, 32),
+        hidden_dim=32,
+        pool_size=2,
+        temperature=1.0,
+        K_min=4,
+        K_max=16,
+    )
+
+
+@pytest.fixture
+def splitter_with_quota():
+    """启用了可学习配额的 GumbelTopKSplitter.
+
+    用于测试 Scheme E 可学习配额机制.
+    """
+    from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+
+    return GumbelTopKSplitter(
+        feature_dim=64,
+        min_patch_size=8,
+        max_depth_limit=4,
+        image_size=(64, 64),
+        hidden_dim=32,
+        pool_size=2,
+        temperature=1.0,
+        K_min=8,
+        K_max=32,
+        learnable_quota=True,
+    )
+
+
+@pytest.fixture
+def splitter_for_ema():
+    """用于 EMA 测试的 GumbelTopKSplitter.
+
+    具有完整 EMA 配置的 splitter.
+    """
+    from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+
+    return GumbelTopKSplitter(
+        feature_dim=256,
+        min_patch_size=4,
+        max_depth_limit=8,
+        image_size=(64, 64),
+        hidden_dim=128,
+        pool_size=2,
+        temperature=1.0,
+        K_min=16,
+        K_max=64,
+        use_depth_variance_normalization=True,
+    )
+
+
+@pytest.fixture
+def features_2d():
+    """2D 特征张量 [B, C]."""
+    return torch.randn(2, 256)
+
+
+@pytest.fixture
+def features_4d():
+    """4D 特征张量 [B, C, H, W]."""
+    return torch.randn(2, 64, 8, 8)
+
+
+@pytest.fixture
+def features_for_splitter(splitter_base):
+    """与 splitter 匹配的 4D 特征张量.
+
+    特征维度与 splitter 配置匹配.
+    """
+    B = 2
+    feature_dim = splitter_base.feature_dim
+    H, W = 8, 8  # 32 / 4 = 8 (min_patch_size=4)
+    return torch.randn(B, feature_dim, H, W)

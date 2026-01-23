@@ -1,8 +1,15 @@
 """
-Fractal ViT Benchmarks Package.
+Fractal ViT Benchmarks Package - Non-Pytest Scripts
 
-This package provides comprehensive benchmarking tools for evaluating
-Fractal ViT tokenization and model performance.
+警告: 此目录包含独立运行脚本，不属于 pytest 测试套件。
+这些脚本用于性能基准测试和 ablation 研究，需独立运行。
+
+运行方式:
+    python -m tests.benchmarks.benchmark_fractal_vit
+    python -m tests.benchmarks.check_convergence
+    python -m tests.benchmarks.compare_fractal_vs_standard
+
+NOT part of pytest - DO NOT run with: pytest tests/benchmarks/
 
 Modules:
 - benchmark_metrics: Core metrics definitions and utilities
@@ -10,19 +17,6 @@ Modules:
 - check_convergence: Training convergence analysis
 - compare_fractal_vs_standard: Comparison with standard ViT
 - evaluate_pretrained: Evaluate pretrained .pth models
-
-Usage:
-    # Run tokenization benchmarks
-    python -m tests.benchmarks.benchmark_fractal_vit
-    
-    # Run convergence analysis
-    python -m tests.benchmarks.check_convergence
-    
-    # Run full comparison
-    python -m tests.benchmarks.compare_fractal_vs_standard
-    
-    # Evaluate pretrained model
-    python -m tests.benchmarks.evaluate_pretrained --checkpoint path/to/best.pth --visualize
 """
 
 from .benchmark_metrics import (

@@ -77,7 +77,7 @@ def test_next_gen_fractal_vit_handles_varied_sizes(device: str) -> None:
 def test_streaming_v3_tokenizer_device_consistency(device: str) -> None:
     """测试流式 V3 tokenizer 的设备一致性."""
     from vit_pytorch import StreamingFractalTokenizerV3
-    
+
     tokenizer = StreamingFractalTokenizerV3(
         image_size=32,
         channels=3,
@@ -85,9 +85,31 @@ def test_streaming_v3_tokenizer_device_consistency(device: str) -> None:
         base_patch_size=4,
         max_depth=3,
     ).to(device)
-    
+
+    # I98-1: 创建独立的 Splitter
+    from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+    from vit_pytorch.config import SplitterConfig
+
+    splitter_config = SplitterConfig(
+        feature_dim=64,
+        min_patch_size=4,
+        max_depth_limit=3,
+        hidden_dim=32,
+        intermediate_dim=32,
+        pool_size=4,
+        K_min=4,
+        K_max=16,
+    )
+    splitter = GumbelTopKSplitter(
+        config=splitter_config,
+        image_size=(32, 32),
+    ).to(device)
+
     images = torch.randn(2, 3, 32, 32, device=device)
-    output = tokenizer.tokenize(images)
+    # I98-1: 使用完整 pipeline (features -> splitter -> tokenizer)
+    features = tokenizer.shared_conv(images)
+    split_result = splitter(features, image_size=(32, 32), hard=True)
+    output = tokenizer.tokenize(images, split_result)
     
     for seq in output:
         assert seq.tokens.device.type == device

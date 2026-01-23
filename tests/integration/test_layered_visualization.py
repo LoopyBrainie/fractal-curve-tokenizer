@@ -24,7 +24,7 @@ import tempfile
 import matplotlib.pyplot as plt
 
 # 导入评估层系统
-from examples.training.evaluation_layers import (
+from training.evaluation_layers import (
     LayeredEvaluationReport,
     L1ClassificationMetrics,
     L2TokenizerMetrics,
@@ -35,7 +35,7 @@ from examples.training.evaluation_layers import (
 )
 
 # 导入可视化系统
-from examples.training.visualization import (
+from training.visualization import (
     LayeredVisualizer,
     FigureConfig,
     L1ClassificationVisualizer,

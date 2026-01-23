@@ -45,24 +45,30 @@ class DummyPositional(nn.Module):
 
     def forward(
         self,
-        levels_info: torch.Tensor,
+        levels_info,
         sequence_positions: torch.Tensor | None = None,
         *,
         regions: torch.Tensor | None = None,
         image_size: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         self.called = True
-        if levels_info.numel() == 0:
-            return torch.zeros(0, self.dim, device=levels_info.device)
-        
+        # I98-4: Support both LevelsInfo and raw tensor
+        if hasattr(levels_info, 'data'):
+            data = levels_info.data
+        else:
+            data = levels_info
+
+        if data.numel() == 0:
+            return torch.zeros(0, self.dim, device=data.device)
+
         # levels_info shape is (Batch, Seq, Info) from FractalCurveViT
         # We need to return (Batch, Seq, Dim) matching the expected shape
-        if levels_info.dim() == 3:
+        if data.dim() == 3:
             # Shape: (B, Seq, Info) -> return (B, Seq, Dim)
-            return torch.zeros(levels_info.shape[0], levels_info.shape[1], self.dim, device=levels_info.device)
+            return torch.zeros(data.shape[0], data.shape[1], self.dim, device=data.device)
         else:
             # Shape: (Batch*Seq, Info) -> return (Batch*Seq, Dim)
-            return torch.zeros(levels_info.shape[0], self.dim, device=levels_info.device)
+            return torch.zeros(data.shape[0], self.dim, device=data.device)
 
 
 def test_vit_uses_custom_components() -> None:
