@@ -1,6 +1,6 @@
 #!/bin/bash
 # Tiny-ImageNet Optimal Training Script (RTX 4070 Laptop)
-# Mathematical derivation: dim=448, depth=8, batch=128, lr=1.5e-4
+# Mathematical derivation: dim=448, depth=8, batch=96, lr=1.1e-4, accum-steps=2
 
 set -e
 
@@ -14,9 +14,10 @@ uv run python src/training/train_fractal_vit.py \
   --ffn-type swiglu_level \
   --tokenizer-type streaming_v3 \
   --min-patch-size 4 \
-  --batch-size 128 \
+  --batch-size 96 \
   --num-workers 4 \
-  --lr 1.5e-4 \
+  --lr 1.1e-4 \
+  --accum-steps 2 \
   --weight-decay 0.08 \
   --warmup-epochs 10 \
   --dropout 0.15 \
