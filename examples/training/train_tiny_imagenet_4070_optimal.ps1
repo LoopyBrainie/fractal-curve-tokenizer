@@ -40,12 +40,12 @@
 # 3. 学习率缩放 (Linear Scaling Rule)
 #    ---------------------------------
 #    lr_base = 3e-4 @ batch_size=256
-#    lr = 3e-4 * (192/256) = 2.25e-4
+#    lr = 3e-4 * (128/256) = 1.5e-4
 #
 # 4. VRAM 预算 (8GB - RTX 4070 Laptop)
 #    ----------------------------------
-#    混合精度模型: 316 MB (31.58M * 10 bytes)
-#    总计(含开销): ~1.5 GB << 8GB ✓
+#    混合精度模型: batch=128, dim=448, depth=8
+#    VRAM 估算: ~1.0 GB (安全余量)
 #
 # 5. torch.compile 状态
 #    -----------------
@@ -65,9 +65,9 @@ uv run python src/training/train_fractal_vit.py `
   --ffn-type swiglu_level `
   --tokenizer-type streaming_v3 `
   --min-patch-size 4 `
-  --batch-size 192 `
+  --batch-size 128 `
   --num-workers 4 `
-  --lr 2.25e-4 `
+  --lr 1.5e-4 `
   --weight-decay 0.08 `
   --warmup-epochs 10 `
   --dropout 0.15 `
