@@ -328,10 +328,10 @@ class CUB200TrainingConfig:
     # 日志
     log_level: str = "INFO"
 
-    # I31: 面积编码配置 (2026-01-18)
-    use_area_encoding: bool = False
-    use_affine_modulation: bool = False
-    fourier_levels: int = 4
+    # I31: 面积编码配置 (从 arch_config 获取，无需重复定义)
+    # use_area_encoding: bool = False  # 移至 arch_config
+    # use_affine_modulation: bool = False  # 移至 arch_config
+    # fourier_levels: int = 4  # 移至 arch_config
 
     # P7-7: 温度退火参数
     splitter_temp_start: float = 1.0
@@ -356,12 +356,24 @@ class CUB200TrainingConfig:
         min_patch_size=4,
     ))
 
-    # 训练策略参数（可覆盖 arch_config 中的默认值）
-    learning_rate: float = 2.7e-4  # 可覆盖 arch_config 中的学习率
+    # =========================================================================
+    # I99: 训练策略参数（补充 arch_config 中未包含的字段）
+    # =========================================================================
+    # 注意: learning_rate 是训练超参数，不在 arch_config 中定义
+    learning_rate: float = 2.7e-4  # 主模型学习率
     use_checkpoint: bool = False
     use_channels_last: bool = False  # I78: channels-last 内存格式 (节省 ~20% VRAM)
     use_compile: bool = False        # I78: torch.compile 优化 (提升 ~30% 训练速度)
     compile_mode: str = "default"    # torch.compile 模式: default, reduce-overhead, max-autotune
+
+    # I99: 补充缺失的模型配置字段（用于检查点保存和模型重建）
+    dim_head: int = 64  # 每个注意力头的维度 (dim // heads)
+    channels: int = 3   # 输入图像通道数
+    K_min: int = 8      # 最少 token 数
+    K_max: int = 64     # 最多 token 数
+    tokenizer_type: str = "streaming_v3"  # Tokenizer 类型
+    ffn_type: str = "swiglu_level"  # FFN 类型
+    # num_scales 已废弃，使用 min_patch_size 动态计算 max_depth
 
     def __post_init__(self):
         """参数验证 - 数学约束"""
@@ -381,6 +393,34 @@ class CUB200TrainingConfig:
 
         # 日志级别
         self.log_level = getattr(logging, self.log_level.upper(), logging.INFO)
+
+    def validate_model_config_consistency(self) -> None:
+        """P1 Fix: 验证 CUB200TrainingConfig 与 ModelArchitectureConfig 的一致性
+
+        检查训练配置参数与模型架构配置是否一致，避免运行时错误。
+
+        Raises:
+            ValueError: 当配置不一致时
+        """
+        issues = []
+
+        # 检查 K_min/K_max 约束
+        if self.K_min > self.K_max:
+            issues.append(f"K_min={self.K_min} > K_max={self.K_max}")
+
+        # 检查 dim_head 兼容性
+        if self.dim % self.heads != 0:
+            issues.append(f"dim={self.dim} 不能被 heads={self.heads} 整除")
+
+        # 检查 min_patch_size 合理性
+        if self.min_patch_size < 1:
+            issues.append(f"min_patch_size={self.min_patch_size} 必须 >= 1")
+
+        if issues:
+            raise ValueError(
+                f"CUB200TrainingConfig 与 ModelArchitectureConfig 不一致:\n  - " +
+                "\n  - ".join(issues)
+            )
 
     # =========================================================================
     # I36: 便捷属性（从 arch_config 获取，保持向后兼容）
@@ -564,8 +604,8 @@ class CUB200Trainer:
         # 训练状态
         self.state = CUB200TrainerState()
 
-        # I35: 混合精度 scaler - 使用 device 关键字参数替代废弃的 positional 参数
-        self.scaler: Optional[GradScaler] = GradScaler(device='cuda', enabled=config.use_amp)
+        # I35: 混合精度 scaler - device 是关键字参数
+        self.scaler: Optional[GradScaler] = GradScaler(enabled=config.use_amp, device='cuda')
 
         self.logger.info(f"CUB200Trainer 初始化完成: device={self.device}, num_classes={num_classes}")
 
@@ -617,12 +657,11 @@ class CUB200Trainer:
         Args:
             train_loader: 训练数据加载器
         """
-        # I98-2: 使用 model.splitter (独立组件)
-        if not hasattr(self.model, 'splitter'):
+        # P0 Fix: 使用 getattr 安全访问 splitter
+        splitter = getattr(self.model, 'splitter', None)
+        if splitter is None:
             self.logger.info("[A21] 模型无 splitter，跳过温度退火设置")
             return
-
-        splitter = self.model.splitter
 
         # 检查是否支持退火 API
         if not hasattr(splitter, 'enable_temperature_annealing'):
@@ -656,11 +695,10 @@ class CUB200Trainer:
         Args:
             epoch: 当前 epoch
         """
-        # I98-2: 使用 model.splitter (独立组件)
-        if not hasattr(self.model, 'splitter'):
+        # P0 Fix: 使用 getattr 安全访问 splitter
+        splitter = getattr(self.model, 'splitter', None)
+        if splitter is None:
             return
-
-        splitter = self.model.splitter
 
         if epoch <= self.config.splitter_temp_warmup:
             # Warmup: 禁用退火，固定 T_start
@@ -902,7 +940,12 @@ class CUB200Trainer:
                 # M2: 统一使用 forward(return_features=True) 提取特征
                 if return_features:
                     outs, features = self.model(imgs, return_features=True)
-                    all_features.append(features[0].cpu() if isinstance(features, list) else features.cpu())
+                    # P1 Fix: features 是 List[Tensor]，需要 stack 成 [B, D]
+                    if isinstance(features, list):
+                        features_tensor = torch.stack(features)  # [B, D]
+                    else:
+                        features_tensor = features
+                    all_features.append(features_tensor.cpu())
                     all_labels.append(labels.cpu())
                 else:
                     outs = self.model(imgs)
@@ -1264,8 +1307,7 @@ class CUB200Trainer:
                 'mlp_dim': self.config.mlp_dim,
                 'dim_head': self.config.dim_head,
                 'drop_path_rate': self.config.drop_path_rate,
-                # Tokenizer 参数
-                'num_scales': self.config.num_scales,
+                # Tokenizer 参数 (I99: num_scales 已废弃)
                 'min_patch_size': self.config.min_patch_size,
                 'K_min': self.config.K_min,
                 'K_max': self.config.K_max,
@@ -1276,7 +1318,7 @@ class CUB200Trainer:
                 'use_compile': self.config.use_compile,
                 'compile_mode': self.config.compile_mode,
                 'channels': self.config.channels,
-                # I31 面积编码配置
+                # I31 面积编码配置 (从 arch_config 获取)
                 'use_area_encoding': self.config.use_area_encoding,
                 'use_affine_modulation': self.config.use_affine_modulation,
                 'fourier_levels': self.config.fourier_levels,
@@ -1435,13 +1477,13 @@ def create_cub200_trainer(
     data_dir: str = "./data",
     output_dir: str = "./checkpoints",
     **kwargs,
-) -> Tuple[CUB200Trainer, 'FractalCurveViT', DataLoader, DataLoader]:
+) -> Tuple[CUB200Trainer, 'FractalCurveViT']:
     """创建 CUB-200 训练器的便捷工厂函数 (I36 统一配置)
 
     设计原则:
         1. 通过 arch_config 统一指定模型架构参数
         2. 通过 config 指定训练策略参数
-        3. 自动创建模型、训练器、数据加载器
+        3. 自动创建模型和训练器
 
     Args:
         config: 训练配置 (可选，默认使用 CUB200TrainingConfig)
@@ -1452,7 +1494,7 @@ def create_cub200_trainer(
         **kwargs: 传递给 config 的参数（会覆盖默认值）
 
     Returns:
-        (trainer, model, train_loader, val_loader) 元组
+        (trainer, model) 元组
 
     用法:
         ```python
@@ -1466,7 +1508,7 @@ def create_cub200_trainer(
             depth=8,
             heads=6,
         )
-        trainer, model, train_loader, val_loader = create_cub200_trainer(
+        trainer, model = create_cub200_trainer(
             arch_config=arch_config,
             batch_size=16,
             learning_rate=0.0003,
@@ -1493,6 +1535,9 @@ def create_cub200_trainer(
     # 创建训练配置
     if config is None:
         config = CUB200TrainingConfig(**kwargs)
+
+    # P1 Fix: 验证配置一致性
+    config.validate_model_config_consistency()
 
     # I36: 使用 config.arch_config 创建模型
     model = FractalCurveViT(

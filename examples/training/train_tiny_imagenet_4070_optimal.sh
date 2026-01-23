@@ -1,60 +1,8 @@
 #!/bin/bash
-# ============================================================================
-# Tiny-ImageNet 最优训练脚本 (RTX 4070 Laptop)
-# ============================================================================
-#
-# 数学形式化分析 (2026-01-21) - 基于第一性原理推导
-# ============================================================================
-#
-# 1. 模型架构参数计算 (I36 激进优化)
-#    --------------------
-#    Tiny-ImageNet: N_train = 100,000 samples, C = 200 classes
-#
-#    参数公式 (SwiGLU FFN):
-#      P_total = depth * 16 * dim^2 + 2.5 * dim * num_classes
-#      mlp_dim = 4 * dim (自动计算)
-#
-#    激进配置 (dim=448, depth=8, heads=7):
-#      mlp_dim = 4 * 448 = 1792
-#      P_total = 8 * 16 * 448^2 + 2.5 * 448 * 200 = 45.44M (实际: 31.58M)
-#
-#    P/N 比率: 31.58M / 100K = 315.8 (ViT 可接受范围: [150, 500])
-#
-# 2. Tokenizer 配置优化 (I36)
-#    ----------------
-#    image_size=64 (Tiny-ImageNet 原始尺寸，固定)
-#    min_patch_size=4
-#    max_depth = log2(64/4) = 4
-#    候选区域: 1+4+16+64+256 = 341 (5 尺度)
-#
-#    I36 新常量 (constants.py):
-#      K_COVERAGE_BASE = 0.12 (12% 覆盖率)
-#      K_COVERAGE_MAX_HARD = 0.25 (25% 硬上限)
-#      K_MAX_SAMPLE_RATIO = 0.25 (25% 采样比例)
-#      K_MIN_SAMPLE_RATIO = 0.03 (3% 最小比例)
-#
-#    动态 Token 数:
-#      K_min = max(8, 0.03 * 341) = 11
-#      K_max = min(4096, 0.25 * 341) = 85
-#      K_avg ≈ 40 (覆盖率 ~12%)
-#
-# 3. 学习率缩放 (Linear Scaling Rule)
-#    ---------------------------------
-#    lr_base = 3e-4 @ batch_size=256
-#    lr = 3e-4 * (192/256) = 2.25e-4
-#
-# 4. VRAM 预算 (8GB - RTX 4070 Laptop)
-#    ----------------------------------
-#    混合精度模型: 316 MB (31.58M * 10 bytes)
-#    总计(含开销): ~1.5 GB << 8GB ✓
-#
-# 5. 稳定性修复
-#    -----------
-#    - --no-prefetch: 禁用 CudaPrefetcher 避免内存问题
-#    - num-workers=2: 减少数据加载并行度
-#    - torch.compile: 已添加更强的内存清理
-#
-# ============================================================================
+# Tiny-ImageNet Optimal Training Script (RTX 4070 Laptop)
+# Mathematical derivation: dim=448, depth=8, batch=192, lr=2.25e-4
+
+set -e
 
 uv run python src/training/train_fractal_vit.py \
   --dataset tiny-imagenet \
@@ -95,5 +43,4 @@ uv run python src/training/train_fractal_vit.py \
   --gradient-clip 1.0 \
   --patience 15 \
   --min-delta 0.001 \
-  --no-prefetch \
-  --exp-name tiny_imagenet_448d_8l_bs192_stable
+  --no-prefetch 

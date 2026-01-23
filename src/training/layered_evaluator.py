@@ -1198,8 +1198,9 @@ class LayeredEvaluator:
             lca_temperature=lca_temperature,
             learnable_temperature=learnable_temperature,
             # I23-2: Token 数量约束（使用检测或默认值）
-            K_min=16,
-            K_max=64,
+            # I99: 优先从 checkpoint config 获取，否则使用默认值
+            K_min=config.get('K_min', 16),
+            K_max=config.get('K_max', 64),
             # I27: 子模块 Dropout 配置
             splitter_dropout=splitter_dropout,
             pos_dropout=pos_dropout,
@@ -1666,6 +1667,12 @@ class LayeredEvaluator:
             # 过拟合警告
             if overfit_ratio > 1.15:
                 print(f"\n    ⚠️  过拟合警告: 训练准确率比测试高 {(overfit_ratio - 1) * 100:.1f}%")
+                # P0 Fix: 初始化 summary 避免 NameError
+                summary = {
+                    'overall_health': 'healthy',
+                    'warnings': [],
+                    'recommendations': [],
+                }
                 summary['warnings'].append(
                     f"Overfitting detected: overfit_ratio={overfit_ratio:.3f}"
                 )

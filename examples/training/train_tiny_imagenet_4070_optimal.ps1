@@ -47,12 +47,11 @@
 #    混合精度模型: 316 MB (31.58M * 10 bytes)
 #    总计(含开销): ~1.5 GB << 8GB ✓
 #
-# 5. torch.compile 兼容性说明
-#    -----------------------
-#    ⚠️ torch.compile 已禁用 - 与动态 token 数量不兼容
-#    原因: CUDA 内存分配器与 torch.compile 存在已知问题
-#    替代方案: gradient-checkpoint + channels-last + AMP
-#    性能损失: 约 10-15% 但更稳定
+# 5. torch.compile 状态
+#    -----------------
+#    torch.compile 已启用 (用户选择)
+#    风险: 与动态 token 可能存在兼容性问题
+#    降级方案: 如遇 OOM，移除 --compile 参数
 #
 # ============================================================================
 
@@ -89,6 +88,7 @@ uv run python src/training/train_fractal_vit.py `
   --lca-temperature 1.5 `
   --use-amp `
   --gradient-checkpoint `
+  --compile `
   --channels-last `
   --tf32 `
   --accum-steps 1 `

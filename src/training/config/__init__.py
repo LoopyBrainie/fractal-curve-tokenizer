@@ -73,7 +73,13 @@ class ModelArchitectureConfig:
     # 固定分辨率时用于初始化，兼容旧 API
 
     # Tokenizer 参数 (I33: 相对预算设计)
-    num_scales: int = 4
+    # P2 Fix: num_scales 已废弃，使用 min_patch_size 动态计算 max_depth
+    num_scales: int = field(default=4, metadata={
+        "deprecated": True,
+        "deprecated_since": "v99",
+        "replacement": "使用 min_patch_size 和 max_depth_hard_limit 动态计算",
+        "description": "四叉树深度级别数，已废弃"
+    })
     min_patch_size: int = 4
     # I33: 相对预算参数 (替代绝对 K_min/K_max)
     token_coverage_min: float = 0.01   # α = 1% 最小覆盖率
@@ -109,6 +115,17 @@ class ModelArchitectureConfig:
         assert self.depth >= 1, f"depth={self.depth} 必须 >= 1"
         assert self.heads >= 1, f"heads={self.heads} 必须 >= 1"
         assert self.num_classes >= 1, f"num_classes={self.num_classes} 必须 >= 1"
+
+        # P2 Fix: 废弃参数警告
+        import warnings
+        if hasattr(self, 'num_scales'):
+            field_info = self.__dataclass_fields__.get('num_scales')
+            if field_info and field_info.metadata.get('deprecated', False):
+                warnings.warn(
+                    "num_scales 参数已废弃 (v99)，请使用 min_patch_size 和 max_depth_hard_limit 替代。",
+                    DeprecationWarning,
+                    stacklevel=2
+                )
 
         # 验证 dim_head 一致性
         expected_dim_head = self.dim // self.heads
