@@ -85,7 +85,19 @@ except ImportError:
     HAS_ROI_ALIGN = False
     roi_align = None  # type: ignore
 
-from .split_adaptive import SplitResult, SplitToken
+# I97-9: SplitResult 和 SplitToken 已从 split_adaptive.py 移除
+# 仅保留类型注解用于文档，实际使用 TensorSplitResult
+from typing import List, Protocol, Any
+
+class SplitToken:
+    """Legacy type - 仅用于类型注解，实际使用 GumbelTopKSplitter."""
+    def __init__(self, **kwargs):
+        pass
+
+class SplitResult:
+    """Legacy type - 仅用于类型注解，实际使用 TensorSplitResult."""
+    def __init__(self, **kwargs):
+        pass
 
 
 class HilbertNativePatchEmbed(nn.Module):

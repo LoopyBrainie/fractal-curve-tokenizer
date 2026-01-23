@@ -52,6 +52,8 @@ import torch.nn as nn
 
 from .constants import EMBEDDING_INIT_STD, HILBERT_BIAS_SCALE
 from .attn_hilbert_bias import AreaEncoder
+from .config import AreaEncoderConfig  # I98-3: 协议驱动配置
+from .levels_info import LevelsInfo  # I98-4
 
 
 class FractalPositionEmbedding(nn.Module):
@@ -126,24 +128,36 @@ class FractalPositionEmbedding(nn.Module):
 
     def forward(
         self,
-        levels_info: torch.Tensor,
+        levels_info: LevelsInfo,
         sequence_positions: Optional[torch.Tensor] = None,
         # I31-3: 额外参数用于与 AreaEnhancedPositionEmbedding 接口兼容
         regions: Optional[torch.Tensor] = None,
         image_size: Optional[int] = None,
     ) -> torch.Tensor:
-        if levels_info.numel() == 0:
-            return torch.zeros(0, self.dim, device=levels_info.device, dtype=torch.float32)
+        # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
+        if isinstance(levels_info, torch.Tensor):
+            # 转换为 LevelsInfo，确保数据类型为 Long
+            if levels_info.dtype != torch.long:
+                levels_info = levels_info.long()
 
-        device = levels_info.device
-        
-        # levels_info: (..., max_info_len)
-        # col 0: depth
-        # col 1..: path indices (0-3)
-        
-        depths = levels_info[..., 0].clamp(0, self.max_level).long()
-        paths = levels_info[..., 1:].long() # (..., path_len)
-        
+            # 从数据形状推断 max_depth: info_dim = max_depth + 1
+            info_dim = levels_info.shape[-1]
+            inferred_max_depth = info_dim - 1
+            levels_info = LevelsInfo(data=levels_info, max_depth=inferred_max_depth)
+
+        if levels_info.data.numel() == 0:
+            return torch.zeros(0, self.dim, device=levels_info.data.device, dtype=torch.float32)
+
+        device = levels_info.data.device
+
+        # 从 LevelsInfo 提取 depths 和 paths
+        depths = levels_info.depths.clamp(0, self.max_level).long()
+        paths = levels_info.paths  # (..., path_len)
+
+        # STAB-7 修复: 确保索引张量为连续格式
+        if depths.dim() > 1:
+            depths = depths.contiguous()
+
         # 1. 深度编码
         depth_emb = self.depth_embedding(depths)
 
@@ -161,7 +175,14 @@ class FractalPositionEmbedding(nn.Module):
         
         # 安全截断，防止越界 (虽然理论上不应该发生)
         flat_indices = flat_indices.clamp(0, self.max_level * 4 - 1)
-        
+
+        # STAB-7 修复: 确保索引张量为连续格式
+        # channels-last 格式与 Embedding 层不兼容，必须转换为 contiguous
+        if flat_indices.dim() > 1:
+            flat_indices = flat_indices.contiguous()
+        else:
+            flat_indices = flat_indices.contiguous()
+
         # 查找 Embedding: (..., path_len, dim)
         path_embs = self.quadrant_embedding(flat_indices)
         
@@ -186,7 +207,7 @@ from .constants import EMBEDDING_INIT_STD, HILBERT_BIAS_SCALE
 
 
 class AreaEnhancedPositionEmbedding(nn.Module):
-    """面积增强的位置编码 (I31-3)
+    """面积增强的位置编码 (I31-3, I98-3: 协议驱动配置)
 
     数学形式化
     ==========
@@ -198,10 +219,8 @@ class AreaEnhancedPositionEmbedding(nn.Module):
         E_area = AreaEncoder(s)     # 面积嵌入
         λ = area_scale (零初始化)   # 可学习权重
 
-    与现有 FractalPositionEmbedding 的关系:
-        - 保持原有深度+路径编码
-        - 添加面积编码作为辅助信息
-        - 使用残差连接渐进启用
+    I98-3: 协议驱动配置
+        使用 AreaEncoderConfig 替代硬编码参数。
 
     属性
     ----
@@ -211,6 +230,8 @@ class AreaEnhancedPositionEmbedding(nn.Module):
         面积编码器 (从 attn_hilbert_bias.py 导入)
     area_scale : nn.Parameter
         可学习权重 (零初始化)
+    config : AreaEncoderConfig
+        编码器配置 (I98-3)
     """
 
     def __init__(
@@ -221,8 +242,9 @@ class AreaEnhancedPositionEmbedding(nn.Module):
         use_hilbert_encoding: bool = True,
         use_spatial_encoding: bool = True,
         dropout: float = 0.1,
+        area_config: Optional[AreaEncoderConfig] = None,
     ):
-        """初始化面积增强位置编码。
+        """初始化面积增强位置编码 (I98-3 协议驱动版本).
 
         参数
         ----
@@ -238,10 +260,17 @@ class AreaEnhancedPositionEmbedding(nn.Module):
             是否使用空间编码，默认 True
         dropout : float, optional
             Dropout 比率，默认 0.1
+        area_config : AreaEncoderConfig, optional
+            面积编码器配置 (I98-3)
         """
         super().__init__()
         self.dim = dim
         self.max_level = max_level
+
+        # I98-3: 使用配置类
+        if area_config is None:
+            area_config = AreaEncoderConfig(fourier_levels=fourier_levels)
+        self.config = area_config
 
         # 基础位置编码 (深度 + 路径)
         self.base_embedding = FractalPositionEmbedding(
@@ -252,12 +281,11 @@ class AreaEnhancedPositionEmbedding(nn.Module):
             dropout=dropout,
         )
 
-        # 面积编码器 (I31-3)
+        # 面积编码器 (I31-3, I98-3: 使用配置类)
         from .attn_hilbert_bias import AreaEncoder
         self.area_encoder = AreaEncoder(
             dim=dim,
-            fourier_levels=fourier_levels,
-            hidden_dim=32
+            config=area_config
         )
 
         # 可学习权重 (零初始化)
@@ -272,7 +300,7 @@ class AreaEnhancedPositionEmbedding(nn.Module):
 
     def forward(
         self,
-        levels_info: torch.Tensor,
+        levels_info: LevelsInfo,
         regions: Optional[torch.Tensor] = None,
         image_size: Optional[int] = None,
     ) -> torch.Tensor:
@@ -280,8 +308,8 @@ class AreaEnhancedPositionEmbedding(nn.Module):
 
         参数
         ----
-        levels_info : torch.Tensor
-            层级信息张量，形状 [B, N, InfoDim]
+        levels_info : LevelsInfo
+            LevelsInfo 实例
         regions : torch.Tensor, optional
             区域边界张量，形状 [B, N, 4]
         image_size : int or tuple, optional
@@ -292,6 +320,17 @@ class AreaEnhancedPositionEmbedding(nn.Module):
         torch.Tensor
             位置编码，形状 [B, N, dim]
         """
+        # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
+        if isinstance(levels_info, torch.Tensor):
+            # 转换为 LevelsInfo，确保数据类型为 Long
+            if levels_info.dtype != torch.long:
+                levels_info = levels_info.long()
+
+            # 从数据形状推断 max_depth: info_dim = max_depth + 1
+            info_dim = levels_info.shape[-1]
+            inferred_max_depth = info_dim - 1
+            levels_info = LevelsInfo(data=levels_info, max_depth=inferred_max_depth)
+
         # 1. 基础位置编码
         pos_emb = self.base_embedding(levels_info)
 

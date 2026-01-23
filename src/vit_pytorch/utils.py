@@ -6,15 +6,9 @@
 ============
 
 核心函数:
-    extract_depths(L) → d ∈ Z^N
-        从 levels_info 提取深度值，d_i = L[i, 0]
-    
-    normalize_levels_info(L, L_max) → L' ∈ Z^{N × info_len}
-        归一化层级信息维度
-    
     create_attention_mask(lengths, max_len) → M ∈ {0,1}^{B × N}
         M[b, i] = 1 if i < lengths[b] else 0
-    
+
     sanitize_tensor(T) → T'
         T' = nan_to_num(T), 替换 NaN/Inf 保证数值稳定性
 
@@ -24,8 +18,6 @@
 | 函数                    | 数学定义                       |
 +========================+===============================+
 | pair(x)                | x → (x, x) if int else x      |
-| extract_depths(L)      | L → L[:, 0].clamp(0, L_max)   |
-| normalize_levels_info  | L → pad/truncate to info_len  |
 | create_attention_mask  | lengths → bool mask           |
 | sanitize_tensor        | T → nan_to_num(T)             |
 +------------------------+-------------------------------+
@@ -143,34 +135,3 @@ def create_attention_mask(levels_info: List[torch.Tensor], device: torch.device)
     mask = torch.where(valid_mask, mask, torch.tensor(1.0, device=device))
 
     return mask
-
-
-def extract_depths(levels_info: torch.Tensor, max_level: int) -> torch.Tensor:
-    """统一从 levels_info 提取深度索引，自动处理 2D/3D 张量。
-    
-    Args:
-        levels_info: 层级信息张量，形状为 (Seq, Info) 或 (Batch, Seq, Info)
-        max_level: 最大层级值，用于 clamp
-        
-    Returns:
-        深度索引张量，形状为 (Seq,) 或 (Batch, Seq)
-    """
-    if levels_info.dim() == 2:
-        depths = levels_info[:, 0]
-    else:
-        depths = levels_info[:, :, 0]
-    return depths.clamp(0, max_level).long()
-
-
-def normalize_levels_info(levels_info: torch.Tensor) -> torch.Tensor:
-    """规范化 levels_info 为 (Batch, Seq, Info) 格式。
-    
-    Args:
-        levels_info: 层级信息张量，形状为 (Seq, Info) 或 (Batch, Seq, Info)
-        
-    Returns:
-        规范化后的张量，形状为 (Batch, Seq, Info)
-    """
-    if levels_info.dim() == 2:
-        return levels_info.unsqueeze(0)
-    return levels_info

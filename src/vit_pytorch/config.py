@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Fractal ViT 统一配置模块
+Fractal ViT 统一配置模块 (I98-3: 协议驱动配置化)
 
 组件配置原则:
 1. 组件自治: 每个组件接收完整配置，独立运行
 2. 精选暴露: 只暴露高影响参数 (impact > 0.1)
 3. 可组合: 支持 YAML 配置 + CLI 参数覆盖
+4. 协议驱动: 使用 Protocol 确保类型安全
 
 数学形式化
 ==========
@@ -18,12 +19,13 @@ Fractal ViT 统一配置模块
          = HIDDEN     if impact(p) ≤ 0.1
 
 日期: 2026-01-17
+更新: 2026-01-22 (I98-3 协议驱动配置)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 # 导入默认常量（作为配置默认值）
 from .constants import (
@@ -43,6 +45,14 @@ from .constants import (
     K_MAX_HARD_LIMIT,
     K_MIN_HARD_LIMIT,
 )
+
+
+# ==================== 类型别名 ====================
+
+# 温度退火调度类型
+AnnealSchedule = Literal['linear', 'exponential', 'cosine']
+# Tokenizer 类型 (streaming_v2 已移除)
+TokenizerType = Literal['streaming_v1', 'streaming_v3']
 
 
 # ==================== Splitter 配置 ====================
@@ -131,6 +141,16 @@ class SplitterConfig:
                 base = list(QUOTA_INIT_LOGITS)
                 base.extend([0.0] * (D - len(base)))
                 return tuple(base)
+
+    # I24-4: 边界条件验证
+    def validate(self) -> None:
+        """验证配置参数的有效性"""
+        if self.max_depth_limit < 2:
+            raise ValueError(
+                "I24-4: max_depth_limit >= 2 是推荐配置。"
+                f"当前 max_depth_limit={self.max_depth_limit} 是边界情况，"
+                "支持但可能导致不平衡的 token 分布。"
+            )
 
 
 # ==================== Attention 配置 ====================
@@ -304,6 +324,165 @@ class FractalViTConfig:
         }
 
 
+# ==================== I98-3: 编码器配置类 ====================
+
+@dataclass
+class ShapeScaleEncoderConfig:
+    """形状-尺度编码器配置 (I98-3, I31-P2: 添加 enabled 标志).
+
+    影响度驱动的常量暴露:
+    - enabled: 启用/禁用编码器，impact=1.0 → 必须暴露
+    - hidden_dim: 隐藏层维度，impact=0.5 → 必须暴露
+    - weight_init: 权重初始化值，impact=0.3 → 可选暴露
+
+    数学形式化
+    ==========
+    形状特征: r = log(w/h) ∈ (-∞, ∞)
+    尺度特征: s = (w/W)(h/H) ∈ [0, 1]
+
+    组合编码: [r_norm, s_log] → MLP → dim
+    其中 r_norm = tanh(r / (1 + |r|)) ∈ (-1, 1)
+          s_log = log(s + ε) ∈ (-∞, 0]
+    """
+    enabled: bool = True  # I31-P2: 启用/禁用开关
+    hidden_dim: int = 64
+    output_dim: int = 256
+    weight_init: float = 0.1  # I35-2: 非零初始化确保梯度
+
+    def to_dict(self) -> dict:
+        return {
+            'enabled': self.enabled,
+            'hidden_dim': self.hidden_dim,
+            'output_dim': self.output_dim,
+            'weight_init': self.weight_init,
+        }
+
+
+@dataclass
+class AreaEncoderConfig:
+    """面积编码器配置 (I98-3).
+
+    影响度驱动的常量暴露:
+    - fourier_levels: Fourier 级别数，impact=0.24 → 必须暴露
+    - hidden_dim: 隐藏层维度，impact=0.3 → 可选暴露
+    - freq_base: 频率基数，impact=0.12 → 可选暴露
+    - cutoff_ratio: Nyquist裁剪比例，impact=0.15 → 可选暴露
+
+    数学形式化
+    ==========
+    傅里叶特征 (I32-7 动态频率 + 软截断门控):
+        f_k = π · b^k · g_k(freq_k, L_norm)
+
+    其中:
+        b = freq_base (频率基数)
+        g_k = CosineGate(freq_k, L_norm) (软截断门控)
+        cutoff_ratio = omega_cutoff / omega_nyquist (Nyquist频率裁剪比例)
+    """
+    fourier_levels: int = 4
+    freq_base: float = 2.0
+    hidden_dim: int = 32
+    output_dim: int = 256
+
+    # I98-3: Nyquist频率裁剪配置
+    # f_cutoff = cutoff_ratio * f_nyquist，其中 cutoff_ratio ∈ (0, 1]
+    cutoff_ratio: float = 0.8
+
+    def to_dict(self) -> dict:
+        return {
+            'fourier_levels': self.fourier_levels,
+            'freq_base': self.freq_base,
+            'hidden_dim': self.hidden_dim,
+            'output_dim': self.output_dim,
+            'cutoff_ratio': self.cutoff_ratio,
+        }
+
+
+@dataclass
+class LCAEncoderConfig:
+    """LCA 编码器配置 (I98-3).
+
+    影响度驱动的常量暴露:
+    - embedding_dim: 嵌入维度，impact=0.5 → 必须暴露
+    - scale_init_factor: 初始化缩放因子，impact=0.15 → 可选暴露
+
+    数学形式化
+    ==========
+    LCA 嵌入初始化:
+        scale_d = scale_factor × (1 + log(d + 1))
+
+    其中 d 为四叉树深度，scale_factor 控制整体缩放。
+    """
+    embedding_dim: int = 128
+    scale_init_factor: float = 0.1  # 替代硬编码 0.1
+    temperature: Optional[float] = None  # None = 自动
+
+    def to_dict(self) -> dict:
+        return {
+            'embedding_dim': self.embedding_dim,
+            'scale_init_factor': self.scale_init_factor,
+            'temperature': self.temperature,
+        }
+
+
+@dataclass
+class AttentionEncoderConfig:
+    """注意力编码器统一配置 (I98-3).
+
+    组合所有编码器配置，支持协议驱动:
+    - ShapeScaleEncoder: 形状-尺度编码
+    - AreaEncoder: 面积编码
+    - LCAEncoder: LCA 嵌入
+
+    同时包含偏置缩放参数 (从 constants.py 独立):
+    - hilbert_bias_scale: Hilbert 偏置缩放
+    - level_bias_scale: Level 偏置缩放
+
+    设计原则
+    =========
+    1. 正交性: 每个编码器配置完全独立
+    2. 可组合: 支持灵活组合不同编码器
+    3. 可禁用: fourier_levels=0 禁用 AreaEncoder
+    """
+    shape_scale: ShapeScaleEncoderConfig = field(
+        default_factory=ShapeScaleEncoderConfig
+    )
+    area: AreaEncoderConfig = field(
+        default_factory=AreaEncoderConfig
+    )
+    lca: LCAEncoderConfig = field(
+        default_factory=LCAEncoderConfig
+    )
+
+    # 偏置缩放 (从 constants.py 独立，I98-3)
+    hilbert_bias_scale: float = 0.1
+    level_bias_scale: float = 0.05
+
+    # I98-3: 初始化参数配置 (用于 HilbertAwareMultiScaleAttention)
+    # 能量基准初始化: raw* = softplus^{-1}(1.0) ≈ 0.5413
+    level_scale_init: float = 0.5413
+    # 深度缩放范围 (hierarchical_depth_scale 初始化边界)
+    hierarchical_scale_bounds: tuple[float, float] = (0.5, 1.5)
+    # 偏置缩放初始化: raw = log(scale)，对应 scale=0.1 和 scale=0.05
+    hilbert_bias_init: float = -2.302585  # ln(0.1)
+    level_bias_init: float = -2.995732    # ln(0.05)
+    # 可禁用能量注入（用于消融实验）
+    energy_injection_enabled: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            'shape_scale': self.shape_scale.to_dict(),
+            'area': self.area.to_dict(),
+            'lca': self.lca.to_dict(),
+            'hilbert_bias_scale': self.hilbert_bias_scale,
+            'level_bias_scale': self.level_bias_scale,
+            'level_scale_init': self.level_scale_init,
+            'hierarchical_scale_bounds': self.hierarchical_scale_bounds,
+            'hilbert_bias_init': self.hilbert_bias_init,
+            'level_bias_init': self.level_bias_init,
+            'energy_injection_enabled': self.energy_injection_enabled,
+        }
+
+
 # ==================== 工厂函数 ====================
 
 def create_splitter_config(
@@ -373,3 +552,142 @@ def create_splitter_config(
             setattr(config, key, value)
 
     return config
+
+
+# ==================== I97-5: 合并 config_fractal.py 功能 ====================
+
+import math
+
+
+@dataclass
+class FractalConfig:
+    """Fractal ViT 统一配置 (原 config_fractal.py).
+
+    从 (image_size, min_patch_size) 自动推导所有几何参数。
+
+    数学形式化
+    ==========
+    推导链:
+        max_depth = ⌈log₂(image_size / min_patch_size)⌉
+        num_scales = max_depth + 1
+        patch_sizes = (min_patch_size × 2^i)_{i=0}^{max_depth}
+        grid_size = image_size / min_patch_size
+        num_tokens = grid_size²
+
+    Hilbert 策略 (自动选择):
+        - grid_size = 2^k: 使用标准 Hilbert 曲线
+        - padding_ratio ≥ 4/3: 使用 Pseudo-Hilbert
+    """
+
+    # ========== 基础参数 (必需) ==========
+    image_size: int
+    min_patch_size: int = 4
+
+    # ========== Tokenizer 配置 ==========
+    tokenizer_type: TokenizerType = 'streaming_v3'
+
+    # ========== 推导参数 (自动计算) ==========
+    max_depth: int = field(init=False)
+    num_scales: int = field(init=False)
+    patch_sizes: Tuple[int, ...] = field(init=False)
+    grid_size: int = field(init=False)
+    num_tokens: int = field(init=False)
+    uses_pseudo_hilbert: bool = field(init=False)
+
+    # 混合策略阈值: ρ* = 4/3
+    PADDING_RATIO_THRESHOLD: float = 4 / 3
+
+    def __post_init__(self) -> None:
+        """从基础参数推导所有配置."""
+        # 验证约束
+        if self.image_size <= 0 or self.min_patch_size <= 0:
+            raise ValueError(
+                f"image_size ({self.image_size}) 和 min_patch_size ({self.min_patch_size}) 必须为正数"
+            )
+
+        if self.image_size % self.min_patch_size != 0:
+            raise ValueError(
+                f"image_size ({self.image_size}) 必须能被 min_patch_size ({self.min_patch_size}) 整除"
+            )
+
+        # 计算 grid_size
+        ratio = self.image_size // self.min_patch_size
+        if ratio <= 0:
+            raise ValueError(f"grid_size = {ratio} 必须为正数")
+
+        # 计算推导参数
+        if ratio > 1:
+            max_depth = math.ceil(math.log2(ratio))
+        else:
+            max_depth = 0
+
+        object.__setattr__(self, 'max_depth', max_depth)
+        object.__setattr__(self, 'num_scales', max_depth + 1)
+        object.__setattr__(self, 'patch_sizes', tuple(
+            self.min_patch_size * (2 ** i) for i in range(max_depth + 1)
+        ))
+        object.__setattr__(self, 'grid_size', ratio)
+        object.__setattr__(self, 'num_tokens', ratio * ratio)
+
+        # 确定 Hilbert 策略
+        is_power_of_2 = ratio > 0 and (ratio & (ratio - 1) == 0)
+        if is_power_of_2:
+            uses_pseudo = False
+        else:
+            n = 1
+            while n < ratio:
+                n *= 2
+            padding_ratio = (n * n) / (ratio * ratio)
+            uses_pseudo = padding_ratio >= self.PADDING_RATIO_THRESHOLD
+
+        object.__setattr__(self, 'uses_pseudo_hilbert', uses_pseudo)
+
+    def scale_to_depth(self, scale_idx: int) -> int:
+        """将尺度索引转换为四叉树深度."""
+        return self.max_depth - scale_idx
+
+    def depth_to_scale(self, depth: int) -> int:
+        """将四叉树深度转换为尺度索引."""
+        return self.max_depth - depth
+
+    def patch_size_at_scale(self, scale_idx: int) -> int:
+        """获取指定尺度的 patch 大小."""
+        return self.patch_sizes[scale_idx]
+
+    def grid_size_at_scale(self, scale_idx: int) -> int:
+        """获取指定尺度的网格边长."""
+        return self.image_size // self.patch_sizes[scale_idx]
+
+    def __repr__(self) -> str:
+        hilbert_strategy = "Pseudo-Hilbert" if self.uses_pseudo_hilbert else "Standard Hilbert"
+        is_power_of_2 = self.grid_size > 0 and (self.grid_size & (self.grid_size - 1) == 0)
+        grid_note = "" if is_power_of_2 else f" (非 2^k, 使用 {hilbert_strategy})"
+
+        if self.tokenizer_type == 'streaming_v3':
+            tokenizer_info = f"  tokenizer_type='{self.tokenizer_type}' (Variable Depth, 推荐)\n"
+        else:
+            tokenizer_info = f"  tokenizer_type='{self.tokenizer_type}' (单尺度)\n"
+
+        return (
+            f"FractalConfig(\n"
+            f"  # Geometry\n"
+            f"  image_size={self.image_size}, min_patch_size={self.min_patch_size}\n"
+            f"  max_depth={self.max_depth}, num_scales={self.num_scales}\n"
+            f"  patch_sizes={self.patch_sizes}\n"
+            f"  grid_size={self.grid_size}{grid_note}, num_tokens={self.num_tokens}\n"
+            f"  # Hilbert Strategy\n"
+            f"  uses_pseudo_hilbert={self.uses_pseudo_hilbert}\n"
+            f"  # Tokenizer\n"
+            f"{tokenizer_info}"
+            f"  # Hilbert Bias: LCA mode\n"
+            f")"
+        )
+
+
+def create_fractal_config(
+    image_size: int,
+    min_patch_size: int = 4,
+    **kwargs,
+) -> FractalConfig:
+    """便捷函数：创建 FractalConfig."""
+    return FractalConfig(image_size, min_patch_size, **kwargs)

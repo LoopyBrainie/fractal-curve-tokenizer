@@ -35,7 +35,7 @@ import torch
 import torch._dynamo
 import torch.nn as nn
 
-from .config_fractal import FractalConfig
+from .config import FractalConfig  # I97-5: 合并 config_fractal.py
 from .curve_hilbert import HilbertCurve
 
 
@@ -376,7 +376,11 @@ class FractalPathEmbedding(nn.Module):
         # 层级偏移: level * 4 + quadrant
         level_offsets = torch.arange(D, device=device) * 4  # [D]
         indices = paths + level_offsets  # [B, N, D]
-        
+
+        # STAB-7 修复: 确保索引张量为连续格式
+        # channels-last 格式与 Embedding 层不兼容
+        indices = indices.contiguous()
+
         # 查找 embedding
         path_embs = self.quadrant_embedding(indices)  # [B, N, D, dim]
         

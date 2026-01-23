@@ -75,7 +75,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .utils import extract_depths
+from .levels_info import LevelsInfo  # I98-4
 
 
 # FFN type literal for type checking
@@ -240,33 +240,29 @@ class AdaptiveFractalFeedForward(nn.Module):
         assert self.level_embedding is not None
         assert self.shared_level_adapter is not None
         assert self.level_mixing_weights is not None
-        
-        if levels_info.dim() == 2:
-            # (Seq, Info) -> broadcast to batch
-            depths = extract_depths(levels_info, self.max_level)
-            level_embs = self.level_embedding(depths).unsqueeze(0).expand(batch, -1, -1)
-            # P1-1 修复: 使用 sigmoid 替代错误的 softmax(dim=0)
-            # 数学形式: α_d = σ(w_d) ∈ (0,1)，每个深度独立控制 adapter 权重
-            mixing_weights = torch.sigmoid(self.level_mixing_weights[depths]).view(1, seq_len, 1)
-        else:
-            # (Batch, Seq, Info)
-            depths = extract_depths(levels_info, self.max_level)
-            level_embs = self.level_embedding(depths)
-            # P1-1 修复: 使用 sigmoid 替代错误的 softmax(dim=1)
-            mixing_weights = torch.sigmoid(self.level_mixing_weights[depths]).unsqueeze(-1)
-        
+
+        # I98-4: 使用 LevelsInfo.depths，并 clamp 负值（padding sentinel）
+        depths = levels_info.depths  # [B, S]
+        # I98-4: clamp depths to [0, max_level] to handle padding sentinel (-1)
+        depths_clamped = depths.clamp(min=0, max=self.max_level)
+        level_embs = self.level_embedding(depths_clamped)
+        # P1-1 修复: 使用 sigmoid 替代错误的 softmax(dim=1)
+        mixing_weights = torch.sigmoid(self.level_mixing_weights[depths_clamped]).unsqueeze(-1)
+
         adapter_input = torch.cat([x_norm, level_embs], dim=-1)
         level_adapted = self.shared_level_adapter(adapter_input)
         
         return main_out * (1 - mixing_weights) + level_adapted * mixing_weights
 
-    def forward(self, x: torch.Tensor, levels_info: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, levels_info: Optional[LevelsInfo] = None) -> torch.Tensor:
         """前向传播。
-        
+
+        I98-4: levels_info 参数类型从 torch.Tensor 改为 LevelsInfo
+
         Args:
             x: 输入张量，形状为 [B, S, D]。
-            levels_info: 层级信息，形状为 (S, Info) 或 (B, S, Info)。
-            
+            levels_info: LevelsInfo 实例（可选）。
+
         Returns:
             输出张量，形状为 [B, S, D]。
         """
@@ -282,7 +278,7 @@ class AdaptiveFractalFeedForward(nn.Module):
             main_out = self.main_net(x_norm)
 
         # ========== Level Adaptation ==========
-        if self.use_level_adaptation and levels_info is not None and levels_info.numel() > 0:
+        if self.use_level_adaptation and levels_info is not None and levels_info.data.numel() > 0:
             main_out = self._apply_level_adaptation(x_norm, main_out, levels_info, batch, seq_len)
 
         return main_out

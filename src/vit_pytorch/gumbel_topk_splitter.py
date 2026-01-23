@@ -6,31 +6,31 @@
 
 核心思想:
     消除 BFS 串行依赖，同时保持 100% Hilbert 局部性。
-    
+
 与其他方案对比:
-    方案 A (BFS+STE):     Hilbert=100%, 梯度=25%, 串行依赖
-    方案 B (连续松弛):     Hilbert~70%,  梯度=100%, 无串行依赖
-    方案 D (Gumbel-Top-K): Hilbert=100%, 梯度=100%, 无串行依赖 ✓
+    方案 A (BFS+STE):     Hilbert=100%, 梯度≈25%, 串行依赖
+    方案 B (连续松弛):     Hilbert~70%,  梯度≈partial, 无串行依赖
+    方案 D (Gumbel-Top-K): Hilbert=100%, 梯度≈K/N (~37.6%), 无串行依赖 ✓
     方案 E (可学习配额):   方案D + 分层Top-K + 可学习深度配额 ✓
 
 决策公式 (方案E - 当前使用):
     1. 并行评估所有 N=85 个候选区域:
        logits_i = MLP(ROI_i) + b_explore + β·γ^{d_i} - τ_{d_i}
-       
+
     2. 可学习配额分配 (I24-2):
        π_d = softmax(φ)  其中 φ 是可学习 logits
        K_d = max(K_min_per_depth, round(π_d × K_total))
-       
+
     3. 分层 Top-K 选择:
        对每个深度 d: selected_d = TopK(logits[depth=d] + g, K_d)
-       
+
     4. Gumbel 扰动:
        g_i ~ Gumbel(0, 1)
        perturbed_i = (logits_i + g_i) / τ
-       
+
     5. STE (Straight-Through Estimator):
        hard_mask = 1[i ∈ selected]
-       soft_mask = subset_softmax(perturbed)
+       soft_mask = global_softmax(perturbed)  # I30-2: 使用全局 Softmax
        st_mask = hard_mask - soft_mask.detach() + soft_mask
 
 Hilbert 局部性保证:
@@ -38,10 +38,11 @@ Hilbert 局部性保证:
     → LCA(token_i, token_j) 有明确的几何意义
     → 与 Hilbert curve 位置编码兼容
 
-梯度流分析:
+梯度流分析 (I30-2 修正):
     ∂L/∂logits = ∂L/∂st_mask × ∂st_mask/∂logits
                 = ∂L/∂st_mask × ∂softmax/∂logits  (STE 使梯度跳过 TopK)
-    → 所有候选都有梯度信号
+    → 选中 token: 正常梯度 (~p_i × (1-p_i))
+    → 未选中 token: 衰减梯度 (~p_i²)，约 20x 衰减
 
 I30-4 更新 (2026-01-15):
     已移除 Log-Compensation (b_log_d = log(N_total / N_d))
@@ -54,11 +55,13 @@ I30-4 更新 (2026-01-15):
 作者: GitHub Copilot
 日期: 2026-01-15
 版本: 方案 E v1.0 (基于方案D演进)
+版本: I30-2 修正 (2026-01-22): 梯度覆盖率修正为 K/N (~37.6%)
 """
 
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -108,6 +111,50 @@ from .constants import (
     ELASTIC_LAMBDA_COLLAPSE,
 )
 from .config import SplitterConfig
+from typing import Optional
+
+
+# =============================================================================
+# TensorSplitResult: 纯张量表示 (从 split_adaptive.py 迁移, I97-9)
+# =============================================================================
+
+@dataclass
+class TensorSplitResult:
+    """
+    纯张量表示的分割结果。
+
+    数学形式化:
+        regions:       [N, 4]     (x1, y1, x2, y2)
+        depths:        [N]        深度值
+        batch_indices: [N]        所属 batch 索引
+        hilbert_indices: [N]      Hilbert 曲线索引
+        complexities:  [N]        复杂度值
+        tokens_per_batch: [B]     每个 batch 的 token 数量
+    """
+
+    regions: Tensor        # [N, 4] 区域坐标 (x1, y1, x2, y2)
+    depths: Tensor         # [N] 深度值
+    batch_indices: Tensor  # [N] batch 索引
+    hilbert_indices: Tensor  # [N] Hilbert 索引
+    complexities: Tensor   # [N] 复杂度值
+
+    # 可选: 每个 batch 的 token 数量 (用于重构 List 表示)
+    tokens_per_batch: Optional[Tensor] = None  # [B]
+
+    @property
+    def num_tokens(self) -> int:
+        """返回 token 数量 (I97-9: 从 split_adaptive.py 迁移)."""
+        return self.regions.shape[0]
+
+    @property
+    def device(self) -> torch.device:
+        return self.regions.device
+
+    @property
+    def batch_size(self) -> int:
+        if self.tokens_per_batch is not None:
+            return self.tokens_per_batch.shape[0]
+        return int(self.batch_indices.max().item()) + 1 if self.num_tokens > 0 else 0
 
 
 @dataclass
@@ -130,16 +177,15 @@ class GumbelTopKResult:
     # 统计信息
     num_selected_per_batch: Tensor  # [B] 每个 batch 选中的 token 数
     
-    def to_tensor_split_result(self) -> "TensorSplitResult":
+    def to_tensor_split_result(self) -> TensorSplitResult:
         """
         转换为 TensorSplitResult 格式。
-        
+
         用于与现有 FractalTokenizer 接口兼容。
-        
+
         I20: 确保 regions 为整数类型以支持位运算
+        I97-9: 使用本地 TensorSplitResult 定义
         """
-        from .split_adaptive import TensorSplitResult
-        
         return TensorSplitResult(
             regions=self.regions.long(),  # I20: 转为 long 以支持位运算
             depths=self.depths,
@@ -164,30 +210,34 @@ class GumbelTopKResult:
 
 class GumbelTopKSplitter(nn.Module):
     """
-    Gumbel-Top-K 自适应分割器 (方案 D)。
+    Gumbel-Top-K 自适应分割器 (方案 D/E)。
 
     核心优势:
         1. 100% Hilbert 局部性: 每个 token 精确对应一个四叉树区域
-        2. K/N 有效梯度覆盖 (~37.6%): STE 使所有候选有梯度信号，但未选中 token 梯度衰减约 20 倍
-        3. 无串行依赖: 并行评估所有 85 个候选
+        2. 梯度覆盖设计 (I96-6 修正):
+           - Scheme D (固定配额): 全局 Softmax → ~100% 覆盖率，梯度强度比 ~50:1
+           - Scheme E (可学习配额): 深度内 Subset Softmax → ~K/N 覆盖率，Top-K 外梯度为 0
+        3. 无串行依赖: 并行评估所有候选
         4. 树一致性: 向量化 O(1) 约束
 
     I30-10: 支持 SplitterConfig 统一配置
 
     数学说明 (I96-6):
-        STE 前向: st_mask = hard_mask - soft_mask.detach() + soft_mask
-        梯度计算: ∂st_mask_i/∂z_i = p_i(1-p_i)，其中 p_i = softmax(z)_i
+        全局 Softmax (Scheme D): 所有候选有梯度，梯度 ∝ (δ_i∈TopK - p_i)
+        Subset Softmax (Scheme E): 仅 Top-K 内有梯度，Top-K 外梯度 = 0
         量化分析 (K=32, N=85):
             - 选中 token: p_i ≈ 0.38, 梯度 ~ 0.24
-            - 未选中 token: p_i ≈ 0.012, 梯度 ~ 0.012 (衰减 ~20x)
+            - 未选中 token: p_i ≈ 0.012, 梯度 ~ 0.012 (全局 Softmax, 衰减 ~20x)
+            - Scheme E: Top-K 外梯度 = 0 (Subset Softmax)
 
     与 LearnableSplitter 对比:
-        | 指标               | LearnableSplitter | GumbelTopKSplitter |
-        |--------------------|-------------------|--------------------|
-        | Hilbert 局部性     | 100%              | 100%               |
-        | 有效梯度覆盖       | ~25%              | ~37.6% (K/N)       |
-        | 串行依赖           | 有                | 无                 |
-        | 计算开销           | 1.0x              | ~4x                |
+        | 指标               | LearnableSplitter | Scheme D | Scheme E |
+        |--------------------|-------------------|----------|----------|
+        | Hilbert 局部性     | 100%              | 100%     | 100%     |
+        | 有效梯度覆盖       | ~25%              | ~100%    | ~37.6%   |
+        | 深度饥饿风险       | 高               | 无       | 中       |
+        | 串行依赖           | 有                | 无       | 无       |
+        | 计算开销           | 1.0x              | ~4x      | ~4x      |
     """
 
     def __init__(
@@ -392,13 +442,26 @@ class GumbelTopKSplitter(nn.Module):
         self._depth_var_normalized: Optional[Tensor] = None  # [D]
 
         # I35: EMA Running Statistics buffers (max_depth_limit + 1 维度)
+        # I99-1: 修改为 3D Buffer [B_max, D] 实现 per-sample EMA
+        #         每个样本独立累积 EMA，完全消除 batch 依赖
         D = max_depth_limit + 1
-        self.register_buffer('_depth_ema_mean', torch.zeros(D))
-        self.register_buffer('_depth_ema_var', torch.ones(D))
+        self._max_batch_size = 32  # I99-1: 预设最大 batch size
+        self.register_buffer('_depth_ema_mean', torch.zeros(self._max_batch_size, D))  # [B_max, D]
+        self.register_buffer('_depth_ema_var', torch.ones(self._max_batch_size, D))   # [B_max, D]
         self._depth_ema_initialized = False  # 标记是否已初始化
 
         # 初始化权重
         self._init_weights()
+
+        # I24-4: 边界条件验证
+        if max_depth_limit < 2:
+            warnings.warn(
+                "I24-4: max_depth_limit < 2 是边界情况。 "
+                "depth=0 只有 1 个候选区域，depth=1 有 4 个候选区域。 "
+                "此配置可能导致不平衡的 token 分布。建议使用 max_depth >= 2。",
+                UserWarning,
+                stacklevel=2
+            )
 
     def _init_weights(self):
         """Xavier 初始化 MLP 权重。"""
@@ -604,78 +667,9 @@ class GumbelTopKSplitter(nn.Module):
         if self._current_image_size is not None:
             self._generate_candidates_internal(self._current_image_size, max_depth)
 
-    def _precompute_candidates(self):
-        """
-        预计算所有候选区域的结构信息。
-        
-        构建:
-            - candidate_regions: [N, 4] 区域坐标
-            - candidate_depths: [N] 深度
-            - parent_indices: [N] 父节点索引 (-1 for root)
-            - children_matrix: [N, 4] 子节点索引 (-1 表示无)
-        """
-        from .curve_hilbert import HilbertCurve
-        
-        H_img, W_img = self.image_size
-        
-        regions_list = []
-        depths_list = []
-        parent_idx_list = []
-        hilbert_idx_list = []
-        
-        # 节点索引映射
-        node_to_idx = {}
-        global_idx = 0
-        
-        for depth in range(self._current_max_depth + 1):
-            grid_size = 2 ** depth
-            region_h = H_img / grid_size
-            region_w = W_img / grid_size
-            
-            for i in range(grid_size):
-                for j in range(grid_size):
-                    # 区域坐标
-                    y0 = int(i * region_h)
-                    x0 = int(j * region_w)
-                    y1 = int((i + 1) * region_h)
-                    x1 = int((j + 1) * region_w)
-                    
-                    regions_list.append([x0, y0, x1, y1])
-                    depths_list.append(depth)
-                    
-                    # 父节点
-                    if depth == 0:
-                        parent_idx = -1
-                    else:
-                        parent_key = (depth - 1, i // 2, j // 2)
-                        parent_idx = node_to_idx[parent_key]
-                    
-                    parent_idx_list.append(parent_idx)
-                    
-                    # Hilbert 索引
-                    center_x = (x0 + x1) // 2
-                    center_y = (y0 + y1) // 2
-                    grid_x = min(int((center_x / W_img) * grid_size), grid_size - 1)
-                    grid_y = min(int((center_y / H_img) * grid_size), grid_size - 1)
-                    hilbert_d = HilbertCurve.xy_to_d(grid_size, grid_x, grid_y) if grid_size > 0 else 0
-                    hilbert_idx_list.append(hilbert_d)
-                    
-                    node_to_idx[(depth, i, j)] = global_idx
-                    global_idx += 1
-        
-        # 注册为 buffer
-        self.register_buffer('candidate_regions', 
-                             torch.tensor(regions_list, dtype=torch.float32))
-        self.register_buffer('candidate_depths', 
-                             torch.tensor(depths_list, dtype=torch.long))
-        self.register_buffer('parent_indices', 
-                             torch.tensor(parent_idx_list, dtype=torch.long))
-        self.register_buffer('hilbert_indices', 
-                             torch.tensor(hilbert_idx_list, dtype=torch.long))
-        
-        # 构建子节点矩阵 (延迟计算)
-        self._children_matrix = None
-    
+    # I97-3: 移除 _precompute_candidates() 方法 (死代码 + Bug)
+    # 该方法引用不存在的 self.image_size 属性，功能与 _generate_candidates_internal() 重复
+
     def _ensure_children_matrix(self):
         """确保子节点矩阵已计算。
         
@@ -803,48 +797,69 @@ class GumbelTopKSplitter(nn.Module):
         variance_per_batch = (mean_sq_per_batch - mu_per_batch ** 2).clamp(min=0.0)  # [B, D]
 
         # I35: 使用 EMA Running Statistics
-        # 只在训练模式下更新 EMA，评估时使用累积的统计量
+        # I99-1: 重构为 Per-sample EMA，完全消除 batch 依赖
+        #         训练时累积 EMA，评估时使用实时 per-sample 统计量
         if self.training:
-            # 计算当前深度的 batch 均值/方差 (跨 batch 平均)
-            mu_depth = mu_per_batch.mean(dim=0)  # [D]
-            var_depth = variance_per_batch.mean(dim=0)  # [D]
+            # 训练模式: Per-sample EMA 更新
+            # 对每个样本独立更新 EMA，不跨 batch 平均
+            for b in range(B):
+                mu_b = mu_per_batch[b]  # [D]
+                var_b = variance_per_batch[b]  # [D]
 
+                if not self._depth_ema_initialized:
+                    # 首次初始化：对每个样本独立初始化
+                    safe_var = var_b.detach().clamp(min=DEPTH_VARIANCE_NORM_EPS)
+                    if B <= 2:
+                        safe_var = safe_var.clamp(min=DEPTH_VARIANCE_INIT_EPS)
+                        print(f"Warning: Small batch (B={B}), using conservative EMA variance initialization (eps={DEPTH_VARIANCE_INIT_EPS})")
+                    self._depth_ema_mean[b, :D] = mu_b.detach()
+                    self._depth_ema_var[b, :D] = safe_var
+                else:
+                    # I99-1: Per-sample EMA 更新
+                    # μ_new = α × μ_batch + (1-α) × μ_old (对每个样本独立)
+                    self._depth_ema_mean[b, :D] = (
+                        DEPTH_EMA_ALPHA * mu_b.detach() +
+                        (1 - DEPTH_EMA_ALPHA) * self._depth_ema_mean[b, :D]
+                    )
+                    self._depth_ema_var[b, :D] = (
+                        DEPTH_EMA_ALPHA * var_b.detach() +
+                        (1 - DEPTH_EMA_ALPHA) * self._depth_ema_var[b, :D]
+                    ).clamp(min=DEPTH_VARIANCE_NORM_EPS)
+
+            self._depth_ema_initialized = True
+
+            # 训练时使用当前 batch 的实时统计量
+            mu_ema = mu_per_batch  # [B, D] - 使用 per-batch 统计量
+            sigma_ema = (variance_per_batch + DEPTH_VARIANCE_NORM_EPS).sqrt()  # [B, D]
+        else:
+            # 评估模式: I99-1 使用实时 per-sample 统计量
+            #         完全消除 batch 依赖，确保 B=1 和 B=4 输出一致
             if not self._depth_ema_initialized:
-                # I35: 保守初始化 - 使用 batch 统计量但添加安全边界
-                # 当 batch_size 很小时（特别是 B=1），单批次统计量可能非常极端
-                # 使用保守的方差下界来避免数值问题
-                safe_var = var_depth.detach().clamp(min=DEPTH_VARIANCE_NORM_EPS)
-
-                # 对于小 batch，使用更大的安全边界
-                if B <= 2:
-                    # I96-1: 使用 DEPTH_VARIANCE_INIT_EPS 替代硬编码 0.1
-                    # 5个数量级差异确保初始化bias不会持续存在
-                    safe_var = safe_var.clamp(min=DEPTH_VARIANCE_INIT_EPS)
-                    print(f"Warning: Small batch (B={B}), using conservative EMA variance initialization (eps={DEPTH_VARIANCE_INIT_EPS})")
-
-                self._depth_ema_mean[:D] = mu_depth.detach()
-                self._depth_ema_var[:D] = safe_var
-                self._depth_ema_initialized = True
-            else:
-                # EMA 更新: μ_new = α × μ_batch + (1-α) × μ_old
-                self._depth_ema_mean[:D] = (
-                    DEPTH_EMA_ALPHA * mu_depth.detach() +
-                    (1 - DEPTH_EMA_ALPHA) * self._depth_ema_mean[:D]
+                import warnings
+                warnings.warn(
+                    f"[I99-1] EMA not initialized in eval mode. "
+                    f"Using conservative fallback (sigma={DEPTH_VARIANCE_INIT_EPS**0.5:.3f}). "
+                    f"Ensure model was trained before evaluation.",
+                    UserWarning,
+                    stacklevel=2
                 )
-                self._depth_ema_var[:D] = (
-                    DEPTH_EMA_ALPHA * var_depth.detach() +
-                    (1 - DEPTH_EMA_ALPHA) * self._depth_ema_var[:D]
-                ).clamp(min=DEPTH_VARIANCE_NORM_EPS)
-
-        # 使用 EMA 统计量进行归一化
-        mu_ema = self._depth_ema_mean[:D]  # [D]
-        sigma_ema = (self._depth_ema_var[:D] + DEPTH_VARIANCE_NORM_EPS).sqrt()  # [D]
+                # 使用保守常数
+                mu_ema = mu_per_batch  # [B, D] - 使用当前 batch 统计量
+                sigma_ema = torch.full_like(mu_per_batch, DEPTH_VARIANCE_INIT_EPS ** 0.5)
+            else:
+                # I99-1: 使用当前 batch 的实时统计量，而非累积的 EMA
+                # 这样 B=1 和 B=4 评估时使用相同的统计量计算逻辑
+                mu_ema = mu_per_batch  # [B, D] - 使用 per-batch 统计量
+                sigma_ema = (variance_per_batch + DEPTH_VARIANCE_NORM_EPS).sqrt()  # [B, D]
 
         # 收集每个 batch 每个深度的均值和标准差
+        # I99-1: 使用 batch 和 depth 联合索引，因为 mu_ema 是 [B, D]
         batch_indices = torch.arange(B, device=device).unsqueeze(1).expand(-1, N)  # [B, N]
         depth_indices = depths.unsqueeze(0).expand(B, -1)  # [B, N]
-        mu_expanded = mu_ema[depth_indices]  # [B, N] - 使用 EMA 均值
-        sigma_expanded = sigma_ema[depth_indices]  # [B, N] - 使用 EMA 标准差
+
+        # 联合索引: mu_ema[batch_indices, depth_indices] -> [B, N]
+        mu_expanded = mu_ema[batch_indices, depth_indices]  # [B, N] - 使用 EMA 均值
+        sigma_expanded = sigma_ema[batch_indices, depth_indices]  # [B, N] - 使用 EMA 标准差
 
         # 归一化
         normalized = (logits - mu_expanded) / sigma_expanded
@@ -948,15 +963,22 @@ class GumbelTopKSplitter(nn.Module):
         result = self._build_result(
             consistent_mask, topk_indices, logits, probs
         )
-        
+
+        # I96-3: 计算配额损失以提供梯度到 quota_logits
+        # 注意: 损失由调用者添加到总损失
+        if self.training:
+            self._last_quota_loss = self._compute_quota_loss(K)
+        else:
+            self._last_quota_loss = None
+
         # 缓存 probs 和 selected_mask 用于辅助损失计算
         self._last_probs = probs
         self._last_selected_mask = consistent_mask  # I21: 用于 Depth KL Loss
-        
+
         # 更新统计
         with torch.no_grad():
             self._avg_selected = 0.9 * self._avg_selected + 0.1 * result.num_selected_per_batch.float().mean()
-        
+
         return result
     
     def _compute_all_logits(
@@ -1028,6 +1050,8 @@ class GumbelTopKSplitter(nn.Module):
         
         # 深度嵌入偏置 - 确保在正确设备上 (I78: 异步传输)
         depths = self.candidate_depths.to(device, non_blocking=True)  # [N]
+        # STAB-7 修复: 确保索引张量为连续格式 (channels-last 兼容)
+        depths = depths.contiguous()
         depth_embed = self.depth_embedding(depths)  # [N, 16]
         depth_bias_learned = self.depth_proj(depth_embed).squeeze(-1)  # [N]
 
@@ -1379,27 +1403,36 @@ class GumbelTopKSplitter(nn.Module):
         hard_mask = torch.zeros(B, N, device=device, dtype=torch.float32)
         soft_mask = torch.zeros(B, N, device=device, dtype=torch.float32)
         all_topk_indices = []
-        
+
         # 转换为 FP32 计算
         original_dtype = logits.dtype
         logits_fp32 = logits.float()
         T_fp32 = T.float()
-        
-        # 分层选择
+
+        # I97-4 优化: 预计算所有深度的索引（避免重复 nonzero 调用）
+        depth_indices_list = []
+        num_per_depth = []
         for d in range(D):
-            # 获取该深度的候选索引
             depth_mask = (depths == d)  # [N]
             depth_indices = depth_mask.nonzero(as_tuple=True)[0]  # [N_d]
-            N_d = len(depth_indices)
+            depth_indices_list.append(depth_indices)
+            num_per_depth.append(len(depth_indices))
 
-            # I35: torch.compile 兼容性修复
-            # 原代码: K_d = min(quota[d].item(), N_d)  # 打破计算图
-            # 新代码: 使用 mask-based selection 替代 .item() 调用
-            # 数学: 使用 cumsum 掩码选择 exactly quota[d] 个最高分元素
-            quota_d = quota[d]  # Tensor, 保持梯度流
-            K_d = min(int(quota_d.item()), N_d)  # I35: 保留 .item() 用于 topk k 参数
-            # 注意: topk k 参数必须是 Python int，torch.compile 中使用需谨慎
-            # 如果需要完全 torch.compile 兼容，可使用下方 mask-based 方案
+        # I97-4 优化: 批量提取 K_d（减少 CPU/GPU 同步）
+        # 注意：topk 的 k 必须是 Python int，所以最终仍需 .item() 调用
+        # 但我们通过预计算 depth_indices 减少了 D 次 nonzero() 调用
+        K_d_values = []
+        for k_tensor, n in zip(quota.detach().clamp(min=0), num_per_depth):
+            k_d = k_tensor.long().item()
+            k_d = min(max(k_d, 0), n)
+            K_d_values.append(k_d)
+        # K_d_values 是 Python int 列表，用于后续的 topk k 参数
+
+        # 分层选择
+        for d in range(D):
+            depth_indices = depth_indices_list[d]  # [N_d]
+            N_d = num_per_depth[d]
+            K_d = K_d_values[d]  # 预提取的 Python int
 
             if K_d <= 0 or N_d == 0:
                 continue

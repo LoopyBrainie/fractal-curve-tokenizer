@@ -67,7 +67,9 @@ logger = logging.getLogger(__name__)
 
 from .attn_hilbert_bias import HilbertAwareMultiScaleAttention
 from .ffn_swiglu import AdaptiveFractalFeedForward, FFNType
-from .utils import extract_depths
+from .config import AttentionEncoderConfig  # I98-3
+from .levels_info import LevelsInfo  # I98-4
+from .complexity_estimator import ComplexityEstimator  # I97-11
 
 
 class DropPath(nn.Module):
@@ -98,17 +100,19 @@ class DropPath(nn.Module):
 
 
 class FractalTransformerBlock(nn.Module):
-    """Hierarchically aware transformer block extracted for reuse.
-    
+    """Hierarchically aware transformer block extracted for reuse (I98-3: 协议驱动配置化).
+
     This block combines Hilbert-aware attention with adaptive feed-forward,
     using level-dependent normalization for depth-aware processing.
-    
+
     P11-2 修复: 参数 max_level 现在应传入与 tokenizer.max_depth 一致的值，
     而非硬编码的 50。这确保 Embedding 表大小与实际使用的深度范围匹配，
     减少约 90% 的参数浪费。
-    
+
     P11-8 简化: 移除 hilbert_bias_mode 和 low_rank_r 参数，仅保留 LCA 模式。
-    
+
+    I98-3: 新增 encoder_config 参数，支持协议驱动的编码器配置。
+
     Args:
         dim: Input/output dimension.
         heads: Number of attention heads.
@@ -120,6 +124,9 @@ class FractalTransformerBlock(nn.Module):
         ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
         lca_temperature: (P6-2) LCA bias temperature, default 1.5.
         learnable_temperature: (P6-2) Whether temperature is learnable.
+        use_affine_modulation: (向后兼容) 是否使用仿射调制偏置。
+        fourier_levels: (向后兼容) 傅里叶频率级别数。
+        encoder_config: (I98-3) AttentionEncoderConfig，协议驱动配置。
     """
 
     def __init__(
@@ -136,11 +143,13 @@ class FractalTransformerBlock(nn.Module):
         learnable_temperature: bool = True,
         use_affine_modulation: bool = True,  # A17: 启用 ShapeScaleEncoder
         fourier_levels: int = 4,
+        encoder_config: Optional["AttentionEncoderConfig"] = None,  # I98-3
     ):
         super().__init__()
         self.dim = dim
         self.max_level = max_level
 
+        # I98-3: 支持协议驱动配置
         self.attention = HilbertAwareMultiScaleAttention(
             dim=dim,
             heads=heads,
@@ -151,6 +160,7 @@ class FractalTransformerBlock(nn.Module):
             learnable_temperature=learnable_temperature,
             use_affine_modulation=use_affine_modulation,
             fourier_levels=fourier_levels,
+            encoder_config=encoder_config,
         )
 
         self.ff = AdaptiveFractalFeedForward(
@@ -205,88 +215,100 @@ class FractalTransformerBlock(nn.Module):
     def _apply_level_aware_norm(
         self,
         x: torch.Tensor,
-        levels_info: Optional[torch.Tensor],
+        levels_info: Optional[LevelsInfo],
         gamma_emb: nn.Embedding,
         beta_emb: nn.Embedding,
         default_norm: nn.LayerNorm,
     ) -> torch.Tensor:
         """应用层级感知的 LayerNorm。
-        
+
         根据每个 token 的层级深度选择对应的 gamma 和 beta 参数。
-        
-        P11-16 改进: 当 levels_info 为 None 时，生成深度 0 的默认 levels_info，
-        确保始终使用 level-aware norm，避免训练/推理行为不一致。
-        
+
         Args:
             x: 输入张量，形状为 [B, S, D]。
-            levels_info: 层级信息，可为 None（将使用深度 0 作为默认）。
+            levels_info: LevelsInfo 实例，可为 None（将使用深度 0 作为默认）。
             gamma_emb: Gamma 参数的嵌入表。
             beta_emb: Beta 参数的嵌入表。
             default_norm: 默认的 LayerNorm（现已弃用，保留用于向后兼容）。
-            
+
         Returns:
             归一化后的张量，形状为 [B, S, D]。
         """
+        # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
+        if isinstance(levels_info, torch.Tensor):
+            # 转换为 LevelsInfo，确保数据类型为 Long
+            if levels_info.dtype != torch.long:
+                levels_info = levels_info.long()
+
+            # 从数据形状推断 max_depth: info_dim = max_depth + 1
+            info_dim = levels_info.shape[-1]
+            inferred_max_depth = info_dim - 1
+            levels_info = LevelsInfo(data=levels_info, max_depth=inferred_max_depth)
+
         # 验证输入维度
         if x.dim() != 3:
             raise ValueError(f"Expected x to be 3D [B, S, D], got {x.dim()}D with shape {x.shape}")
 
         batch_size, seq_len, dim = x.shape
-        
-        # P11-16: 当 levels_info 为 None 时，生成深度 0 的默认值
-        # 这确保始终使用 level-aware norm，避免两种 norm 路径的行为差异
-        if levels_info is None or levels_info.numel() == 0:
-            # 创建全零 depths，表示所有 token 深度为 0
+
+        # 当 levels_info 为 None 时，生成深度 0 的默认值
+        if levels_info is None or levels_info.data.numel() == 0:
             depths = torch.zeros(batch_size, seq_len, dtype=torch.long, device=x.device)
-            gamma = gamma_emb(depths)  # (B, S, dim)
-            beta = beta_emb(depths)    # (B, S, dim)
-        elif levels_info.dim() == 2:
-            # Old behavior: (Seq, Info) -> broadcast to batch
-            depths = extract_depths(levels_info, self.max_level) # (seq_len,)
-            gamma = gamma_emb(depths).unsqueeze(0) # (1, seq_len, dim)
-            beta = beta_emb(depths).unsqueeze(0) # (1, seq_len, dim)
         else:
-            # New behavior: (Batch, Seq, Info)
-            depths = extract_depths(levels_info, self.max_level) # (B, S)
-            gamma = gamma_emb(depths) # (B, S, dim)
-            beta = beta_emb(depths) # (B, S, dim)
-        
+            depths = levels_info.depths  # (B, S)
+            # I98-4: clamp depths to [0, max_level] to handle padding sentinel (-1)
+            depths = depths.clamp(min=0, max=self.max_level)
+
+        gamma = gamma_emb(depths)  # (B, S, dim)
+        beta = beta_emb(depths)    # (B, S, dim)
+
         # Manual LayerNorm: (x - mean) / std * gamma + beta
         mean = x.mean(dim=-1, keepdim=True)
         var = x.var(dim=-1, keepdim=True, unbiased=False)
         x_norm = (x - mean) / torch.sqrt(var + 1e-5)
-        
+
         return x_norm * gamma + beta
 
     def forward(
         self,
         x: torch.Tensor,
-        levels_info: Optional[torch.Tensor] = None,
+        levels_info: Optional[LevelsInfo] = None,
         attention_mask: Optional[torch.Tensor] = None,
         regions: Optional[torch.Tensor] = None,
         image_size: Optional[int] = None,
     ) -> torch.Tensor:
         """前向传播。
-        
-        P11-3 改进: 新增 regions 和 image_size 参数，用于直接从区域边界
-        计算正确的四叉树 LCA 偏置，绕过 levels_info 中全为 0 的路径问题。
-        
+
+        I98-4: levels_info 参数类型从 torch.Tensor 改为 LevelsInfo
+
         Args:
             x: 输入张量，形状为 [B, S, D]。
-            levels_info: 层级信息（可选），用于 depth 提取和 level bias。
+            levels_info: LevelsInfo 实例（可选）。
             attention_mask: 注意力掩码（可选）。
-            regions: (P11-3) 区域边界张量，形状为 [B, N, 4]，
-                     格式 [x1, y1, x2, y2]，用于计算正确的 Hilbert LCA 偏置。
-            image_size: (P11-3) 图像边长，与 regions 配合使用。
-            
+            regions: 区域边界张量，形状为 [B, N, 4]，格式 [x1, y1, x2, y2]。
+            image_size: 图像边长，与 regions 配合使用。
+
         Returns:
             输出张量，形状为 [B, S, D]。
         """
+        # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
+        if isinstance(levels_info, torch.Tensor):
+            # 转换为 LevelsInfo，确保数据类型为 Long
+            if levels_info.dtype != torch.long:
+                levels_info = levels_info.long()
+
+            # 从数据形状推断 max_depth: info_dim = max_depth + 1
+            info_dim = levels_info.shape[-1]
+            inferred_max_depth = info_dim - 1
+            levels_info = LevelsInfo(data=levels_info, max_depth=inferred_max_depth)
+
         # I34-10 修复: 使用单门控设计
         # gate ∈ [-1, 1] 支持双向调制 (抑制/增强)
-        if levels_info is not None and levels_info.numel() > 0:
-            depths = extract_depths(levels_info, self.max_level)  # (S,) or (B, S)
-            gate_raw = self._residual_gate(depths)  # (..., 1)
+        if levels_info is not None and levels_info.data.numel() > 0:
+            depths = levels_info.depths  # (B, S)
+            # I98-4: clamp depths to [0, max_level] to handle padding sentinel (-1)
+            depths_clamped = depths.clamp(min=0, max=self.max_level)
+            gate_raw = self._residual_gate(depths_clamped)  # (..., 1)
             gate = torch.tanh(gate_raw)  # (..., 1) ∈ [-1, 1]
 
             # 调整形状以便广播: (B, S, 1) for element-wise multiplication
@@ -319,19 +341,21 @@ class FractalTransformerBlock(nn.Module):
 
 
 class FractalTransformer(nn.Module):
-    """High-level transformer stack coordinating block execution.
-    
+    """High-level transformer stack coordinating block execution (I98-3: 协议驱动配置化).
+
     This module stacks multiple FractalTransformerBlock layers,
     adding global context attention and level aggregation for enhanced
     hierarchical processing.
-    
+
     Supports gradient checkpointing for memory-efficient training.
-    
+
     P11-2 修复: 参数 max_level 现在应传入与 tokenizer.max_depth 一致的值，
     而非硬编码的 50。这确保所有子模块的 Embedding 表大小与实际使用的深度范围匹配。
-    
+
     P11-8 简化: 移除 hilbert_bias_mode 和 low_rank_r 参数，仅保留 LCA 模式。
-    
+
+    I98-3: 新增 encoder_config 参数，支持协议驱动的编码器配置。
+
     Args:
         dim: Input/output dimension.
         depth: Number of transformer blocks.
@@ -345,6 +369,9 @@ class FractalTransformer(nn.Module):
         use_checkpoint: Whether to use gradient checkpointing (saves memory).
         lca_temperature: (P6-2) LCA bias temperature, default 1.5.
         learnable_temperature: (P6-2) Whether temperature is learnable.
+        use_affine_modulation: (向后兼容) 是否使用仿射调制偏置。
+        fourier_levels: (向后兼容) 傅里叶频率级别数。
+        encoder_config: (I98-3) AttentionEncoderConfig，协议驱动配置。
     """
 
     def __init__(
@@ -363,6 +390,11 @@ class FractalTransformer(nn.Module):
         learnable_temperature: bool = True,
         use_affine_modulation: bool = True,  # A17: 启用 ShapeScaleEncoder
         fourier_levels: int = 4,
+        encoder_config: Optional[AttentionEncoderConfig] = None,  # I98-3
+        # I97-11: 动态计算参数
+        use_dynamic_depth: bool = True,
+        min_layers: int | None = None,
+        complexity_hidden_dim: int | None = None,
     ):
         super().__init__()
         self.dim = dim
@@ -370,6 +402,20 @@ class FractalTransformer(nn.Module):
         self.max_level = max_level
         self.ffn_type = ffn_type
         self.use_checkpoint = use_checkpoint
+
+        # I97-11: 动态深度配置
+        self.use_dynamic_depth = use_dynamic_depth
+        self.min_layers = min_layers or (depth // 2)
+
+        # I97-11: 复杂度估计器
+        if use_dynamic_depth:
+            self.complexity_estimator = ComplexityEstimator(
+                dim=dim,
+                hidden_dim=complexity_hidden_dim,
+                use_cls=False,
+            )
+        else:
+            self.complexity_estimator = None
 
         # Stochastic depth decay rule
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
@@ -389,6 +435,7 @@ class FractalTransformer(nn.Module):
                     learnable_temperature=learnable_temperature,
                     use_affine_modulation=use_affine_modulation,
                     fourier_levels=fourier_levels,
+                    encoder_config=encoder_config,  # I98-3
                 )
                 for i in range(depth)
             ]
@@ -428,42 +475,84 @@ class FractalTransformer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        levels_info: Optional[torch.Tensor] = None,
+        levels_info: Optional[LevelsInfo] = None,
         attention_mask: Optional[torch.Tensor] = None,
         regions: Optional[torch.Tensor] = None,
         image_size: Optional[int] = None,
-    ) -> torch.Tensor:
+        return_extra_info: bool = False,
+    ) -> tuple[torch.Tensor, dict] | torch.Tensor:
         """前向传播。
-        
-        P11-3 改进: 新增 regions 和 image_size 参数，用于直接从区域边界
-        计算正确的四叉树 LCA 偏置，绕过 levels_info 中全为 0 的路径问题。
-        
+
+        I98-4: levels_info 参数类型从 torch.Tensor 改为 LevelsInfo
+
         Args:
             x: 输入张量，形状为 [B, S, D]。
-            levels_info: 层级信息（可选），用于 depth 提取和 level bias。
+            levels_info: LevelsInfo 实例（可选）。
             attention_mask: 注意力掩码（可选）。
-            regions: (P11-3) 区域边界张量，形状为 [B, N, 4]，
-                     格式 [x1, y1, x2, y2]，用于计算正确的 Hilbert LCA 偏置。
-            image_size: (P11-3) 图像边长，与 regions 配合使用。
-            
+            regions: 区域边界张量，形状为 [B, N, 4]，格式 [x1, y1, x2, y2]。
+            image_size: 图像边长，与 regions 配合使用。
+            return_extra_info: (I97-11) 是否返回额外信息。
+
         Returns:
-            输出张量，形状为 [B, S, D]。
+            如果 return_extra_info=True: (output, extra_info)
+            否则: output
         """
+        # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
+        if isinstance(levels_info, torch.Tensor):
+            # 转换为 LevelsInfo，确保数据类型为 Long
+            if levels_info.dtype != torch.long:
+                levels_info = levels_info.long()
+
+            # 从数据形状推断 max_depth: info_dim = max_depth + 1
+            info_dim = levels_info.shape[-1]
+            inferred_max_depth = info_dim - 1
+            levels_info = LevelsInfo(data=levels_info, max_depth=inferred_max_depth)
+
         batch_size, seq_len, dim = x.shape
 
-        for layer in self.layers:
+        # I97-11: 动态深度计算（仅在推理时）
+        extra_info = {'effective_depth': self.depth, 'complexity': None}
+        effective_depth = self.depth
+
+        if self.use_dynamic_depth and not self.training:
+            # 计算复杂度
+            if self.complexity_estimator is not None:
+                complexity = self.complexity_estimator(x)  # [B, 1]
+
+                # 线性映射到 [min_layers, depth]
+                target_layers = self.min_layers + \
+                    (self.depth - self.min_layers) * complexity  # [B, 1]
+
+                # 离散化（向下取整以节省更多计算）
+                effective_depth_per_sample = target_layers.floor().long().clamp(
+                    min=self.min_layers,
+                    max=self.depth,
+                )  # [B, 1]
+
+                # 确保batch内一致性（简化：使用mean，需要转float）
+                effective_depth = effective_depth_per_sample.float().mean().long().item()
+
+                extra_info = {
+                    'effective_depth': effective_depth,
+                    'complexity': complexity,
+                }
+
+        # 执行transformer层
+        for i, layer in enumerate(self.layers):
+            if i >= effective_depth:
+                break
             if self.use_checkpoint and self.training:
                 # Gradient checkpointing: 重新计算激活值以节省显存
                 # Note: checkpoint 不支持关键字参数，需要使用位置参数
                 # P11-3: 传递 regions 和 image_size
                 x = checkpoint(
-                    layer, x, levels_info, attention_mask, regions, image_size, 
+                    layer, x, levels_info, attention_mask, regions, image_size,
                     use_reentrant=False
                 )
             else:
                 x = layer(
-                    x, 
-                    levels_info=levels_info, 
+                    x,
+                    levels_info=levels_info,
                     attention_mask=attention_mask,
                     regions=regions,
                     image_size=image_size,
@@ -473,9 +562,11 @@ class FractalTransformer(nn.Module):
         # HilbertAwareMultiScaleAttention 已经充分保留全局信息流
 
         # ARCH-R2 方案 B: 层级感知的特征聚合
-        if levels_info is not None and levels_info.numel() > 0:
-            depths = extract_depths(levels_info, self.max_level)  # (S,) or (B, S)
-            scale = torch.sigmoid(self._level_aggregator_scale(depths))  # (..., D)
+        if levels_info is not None and levels_info.data.numel() > 0:
+            depths = levels_info.depths  # (B, S)
+            # I98-4: clamp depths to [0, max_level] to handle padding sentinel (-1)
+            depths_clamped = depths.clamp(min=0, max=self.max_level)
+            scale = torch.sigmoid(self._level_aggregator_scale(depths_clamped))  # (..., D)
             
             # 调整形状以匹配 x: [B, S, D]
             if scale.dim() == 2:
@@ -488,4 +579,8 @@ class FractalTransformer(nn.Module):
             x = x + F.softplus(self._aggregator_scale) * aggregated
 
         x = self.final_norm(x)
+
+        # I97-11: 返回额外信息
+        if return_extra_info:
+            return x, extra_info
         return x

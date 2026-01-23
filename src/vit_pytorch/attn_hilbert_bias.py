@@ -49,8 +49,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from .constants import HILBERT_BIAS_SCALE, LEVEL_BIAS_SCALE
-from .utils import extract_depths, normalize_levels_info
+from .constants import *
+from .config import (
+    ShapeScaleEncoderConfig,
+    AreaEncoderConfig,
+    LCAEncoderConfig,
+    AttentionEncoderConfig,
+)
+from .levels_info import LevelsInfo  # I98-4
 from .embed_fractal_path import VectorizedPathEncoder
 from .depth_utils import (
     compute_region_shape_scale,
@@ -79,50 +85,61 @@ class HilbertBiasBase(ABC, nn.Module):
         内部统一使用 3D 格式 (B, S, Info) 处理，避免代码重复
     """
     
-    def forward(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+    def forward(self, levels_info: LevelsInfo) -> Optional[torch.Tensor]:
         """计算 Hilbert Bias。
-        
-        自动处理 2D/3D 输入，维护输出形状兼容性。
-        
+
         Args:
-            levels_info: 层级信息张量
-                - 2D: (S, Info) 单样本格式
-                - 3D: (B, S, Info) 批量格式
-            
+            levels_info: LevelsInfo 实例，形状为 [B, S, D+1]
+
         Returns:
-            偏置矩阵:
-                - 2D 输入 → (H, S, S)
-                - 3D 输入 → (B, H, S, S)
-            若输入无效则返回 None
+            偏置矩阵: (B, H, S, S) 或 None
         """
-        if levels_info.numel() == 0:
+        # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
+        was_2d = False
+        if isinstance(levels_info, torch.Tensor):
+            # 转换为 LevelsInfo，确保数据类型为 Long
+            if levels_info.dtype != torch.long:
+                levels_info = levels_info.long()
+
+            # 处理 2D tensor (S, Info) -> 添加 batch 维度
+            if levels_info.dim() == 2:
+                was_2d = True
+                levels_info = levels_info.unsqueeze(0)  # (1, S, Info)
+
+            # 从数据形状推断 max_depth: info_dim = max_depth + 1
+            info_dim = levels_info.shape[-1]
+
+            # I98-4: 如果 info_dim == 1（只有深度列），返回 None
+            # 这是测试期望的行为，表示信息不足无法计算 LCA
+            if info_dim <= 1:
+                return None
+
+            inferred_max_depth = info_dim - 1
+
+            levels_info = LevelsInfo(data=levels_info, max_depth=inferred_max_depth)
+
+        if levels_info.data.numel() == 0:
             return None
-        
-        # 记录原始维度以决定输出形状
-        was_2d = levels_info.dim() == 2
-        
-        # 统一规范化为 3D: (B, S, Info)
-        levels_info_3d = normalize_levels_info(levels_info)
-        
+
         # 调用子类实现的核心计算
-        bias = self._compute_bias_3d(levels_info_3d)
-        
+        bias = self._compute_bias_3d(levels_info)
+
         if bias is None:
             return None
-        
-        # 若原始输入为 2D，移除 batch 维度: (B, H, S, S) → (H, S, S)
+
+        # 如果原始输入是 2D，移除 batch 维度以保持向后兼容
         if was_2d:
             bias = bias.squeeze(0)
-        
+
         return bias
     
     @abstractmethod
-    def _compute_bias_3d(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+    def _compute_bias_3d(self, levels_info: LevelsInfo) -> Optional[torch.Tensor]:
         """核心计算逻辑（子类实现）。
-        
+
         Args:
-            levels_info: 规范化后的 3D 张量 (B, S, Info)
-            
+            levels_info: LevelsInfo 实例
+
         Returns:
             偏置矩阵 (B, H, S, S) 或 None
         """
@@ -325,47 +342,37 @@ class LCAHilbertBias(HilbertBiasBase):
             # 广播到所有 heads，加小随机扰动
             init_values = log_depths.unsqueeze(1).expand(-1, self.heads)
             self.lca_embedding.weight.copy_(init_values)
-            # 添加小随机扰动以打破对称性
+            # I98-3: 添加小随机扰动以打破对称性
+            # 使用常量 EMBEDDING_INIT_STD 而非硬编码 0.02
             self.lca_embedding.weight.add_(
-                torch.randn_like(self.lca_embedding.weight) * 0.02
+                torch.randn_like(self.lca_embedding.weight) * EMBEDDING_INIT_STD
             )
     
-    def _compute_bias_3d(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+    def _compute_bias_3d(self, levels_info: LevelsInfo) -> Optional[torch.Tensor]:
         """计算基于 LCA 的 Hilbert Bias（核心 3D 实现）。
 
         数学形式:
             LCA[b,i,j] = sum_d prod_{k<=d} 1[p_i[k] = p_j[k]]
             Bias[b,i,j] = Embedding(LCA[b,i,j])
 
-        I32-2 修复: 处理 padding sentinel (-1)
-            - 使用 levels_info[:, :, 0] = -1 标识 padding token
-            - Padding token 的 LCA 偏置设为 0（不参与空间注意力）
-            - 有效 token 的 depth ∈ [0, max_depth]
-
-        P1-6 优化: LCA 深度矩阵缓存
-            - 同一 batch 的 levels_info 在所有 Transformer 层间共享
-            - 使用 data_ptr 作为缓存键，避免重复计算
-            - 理论加速: 6层时约 6x
-
-        复杂度: O(B·N²·D) 但无 Python 循环开销
-
         Args:
-            levels_info: (B, S, Info) 规范化后的层级信息
+            levels_info: LevelsInfo 实例
 
         Returns:
             (B, H, S, S) 偏置矩阵，若无效则返回 None
         """
-        batch_size, seq_len, info_dim = levels_info.shape
+        data = levels_info.data
+        batch_size, seq_len, info_dim = data.shape
         if info_dim <= 1:
             return None
 
         # I32-2: 提取深度列，识别 padding token
-        depths = levels_info[:, :, 0]  # [B, S]
+        depths = data[:, :, 0]  # [B, S]
         # Padding mask: True 表示 padding token (depth == -1)
         padding_mask = depths == -1
 
         # 提取四叉树路径: (B, S, Path)
-        paths = levels_info[:, :, 1:].long()
+        paths = data[:, :, 1:].long()
 
         # I32-2: 对于 padding token，将路径设为 0，避免影响 LCA 计算
         # 有效 token 的路径是 0-3，padding token 设为 0 不会引入错误的前缀匹配
@@ -395,8 +402,8 @@ class LCAHilbertBias(HilbertBiasBase):
         #
         # PyTorch 版本号 (._version) 在每次 in-place 操作时自动递增
         # 这确保了原地修改后的张量能正确触发缓存失效
-        data_ptr = levels_info.data_ptr()
-        torch_version = levels_info._version if hasattr(levels_info, '_version') else 0
+        data_ptr = data.data_ptr()
+        torch_version = data._version if hasattr(data, '_version') else 0
         cache_hit = False
 
         if data_ptr in self._lca_cache_inputs:
@@ -529,15 +536,17 @@ class LCAHilbertBias(HilbertBiasBase):
 
 
 class   HilbertAwareMultiScaleAttention(nn.Module):
-    """Hilbert 曲线感知的多尺度注意力机制。
+    """Hilbert 曲线感知的多尺度注意力机制 (I98-3: 协议驱动配置化).
 
     通过编码层级深度和 Hilbert 路径关系来调制注意力权重。
-    
+
     P11-2 修复: max_level 参数现在应传入与 tokenizer.max_depth 一致的值，
     确保 Embedding 表大小与实际使用的深度范围匹配，减少约 90% 的参数浪费。
-    
+
     P11-8 简化: 移除 bias_mode 和 low_rank_r 参数，仅保留 LCA 模式。
-    
+
+    I98-3: 新增 encoder_config 参数，支持协议驱动的编码器配置。
+
     Attributes:
         heads: 注意力头数
         dim_head: 每个头的维度
@@ -545,6 +554,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         use_hilbert_bias: 是否使用 Hilbert 偏置
         use_level_scaling: 是否使用层级缩放
         scale: 注意力缩放因子
+        config: AttentionEncoderConfig (I98-3)
     """
 
     def __init__(
@@ -558,12 +568,15 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         use_level_scaling: bool = True,
         lca_temperature: Optional[float] = 1.5,
         learnable_temperature: bool = True,
-        # I31-3: 仿射调制参数
-        # I32-7: A17 默认启用 ShapeScaleEncoder
+        # I31-3: 仿射调制参数 (向后兼容)
         use_affine_modulation: bool = True,
         fourier_levels: int = 4,
+        # I97-10: 新增层次化注意力模式
+        use_hierarchical_attention: bool = False,
+        # I98-3: 新协议驱动配置
+        encoder_config: Optional[AttentionEncoderConfig] = None,
     ) -> None:
-        """初始化 HilbertAwareMultiScaleAttention。
+        """初始化 HilbertAwareMultiScaleAttention (I98-3 协议驱动版本).
 
         P11-2 修复: 参数 max_level 现在应传入与 tokenizer.max_depth 一致的值，
         而非硬编码的 50。这确保 level_scale 和 relative_pos_embedding 的
@@ -572,6 +585,12 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         P11-8 简化: 移除 bias_mode 和 low_rank_r 参数，仅保留 LCA 模式。
 
         I31-3: 添加仿射调制支持，通过面积信息调制注意力偏置。
+
+        I98-3: 新增 encoder_config 参数，支持协议驱动的编码器配置。
+        当 encoder_config 存在时，忽略 use_affine_modulation 和 fourier_levels 参数。
+
+        I97-10: 新增 use_hierarchical_attention 参数，实现深度内独立Attention。
+        数学形式: Attn(X) = ⊕_d softmax(Q_d K_d^T / √d_k + B_d) V_d
 
         Args:
             dim: 输入维度
@@ -585,8 +604,10 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                 - None: 不使用温度缩放 (兼容模式)
                 - float: 温度初始值
             learnable_temperature: (P6-2) 是否使温度可学习
-            use_affine_modulation: (I31-3) 是否使用仿射调制偏置，默认 True (A17: 启用ShapeScaleEncoder)
-            fourier_levels: (I31-3) 傅里叶频率级别数，默认 4
+            use_affine_modulation: (I31-3) 是否使用仿射调制偏置，默认 True (向后兼容)
+            fourier_levels: (I31-3) 傅里叶频率级别数，默认 4 (向后兼容)
+            use_hierarchical_attention: (I97-10) 是否使用深度内独立Attention，默认 False
+            encoder_config: (I98-3) AttentionEncoderConfig，协议驱动配置
         """
         super().__init__()
         self.heads = heads
@@ -594,7 +615,19 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         self.max_level = max_level
         self.use_hilbert_bias = use_hilbert_bias
         self.use_level_scaling = use_level_scaling
-        self.use_affine_modulation = use_affine_modulation  # I31-3
+        # I97-10: 新增层次化注意力模式
+        self.use_hierarchical_attention = use_hierarchical_attention
+
+        # I98-3: 处理配置
+        if encoder_config is not None:
+            self.config = encoder_config
+            # 从配置中获取参数，忽略旧参数
+            self.use_affine_modulation = encoder_config.area.fourier_levels > 0
+        else:
+            self.config = AttentionEncoderConfig(
+                area=AreaEncoderConfig(fourier_levels=fourier_levels),
+            )
+            self.use_affine_modulation = use_affine_modulation
 
         # I24-11: 注意力权重存储开关 (默认关闭以节省内存)
         # 评估时设为 True 以支持 attention 可视化和分析
@@ -618,13 +651,12 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         else:
             self.hilbert_bias_impl = None
 
-        # I31-3: 仿射调制偏置 (可选)
-        if use_affine_modulation:
+        # I31-3: 仿射调制偏置 (可选) - I98-3: 支持协议驱动配置
+        if self.use_affine_modulation:
             self.affine_modulated_bias: Optional[nn.Module] = AffineModulatedBias(
                 dim=dim,
                 max_depth=max_level,
-                enable_area_modulation=True,
-                fourier_levels=fourier_levels,
+                config=self.config,
             )
         else:
             self.affine_modulated_bias = None
@@ -633,11 +665,31 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             # P11-4 修复: 使用 Softplus 约束确保 level_scale > 0
             # 原设计使用 N(1.0, 0.1) 初始化，但无正性约束，有偏梯度可导致负值
             # 新设计: softplus(_level_scale_raw) ∈ (0, +∞)
-            # 初始化 x=0.54 使得 softplus(0.54) ≈ 1.0
+            # I98-3: 从配置读取初始化值，默认 softplus(0.54) ≈ 1.0
             self._level_scale_raw: Optional[nn.Embedding] = nn.Embedding(max_level + 1, heads)
-            nn.init.constant_(self._level_scale_raw.weight, 0.54)  # softplus(0.54) ≈ 1.0
+            nn.init.constant_(self._level_scale_raw.weight, self.config.level_scale_init)
         else:
             self._level_scale_raw = None
+
+        # I97-10: 层级化注意力的深度缩放因子
+        # 每个深度有独立的缩放因子，用于深度内Attention
+        if use_hierarchical_attention:
+            self._hierarchical_depth_scale = nn.Parameter(torch.ones(max_level + 1, heads))
+            # I98-3: 从配置读取初始化边界，默认 [0.5, 1.5]
+            low, high = self.config.hierarchical_scale_bounds
+            nn.init.uniform_(self._hierarchical_depth_scale, low, high)
+        else:
+            self._hierarchical_depth_scale = None
+
+        # I97-7: 可学习偏置缩放因子 (Softplus 约束)
+        # 使用 softplus 确保 λ > 0，梯度稳定
+        # I98-3: 从配置读取初始化值，默认 log(0.1) 和 log(0.05)
+        self._hilbert_bias_scale_raw = nn.Parameter(
+            torch.tensor(self.config.hilbert_bias_init)
+        )
+        self._level_bias_scale_raw = nn.Parameter(
+            torch.tensor(self.config.level_bias_init)
+        )
 
         # A19: 移除可学习 scale_weights，保留标准 1/√d_k
         # 理由: LayerNorm 已将 Q,K 方差控制在 1，1/√d_k 已足够
@@ -649,29 +701,36 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
 
+    # I98-3: 获取配置方法
+    def get_config(self) -> AttentionEncoderConfig:
+        """获取当前编码器配置 (I98-3)."""
+        return self.config
+
+    # I97-7: 可学习偏置缩放因子属性
+    @property
+    def hilbert_bias_scale(self) -> torch.Tensor:
+        """获取 Hilbert 偏置缩放因子 (可学习, Softplus 约束)."""
+        return F.softplus(self._hilbert_bias_scale_raw)
+
+    @property
+    def level_bias_scale(self) -> torch.Tensor:
+        """获取层级偏置缩放因子 (可学习, Softplus 约束)."""
+        return F.softplus(self._level_bias_scale_raw)
+
     def _compute_hilbert_bias(
         self,
-        levels_info: Optional[torch.Tensor] = None,
+        levels_info: Optional[LevelsInfo] = None,
         regions: Optional[torch.Tensor] = None,
         image_size: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         """计算基于 Hilbert 路径的注意力偏置。
-        
-        根据 bias_mode 调用不同的实现：
-        - 'lca': LCA 嵌入表（推荐，支持 regions 直接计算）
-        - 'low_rank': 低秩分解
-        - 'hierarchical': 分层计算
-        
-        P11-3 改进: 当提供 regions + image_size 时，使用 forward_from_regions
-        直接从区域边界计算正确的四叉树 LCA，绕过有问题的 levels_info 路径。
-        
+
         Args:
-            levels_info: 层级信息张量，形状为 (Seq, Info) 或 (Batch, Seq, Info)
-                        [已废弃，路径部分全为 0]
+            levels_info: LevelsInfo 实例（可选）
             regions: (P11-3) 区域边界张量，形状为 (B, N, 4)
                      格式 [x1, y1, x2, y2]
             image_size: (P11-3) 图像边长，与 regions 配合使用
-            
+
         Returns:
             Hilbert 偏置张量，形状为 (H, S, S) 或 (B, H, S, S)，若无效则返回 None
         """
@@ -680,80 +739,192 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
 
         if self.hilbert_bias_impl is None:
             return None
-        
+
         # P11-3: 优先使用 regions 直接计算 (LCA 模式)
-        # P11-8: 简化后仅支持 LCA 模式
         if regions is not None and image_size is not None:
             if isinstance(self.hilbert_bias_impl, LCAHilbertBias):
                 return self.hilbert_bias_impl.forward_from_regions(regions, image_size)
-        
+
         # 回退到 levels_info
-        if levels_info is not None and levels_info.numel() > 0:
+        if levels_info is not None and levels_info.data.numel() > 0:
             return self.hilbert_bias_impl(levels_info)
-        
+
         return None
 
-    def _compute_level_bias(self, levels_info: torch.Tensor) -> Optional[torch.Tensor]:
+    def _compute_level_bias(self, levels_info: LevelsInfo) -> Optional[torch.Tensor]:
         """计算基于层级差异的相对位置偏置。
-        
+
         Args:
-            levels_info: 层级信息张量，形状为 (Seq, Info) 或 (Batch, Seq, Info)
-            
+            levels_info: LevelsInfo 实例
+
         Returns:
-            层级偏置张量，形状为 (H, S, S) 或 (B, H, S, S)，若无效则返回 None
+            层级偏置张量，形状为 [B, H, S, S]，若无效则返回 None
         """
-        if levels_info.numel() == 0:
+        if levels_info.data.numel() == 0:
             return None
 
-        if levels_info.dim() == 2:
-            # Old behavior: (Seq, Info)
-            depths = extract_depths(levels_info, self.max_level)
-            level_diff = depths.unsqueeze(0) - depths.unsqueeze(1)
-            level_diff = level_diff.clamp(-self.max_level, self.max_level) + self.max_level
-            rel_pos_bias = self.relative_pos_embedding(level_diff)
-            return rel_pos_bias.permute(2, 0, 1) # (H, S, S)
+        depths = levels_info.depths  # (B, S)
+        level_diff = depths.unsqueeze(2) - depths.unsqueeze(1)  # (B, S, S)
+        level_diff = level_diff.clamp(-self.max_level, self.max_level) + self.max_level
+        rel_pos_bias = self.relative_pos_embedding(level_diff)  # (B, S, S, H)
+        return rel_pos_bias.permute(0, 3, 1, 2)  # (B, H, S, S)
+
+    def _forward_hierarchical(
+        self,
+        x: torch.Tensor,
+        levels_info: LevelsInfo,
+        attention_mask: Optional[torch.Tensor],
+        regions: Optional[torch.Tensor],
+        image_size: Optional[int],
+        batch: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """I97-10: 深度内独立Attention的前向传播。
+
+        数学形式:
+            Attn(X) = ⊕_d softmax(Q_d K_d^T / √d_k + B_d) V_d
+
+        其中 ⊕_d 表示按深度拼接，X_d 是深度 d 的 tokens。
+
+        Args:
+            x: 输入张量，形状为 [B, N, D]
+            levels_info: LevelsInfo 实例
+            attention_mask: 注意力掩码
+            regions: 区域边界张量
+            image_size: 图像边长
+            batch: batch size
+            seq_len: 序列长度
+
+        Returns:
+            输出张量，形状为 [B, N, D]
+        """
+        # 提取深度信息
+        depths = levels_info.depths  # [B, N]
+
+        # LayerNorm + QKV投影
+        x = self.norm(x)
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.heads), qkv)
+
+        # 初始化输出
+        output = torch.zeros(batch, seq_len, self.heads * self.dim_head, device=x.device, dtype=x.dtype)
+
+        # 深度缩放因子 (用于层级化注意力)
+        if self._hierarchical_depth_scale is not None:
+            depth_scales = self._hierarchical_depth_scale  # [max_level+1, heads]
         else:
-            # New behavior: (Batch, Seq, Info)
-            depths = extract_depths(levels_info, self.max_level) # (B, S)
-            level_diff = depths.unsqueeze(2) - depths.unsqueeze(1) # (B, S, S)
-            level_diff = level_diff.clamp(-self.max_level, self.max_level) + self.max_level
-            rel_pos_bias = self.relative_pos_embedding(level_diff) # (B, S, S, H)
-            return rel_pos_bias.permute(0, 3, 1, 2) # (B, H, S, S)
+            depth_scales = None
+
+        # 遍历每个深度，分别计算Attention
+        for d in range(self.max_level + 1):
+            # 深度d的token索引
+            depth_mask = (depths == d)  # [B, N]
+            depth_count = depth_mask.sum(dim=1)  # [B]
+
+            # 检查是否有深度d的token（跨所有batch）
+            if depth_count.sum() == 0:
+                continue
+
+            # 为每个batch分别处理（因为不同样本可能有不同的token数量）
+            for b in range(batch):
+                b_depth_mask = depth_mask[b]  # [N]
+                b_depth_count = depth_count[b].item()
+
+                if b_depth_count == 0:
+                    continue
+
+                # 提取深度d的QKV
+                q_d = q[b, :, b_depth_mask, :]  # [H, M, d_k]
+                k_d = k[b, :, b_depth_mask, :]  # [H, M, d_k]
+                v_d = v[b, :, b_depth_mask, :]  # [H, M, d_k]
+
+                # 深度缩放 (广播到 [H, 1, 1])
+                if depth_scales is not None:
+                    scale = self.scale * depth_scales[d].view(self.heads, 1, 1)
+                else:
+                    scale = self.scale
+
+                # QK^T
+                dots = torch.matmul(q_d, k_d.transpose(-1, -2)) * scale  # [H, M, M]
+
+                # Hilbert偏置（深度专用）
+                if self.use_hilbert_bias and self.hilbert_bias_impl is not None:
+                    # 计算当前深度的Hilbert偏置
+                    if regions is not None and image_size is not None:
+                        # 使用regions计算
+                        b_regions = regions[b:b+1, b_depth_mask, :]  # [1, M, 4]
+                        hilbert_bias = self.hilbert_bias_impl.forward_from_regions(b_regions, image_size)
+                        if hilbert_bias is not None:
+                            # hilbert_bias: [H, M, M]
+                            dots = dots + hilbert_bias * self.hilbert_bias_scale
+
+                # Level偏置（深度内，理论上为0，因为同一深度的level diff = 0）
+                # 但保留接口以备将来扩展
+
+                # Softmax
+                attn = self.attend(dots)
+                attn = self.dropout(attn)
+
+                # 加权
+                out_d = torch.matmul(attn, v_d)  # [H, M, d_k]
+
+                # 填充到输出
+                output[b, b_depth_mask, :] = rearrange(out_d, "h m d -> m (h d)")
+
+        return self.to_out(output)
 
     def forward(
         self,
         x: torch.Tensor,
-        levels_info: Optional[torch.Tensor] = None,
+        levels_info: Optional[LevelsInfo] = None,
         attention_mask: Optional[torch.Tensor] = None,
         regions: Optional[torch.Tensor] = None,
         image_size: Optional[int] = None,
     ) -> torch.Tensor:
         """前向传播。
 
-        P11-3 改进: 新增 regions 和 image_size 参数，用于直接从区域边界
-        计算正确的四叉树 LCA 偏置，绕过 levels_info 中全为 0 的路径问题。
-
-        P-OPT: 使用 Flash SDP 优化（当无偏置时）
+        I98-4: levels_info 参数类型从 torch.Tensor 改为 LevelsInfo
 
         Args:
             x: 输入张量，形状为 [B, N, D]
-            levels_info: 层级信息（可选，用于 depth 提取和 level bias）
+            levels_info: LevelsInfo 实例（可选）
             attention_mask: 注意力掩码（可选）
-            regions: (P11-3) 区域边界张量，形状为 [B, N, 4]，
-                     格式 [x1, y1, x2, y2]，用于计算正确的 Hilbert LCA 偏置
-            image_size: (P11-3) 图像边长，与 regions 配合使用
+            regions: 区域边界张量，形状为 [B, N, 4]，格式 [x1, y1, x2, y2]
+            image_size: 图像边长，与 regions 配合使用
 
         Returns:
             输出张量，形状为 [B, N, D]
         """
-        batch, _, _ = x.shape
+        batch, seq_len, _ = x.shape
+
+        # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
+        if isinstance(levels_info, torch.Tensor):
+            # 转换为 LevelsInfo，确保数据类型为 Long
+            if levels_info.dtype != torch.long:
+                levels_info = levels_info.long()
+
+            # 处理 2D tensor (S, Info) -> 添加 batch 维度
+            if levels_info.dim() == 2:
+                levels_info = levels_info.unsqueeze(0)  # (1, S, Info)
+
+            # 从数据形状推断 max_depth: info_dim = max_depth + 1
+            info_dim = levels_info.shape[-1]
+            inferred_max_depth = info_dim - 1
+
+            levels_info = LevelsInfo(data=levels_info, max_depth=inferred_max_depth)
+
+        # I97-10: 层级化注意力模式
+        if self.use_hierarchical_attention and levels_info is not None and levels_info.data.numel() > 0:
+            return self._forward_hierarchical(
+                x, levels_info, attention_mask, regions, image_size, batch, seq_len
+            )
 
         x = self.norm(x)
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.heads), qkv)
 
         # P-OPT: 检查是否有偏置，无偏置时使用 Flash SDP
-        has_level_scaling = self.use_level_scaling and levels_info is not None and levels_info.numel() > 0
+        has_level_scaling = self.use_level_scaling and levels_info is not None and levels_info.data.numel() > 0
         has_affine_bias = (self.use_affine_modulation and
                           regions is not None and image_size is not None and
                           self.affine_modulated_bias is not None)
@@ -796,11 +967,13 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         if has_level_scaling:
             # Type guard: guaranteed non-None when use_level_scaling is True
             assert self._level_scale_raw is not None
-            
-            depths = extract_depths(levels_info, self.max_level)
+
+            depths = levels_info.depths  # [B, S]
+            # I98-4: clamp depths to [0, max_level] to handle padding sentinel (-1)
+            depths_clamped = depths.clamp(min=0, max=self.max_level)
             # I34-15: 移除 2D 分支死代码，levels_info 始终为 3D
             # P11-4: Softplus 约束确保 level_scales ∈ (0, +∞)
-            level_scales = F.softplus(self._level_scale_raw(depths))  # (B, S, H)
+            level_scales = F.softplus(self._level_scale_raw(depths_clamped))  # (B, S, H)
             level_scales = level_scales.permute(0, 2, 1).unsqueeze(-1)  # (B, H, S, 1)
 
             dots = dots * level_scales
@@ -826,7 +999,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                         affine_bias_avg = affine_bias.reshape(
                             batch, self.heads, actual_head_dim, N, N
                         ).mean(dim=2)
-                        dots = dots + affine_bias_avg * HILBERT_BIAS_SCALE
+                        dots = dots + affine_bias_avg * self.hilbert_bias_scale
             else:
                 hilbert_bias = self._compute_hilbert_bias(
                     levels_info=levels_info,
@@ -836,17 +1009,17 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                 if hilbert_bias is not None:
                     # hilbert_bias: (H, S, S) or (B, H, S, S)
                     if hilbert_bias.dim() == 3:
-                        dots = dots + hilbert_bias.unsqueeze(0) * HILBERT_BIAS_SCALE
+                        dots = dots + hilbert_bias.unsqueeze(0) * self.hilbert_bias_scale
                     else:
-                        dots = dots + hilbert_bias * HILBERT_BIAS_SCALE
+                        dots = dots + hilbert_bias * self.hilbert_bias_scale
 
             level_bias = self._compute_level_bias(levels_info)
             if level_bias is not None:
                 # level_bias: (H, S, S) or (B, H, S, S)
                 if level_bias.dim() == 3:
-                    dots = dots + level_bias.unsqueeze(0) * LEVEL_BIAS_SCALE
+                    dots = dots + level_bias.unsqueeze(0) * self.level_bias_scale
                 else:
-                    dots = dots + level_bias * LEVEL_BIAS_SCALE
+                    dots = dots + level_bias * self.level_bias_scale
 
         if attention_mask is not None:
             mask_value = -torch.finfo(dots.dtype).max
@@ -869,7 +1042,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
 
 
 class ShapeScaleEncoder(nn.Module):
-    """形状-尺度编码器 (I31 原始，I35: 迭代改进)
+    """形状-尺度编码器 (I31 原始，I35: 迭代改进，I98-3: 协议驱动配置化)
 
     数学形式化
     ==========
@@ -896,39 +1069,55 @@ class ShapeScaleEncoder(nn.Module):
     I35-2: 非零初始化
         τ = 0.1 确保训练初期有梯度回传。
 
+    I98-3: 协议驱动配置
+        使用 ShapeScaleEncoderConfig 替代硬编码参数。
+
     架构:
         encoder: [r, s] -> Linear(2, hidden) -> GELU -> Linear(hidden, dim/2) -> GELU -> Linear(dim/2, dim)
         bias_encoder: [r_i, s_i, r_j, s_j] -> Linear(4, hidden) -> GELU -> Linear(hidden, hidden/2) -> GELU -> Linear(hidden/2, 1)
 
     属性
     ----
+    config : ShapeScaleEncoderConfig
+        编码器配置 (I98-3)
     encoder : nn.Sequential
         组合特征编码器: 2 -> hidden -> dim/2 -> dim
     bias_encoder : nn.Sequential
         直接偏置编码器: 4 -> hidden -> hidden/2 -> 1 (I35 Phase 2)
     shape_scale_weight : nn.Parameter
-        可学习权重 (非零初始化: 0.1)
+        可学习权重 (初始化值来自 config)
     """
 
-    def __init__(self, dim: int, hidden_dim: int = 64):
-        """初始化形状-尺度编码器。
+    def __init__(
+        self,
+        dim: int,
+        config: Optional[ShapeScaleEncoderConfig] = None,
+    ):
+        """初始化形状-尺度编码器 (I98-3 协议驱动版本).
 
         参数
         ----
         dim : int
             输出嵌入维度
-        hidden_dim : int, optional
-            隐藏层维度，默认 64
+        config : ShapeScaleEncoderConfig, optional
+            编码器配置，为 None 时使用默认配置
         """
         super().__init__()
+
+        if config is None:
+            config = ShapeScaleEncoderConfig()
+
+        self.config = config
+        self.dim = dim
+        self.hidden_dim = config.hidden_dim
 
         # 组合特征编码器 (I35-1 核心改进)
         # 输入: [r, s] 形状 [B, N, 2]
         # 输出: [B, N, dim]
         self.encoder = nn.Sequential(
-            nn.Linear(2, hidden_dim),
+            nn.Linear(2, config.hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, dim // 2),
+            nn.Linear(config.hidden_dim, dim // 2),
             nn.GELU(),
             nn.Linear(dim // 2, dim)
         )
@@ -937,19 +1126,35 @@ class ShapeScaleEncoder(nn.Module):
         # 输入: [r_i, s_i, r_j, s_j] 形状 [B, N, N, 4]
         # 输出: [B, N, N, 1] 标量偏置
         self.bias_encoder = nn.Sequential(
-            nn.Linear(4, hidden_dim),
+            nn.Linear(4, config.hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(config.hidden_dim, config.hidden_dim // 2),
             nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Linear(config.hidden_dim // 2, 1)
         )
 
         # 可学习权重 (非零初始化，渐进启用)
-        # I35-2 修复: τ = 0 阻塞梯度，改用 τ = 0.1 确保训练初期有梯度
-        self.shape_scale_weight = nn.Parameter(torch.tensor(0.1))
+        # I35-2 修复: τ = 0 阻塞梯度，改用 config.weight_init 确保训练初期有梯度
+        self.shape_scale_weight = nn.Parameter(
+            torch.tensor(config.weight_init)
+        )
 
         # 初始化权重
         self._init_weights()
+
+    def get_config(self) -> ShapeScaleEncoderConfig:
+        """获取当前配置 (I98-3).
+
+        返回
+        ----
+        ShapeScaleEncoderConfig
+            当前配置，包含实际运行参数
+        """
+        return ShapeScaleEncoderConfig(
+            hidden_dim=self.hidden_dim,
+            output_dim=self.dim,
+            weight_init=self.shape_scale_weight.item(),
+        )
 
     def _init_weights(self):
         """初始化权重。"""
@@ -1076,7 +1281,7 @@ class ShapeScaleEncoder(nn.Module):
 
 
 class LCAHilbertBiasWithShapeScale(nn.Module):
-    """带形状-尺度修正的 LCA Hilbert 偏置 (I31)
+    """带形状-尺度修正的 LCA Hilbert 偏置 (I31, I98-3: 协议驱动配置)
 
     数学形式化
     ==========
@@ -1094,6 +1299,9 @@ class LCAHilbertBiasWithShapeScale(nn.Module):
     非零初始化 (I35-2):
         τ = 0.1 时，训练初期 B_SS 就有梯度回传，加速收敛
 
+    I98-3: 协议驱动配置
+        使用 ShapeScaleEncoderConfig 替代硬编码参数。
+
     属性
     ----
     lca_embedding : nn.Embedding
@@ -1102,6 +1310,8 @@ class LCAHilbertBiasWithShapeScale(nn.Module):
         形状-尺度编码器
     shape_scale_weight : nn.Parameter
         可学习组合权重
+    config : ShapeScaleEncoderConfig
+        编码器配置 (I98-3)
     """
 
     def __init__(
@@ -1112,8 +1322,9 @@ class LCAHilbertBiasWithShapeScale(nn.Module):
         enable_shape_scale: bool = True,
         shape_scale_dim: Optional[int] = None,
         shape_scale_hidden_dim: int = 64,
+        shape_scale_config: Optional[ShapeScaleEncoderConfig] = None,
     ):
-        """初始化带形状-尺度修正的 LCA Hilbert 偏置 (I35: 特征解耦重构)。
+        """初始化带形状-尺度修正的 LCA Hilbert 偏置 (I35: 特征解耦重构, I98-3 协议驱动).
 
         参数
         ----
@@ -1129,8 +1340,15 @@ class LCAHilbertBiasWithShapeScale(nn.Module):
             形状-尺度嵌入维度，默认等于 dim
         shape_scale_hidden_dim : int, optional
             形状-尺度编码器隐藏层维度，默认 64 (I35: 与 ShapeScaleEncoder 默认值一致)
+        shape_scale_config : ShapeScaleEncoderConfig, optional
+            形状-尺度编码器配置 (I98-3)
         """
         super().__init__()
+
+        # I98-3: 使用配置类
+        if shape_scale_config is None:
+            shape_scale_config = ShapeScaleEncoderConfig(hidden_dim=shape_scale_hidden_dim)
+        self.config = shape_scale_config
 
         # LCA 嵌入层
         lca_embed_dim = lca_embedding_dim or dim
@@ -1139,12 +1357,12 @@ class LCAHilbertBiasWithShapeScale(nn.Module):
             embedding_dim=lca_embed_dim
         )
 
-        # 形状-尺度编码器 (I35: 统一使用特征解耦版本)
+        # 形状-尺度编码器 (I35: 统一使用特征解耦版本, I98-3: 使用配置类)
         self.enable_shape_scale = enable_shape_scale
         if enable_shape_scale:
             self.shape_scale_encoder = ShapeScaleEncoder(
                 dim=shape_scale_dim or dim,
-                hidden_dim=shape_scale_hidden_dim
+                config=shape_scale_config
             )
 
         # 初始化权重
@@ -1252,7 +1470,7 @@ class LCAHilbertBiasWithShapeScale(nn.Module):
 
 
 class AreaEncoder(nn.Module):
-    """面积编码器 (I31-3, I32-7)
+    """面积编码器 (I31-3, I32-7, I98-3: 协议驱动配置化)
 
     数学形式化
     ==========
@@ -1268,31 +1486,18 @@ class AreaEncoder(nn.Module):
             f_k = \\pi \\cdot b^k \\cdot g_k(freq_k, L_{{norm}})
 
         其中:
-            b = 2  (频率基数)
+            b = freq_base (频率基数，可配置)
             g_k = \\text{{CosineGate}}(freq_k, L_{{norm}})  (软截断门控)
 
-    软截断门控 (I32-7):
-
-        .. math::
-            g_k = \\begin{cases}}
-                1 & f_k \\leq 0.8 \\cdot \\omega_{{Nyquist}} \\\\
-                \\frac{{1}}{{2}}(1 + \\cos\\frac{{\\pi(f_k - 0.8\\omega_{{Nyquist}})}}
-                              {{0.2\\omega_{{Nyquist}}}}) & 0.8\\omega_{{Nyquist}} < f_k < \\omega_{{Nyquist}} \\\\
-                0 & f_k \\geq \\omega_{{Nyquist}}
-            \\end{cases}
-
-    Nyquist 约束:
-
-        .. math::
-            \\omega_{{Nyquist}} = \\frac{{\\pi}}{{L_{{norm}}}}, \\quad L_{{norm}} = \\frac{{L_{{patch}}}}{{L_{{image}}}}
-
-    MLP 投影:
-        E = W_2 · GELU(W_1 · γ(f))
+    I98-3: 协议驱动配置
+        使用 AreaEncoderConfig 替代硬编码参数。
 
     属性
     ----
+    config : AreaEncoderConfig
+        编码器配置 (I98-3)
     fourier_levels : int
-        傅里叶频率级别数，默认 4
+        傅里叶频率级别数
     fourier_dim : int
         傅里叶特征维度 = 2 × fourier_levels
     fourier_proj : nn.Linear
@@ -1306,45 +1511,69 @@ class AreaEncoder(nn.Module):
     def __init__(
         self,
         dim: int,
-        fourier_levels: int = 4,
-        hidden_dim: int = 32,
-        freq_base: float = 2.0,
+        config: Optional[AreaEncoderConfig] = None,
     ):
-        """初始化面积编码器。
+        """初始化面积编码器 (I98-3 协议驱动版本).
 
         参数
         ----
         dim : int
             输出嵌入维度
-        fourier_levels : int, optional
-            傅里叶频率级别数，默认 4
-        hidden_dim : int, optional
-            隐藏层维度，默认 32
-        freq_base : float, optional
-            频率基数，默认 2.0
+        config : AreaEncoderConfig, optional
+            编码器配置，为 None 时使用默认配置
         """
         super().__init__()
+
+        if config is None:
+            config = AreaEncoderConfig()
+
+        self.config = config
         self.dim = dim
-        self.fourier_levels = fourier_levels
-        self.fourier_dim = fourier_levels * 2  # sin + cos
-        self.freq_base = freq_base
+        self.fourier_levels = config.fourier_levels
+        self.freq_base = config.freq_base
+        self.fourier_dim = config.fourier_levels * 2  # sin + cos
 
-        # 傅里叶特征投影: 2L -> hidden
-        self.fourier_proj = nn.Linear(self.fourier_dim, hidden_dim)
+        # I98-3: 从配置读取 Nyquist 裁剪比例
+        self.cutoff_ratio = config.cutoff_ratio
 
-        # MLP 投影: hidden -> dim
-        self.mlp = nn.Sequential(
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, dim)
-        )
+        # fourier_levels=0 时禁用编码器
+        if config.fourier_levels > 0:
+            # 傅里叶特征投影: 2L -> hidden
+            self.fourier_proj = nn.Linear(self.fourier_dim, config.hidden_dim)
+
+            # MLP 投影: hidden -> dim
+            self.mlp = nn.Sequential(
+                nn.GELU(),
+                nn.Linear(config.hidden_dim, config.hidden_dim),
+                nn.GELU(),
+                nn.Linear(config.hidden_dim, dim)
+            )
+        else:
+            # 禁用模式：创建占位符
+            self.fourier_proj = None
+            self.mlp = None
 
         # 可学习权重 (零初始化)
         self.area_weight = nn.Parameter(torch.zeros(1))
 
         # 初始化权重
         self._init_weights()
+
+    def get_config(self) -> AreaEncoderConfig:
+        """获取当前配置 (I98-3).
+
+        返回
+        ----
+        AreaEncoderConfig
+            当前配置，包含实际运行参数
+        """
+        return AreaEncoderConfig(
+            fourier_levels=self.fourier_levels,
+            freq_base=self.freq_base,
+            hidden_dim=self.config.hidden_dim,
+            output_dim=self.dim,
+            cutoff_ratio=self.cutoff_ratio,  # I98-3: 包含 cutoff_ratio
+        )
 
     def _init_weights(self):
         """初始化权重。"""
@@ -1464,9 +1693,10 @@ class AreaEncoder(nn.Module):
         # [B, N] -> [B, N, 1] 用于广播
         omega_nyquist = (math.pi / (L_norm + 1e-8)).unsqueeze(-1)  # [B, N, 1]
 
-        # 截止频率: 80% Nyquist
+        # 截止频率: 从配置读取，默认 80% Nyquist
+        # I98-3: omega_cutoff = cutoff_ratio * omega_nyquist
         # [B, N] -> [B, N, 1]
-        omega_cutoff = omega_nyquist * 0.8  # [B, N, 1]
+        omega_cutoff = omega_nyquist * self.cutoff_ratio  # [B, N, 1]
 
         # P-OPT-5: 预计算所有频率序列 (向量化关键)
         # [L] -> [1, 1, L]
@@ -1517,7 +1747,7 @@ class AreaEncoder(nn.Module):
         regions: torch.Tensor,
         image_size: Tuple[int, int],
     ) -> torch.Tensor:
-        """计算面积嵌入。
+        """计算面积嵌入 (I98-3: 支持禁用).
 
         参数
         ----
@@ -1533,6 +1763,11 @@ class AreaEncoder(nn.Module):
             面积嵌入，形状 [B, N, dim]
         """
         B, N, _ = regions.shape
+
+        # I98-3: fourier_levels=0 时禁用编码器，返回零张量
+        if self.fourier_levels == 0:
+            return torch.zeros(B, N, self.dim, device=regions.device)
+
         # 处理 image_size 格式：支持 int 或 (W, H) 元组
         if isinstance(image_size, int):
             image_size_tuple = (image_size, image_size)
@@ -1566,7 +1801,7 @@ class AreaEncoder(nn.Module):
 
 
 class AffineModulatedBias(nn.Module):
-    """仿射调制注意力偏置 (I31-3)
+    """仿射调制注意力偏置 (I31-3, I98-3: 协议驱动配置化)
 
     数学形式化
     ==========
@@ -1579,11 +1814,13 @@ class AffineModulatedBias(nn.Module):
         β(s_i, s_j) = MLP_β(p_s)        # 偏置因子
         p_s = area_emb[i] · area_emb[j] # 面积相似性
 
-    残差连接:
-        B_{\text{final}} = B_{\text{spatial}} + α · (γ ⊙ B_{\text{spatial}} + β - B_{\text{spatial}})
+    I98-3: 协议驱动配置
+        使用 AttentionEncoderConfig 替代硬编码参数。
 
     属性
     ----
+    config : AttentionEncoderConfig
+        编码器配置 (I98-3)
     lca_embedding : nn.Embedding
         LCA 深度嵌入层
     area_encoder : AreaEncoder
@@ -1600,10 +1837,9 @@ class AffineModulatedBias(nn.Module):
         self,
         dim: int,
         max_depth: int,
-        enable_area_modulation: bool = True,
-        fourier_levels: int = 4,
+        config: Optional[AttentionEncoderConfig] = None,
     ):
-        """初始化仿射调制偏置。
+        """初始化仿射调制偏置 (I98-3 协议驱动版本).
 
         参数
         ----
@@ -1611,32 +1847,39 @@ class AffineModulatedBias(nn.Module):
             注意力维度
         max_depth : int
             最大四叉树深度
-        enable_area_modulation : bool, optional
-            是否启用面积调制，默认 True
-        fourier_levels : int, optional
-            傅里叶频率级别数，默认 4
+        config : AttentionEncoderConfig, optional
+            编码器配置，为 None 时使用默认配置
         """
         super().__init__()
+
+        if config is None:
+            config = AttentionEncoderConfig()
+
+        self.config = config
         self.dim = dim
         self.max_depth = max_depth
-        self.enable_area_modulation = enable_area_modulation
+        self.enable_area_modulation = config.area.fourier_levels > 0
 
-        # 空间偏置 (LCA)
+        # I98-3: 从配置获取 scale_init_factor
+        scale_init_factor = config.lca.scale_init_factor
+
+        # 空间偏置 (LCA) - 始终使用 dim 作为嵌入维度以保持一致性
+        # config.lca.embedding_dim 仅用于配置记录，实际使用 dim
         self.lca_embedding = nn.Embedding(
             num_embeddings=max_depth + 1,
             embedding_dim=dim
         )
 
         # 面积编码器和调制网络
-        if enable_area_modulation:
+        if self.enable_area_modulation:
+            # 使用配置的 AreaEncoder
             self.area_encoder = AreaEncoder(
                 dim=dim,
-                fourier_levels=fourier_levels,
-                hidden_dim=32
+                config=config.area
             )
 
             # 傅里叶特征维度
-            fourier_dim = fourier_levels * 2  # sin + cos
+            fourier_dim = config.area.fourier_levels * 2  # sin + cos
 
             # 缩放网络: fourier_features → [0, 1]
             self.scale_net = nn.Sequential(
@@ -1657,14 +1900,34 @@ class AffineModulatedBias(nn.Module):
             # 残差权重 (零初始化)
             self.residual_alpha = nn.Parameter(torch.zeros(1))
 
-        self._init_weights()
+        # I31-P2: 添加 ShapeScale 编码器
+        self.enable_shape_scale = config.shape_scale.enabled
+        if self.enable_shape_scale:
+            self.shape_scale_encoder = ShapeScaleEncoder(
+                dim=dim,
+                config=config.shape_scale
+            )
+            # 形状编码 → 偏置网络
+            # Fourier 特征: 4 levels × 2 (sin/cos) = 8 维
+            shape_fourier_dim = 8
+            self.shape_bias_net = nn.Sequential(
+                nn.Linear(shape_fourier_dim, shape_fourier_dim),
+                nn.GELU(),
+                nn.Linear(shape_fourier_dim, dim),
+                nn.Tanh()  # β_shape ∈ (-1, 1)
+            )
+            # 形状调制权重
+            self.shape_scale_alpha = nn.Parameter(torch.zeros(1))
 
-    def _init_weights(self):
-        """初始化权重。"""
+        self._init_weights(scale_init_factor)
+
+    def _init_weights(self, scale_init_factor: float = 0.1):
+        """初始化权重 (I98-3: 使用可配置的 scale_init_factor)."""
         # LCA 嵌入: 深度越大（越邻近）偏置越高
+        # I98-3: 使用配置的 scale_init_factor
         with torch.no_grad():
             for d in range(self.lca_embedding.num_embeddings):
-                scale = 0.1 * (1 + torch.log(torch.tensor(d + 1.0)))
+                scale = scale_init_factor * (1 + torch.log(torch.tensor(d + 1.0)))
                 self.lca_embedding.weight[d].fill_(scale)
 
     def _compute_lca_bias_from_regions(
@@ -1701,7 +1964,17 @@ class AffineModulatedBias(nn.Module):
         regions: torch.Tensor,
         image_size: int,
     ) -> torch.Tensor:
-        """计算仿射调制偏置。
+        """计算仿射调制偏置 (I31-P2: 添加 ShapeScale 支持).
+
+        数学形式化
+        ==========
+        融合公式:
+            B* = B_LCA + α_area * B_area + α_shape * B_shape
+
+        其中:
+            B_LCA: LCA 嵌入偏置 (已有)
+            B_area: 面积调制偏置 (已有)
+            B_shape: 形状-尺度编码偏置 (I31-P2: 新增)
 
         参数
         ----
@@ -1720,47 +1993,87 @@ class AffineModulatedBias(nn.Module):
         # 1. 空间偏置 (LCA) [B, dim, N, N]
         lca_bias = self._compute_lca_bias_from_regions(regions, image_size)
 
-        if not self.enable_area_modulation:
+        if not self.enable_area_modulation and not self.enable_shape_scale:
             return lca_bias
 
         # 2. 面积编码 [B, N, dim]
-        # image_size 已经是 (W, H) 元组，无需再包装
-        area_emb = self.area_encoder(regions, image_size)
+        # image_size 是 int，需要转换为 (W, H) 元组
+        image_size_tuple = (image_size, image_size) if isinstance(image_size, int) else image_size
+        area_emb = self.area_encoder(regions, image_size_tuple) if self.enable_area_modulation else None
+
+        # I31-P2: 形状-尺度编码 [B, N, dim]
+        shape_emb = self.shape_scale_encoder(regions, image_size_tuple) if self.enable_shape_scale else None
 
         # 3. 计算面积相似性矩阵 [B, N, N]
         # p_s[i,j] = area_emb[i] · area_emb[j]
-        area_sim = torch.bmm(area_emb, area_emb.transpose(-2, -1))
+        if area_emb is not None:
+            area_sim = torch.bmm(area_emb, area_emb.transpose(-2, -1))
+        else:
+            area_sim = None
 
-        # 4. 傅里叶特征编码面积相似性
-        fourier_features = []
-        for k in range(self.area_encoder.fourier_levels):
-            freq = 2 ** k
-            fourier_features.append(torch.sin(freq * math.pi * area_sim))
-            fourier_features.append(torch.cos(freq * math.pi * area_sim))
-        gamma_features = torch.stack(fourier_features, dim=-1)  # [B, N, N, 2L]
+        # 4. 计算形状相似性矩阵 [B, N, N]
+        # p_r[i,j] = shape_emb[i] · shape_emb[j]
+        if shape_emb is not None:
+            shape_sim = torch.bmm(shape_emb, shape_emb.transpose(-2, -1))
+        else:
+            shape_sim = None
 
-        # 5. 仿射调制
-        # 展平 [B, N, N, 2L] -> [B*N*N, 2L] 以便通过 Linear 层
-        B, N, N, fourier_dim = gamma_features.shape
-        gamma_flat = gamma_features.view(-1, fourier_dim)
+        # 5. 傅里叶特征编码面积相似性
+        if area_sim is not None:
+            fourier_features = []
+            for k in range(self.area_encoder.fourier_levels):
+                freq = 2 ** k
+                fourier_features.append(torch.sin(freq * math.pi * area_sim))
+                fourier_features.append(torch.cos(freq * math.pi * area_sim))
+            gamma_features = torch.stack(fourier_features, dim=-1)  # [B, N, N, 2L]
 
-        # 通过网络
-        gamma = self.scale_net(gamma_flat)  # [B*N*N, dim]
-        beta = self.bias_net(gamma_flat)    # [B*N*N, dim]
+            # 仿射调制
+            # 展平 [B, N, N, 2L] -> [B*N*N, 2L] 以便通过 Linear 层
+            B, N, N, fourier_dim = gamma_features.shape
+            gamma_flat = gamma_features.view(-1, fourier_dim)
 
-        # 恢复形状 [B, N, N, dim]
-        gamma = gamma.view(B, N, N, self.dim)
-        beta = beta.view(B, N, N, self.dim)
+            # 通过网络
+            gamma = self.scale_net(gamma_flat)  # [B*N*N, dim]
+            beta = self.bias_net(gamma_flat)    # [B*N*N, dim]
 
-        # 调整维度以匹配 lca_bias: [B, dim, N, N]
-        gamma = gamma.permute(0, 3, 1, 2)
-        beta = beta.permute(0, 3, 1, 2)
+            # 恢复形状 [B, N, N, dim]
+            gamma = gamma.view(B, N, N, self.dim)
+            beta = beta.view(B, N, N, self.dim)
 
-        # 6. 仿射变换
-        modulated = gamma * lca_bias + beta
+            # 调整维度以匹配 lca_bias: [B, dim, N, N]
+            gamma = gamma.permute(0, 3, 1, 2)
+            beta = beta.permute(0, 3, 1, 2)
 
-        # 7. 残差连接
-        combined_bias = lca_bias + self.residual_alpha * (modulated - lca_bias)
+            # 仿射变换
+            modulated_area = gamma * lca_bias + beta
+
+            # 残差连接
+            combined_bias = lca_bias + self.residual_alpha * (modulated_area - lca_bias)
+        else:
+            combined_bias = lca_bias
+
+        # I31-P2: 形状-尺度调制
+        if shape_sim is not None:
+            # 傅里叶特征编码形状相似性
+            shape_fourier_features = []
+            for k in range(4):  # 固定 4 个 Fourier 级别
+                freq = 2 ** k
+                shape_fourier_features.append(torch.sin(freq * math.pi * shape_sim))
+                shape_fourier_features.append(torch.cos(freq * math.pi * shape_sim))
+            shape_gamma_features = torch.stack(shape_fourier_features, dim=-1)  # [B, N, N, 8]
+
+            # 展平并通过偏置网络
+            B, N, N, shape_fourier_dim = shape_gamma_features.shape
+            shape_flat = shape_gamma_features.view(-1, shape_fourier_dim)
+            shape_beta = self.shape_bias_net(shape_flat)  # [B*N*N, dim]
+
+            # 恢复形状 [B, dim, N, N]
+            shape_beta = shape_beta.view(B, N, N, self.dim)
+            shape_beta = shape_beta.permute(0, 3, 1, 2)
+
+            # 形状调制: 直接加到偏置上
+            # B_shape = shape_beta (与 LCA 偏置相加)
+            combined_bias = combined_bias + self.shape_scale_alpha * shape_beta
 
         return combined_bias
 

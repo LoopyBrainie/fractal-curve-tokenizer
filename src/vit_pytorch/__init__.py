@@ -44,18 +44,23 @@ from .attn_hilbert_bias import (
     LCAHilbertBias,
 )
 from .ffn_swiglu import AdaptiveFractalFeedForward, FFNType, SwiGLUFFN
-from .config_fractal import (
+from .config import (
     FractalConfig,
     create_fractal_config,
     AnnealSchedule,
     TokenizerType,
-)
+    SplitterConfig,
+    AttentionConfig,
+    TokenizerConfig,
+    TransformerConfig,
+    FractalViTConfig,
+)  # I97-5: 合并 config_fractal.py
 from .embed_fractal_path import (
     FractalPathEmbedding,
     HierarchicalAttentionBias,
     VectorizedPathEncoder,
 )
-from .model_fractal_vit import FractalCurveViT
+from .model_fractal_vit import FractalCurveViT, create_fractal_vit
 from .curve_hilbert import (
     HilbertCurve,
     PseudoHilbertCurve,
@@ -71,14 +76,12 @@ from .curve_hilbert_indexer import (
 )
 from .embed_multiscale_patch import MultiScalePatchEncoder
 from .base_tokenizer import BaseTokenizer, BaseTokenProcessor, TokenSequence, TokenizerOutput
+from .levels_info import LevelsInfo  # I98-4
 from .block_transformer import FractalTransformer, FractalTransformerBlock
-from .utils import extract_depths, normalize_levels_info
-from .split_adaptive import (
-    AdaptiveSplitConfig,
-    TemperatureScheduler,
-    LearnableSplitter,
-    SplitScheme,
-    TensorSplitResult,  # P9-1: 纯张量分割结果
+from .gumbel_topk_splitter import (
+    GumbelTopKSplitter,
+    TensorSplitResult,
+    GumbelTopKResult,
 )
 
 
@@ -86,6 +89,7 @@ __all__ = [
     # === 主要模型 ===
     "StreamingFractalTokenizerV3",  # Variable Depth Tokenizer
     "FractalCurveViT",
+    "create_fractal_vit",  # I98-2: 工厂函数
     # === 配置与路径编码 ===
     "FractalConfig",
     "create_fractal_config",
@@ -99,6 +103,7 @@ __all__ = [
     "BaseTokenizer",
     "TokenSequence",
     "TokenizerOutput",
+    "LevelsInfo",  # I98-4
     "HilbertCurve",
     "PseudoHilbertCurve",
     "HilbertIndexer",
@@ -116,15 +121,11 @@ __all__ = [
     # === 位置编码 ===
     "FractalPositionEmbedding",
     # === 工具函数 ===
-    "extract_depths",
-    "normalize_levels_info",
     "get_quadrant_order",
     "hilbert_distance_to_xy",
     "xy_to_hilbert_distance",
-    # === 分割器 (P7/P8/P9) ===
-    "AdaptiveSplitConfig",
-    "TemperatureScheduler",
-    "LearnableSplitter",
-    "SplitScheme",
+    # === 分割器 (Scheme D/E - GumbelTopKSplitter) ===
+    "GumbelTopKSplitter",
+    "GumbelTopKResult",
     "TensorSplitResult",  # P9-1: 完全向量化分割结果
 ]

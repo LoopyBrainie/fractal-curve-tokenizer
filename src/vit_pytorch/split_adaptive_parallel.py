@@ -78,8 +78,8 @@ import math
 # I12-7: 数值稳定性常量
 from .constants import DIVISION_EPSILON
 
-# 导入现有数据结构
-from .split_adaptive import TensorSplitResult, Region
+# I97-9: 导入现有数据结构 (TensorSplitResult 从 gumbel_topk_splitter 迁移)
+from .gumbel_topk_splitter import TensorSplitResult
 
 
 class ShallowParallelEvaluator(nn.Module):
@@ -385,49 +385,7 @@ class ShallowParallelEvaluator(nn.Module):
             )
         
         return cumulative_probs
-    
-    def get_candidate_probs_result(
-        self,
-        features: Tensor,
-        complexity_mlp: nn.Module,
-        thresholds: Tensor,
-        temperature: float,
-        pool_size: int = 4,
-    ):
-        """
-        I10-19: 获取完整的候选概率结果（用于连续松弛）
-        
-        返回 ShallowCandidateProbs 供 FractalTokenizer 使用
-        
-        Args:
-            features: [B, C, H_feat, W_feat] 特征图
-            complexity_mlp: ComplexityMLP实例
-            thresholds: [D+1] 阈值向量
-            temperature: Gumbel-Softmax温度
-            pool_size: ROI-Align输出尺寸
-            
-        Returns:
-            ShallowCandidateProbs: 候选概率信息
-        """
-        # 调用forward方法计算概率
-        logits, probs, cumulative_probs = self.forward(
-            features, complexity_mlp, thresholds, temperature, pool_size
-        )
-        
-        # 导入ShallowCandidateProbs
-        from .split_adaptive import ShallowCandidateProbs
-        
-        return ShallowCandidateProbs(
-            candidate_regions=self.candidate_regions,
-            candidate_depths=self.candidate_depths,
-            probs=probs,
-            cumulative_probs=cumulative_probs,
-            parent_indices=self.parent_indices,
-            hilbert_indices=self.hilbert_indices,
-            max_depth_parallel=self.max_depth_parallel,
-            image_size=self.image_size,
-        )
-    
+
     def select_top_k_regions(
         self,
         cumulative_probs: Tensor,
@@ -579,6 +537,8 @@ class ShallowParallelEvaluator(nn.Module):
             
             # Gather children tokens [B, M_d*4, D]
             children_flat_expanded = children_flat_clamped.unsqueeze(-1).expand(-1, -1, D)  # [B, M_d*4, D]
+            # STAB-7 修复: 确保 gather 索引为连续格式
+            children_flat_expanded = children_flat_expanded.contiguous()
             children_tokens_flat = torch.gather(tokens_all, 1, children_flat_expanded)  # [B, M_d*4, D]
             children_tokens = children_tokens_flat.view(B, M_d, 4, D)  # [B, M_d, 4, D]
             
@@ -657,6 +617,8 @@ class ShallowParallelEvaluator(nn.Module):
         
         # Gather selected tokens [B, max_valid, D]
         topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, D)  # [B, max_valid, D]
+        # STAB-7 修复: 确保 gather 索引为连续格式
+        topk_indices_expanded = topk_indices_expanded.contiguous()
         selected_tokens = torch.gather(tokens_all, 1, topk_indices_expanded)  # [B, max_valid, D]
         
         # Gather selected depths [B, max_valid]
@@ -716,58 +678,6 @@ class ShallowParallelEvaluator(nn.Module):
         # 注册为 buffer (不参与训练)
         self.register_buffer('_children_matrix', children_matrix)
         self.register_buffer('_has_children', has_children)
-
-
-def integrate_shallow_parallel_to_splitter(
-    splitter: nn.Module,
-    max_depth_parallel: int = 3,
-    enable: bool = True,
-) -> None:
-    """
-    将浅层并行评估器集成到现有LearnableSplitter。
-    
-    数学形式化
-    ==========
-    
-    集成策略:
-        if enable:
-            浅层 (d ≤ K): 使用并行评估
-            深层 (d > K): 使用原BFS
-        else:
-            所有深度: 使用原BFS
-            
-    实施方式:
-        1. 创建ShallowParallelEvaluator实例
-        2. 注册为splitter的子模块
-        3. 修改splitter.forward()调用逻辑
-        
-    Args:
-        splitter: LearnableSplitter实例
-        max_depth_parallel: K值 (默认3)
-        enable: 是否启用并行评估
-    """
-    from .split_adaptive import LearnableSplitter
-    
-    if not isinstance(splitter, LearnableSplitter):
-        raise TypeError(f"Expected LearnableSplitter, got {type(splitter)}")
-    
-    # 创建评估器
-    evaluator = ShallowParallelEvaluator(
-        max_depth_parallel=max_depth_parallel,
-        image_size=(64, 64),  # Tiny-ImageNet default
-    )
-    
-    # 注册为子模块
-    splitter.add_module('_shallow_parallel_evaluator', evaluator)
-    splitter._shallow_parallel_enabled = enable
-    splitter._shallow_parallel_K = max_depth_parallel
-    
-    print(f"[I10-18-R] Shallow parallel evaluator integrated:")
-    print(f"  - Max depth parallel: K={max_depth_parallel}")
-    print(f"  - Candidates: {evaluator.num_candidates}")
-    print(f"  - Enabled: {enable}")
-    print(f"  - Expected FLOPS increase: ~2.4x vs baseline BFS")
-    print(f"  - Expected gradient coverage: >95% for depths 0-{max_depth_parallel}")
 
 
 # ============================================================================

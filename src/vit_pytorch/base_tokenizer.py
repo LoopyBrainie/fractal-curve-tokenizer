@@ -81,6 +81,8 @@ class TokenizerOutput:
 
     I30-11: 新增 _split_probs_cache 用于加权池化 (Weighted Mean Pooling)
 
+    I98-5: 新增 _levels_info_cache 用于 LevelsInfo 强类型缓存
+
     P-OPT-11 Phase 9: 延迟构造 TokenSequence。
     支持 sequences=None 创建，首次访问时从缓存构造。
 
@@ -92,10 +94,11 @@ class TokenizerOutput:
         _regions_cache: (P11-3) 预填充的 regions [B, MaxN, 4] (可选缓存)
         _image_size_cache: (P11-3) 图像边长 (可选缓存)
         _split_probs_cache: (I30-11) 预填充的分割概率 [B, MaxN] (可选缓存)
+        _levels_info_cache: (I98-5) LevelsInfo 强类型缓存 (可选缓存)
 
     Properties:
         tokens: 堆叠的 tokens [B, N, D]（假设所有样本 token 数量相同）
-        levels_info: 堆叠的 levels_info [B, N, K] 或 None
+        levels_info: (I98-5) LevelsInfo 强类型，包含运行时契约验证
         split_probs: 堆叠的分割概率 [B, N] 或 None (I30-11)
         batch_size: 批次大小
     """
@@ -107,6 +110,8 @@ class TokenizerOutput:
     _image_size_cache: Optional[int] = field(default=None, repr=False)
     _split_probs_cache: Optional[torch.Tensor] = field(default=None, repr=False)
     _lazy_sequences_built: bool = field(default=False, repr=False)
+    # I98-5: LevelsInfo 强类型缓存
+    _levels_info_cache: Optional["LevelsInfo"] = field(default=None, repr=False)
 
     def _build_sequences_from_cache(self) -> None:
         """从缓存张量构造 TokenSequence 列表 (P-OPT-11 Phase 9).
@@ -177,17 +182,10 @@ class TokenizerOutput:
             raise ValueError("Cannot get tokens from empty TokenizerOutput")
         return torch.stack([seq.tokens for seq in self])
     
-    @property
-    def levels_info(self) -> Optional[torch.Tensor]:
-        """获取堆叠的 levels_info [B, N, K] 或 None。
+    def _build_levels_info_tensor(self) -> Optional[torch.Tensor]:
+        """内部方法：构建 levels_info 原始张量。
 
-        如果所有样本都没有 levels 信息，返回 None。
-        否则返回堆叠的张量（对缺失的 levels 用零填充）。
-
-        I32-2: 如果有 _padded_levels_cache 缓存，直接返回缓存
-               缓存中 padding 位置使用 -1 sentinel 标识
-
-        P-OPT-11: 支持 sequences=None 时的 lazy 构建。
+        I98-5: 用于内部实现，返回 raw tensor 供缓存构造使用。
 
         Returns:
             堆叠的 levels_info 张量或 None
@@ -195,11 +193,11 @@ class TokenizerOutput:
         if len(self) == 0:
             return None
 
-        # I32-2: 优先使用缓存
+        # 优先使用缓存
         if self._padded_levels_cache is not None:
             return self._padded_levels_cache
 
-        # P-OPT-11: 使用迭代器 (会自动触发 lazy 构建)
+        # 使用迭代器 (会自动触发 lazy 构建)
         levels_list = [seq.get_levels() for seq in self]
 
         # 如果所有 levels 都是 None，返回 None
@@ -207,7 +205,6 @@ class TokenizerOutput:
             return None
 
         # 找到最大维度
-        # P-OPT-11: 使用 _padded_tokens_cache 获取 device，避免依赖 sequences
         if self._padded_tokens_cache is not None:
             device = self._padded_tokens_cache.device
         else:
@@ -226,15 +223,53 @@ class TokenizerOutput:
             len(self), max_len, info_dim,
             dtype=torch.long, device=device
         )
-        
+
         for i, levels in enumerate(levels_list):
             if levels is not None:
                 if levels.dim() == 1:
                     stacked[i, :levels.shape[0], 0] = levels
                 else:
                     stacked[i, :levels.shape[0], :levels.shape[1]] = levels
-        
+
         return stacked
+
+    @property
+    def levels_info(self) -> Optional["LevelsInfo"]:
+        """获取 LevelsInfo 强类型（I98-5 增强）。
+
+        直接返回 LevelsInfo 实例，包含四叉树契约验证：
+        - C1: depth 范围 [-1, D]
+        - C2: path 范围 [0, 3]
+        - C3: 路径长度一致性
+
+        使用缓存避免重复构造。
+
+        Returns:
+            LevelsInfo 实例或 None（当序列为空时）
+        """
+        from .levels_info import LevelsInfo
+
+        if len(self) == 0:
+            return None
+
+        # 使用缓存
+        if self._levels_info_cache is not None:
+            return self._levels_info_cache
+
+        # 从缓存张量构造 LevelsInfo
+        if self._padded_levels_cache is not None:
+            D = self._padded_levels_cache.shape[-1] - 1
+            info = LevelsInfo(data=self._padded_levels_cache, max_depth=D)
+        else:
+            # 从 sequences 构造
+            all_levels = self._build_levels_info_tensor()
+            if all_levels is None:
+                return None
+            D = all_levels.shape[-1] - 1
+            info = LevelsInfo(data=all_levels, max_depth=D)
+
+        self._levels_info_cache = info
+        return info
 
     def tokens_list(self) -> List[torch.Tensor]:
         # P-OPT-11: 使用迭代器 (会自动触发 lazy 构建)
@@ -296,8 +331,8 @@ class TokenizerOutput:
                 padded[:, :, :cache.shape[2]] = cache
                 return padded
         
-        # 回退: 使用 levels_info 属性 (包含 Python 循环)
-        levels = self.levels_info
+        # 回退: 使用 _build_levels_info_tensor (I98-5: 避免调用 levels_info 属性)
+        levels = self._build_levels_info_tensor()
         if levels is None:
             B = len(self)
             # P-OPT-11: 使用 _padded_tokens_cache 获取 device
@@ -362,6 +397,29 @@ class TokenizerOutput:
             [B, MaxN] 填充后的分割概率，或 None (如果未设置缓存)
         """
         return self._split_probs_cache
+
+    def get_levels_info(self, max_depth: int) -> "LevelsInfo":
+        """获取 LevelsInfo 实例 (I98-4 新增, I98-5 简化).
+
+        I98-5: 现在直接使用 levels_info 属性（返回 LevelsInfo）。
+        仅在 levels_info 为 None 时创建新的 LevelsInfo。
+
+        Args:
+            max_depth: 四叉树最大深度
+
+        Returns:
+            LevelsInfo 实例
+        """
+        info = self.levels_info
+        if info is not None:
+            return info
+
+        # I98-5: levels_info 为 None 时创建默认 LevelsInfo
+        from .levels_info import LevelsInfo
+        B = self.batch_size
+        N = 1
+        all_levels = torch.zeros(B, N, max_depth + 1, dtype=torch.long)
+        return LevelsInfo(data=all_levels, max_depth=max_depth)
 
     def to_legacy(self) -> "LegacyTokenizerOutput":
         return LegacyTokenizerOutput(
