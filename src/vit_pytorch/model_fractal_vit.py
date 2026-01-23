@@ -1217,10 +1217,15 @@ class FractalCurveViT(nn.Module):
             if hasattr(t, 'K_max'):
                 tokenizer_info['K_max'] = t.K_max
 
-        # Splitter 参数
+        # Splitter 参数 (I99: 统一访问路径 - 先检查 self.splitter，再回退到 self.tokenizer.splitter)
         splitter_info: Dict[str, Any] = {}
-        if hasattr(self, 'tokenizer') and hasattr(self.tokenizer, 'splitter'):
+        if hasattr(self, 'splitter'):
+            s = self.splitter
+        elif hasattr(self, 'tokenizer') and hasattr(self.tokenizer, 'splitter'):
             s = self.tokenizer.splitter
+        else:
+            s = None
+        if s is not None:
             splitter_info = {
                 'type': type(s).__name__,
             }
