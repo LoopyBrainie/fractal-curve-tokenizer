@@ -613,10 +613,12 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # ====================================================================
         # 向量化分配到输出 buffer
         # ====================================================================
-        tokens = torch.zeros(B, max_tokens, dim, device=device, dtype=dtype)
+        # I99-1: 防御性检查 - 确保 max_tokens 至少为 1
+        max_tokens_safe = max(1, max_tokens)
+        tokens = torch.zeros(B, max_tokens_safe, dim, device=device, dtype=dtype)
         # I32-2: 使用-1 sentinel标识padding token，避免与有效depth=0混淆
-        levels_info = torch.full((B, max_tokens, self.max_depth + 1), -1, dtype=torch.long, device=device)
-        padded_regions = torch.zeros(B, max_tokens, 4, dtype=torch.long, device=device)  # P11-3
+        levels_info = torch.full((B, max_tokens_safe, self.max_depth + 1), -1, dtype=torch.long, device=device)
+        padded_regions = torch.zeros(B, max_tokens_safe, 4, dtype=torch.long, device=device)  # P11-3
 
         # I99-1: 修复 batch 独立性 - 确保按 (batch_idx, hilbert_idx) 排序
         # 问题: batch_indices 可能未按 batch 分组，导致 token 位置计算错误
@@ -670,6 +672,14 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             global_positions = torch.arange(N_total, device=device)
             token_positions = global_positions - batch_starts[batch_indices]
 
+            # I99-1: 防御性边界检查 - 钳制 token_positions 到 [0, max_tokens_safe-1]
+            # 防止由于 splitter 异常导致的越界访问
+            token_positions = token_positions.clamp(min=0, max=max_tokens_safe - 1)
+
+        # I99-1: 防御性检查 - 确保 batch_indices 在有效范围内
+        if N_total > 0:
+            batch_indices = batch_indices.clamp(min=0, max=B - 1)
+
         # 向量化分配
         tokens[batch_indices, token_positions] = all_tokens.to(dtype)
         
@@ -701,8 +711,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # I30-11: 构建 padded_split_probs [B, max_tokens]
         # I99-1: 使用排序后的 raw_probs
         padded_split_probs = None
-        if raw_probs is not None and N_total > 0 and max_tokens > 0:
-            split_probs_padded = torch.zeros(B, max_tokens, dtype=raw_probs.dtype, device=device)
+        if raw_probs is not None and N_total > 0 and max_tokens_safe > 0:
+            split_probs_padded = torch.zeros(B, max_tokens_safe, dtype=raw_probs.dtype, device=device)
 
             # 向量化分配: split_probs_padded[batch_idx, token_pos] = raw_probs_sorted[...]
             split_probs_padded[batch_indices, token_positions] = raw_probs
