@@ -27,7 +27,7 @@
 使用示例
 ========
 ```python
-from examples.training import (
+from training import (
     ClassBalancedSampler,
     FocalLoss,
     ClassificationMetrics,

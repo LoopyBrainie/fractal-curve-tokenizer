@@ -617,11 +617,12 @@ class CUB200Trainer:
         Args:
             train_loader: 训练数据加载器
         """
-        if not hasattr(self.model, 'tokenizer') or not hasattr(self.model.tokenizer, 'splitter'):
-            self.logger.info("[A21] 模型无 tokenizer 或 splitter，跳过温度退火设置")
+        # I98-2: 使用 model.splitter (独立组件)
+        if not hasattr(self.model, 'splitter'):
+            self.logger.info("[A21] 模型无 splitter，跳过温度退火设置")
             return
 
-        splitter = self.model.tokenizer.splitter
+        splitter = self.model.splitter
 
         # 检查是否支持退火 API
         if not hasattr(splitter, 'enable_temperature_annealing'):
@@ -655,10 +656,11 @@ class CUB200Trainer:
         Args:
             epoch: 当前 epoch
         """
-        if not hasattr(self.model, 'tokenizer') or not hasattr(self.model.tokenizer, 'splitter'):
+        # I98-2: 使用 model.splitter (独立组件)
+        if not hasattr(self.model, 'splitter'):
             return
 
-        splitter = self.model.tokenizer.splitter
+        splitter = self.model.splitter
 
         if epoch <= self.config.splitter_temp_warmup:
             # Warmup: 禁用退火，固定 T_start
@@ -1454,8 +1456,8 @@ def create_cub200_trainer(
 
     用法:
         ```python
-        from examples.training.trainer import create_cub200_trainer
-        from examples.training.config import ModelArchitectureConfig
+        from training.trainer import create_cub200_trainer
+        from training.config import ModelArchitectureConfig
 
         # 推荐方式：使用统一的架构配置
         arch_config = ModelArchitectureConfig(
@@ -1544,7 +1546,7 @@ class CUB200ModularTrainer:
 
     用法:
         ```python
-        from examples.training.trainer import CUB200ModularTrainer, CUB200TrainingConfig
+        from training.trainer import CUB200ModularTrainer, CUB200TrainingConfig
         from vit_pytorch import FractalCurveViT
 
         model = FractalCurveViT(num_classes=200, dim=384, depth=8, heads=6)

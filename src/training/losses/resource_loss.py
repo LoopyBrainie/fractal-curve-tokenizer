@@ -138,7 +138,7 @@ project_root = Path(__file__).parent.parent.parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from examples.training.core.resource_stats import ModelResourceStats
+from training.core.resource_stats import ModelResourceStats
 
 
 def compute_depth_entropy(

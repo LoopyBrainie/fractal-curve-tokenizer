@@ -1651,9 +1651,9 @@ class StabilityEvaluator:
                 else:
                     metrics.gradient_health_score = 1.0
         
-        # 分割器健康
-        if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
-            splitter = model.tokenizer.splitter
+        # I98-2: 分割器健康
+        if hasattr(model, 'splitter'):
+            splitter = model.splitter
             # I78: 移除 get_health_score dead code - GumbelTopKSplitter 没有此方法
 
             # 温度状态
@@ -1725,12 +1725,11 @@ class SplitterEvaluator:
         """执行分割器专项评估"""
         model.eval()
         metrics = L7SplitterMetrics()
-        
-        # 检查模型是否有分割器
-        if not hasattr(model, 'tokenizer') or not hasattr(model.tokenizer, 'splitter'):
+        # I98-2: 检查模型是否有分割器
+        if not hasattr(model, 'splitter'):
             return metrics
-        
-        splitter = model.tokenizer.splitter
+
+        splitter = model.splitter
         
         # 基础参数提取
         if hasattr(splitter, 'log_temperature'):

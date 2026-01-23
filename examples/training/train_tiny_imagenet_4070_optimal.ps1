@@ -57,7 +57,7 @@
 # ============================================================================
 
 $script = @"
-uv run python examples/training/train_fractal_vit.py `
+uv run python src/training/train_fractal_vit.py `
   --dataset tiny-imagenet `
   --epochs 100 `
   --dim 448 `

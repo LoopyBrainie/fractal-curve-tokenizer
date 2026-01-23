@@ -1827,8 +1827,9 @@ def train_epoch(
             # I14-1 D1: 新增崩溃惩罚，需要传递 actual_token_count
             splitter_loss = None
             splitter_metrics = {}
-            if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
-                splitter = model.tokenizer.splitter
+            # I98-2: 使用 model.splitter (独立组件)
+            if hasattr(model, 'splitter'):
+                splitter = model.splitter
                 # I24-ALIGN: 确保 _last_features 存在 (forward 后应已设置)
                 last_features = getattr(model.tokenizer, '_last_features', None)
                 if hasattr(splitter, 'get_auxiliary_losses') and last_features is not None:
@@ -1987,7 +1988,7 @@ def train_epoch(
     
     # P10-4/P10-5/P10-9: 获取自适应分割器深度分布统计
     if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
-        splitter = model.tokenizer.splitter
+        splitter = model.splitter
         if hasattr(splitter, 'get_depth_distribution_stats'):
             try:
                 depth_stats = splitter.get_depth_distribution_stats()
@@ -2898,7 +2899,7 @@ def main():
 
     # I30-10: 配额参数冻结 (独立于 freeze_tokenizer)
     if config.freeze_quota:
-        model.tokenizer.splitter.set_quota_grad(False)
+        model.splitter.set_quota_grad(False)
         print(f"[I30-10] Frozen quota logits (quota will not learn)")
 
     # I24-1: Tokenizer 参数冻结 (减少小数据集过拟合)
@@ -3374,7 +3375,7 @@ def main():
     # =========================================================================
     splitter_annealing_enabled = False
     if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
-        splitter = model.tokenizer.splitter
+        splitter = model.splitter
         # 计算总训练步数 (epochs × batches_per_epoch)
         batches_per_epoch = len(train_loader) // config.accum_steps
         total_training_steps = config.epochs * batches_per_epoch
@@ -3451,7 +3452,7 @@ def main():
         #       在 forward() 中自动更新，无需手动调用 scheduler.step()
         #       但 warmup 期间需要禁用退火，保持 T_start
         if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
-            splitter = model.tokenizer.splitter
+            splitter = model.splitter
             if epoch <= config.splitter_temp_warmup:
                 # Warmup 阶段：暂时禁用自动退火，固定 T_start
                 if hasattr(splitter, 'disable_temperature_annealing'):
@@ -3670,7 +3671,7 @@ def main():
             max_entropy_value = perf_stats['max_entropy']
         elif hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
             # 从 splitter.max_depth 动态计算
-            splitter = model.tokenizer.splitter
+            splitter = model.splitter
             if hasattr(splitter, 'max_depth'):
                 import math
                 max_entropy_value = math.log(splitter.max_depth + 1)

@@ -82,10 +82,9 @@ import torchvision.datasets as datasets
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
-sys.path.insert(0, str(PROJECT_ROOT / "examples" / "training"))
 
 # 导入评估层
-from evaluation_layers import (
+from .evaluation_layers import (
     LayeredEvaluationReport,
     L1ClassificationMetrics,
     L2TokenizerMetrics,
@@ -108,7 +107,7 @@ from evaluation_layers import (
 # 导入 CUB-200 专用评估器
 try:
     # 使用完整导入路径以避免相对导入问题
-    from examples.training.trainer.cub200_trainer import (
+    from training.trainer.cub200_trainer import (
         CUB200Trainer,
         CUB200EvalResult,
         CUB200TrainingConfig,
@@ -1839,11 +1838,11 @@ def create_evaluator(
     ----
     LayeredEvaluator
         配置好的评估器实例
-    
+
     示例
     ----
-    >>> from examples.training import EvaluationConfig, create_evaluator
-    >>> 
+    >>> from training import EvaluationConfig, create_evaluator
+    >>>
     >>> # 使用默认配置
     >>> evaluator = create_evaluator("checkpoint.pt", "cifar10")
     >>> 

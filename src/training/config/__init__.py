@@ -157,74 +157,9 @@ class DataConfig:
     sampler_beta_min: float = 0.5  # ProgressiveSampler beta_min
 
 
-@dataclass
-class ModelConfig:
-    """模型配置
-    
-    I27 Dropout 配置指南
-    ====================
-    
-    数学依据:
-        根据 Rademacher 复杂度理论，正则化强度应与模型容量/数据量比例相关:
-        
-        p_opt ≈ k × √(params / samples)
-        
-        对于 31.66M 参数、100K 样本:
-        p_opt ≈ k × √(31.66M / 100K) ≈ k × 17.8
-        
-    推荐配置 (Tiny-ImageNet, 100K samples):
-        | 组件 | 推荐值 | 数学依据 |
-        |------|--------|---------|
-        | dropout | 0.15-0.25 | 主干正则化 |
-        | attention_dropout | 0.10-0.15 | Attention 更敏感 |
-        | splitter_dropout | 0.10-0.15 | 分割决策质量 |
-        | pos_dropout | 0.05-0.10 | 信息瓶颈需保守 |
-        
-    过拟合诊断:
-        若 train_acc - val_acc > 15%:
-            → dropout += 0.05
-            → weight_decay *= 1.5
-            
-    欠拟合诊断:
-        若 train_acc < 50% @ epoch 50:
-            → dropout -= 0.05
-            → learning_rate *= 1.5
-    """
-    name: str = "fractal_vit"
-    
-    # 核心参数
-    image_size: int = 64
-    patch_size: int = 8
-    embed_dim: int = 384
-    depth: int = 10
-    num_heads: int = 8
-    num_classes: int = 200
-    
-    # MLP
-    mlp_ratio: float = 4.0
-    
-    # Dropout (I27: 添加数学注释)
-    # 主 Transformer dropout，传递到 FFN 和 Attention 输出
-    dropout: float = 0.1
-    # Attention 内部 dropout (对 softmax(QK^T/√d) 应用)
-    attention_dropout: float = 0.1
-    
-    # Hilbert Curve 特定
-    max_depth: int = 4
-    splitter_hidden_dim: int = 128
-    # I27: Splitter MLP dropout
-    # 推荐: min(dropout, 0.15)，过高会导致分割决策不稳定
-    splitter_dropout: float = 0.1
-    # I27: Position Embedding Fusion Network dropout
-    # 推荐: dropout * 0.5，信息瓶颈需保守正则化
-    pos_dropout: float = 0.05
-
-    # I31: 面积编码配置 (2026-01-18)
-    # 位置编码增强：形状-尺度编码补充离散 Level 的几何信息
-    use_area_encoding: bool = False
-    # 注意力偏置增强：仿射调制基于面积相似性
-    use_affine_modulation: bool = False
-    fourier_levels: int = 4  # 傅里叶特征级别数
+# I97-5: ModelConfig 已弃用，请使用 ModelArchitectureConfig
+# 保留别名以保持向后兼容性
+ModelConfig = ModelArchitectureConfig
 
 
 @dataclass
@@ -300,19 +235,6 @@ class LossConfig:
     # γ = 5: 极端聚焦 (仅对非常难的样本有梯度)
     focal_gamma: float = 2.5  # I28-1: 从 2.0 提升到 2.5
     focal_alpha: Optional[List[float]] = None  # None = 自动计算
-
-    # A23: Adaptive Focal Loss 参数 (L2: 尚未实现，保留接口)
-    # 自适应模式:
-    # - "fixed": 固定 γ (退化为标准 FocalLoss)
-    # - "difficulty": 基于样本难度调整
-    # - "annealing": 基于训练进度退火
-    # - "combined": 综合 difficulty 和 annealing
-    # TODO: 实现自适应 Focal Loss 以支持动态 γ 调整
-    adaptive_focal_mode: str = "combined"
-    adaptive_base_gamma: float = 2.0  # 基础 γ
-    adaptive_gamma_min: float = 1.0   # γ 最小值
-    adaptive_gamma_max: float = 5.0   # γ 最大值
-    use_adaptive_focal: bool = False  # 是否使用自适应模式 (L2: 当前未使用)
 
     # Class-Balanced 参数
     # β (beta): 有效样本数衰减因子
@@ -524,7 +446,7 @@ class ExperimentConfig:
     
     # 子配置
     data: DataConfig = field(default_factory=DataConfig)
-    model: ModelConfig = field(default_factory=ModelConfig)
+    model: ModelArchitectureConfig = field(default_factory=ModelArchitectureConfig)
     loss: LossConfig = field(default_factory=LossConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
@@ -668,7 +590,7 @@ class ConfigLoader:
             description=config.get("description", ""),
             seed=config.get("seed", 42),
             data=_dict_to_dataclass(config.get("data", {}), DataConfig),
-            model=_dict_to_dataclass(config.get("model", {}), ModelConfig),
+            model=_dict_to_dataclass(config.get("model", {}), ModelArchitectureConfig),
             loss=_dict_to_dataclass(config.get("loss", {}), LossConfig),
             budget=_dict_to_dataclass(config.get("budget", {}), BudgetConfig),
             optimizer=_dict_to_dataclass(config.get("optimizer", {}), OptimizerConfig),

@@ -308,7 +308,7 @@
 #
 # ============================================================================
 
-uv run python examples/training/train_fractal_vit.py `
+uv run python src/training/train_fractal_vit.py `
   --dataset cub200 `
   --epochs 100 `
   --num-workers 4 `
