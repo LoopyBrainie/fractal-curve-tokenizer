@@ -238,17 +238,17 @@ logits, tokens, lengths = model(img, return_tokens=True)
 
 ```bash
 # CIFAR-10 quick validation
-python examples/training/train_fractal_vit.py --quick-test --use-amp
+python src/training/train_fractal_vit.py --quick-test --use-amp
 
 # Tiny-ImageNet full training
-python examples/training/train_fractal_vit.py \
+python src/training/train_fractal_vit.py \
     --dataset tiny-imagenet --epochs 100 \
     --dim 320 --depth 12 --heads 8 \
     --dropout 0.2 --drop-path 0.2 --weight-decay 0.1 \
     --use-amp --gradient-checkpoint --compile --channels-last
 
 # Small dataset (reduce overfitting)
-python examples/training/train_fractal_vit.py \
+python src/training/train_fractal_vit.py \
     --dataset tiny-imagenet --epochs 150 \
     --dim 256 --depth 8 --heads 6 \
     --dropout 0.25 --drop-path 0.25 --freeze-tokenizer --use-amp
@@ -257,8 +257,8 @@ python examples/training/train_fractal_vit.py \
 ### Windows RTX 4070 Optimized
 
 ```powershell
-.\examples\training\train_tiny_imagenet_4070_optimal.ps1
-.\examples\training\train_cub200_4070_optimal.ps1
+.\src\training\train_tiny_imagenet_4070_optimal.ps1
+.\src\training\train_cub200_4070_optimal.ps1
 ```
 
 ## Testing
@@ -331,13 +331,3 @@ pip install -e .  # or: uv sync
 ## License
 
 MIT License - see [LICENSE](LICENSE).
-
-## Citation
-
-```bibtex
-@article{fractal-vit,
-  title={Fractal Curve Tokenizer: Adaptive Multi-Scale Vision Transformer},
-  author={Project Authors},
-  year={2024}
-}
-```

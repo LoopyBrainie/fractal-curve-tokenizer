@@ -2,7 +2,7 @@
 
 ## 3.1 Overview
 
-The `StreamingFractalTokenizerV3` implements **Variable Depth Tokenization** via adaptive quadtree splitting and Hilbert curve reordering. It adopts the **Gumbel-Top-K (Scheme D)** mechanism with **Learnable Quota Allocation (Scheme E)** to ensure 100% gradient coverage and parallel execution, replacing earlier BFS-based approaches.
+The `StreamingFractalTokenizerV3` implements **Variable Depth Tokenization** via adaptive quadtree splitting and Hilbert curve reordering. It adopts the **Gumbel-Top-K (Scheme D)** mechanism with **Learnable Quota Allocation (Scheme E)** for ~K/N gradient coverage (~37.6%) and parallel execution, replacing earlier BFS-based approaches.
 
 ---
 
@@ -39,7 +39,7 @@ where:
 $$z_i = \text{logits}_i + g_i, \quad g_i \sim \text{Gumbel}(0, 1)$$
 $$\text{selected\_indices} = \text{TopK}(\{z_i/\tau\}_{i=1}^{N_{cand}}, K)$$
 
-This formulation provides gradients for **all** candidates via the Straight-Through Estimator (STE), unlike thresholding which kills gradients for rejected regions.
+This formulation provides gradients for **selected** candidates via the Straight-Through Estimator (STE), while unselected candidates receive attenuated gradients (~20x reduction).
 
 ### 3.2.3 Learnable Quota Allocation (Scheme E)
 
@@ -92,7 +92,7 @@ $$E_{shape}(R) = \text{MLP}([r \cdot g; s \cdot (1-g)])$$
 | Feature | Description |
 |:--------|:------------|
 | **Parallelism** | 100% (All regions evaluated in one batch) |
-| **Gradient Flow** | 100% (STE allows gradients to flow to unselected regions) |
+| **Gradient Flow** | ~37.6% (K/N) - STE provides gradients to selected tokens, attenuated for unselected |
 | **Hilbert Locality** | 100% (Strict adherence to Hilbert curve ordering) |
 | **Complexity** | $O(N_{cand})$ parallel evaluation |
 
