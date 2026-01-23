@@ -49,9 +49,8 @@
 #
 # 5. torch.compile 状态
 #    -----------------
-#    torch.compile 已启用 (用户选择)
-#    风险: 与动态 token 可能存在兼容性问题
-#    降级方案: 如遇 OOM，移除 --compile 参数
+#    torch.compile 已禁用 (OOM 风险)
+#    使用 gradient-checkpoint + channels-last + AMP 替代
 #
 # ============================================================================
 
@@ -88,7 +87,6 @@ uv run python src/training/train_fractal_vit.py `
   --lca-temperature 1.5 `
   --use-amp `
   --gradient-checkpoint `
-  --compile `
   --channels-last `
   --tf32 `
   --accum-steps 1 `

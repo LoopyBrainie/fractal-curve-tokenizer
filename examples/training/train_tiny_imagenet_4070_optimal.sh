@@ -36,7 +36,6 @@ uv run python src/training/train_fractal_vit.py \
   --lca-temperature 1.5 \
   --use-amp \
   --gradient-checkpoint \
-  --compile \
   --channels-last \
   --tf32 \
   --accum-steps 1 \
