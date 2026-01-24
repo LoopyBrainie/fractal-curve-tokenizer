@@ -158,9 +158,19 @@ except RuntimeError:
 
 # CUDA 内存优化 - 使用更保守的分配策略
 import os
+import platform
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,expandable_segments:True,garbage_collection_threshold:0.8'
-# 禁用 inductor 的一些可能导致 CUDA 内存问题的优化
-os.environ['TORCHINDUCTOR_CACHE_DIR'] = '/tmp/torch_inductor_cache'
+
+# I101-1: torch.compile Windows 兼容性修复
+# Windows 用户名包含 \U 被 Python 解析为 unicode escape，导致 inductor 编译失败
+# 解决方案：设置缓存到纯 ASCII 路径
+if platform.system() == 'Windows':
+    # 使用纯 ASCII 路径避免 unicode escape 问题
+    os.environ['TORCHINDUCTOR_CACHE_DIR'] = 'D:/temp/torchinductor_cache'
+    os.environ['TMP'] = 'D:/temp'
+else:
+    os.environ['TORCHINDUCTOR_CACHE_DIR'] = '/tmp/torch_inductor_cache'
+
 os.environ['CUDNN_V8_API_ENABLED'] = '1'
 
 # 强制使用更保守的内存分配策略
@@ -2606,7 +2616,11 @@ def main():
                        help=f"Learnable splitter final temperature (default: {SPLITTER_TEMP_END}, I24-7 optimized)")
     parser.add_argument("--splitter-temp-warmup", type=int, default=5,
                        help="Warmup epochs with fixed T_start (default: 5)")
-    
+    # I100-2: 添加温度调度策略参数 (原为 constants.py 常量)
+    parser.add_argument("--temp-schedule", type=str, default=SPLITTER_TEMP_SCHEDULE,
+                       choices=["linear", "cosine", "exponential"],
+                       help=f"Temperature annealing schedule (default: {SPLITTER_TEMP_SCHEDULE})")
+
     # P10-4/P10-5: 软熵损失参数
     parser.add_argument("--include-soft-entropy", action="store_true", default=True,
                        help="Enable soft entropy loss (default: True, recommended)")
@@ -3371,16 +3385,18 @@ def main():
         if hasattr(splitter, 'enable_temperature_annealing'):
             # 考虑 warmup: 在 warmup 期间使用 T_start，之后开始退火
             post_warmup_steps = max(1, (config.epochs - config.splitter_temp_warmup) * batches_per_epoch)
+            # I100-2: 使用命令行参数 config.temp_schedule
+            schedule = getattr(config, 'temp_schedule', SPLITTER_TEMP_SCHEDULE)
             splitter.enable_temperature_annealing(
                 total_steps=post_warmup_steps,
                 T_start=config.splitter_temp_start,
                 T_end=config.splitter_temp_end,
-                schedule=SPLITTER_TEMP_SCHEDULE,  # I29-4: 使用常量
+                schedule=schedule,
             )
             print(f"[OK] 启用自适应分割器温度退火:")
             print(f"     T: {config.splitter_temp_start} → {config.splitter_temp_end}")
             print(f"     Steps: {post_warmup_steps} (after {config.splitter_temp_warmup} warmup epochs)")
-            print(f"     Schedule: {SPLITTER_TEMP_SCHEDULE}")  # I29-4: 显示实际使用的调度
+            print(f"     Schedule: {schedule}")  # I100-2: 显示实际使用的调度
             splitter_annealing_enabled = True
         
         # 启用探索偏置退火 (P10-12 + P10-15)
@@ -3455,11 +3471,13 @@ def main():
                 
                 # 重新启用温度退火
                 if hasattr(splitter, 'enable_temperature_annealing'):
+                    # I100-2: 使用命令行参数 config.temp_schedule
+                    schedule = getattr(config, 'temp_schedule', SPLITTER_TEMP_SCHEDULE)
                     splitter.enable_temperature_annealing(
                         total_steps=post_warmup_steps,
                         T_start=config.splitter_temp_start,
                         T_end=config.splitter_temp_end,
-                        schedule=SPLITTER_TEMP_SCHEDULE,  # I29-4: 使用常量
+                        schedule=schedule,
                     )
                 # P10-15: 同步启用偏置退火 (使用模型默认参数)
                 if hasattr(splitter, 'enable_explore_bias_annealing'):

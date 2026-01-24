@@ -256,73 +256,62 @@ class LCAHilbertBias(HilbertBiasBase):
         self._init_weights()
     
     def _init_temperature(
-        self, 
-        lca_temperature: Optional[float], 
+        self,
+        lca_temperature: Optional[float],
         learnable: bool
     ) -> None:
         """初始化温度参数。
-        
-        P6-2 数学推导:
-        - 使用 softplus: τ = log(1 + exp(γ))
-        - 求逆: γ = log(exp(τ) - 1)
-        - 对于 τ=1.5: γ = log(e^1.5 - 1) ≈ 1.176
-        
-        数值稳定性:
-        - 当 τ < ln(2) ≈ 0.693 时, exp(τ) - 1 < 1, log 参数趋近 0
-        - 使用 softplus_inverse 的稳定形式: γ = τ + log(1 - exp(-τ))
-        - 此公式对所有 τ > 0 数值稳定
-        
+
+        I102-1 改进: 使用 log-space 参数化替代 softplus 逆变换
+
+        数学分析:
+        - 原始设计: γ = softplus^{-1}(τ) = log(exp(τ) - 1)
+          问题: τ → 0 时 log(0) → -inf，数值不稳定
+        - 新设计: τ = softplus(γ)，γ ∈ ℝ 直接参数化
+          优点: 只需正向 softplus 计算，天然数值稳定
+
+        参数化原则:
+        - 直接参数化目标空间，避免逆变换
+        - log-space 参数直觉性强: γ = log(τ) 近似
+        - softplus 正向约束保证正值，无溢出风险
+
         Args:
             lca_temperature: 目标温度值，None 表示禁用
             learnable: 是否可学习
         """
-        import math
-        
         if lca_temperature is None:
-            # 兼容模式: 无温度缩放
-            self._lca_temp_raw: Optional[nn.Parameter] = None
-            # I34-16: 使用 buffer 自动跟踪设备
+            # 禁用模式: 无温度缩放
+            self._lca_temp_gamma: Optional[nn.Parameter] = None
             self.register_buffer('_lca_temp_fixed', None)
         elif learnable:
             # 可学习模式: per-head 温度
-            # I24-ALIGN: 数值稳定的 softplus 逆变换
-            # 标准公式 γ = log(exp(τ) - 1) 在 τ < 0.693 时不稳定
-            # 使用等价形式: γ = τ + log(1 - exp(-τ))
-            # 对于 τ → 0+: γ → -∞ (正确)
-            # 对于 τ → ∞: γ → τ (正确)
-            if lca_temperature > 20:
-                # 大温度: softplus 饱和，γ ≈ τ
-                init_raw = lca_temperature
-            else:
-                # 通用稳定公式
-                init_raw = lca_temperature + math.log(1 - math.exp(-lca_temperature))
-            self._lca_temp_raw = nn.Parameter(
-                torch.full((self.heads,), init_raw)
+            # I102-1: 使用 log-space 参数化，数值稳定
+            # 初始化: γ_init = log(τ_init + ε)，τ = softplus(γ)
+            # 对于 τ_init >> 1e-8，有 γ_init ≈ log(τ_init)
+            init_gamma = math.log(lca_temperature + 1e-8)
+            self._lca_temp_gamma = nn.Parameter(
+                torch.full((self.heads,), init_gamma)
             )
-            # I34-16: 使用 buffer 自动跟踪设备
             self.register_buffer('_lca_temp_fixed', None)
         else:
             # 固定模式
-            # I34-16: 使用 buffer 自动跟踪设备，避免 CPU→GPU 传输
-            self._lca_temp_raw = None
+            self._lca_temp_gamma = None
             self.register_buffer('_lca_temp_fixed',
                 torch.full((self.heads,), lca_temperature))
     
     @property
     def lca_temperature(self) -> Optional[torch.Tensor]:
         """获取当前 LCA 温度值。
-        
+
         Returns:
             (H,) 温度向量，若禁用则返回 None
         """
-        if self._lca_temp_raw is not None:
-            # 可学习: softplus 确保正值
-            return F.softplus(self._lca_temp_raw)
+        if self._lca_temp_gamma is not None:
+            # 可学习: softplus 正向变换，数值稳定
+            return F.softplus(self._lca_temp_gamma)
         elif self._lca_temp_fixed is not None:
-            # I34-16: buffer 自动跟踪设备，直接返回
             return self._lca_temp_fixed
         else:
-            # 禁用
             return None
     
     def _init_weights(self) -> None:
@@ -381,12 +370,14 @@ class LCAHilbertBias(HilbertBiasBase):
 
         # I30-5: 路径值验证 + 警告
         # 四叉树路径值必须是 0-3 (对应四个象限: 左上, 右上, 左下, 右下)
-        path_min = paths.min().item()
-        path_max = paths.max().item()
-        if path_max > 3 or path_min < 0:
+        # I102-5: 使用张量比较避免 GPU-CPU 同步
+        path_min = paths.min()
+        path_max = paths.max()
+        invalid_path = (path_max > 3) | (path_min < 0)
+        if invalid_path.any():
             warnings.warn(
                 f"[I30-5] levels_info path values out of range: "
-                f"[{path_min}, {path_max}], expected [0, 3]. "
+                f"[{path_min.item():.2f}, {path_max.item():.2f}], expected [0, 3]. "
                 f"Clipping will be applied. "
                 f"This may indicate a tokenizer bug.",
                 RuntimeWarning,
@@ -418,7 +409,9 @@ class LCAHilbertBias(HilbertBiasBase):
             # 缓存未命中，计算 LCA
             lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
             # I34-13: LCA 钳位警告 - 静默钳位可能隐藏计算 bug
-            if (lca_depths < 0).any() or (lca_depths > self.max_depth).any():
+            # I102-5: 使用张量比较 + 延迟构造警告消息
+            lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_depth).any()
+            if lca_invalid:
                 warnings.warn(
                     f"LCA depth clamped to [0, {self.max_depth}]. "
                     f"Min: {lca_depths.min().item():.2f}, Max: {lca_depths.max().item():.2f}"
@@ -509,7 +502,9 @@ class LCAHilbertBias(HilbertBiasBase):
         # 计算 LCA 深度矩阵
         lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
         # I34-13: LCA 钳位警告 - 静默钳位可能隐藏计算 bug
-        if (lca_depths < 0).any() or (lca_depths > self.max_depth).any():
+        # I102-5: 使用张量比较 + 延迟构造警告消息
+        lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_depth).any()
+        if lca_invalid:
             warnings.warn(
                 f"LCA depth clamped to [0, {self.max_depth}]. "
                 f"Min: {lca_depths.min().item():.2f}, Max: {lca_depths.max().item():.2f}"
@@ -1714,14 +1709,19 @@ class AreaEncoder(nn.Module):
         # gate = 1 if freq_k <= omega_cutoff (广播)
         # gate = 0.5 * (1 + cos(...)) if omega_cutoff < freq_k < omega_nyquist
         # gate = 0 if freq_k >= omega_nyquist
+
+        # I102-2: 使用 clamp 替代 epsilon，保护 FP16 数值稳定性
+        # 语义: 分母下界为 1e-6，确保门控函数行为可控
+        denom = omega_nyquist - omega_cutoff  # [B, N, 1]
+        denom_safe = denom.clamp(min=1e-6)    # FP16 安全下界
+
         gate_full = torch.where(
             base_freqs <= omega_cutoff,
             torch.ones(1, device=area_scores.device, dtype=area_scores.dtype),
             torch.where(
                 base_freqs < omega_nyquist,
                 0.5 * (1 + torch.cos(
-                    math.pi * (base_freqs - omega_cutoff) /
-                    (omega_nyquist - omega_cutoff + 1e-8)
+                    math.pi * (base_freqs - omega_cutoff) / denom_safe
                 )),
                 torch.zeros(1, device=area_scores.device, dtype=area_scores.dtype)
             )

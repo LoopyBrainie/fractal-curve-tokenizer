@@ -796,9 +796,24 @@ class GumbelTopKSplitter(nn.Module):
         mean_sq_per_batch = depth_sq_sums / depth_counts.unsqueeze(0)  # [B, D]
         variance_per_batch = (mean_sq_per_batch - mu_per_batch ** 2).clamp(min=0.0)  # [B, D]
 
-        # I35: 使用 EMA Running Statistics
-        # I99-1: 重构为 Per-sample EMA，完全消除 batch 依赖
-        #         训练时累积 EMA，评估时使用实时 per-sample 统计量
+        # ====================================================================
+        # 深度方差归一化 (Depth Variance Normalization)
+        #
+        # CRIT-2 修复: 准确描述归一化策略
+        #
+        # 策略说明:
+        # - 训练时: 累积 EMA 统计量用于初始化回退，归一化使用实时 batch 统计量
+        # - 评估时: 使用实时 per-sample 统计量，确保 B=1 和 B=4 行为一致
+        #
+        # 数学形式化:
+        #   归一化: z_norm = (z - μ_batch) / (σ_batch + ε)
+        #   其中 μ_batch, σ_batch 来自当前 batch (非 EMA 累积值)
+        #
+        # 设计理由:
+        #   1. 实时统计量确保不同 batch size 下的归一化行为一致
+        #   2. EMA 仅用于初始化时的保守回退 (避免未训练时的数值异常)
+        #   3. Per-sample EMA 跟踪每个样本的统计量变化
+        # ====================================================================
         if self.training:
             # 训练模式: Per-sample EMA 更新
             # 对每个样本独立更新 EMA，不跨 batch 平均
@@ -829,38 +844,42 @@ class GumbelTopKSplitter(nn.Module):
 
             self._depth_ema_initialized = True
 
-            # 训练时使用当前 batch 的实时统计量
-            mu_ema = mu_per_batch  # [B, D] - 使用 per-batch 统计量
-            sigma_ema = (variance_per_batch + DEPTH_VARIANCE_NORM_EPS).sqrt()  # [B, D]
+            # 归一化使用当前 batch 的实时统计量 (非 EMA 累积值)
+            # 这样确保不同 batch size 下的归一化行为一致
+            mu_normalize = mu_per_batch  # [B, D]
+            sigma_normalize = (variance_per_batch + DEPTH_VARIANCE_NORM_EPS).sqrt()  # [B, D]
         else:
-            # 评估模式: I99-1 使用实时 per-sample 统计量
-            #         完全消除 batch 依赖，确保 B=1 和 B=4 输出一致
+            # ====================================================================
+            # 评估模式
+            # ====================================================================
             if not self._depth_ema_initialized:
                 import warnings
                 warnings.warn(
-                    f"[I99-1] EMA not initialized in eval mode. "
-                    f"Using conservative fallback (sigma={DEPTH_VARIANCE_INIT_EPS**0.5:.3f}). "
-                    f"Ensure model was trained before evaluation.",
+                    f"[I99-1] 深度方差归一化未初始化 (model.eval() 前未进行训练)。"
+                    f"使用保守回退 (sigma={DEPTH_VARIANCE_INIT_EPS**0.5:.3f})。"
+                    f"请确保模型已训练后再进行评估。",
                     UserWarning,
                     stacklevel=2
                 )
-                # 使用保守常数
-                mu_ema = mu_per_batch  # [B, D] - 使用当前 batch 统计量
-                sigma_ema = torch.full_like(mu_per_batch, DEPTH_VARIANCE_INIT_EPS ** 0.5)
+                # 使用保守常数作为回退 (非 EMA 累积值)
+                mu_normalize = mu_per_batch
+                sigma_normalize = torch.full_like(mu_per_batch, DEPTH_VARIANCE_INIT_EPS ** 0.5)
             else:
-                # I99-1: 使用当前 batch 的实时统计量，而非累积的 EMA
-                # 这样 B=1 和 B=4 评估时使用相同的统计量计算逻辑
-                mu_ema = mu_per_batch  # [B, D] - 使用 per-batch 统计量
-                sigma_ema = (variance_per_batch + DEPTH_VARIANCE_NORM_EPS).sqrt()  # [B, D]
+                # 使用当前 batch 的实时统计量 (非 EMA 累积值)
+                # 这样确保 B=1 和 B=4 评估时行为一致
+                mu_normalize = mu_per_batch  # [B, D]
+                sigma_normalize = (variance_per_batch + DEPTH_VARIANCE_NORM_EPS).sqrt()  # [B, D]
 
-        # 收集每个 batch 每个深度的均值和标准差
-        # I99-1: 使用 batch 和 depth 联合索引，因为 mu_ema 是 [B, D]
+        # ====================================================================
+        # 收集每个 batch 每个深度的均值和标准差用于归一化
+        # 使用联合索引: mu_normalize[batch_indices, depth_indices] -> [B, N]
+        # ====================================================================
         batch_indices = torch.arange(B, device=device).unsqueeze(1).expand(-1, N)  # [B, N]
         depth_indices = depths.unsqueeze(0).expand(B, -1)  # [B, N]
 
-        # 联合索引: mu_ema[batch_indices, depth_indices] -> [B, N]
-        mu_expanded = mu_ema[batch_indices, depth_indices]  # [B, N] - 使用 EMA 均值
-        sigma_expanded = sigma_ema[batch_indices, depth_indices]  # [B, N] - 使用 EMA 标准差
+        # 联合索引获取归一化参数 (使用实时统计量，非 EMA)
+        mu_expanded = mu_normalize[batch_indices, depth_indices]  # [B, N]
+        sigma_expanded = sigma_normalize[batch_indices, depth_indices]  # [B, N]
 
         # 归一化
         normalized = (logits - mu_expanded) / sigma_expanded
@@ -950,13 +969,16 @@ class GumbelTopKSplitter(nn.Module):
             selected_mask, topk_indices = self._gumbel_topk_ste(logits, K, hard)
         # selected_mask: [B, N] (STE 版本，有梯度)
         # topk_indices: [B, K'] (硬选择索引，K' 可能略小于 K)
-        
+
         # ====================================================================
-        # Step 3: 树一致性约束
+        # Step 3: I100-1 移除树一致性约束
+        # 原因: 树一致性约束是人为设计，非任务必需
+        # - Hilbert 曲线核心价值是空间局部性，而非树互斥
+        # - 父子共存可捕获不同粒度的特征
+        # - 移除约束允许模型自己学习最优策略
+        # 之前: consistent_mask = self._enforce_tree_consistency(...)
         # ====================================================================
-        # I96-4: 传递 training 参数以区分软边距/硬边距
-        consistent_mask = self._enforce_tree_consistency(selected_mask, topk_indices, training=self.training)
-        # consistent_mask: [B, N] (排除有子节点被选中的父节点)
+        consistent_mask = selected_mask  # 直接使用，移除树一致性约束
         
         # ====================================================================
         # Step 4: 构建输出
@@ -1185,7 +1207,8 @@ class GumbelTopKSplitter(nn.Module):
             # I23-2: 修复 flatten bug，改为 per-batch 计算取平均
             sorted_probs, _ = torch.sort(probs, dim=1, descending=True)  # [B, N]
             cumsum = sorted_probs.cumsum(dim=1)  # [B, N]
-            total_prob = cumsum[:, -1:].clamp(min=1e-8)  # [B, 1] 防止除零
+            # I102-3: 提升 epsilon 到 1e-6，FP16 安全边界 (原 1e-8 在边界)
+            total_prob = cumsum[:, -1:].clamp(min=1e-6)  # [B, 1] 防止除零
             # 找到每个 batch 中达到 90% 累积概率的位置
             threshold_mask = cumsum < 0.9 * total_prob  # [B, N]
             k_90_per_batch = threshold_mask.sum(dim=1).float() + 1  # [B]

@@ -37,6 +37,8 @@ from typing import Optional, Tuple
 
 import torch
 
+from .constants import SHAPE_NORM_EPSILON  # I102-4
+
 
 def compute_max_depth(
     image_size: Tuple[int, int],
@@ -424,7 +426,7 @@ def compute_shape_scale_similarity(
 
     # 归一化特征
     norm = torch.norm(features, dim=-1, keepdim=True)  # [B, N, 1]
-    norm = norm + 1e-8  # 防止除零
+    norm = norm + SHAPE_NORM_EPSILON  # I102-4: FP16 安全下界
     features_normed = features / norm
 
     # 余弦相似性矩阵 [B, N, N]

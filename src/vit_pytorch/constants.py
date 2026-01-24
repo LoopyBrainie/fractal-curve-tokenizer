@@ -118,6 +118,12 @@ DIVISION_EPSILON: float = 1e-8
 #: 用途: prob.clamp(min=PROB_EPSILON)
 PROB_EPSILON: float = 1e-8
 
+#: I102-4: 形状归一化 epsilon (FP16 安全下界)
+#: 用途: norm = ||f|| + ε 防止除零
+#: FP16 安全: ε >= 1e-6 (FP16 最小正规数 ~6e-8)
+#: 验证: 原 ε=1e-8 位于 FP16 边界，可能导致下溢
+SHAPE_NORM_EPSILON: float = 1e-6
+
 #: 温度参数下界 (Gumbel-Softmax/Top-K)
 #: 数学分析: T < 0.1 时 softmax 梯度趋近于 0
 #: I35 改进: 从 0.1 提升到 0.3，保持更健康的梯度流
