@@ -117,9 +117,9 @@ def run_experiment(config_name: str, seed: int, timeout: Optional[int] = None) -
     output_dir = OUTPUT_DIR / f"config_{config_name}" / f"seed_{seed}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # 使用 uv run 直接调用 Python 脚本
     cmd = [
-        sys.executable, "-m", "pip", "run",
-        "--script", "src/training/train_fractal_vit.py",
+        "uv", "run", "python", "src/training/train_fractal_vit.py",
         "--save-dir", str(output_dir),
     ] + build_args(config_name, seed)
 
