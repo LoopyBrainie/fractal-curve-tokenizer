@@ -29,7 +29,11 @@ uv sync
 uv run pytest tests/
 ```
 
-**Package import**: Use `from vit_pytorch import FractalCurveViT`, NOT `from fractal_curve_tokenizer`.
+**Package import**: Use `uv run python -c "
+import sys
+sys.path.insert(0, 'src')
+import torch
+from vit_pytorch import FractalCurveViT`, NOT `from fractal_curve_tokenizer import FractalCurveViT`.
 **Note**: `tests/conftest.py` adds `src/` to `sys.path` automatically.
 
 ---
@@ -80,6 +84,38 @@ uv run pytest tests/
    - Verify mathematical properties in implementation
    - Check numerical stability with edge cases
    - Validate computational complexity claims
+
+### Vectorization Testing Workflow
+
+Add vectorization checks to catch Python loops and non-vectorized operations:
+
+```bash
+# Standard workflow: write function → unit test → vectorization test
+编写新函数 → 运行单元测试 → 运行向量化测试
+```
+
+```bash
+# Run vectorization tests
+uv run pytest tests/unit/utilities/test_vectorization.py -m vectorization
+
+# With performance benchmarks
+uv run pytest tests/unit/utilization/test_vectorization.py -m "vectorization or slow_vectorization"
+```
+
+**VmapScanner Principle**: Use `torch.vmap` as a "scanner" to detect non-vectorized code:
+
+- Python `for` loops over batch dimension → vmap fails
+- Hardcoded batch_size → vmap fails
+- Data-dependent control flow → vmap fails
+
+**Key Test Modules**:
+
+- [test_vectorization.py](tests/unit/utilities/test_vectorization.py): VmapScanner + vectorization tests
+
+**Marked Tests**:
+
+- `pytest.mark.vectorization`: Vectorization test marker
+- `pytest.mark.slow_vectorization`: Slow performance benchmark marker
 
 ---
 

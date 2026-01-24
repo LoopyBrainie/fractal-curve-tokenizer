@@ -314,3 +314,17 @@ def mock_dataset() -> MockDataset:
 def small_mock_dataset() -> MockDataset:
     """小型模拟数据集 fixture (用于快速测试)."""
     return MockDataset(size=10, image_size=32, num_classes=10)
+
+
+# =============================================================================
+# Pytest Markers 配置 (向量化测试框架)
+# =============================================================================
+
+def pytest_configure(config):
+    """注册 pytest markers."""
+    config.addinivalue_line(
+        "markers", "vectorization: marker for vectorization tests using torch.vmap"
+    )
+    config.addinivalue_line(
+        "markers", "slow_vectorization: slow vectorization tests (performance benchmarks)"
+    )
