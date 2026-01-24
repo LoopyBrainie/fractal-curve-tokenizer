@@ -112,37 +112,60 @@ for cfg in configs:
 def generate_parallel_runner(num_parallel):
     """生成并行批量运行脚本"""
     script = '''#!/bin/bash
-# I100-2 批量运行 (并行数=''' + str(num_parallel) + ''')
+# I100-2 Parallel Batch Runner (parallel=''' + str(num_parallel) + ''')
 set -e
+
 SCRIPT_DIR="scripts"
 LOG_DIR="experiments/temp_ablation/logs"
+MAX_PARALLEL=''' + str(num_parallel) + '''
 mkdir -p "$LOG_DIR"
-echo "=== I100-2 批量运行 (并行=''' + str(num_parallel) + ''') ==="
+
+echo "=== I100-2 Parallel Run (parallel=''' + str(num_parallel) + ''') ==="
+
 CONFIGS=(A B C D E F G H I)
 SEEDS=(1 2 3)
-current=0
-PIDS=()
 
-run_exp() {
-    local cfg=$1 seed=$2
-    local log="$LOG_DIR/${cfg}_seed_${seed}.log"
-    echo "[启动] $cfg seed=$seed"
-    bash "$SCRIPT_DIR/run_ablation_${cfg}_seed_${seed}.sh" >> "$log" 2>&1 &
-    PIDS+=($!)
-}
-
+# Generate all task pairs
+TASKS=()
 for cfg in "${CONFIGS[@]}"; do
     for seed in "${SEEDS[@]}"; do
-        while (( current >= ''' + str(num_parallel) + ''' )); do
-            wait -n
-            ((current--))
-        done
-        run_exp "$cfg" "$seed"
-        ((current++))
+        TASKS+=("$cfg $seed")
     done
 done
-wait
-echo "=== 所有实验完成 ==="
+
+# Run tasks in parallel
+total=${#TASKS[@]}
+running=0
+idx=0
+
+next_task() {
+    if (( idx >= total )); then
+        return 1
+    fi
+    task="${TASKS[$idx]}"
+    cfg=$(echo "$task" | cut -d' ' -f1)
+    seed=$(echo "$task" | cut -d' ' -f2)
+    ((idx++))
+
+    local log="$LOG_DIR/${cfg}_seed_${seed}.log"
+    echo "[START] $cfg seed=$seed"
+    bash "$SCRIPT_DIR/run_ablation_${cfg}_seed_${seed}.sh" >> "$log" 2>&1 &
+    return 0
+}
+
+# Start initial tasks
+while (( running < MAX_PARALLEL )) && next_task; do
+    ((running++))
+done
+
+# Wait for tasks to complete and start new ones
+while (( running > 0 )); do
+    wait -n
+    ((running--))
+    next_task && ((running++)) || true
+done
+
+echo "=== All Experiments Complete ==="
 bash "$SCRIPT_DIR/analyze_results_wsl.sh"
 '''
     return script
@@ -151,32 +174,21 @@ bash "$SCRIPT_DIR/analyze_results_wsl.sh"
 def generate_quick_commands():
     """生成快速运行命令"""
     return '''#!/bin/bash
-# I100-2 快速运行 (后台并行)
+# I100-2 Quick Run Commands
 
-# 在 WSL 中执行以下命令:
-
-# 1. 进入项目目录
+# 1. GNU parallel (recommended, requires parallel package)
 cd /mnt/d/myProject/fractal-curve-tokenizer
-
-# 2. 生成运行脚本
-python scripts/generate_temp_ablation_wsl.py --dry-run
-
-# 3. 方式1: 顺序运行 (单 GPU)
-for f in scripts/run_ablation_*.sh; do
-    echo "运行: $f"
-    bash "$f"
-done
-
-# 方式2: 并行运行 (多 GPU/Podman)
 parallel -j4 ::: scripts/run_ablation_*.sh
 
-# 方式3: 手动后台运行
-for f in scripts/run_ablation_A_*.sh; do
+# 2. Simple background loop
+cd /mnt/d/myProject/fractal-curve-tokenizer
+for f in scripts/run_ablation_*.sh; do
+    echo "Running: $f"
     bash "$f" &
 done
 wait
 
-# 4. 分析结果
+# 3. Check results
 bash scripts/analyze_results_wsl.sh
 '''
 
