@@ -40,8 +40,6 @@ uv run python src/training/train_fractal_vit.py \
   --gradient-checkpoint \
   --channels-last \
   --tf32 \
-  --compile \
   --gradient-clip 1.0 \
   --patience 25 \
-  --min-delta 0.001 \
-  --exp-name tiny_imagenet_384d_8l_bs192_ep150
+  --min-delta 0.001 
