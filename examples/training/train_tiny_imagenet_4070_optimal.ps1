@@ -65,9 +65,9 @@ uv run python src/training/train_fractal_vit.py `
   --ffn-type swiglu_level `
   --tokenizer-type streaming_v3 `
   --min-patch-size 4 `
-  --batch-size 192 `
+  --batch-size 144 `
   --num-workers 4 `
-  --lr 2.25e-4 `
+  --lr 2.0e-4 `
   --accum-steps 1 `
   --weight-decay 0.08 `
   --warmup-epochs 15 `
@@ -94,7 +94,7 @@ uv run python src/training/train_fractal_vit.py `
   --gradient-clip 1.0 `
   --patience 25 `
   --min-delta 0.001 `
-  --exp-name tiny_imagenet_384d_8l_bs192_ep150
+  --exp-name tiny_imagenet_384d_8l_bs144_ep150
 "@
 
 # 执行训练脚本

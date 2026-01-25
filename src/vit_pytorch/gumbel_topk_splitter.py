@@ -603,6 +603,7 @@ class GumbelTopKSplitter(
             self._cached_device_depths = None
             self._cached_device_thresholds = None
             self._cached_device_children_matrix = None
+            self._cached_device_hilbert = None  # I103-3: 清除 hilbert 缓存
             return
 
         # 重新计算候选区域
@@ -617,6 +618,7 @@ class GumbelTopKSplitter(
         self._cached_device_depths = None
         self._cached_device_thresholds = None
         self._cached_device_children_matrix = None
+        self._cached_device_hilbert = None  # I103-3: 清除 hilbert 缓存
 
         # 存入缓存 (限制大小)
         if len(self._candidate_cache) < 256:
