@@ -150,6 +150,9 @@ def run_experiment(config_name: str, seed: int, log_file: Optional[Path] = None)
     output_dir = OUTPUT_DIR / f"config_{config_name}" / f"seed_{seed}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # 打印实验开始信息
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 开始 {config_name}({cfg['desc']}) seed={seed} -> {output_dir}")
+
     # 日志文件
     if log_file is None:
         log_file = output_dir / "train.log"
