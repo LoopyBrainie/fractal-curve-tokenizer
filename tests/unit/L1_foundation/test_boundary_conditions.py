@@ -391,3 +391,93 @@ class TestMathInvariantsBoundary:
         # 标准 Hilbert 曲线的最大跳跃应该是 √2 ≈ 1.41
         # 实际上由于边界翻转，可能达到约 2.12
         assert max_dist < 3.0  # 确保没有极端跳跃
+
+
+class TestNPowerOf2Validation:
+    """I102-11: n 值必须是 2 的幂验证测试"""
+
+    @pytest.mark.parametrize("invalid_n", [3, 5, 6, 7, 9, 10, 12, 15, 17, 31])
+    def test_xy_to_d_invalid_n_raises_error(self, invalid_n):
+        """n 非 2 的幂时 xy_to_d 应该抛出 ValueError"""
+        with pytest.raises(ValueError, match="must be a power of 2"):
+            HilbertCurve.xy_to_d(invalid_n, 0, 0)
+
+    @pytest.mark.parametrize("invalid_n", [3, 5, 6, 7, 9, 10, 12, 15, 17, 31])
+    def test_d_to_xy_invalid_n_raises_error(self, invalid_n):
+        """n 非 2 的幂时 d_to_xy 应该抛出 ValueError"""
+        with pytest.raises(ValueError, match="must be a power of 2"):
+            HilbertCurve.d_to_xy(invalid_n, 0)
+
+    @pytest.mark.parametrize("invalid_n", [3, 5, 6, 7, 9, 10, 12, 15, 17, 31])
+    def test_xy_to_d_batch_invalid_n_raises_error(self, invalid_n):
+        """n 非 2 的幂时 xy_to_d_batch 应该抛出 ValueError"""
+        x = torch.tensor([0, 1, 2])
+        y = torch.tensor([0, 1, 2])
+        with pytest.raises(ValueError, match="must be a power of 2"):
+            HilbertCurve.xy_to_d_batch(invalid_n, x, y)
+
+    @pytest.mark.parametrize("invalid_n", [3, 5, 6, 7, 9, 10, 12, 15, 17, 31])
+    def test_d_to_xy_batch_invalid_n_raises_error(self, invalid_n):
+        """n 非 2 的幂时 d_to_xy_batch 应该抛出 ValueError"""
+        d = torch.tensor([0, 1, 2])
+        with pytest.raises(ValueError, match="must be a power of 2"):
+            HilbertCurve.d_to_xy_batch(invalid_n, d)
+
+    @pytest.mark.parametrize("valid_n", [1, 2, 4, 8, 16, 32, 64, 128])
+    def test_valid_powers_of_2_xy_to_d(self, valid_n):
+        """有效的 2 的幂 xy_to_d 应该正常工作"""
+        d = HilbertCurve.xy_to_d(valid_n, 0, 0)
+        assert isinstance(d, int)
+        assert d >= 0
+
+    @pytest.mark.parametrize("valid_n", [1, 2, 4, 8, 16, 32, 64, 128])
+    def test_valid_powers_of_2_d_to_xy(self, valid_n):
+        """有效的 2 的幂 d_to_xy 应该正常工作"""
+        x, y = HilbertCurve.d_to_xy(valid_n, 0)
+        assert isinstance(x, int)
+        assert isinstance(y, int)
+        assert 0 <= x < valid_n
+        assert 0 <= y < valid_n
+
+    @pytest.mark.parametrize("valid_n", [1, 2, 4, 8, 16, 32])
+    def test_valid_powers_of_2_batch(self, valid_n):
+        """有效的 2 的幂批量方法应该正常工作"""
+        B = 4
+        x = torch.randint(0, valid_n, (B,))
+        y = torch.randint(0, valid_n, (B,))
+        d = HilbertCurve.xy_to_d_batch(valid_n, x, y)
+        assert d.shape == (B,)
+
+        d_input = torch.randint(0, valid_n * valid_n, (B,))
+        x_out, y_out = HilbertCurve.d_to_xy_batch(valid_n, d_input)
+        assert x_out.shape == (B,)
+        assert y_out.shape == (B,)
+
+    def test_error_message_contains_suggestion(self):
+        """错误消息应该包含自动调整建议"""
+        n = 9
+        with pytest.raises(ValueError) as exc_info:
+            HilbertCurve.xy_to_d(n, 0, 0)
+
+        error_msg = str(exc_info.value)
+        assert "_next_power_of_2" in error_msg
+        assert "16" in error_msg  # _next_power_of_2(9) = 16
+
+    def test_edge_case_n_1_is_valid(self):
+        """n=1 是有效的 2 的幂 (2^0=1)"""
+        # n=1 应该正常工作
+        d = HilbertCurve.xy_to_d(1, 0, 0)
+        assert d == 0
+
+        x, y = HilbertCurve.d_to_xy(1, 0)
+        assert x == 0 and y == 0
+
+        # 批量方法
+        x_batch = torch.tensor([0])
+        y_batch = torch.tensor([0])
+        d_batch = HilbertCurve.xy_to_d_batch(1, x_batch, y_batch)
+        assert d_batch.shape == (1,)
+
+        d_input = torch.tensor([0])
+        x_out, y_out = HilbertCurve.d_to_xy_batch(1, d_input)
+        assert x_out.shape == (1,)

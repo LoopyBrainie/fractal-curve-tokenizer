@@ -229,12 +229,13 @@ class TestFractalTransformerDynamicDepth:
             min_layers=4,
         ).to(device)
 
-    def test_inference_mode_skip_layers(
+    def test_inference_mode_fixed_depth(
         self, transformer, dim, depth, device, levels_info
     ):
-        """测试8: 推理时跳过部分层。
+        """测试8: 推理时使用固定深度 (depth // 2)。
 
-        预期: 推理时使用少于全部层数
+        I100-6: 动态深度因条件计算与 GPU SIMT 并行矛盾而被放弃
+        现在统一使用固定深度 depth // 2
         """
         batch_size, seq_len = levels_info.shape[0], levels_info.shape[1]
         transformer.eval()
@@ -247,18 +248,18 @@ class TestFractalTransformerDynamicDepth:
 
         # 检查额外信息
         assert 'effective_depth' in extra_info
-        assert 'complexity' in extra_info
 
-        # 推理时应该返回有效层数
-        assert extra_info['effective_depth'] >= 1
-        assert extra_info['effective_depth'] <= depth
+        # I100-6: 固定深度 = depth // 2
+        expected_depth = depth // 2
+        assert extra_info['effective_depth'] == expected_depth, \
+            f"推理时应使用 depth // 2 = {expected_depth} 层，实际为 {extra_info['effective_depth']}"
 
-    def test_training_mode_all_layers(
+    def test_training_mode_fixed_depth(
         self, transformer, dim, depth, device, levels_info
     ):
-        """测试9: 训练时所有层都参与。
+        """测试9: 训练时也使用固定深度。
 
-        预期: 训练模式使用全部层数
+        I100-6: 训练和推理统一使用固定深度 (depth // 2)
         """
         batch_size, seq_len = levels_info.shape[0], levels_info.shape[1]
         transformer.train()
@@ -266,9 +267,10 @@ class TestFractalTransformerDynamicDepth:
 
         output, extra_info = transformer(x, levels_info=levels_info, return_extra_info=True)
 
-        # 训练时应该使用全部层数
-        assert extra_info['effective_depth'] == depth, \
-            f"训练时应使用全部 {depth} 层，实际为 {extra_info['effective_depth']}"
+        # I100-6: 统一使用固定深度 depth // 2
+        expected_depth = depth // 2
+        assert extra_info['effective_depth'] == expected_depth, \
+            f"训练时应使用 depth // 2 = {expected_depth} 层，实际为 {extra_info['effective_depth']}"
 
         # 反向传播应该工作
         loss = output.sum()
