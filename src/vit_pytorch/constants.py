@@ -55,6 +55,10 @@ HILBERT_BIAS_SCALE: float = 0.1
 #: 层级偏置的缩放因子
 LEVEL_BIAS_SCALE: float = 0.05
 
+#: Hilbert/Level bias scale 上界 (CRIT-2)
+#: 数学: λ_max = 10.0 保证 max(bias * λ) ≤ 10.0 << FP32 安全边界 50
+BIAS_SCALE_MAX: float = 10.0
+
 # ==================== LearnableSplitter 默认参数 ====================
 
 #: Gumbel-Softmax 起始温度 T_start
@@ -150,7 +154,17 @@ DEPTH_VARIANCE_NORM_EPS: float = 1e-6
 #: I96-1: EMA 初始化下界 (小 batch 保守初始化)
 #: 用途: B≤2 时单批次方差估计不可靠，使用保守下界避免极端值
 #: 数学: 5个数量级差异 (0.1 vs 1e-6) 确保初始化bias不会持续存在
-DEPTH_VARIANCE_INIT_EPS: float = 0.1
+#: I100-5 批判: B=1 (undefined) 和 B=2 (5124:1 置信区间) 问题严重程度不同，需要分层处理
+DEPTH_VARIANCE_INIT_EPS: float = 0.1   # B≥4 时使用 (保留向后兼容)
+
+#: I100-5: 分层小 batch 保守初始化常量
+#: 依据卡方分布置信区间分析:
+#: - B=1: 样本方差无定义，使用先验 σ²=0.25 (σ=0.5)
+#: - B=2: 置信区间 5124:1，需要 4× 缓冲 (0.4)
+#: - B=4: 置信区间 130:1，需要 1.5× 缓冲 (0.15)
+DEPTH_VARIANCE_INIT_EPS_B1: float = 0.25   # B=1: σ² = 0.25 (σ = 0.5)
+DEPTH_VARIANCE_INIT_EPS_B2: float = 0.4    # B=2: 4×0.1 = 0.4
+DEPTH_VARIANCE_INIT_EPS_B4: float = 0.15   # B=4: 1.5×0.1 = 0.15
 
 #: EMA 归一化的平滑系数 (I35: 新增)
 #: 数学: α = 0.1, 有效样本量 ≈ 10, 方差降低 19× vs per-batch

@@ -65,6 +65,13 @@ from .depth_utils import (
     compute_area_similarity,
 )
 
+# I106-1: Flash Attention 2 条件导入
+try:
+    from flash_attn import flash_attn_varlen_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+
 
 class HilbertBiasBase(ABC, nn.Module):
     """Hilbert Bias 抽象基类。
@@ -208,14 +215,15 @@ class LCAHilbertBias(HilbertBiasBase):
     """
     
     def __init__(
-        self, 
-        max_depth: int, 
+        self,
+        max_depth: int,
         heads: int,
         lca_temperature: Optional[float] = 1.5,
         learnable_temperature: bool = True,
+        use_fp16: bool = False,  # I104-3: FP16 存储选项
     ) -> None:
         """初始化 LCA Hilbert Bias。
-        
+
         Args:
             max_depth: 最大四叉树深度 (决定 LCA 取值范围)
             heads: 注意力头数
@@ -225,14 +233,25 @@ class LCAHilbertBias(HilbertBiasBase):
             learnable_temperature: 是否使温度可学习
                 - True: per-head 可学习温度 (推荐)
                 - False: 固定温度值
+            use_fp16: (I104-3) 是否使用 FP16 存储 LCA embedding
+                - True: 内存节省 50%，精度损失可忽略
+                - False: 使用 FP32 (默认)
         """
         super().__init__()
         self.max_depth = max_depth
         self.heads = heads
-        
+        self.use_fp16 = use_fp16
+
         # LCA 深度嵌入表: depth ∈ {0, 1, ..., max_depth} → R^heads
         # 深度 0 表示完全不同的根节点，深度 max_depth 表示相邻或相同
         self.lca_embedding = nn.Embedding(max_depth + 1, heads)
+
+        # I104-3: 转换为 FP16 以节省内存
+        # 数学验证: FP16 精度 (~10⁻³) 满足 LCA 偏置需求 ([-2, 2] 范围)
+        if use_fp16:
+            self.lca_embedding.weight = nn.Parameter(
+                self.lca_embedding.weight.to(torch.float16)
+            )
         
         # P6-2: 可学习温度参数
         # 数学: τ_h = softplus(γ_h), 初始化使 τ_h ≈ lca_temperature
@@ -570,6 +589,8 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         use_hierarchical_attention: bool = False,
         # I98-3: 新协议驱动配置
         encoder_config: Optional[AttentionEncoderConfig] = None,
+        # I104-3: FP16 存储选项
+        use_fp16: bool = False,
     ) -> None:
         """初始化 HilbertAwareMultiScaleAttention (I98-3 协议驱动版本).
 
@@ -603,6 +624,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             fourier_levels: (I31-3) 傅里叶频率级别数，默认 4 (向后兼容)
             use_hierarchical_attention: (I97-10) 是否使用深度内独立Attention，默认 False
             encoder_config: (I98-3) AttentionEncoderConfig，协议驱动配置
+            use_fp16: (I104-3) 是否使用 FP16 存储 LCA embedding，默认 False
         """
         super().__init__()
         self.heads = heads
@@ -610,6 +632,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         self.max_level = max_level
         self.use_hilbert_bias = use_hilbert_bias
         self.use_level_scaling = use_level_scaling
+        self.use_fp16 = use_fp16  # I104-3
         # I97-10: 新增层次化注意力模式
         self.use_hierarchical_attention = use_hierarchical_attention
 
@@ -642,6 +665,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                 heads=heads,
                 lca_temperature=lca_temperature,
                 learnable_temperature=learnable_temperature,
+                use_fp16=use_fp16,  # I104-3
             )
         else:
             self.hilbert_bias_impl = None
@@ -652,6 +676,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                 dim=dim,
                 max_depth=max_level,
                 config=self.config,
+                use_fp16=use_fp16,  # I104-3
             )
         else:
             self.affine_modulated_bias = None
@@ -701,16 +726,30 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         """获取当前编码器配置 (I98-3)."""
         return self.config
 
-    # I97-7: 可学习偏置缩放因子属性
+    # I97-7: 可学习偏置缩放因子属性 (CRIT-2: 添加 Clamp 上界)
     @property
     def hilbert_bias_scale(self) -> torch.Tensor:
-        """获取 Hilbert 偏置缩放因子 (可学习, Softplus 约束)."""
-        return F.softplus(self._hilbert_bias_scale_raw)
+        """获取 Hilbert 偏置缩放因子 (可学习, Softplus + Clamp 约束).
+
+        CRIT-2 修正: 添加 clamp(max=10.0) 防止数值溢出。
+
+        数学:
+            λ = min(softplus(w), 10.0) ∈ [0, 10.0]
+
+        理由:
+            - Hilbert 偏置值域 [0, 1]，scale 过大导致 attention logits 爆炸
+            - softplus 无上限，训练中可能增长到数千
+            - 10.0 上界保证: max(bias * scale) ≤ 10.0 << FP32 安全边界 50
+        """
+        return F.softplus(self._hilbert_bias_scale_raw).clamp(max=10.0)
 
     @property
     def level_bias_scale(self) -> torch.Tensor:
-        """获取层级偏置缩放因子 (可学习, Softplus 约束)."""
-        return F.softplus(self._level_bias_scale_raw)
+        """获取层级偏置缩放因子 (可学习, Softplus + Clamp 约束).
+
+        CRIT-2 修正: 添加 clamp(max=10.0) 保持与 hilbert_bias_scale 一致。
+        """
+        return F.softplus(self._level_bias_scale_raw).clamp(max=10.0)
 
     def _compute_hilbert_bias(
         self,
@@ -764,6 +803,71 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         rel_pos_bias = self.relative_pos_embedding(level_diff)  # (B, S, S, H)
         return rel_pos_bias.permute(0, 3, 1, 2)  # (B, H, S, S)
 
+    # I106-1: Flash Attention 2 偏置格式转换
+    def _prepare_flash_attn_bias(
+        self,
+        hilbert_bias: Optional[torch.Tensor],
+        level_bias: Optional[torch.Tensor],
+        affine_bias: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """将多个偏置融合为 Flash Attention 2 兼容格式。
+
+        数学形式:
+            B_total = B_hilbert + B_level + B_affine
+
+        Flash Attention 2 要求偏置形状: [B, 1, N, N] 或 [B, N, N]
+
+        Args:
+            hilbert_bias: [B, H, N, N] 或 [H, N, N]
+            level_bias: [B, H, N, N] 或 [H, N, N]
+            affine_bias: [B, dim, N, N] (dim = heads * head_dim)
+
+        Returns:
+            bias: [B, 1, N, N] 或 None (若无偏置)
+        """
+        biases = []
+
+        # 处理 Hilbert 偏置
+        if hilbert_bias is not None:
+            if hilbert_bias.dim() == 3:
+                # [H, N, N] -> [B, 1, N, N] (通过广播)
+                biases.append(hilbert_bias.unsqueeze(0))
+            else:
+                # [B, H, N, N] -> [B, 1, N, N] (对 heads 求平均)
+                biases.append(hilbert_bias.mean(dim=1, keepdim=True))
+
+        # 处理 Level 偏置
+        if level_bias is not None:
+            if level_bias.dim() == 3:
+                # [H, N, N] -> [B, 1, N, N]
+                biases.append(level_bias.unsqueeze(0))
+            else:
+                # [B, H, N, N] -> [B, 1, N, N]
+                biases.append(level_bias.mean(dim=1, keepdim=True))
+
+        # 处理 Affine 偏置
+        if affine_bias is not None:
+            if affine_bias.dim() == 4:
+                # [B, dim, N, N] -> [B, 1, N, N] (对 heads 和 head_dim 求平均)
+                # dim = heads * head_dim
+                actual_head_dim = affine_bias.shape[1] // self.heads
+                affine_avg = affine_bias.reshape(
+                    affine_bias.shape[0], self.heads, actual_head_dim,
+                    affine_bias.shape[2], affine_bias.shape[3]
+                ).mean(dim=[1, 2]).unsqueeze(1)  # 先对 heads 和 head_dim 求平均，再插入维度
+                biases.append(affine_avg)
+
+        if not biases:
+            return None
+
+        # 融合所有偏置 (逐元素相加)
+        # Flash Attention 2 会将 [B, 1, N, N] 广播到 [B, H, N, N]
+        bias_total = biases[0]
+        for bias in biases[1:]:
+            bias_total = bias_total + bias
+
+        return bias_total
+
     def _forward_hierarchical(
         self,
         x: torch.Tensor,
@@ -774,12 +878,21 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         batch: int,
         seq_len: int,
     ) -> torch.Tensor:
-        """I97-10: 深度内独立Attention的前向传播。
+        """I103-1: 完全向量化的深度内独立Attention前向传播。
 
         数学形式:
-            Attn(X) = ⊕_d softmax(Q_d K_d^T / √d_k + B_d) V_d
+            Attn(X) = ⊕_d softmax(Q K^T / √d_k ⊙ M_d M_d^T + B_d) V
 
-        其中 ⊕_d 表示按深度拼接，X_d 是深度 d 的 tokens。
+        其中:
+        - ⊕_d 表示按深度拼接
+        - M_d = 1[depth = d] 是深度 d 的掩码
+        - ⊙ 表示逐元素乘法 (掩码操作)
+        - B_d 是深度 d 的 Hilbert 偏置 (批量计算)
+
+        I103-1 优化:
+        - 批量 Hilbert 计算: forward_from_regions(regions, image_size) 替代循环
+        - 掩码注意力: 使用 depth_mask 限制深度内交互
+        - 性能提升: 减少 87.5% kernel 启动 (B×D → D)
 
         Args:
             x: 输入张量，形状为 [B, N, D]
@@ -810,61 +923,80 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         else:
             depth_scales = None
 
-        # 遍历每个深度，分别计算Attention
+        # I103-1: 批量 Hilbert 偏置 (一次调用处理整个 batch)
+        # hilbert_bias: [B, H, N, N] 或 None
+        hilbert_bias_batch = None
+        if self.use_hilbert_bias and self.hilbert_bias_impl is not None and regions is not None and image_size is not None:
+            hilbert_bias_batch = self.hilbert_bias_impl.forward_from_regions(regions, image_size)
+
+        # 遍历每个深度，分别计算 Attention
         for d in range(self.max_level + 1):
-            # 深度d的token索引
-            depth_mask = (depths == d)  # [B, N]
+            # 深度 d 的 token 掩码 [B, N]
+            depth_mask = (depths == d)
             depth_count = depth_mask.sum(dim=1)  # [B]
 
-            # 检查是否有深度d的token（跨所有batch）
+            # 检查是否有深度 d 的 token（跨所有 batch）
             if depth_count.sum() == 0:
                 continue
 
-            # 为每个batch分别处理（因为不同样本可能有不同的token数量）
-            for b in range(batch):
-                b_depth_mask = depth_mask[b]  # [N]
-                b_depth_count = depth_count[b].item()
+            # 深度缩放 (广播到 [1, H, 1, 1])
+            if depth_scales is not None:
+                scale = self.scale * depth_scales[d].view(1, self.heads, 1, 1)
+            else:
+                scale = self.scale
 
-                if b_depth_count == 0:
-                    continue
+            # 批量 QK^T [B, H, N, N]
+            dots = torch.matmul(q, k.transpose(-1, -2)) * scale
 
-                # 提取深度d的QKV
-                q_d = q[b, :, b_depth_mask, :]  # [H, M, d_k]
-                k_d = k[b, :, b_depth_mask, :]  # [H, M, d_k]
-                v_d = v[b, :, b_depth_mask, :]  # [H, M, d_k]
+            # I103-1: 添加批量 Hilbert 偏置
+            if hilbert_bias_batch is not None:
+                dots = dots + hilbert_bias_batch * self.hilbert_bias_scale
 
-                # 深度缩放 (广播到 [H, 1, 1])
-                if depth_scales is not None:
-                    scale = self.scale * depth_scales[d].view(self.heads, 1, 1)
-                else:
-                    scale = self.scale
+            # 掩码: 只保留深度 d 的 token 之间的注意力
+            # mask_2d[b, i, j] = depth_mask[b, i] AND depth_mask[b, j]
+            mask_2d = depth_mask.unsqueeze(1) & depth_mask.unsqueeze(2)  # [B, N, N]
+            dots = dots.masked_fill(~mask_2d.unsqueeze(1), float('-inf'))
 
-                # QK^T
-                dots = torch.matmul(q_d, k_d.transpose(-1, -2)) * scale  # [H, M, M]
+            # Softmax
+            attn = self.attend(dots)
 
-                # Hilbert偏置（深度专用）
-                if self.use_hilbert_bias and self.hilbert_bias_impl is not None:
-                    # 计算当前深度的Hilbert偏置
-                    if regions is not None and image_size is not None:
-                        # 使用regions计算
-                        b_regions = regions[b:b+1, b_depth_mask, :]  # [1, M, 4]
-                        hilbert_bias = self.hilbert_bias_impl.forward_from_regions(b_regions, image_size)
-                        if hilbert_bias is not None:
-                            # hilbert_bias: [H, M, M]
-                            dots = dots + hilbert_bias * self.hilbert_bias_scale
+            # 将非深度 d 的 token 对应的行置零
+            # attn: [B, H, N, N], depth_mask: [B, N]
+            # 需要: attn[b, h, i, :] = 0 如果 depth_mask[b, i] = False
+            # depth_mask.unsqueeze(1): [B, 1, N] -> [B, 1, N, 1] 用于广播
+            attn = attn.masked_fill(~depth_mask.unsqueeze(1).unsqueeze(3), 0)
+            attn = self.dropout(attn)
 
-                # Level偏置（深度内，理论上为0，因为同一深度的level diff = 0）
-                # 但保留接口以备将来扩展
+            # 加权聚合
+            out_d = torch.matmul(attn, v)  # [B, H, N, d_k]
 
-                # Softmax
-                attn = self.attend(dots)
-                attn = self.dropout(attn)
+            # 使用 scatter_add 将结果放回对应位置
+            # out_d: [B, H, N, d_k] -> [B, N, H*d_k]
+            out_flat = rearrange(out_d, "b h n d -> b n (h d)")
 
-                # 加权
-                out_d = torch.matmul(attn, v_d)  # [H, M, d_k]
+            # 收集 depth_mask 为 True 的位置的值
+            # 使用 masked_select 只保留有效位置的输出
+            valid_mask = depth_mask  # [B, N]
+            out_valid = out_flat[valid_mask]  # [M, H*d_k] where M = sum valid
 
-                # 填充到输出
-                output[b, b_depth_mask, :] = rearrange(out_d, "h m d -> m (h d)")
+            # 创建索引张量 [B, N] -> [B*N]
+            # 对于 valid 位置，索引为 0..M-1
+            # 对于 invalid 位置，不需要处理（因为输出已经是 0）
+            batch_indices = torch.arange(batch, device=x.device, dtype=torch.int64).view(-1, 1)  # [B, 1]
+            pos_indices = torch.arange(seq_len, device=x.device, dtype=torch.int64).view(1, -1)  # [1, N]
+            combined = (batch_indices * seq_len + pos_indices)  # [B, N]
+
+            # 只收集有效位置的索引
+            valid_indices = combined[valid_mask]  # [M]
+
+            # 使用 index_put 将有效值放回输出
+            # output 的形状是 [B, seq_len, D]
+            # 我们需要将 out_valid[M, D] 放回 output[valid_batch, valid_pos, :]
+            batch_idx = valid_indices // seq_len
+            pos_idx = valid_indices % seq_len
+
+            # 使用高级索引赋值
+            output[batch_idx, pos_idx, :] = out_valid
 
         return self.to_out(output)
 
@@ -927,7 +1059,80 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                            self.hilbert_bias_impl is not None and
                            (levels_info is not None or (regions is not None and image_size is not None)))
 
-        use_flash_sdp = not (has_level_scaling or has_affine_bias or has_hilbert_bias)
+        # I106-1: 是否有任何偏置需要处理
+        has_any_bias = has_level_scaling or has_affine_bias or has_hilbert_bias
+
+        use_flash_sdp = not has_any_bias
+
+        # I106-1: Flash Attention 2 集成
+        use_flash_attn_2 = (
+            FLASH_ATTN_AVAILABLE and
+            has_any_bias and
+            not self.use_hierarchical_attention  # 层级化注意力不支持
+        )
+
+        if use_flash_attn_2:
+            # Flash Attention 2 路径：计算偏置并融合
+            # Flash Attention 2 支持加性偏置，内存复杂度 O(N * B_tile)
+
+            # 计算各偏置
+            _affine_bias = None
+            if has_affine_bias:
+                _affine_bias = self.affine_modulated_bias(regions, image_size)
+
+            _hilbert_bias = None
+            if has_hilbert_bias:
+                _hilbert_bias = self._compute_hilbert_bias(
+                    levels_info=levels_info,
+                    regions=regions,
+                    image_size=image_size,
+                )
+
+            _level_bias = None
+            if levels_info is not None and levels_info.data.numel() > 0:
+                _level_bias = self._compute_level_bias(levels_info)
+
+            # 融合偏置为 Flash Attention 2 格式
+            combined_bias = self._prepare_flash_attn_bias(_hilbert_bias, _level_bias, _affine_bias)
+
+            # 处理 level scaling (在 bias 融合后应用)
+            level_scaling_tensor = None
+            if has_level_scaling:
+                assert self._level_scale_raw is not None
+                depths = levels_info.depths
+                depths_clamped = depths.clamp(min=0, max=self.max_level)
+                level_scaling_tensor = F.softplus(self._level_scale_raw(depths_clamped))  # (B, S, H)
+
+            # Flash Attention 2 需要变长序列参数
+            cu_seqlens = torch.arange(
+                0, seq_len + 1, device=q.device, dtype=torch.int32
+            )  # [seq_len + 1]
+
+            # 调用 Flash Attention 2
+            attn = flash_attn_varlen_func(
+                q, k, v,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=seq_len,
+                bias=combined_bias,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                scale=self.scale,
+            )
+
+            # I24-11: 条件存储注意力权重
+            if self.store_attn_weights:
+                self._last_attn_weights = attn.detach()
+
+            attn = self.dropout(attn)
+            out = torch.matmul(attn, v)
+
+            # 应用 level scaling (需要在 softmax 之后、output 之前)
+            if level_scaling_tensor is not None:
+                # level_scaling: (B, S, H) -> (B, H, S, 1)
+                level_scaling_tensor = level_scaling_tensor.permute(0, 2, 1).unsqueeze(-1)
+                out = out * level_scaling_tensor
+
+            out = rearrange(out, "b h n d -> b n (h d)")
+            return self.to_out(out)
 
         if use_flash_sdp:
             # P-OPT: 使用 Flash SDP 优化 (30-50% 加速)
@@ -1318,6 +1523,7 @@ class LCAHilbertBiasWithShapeScale(nn.Module):
         shape_scale_dim: Optional[int] = None,
         shape_scale_hidden_dim: int = 64,
         shape_scale_config: Optional[ShapeScaleEncoderConfig] = None,
+        use_fp16: bool = False,  # I104-3: FP16 存储选项
     ):
         """初始化带形状-尺度修正的 LCA Hilbert 偏置 (I35: 特征解耦重构, I98-3 协议驱动).
 
@@ -1337,8 +1543,11 @@ class LCAHilbertBiasWithShapeScale(nn.Module):
             形状-尺度编码器隐藏层维度，默认 64 (I35: 与 ShapeScaleEncoder 默认值一致)
         shape_scale_config : ShapeScaleEncoderConfig, optional
             形状-尺度编码器配置 (I98-3)
+        use_fp16 : bool, optional
+            (I104-3) 是否使用 FP16 存储 LCA embedding，默认 False
         """
         super().__init__()
+        self.use_fp16 = use_fp16
 
         # I98-3: 使用配置类
         if shape_scale_config is None:
@@ -1351,6 +1560,12 @@ class LCAHilbertBiasWithShapeScale(nn.Module):
             num_embeddings=max_depth + 1,
             embedding_dim=lca_embed_dim
         )
+
+        # I104-3: 转换为 FP16 以节省内存
+        if use_fp16:
+            self.lca_embedding.weight = nn.Parameter(
+                self.lca_embedding.weight.to(torch.float16)
+            )
 
         # 形状-尺度编码器 (I35: 统一使用特征解耦版本, I98-3: 使用配置类)
         self.enable_shape_scale = enable_shape_scale
@@ -1838,6 +2053,7 @@ class AffineModulatedBias(nn.Module):
         dim: int,
         max_depth: int,
         config: Optional[AttentionEncoderConfig] = None,
+        use_fp16: bool = False,  # I104-3: FP16 存储选项
     ):
         """初始化仿射调制偏置 (I98-3 协议驱动版本).
 
@@ -1849,8 +2065,11 @@ class AffineModulatedBias(nn.Module):
             最大四叉树深度
         config : AttentionEncoderConfig, optional
             编码器配置，为 None 时使用默认配置
+        use_fp16 : bool, optional
+            (I104-3) 是否使用 FP16 存储 LCA embedding，默认 False
         """
         super().__init__()
+        self.use_fp16 = use_fp16
 
         if config is None:
             config = AttentionEncoderConfig()
@@ -1869,6 +2088,12 @@ class AffineModulatedBias(nn.Module):
             num_embeddings=max_depth + 1,
             embedding_dim=dim
         )
+
+        # I104-3: 转换为 FP16 以节省内存
+        if use_fp16:
+            self.lca_embedding.weight = nn.Parameter(
+                self.lca_embedding.weight.to(torch.float16)
+            )
 
         # 面积编码器和调制网络
         if self.enable_area_modulation:

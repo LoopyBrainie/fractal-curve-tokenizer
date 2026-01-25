@@ -78,12 +78,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-try:
-    from torchvision.ops import roi_align
-    HAS_ROI_ALIGN = True
-except ImportError:
-    HAS_ROI_ALIGN = False
-    roi_align = None  # type: ignore
+# I100-4: 强制依赖 torchvision
+# 移除 _fallback_roi_pool 回退实现，统一使用 torchvision.ops.roi_align
+from torchvision.ops import roi_align  # 强制依赖，无回退
 
 # I97-9: SplitResult 和 SplitToken 已从 split_adaptive.py 移除
 # 仅保留类型注解用于文档，实际使用 TensorSplitResult
@@ -359,20 +356,17 @@ class HilbertNativePatchEmbed(nn.Module):
         depths_tensor = torch.tensor(all_depths, device=device, dtype=torch.long)  # [N_total]
         
         # 5. ROI-Align 批量池化 (核心向量化操作)
-        if HAS_ROI_ALIGN:
-            # torchvision.ops.roi_align 期望 boxes 格式: [N, 5] 其中每行是 [batch_idx, x1, y1, x2, y2]
-            pooled = roi_align(
-                features,  # [B, D, H', W']
-                boxes_tensor,  # [N_total, 5]
-                output_size=(1, 1),
-                spatial_scale=1.0,  # 已经在 feature map 坐标系中
-                aligned=True,  # 更精确的对齐
-            )  # [N_total, D, 1, 1]
-            pooled = pooled.squeeze(-1).squeeze(-1)  # [N_total, D]
-        else:
-            # 回退到逐个处理 (性能较差但无依赖)
-            pooled = self._fallback_roi_pool(features, boxes_tensor, fh, fw)
-        
+        # I100-4: 强制使用 torchvision.ops.roi_align，无回退实现
+        # torchvision.ops.roi_align 期望 boxes 格式: [N, 5] 其中每行是 [batch_idx, x1, y1, x2, y2]
+        pooled = roi_align(
+            features,  # [B, D, H', W']
+            boxes_tensor,  # [N_total, 5]
+            output_size=(1, 1),
+            spatial_scale=1.0,  # 已经在 feature map 坐标系中
+            aligned=True,  # 更精确的对齐
+        )  # [N_total, D, 1, 1]
+        pooled = pooled.squeeze(-1).squeeze(-1)  # [N_total, D]
+
         # 6. 批量应用深度编码
         # t_i = pooled_i * σ_{d_i} + E_{d_i}
         scales = self.depth_scale[depths_tensor]  # [N_total]
@@ -393,71 +387,7 @@ class HilbertNativePatchEmbed(nn.Module):
         tokens = self.norm(tokens)
         
         return tokens, levels_info
-    
-    def _fallback_roi_pool(
-        self,
-        features: Tensor,  # [B, D, H', W']
-        boxes: Tensor,  # [N, 5] with [batch_idx, x1, y1, x2, y2]
-        fh: int,
-        fw: int,
-    ) -> Tensor:
-        """回退的 ROI 池化实现 (无 torchvision 时使用).
-        
-        P12-5: 使用批量 grid_sample 实现向量化，从 O(N) 优化到 O(B)。
-        
-        使用 grid_sample 实现类似 ROI-Align 的效果.
-        """
-        import warnings
-        warnings.warn(
-            "_fallback_roi_pool 性能较差，建议安装 torchvision 使用 roi_align。",
-            UserWarning,
-            stacklevel=3
-        )
-        
-        N = boxes.shape[0]
-        B, D = features.shape[0], features.shape[1]
-        device = features.device
-        dtype = features.dtype
-        
-        if N == 0:
-            return torch.zeros(0, D, device=device, dtype=dtype)
-        
-        # P12-5: 向量化实现 - 按 batch 分组，每个 batch 内批量 grid_sample
-        batch_indices = boxes[:, 0].long()
-        x1, y1, x2, y2 = boxes[:, 1], boxes[:, 2], boxes[:, 3], boxes[:, 4]
-        
-        # 计算归一化中心点 (转换到 [-1, 1] 坐标系)
-        cx = (x1 + x2) / fw - 1
-        cy = (y1 + y2) / fh - 1
-        
-        pooled = torch.zeros(N, D, device=device, dtype=dtype)
-        
-        for b in range(B):
-            mask = batch_indices == b
-            if not mask.any():
-                continue
-            
-            # 获取该 batch 的中心点
-            cx_b = cx[mask]
-            cy_b = cy[mask]
-            n = cx_b.shape[0]
-            
-            # 创建批量网格 [1, n, 1, 2]
-            grid = torch.stack([cx_b, cy_b], dim=-1).view(1, n, 1, 2)
-            
-            # 批量采样
-            sampled = F.grid_sample(
-                features[b:b+1],  # [1, D, H', W']
-                grid,
-                mode='bilinear',
-                padding_mode='border',
-                align_corners=False,
-            )  # [1, D, n, 1]
-            
-            pooled[mask] = sampled.squeeze(-1).squeeze(0).T
-        
-        return pooled
-    
+
     def forward_fixed_grid(
         self,
         images: Tensor,

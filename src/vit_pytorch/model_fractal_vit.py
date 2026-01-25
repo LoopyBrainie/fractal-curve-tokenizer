@@ -121,6 +121,7 @@ class FractalCurveViT(nn.Module):
         fourier_levels: int = 4,
         encoder_config: Optional[AttentionEncoderConfig] = None,
         quota_learnable: Optional[bool] = None,
+        lca_fp16: bool = False,  # I104-3: 使用 FP16 存储 LCA embedding
     ) -> None:
         """初始化 FractalCurveViT。
 
@@ -190,6 +191,7 @@ class FractalCurveViT(nn.Module):
         self._is_streaming = True  # 现在所有 tokenizer 都是 streaming 模式
         self.lca_temperature = lca_temperature
         self.learnable_temperature = learnable_temperature
+        self.lca_fp16 = lca_fp16  # I104-3
 
         # ====================================================================
         # I27: 子模块 Dropout 配置 (避免硬编码)
@@ -365,6 +367,7 @@ class FractalCurveViT(nn.Module):
                 use_affine_modulation=use_affine_modulation,
                 fourier_levels=fourier_levels,
                 encoder_config=encoder_config,
+                use_fp16=lca_fp16,  # I104-3
             )
 
         # === MLP Head ===
@@ -784,10 +787,11 @@ class FractalCurveViT(nn.Module):
                 aux_infos.append(aux_info)
 
         if return_features:
-            # 直接返回 pooled 表示作为每个样本的特征
-            features_list = [pooled[i] for i in range(pooled.shape[0])]
+            # 直接返回 pooled 张量 [B, D] 而非 List[Tensor]
+            # P1 Fix: 避免冗余的 list comprehension + stack 操作
+            features_tensor = pooled
 
-        return aux_infos, features_list
+        return aux_infos, features_tensor if return_features else None
 
     # H2: Protocol compliance - overload signatures for type checkers
     @overload
@@ -815,7 +819,7 @@ class FractalCurveViT(nn.Module):
         return_aux_info: bool = False,
         return_features: bool = True,
         return_tokens: bool = False,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]: ...
+    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @overload
     def forward(
@@ -824,7 +828,7 @@ class FractalCurveViT(nn.Module):
         return_aux_info: bool = True,
         return_features: bool = True,
         return_tokens: bool = False,
-    ) -> Tuple[torch.Tensor, List[Dict[str, Any]], List[torch.Tensor]]: ...
+    ) -> Tuple[torch.Tensor, List[Dict[str, Any]], torch.Tensor]: ...
 
     @overload
     def forward(
@@ -919,17 +923,17 @@ class FractalCurveViT(nn.Module):
 
         # 6. 辅助输出
         if return_aux_info or return_features:
-            aux_infos, features_list = self._prepare_auxiliary_output(
+            aux_infos, features_tensor = self._prepare_auxiliary_output(
                 batch_size, lengths, levels_list, pooled, return_aux_info, return_features,
                 split_probs=split_probs
             )
-            
+
             if return_aux_info and return_features:
-                return final_output, aux_infos, features_list
+                return final_output, aux_infos, features_tensor
             if return_aux_info:
                 return final_output, aux_infos
             if return_features:
-                return final_output, features_list
+                return final_output, features_tensor
 
         return final_output
 
@@ -1362,6 +1366,8 @@ def create_fractal_vit(
     pool: str = "cls",
     # 编码器配置 (I98-3)
     encoder_config: Optional[AttentionEncoderConfig] = None,
+    # I104-3: FP16 存储 LCA embedding
+    lca_fp16: bool = False,
 ) -> FractalCurveViT:
     """创建 FractalCurveViT 实例的工厂函数。
 
@@ -1510,6 +1516,7 @@ def create_fractal_vit(
         use_affine_modulation=use_affine_modulation,
         fourier_levels=fourier_levels,
         encoder_config=encoder_config,
+        use_fp16=lca_fp16,  # I104-3
     )
 
     # 创建 MLP Head

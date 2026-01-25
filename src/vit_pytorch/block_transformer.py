@@ -144,6 +144,7 @@ class FractalTransformerBlock(nn.Module):
         use_affine_modulation: bool = True,  # A17: 启用 ShapeScaleEncoder
         fourier_levels: int = 4,
         encoder_config: Optional["AttentionEncoderConfig"] = None,  # I98-3
+        use_fp16: bool = False,  # I104-3: FP16 存储 LCA embedding
     ):
         super().__init__()
         self.dim = dim
@@ -161,6 +162,7 @@ class FractalTransformerBlock(nn.Module):
             use_affine_modulation=use_affine_modulation,
             fourier_levels=fourier_levels,
             encoder_config=encoder_config,
+            use_fp16=use_fp16,  # I104-3
         )
 
         self.ff = AdaptiveFractalFeedForward(
@@ -395,6 +397,7 @@ class FractalTransformer(nn.Module):
         use_dynamic_depth: bool = True,
         min_layers: int | None = None,
         complexity_hidden_dim: int | None = None,
+        use_fp16: bool = False,  # I104-3: FP16 存储 LCA embedding
     ):
         super().__init__()
         self.dim = dim
@@ -402,6 +405,7 @@ class FractalTransformer(nn.Module):
         self.max_level = max_level
         self.ffn_type = ffn_type
         self.use_checkpoint = use_checkpoint
+        self.use_fp16 = use_fp16  # I104-3
 
         # I97-11: 动态深度配置
         self.use_dynamic_depth = use_dynamic_depth
@@ -436,6 +440,7 @@ class FractalTransformer(nn.Module):
                     use_affine_modulation=use_affine_modulation,
                     fourier_levels=fourier_levels,
                     encoder_config=encoder_config,  # I98-3
+                    use_fp16=use_fp16,  # I104-3
                 )
                 for i in range(depth)
             ]
@@ -510,32 +515,14 @@ class FractalTransformer(nn.Module):
 
         batch_size, seq_len, dim = x.shape
 
-        # I97-11: 动态深度计算（仅在推理时）
-        extra_info = {'effective_depth': self.depth, 'complexity': None}
-        effective_depth = self.depth
+        # I100-6: 使用固定深度 (depth // 2) 而非动态深度
+        # 原因：动态深度的条件计算与 GPU SIMT 并行存在根本矛盾
+        #       - 条件计算要求 per-sample 独立深度 L_i
+        #       - GPU SIMT 要求 batch 内同一深度
+        #       固定深度可实现 50% FLOPs 节省，同时保持 Hilbert 局部性
+        effective_depth = self.depth // 2
 
-        if self.use_dynamic_depth and not self.training:
-            # 计算复杂度
-            if self.complexity_estimator is not None:
-                complexity = self.complexity_estimator(x)  # [B, 1]
-
-                # 线性映射到 [min_layers, depth]
-                target_layers = self.min_layers + \
-                    (self.depth - self.min_layers) * complexity  # [B, 1]
-
-                # 离散化（向下取整以节省更多计算）
-                effective_depth_per_sample = target_layers.floor().long().clamp(
-                    min=self.min_layers,
-                    max=self.depth,
-                )  # [B, 1]
-
-                # 确保batch内一致性（简化：使用mean，需要转float）
-                effective_depth = effective_depth_per_sample.float().mean().long().item()
-
-                extra_info = {
-                    'effective_depth': effective_depth,
-                    'complexity': complexity,
-                }
+        extra_info = {'effective_depth': effective_depth}
 
         # 执行transformer层
         for i, layer in enumerate(self.layers):

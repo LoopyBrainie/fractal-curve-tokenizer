@@ -49,7 +49,11 @@ def compute_max_depth(
     动态计算四叉树最大深度。
 
     数学形式:
-        L_max = max(0, floor(log2(min(H, W) / min_patch_size)))
+        L_max = max(0, ceil(log2(min(H, W) / min_patch_size)))
+
+    语义说明:
+        L_max 是确保最小 patch 达到目标尺寸所需的最小分裂次数。
+        即: min_patch_size * 2^L_max >= min_dim
 
     参数
     ----
@@ -93,7 +97,7 @@ def compute_max_depth(
 
     # 动态计算深度 (I34-5 修复: 使用 ceil 而非 floor)
     # 公式: L_max = ceil(log2(min_dim / min_patch_size))
-    # 原因: 深度d的patch大小为 min_patch * 2^d，需要满足 >= min_patch_size
+    # 语义: 确保 min_patch_size * 2^L_max >= min_dim，即最小 patch 达到目标尺寸
     max_depth = int(math.ceil(math.log2(min_dim / min_patch_size)))
 
     # 应用硬上限（如果指定）
@@ -568,7 +572,7 @@ def compute_area_similarity(
     # 归一化面积分数作为特征向量
     features = area_scores.unsqueeze(-1)  # [B, N, 1]
     norm = torch.norm(features, dim=-1, keepdim=True)  # [B, N, 1]
-    norm = norm + 1e-8  # 防止除零
+    norm = norm + SHAPE_NORM_EPSILON  # I102-4: FP16 安全下界
     features_normed = features / norm
 
     # 余弦相似性矩阵 [B, N, N]

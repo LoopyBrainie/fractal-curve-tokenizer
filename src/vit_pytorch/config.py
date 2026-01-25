@@ -176,6 +176,7 @@ class AttentionConfig:
     lca_embedding_dim: int = 128
     lca_temperature: Optional[float] = None  # None = 自动
     learnable_temperature: bool = True
+    lca_fp16: bool = False  # I104-3: 使用 FP16 存储 LCA embedding
 
     # 偏置缩放
     hilbert_bias_scale: float = HILBERT_BIAS_SCALE

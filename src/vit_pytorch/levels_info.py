@@ -47,6 +47,39 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple
 import torch
 
+# I102-8: Hilbert 索引查找表 (预计算)
+# 约束: D_max <= 6 (空间复杂度 5460 条目 ≈ 22 KB)
+_MAX_HILBERT_DEPTH = 6
+
+from .curve_hilbert import xy_to_hilbert_distance
+
+_HILBERT_LUT = {}
+for d in range(1, _MAX_HILBERT_DEPTH + 1):
+    _HILBERT_LUT[d] = {}
+    for path_int in range(4 ** d):
+        # 解码: 整数 → 路径
+        path = [(path_int // (4 ** (d - t - 1))) % 4 for t in range(d)]
+
+        # 计算坐标
+        x, y = 0, 0
+        for level, quadrant in enumerate(path):
+            half = 1 << (d - level - 1)
+            if quadrant == 1:
+                x += half
+            elif quadrant == 2:
+                y += half
+            elif quadrant == 3:
+                x += half
+                y += half
+
+        # 计算 Hilbert 距离
+        _HILBERT_LUT[d][path_int] = xy_to_hilbert_distance(1 << d, x, y)
+
+# I103-2: Hilbert 索引权重缓存 (类级缓存)
+# 避免在 get_hilbert_indices() 中重复创建权重张量
+# 内存: D_max=8 时仅需存储 36 个整数 (< 1KB)
+_hilbert_weights_cache: dict = {}
+
 
 @dataclass
 class LevelsInfo:
@@ -252,6 +285,34 @@ class LevelsInfo:
 
         return LevelsInfo.from_arrays(depths, paths, max_depth)
 
+    # ========== I103-2: 权重缓存方法 ==========
+
+    @staticmethod
+    def _get_hilbert_weights_for_depth(d: int, device: torch.device) -> torch.Tensor:
+        """获取深度 d 的 Hilbert 编码权重 (使用类级缓存)。
+
+        I103-2 优化: 使用类级缓存避免重复计算。
+
+        数学:
+            weights = [4^(d-1), 4^(d-2), ..., 4^0]
+
+        Args:
+            d: 深度 (1 <= d <= max_depth)
+            device: 目标设备
+
+        Returns:
+            weights: [d] 权重张量
+        """
+        if d not in _hilbert_weights_cache:
+            # 首次访问: 计算并缓存
+            weights_list = [4 ** (d - t - 1) for t in range(d)]
+            _hilbert_weights_cache[d] = torch.tensor(
+                weights_list,
+                dtype=torch.long,
+                device=device
+            )
+        return _hilbert_weights_cache[d].to(device, non_blocking=True)
+
     # ========== Hilbert Curve 工具方法 ==========
 
     def _path_to_hilbert_index(self, path: list[int], depth: int) -> int:
@@ -296,28 +357,52 @@ class LevelsInfo:
     def get_hilbert_indices(self) -> torch.Tensor:
         """计算 Hilbert 曲线索引 (用于排序)。
 
+        I102-8 修复: 使用查找表实现正确的向量化
+        I103-2 优化: 使用类级权重缓存避免重复创建张量
+        数学等价于 _path_to_hilbert_index，但运行时 O(B×N)
+
         Returns:
             hilbert_indices: [B, N] 每个 token 的 Hilbert 序
         """
         B, N, D_plus_1 = self.data.shape
         D = D_plus_1 - 1
+        depths = self.data[:, :, 0]  # [B, N]
+        paths = self.data[:, :, 1:]  # [B, N, D]
 
-        hilbert_indices = torch.zeros(B, N, dtype=torch.long, device=self.data.device)
+        # 验证深度约束
+        if D > _MAX_HILBERT_DEPTH:
+            raise ValueError(
+                f"Hilbert 深度 {D} 超过最大允许值 {_MAX_HILBERT_DEPTH}。"
+                "请考虑使用动态回退方案。"
+            )
 
-        for b in range(B):
-            for n in range(N):
-                depth = int(self.data[b, n, 0].item())
-                if depth < 0:
-                    continue
+        results = torch.zeros(B, N, dtype=torch.long, device=self.data.device)
 
-                path = self.data[b, n, 1 : 1 + depth].tolist()
-                idx = self._path_to_hilbert_index(path, depth)
-                hilbert_indices[b, n] = idx
+        for d in range(1, D + 1):
+            mask = (depths == d)
+            if not mask.any():
+                continue
 
-        return hilbert_indices
+            # 路径编码: [B, N] → [B, N]
+            # I103-2 优化: 使用类级缓存避免重复创建权重张量
+            weights = self._get_hilbert_weights_for_depth(d, self.data.device)
+            path_ints = (paths[:, :, :d] * weights).sum(dim=-1)
+
+            # LUT 查找
+            valid_path_ints = path_ints[mask]
+            results[mask] = torch.tensor(
+                [_HILBERT_LUT[d][int(p)] for p in valid_path_ints],
+                dtype=torch.long,
+                device=self.data.device
+            )
+
+        return results
 
     def get_lca_matrix(self) -> torch.Tensor:
         """计算 LCA 矩阵 (用于注意力偏置)。
+
+        I102-7 向量化实现: O(B×N²×D) → 纯张量运算，无 Python 循环
+        利用 broadcasting 同时计算所有 (i, j) 对的 LCA 深度。
 
         Returns:
             lca_matrix: [B, N, N] 每对 token 的 LCA 深度
@@ -325,29 +410,29 @@ class LevelsInfo:
         B, N, D_plus_1 = self.data.shape
         D = D_plus_1 - 1
 
-        lca_matrix = torch.zeros(B, N, N, dtype=torch.long, device=self.data.device)
+        # 提取深度和路径
+        depths = self.data[:, :, 0]  # [B, N]
+        paths = self.data[:, :, 1:]  # [B, N, D]
 
-        for b in range(B):
-            for i in range(N):
-                for j in range(i + 1, N):
-                    d_i = int(self.data[b, i, 0].item())
-                    d_j = int(self.data[b, j, 0].item())
+        # 创建深度掩码 [B, N, D]
+        depth_indices = torch.arange(D, device=self.data.device)  # [D]
+        depth_mask = (depth_indices < depths.unsqueeze(-1))  # [B, N, D]
 
-                    if d_i < 0 or d_j < 0:
-                        continue
+        # Broadcasting: 扩展到 [B, N, N, D]
+        paths_i = paths.unsqueeze(2)  # [B, N, 1, D]
+        paths_j = paths.unsqueeze(1)  # [B, 1, N, D]
+        mask_i = depth_mask.unsqueeze(2)  # [B, N, 1, D]
+        mask_j = depth_mask.unsqueeze(1)  # [B, 1, N, D]
 
-                    path_i = self.data[b, i, 1 : 1 + d_i].tolist()
-                    path_j = self.data[b, j, 1 : 1 + d_j].tolist()
+        # 比较所有对并应用有效掩码 [B, N, N, D]
+        match = (paths_i == paths_j)
+        valid_mask = mask_i & mask_j
 
-                    # 计算 LCA
-                    lca_depth = 0
-                    for t in range(min(d_i, d_j)):
-                        if path_i[t] == path_j[t]:
-                            lca_depth = t + 1
-                        else:
-                            break
+        # LCA 深度 = 匹配且有效的层数 [B, N, N]
+        lca_matrix = (match & valid_mask).sum(dim=-1)
 
-                    lca_matrix[b, i, j] = lca_depth
-                    lca_matrix[b, j, i] = lca_depth
+        # I102-7: 向量化对角线清零 - 使用 diagonal() 方法替代 Python 循环
+        # 数学形式: LCA_out = LCA_in ⊙ (1 - I_N)^(⊗B)
+        lca_matrix.diagonal(dim1=1, dim2=2).zero_()
 
         return lca_matrix

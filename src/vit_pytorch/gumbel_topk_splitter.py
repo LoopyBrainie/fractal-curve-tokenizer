@@ -85,6 +85,9 @@ from .constants import (
     DEPTH_VARIANCE_NORM_ENABLED,
     DEPTH_VARIANCE_NORM_EPS,
     DEPTH_VARIANCE_INIT_EPS,  # I96-1: EMA 初始化下界
+    DEPTH_VARIANCE_INIT_EPS_B1,  # I100-5: B=1 保守初始化
+    DEPTH_VARIANCE_INIT_EPS_B2,  # I100-5: B=2 保守初始化
+    DEPTH_VARIANCE_INIT_EPS_B4,  # I100-5: B=4 保守初始化
     DEPTH_EMA_ALPHA,  # I35: EMA 系数
     SOFT_EXCLUSION_MARGIN,  # I96-4: 树一致性软排除边距
     # I24-2 方案E: 可学习配额
@@ -111,6 +114,11 @@ from .constants import (
     ELASTIC_LAMBDA_COLLAPSE,
 )
 from .config import SplitterConfig
+from .base_splitter import (
+    CoreSplitter,
+    AnnealingSplitter,
+    MetricsSplitter,
+)
 from typing import Optional
 
 
@@ -208,36 +216,44 @@ class GumbelTopKResult:
         return self.num_selected_per_batch.shape[0]
 
 
-class GumbelTopKSplitter(nn.Module):
+class GumbelTopKSplitter(
+    nn.Module,  # 必须放在最左边以确保正确初始化
+    CoreSplitter,
+    AnnealingSplitter,
+    MetricsSplitter,
+):
     """
     Gumbel-Top-K 自适应分割器 (方案 D/E)。
 
     核心优势:
         1. 100% Hilbert 局部性: 每个 token 精确对应一个四叉树区域
-        2. 梯度覆盖设计 (I96-6 修正):
-           - Scheme D (固定配额): 全局 Softmax → ~100% 覆盖率，梯度强度比 ~50:1
-           - Scheme E (可学习配额): 深度内 Subset Softmax → ~K/N 覆盖率，Top-K 外梯度为 0
+        2. 梯度覆盖设计 (CRIT-1 修正):
+           - Scheme D/E: 全局 Softmax → ~100% 覆盖率，梯度强度比 ~20:1
+           - 理由: 与 Hilbert 局部性正交，消除死区问题
         3. 无串行依赖: 并行评估所有候选
         4. 树一致性: 向量化 O(1) 约束
 
     I30-10: 支持 SplitterConfig 统一配置
 
-    数学说明 (I96-6):
-        全局 Softmax (Scheme D): 所有候选有梯度，梯度 ∝ (δ_i∈TopK - p_i)
-        Subset Softmax (Scheme E): 仅 Top-K 内有梯度，Top-K 外梯度 = 0
+    数学说明 (CRIT-1):
+        全局 Softmax (Scheme D/E): 所有候选有梯度，梯度 ∝ (δ_i∈TopK - p_i)
         量化分析 (K=32, N=85):
             - 选中 token: p_i ≈ 0.38, 梯度 ~ 0.24
-            - 未选中 token: p_i ≈ 0.012, 梯度 ~ 0.012 (全局 Softmax, 衰减 ~20x)
-            - Scheme E: Top-K 外梯度 = 0 (Subset Softmax)
+            - 未选中 token: p_i ≈ 0.012, 梯度 ~ 0.012 (衰减 ~20x)
 
     与 LearnableSplitter 对比:
         | 指标               | LearnableSplitter | Scheme D | Scheme E |
         |--------------------|-------------------|----------|----------|
         | Hilbert 局部性     | 100%              | 100%     | 100%     |
-        | 有效梯度覆盖       | ~25%              | ~100%    | ~37.6%   |
-        | 深度饥饿风险       | 高               | 无       | 中       |
+        | 有效梯度覆盖       | ~25%              | ~100%    | ~100%    |
+        | 深度饥饿风险       | 高               | 无       | 无       |
         | 串行依赖           | 有                | 无       | 无       |
         | 计算开销           | 1.0x              | ~4x      | ~4x      |
+
+    I98-7: 完整实现 Splitter Protocol 层次:
+        - CoreSplitter: 核心决策逻辑
+        - AnnealingSplitter: 温度/偏置退火
+        - MetricsSplitter: 诊断指标和正则化
     """
 
     def __init__(
@@ -303,6 +319,10 @@ class GumbelTopKSplitter(nn.Module):
             self._K_min_abs = config.K_min_abs
             self._K_max_hard = config.K_max_hard
             self._use_adaptive_coverage = config.use_adaptive_coverage
+            # I100-7: 信息密度自适应配额
+            self._enable_info_adaptive_quota = getattr(
+                config, "enable_info_adaptive_quota", False
+            )
         else:
             # 使用传统参数（向后兼容）
             self.config = None
@@ -319,6 +339,8 @@ class GumbelTopKSplitter(nn.Module):
             self._K_min_abs = K_MIN_HARD_LIMIT
             self._K_max_hard = K_MAX_HARD_LIMIT
             self._use_adaptive_coverage = True
+            # I100-7: 信息密度自适应配额 (默认关闭)
+            self._enable_info_adaptive_quota = False
 
         # I30-17-EXT: 存储配置，不预计算
         self.feature_dim = feature_dim
@@ -410,6 +432,9 @@ class GumbelTopKSplitter(nn.Module):
         else:
             self.quota_logits = None
 
+        # I98-7: 初始化 CoreSplitter Protocol 属性 (必须在 _update_candidates 之前)
+        self._num_candidates = 0
+
         # I30-17-EXT: 初始化候选区域 (基于初始 image_size)
         self._update_candidates(image_size)
         
@@ -450,6 +475,12 @@ class GumbelTopKSplitter(nn.Module):
         self.register_buffer('_depth_ema_var', torch.ones(self._max_batch_size, D))   # [B_max, D]
         self._depth_ema_initialized = False  # 标记是否已初始化
 
+        # I103-3: 设备端张量惰性缓存 (避免重复 .to(device) 传输)
+        self._cached_device_regions: Optional[torch.Tensor] = None
+        self._cached_device_depths: Optional[torch.Tensor] = None
+        self._cached_device_thresholds: Optional[torch.Tensor] = None
+        self._cached_device_children_matrix: Optional[torch.Tensor] = None
+
         # 初始化权重
         self._init_weights()
 
@@ -473,6 +504,66 @@ class GumbelTopKSplitter(nn.Module):
 
         nn.init.xavier_uniform_(self.depth_proj.weight)
         nn.init.zeros_(self.depth_proj.bias)
+
+    # I103-3: 设备端张量惰性缓存方法
+    def _get_device_tensor(
+        self,
+        cpu_tensor: torch.Tensor,
+        cache_attr: str,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """获取设备端张量 (使用惰性缓存避免重复传输)。
+
+        I103-3 优化: 首次传输后缓存设备端副本，后续调用复用缓存。
+
+        数学:
+            T_device = T_cpu.to(device)  (仅首次)
+            T_device = cached            (后续调用，设备匹配时)
+
+        Args:
+            cpu_tensor: CPU 端原始张量
+            cache_attr: 缓存字段名 (如 "_cached_device_regions")
+            device: 目标设备
+
+        Returns:
+            设备端张量
+        """
+        cached = getattr(self, cache_attr, None)
+        if cached is not None:
+            # 缓存存在，检查设备是否匹配
+            if cached.device == device:
+                return cached
+            # 设备不匹配，需要迁移
+            return cached.to(device, non_blocking=True)
+
+        # 首次传输
+        device_tensor = cpu_tensor.to(device, non_blocking=True)
+        setattr(self, cache_attr, device_tensor)
+        return device_tensor
+
+    # ============================================================================
+    # CoreSplitter Protocol 实现 (I98-7)
+    # ============================================================================
+
+    @property
+    def max_depth_limit(self) -> int:
+        """获取最大深度限制。"""
+        return self._current_max_depth_limit
+
+    @property
+    def num_candidates(self) -> int:
+        """获取当前候选区域数量。"""
+        return self._num_candidates
+
+    @num_candidates.setter
+    def num_candidates(self, value: int) -> None:
+        """设置候选区域数量。"""
+        self._num_candidates = value
+
+    @property
+    def is_training(self) -> bool:
+        """获取当前训练/评估模式。"""
+        return self.training
 
     # I30-17-EXT: 动态候选区域更新方法
     def _update_candidates(self, image_size: Tuple[int, int]):
@@ -507,6 +598,11 @@ class GumbelTopKSplitter(nn.Module):
             self._current_max_depth = computed_max_depth
             self._current_image_size = image_size
             self._children_matrix = None  # 重置子节点矩阵
+            # I103-3: 清除设备端缓存 (候选区域已从缓存恢复)
+            self._cached_device_regions = None
+            self._cached_device_depths = None
+            self._cached_device_thresholds = None
+            self._cached_device_children_matrix = None
             return
 
         # 重新计算候选区域
@@ -516,6 +612,11 @@ class GumbelTopKSplitter(nn.Module):
         self._current_max_depth = computed_max_depth
         self._current_image_size = image_size
         self._children_matrix = None
+        # I103-3: 清除设备端缓存 (候选区域已更新)
+        self._cached_device_regions = None
+        self._cached_device_depths = None
+        self._cached_device_thresholds = None
+        self._cached_device_children_matrix = None
 
         # 存入缓存 (限制大小)
         if len(self._candidate_cache) < 256:
@@ -768,7 +869,10 @@ class GumbelTopKSplitter(nn.Module):
             normalized: [B, N] 按深度归一化后的 logits
         """
         B, N = logits.shape
-        depths = self.candidate_depths.to(device, non_blocking=True)  # [N] I78: 异步传输
+        # I103-3: 使用设备端缓存
+        depths = self._get_device_tensor(
+            self.candidate_depths, "_cached_device_depths", device
+        )  # [N]
         D = self._current_max_depth + 1
 
         # P-OPT-3: 向量化深度方差归一化
@@ -823,11 +927,21 @@ class GumbelTopKSplitter(nn.Module):
                 var_b = variance_per_batch[b]  # [D]
 
                 if not self._depth_ema_initialized:
-                    # 首次初始化：对每个样本独立初始化
+                    # I100-5: 首次初始化 - 分层保守初始化
+                    # 根据 batch size 的统计可靠性分级处理
                     safe_var = var_b.detach().clamp(min=DEPTH_VARIANCE_NORM_EPS)
-                    if B <= 2:
-                        safe_var = safe_var.clamp(min=DEPTH_VARIANCE_INIT_EPS)
-                        print(f"Warning: Small batch (B={B}), using conservative EMA variance initialization (eps={DEPTH_VARIANCE_INIT_EPS})")
+                    if B == 1:
+                        # B=1: 样本方差无定义，使用先验 σ²=0.25
+                        safe_var = safe_var.clamp(min=DEPTH_VARIANCE_INIT_EPS_B1)
+                        print(f"Warning: B={B}, using B1 tiered init (eps={DEPTH_VARIANCE_INIT_EPS_B1})")
+                    elif B == 2:
+                        # B=2: 置信区间 5124:1，需要 4× 缓冲
+                        safe_var = safe_var.clamp(min=DEPTH_VARIANCE_INIT_EPS_B2)
+                        print(f"Warning: B={B}, using B2 tiered init (eps={DEPTH_VARIANCE_INIT_EPS_B2})")
+                    elif B == 4:
+                        # B=4: 置信区间 130:1，需要 1.5× 缓冲
+                        safe_var = safe_var.clamp(min=DEPTH_VARIANCE_INIT_EPS_B4)
+                    # B≥4: 使用 DEPTH_VARIANCE_NORM_EPS (1e-6)
                     self._depth_ema_mean[b, :D] = mu_b.detach()
                     self._depth_ema_var[b, :D] = safe_var
                 else:
@@ -889,11 +1003,15 @@ class GumbelTopKSplitter(nn.Module):
     @property
     def current_temperature(self) -> float:
         """当前温度 τ > 0。
-        
+
         I18-5: 温度下界从 0.01 提升到 0.1，确保 STE 梯度健康。
         """
         return self.log_temperature.exp().clamp(min=TEMPERATURE_MIN).item()
-    
+
+    def get_current_temperature(self) -> float:
+        """获取当前 Gumbel 温度值 (AnnealingSplitter 接口)。"""
+        return self.current_temperature
+
     @property 
     def thresholds(self) -> Tensor:
         """当前有效阈值向量。"""
@@ -962,8 +1080,11 @@ class GumbelTopKSplitter(nn.Module):
         K = max(min(K, N), min(self.K_min, N))
         
         # I24-2 方案E: 分层 Top-K (可学习配额)
+        # I100-7: 传递 features 以支持信息密度自适应配额
         if LEARNABLE_QUOTA_ENABLED and self.quota_logits is not None:
-            selected_mask, topk_indices = self._stratified_gumbel_topk_ste(logits, K, hard)
+            selected_mask, topk_indices = self._stratified_gumbel_topk_ste(
+                logits, K, hard, features=features
+            )
         else:
             # 传统全局 Top-K
             selected_mask, topk_indices = self._gumbel_topk_ste(logits, K, hard)
@@ -1029,9 +1150,11 @@ class GumbelTopKSplitter(nn.Module):
         N = self.num_candidates
         device = features.device
         dtype = features.dtype
-        
-        # 缩放区域坐标到特征图空间 (I78: 异步传输 + clone 支持原地修改)
-        regions_feat = self.candidate_regions.to(device, non_blocking=True).clone()
+
+        # 缩放区域坐标到特征图空间 (I103-3: 缓存 + clone 支持原地修改)
+        regions_feat = self._get_device_tensor(
+            self.candidate_regions, "_cached_device_regions", device
+        ).clone()
         regions_feat[:, [0, 2]] *= scale_w  # x
         regions_feat[:, [1, 3]] *= scale_h  # y
         
@@ -1070,9 +1193,11 @@ class GumbelTopKSplitter(nn.Module):
         # ====================================================================
         if DEPTH_VARIANCE_NORM_ENABLED:
             complexity_logits = self._normalize_by_depth(complexity_logits, device, dtype)
-        
-        # 深度嵌入偏置 - 确保在正确设备上 (I78: 异步传输)
-        depths = self.candidate_depths.to(device, non_blocking=True)  # [N]
+
+        # 深度嵌入偏置 - 确保在正确设备上 (I103-3: 使用缓存)
+        depths = self._get_device_tensor(
+            self.candidate_depths, "_cached_device_depths", device
+        )  # [N]
         # STAB-7 修复: 确保索引张量为连续格式 (channels-last 兼容)
         depths = depths.contiguous()
         depth_embed = self.depth_embedding(depths)  # [N, 16]
@@ -1083,8 +1208,10 @@ class GumbelTopKSplitter(nn.Module):
 
         # I30-4: 已移除 Log-Compensation (被方案E完全替代)
 
-        # 阈值 - 确保 thresholds 在正确设备上 (I78: 异步传输)
-        thresholds = self.thresholds.to(device, non_blocking=True)
+        # 阈值 - 确保 thresholds 在正确设备上 (I103-3: 使用缓存)
+        thresholds = self._get_device_tensor(
+            self.thresholds, "_cached_device_thresholds", device
+        )
         taus = thresholds[depths]  # [N]
         
         # 总 logits
@@ -1223,88 +1350,71 @@ class GumbelTopKSplitter(nn.Module):
 
             return K
     
-    def _compute_quota_allocation(self, K: int) -> Tensor:
+    def _compute_quota_allocation(
+        self, K: int, info_density: Optional[Tensor] = None
+    ) -> Tensor:
         """
-        计算可学习配额分配 (I24-2 方案E, I32-3 贪心最优重构)。
+        配额分配 (I100-7 重构为标准 Largest Remainder Method)。
 
         数学形式化
         ==========
 
         问题定义:
-            输入: p = softmax(φ) ∈ Δ^{D-1}, K ∈ ℤ⁺, k_min ∈ ℤ⁺
-            约束: ΣK_d = K, K_d ≥ k_min, K_d ∈ ℤ
+            输入: p = softmax(φ) ∈ Δ^{D-1}, K ∈ ℤ⁺
+            约束: ΣK_d = K, K_d ≥ 0, K_d ∈ ℤ
             目标: min Σ|K_d - p_d·K|
 
-        I32-3 改进: 比例缩放 + 贪心微调
-        ------------------------------
-        相比原实现的改进:
-        1. 移除复杂的比例缩放逻辑，简化流程
-        2. 迭代微调时使用偏差驱动而非最大值驱动
-        3. 严格的约束满足保证
+        算法: Largest Remainder Method (Hamilton Method)
+        ------------------------------------------------
+        公式:
+            K_d^floor = floor(p_d × K)
+            r_d = p_d × K - K_d^floor (余数)
+            K_d = K_d^floor + 1 如果 r_d 在 top-(K - ΣK_d^floor) 中
+
+        最优性 (Hondt, 1878):
+            LRM 最小化 L₁ 误差，且满足:
+            - 配额单调性: p_d ≥ p_e ⇒ K_d/K ≥ K_e/K
+            - 人口 monotonicity: K 增加时 K_d 不减少
+
+        与旧实现对比 (I32-3):
+            旧: 迭代微调 O(D²)，不保证最优
+            新: 直接计算 O(D log D)，数学最优
 
         Args:
             K: 总 token 配额
+            info_density: [D] 各深度的信息密度 (可选，I100-7)
 
         Returns:
             quota: [D] 每个深度的配额分配
         """
         D = self._current_max_depth + 1
-        # I100-2 FIX: 使用 quota_logits.device 确保所有张量在同一设备
         device = self.quota_logits.device if self.quota_logits is not None else self.candidate_depths.device
+
+        # I100-7: 信息密度自适应模式
+        if info_density is not None and self._enable_info_adaptive_quota:
+            return self._compute_quota_allocation_info_adaptive(K, info_density)
 
         if self.quota_logits is None or not self._enable_learnable_quota:
             # 回退到均匀分配
             quota = torch.full((D,), K // D, dtype=torch.long, device=device)
-            quota[D - 1] += K - quota.sum()  # 余数给最后一个深度
+            quota[D - 1] += K - quota.sum()
             return quota
 
         # Softmax 计算配额概率
-        # I35 Fix: 切片到当前深度维度，避免 quota_logits (max_depth+1) 与
-        # _current_max_depth+1 不匹配的问题
         p = F.softmax(self.quota_logits[:D], dim=0)  # [D]
-        p = p.to(device)  # 确保与 quota 一致
+        p = p.to(device)
 
-        # 初始四舍五入
-        quota = (p * K).round().long()
+        # I100-7: 标准 Largest Remainder Method (LRM)
+        floor_quota = (p * K).floor().long()  # [D]
+        remainders = (p * K) - floor_quota    # [D]
+        remaining = K - floor_quota.sum()     # 剩余配额数量
 
-        # I96-7 FIX: 移除硬下界约束，改用软正则化
-        # 原因: 硬约束 (K_d >= 2) 存在数学问题:
-        #   1. 深度 0: N_0=1 < K_0^min=2 (不可行)
-        #   2. 浅层过度表示: 深度 1 采样率是深度 4 的 64 倍
-        # 解决方案: 不使用硬下界，下界通过 _compute_quota_loss 中的软正则化实现
-        # quota = quota.clamp(min=min_quota)  # 已移除
+        if remaining > 0:
+            # 分配给余数最大的深度
+            _, indices = torch.topk(remainders, min(remaining, D))
+            floor_quota[indices] += 1
 
-        # I32-3: 迭代微调确保 ΣK_d = K (最多 D 次)
-        for _ in range(D):
-            total = quota.sum()
-            diff = K - total  # >0: 不足, <0: 超出
-
-            if diff == 0:
-                break
-
-            if diff > 0:
-                # 不足时：优先从概率最高的深度增加
-                # 保持与 softmax 概率的一致性
-                probs_sorted, indices = torch.sort(p, descending=True)
-                for i in range(min(diff, D)):
-                    quota[indices[i]] += 1
-            else:
-                # 超出时：从概率最低的深度扣减（无硬下界）
-                # I96-7: 允许扣减到 0，下界通过软正则化实现
-                mask = quota > 0
-                if mask.sum() > 0:
-                    # 获取可扣减的深度及其概率
-                    available_p = p[mask]
-                    available_indices = torch.masked_select(
-                        torch.arange(D, device=device), mask
-                    )
-                    # 优先从概率最低的扣减
-                    _, sorted_idx = torch.sort(available_p, descending=False)
-                    for i in range(min(-diff, len(sorted_idx))):
-                        idx = available_indices[sorted_idx[i]]
-                        quota[idx] -= 1
-
-        return quota
+        return floor_quota
 
     def _compute_quota_loss(self, K: int) -> Tensor:
         """
@@ -1366,12 +1476,21 @@ class GumbelTopKSplitter(nn.Module):
         # 目的: 鼓励但不强制深度下界，软约束允许模型学习最优分布
         # 优势: 无约束满足问题，梯度完整，保持 Hilbert 曲线局部性
         K_soft_float = K_soft.float()  # 转换为浮点用于计算
-        K_min_targets = []
-        for d in range(D):
-            N_d = 4 ** d  # 深度 d 的候选数量
-            K_min_d = max(1, int(QUOTA_MIN_RATIO * N_d))
-            K_min_targets.append(K_min_d)
-        K_min_tensor = torch.tensor(K_min_targets, device=K_soft.device, dtype=K_soft_float.dtype)
+        # I105-1: 向量化实现 (替代 Python for 循环)
+        # 原代码:
+        #     K_min_targets = []
+        #     for d in range(D):
+        #         N_d = 4 ** d
+        #         K_min_d = max(1, int(QUOTA_MIN_RATIO * N_d))
+        #         K_min_targets.append(K_min_d)
+        #     K_min_tensor = torch.tensor(K_min_targets, device=K_soft.device, dtype=K_soft_float.dtype)
+        depth_indices = torch.arange(D, device=K_soft.device, dtype=torch.long)
+        N = 4 ** depth_indices  # [D], 向量化几何序列
+        # 注意: 使用 floor() 而非 ceil() 以保持与 int() 截断行为一致
+        K_min_tensor = torch.clamp(
+            (QUOTA_MIN_RATIO * N).floor().long(),
+            min=1
+        ).to(dtype=K_soft_float.dtype)  # [D], 无需手动创建列表
 
         # 计算下界违反: max(0, K_min - K_soft)
         violation = (K_min_tensor - K_soft_float).clamp(min=0)
@@ -1382,34 +1501,158 @@ class GumbelTopKSplitter(nn.Module):
 
         return loss
 
+    # I100-7: 信息密度自适应配额计算
+    def _compute_info_density(self, features: Tensor) -> Tensor:
+        """
+        计算图像的多尺度信息密度 (I100-7 方案D 改进版 v2)。
+
+        数学形式化
+        ==========
+
+        问题定义:
+            给定特征图 F ∈ ℝ^{B×C×H×W}，计算各尺度的信息密度
+
+        改进的信息密度估计 (I100-7 v2):
+            使用特征图的 **归一化局部变化** 而非绝对范数
+
+        理由:
+            1. L2 范数受特征强度影响，产生偏差
+            2. 使用局部变化率更公平
+            3. 变化率反映该尺度的信息丰富程度
+
+        公式:
+            I_d = mean(|F_d - mean(F_d)|) / (std(F_d) + ε)
+
+        Args:
+            features: [B, C, H_feat, W_feat] 特征图
+
+        Returns:
+            info_density: [D] 各深度的信息密度 (归一化)
+        """
+        B, C, H_feat, W_feat = features.shape
+        D = self._current_max_depth + 1
+
+        info_density = []
+
+        for d in range(D):
+            # 深度 d 对应的特征图分辨率
+            h_d = max(1, H_feat // (2 ** d))
+            w_d = max(1, W_feat // (2 ** d))
+
+            if h_d == H_feat and w_d == W_feat:
+                feat_d = features
+            else:
+                feat_d = F.adaptive_avg_pool2d(features, (h_d, w_d))
+
+            # 计算归一化变化率作为信息密度
+            # mean(|x - mean(x)|) / std(x) = 变异系数
+            # [B, C, h_d, w_d] → [B]
+            feat_mean = feat_d.mean(dim=(1, 2, 3), keepdim=True)  # [B, 1, 1, 1]
+            feat_std = feat_d.std(dim=(1, 2, 3), keepdim=True) + 1e-8  # [B, 1, 1, 1]
+
+            # 变异系数 (coefficient of variation)
+            cv = ((feat_d - feat_mean).abs() / feat_std).mean()
+
+            info_density.append(cv)
+
+        # 归一化: 使用 softmax 确保 Σ I_d = 1
+        info_density = torch.stack(info_density)  # [D]
+        info_density_norm = F.softmax(info_density, dim=0)
+
+        return info_density_norm
+
+    def _compute_quota_allocation_info_adaptive(
+        self, K: int, info_density: Tensor
+    ) -> Tensor:
+        """
+        信息密度自适应配额分配 (I100-7 重构为标准 LRM)。
+
+        数学形式化
+        ==========
+
+        核心思想:
+            配额与信息密度成正比，而非固定分布
+
+        算法: Largest Remainder Method (Hamilton Method)
+        ------------------------------------------------
+        公式:
+            q_d^floor = floor(I_d × K)
+            r_d = I_d × K - q_d^floor (余数)
+            q_d = q_d^floor + 1 如果 r_d 在 top-(K - Σq_d^floor) 中
+
+        最优性:
+            LRM 最小化 L₁ 误差: min Σ|q_d - I_d·K|
+
+        与可学习配额的对比:
+            - 可学习配额: q_d = K × softmax(φ)_d (全局静态)
+            - 信息密度自适应: q_d = K × I_d (输入自适应)
+
+        Args:
+            K: 总 token 配额
+            info_density: [D] 各深度的信息密度 (归一化)
+
+        Returns:
+            quota: [D] 每个深度的配额分配
+        """
+        D = self._current_max_depth + 1
+        device = info_density.device
+
+        # 确保 info_density 长度匹配当前深度
+        if len(info_density) < D:
+            # 填充均匀分布
+            info_density_extended = info_density.new_zeros(D)
+            info_density_extended[: len(info_density)] = info_density
+            info_density_extended[len(info_density) :] = 1.0 / D
+            info_density = info_density_extended
+        elif len(info_density) > D:
+            info_density = info_density[:D]
+
+        # I100-7: 标准 Largest Remainder Method (LRM)
+        floor_quota = (info_density * K).floor().long()  # [D]
+        remainders = (info_density * K) - floor_quota    # [D]
+        remaining = K - floor_quota.sum()                # 剩余配额数量
+
+        if remaining > 0:
+            # 分配给余数最大的深度
+            _, indices = torch.topk(remainders, min(remaining, D))
+            floor_quota[indices] += 1
+
+        return floor_quota
+
     def _stratified_gumbel_topk_ste(
         self,
         logits: Tensor,
         K: int,
         hard: bool = False,
+        features: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
-        分层 Gumbel-Top-K 选择 (I24-2 方案E 核心)。
-        
+        分层 Gumbel-Top-K 选择 (Scheme E 核心，I100-7 信息密度自适应)。
+
         数学形式化
         ==========
-        
+
         与全局 Top-K 的区别:
             全局: selected = TopK(logits, K)  → 深度崩塌
             分层: selected = ∪_d TopK(logits[d], K_d)  → 配额保证
-            
-        STE 梯度流:
-            深度内独立 softmax → 梯度增强 K/K_d 倍
-            例: K=32, K_d=8 → 梯度增强 4x (相比全局 softmax)
-            
+
+        CRIT-1 修正: 使用全局 Softmax 而非 Subset Softmax
+            - 旧: 深度内 Subset Softmax → ~K/N 梯度覆盖率 (37.6%)
+            - 新: 深度内全局 Softmax → ~100% 梯度覆盖率
+            - 理由: 与 Hilbert 局部性正交，消除死区问题
+
         配额下界保护:
-            K_d >= 1 保证每个深度至少有梯度信号
-            
+            K_d >= 1 保证每个深度至少有硬选择
+
+        I100-7 信息密度自适应:
+            当 features 不为 None 时，使用信息密度驱动配额分配
+
         Args:
             logits: [B, N] 候选 logits
             K: 总选择数量
             hard: 是否使用硬决策
-            
+            features: [B, C, H, W] 输入特征 (可选，I100-7)
+
         Returns:
             selected_mask: [B, N] STE 选择掩码 (有梯度)
             topk_indices: [B, K'] 硬选择索引 (K' 可能略小于 K)
@@ -1417,10 +1660,18 @@ class GumbelTopKSplitter(nn.Module):
         B, N = logits.shape
         device = logits.device
         D = self._current_max_depth + 1
-        depths = self.candidate_depths.to(device, non_blocking=True)  # [N] I78: 异步传输
-        
-        # 计算配额分配
-        quota = self._compute_quota_allocation(K)  # [D]
+        # I103-3: 使用设备端缓存
+        depths = self._get_device_tensor(
+            self.candidate_depths, "_cached_device_depths", device
+        )  # [N]
+
+        # I100-7: 计算信息密度 (如果启用且提供了 features)
+        info_density = None
+        if features is not None and self._enable_info_adaptive_quota:
+            info_density = self._compute_info_density(features)
+
+        # 计算配额分配 (支持信息密度自适应)
+        quota = self._compute_quota_allocation(K, info_density)  # [D]
         
         # I18-5: 使用 TEMPERATURE_MIN 常量确保梯度健康
         T = self.log_temperature.exp().clamp(min=TEMPERATURE_MIN)
@@ -1445,13 +1696,12 @@ class GumbelTopKSplitter(nn.Module):
             num_per_depth.append(len(depth_indices))
 
         # I97-4 优化: 批量提取 K_d（减少 CPU/GPU 同步）
-        # 注意：topk 的 k 必须是 Python int，所以最终仍需 .item() 调用
-        # 但我们通过预计算 depth_indices 减少了 D 次 nonzero() 调用
-        K_d_values = []
-        for k_tensor, n in zip(quota.detach().clamp(min=0), num_per_depth):
-            k_d = k_tensor.long().item()
-            k_d = min(max(k_d, 0), n)
-            K_d_values.append(k_d)
+        # I102-6: 使用 tolist() 一次性转换，避免 D 次 .item() 调用
+        quota_clamped = quota.detach().clamp(min=0).long()  # [D] 张量
+        K_d_values_raw = quota_clamped.tolist()  # 一次性转换为 Python 列表
+
+        # 批量边界检查（避免 Python 循环内的 .item() 调用）
+        K_d_values = [min(max(k_d, 0), n) for k_d, n in zip(K_d_values_raw, num_per_depth)]
         # K_d_values 是 Python int 列表，用于后续的 topk k 参数
 
         # 分层选择
@@ -1477,14 +1727,14 @@ class GumbelTopKSplitter(nn.Module):
                 perturbed = (logits_d + gumbel) / T_fp32
                 topk_vals, topk_local = torch.topk(perturbed, K_d, dim=1)  # [B, K_d]
 
-                # 深度内 Subset Softmax
-                subset_softmax = F.softmax(topk_vals, dim=1)  # [B, K_d]
+                # CRIT-1: 使用全局 Softmax (而非 Subset Softmax)
+                # 原因: Subset Softmax 梯度覆盖率仅 K/N ≈ 37.6%，与 Hilbert 曲线期望冲突
+                #       全局 Softmax 提供 ~100% 梯度覆盖，消除死区问题
+                # 数学: π_i = e^{z_i} / Σ_j e^{z_j}，梯度 ∂L/∂z_j 对所有 j 非零
+                depth_softmax = F.softmax(perturbed, dim=1)  # [B, N_d]
 
-                # 映射回全局索引
-                topk_global = depth_indices[topk_local]  # [B, K_d]
-
-                # 更新 soft_mask
-                soft_mask.scatter_(1, topk_global, subset_softmax)
+                # 更新 soft_mask（使用全局 softmax）
+                soft_mask[:, depth_indices] = depth_softmax  # [B, N_d]
 
             # 更新 hard_mask
             topk_global = depth_indices[topk_local]  # [B, K_d]
@@ -1636,8 +1886,10 @@ class GumbelTopKSplitter(nn.Module):
         B, N = selected_mask.shape
         device = selected_mask.device
 
-        # 确保 children_matrix 在正确设备上 (I78: 异步传输)
-        children_matrix = self._children_matrix.to(device, non_blocking=True)  # [N, 4]
+        # 确保 children_matrix 在正确设备上 (I103-3: 使用缓存)
+        children_matrix = self._get_device_tensor(
+            self._children_matrix, "_cached_device_children_matrix", device
+        )  # [N, 4]
 
         # 对于每个节点，检查其子节点是否被选中
         # valid_children: [N, 4] 哪些子节点索引是有效的
@@ -1739,12 +1991,17 @@ class GumbelTopKSplitter(nn.Module):
         selected_positions = final_selected.nonzero(as_tuple=False)  # [total, 2]
         batch_indices = selected_positions[:, 0]  # [total]
         candidate_indices = selected_positions[:, 1]  # [total]
-        
-        # 向量化索引所有候选属性 - 确保在正确设备上 (I78: 异步传输)
-        regions = self.candidate_regions.to(device, non_blocking=True)[candidate_indices]  # [total, 4]
-        depths = self.candidate_depths.to(device, non_blocking=True)[candidate_indices]  # [total]
-        hilbert_indices = self.hilbert_indices.to(device, non_blocking=True)[candidate_indices]  # [total]
-        
+
+        # 向量化索引所有候选属性 - I103-3: 使用缓存
+        regions = self._get_device_tensor(
+            self.candidate_regions, "_cached_device_regions", device
+        )[candidate_indices]  # [total, 4]
+        depths = self._get_device_tensor(
+            self.candidate_depths, "_cached_device_depths", device
+        )[candidate_indices]  # [total]
+        # hilbert_indices 直接从 CPU 获取并索引
+        hilbert_indices = self.hilbert_indices[candidate_indices]  # [total]
+
         return GumbelTopKResult(
             regions=regions,
             depths=depths,
@@ -1862,11 +2119,14 @@ class GumbelTopKSplitter(nn.Module):
         # 2. Soft Entropy Loss
         if include_soft_entropy and probs is not None:
             entropy_loss = self.get_depth_entropy_loss(weight=entropy_weight, probs=probs)
-            
+
             if entropy_mode == 'target' and entropy_target is not None:
                 # Target mode: minimize |H - H_target|²
                 B, N = probs.shape
-                depths = self.candidate_depths.to(probs.device)
+                # I103-3: 使用设备端缓存
+                depths = self._get_device_tensor(
+                    self.candidate_depths, "_cached_device_depths", probs.device
+                )
 
                 # 计算当前熵
                 depth_probs = []
@@ -1963,7 +2223,10 @@ class GumbelTopKSplitter(nn.Module):
             return torch.tensor(0.0, device=self.candidate_regions.device)
 
         B, N = probs.shape
-        depths = self.candidate_depths.to(probs.device)  # [N]
+        # I103-3: 使用设备端缓存
+        depths = self._get_device_tensor(
+            self.candidate_depths, "_cached_device_depths", probs.device
+        )  # [N]
         D = self._current_max_depth + 1
 
         # P-OPT-7: 向量化深度平均概率计算 (消除 for 循环)
@@ -2071,7 +2334,10 @@ class GumbelTopKSplitter(nn.Module):
 
         B, N = selected_mask.shape
         device = selected_mask.device
-        depths = self.candidate_depths.to(device, non_blocking=True)  # I78: 异步传输
+        # I103-3: 使用设备端缓存
+        depths = self._get_device_tensor(
+            self.candidate_depths, "_cached_device_depths", device
+        )  # [N]
         D = self._current_max_depth + 1
 
         with torch.no_grad():
@@ -2305,6 +2571,103 @@ class GumbelTopKSplitter(nn.Module):
             'explore_bias': self.explore_bias.item(),
             'depth_bias_beta': self.depth_bias_beta.item(),
             'depth_bias_gamma': self.depth_bias_gamma.item(),
+        }
+
+    # ============================================================================
+    # MetricsSplitter 接口实现 (I98-7)
+    # ============================================================================
+
+    def get_quota_logits(self) -> Optional[Tensor]:
+        """
+        获取可学习配额 logits。
+
+        数学:
+            φ = [φ_0, φ_1, ..., φ_{D-1}]
+            π_d = softmax(φ)_d
+
+        Returns:
+            None 如果未启用可学习配额
+        """
+        return self.quota_logits
+
+    def get_quota_probs(self) -> Optional[Tensor]:
+        """
+        获取配额概率分布。
+
+        数学:
+            π = softmax(φ)
+
+        Returns:
+            None 如果未启用可学习配额
+        """
+        if self.quota_logits is None:
+            return None
+        return F.softmax(self.quota_logits, dim=0)
+
+    def get_variance_regularization(self) -> Tensor:
+        """
+        获取深度方差正则化损失。
+
+        数学:
+            L_var = Σ_d π_d × (d - E[d])²
+            E[d] = Σ_d d × π_d
+            避免配额过度集中于特定深度
+
+        Returns:
+            Tensor: 方差正则化损失值
+        """
+        if self.quota_logits is None:
+            return torch.tensor(0.0, device=self.candidate_regions.device)
+
+        # 计算配额分布
+        quota_probs = F.softmax(self.quota_logits, dim=0)  # [D]
+
+        # 计算期望深度 E[d]
+        depths = torch.arange(
+            len(quota_probs),
+            device=quota_probs.device,
+            dtype=quota_probs.dtype
+        )
+        expected_depth = (quota_probs * depths).sum()
+
+        # 计算方差
+        variance = (quota_probs * (depths - expected_depth) ** 2).sum()
+
+        return variance
+
+    def get_coverage_stats(self) -> Dict[str, float]:
+        """
+        获取覆盖率统计。
+
+        数学:
+            raw_coverage = K_selected / N_total
+            adaptive_coverage = raw_coverage × sqrt(min(H, W) / ref_size)
+
+        Returns:
+            Dict[str, float]: {
+                'raw_coverage': float,
+                'adaptive_coverage': float,
+                'K_selected': int,
+                'N_total': int,
+            }
+        """
+        K_selected = int(self._avg_selected.item())
+        N_total = self.num_candidates
+
+        # 原始覆盖率
+        raw_coverage = K_selected / N_total if N_total > 0 else 0.0
+
+        # 自适应覆盖率 (I33)
+        min_dim = min(self._current_image_size)
+        ref_size = K_ADAPTIVE_REFERENCE_SIZE  # 默认 224
+        adaptive_factor = (min_dim / ref_size) ** 0.5
+        adaptive_coverage = raw_coverage * adaptive_factor
+
+        return {
+            'raw_coverage': raw_coverage,
+            'adaptive_coverage': adaptive_coverage,
+            'K_selected': K_selected,
+            'N_total': N_total,
         }
 
 

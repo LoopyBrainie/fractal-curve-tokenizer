@@ -1,60 +1,55 @@
 """
-Splitter 核心接口定义
+Splitter 接口协议定义（功能分组版本）
 
 数学形式化
 ==========
 
 Hilbert Curve ViT 的 Splitter 组件负责决策哪些区域需要进一步细分。
 
-组件职责抽象:
-    - Splitter: $S: \mathbb{R}^{N×D} → \{0,1\}^N$ (决策函数)
-    - 输入: 候选区域的特征表示
-    - 输出: 二值选择 mask (是否选中该区域)
-
-与 Tokenizer 的关系:
-    - 当前设计 (错误): Tokenizer 内部创建 Splitter
-    - 正确设计: Splitter 作为独立组件，Tokenizer 使用其决策结果
-
-    T ← S: Tokenizer 使用 Splitter 的输出，但不创建 Splitter
+核心职责抽象:
+    Splitter: S: (F, R, K) → SplitResult
+    - 输入: 候选区域的特征表示 F，区域集合 R，预算约束 K
+    - 输出: 选中区域及其元数据（包含 Hilbert 索引）
 
 接口设计原则:
-    1. 最小接口: 只暴露必要方法
-    2. 协议而非抽象类: 使用 Protocol 实现 duck typing
-    3. 类型安全: 完整的类型注解
+    1. 正交分解: Core/Annealing/Metrics 三层独立
+    2. 渐进式实现: 可选择实现子集
+    3. 类型安全: 完整的类型注解 + 运行时验证
+
+与 Tokenizer 的关系:
+    - Splitter 输出作为 Tokenizer 的输入
+    - 两者通过 SplitResult 数据结构解耦
 
 作者: Claude Code
-日期: 2026-01-22
+日期: 2026-01-25
+版本: 功能分组 Protocol v1.0 (基于数学形式化分析)
 """
 
 from __future__ import annotations
 
-from typing import Protocol, Dict, Any, Tuple, Optional
+from typing import Protocol, Dict, Any, Tuple, Optional, Literal
 from torch import Tensor
 
 
-class BaseSplitter(Protocol):
+# =============================================================================
+# CoreSplitter: 核心决策逻辑（必须实现）
+# =============================================================================
+
+class CoreSplitter(Protocol):
     """
-    Hilbert Curve ViT Splitter 核心接口协议。
+    Splitter 核心决策接口。
 
-    该协议定义了 Splitter 组件必须实现的最小接口。
-    遵循 Protocol 设计模式，支持 duck typing 实现。
+    数学形式:
+        S: (F, R, K) → SplitResult
+        其中:
+        - F ∈ R^{B×C×H_f×W_f} 是特征空间
+        - R = QuadtreeDecompose(L_max) 是候选区域集合
+        - K 是 token 预算约束
 
-    核心方法:
-        - forward(): 执行分割决策
-        - update_candidates(): 更新候选区域（当 image_size 变化时）
-
-    温度控制方法:
-        - set_temperature(): 设置 Gumbel 温度
-        - get_current_temperature(): 获取当前温度
-
-    诊断方法:
-        - get_diagnostics(): 获取诊断信息
-        - get_depth_distribution(): 获取深度分布
-
-    与 Tokenizer 的关系:
-        - Tokenizer 不持有 Splitter 引用
-        - Splitter 输出作为 Tokenizer 的输入
-        - 两者通过 SplitResult 数据结构解耦
+    约束:
+        1. Hilbert 局部性: 结果包含 hilbert_indices 保证空间邻近性
+        2. 预算有界: K_min ≤ |SplitResult| ≤ K_max
+        3. 可微性: 训练模式支持梯度流 (STE)
     """
 
     def forward(
@@ -64,13 +59,12 @@ class BaseSplitter(Protocol):
         hard: bool = False,
     ) -> "SplitResult":
         """
-        执行分割决策：哪些候选区域应该被选中。
+        执行分割决策。
 
-        数学形式:
-            对每个候选区域 i:
-            - 计算复杂度分数 s_i = MLP(ROI_i)
-            - 应用 Gumbel 扰动: g_i ~ Gumbel(0, 1)
-            - Top-K 选择: selected = TopK(s_i + g_i, K)
+        数学:
+            logits = MLP(ROI_aligned(F, R))
+            selected = TopK_Gumbel(logits, K)
+            result = {R_i | i ∈ selected}
 
         Args:
             features: [B, C, H_feat, W_feat] 特征图
@@ -78,7 +72,7 @@ class BaseSplitter(Protocol):
             hard: 是否使用硬决策（推理模式）
 
         Returns:
-            SplitResult: 分割结果，包含选中区域信息
+            SplitResult: 选中区域及其元数据
 
         Note:
             - 训练模式返回 STE mask（支持梯度）
@@ -90,8 +84,9 @@ class BaseSplitter(Protocol):
         """
         根据输入尺寸动态更新候选区域。
 
-        数学形式:
-            L_max = min(max_depth_limit, max(0, floor(log2(min(H, W) / min_patch_size))))
+        数学:
+            L_max = min(max_depth_limit, floor(log2(min(H, W) / min_patch_size)))
+            N = Σ_{d=0}^{L_max} 4^d = (4^{L_max+1} - 1) / 3
 
         Args:
             image_size: (H, W) 输入图像尺寸
@@ -102,15 +97,67 @@ class BaseSplitter(Protocol):
         """
         ...
 
-    # =========================================================================
-    # 温度控制接口
-    # =========================================================================
+    @property
+    def max_depth_limit(self) -> int:
+        """
+        获取最大深度限制。
+
+        Returns:
+            int: 最大深度 L_max
+        """
+        ...
+
+    @property
+    def num_candidates(self) -> int:
+        """
+        获取当前候选区域数量。
+
+        数学:
+            N = Σ_{d=0}^{L_max} 4^d = (4^{L_max+1} - 1) / 3
+
+        Returns:
+            int: 候选区域总数 N
+        """
+        ...
+
+    @property
+    def is_training(self) -> bool:
+        """
+        获取当前训练/评估模式。
+
+        Returns:
+            bool: True 表示训练模式
+
+        Note:
+            使用 is_training 而非 training 以避免与 nn.Module.training 冲突
+        """
+        ...
+
+
+# =============================================================================
+# AnnealingSplitter: 退火控制（可选，用于训练）
+# =============================================================================
+
+class AnnealingSplitter(Protocol):
+    """
+    温度和偏置退火接口。
+
+    数学形式:
+        τ(t) = τ_start × (τ_end/τ_start)^(t/T)  # 指数退火
+        τ(t) = τ_start - (τ_start - τ_end) × t/T  # 线性退火
+        τ(t) = τ_end + (τ_start - τ_end) × cos²(π × t / (2T))  # 余弦退火
+
+    温度 τ 的物理意义:
+        - τ → ∞: 均匀随机探索
+        - τ → 0: 确定性利用
+        - 梯度强度: ∂p/∂z ∝ 1/τ
+    """
 
     def set_temperature(self, temperature: float) -> None:
         """
         设置 Gumbel 温度参数。
 
-        数学形式:
+        数学:
             τ 控制探索-利用权衡:
             - τ → ∞: 均匀随机选择
             - τ → 0: 确定性选择 argmax
@@ -133,9 +180,62 @@ class BaseSplitter(Protocol):
         """
         ...
 
-    # =========================================================================
-    # 诊断接口
-    # =========================================================================
+    def set_annealing_schedule(
+        self,
+        schedule: Literal["linear", "exponential", "cosine"],
+        start: float,
+        end: float,
+        total_steps: int,
+    ) -> None:
+        """
+        配置退火调度。
+
+        数学:
+            linear: τ(t) = start + (end - start) × t/total_steps
+            exponential: τ(t) = start × (end/start)^(t/total_steps)
+            cosine: τ(t) = end + (start - end) × cos²(π × t / (2×total_steps))
+
+        Args:
+            schedule: 退火调度类型
+            start: 起始温度
+            end: 终止温度
+            total_steps: 总步数
+        """
+        ...
+
+    def set_explore_bias(self, bias: float) -> None:
+        """
+        设置探索偏置。
+
+        数学:
+            logits'_i = logits_i + b_explore
+            其中 b_explore ∈ [0, 1] 控制探索程度
+
+        Args:
+            bias: 探索偏置值
+        """
+        ...
+
+
+# =============================================================================
+# MetricsSplitter: 诊断指标和正则化（可选，用于训练和分析）
+# =============================================================================
+
+class MetricsSplitter(Protocol):
+    """
+    诊断指标和正则化接口。
+
+    数学形式:
+        H(π) = -Σ_d π_d log(π_d)           # 配额熵
+        Var(d) = Σ_d π_d × (d - E[d])²     # 深度方差
+        coverage = K_selected / N_total     # 覆盖率
+        adaptive_coverage = coverage × min(H, W) / ref_size  # 自适应覆盖率
+
+    正则化目标:
+        L_total = L_task + λ_H × H(π) + λ_V × Var(d)
+        - 熵正则化: 鼓励配额分布多样性
+        - 方差正则化: 避免深度聚集
+    """
 
     def get_diagnostics(self) -> Dict[str, Any]:
         """
@@ -163,46 +263,79 @@ class BaseSplitter(Protocol):
         """
         ...
 
-    # =========================================================================
-    # 属性接口
-    # =========================================================================
-
-    @property
-    def max_depth_limit(self) -> int:
+    def get_quota_logits(self) -> Optional[Tensor]:
         """
-        获取最大深度限制。
+        获取可学习配额 logits。
+
+        数学:
+            φ = [φ_0, φ_1, ..., φ_{D-1}]
+            π_d = softmax(φ)_d
 
         Returns:
-            int: 最大深度 L_max
+            None 如果未启用可学习配额
         """
         ...
 
-    @property
-    def num_candidates(self) -> int:
+    def get_quota_probs(self) -> Optional[Tensor]:
         """
-        获取当前候选区域数量。
+        获取配额概率分布。
 
-        数学形式:
-            N = Σ_{d=0}^{L_max} 4^d = (4^{L_max+1} - 1) / 3
+        数学:
+            π = softmax(φ)
 
         Returns:
-            int: 候选区域总数 N
+            None 如果未启用可学习配额
         """
         ...
 
-    @property
-    def training(self) -> bool:
+    def get_entropy_loss(self) -> Tensor:
         """
-        获取当前训练/评估模式。
+        获取配额熵正则化损失。
+
+        数学:
+            L_entropy = -Σ_d π_d × log(π_d + ε)
+            鼓励配额分布保持多样性
 
         Returns:
-            bool: True 表示训练模式
+            Tensor: 熵损失值
+        """
+        ...
+
+    def get_variance_regularization(self) -> Tensor:
+        """
+        获取深度方差正则化损失。
+
+        数学:
+            L_var = Σ_d π_d × (d - E[d])²
+            E[d] = Σ_d d × π_d
+            避免配额过度集中于特定深度
+
+        Returns:
+            Tensor: 方差正则化损失值
+        """
+        ...
+
+    def get_coverage_stats(self) -> Dict[str, float]:
+        """
+        获取覆盖率统计。
+
+        数学:
+            raw_coverage = K_selected / N_total
+            adaptive_coverage = raw_coverage × sqrt(min(H, W) / ref_size)
+
+        Returns:
+            Dict[str, float]: {
+                'raw_coverage': float,
+                'adaptive_coverage': float,
+                'K_selected': int,
+                'N_total': int,
+            }
         """
         ...
 
 
 # =============================================================================
-# 数据类型定义
+# SplitResult: 标准输出数据结构
 # =============================================================================
 
 class SplitResult:
@@ -218,6 +351,7 @@ class SplitResult:
 
     数学形式化:
         M = |{i : selected_mask[i] = 1}| (选中的 token 数量)
+        HilbertOrder: HilbertCurve(R_selected) → [0, M-1]
     """
 
     regions: Tensor           # [M, 4] 坐标 (x0, y0, x1, y1)
@@ -276,18 +410,105 @@ class SplitResult:
         """
         return self.regions.shape[0]
 
-    @property
-    def tokens_per_batch(self) -> Tensor:
+    def tokens_per_batch(self, B: int) -> Tensor:
         """
         计算每个 batch 选中的 token 数量。
+
+        数学:
+            K_b = Σ_i 1{batch_indices[i] = b}
+
+        Args:
+            B: batch size
 
         Returns:
             Tensor: [B] 每个 batch 的 token 数量
         """
         import torch
         if self.batch_indices.numel() == 0:
-            return torch.zeros(1, dtype=torch.long, device=self.batch_indices.device)
+            return torch.zeros(B, dtype=torch.long, device=self.batch_indices.device)
         return torch.bincount(
             self.batch_indices,
-            minlength=int(self.batch_indices.max().item() + 1)
+            minlength=B
         )
+
+
+# =============================================================================
+# 运行时 Protocol 验证工具
+# =============================================================================
+
+def validate_core_splitter(splitter: Any, name: str = "Splitter") -> None:
+    """
+    验证 CoreSplitter 契约。
+
+    Args:
+        splitter: 要验证的对象
+        name: 对象名称（用于错误信息）
+
+    Raises:
+        AssertionError: 如果缺少必需方法
+    """
+    required_methods = ['forward', 'update_candidates']
+    required_properties = ['max_depth_limit', 'num_candidates', 'is_training']
+
+    for method in required_methods:
+        assert hasattr(splitter, method), f"{name} 缺少必需方法: {method}"
+        assert callable(getattr(splitter, method)), f"{name}.{method} 不是可调用的"
+
+    for prop in required_properties:
+        assert hasattr(splitter, prop), f"{name} 缺少必需属性: {prop}"
+
+
+def validate_annealing_splitter(splitter: Any, name: str = "Splitter") -> None:
+    """
+    验证 AnnealingSplitter 契约（软验证，可选实现）。
+
+    Args:
+        splitter: 要验证的对象
+        name: 对象名称（用于错误信息）
+    """
+    optional_methods = ['set_temperature', 'get_current_temperature']
+
+    for method in optional_methods:
+        if hasattr(splitter, method):
+            assert callable(getattr(splitter, method)), f"{name}.{method} 不是可调用的"
+
+
+def validate_metrics_splitter(splitter: Any, name: str = "Splitter") -> None:
+    """
+    验证 MetricsSplitter 契约（软验证，可选实现）。
+
+    Args:
+        splitter: 要验证的对象
+        name: 对象名称（用于错误信息）
+    """
+    optional_methods = [
+        'get_diagnostics',
+        'get_depth_distribution',
+        'get_quota_logits',
+        'get_quota_probs',
+        'get_entropy_loss',
+        'get_variance_regularization',
+        'get_coverage_stats',
+    ]
+
+    for method in optional_methods:
+        if hasattr(splitter, method):
+            assert callable(getattr(splitter, method)), f"{name}.{method} 不是可调用的"
+
+
+def validate_splitter(splitter: Any, name: str = "Splitter") -> None:
+    """
+    完整验证 Splitter 契约。
+
+    验证顺序:
+        1. CoreSplitter (必需)
+        2. AnnealingSplitter (可选)
+        3. MetricsSplitter (可选)
+
+    Args:
+        splitter: 要验证的对象
+        name: 对象名称（用于错误信息）
+    """
+    validate_core_splitter(splitter, name)
+    validate_annealing_splitter(splitter, name)
+    validate_metrics_splitter(splitter, name)
