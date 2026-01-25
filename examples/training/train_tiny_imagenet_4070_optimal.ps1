@@ -3,7 +3,8 @@
 # ============================================================================
 #
 # 数学形式化分析 (2026-01-26) - 150 epochs 优化版本
-# I102-4: 修复显存泄露后启用 batch=192 + compile
+# I102-4: 修复显存泄露后启用 batch=64 + compile
+# I103-5: 改用 batch=64*3 测试是否存在显存问题
 # ============================================================================
 #
 # 1. 模型架构参数计算
@@ -28,14 +29,14 @@
 #      - torch.compile: ~10-15% 额外优化
 #      - channels-last: ~10-20% 内存效率提升
 #
-#    内存分解 (batch=192):
+#    内存分解 (batch=64*3):
 #      权重 (FP16):     44.2 MB
 #      梯度 (FP16):     44.2 MB
 #      优化器 (FP32):   185.6 MB
 #      激活值 (CP):     60 MB
-#      输入数据:        294 MB
+#      输入数据:        98 MB
 #      开销/缓冲:       ~500 MB
-#      总计:            ~2.5 GB (I102-4 修复后)
+#      总计:            ~1.0 GB (I103-5 测试)
 #
 # 3. 学习率缩放 (Linear Scaling Rule)
 #    ---------------------------------
@@ -66,10 +67,10 @@ uv run python src/training/train_fractal_vit.py `
   --ffn-type swiglu_level `
   --tokenizer-type streaming_v3 `
   --min-patch-size 4 `
-  --batch-size 192 `
+  --batch-size 64 `
+  --accum-steps 3 `
   --num-workers 4 `
-  --lr 2.25e-4 `
-  --accum-steps 1 `
+  --lr 3e-4 `
   --weight-decay 0.08 `
   --warmup-epochs 15 `
   --dropout 0.15 `
@@ -95,7 +96,7 @@ uv run python src/training/train_fractal_vit.py `
   --gradient-clip 1.0 `
   --patience 25 `
   --min-delta 0.001 `
-  --exp-name tiny_imagenet_384d_8l_bs192_ep150
+  --exp-name tiny_imagenet_384d_8l_bs64x3_ep150
 "@
 
 # 执行训练脚本

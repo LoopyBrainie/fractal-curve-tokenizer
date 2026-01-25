@@ -1,8 +1,7 @@
 #!/bin/bash
 # Tiny-ImageNet Optimal Training Script (RTX 4070 Laptop)
-# Mathematical derivation: dim=384, depth=8, batch=192, lr=2.25e-4, epochs=150
-# I102-4: 修复显存泄露后启用 batch=192 + compile
-# Optimizations: gradient-checkpoint + compile + channels-last + AMP + TF32
+# Mathematical derivation: dim=384, depth=8, batch=64, lr=3e-4, epochs=150
+# I103-5: batch=64*3 测试显存稳定性
 
 set -e
 
@@ -16,10 +15,10 @@ uv run python src/training/train_fractal_vit.py \
   --ffn-type swiglu_level \
   --tokenizer-type streaming_v3 \
   --min-patch-size 4 \
-  --batch-size 192 \
+  --batch-size 64 \
+  --accum-steps 3 \
   --num-workers 4 \
-  --lr 2.25e-4 \
-  --accum-steps 1 \
+  --lr 3e-4 \
   --weight-decay 0.08 \
   --warmup-epochs 15 \
   --dropout 0.15 \
@@ -44,5 +43,4 @@ uv run python src/training/train_fractal_vit.py \
   --compile \
   --gradient-clip 1.0 \
   --patience 25 \
-  --min-delta 0.001 \
-  --exp-name tiny_imagenet_384d_8l_bs192_ep150
+  --min-delta 0.001 
