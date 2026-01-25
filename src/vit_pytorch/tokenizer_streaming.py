@@ -272,7 +272,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         # 1. 提取共享特征图
         features = self.shared_conv(images)  # [B, d_model, H/p, W/p]
-        self._last_features = features
+        # I102-4: 使用 detach() 防止显存泄露，保留 no_grad 计算图以节省内存
+        self._last_features = features.detach()
 
         # 2. I98-1: 使用外部传入的 split_result
         # GumbelTopKResult → TensorSplitResult 转换
@@ -316,8 +317,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 flat_idx = batch_indices * max_d + depths.clamp(min=0, max=max_d - 1)
                 ones = torch.ones_like(flat_idx)
                 count_matrix.view(-1).scatter_add_(0, flat_idx, ones)
-                
-                self._last_depth_count_matrix = count_matrix
+
+                # I102-4: 使用 detach() 防止显存泄露
+                self._last_depth_count_matrix = count_matrix.detach()
                 
                 # P-OPT-3: 延迟转换到 CPU，使用 non_blocking
                 # 仅在实际需要 depth_dists 时才转换（统计信息通常只用于日志）

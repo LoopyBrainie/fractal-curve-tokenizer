@@ -437,8 +437,8 @@ class LCAHilbertBias(HilbertBiasBase):
                 )
             lca_depths = lca_depths.clamp(0, self.max_depth)
 
-            # 更新缓存: 使用当前 PyTorch 版本号
-            self._lca_cache_inputs[data_ptr] = (data_ptr, torch_version, lca_depths)
+            # I102-4: 使用 detach() 防止显存泄露
+            self._lca_cache_inputs[data_ptr] = (data_ptr, torch_version, lca_depths.detach())
         
         # 批量嵌入: (B, S, S, H)
         bias = self.lca_embedding(lca_depths)

@@ -1883,7 +1883,6 @@ def train_epoch(
             # 包含: 软熵损失 + 弹性预算损失 + 阈值 barrier 正则化
             # I14-1 D1: 新增崩溃惩罚，需要传递 actual_token_count
             splitter_loss = None
-            splitter_metrics = {}
             # I98-2: 使用 model.splitter (独立组件)
             if hasattr(model, 'splitter'):
                 splitter = model.splitter
@@ -1919,9 +1918,8 @@ def train_epoch(
                             splitter_loss = torch.tensor(float(splitter_loss), device=device)
                     else:
                         splitter_loss = torch.tensor(0.0, device=device)
-                    # P11-8: 延迟 .item() 调用，避免每个 batch 的 GPU-CPU 同步
-                    # 仅在需要显示时才调用
-                    splitter_metrics = aux_losses  # 保留张量引用
+                    # I102-4: splitter_metrics 是死代码，移除以防止显存泄露
+                    # splitter_metrics = aux_losses  # 保留张量引用会导致内存累积
                     # GumbelTopKSplitter 的 get_auxiliary_losses 已包含所有必需损失
                     use_legacy_entropy = False
             

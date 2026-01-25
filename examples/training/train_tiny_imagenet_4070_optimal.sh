@@ -1,8 +1,8 @@
 #!/bin/bash
 # Tiny-ImageNet Optimal Training Script (RTX 4070 Laptop)
-# Mathematical derivation: dim=384, depth=8, batch=36x3=108, lr=1.25e-4, epochs=150
-# Optimizations: gradient-checkpoint + channels-last + AMP + TF32 (compile disabled)
-# Note: Using gradient accumulation to avoid OOM
+# Mathematical derivation: dim=384, depth=8, batch=192, lr=2.25e-4, epochs=150
+# I102-4: 修复显存泄露后启用 batch=192 + compile
+# Optimizations: gradient-checkpoint + compile + channels-last + AMP + TF32
 
 set -e
 
@@ -16,10 +16,10 @@ uv run python src/training/train_fractal_vit.py \
   --ffn-type swiglu_level \
   --tokenizer-type streaming_v3 \
   --min-patch-size 4 \
-  --batch-size 60 \
+  --batch-size 192 \
   --num-workers 4 \
-  --lr 2.1e-4 \
-  --accum-steps 3 \
+  --lr 2.25e-4 \
+  --accum-steps 1 \
   --weight-decay 0.08 \
   --warmup-epochs 15 \
   --dropout 0.15 \
@@ -41,6 +41,8 @@ uv run python src/training/train_fractal_vit.py \
   --gradient-checkpoint \
   --channels-last \
   --tf32 \
+  --compile \
   --gradient-clip 1.0 \
   --patience 25 \
-  --min-delta 0.001 
+  --min-delta 0.001 \
+  --exp-name tiny_imagenet_384d_8l_bs192_ep150

@@ -1113,13 +1113,14 @@ class GumbelTopKSplitter(
         # I96-3: 计算配额损失以提供梯度到 quota_logits
         # 注意: 损失由调用者添加到总损失
         if self.training:
-            self._last_quota_loss = self._compute_quota_loss(K)
+            self._last_quota_loss = self._compute_quota_loss(K).detach()
         else:
             self._last_quota_loss = None
 
         # 缓存 probs 和 selected_mask 用于辅助损失计算
-        self._last_probs = probs
-        self._last_selected_mask = consistent_mask  # I21: 用于 Depth KL Loss
+        # I102-4: 使用 detach() 防止显存泄露
+        self._last_probs = probs.detach()
+        self._last_selected_mask = consistent_mask.detach()  # I21: 用于 Depth KL Loss
 
         # 更新统计
         with torch.no_grad():

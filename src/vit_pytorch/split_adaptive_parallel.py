@@ -637,15 +637,10 @@ class ShallowParallelEvaluator(nn.Module):
         # 重新归一化权重
         weight_sum = token_weights.sum(dim=1, keepdim=True).clamp(min=DIVISION_EPSILON)
         token_weights = token_weights / weight_sum
-        
-        # 缓存深度信息供外部使用 (用于LCA偏置计算)
-        self._last_token_depths = selected_depths
-        
-        # I18-3 修复: 缓存每个batch的有效token数 (非padding的token数量)
-        # padding_mask: [B, max_valid], True表示有效token
-        # 这允许 tokenizer 获取准确的 avg_tokens_per_image 统计
-        self._last_valid_counts = padding_mask.sum(dim=1).clamp(min=1)  # [B]
-        
+
+        # I102-4: 移除死代码 _last_token_depths 和 _last_valid_counts
+        # (这些变量从未被使用，保留会导致潜在显存泄露)
+
         return selected_tokens, token_weights
     
     def _precompute_tree_structure(self, device: torch.device) -> None:

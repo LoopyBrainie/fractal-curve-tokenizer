@@ -3,6 +3,7 @@
 # ============================================================================
 #
 # 数学形式化分析 (2026-01-26) - 150 epochs 优化版本
+# I102-4: 修复显存泄露后启用 batch=192 + compile
 # ============================================================================
 #
 # 1. 模型架构参数计算
@@ -10,12 +11,12 @@
 #    Tiny-ImageNet: N_train = 100,000 samples, C = 200 classes
 #
 #    参数公式 (SwiGLU FFN):
-#      P_total = depth * 16 * dim^2 + 2.5 * dim * num_classes
-#      mlp_dim = 4 * dim (自动计算)
+#      P_total = depth × 16 × dim² + 2.5 × dim × num_classes
+#      mlp_dim = 4 × dim (自动计算)
 #
 #    配置 (dim=384, depth=8, heads=6):
-#      mlp_dim = 4 * 384 = 1536
-#      P_total = 8 * 16 * 384^2 + 2.5 * 384 * 200 = 23.2M
+#      mlp_dim = 4 × 384 = 1536
+#      P_total = 8 × 16 × 384² + 2.5 × 384 × 200 = 23.2M
 #
 #    P/N 比率: 23.2M / 100K = 232 (ViT 可接受范围: [150, 500])
 #
@@ -34,23 +35,23 @@
 #      激活值 (CP):     60 MB
 #      输入数据:        294 MB
 #      开销/缓冲:       ~500 MB
-#      总计:            ~1.9 GB
+#      总计:            ~2.5 GB (I102-4 修复后)
 #
 # 3. 学习率缩放 (Linear Scaling Rule)
 #    ---------------------------------
 #    lr_base = 3e-4 @ batch_size=256
-#    lr = 3e-4 * (192/256) = 2.25e-4
+#    lr = 3e-4 × (192/256) = 2.25e-4
 #
-# 4. Tokenizer 配置 (Tiny-ImageNet 64x64)
+# 4. Tokenizer 配置 (Tiny-ImageNet 64×64)
 #    -------------------------------------
 #    image_size=64, min_patch_size=4
 #    max_depth = log2(64/4) = 4
 #    N_candidates = 341 (5 尺度: 1+4+16+64+256)
 #
 #    动态 Token 数:
-#      K_min = max(8, 0.03 * 341) = 11
-#      K_max = min(4096, 0.25 * 341) = 85
-#      K_avg = 41 (覆盖率 ~12%)
+#      K_min = max(8, 0.03 × 341) = 11
+#      K_max = min(4096, 0.25 × 341) = 85
+#      K_avg ≈ 41 (覆盖率 ~12%)
 #
 # ============================================================================
 
@@ -65,10 +66,10 @@ uv run python src/training/train_fractal_vit.py `
   --ffn-type swiglu_level `
   --tokenizer-type streaming_v3 `
   --min-patch-size 4 `
-  --batch-size 60 `
+  --batch-size 192 `
   --num-workers 4 `
-  --lr 2.1e-4 `  # 3e-4 × 180/256
-  --accum-steps 3 `
+  --lr 2.25e-4 `
+  --accum-steps 1 `
   --weight-decay 0.08 `
   --warmup-epochs 15 `
   --dropout 0.15 `
@@ -90,10 +91,11 @@ uv run python src/training/train_fractal_vit.py `
   --gradient-checkpoint `
   --channels-last `
   --tf32 `
+  --compile `
   --gradient-clip 1.0 `
   --patience 25 `
   --min-delta 0.001 `
-  --exp-name tiny_imagenet_384d_8l_bs60x3_ep150
+  --exp-name tiny_imagenet_384d_8l_bs192_ep150
 "@
 
 # 执行训练脚本
