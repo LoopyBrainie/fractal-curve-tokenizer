@@ -320,8 +320,8 @@ def main():
 
     args = parser.parse_args()
 
-    # 确定配置和种子
-    configs = [args.config.upper()] if args.config else list(ABLATION_CONFIGS.keys())
+    # 确定配置和种子 (支持逗号分隔)
+    configs = args.config.upper().split(",") if args.config else list(ABLATION_CONFIGS.keys())
     seeds = [args.seed] if args.seed is not None else SEEDS
 
     total = len(configs) * len(seeds)
