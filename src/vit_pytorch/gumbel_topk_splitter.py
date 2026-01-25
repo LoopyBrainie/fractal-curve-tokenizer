@@ -1249,7 +1249,8 @@ class GumbelTopKSplitter(nn.Module):
             quota: [D] 每个深度的配额分配
         """
         D = self._current_max_depth + 1
-        device = self.candidate_depths.device
+        # I100-2 FIX: 使用 quota_logits.device 确保所有张量在同一设备
+        device = self.quota_logits.device if self.quota_logits is not None else self.candidate_depths.device
 
         if self.quota_logits is None or not self._enable_learnable_quota:
             # 回退到均匀分配
@@ -1261,6 +1262,7 @@ class GumbelTopKSplitter(nn.Module):
         # I35 Fix: 切片到当前深度维度，避免 quota_logits (max_depth+1) 与
         # _current_max_depth+1 不匹配的问题
         p = F.softmax(self.quota_logits[:D], dim=0)  # [D]
+        p = p.to(device)  # 确保与 quota 一致
 
         # 初始四舍五入
         quota = (p * K).round().long()
