@@ -797,24 +797,45 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         """计算深度分布统计信息.
 
         I98-1: 需要外部传入 split_result，因为 Splitter 已不再是内部组件。
+        如果未提供 split_result，尝试从 model.splitter 获取。
 
         Args:
             images: [B, C, H, W] 输入图像
-            split_result: 外部 Splitter 的输出结果（必须提供）
+            split_result: 外部 Splitter 的输出结果（可选，如果未提供则尝试自动获取）
 
         Returns:
             Dict[str, Any]: 深度分布统计信息
-
-        Raises:
-            ValueError: 如果 split_result 未提供
         """
         from .gumbel_topk_splitter import GumbelTopKResult
 
+        # I98-1: 如果未提供 split_result，尝试从外部获取
         if split_result is None:
-            raise ValueError(
-                "I98-1: compute_scale_distribution 需要外部传入 split_result 参数. "
-                "Splitter 现在是独立组件，不再是 Tokenizer 内部创建."
-            )
+            # 尝试从 model.splitter 获取
+            if hasattr(self, '_model') and hasattr(self._model, 'splitter'):
+                model = self._model
+                # 获取特征图
+                features = self.shared_conv(images)
+                # 调用 splitter
+                split_result = model.splitter(features, image_size=(images.shape[2], images.shape[3]))
+            elif hasattr(self, '_last_features') and self._last_features is not None:
+                # 使用缓存的特征图（如果有）
+                if hasattr(self, '_parent_model') and hasattr(self._parent_model, 'splitter'):
+                    model = self._parent_model
+                    split_result = model.splitter(
+                        self._last_features,
+                        image_size=(images.shape[2], images.shape[3]) if images.dim() == 4 else None
+                    )
+
+            # 如果仍然无法获取 split_result，返回空统计
+            if split_result is None:
+                return {
+                    'scale_ratios': {},
+                    'entropy': 0.0,
+                    'max_entropy': 0.0,
+                    'dominant_scale': self.base_patch_size,
+                    'depth_distribution': {},
+                    'warning': 'split_result not available - tokenizer has no access to splitter'
+                }
 
         _ = self.tokenize(images, split_result)
         

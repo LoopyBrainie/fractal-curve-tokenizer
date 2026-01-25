@@ -1999,8 +1999,10 @@ class GumbelTopKSplitter(
         depths = self._get_device_tensor(
             self.candidate_depths, "_cached_device_depths", device
         )[candidate_indices]  # [total]
-        # hilbert_indices 直接从 CPU 获取并索引
-        hilbert_indices = self.hilbert_indices[candidate_indices]  # [total]
+        # hilbert_indices 也需要设备一致性 (修复 RuntimeError: indices device mismatch)
+        hilbert_indices = self._get_device_tensor(
+            self.hilbert_indices, "_cached_device_hilbert", device
+        )[candidate_indices]  # [total]
 
         return GumbelTopKResult(
             regions=regions,
