@@ -808,10 +808,8 @@ class CUB200Trainer:
             with autocast(device_type=self.device.type, enabled=self.config.use_amp):
                 # M2: 获取 logits 和 features（用于 Center Loss）
                 if self.config.use_center_loss:
-                    # I35: 模型返回 (logits, features_list)，其中 features_list 是 List[Tensor]
-                    # 每个元素是单个样本的 pooled 表示，需要 stack 成 [B, D]
-                    logits, features_list = self.model(imgs, return_features=True)
-                    features = torch.stack(features_list)  # [B, D]
+                    # P1 Fix: 模型现在直接返回 tensor [B, D]，不再需要 stack
+                    logits, features = self.model(imgs, return_features=True)
                     loss, stats = self.compute_loss(logits, labels, features=features)
                 else:
                     logits = self.model(imgs)
@@ -940,12 +938,8 @@ class CUB200Trainer:
                 # M2: 统一使用 forward(return_features=True) 提取特征
                 if return_features:
                     outs, features = self.model(imgs, return_features=True)
-                    # P1 Fix: features 是 List[Tensor]，需要 stack 成 [B, D]
-                    if isinstance(features, list):
-                        features_tensor = torch.stack(features)  # [B, D]
-                    else:
-                        features_tensor = features
-                    all_features.append(features_tensor.cpu())
+                    # P1 Fix: 模型直接返回 tensor [B, D]
+                    all_features.append(features.cpu())
                     all_labels.append(labels.cpu())
                 else:
                     outs = self.model(imgs)

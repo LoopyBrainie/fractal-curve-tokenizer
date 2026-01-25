@@ -1,12 +1,13 @@
 #!/bin/bash
 # Tiny-ImageNet Optimal Training Script (RTX 4070 Laptop)
-# Mathematical derivation: dim=384, depth=8, batch=64, lr=1.5e-4, accum-steps=2
+# Mathematical derivation: dim=384, depth=8, batch=192, lr=2.25e-4, epochs=150
+# Optimizations: gradient-checkpoint + compile + channels-last + AMP + TF32
 
 set -e
 
 uv run python src/training/train_fractal_vit.py \
   --dataset tiny-imagenet \
-  --epochs 100 \
+  --epochs 150 \
   --dim 384 \
   --depth 8 \
   --heads 6 \
@@ -14,15 +15,15 @@ uv run python src/training/train_fractal_vit.py \
   --ffn-type swiglu_level \
   --tokenizer-type streaming_v3 \
   --min-patch-size 4 \
-  --batch-size 64 \
+  --batch-size 192 \
   --num-workers 4 \
-  --lr 1.5e-4 \
-  --accum-steps 2 \
+  --lr 2.25e-4 \
+  --accum-steps 1 \
   --weight-decay 0.08 \
-  --warmup-epochs 10 \
+  --warmup-epochs 15 \
   --dropout 0.15 \
   --emb-dropout 0.1 \
-  --drop-path 0.12 \
+  --drop-path 0.15 \
   --label-smoothing 0.1 \
   --mixup-alpha 0.4 \
   --cutmix-alpha 1.0 \
@@ -33,14 +34,14 @@ uv run python src/training/train_fractal_vit.py \
   --include-elastic-budget \
   --splitter-temp-start 1.0 \
   --splitter-temp-end 0.5 \
-  --splitter-temp-warmup 10 \
+  --splitter-temp-warmup 20 \
   --lca-temperature 1.5 \
   --use-amp \
   --gradient-checkpoint \
   --channels-last \
   --tf32 \
-  --accum-steps 1 \
+  --compile \
   --gradient-clip 1.0 \
-  --patience 15 \
+  --patience 25 \
   --min-delta 0.001 \
-  --no-prefetch 
+  --exp-name tiny_imagenet_384d_8l_bs192_ep150

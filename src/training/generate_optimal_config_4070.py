@@ -24,65 +24,11 @@ from dataclasses import dataclass, field
 from typing import Tuple, Optional
 import torch
 
-
 # =============================================================================
-# 1. Model Architecture Configuration (Mathematically Derived)
+# I98-6: 统一配置入口
+# 使用 ModelArchitectureConfig 作为统一的模型配置类
 # =============================================================================
-
-@dataclass
-class ModelConfig:
-    """
-    Model Architecture Configuration
-
-    Math Derivation:
-    - dim_head = dim / heads (must be integer, default 64)
-    - mlp_dim = dim × 4 (SwiGLU ratio)
-    - Parameters: P = depth × 16 × dim² + 2.5 × dim × num_classes
-
-    For RTX 4070 Laptop (8GB VRAM), dim=384, depth=10:
-    - P = 10 × 16 × 384² + 2.5 × 384 × 200 ≈ 41.4M
-    - M_activations (batch=192, seq_len=64) ≈ 350MB
-    - M_total ≈ 1.2GB (well within budget)
-    """
-    num_classes: int = 200
-    dim: int = 384           # Embedding dimension
-    depth: int = 10          # Transformer layers
-    heads: int = 6           # Attention heads (dim_head = 64)
-    mlp_dim: int = field(default_factory=lambda: 384 * 4)  # FFN dimension
-
-    @property
-    def dim_head(self) -> int:
-        """Per-head dimension (default 64 for efficiency)"""
-        return self.dim // self.heads
-
-    @property
-    def mlp_ratio(self) -> float:
-        """MLP expansion ratio"""
-        return self.mlp_dim / self.dim
-
-    @property
-    def params_total(self) -> int:
-        """Total model parameters"""
-        # Attention: Q, K, V, O = 4 × dim² per layer
-        # FFN (SwiGLU): up, gate, down = 3 × 2 × dim × mlp_dim = 12 × dim² per layer
-        # Total per layer: 16 × dim²
-        attention = 4 * self.dim * self.dim
-        ffn = 3 * 2 * self.dim * self.mlp_dim
-        params_per_layer = attention + ffn
-
-        transformer = self.depth * params_per_layer
-
-        # MLP Head: LayerNorm + 2 Linear
-        head = (
-            2 * self.dim +  # LayerNorm weights + bias
-            self.dim * self.num_classes +  # Final projection
-            self.num_classes * self.num_classes // 2  # Additional head
-        )
-
-        # CLS token
-        cls = self.dim
-
-        return int(transformer + head + cls)
+from src.training.config import ModelArchitectureConfig as ModelConfig
 
 
 # =============================================================================
@@ -140,19 +86,31 @@ def calc_memory_budget(
     batch_size: int,
     seq_len: int,
     dim: int,
+    depth: int,
+    heads: int,
     use_checkpoint: bool = True,
     use_amp: bool = True,
     use_channels_last: bool = True,
 ) -> dict:
     """
-    Calculate training memory budget
+    Calculate training memory budget (I101-2 修正版)
 
     Math Formulas:
-    - M_params = P × 4 bytes (FP32)
-    - M_grad = P × 4 bytes (FP32)
+    - M_params = P × 4 bytes (FP32) or × 2 (FP16)
+    - M_grad = P × 4 bytes (FP32) or × 2 (FP16)
     - M_optimizer = P × 8 bytes (AdamW m+v states)
-    - M_activations = B × L × S × D × 13 × checkpoint_factor × amp_factor
+    - M_activations = B × L × S × D × 8 × checkpoint_factor × amp_factor
+    - M_attention = B × H × S × S × 2 × depth × 0.5 (FP16, with checkpoint)
+    - M_lca_bias = B × H × S × S × 4 (FP32, LCA bias matrix)
+    - M_levels_info = B × S × (D+1) × 4 (levels_info data)
     - M_data = B × C × H × W × 4 bytes
+
+    Key Fix (I101-2):
+    - Original formula missed O(N²) attention and LCA bias matrices
+    - For N=256, H=8, depth=10, batch=64:
+      - Attention matrix: ~655 MB (FP16)
+      - LCA bias matrix: ~128 MB (FP32)
+      - Total missing: ~783 MB!
 
     Optimization Factors:
     - checkpoint_factor = 0.35 (65% savings with gradient checkpointing)
@@ -160,8 +118,10 @@ def calc_memory_budget(
     - channels_last_factor = 0.9 (memory layout optimization)
 
     Returns:
-        Memory budget in MB
+        Memory budget in MB (detailed breakdown)
     """
+    import math
+
     checkpoint_factor = 0.35 if use_checkpoint else 1.0
     amp_factor = 0.5 if use_amp else 1.0
     channels_last_factor = 0.9 if use_channels_last else 1.0
@@ -175,10 +135,33 @@ def calc_memory_budget(
     # Optimizer states (AdamW: m + v)
     M_optimizer = params * 8 / (1024 ** 2)
 
-    # Activations: B × L × S × D × 13 × optimization_factors
+    # I101-2 Fix: Activations (corrected formula)
+    # Q, K, V, O projections + FFN activations = 8 × dim per token
     M_activations = (
-        batch_size * seq_len * dim * 13 * 4 / (1024 ** 2)
-        * checkpoint_factor * amp_factor * channels_last_factor
+        batch_size * seq_len * dim * 8 * 4 / (1024 ** 2)  # FP32 baseline
+        * depth * checkpoint_factor * amp_factor * channels_last_factor
+    )
+
+    # I101-2 Fix: Attention matrices (B×H×N×N×2 bytes per head, FP16)
+    # Standard ViT attention: QK^T matrix per layer per head
+    # With gradient checkpointing, only need to recompute during backward
+    M_attention = (
+        batch_size * heads * seq_len * seq_len * 2 / (1024 ** 2)  # FP16
+        * depth * 0.5  # checkpoint saves ~50% of attention memory
+        * amp_factor
+    )
+
+    # I101-2 Fix: LCA bias matrix (B×H×N×N×4 bytes, FP32 required for stability)
+    # This is the Fractal ViT specific O(N²) memory consumer
+    M_lca_bias = (
+        batch_size * heads * seq_len * seq_len * 4 / (1024 ** 2)  # FP32
+    )
+
+    # I101-2 Fix: levels_info data (B×N×(D+1)×4 bytes)
+    # D = log2(N) is the maximum quadtree depth
+    D = max(1, int(math.log2(seq_len))) if seq_len > 0 else 1
+    M_levels_info = (
+        batch_size * seq_len * (D + 1) * 4 / (1024 ** 2)
     )
 
     # Input data (64x64 RGB)
@@ -187,13 +170,21 @@ def calc_memory_budget(
     # CUDA overhead
     M_cuda = 500
 
-    total = M_params + M_grad + M_optimizer + M_activations + M_data + M_cuda
+    # Calculate total with all terms
+    total = (
+        M_params + M_grad + M_optimizer +
+        M_activations + M_attention + M_lca_bias +
+        M_levels_info + M_data + M_cuda
+    )
 
     return {
         "params_MB": M_params,
         "grad_MB": M_grad,
         "optimizer_MB": M_optimizer,
         "activations_MB": M_activations,
+        "attention_MB": M_attention,      # I101-2: was missing!
+        "lca_bias_MB": M_lca_bias,        # I101-2: was missing!
+        "levels_info_MB": M_levels_info,  # I101-2: was missing!
         "data_MB": M_data,
         "cuda_MB": M_cuda,
         "total_MB": total,
@@ -368,6 +359,8 @@ class TinyImageNetTrainingConfig:
             batch_size=self.lr.batch_size,
             seq_len=self.tokenizer.N_tokens_typical,
             dim=self.model.dim,
+            depth=self.model.depth,
+            heads=self.model.heads,
             use_checkpoint=self.opt.use_checkpoint,
             use_amp=self.opt.use_amp,
             use_channels_last=self.opt.use_channels_last,

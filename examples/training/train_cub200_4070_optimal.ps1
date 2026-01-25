@@ -322,7 +322,6 @@ uv run python src/training/train_fractal_vit.py `
   --ffn-type swiglu_level `
   `
   <# ===== I78: 动态分辨率 Tokenizer 配置 (自动计算 max_depth) ===== #> `
-  --tokenizer-type streaming_v3 `
   --image-size none  `
   --min-patch-size 14  `
   --K-min 14 `

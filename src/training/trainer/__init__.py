@@ -556,7 +556,13 @@ class ModularTrainer:
             targets = targets.to(self.device, non_blocking=True)
             
             with torch.amp.autocast('cuda', enabled=self.config.use_amp):
-                outputs = self.model(inputs)
+                model_output = self.model(inputs)
+                # P0-Critical: 模型可能返回 (logits,) 或 (logits, aux_infos) 等元组
+                # 提取 logits 用于损失计算
+                if isinstance(model_output, tuple):
+                    outputs = model_output[0]
+                else:
+                    outputs = model_output
                 loss = self.loss_fn(outputs, targets)
                 
                 # 辅助损失
@@ -597,7 +603,7 @@ class ModularTrainer:
             total_loss += batch_loss
             num_batches += 1
             
-            # 更新指标
+            # 更新指标 (使用已提取的 outputs)
             if self.metrics:
                 self.metrics.update(outputs.detach(), targets)
             
@@ -649,12 +655,17 @@ class ModularTrainer:
 
             # 验证禁用 AMP 以确保指标精度 (I78: 使用 detach().item() 支持 torch.compile)
             with torch.amp.autocast('cuda', enabled=False):
-                outputs = self.model(inputs)
+                model_output = self.model(inputs)
+                # P0-Critical: 模型可能返回元组，提取 logits
+                if isinstance(model_output, tuple):
+                    outputs = model_output[0]
+                else:
+                    outputs = model_output
                 loss = self.loss_fn(outputs, targets)
 
             total_loss += loss.detach().item()
             num_batches += 1
-            
+
             if self.metrics:
                 self.metrics.update(outputs, targets)
         

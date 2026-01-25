@@ -1592,6 +1592,241 @@ class EfficiencyEvaluator:
 
 
 # ============================================================================
+# I101-2: 显存诊断工具
+# ============================================================================
+
+def diagnose_memory_usage(
+    model: nn.Module,
+    sample_input: torch.Tensor,
+    device: torch.device,
+    batch_size: int = 8,
+    seq_len: int = 64,
+    dim: int = 384,
+    depth: int = 8,
+    heads: int = 6,
+) -> dict:
+    """
+    I101-2: 详细显存诊断工具
+
+    提供显存使用的完整分解，帮助定位隐藏的显存消耗源。
+
+    数学形式化
+    ===========
+    显存分解:
+        M_total = M_params + M_grad + M_optimizer + M_activations
+                + M_attention + M_lca_bias + M_levels_info + M_overhead
+
+    其中 O(N²) 项:
+        - M_attention = B × H × N² × 2 (FP16 attention matrices)
+        - M_lca_bias = B × H × N² × 4 (FP32 LCA bias)
+        - M_levels_info = B × N × (D+1) × 4 (levels info data)
+
+    Args:
+        model: 待诊断的模型
+        sample_input: 样本输入张量
+        device: 计算设备
+        batch_size: 批次大小
+        seq_len: 序列长度 (token 数)
+        dim: 模型维度
+        depth: Transformer 层数
+        heads: 注意力头数
+
+    Returns:
+        包含详细显存分解的字典
+    """
+    import math
+
+    # 1. 获取模型参数信息
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    # 2. 测量实际峰值显存
+    model.eval()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+    with torch.no_grad():
+        _ = model(sample_input)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+        peak_memory_bytes = torch.cuda.max_memory_allocated()
+        reserved_memory_bytes = torch.cuda.max_memory_reserved()
+    else:
+        peak_memory_bytes = total_params * 4 * 3  # 粗略估算
+        reserved_memory_bytes = peak_memory_bytes * 1.2
+
+    # 3. 计算各组件的理论显存 (基于 I101-2 修正公式)
+    # 参数 (FP32)
+    M_params = total_params * 4 / (1024 ** 2)
+
+    # 梯度 (FP32)
+    M_grad = total_params * 4 / (1024 ** 2)
+
+    # Optimizer 状态 (FP32 m+v)
+    M_optimizer = total_params * 8 / (1024 ** 2)
+
+    # Transformer 激活 (FP32 baseline, with checkpoint)
+    checkpoint_factor = 0.35
+    M_activations = (
+        batch_size * seq_len * dim * 8 * 4 / (1024 ** 2)
+        * depth * checkpoint_factor
+    )
+
+    # 注意力矩阵 (FP16)
+    M_attention = (
+        batch_size * heads * seq_len * seq_len * 2 / (1024 ** 2)
+        * depth * 0.5
+    )
+
+    # LCA 偏置矩阵 (FP32)
+    M_lca_bias = (
+        batch_size * heads * seq_len * seq_len * 4 / (1024 ** 2)
+    )
+
+    # levels_info 数据 (FP32)
+    D = max(1, int(math.log2(seq_len))) if seq_len > 0 else 1
+    M_levels_info = (
+        batch_size * seq_len * (D + 1) * 4 / (1024 ** 2)
+    )
+
+    # 输入数据
+    M_data = batch_size * sample_input.shape[1] * sample_input.shape[2] * sample_input.shape[3] * 4 / (1024 ** 2)
+
+    # CUDA 开销
+    M_cuda = 500
+
+    # 理论总计
+    M_theoretical = (
+        M_params + M_grad + M_optimizer +
+        M_activations + M_attention + M_lca_bias +
+        M_levels_info + M_data + M_cuda
+    )
+
+    # 4. 计算各组件占比
+    total_with_overhead = peak_memory_bytes / (1024 ** 2)
+
+    def calc_pct(val: float) -> float:
+        if total_with_overhead > 0:
+            return val / total_with_overhead * 100
+        return 0.0
+
+    return {
+        "actual_peak_mb": total_with_overhead,
+        "reserved_mb": reserved_memory_bytes / (1024 ** 2),
+        "theoretical_total_mb": M_theoretical,
+        "error_pct": (total_with_overhead - M_theoretical) / max(total_with_overhead, 1) * 100,
+        "breakdown": {
+            "params_mb": {
+                "value": M_params,
+                "pct": calc_pct(M_params),
+                "description": "模型参数 (FP32)"
+            },
+            "grad_mb": {
+                "value": M_grad,
+                "pct": calc_pct(M_grad),
+                "description": "梯度 (FP32)"
+            },
+            "optimizer_mb": {
+                "value": M_optimizer,
+                "pct": calc_pct(M_optimizer),
+                "description": "优化器状态 (AdamW m+v)"
+            },
+            "activations_mb": {
+                "value": M_activations,
+                "pct": calc_pct(M_activations),
+                "description": "Transformer 激活 (checkpointed)"
+            },
+            "attention_mb": {
+                "value": M_attention,
+                "pct": calc_pct(M_attention),
+                "description": "注意力矩阵 QK^T (FP16, O(N²×H))"
+            },
+            "lca_bias_mb": {
+                "value": M_lca_bias,
+                "pct": calc_pct(M_lca_bias),
+                "description": "LCA 偏置矩阵 (FP32, O(N²×H))"
+            },
+            "levels_info_mb": {
+                "value": M_levels_info,
+                "pct": calc_pct(M_levels_info),
+                "description": "levels_info 数据"
+            },
+            "data_mb": {
+                "value": M_data,
+                "pct": calc_pct(M_data),
+                "description": "输入数据"
+            },
+            "cuda_overhead_mb": {
+                "value": M_cuda,
+                "pct": calc_pct(M_cuda),
+                "description": "CUDA 开销"
+            },
+        },
+        "model_info": {
+            "total_params": total_params,
+            "trainable_params": trainable_params,
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "dim": dim,
+            "depth": depth,
+            "heads": heads,
+        },
+        "warnings": [],
+    }
+
+
+def print_memory_diagnosis(diagnosis: dict) -> None:
+    """打印显存诊断结果 (格式化输出)"""
+    print("\n" + "=" * 80)
+    print("I101-2: 显存诊断报告")
+    print("=" * 80)
+
+    model_info = diagnosis["model_info"]
+    print(f"\n模型配置:")
+    print(f"  - 参数总量: {model_info['total_params']:,}")
+    print(f"  - 可训练参数: {model_info['trainable_params']:,}")
+    print(f"  - Batch Size: {model_info['batch_size']}")
+    print(f"  - 序列长度: {model_info['seq_len']}")
+    print(f"  - 维度: {model_info['dim']}")
+    print(f"  - 层数: {model_info['depth']}")
+    print(f"  - 头数: {model_info['heads']}")
+
+    print(f"\n显存使用:")
+    print(f"  - 实际峰值: {diagnosis['actual_peak_mb']:.1f} MB")
+    print(f"  - 理论估算: {diagnosis['theoretical_total_mb']:.1f} MB")
+    print(f"  - 误差: {diagnosis['error_pct']:.1f}%")
+
+    print(f"\n显存分解 (按占用大小排序):")
+    breakdown = diagnosis["breakdown"]
+    sorted_items = sorted(breakdown.items(), key=lambda x: x[1]["value"], reverse=True)
+
+    for key, item in sorted_items:
+        bar = "█" * int(item["pct"] / 2) + "░" * (50 - int(item["pct"] / 2))
+        print(f"  {item['description']:30s}: {item['value']:8.1f} MB ({item['pct']:5.1f}%) {bar[:25]}")
+
+    print("\n" + "=" * 80)
+
+    # 警告信息
+    if diagnosis["warnings"]:
+        print("\n警告:")
+        for warning in diagnosis["warnings"]:
+            print(f"  ⚠️  {warning}")
+
+    # O(N²) 警告
+    lca_pct = breakdown["lca_bias_mb"]["pct"]
+    attention_pct = breakdown["attention_mb"]["pct"]
+    o2n_total = lca_pct + attention_pct
+
+    if o2n_total > 20:
+        print(f"\n⚠️  O(N²) 显存占比过高: {o2n_total:.1f}%")
+        print("   建议: 减少序列长度或 batch size")
+
+    print()
+
+
+# ============================================================================
 # L6: 训练稳定性评估器
 # ============================================================================
 
@@ -1787,23 +2022,10 @@ class SplitterEvaluator:
                 # 触发 tokenizer 前向传播
                 try:
                     output = model.tokenizer.tokenize(imgs)
-                    
-                    # 尝试获取分割器的内部状态
-                    if hasattr(splitter, '_last_logits') and splitter._last_logits is not None:
-                        logits = splitter._last_logits  # [B, N]
-                        
-                        # 选择概率
-                        probs = torch.sigmoid(logits / metrics.temperature)
-                        selection_probs.extend(probs.flatten().cpu().tolist())
-                        
-                        # 按深度分组 (如果有深度信息)
-                        if hasattr(splitter, '_last_depths') and splitter._last_depths is not None:
-                            depths = splitter._last_depths
-                            for d in range(depths.max().item() + 1):
-                                mask = (depths == d).flatten()
-                                if mask.any():
-                                    d_logits = logits.flatten()[mask]
-                                    mlp_outputs_by_depth[d].extend(d_logits.cpu().tolist())
+
+                    # P1 Fix: 移除对不存在的内部状态 _last_logits/_last_depths 的引用
+                    # GumbelTopKSplitter 使用 _last_probs 和 _last_selected_mask
+                    # 这些不包含 MLP logits 或 depth 信息，无需在此处处理
                 except Exception:
                     pass
         

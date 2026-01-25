@@ -422,9 +422,6 @@ class TrainingConfig:
     # max_depth 由 min_patch_size 和 image_size 自动计算: floor(log2(min(H, W) / min_patch_size))
     min_patch_size: int  # 目标最小 patch 大小
 
-    # Tokenizer 配置 (V3 Variable Depth Tokens)
-    tokenizer_type: str = "streaming_v3"  # 'streaming_v3' (唯一支持)
-
     # GumbelTopKSplitter (Scheme D) 参数
     K_min: int = 16  # 最小 token 数量 (硬下界约束)
     K_max: int = 64  # 最大 token 数量 (软上界约束)
@@ -1292,6 +1289,50 @@ def download_cub200(data_root: Path) -> bool:
     return True
 
 
+def _compute_prefetch_factor(
+    batch_size: int,
+    num_workers: int,
+    is_container: bool = True,
+    swap_memory_mb: float = 24576.0,  # 默认 24GB swap
+    model_memory_mb: float = 2048.0,   # 模型内存估计
+    sample_memory_mb: float = 2.0,     # 单样本内存估计 (MB)
+    prefetch_max: int = 8,             # prefetch_factor 上限
+) -> int:
+    """
+    计算安全的 DataLoader prefetch_factor
+
+    数学模型:
+        Memory_prefetch = B × W × P × M_s ≤ M_swap - M_model
+
+    参数:
+        batch_size: 批次大小
+        num_workers: DataLoader worker 数
+        is_container: 是否容器环境
+        swap_memory_mb: 可用交换内存 (MB)
+        model_memory_mb: 模型内存估计 (MB)
+        sample_memory_mb: 单样本内存估计 (MB)
+        prefetch_max: prefetch_factor 上限
+
+    返回:
+        prefetch_factor: 安全预取因子 (最小值 2)
+
+    示例:
+        Container (B=32, W=8, 24GB swap):
+            P = min(8, (24576-2048)/(32*8*2)) = min(8, 44) = 8
+    """
+    # 可用于预取的内存
+    available_memory = swap_memory_mb - model_memory_mb
+
+    # 计算最大安全预取因子
+    max_safe_prefetch = available_memory / (batch_size * num_workers * sample_memory_mb)
+
+    # 根据环境计算上限
+    prefetch_upper = min(prefetch_max, int(max_safe_prefetch))
+
+    # 保证最小预取以维持性能
+    return max(2, prefetch_upper)
+
+
 # ============================================================================
 # 数据加载
 # ============================================================================
@@ -1488,8 +1529,14 @@ def create_dataloaders(
     }
     if effective_workers > 0:
         # prefetch_factor: 每个 worker 预取的 batch 数
-        # 过大会导致内存问题，使用保守值
-        loader_kwargs['prefetch_factor'] = 8 if is_container else 4
+        # 使用动态计算，根据可用内存调整
+        loader_kwargs['prefetch_factor'] = _compute_prefetch_factor(
+            batch_size=config.batch_size,
+            num_workers=effective_workers,
+            is_container=is_container,
+            swap_memory_mb=24576.0,  # 24GB swap
+            model_memory_mb=2048.0,   # 模型内存
+        )
         # 添加 generator 参数以提高多进程随机性
         loader_kwargs['generator'] = torch.Generator().manual_seed(42)
     
@@ -2429,7 +2476,6 @@ def verify_train_eval_consistency(
         'passed': True,
         'checks': {},
         'warnings': [],
-        'tokenizer_type': config.tokenizer_type,
     }
     
     # 获取一个 batch 用于测试
@@ -2496,7 +2542,7 @@ def verify_train_eval_consistency(
             report['passed'] = False
     
     # 打印 Tokenizer 信息
-    print(f"  [OK] Tokenizer: {config.tokenizer_type} (Variable Depth Tokens)")
+    print(f"  [OK] Tokenizer: streaming_v3 (Variable Depth Tokens)")
     
     # 总结
     print()
@@ -2549,11 +2595,6 @@ def main():
                        help="Use channels-last memory format for faster convolutions")
     parser.add_argument("--no-prefetch", action="store_true",
                        help="Disable CudaPrefetcher (for debugging data loading issues)")
-    
-    # Tokenizer 类型
-    parser.add_argument("--tokenizer-type", type=str, default="streaming_v3",
-                       choices=["streaming_v3"],
-                       help="Tokenizer type: streaming_v3 (Variable Depth Tokens, only supported)")
 
     # I30-1: Hilbert vs Raster 消融实验 - 扫描顺序参数
     parser.add_argument("--scan-order", type=str, default="hilbert",
@@ -2778,8 +2819,6 @@ def main():
         ffn_type=args.ffn_type,
         # I30-17: 动态深度配置 - max_depth 由 min_patch_size 自动计算
         min_patch_size=args.min_patch_size,
-        # Tokenizer 配置 (V3)
-        tokenizer_type=args.tokenizer_type,
         # GumbelTopKSplitter (Scheme D) 参数
         K_min=args.K_min,
         K_max=args.K_max,
@@ -3780,7 +3819,7 @@ def main():
             'early_stopped': early_stopped,
             'best_epoch': epoch - patience_counter if early_stopped else epoch,
             'consistency_passed': consistency_report.get('passed', None),
-            'tokenizer_type': config.tokenizer_type,
+            'tokenizer_type': 'streaming_v3',
         }
         if per_class_stats:
             results['per_class_stats'] = {

@@ -50,10 +50,9 @@ class ModelArchitectureConfig:
         - dim_head: 每头维度 = dim / heads
 
     Tokenizer 参数:
-        - num_scales: 四叉树深度级别数
         - min_patch_size: 最小 patch 大小
         - K_min/K_max: Token 数量范围 (I33: 相对预算)
-        - max_depth: 最大分割深度
+        - max_depth_hard_limit: 最大分割深度硬上限
     """
     # 核心架构参数
     num_classes: int = 200
@@ -73,13 +72,6 @@ class ModelArchitectureConfig:
     # 固定分辨率时用于初始化，兼容旧 API
 
     # Tokenizer 参数 (I33: 相对预算设计)
-    # P2 Fix: num_scales 已废弃，使用 min_patch_size 动态计算 max_depth
-    num_scales: int = field(default=4, metadata={
-        "deprecated": True,
-        "deprecated_since": "v99",
-        "replacement": "使用 min_patch_size 和 max_depth_hard_limit 动态计算",
-        "description": "四叉树深度级别数，已废弃"
-    })
     min_patch_size: int = 4
     # I33: 相对预算参数 (替代绝对 K_min/K_max)
     token_coverage_min: float = 0.01   # α = 1% 最小覆盖率
@@ -93,7 +85,7 @@ class ModelArchitectureConfig:
     # 性能优化选项
     use_checkpoint: bool = False
     use_channels_last: bool = False  # I78: channels-last 内存格式
-    use_compile: bool = False        # I78: torch.compile 优化
+    compile_model: bool = False      # I78: torch.compile 优化
     compile_mode: str = "default"    # torch.compile 模式
 
     # I31: 形状-尺度编码配置
@@ -116,16 +108,15 @@ class ModelArchitectureConfig:
         assert self.heads >= 1, f"heads={self.heads} 必须 >= 1"
         assert self.num_classes >= 1, f"num_classes={self.num_classes} 必须 >= 1"
 
-        # P2 Fix: 废弃参数警告
-        import warnings
-        if hasattr(self, 'num_scales'):
-            field_info = self.__dataclass_fields__.get('num_scales')
-            if field_info and field_info.metadata.get('deprecated', False):
-                warnings.warn(
-                    "num_scales 参数已废弃 (v99)，请使用 min_patch_size 和 max_depth_hard_limit 替代。",
-                    DeprecationWarning,
-                    stacklevel=2
-                )
+        # 验证覆盖率数学约束: 0 < α < β < 1
+        assert 0 < self.token_coverage_min < self.token_coverage_max < 1, \
+            f"覆盖率约束违反: 0 < {self.token_coverage_min} < {self.token_coverage_max} < 1"
+
+        # 验证 K 边界: K_min_abs > 0
+        assert self.K_min_abs > 0, f"K_min_abs={self.K_min_abs} 必须 > 0"
+
+        # 验证 max_depth: >= 1
+        assert self.max_depth_hard_limit >= 1, f"max_depth_hard_limit={self.max_depth_hard_limit} 必须 >= 1"
 
         # 验证 dim_head 一致性
         expected_dim_head = self.dim // self.heads
@@ -144,6 +135,40 @@ class ModelArchitectureConfig:
     def mlp_ratio(self) -> float:
         """返回 mlp_ratio (用于向后兼容)"""
         return self.mlp_dim / self.dim if self.dim > 0 else 4.0
+
+    @property
+    def params_total(self) -> int:
+        """Total model parameters
+
+        数学公式:
+            P = depth × (16 × dim²) + 2.5 × dim × num_classes
+
+        其中:
+            - Attention: Q, K, V, O = 4 × dim² per layer
+            - FFN (SwiGLU): 12 × dim² per layer
+            - Total per layer: 16 × dim²
+
+        Returns:
+            总参数量
+        """
+        # Attention: Q, K, V, O = 4 × dim² per layer
+        attention = 4 * self.dim * self.dim
+        # FFN (SwiGLU): up, gate, down = 3 × 2 × dim × mlp_dim = 12 × dim² per layer
+        ffn = 3 * 2 * self.dim * self.mlp_dim
+        params_per_layer = attention + ffn
+
+        transformer = self.depth * params_per_layer
+
+        # MLP Head: LayerNorm + Linear projection
+        head = (
+            2 * self.dim +  # LayerNorm weights + bias
+            self.dim * self.num_classes  # Final projection
+        )
+
+        # CLS token
+        cls = self.dim
+
+        return int(transformer + head + cls)
 
 
 # ============================================================================
