@@ -324,7 +324,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 # P-OPT-3: 延迟转换到 CPU，使用 non_blocking
                 # 仅在实际需要 depth_dists 时才转换（统计信息通常只用于日志）
                 # 将 dict 构建移到 _build_depth_dists_lazy 方法
-                self._depth_count_matrix_for_stats = count_matrix
+                # I103-5: 添加 detach() 防止显存泄露 (count_matrix 带梯度)
+                self._depth_count_matrix_for_stats = count_matrix.detach()
                 depth_dists = None  # 延迟构建
             else:
                 depth_dists = [{} for _ in range(B)]
