@@ -1536,11 +1536,8 @@ def create_dataloaders(
     shm_sufficient = shm_size_gb >= 2.0
     shm_moderate = shm_size_gb >= 1.0
     
-    use_pin_memory = (
-        effective_workers > 0 
-        and torch.cuda.is_available() 
-        and (not is_container or shm_moderate)  # 容器中需要足够共享内存
-    )
+    # P-OPT: 禁用 pin_memory 避免 torch.compile + 多进程兼容性问题
+    use_pin_memory = False
     use_persistent_workers = (
         effective_workers > 0 
         and (not is_container or shm_sufficient)  # 容器中需要更多共享内存
