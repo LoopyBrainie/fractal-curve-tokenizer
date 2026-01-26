@@ -724,15 +724,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         stats = self._last_split_stats.copy()
         stats['depth_entropy'] = self.get_scale_entropy()
         return stats
-    
-    def get_entropy_loss(self) -> Optional[torch.Tensor]:
-        """获取熵正则化损失 (用于可学习分割器).
-
-        I98-1: 修复 - tokenizer 不再持有 splitter，现在总是返回 None。
-        熵损失应该从外部 splitter 获取。
-        """
-        # I98-1: tokenizer 不再持有 splitter，熵损失从外部获取
-        return None
 
     @torch.no_grad()
     def get_scale_entropy(self) -> Optional[float]:
@@ -881,32 +872,4 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         return stats
 
-    def set_split_temperature(self, temperature: float) -> None:
-        """设置可学习分割器的温度 (用于退火调度).
-
-        I98-1: 此方法已弃用.
-        温度控制现在由外部 Splitter 管理:
-            model.splitter.set_temperature(temperature)
-
-        Args:
-            temperature: Gumbel 温度值
-
-        Note:
-            此方法保留用于向后兼容，但不再生效。
-        """
-        import warnings
-        warnings.warn(
-            "I98-1: set_split_temperature 已弃用. "
-            "请使用 model.splitter.set_temperature(temperature) 替代.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-
-    def reset_split_statistics(self) -> None:
-        """重置可学习分割器的统计信息.
-
-        I98-1: 此方法已弃用.
-        统计信息重置现在由外部 Splitter 管理.
-        """
-        pass
 

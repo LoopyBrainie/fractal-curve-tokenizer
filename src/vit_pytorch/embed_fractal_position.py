@@ -37,7 +37,7 @@ forward (位置编码):
           └─ 融合网络:  O(N · D · D)     — MLP
     空间: O(L_max · 4 · D)  — quadrant_embedding 表
 
-其中: N=seq_len, D=dim, L_max=max_level
+其中: N=seq_len, D=dim, L_max=max_depth
 
 P11-5 修复: 删除了未使用的 level_attention_bias 参数和 get_attention_bias 方法。
 注意力偏置功能已由 LCAHilbertBias (attn_hilbert_bias.py) 统一提供。
@@ -61,7 +61,7 @@ class FractalPositionEmbedding(nn.Module):
     高级分形位置编码，完全对齐增强tokenizer
     支持动态层级、Hilbert路径编码和多尺度空间感知
     
-    P11-2 修复: max_level 参数现在应传入与 tokenizer.max_depth 一致的值，
+    P11-2 修复: max_depth 参数现在应传入与 tokenizer.max_depth 一致的值，
     确保 Embedding 表大小与实际使用的深度范围匹配，减少约 90% 的参数浪费。
     
     I27-2 修复: 添加 dropout 参数，允许统一控制正则化强度。
@@ -84,7 +84,7 @@ class FractalPositionEmbedding(nn.Module):
     def __init__(
         self,
         dim: int,
-        max_level: int = 8,  # P11-2: 默认改为 8，应由上层传入实际 max_depth
+        max_depth: int = 8,  # P0 修复: 统一使用 max_depth
         max_seq_len: int = 10000,
         use_hilbert_encoding: bool = True,
         use_spatial_encoding: bool = True,
@@ -93,20 +93,20 @@ class FractalPositionEmbedding(nn.Module):
     ):
         super().__init__()
         self.dim = dim
-        self.max_level = max_level
+        self.max_depth = max_depth  # P0 修复: 统一使用 max_depth
         self.max_seq_len = max_seq_len
         self.use_hilbert_encoding = use_hilbert_encoding
         self.use_spatial_encoding = use_spatial_encoding
         self.dropout_rate = dropout  # I27-2: 保存用于调试
 
         # 1. 深度编码 (Depth Embedding)
-        self.depth_embedding = nn.Embedding(max_level + 1, dim)
+        self.depth_embedding = nn.Embedding(max_depth + 1, dim)
 
         # 2. 层级路径编码 (Hierarchical Path Embedding)
         # 替代原有的 LSTM 和 2D 绝对位置编码
         # 每个层级有 4 个象限 (0, 1, 2, 3)
-        # 总共 max_level * 4 个唯一的层级-象限组合
-        self.quadrant_embedding = nn.Embedding(max_level * 4, dim)
+        # 总共 max_depth * 4 个唯一的层级-象限组合
+        self.quadrant_embedding = nn.Embedding(max_depth * 4, dim)
 
         # 3. 融合网络 (简化版)
         # 输入: Depth Emb + Path Emb
@@ -151,7 +151,7 @@ class FractalPositionEmbedding(nn.Module):
         device = levels_info.data.device
 
         # 从 LevelsInfo 提取 depths 和 paths
-        depths = levels_info.depths.clamp(0, self.max_level).long()
+        depths = levels_info.depths.clamp(0, self.max_depth).long()
         paths = levels_info.paths  # (..., path_len)
 
         # STAB-7 修复: 确保索引张量为连续格式
@@ -174,7 +174,7 @@ class FractalPositionEmbedding(nn.Module):
         flat_indices = paths + level_offsets
         
         # 安全截断，防止越界 (虽然理论上不应该发生)
-        flat_indices = flat_indices.clamp(0, self.max_level * 4 - 1)
+        flat_indices = flat_indices.clamp(0, self.max_depth * 4 - 1)
 
         # STAB-7 修复: 确保索引张量为连续格式
         # channels-last 格式与 Embedding 层不兼容，必须转换为 contiguous
@@ -237,7 +237,7 @@ class AreaEnhancedPositionEmbedding(nn.Module):
     def __init__(
         self,
         dim: int,
-        max_level: int = 8,
+        max_depth: int = 8,
         fourier_levels: int = 4,
         use_hilbert_encoding: bool = True,
         use_spatial_encoding: bool = True,
@@ -250,7 +250,7 @@ class AreaEnhancedPositionEmbedding(nn.Module):
         ----
         dim : int
             嵌入维度
-        max_level : int, optional
+        max_depth : int, optional
             最大层级，默认 8
         fourier_levels : int, optional
             傅里叶频率级别数，默认 4
@@ -265,7 +265,7 @@ class AreaEnhancedPositionEmbedding(nn.Module):
         """
         super().__init__()
         self.dim = dim
-        self.max_level = max_level
+        self.max_depth = max_depth
 
         # I98-3: 使用配置类
         if area_config is None:
@@ -275,7 +275,7 @@ class AreaEnhancedPositionEmbedding(nn.Module):
         # 基础位置编码 (深度 + 路径)
         self.base_embedding = FractalPositionEmbedding(
             dim=dim,
-            max_level=max_level,
+            max_depth=max_depth,
             use_hilbert_encoding=use_hilbert_encoding,
             use_spatial_encoding=use_spatial_encoding,
             dropout=dropout,

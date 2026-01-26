@@ -238,7 +238,7 @@ class DynamicDepthRouter(nn.Module):
 
 def compute_complexity_from_depth_distribution(
     depths: torch.Tensor,
-    max_level: int,
+    max_depth: int,
 ) -> torch.Tensor:
     """从深度分布计算复杂度（无需额外参数）。
 
@@ -249,7 +249,7 @@ def compute_complexity_from_depth_distribution(
 
     Args:
         depths: 深度值 [B, N]
-        max_level: 最大深度
+        max_depth: 最大深度
 
     Returns:
         复杂度得分 [B, 1]
@@ -257,18 +257,18 @@ def compute_complexity_from_depth_distribution(
     B, N = depths.shape
 
     # 深度权重：深度越大，权重越高（细节越丰富）
-    # 权重数量 = max_level + 1 (深度 0 到 max_level)
+    # 权重数量 = max_depth + 1 (深度 0 到 max_depth)
     depth_weights = torch.arange(
-        1, max_level + 2, dtype=torch.float32, device=depths.device
-    )  # [max_level + 1]
+        1, max_depth + 2, dtype=torch.float32, device=depths.device
+    )  # [max_depth + 1]
     depth_weights = depth_weights / depth_weights.sum()  # 归一化
 
-    # 计算深度分布 - 使用 num_classes=max_level+2 确保与 depths 中的值兼容
-    depth_distribution = F.one_hot(depths, num_classes=max_level + 2).float()
-    depth_distribution = depth_distribution.mean(dim=1)  # [B, max_level + 2]
+    # 计算深度分布 - 使用 num_classes=max_depth+2 确保与 depths 中的值兼容
+    depth_distribution = F.one_hot(depths, num_classes=max_depth + 2).float()
+    depth_distribution = depth_distribution.mean(dim=1)  # [B, max_depth + 2]
 
-    # 只使用前 max_level + 1 列进行计算
-    depth_distribution = depth_distribution[:, :max_level + 1]  # [B, max_level + 1]
+    # 只使用前 max_depth + 1 列进行计算
+    depth_distribution = depth_distribution[:, :max_depth + 1]  # [B, max_depth + 1]
 
     # 计算复杂度
     complexity = depth_distribution @ depth_weights  # [B]

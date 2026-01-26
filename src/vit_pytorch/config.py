@@ -30,7 +30,6 @@ from typing import Literal, Optional, Tuple
 # 导入默认常量（作为配置默认值）
 from .constants import (
     LEARNABLE_QUOTA_ENABLED,
-    QUOTA_MIN_PER_DEPTH,
     QUOTA_INIT_LOGITS,
     QUOTA_ENTROPY_WEIGHT,
     HILBERT_BIAS_SCALE,
@@ -114,7 +113,7 @@ class SplitterConfig:
     # I30-10: 配额参数暴露
     enable_learnable_quota: bool = LEARNABLE_QUOTA_ENABLED
     quota_init_logits: Optional[Tuple[float, ...]] = None  # None = 使用默认
-    quota_min_per_depth: int = QUOTA_MIN_PER_DEPTH
+    quota_min_per_depth: int = 2  # DEPRECATED: I96-7, 使用 quota_min_ratio 替代
     quota_entropy_weight: float = QUOTA_ENTROPY_WEIGHT
 
     # I30-10: 冻结控制

@@ -175,7 +175,7 @@ class LevelsInfo:
 
     @property
     def max_level(self) -> int:
-        """D"""
+        """D: 返回 max_depth 字段 (property 接口)"""
         return self.max_depth
 
     def __len__(self) -> int:

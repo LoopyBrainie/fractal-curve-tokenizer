@@ -2340,6 +2340,26 @@ class GumbelTopKSplitter(
 
         return loss
 
+    def get_entropy_loss(self, weight: float = QUOTA_ENTROPY_WEIGHT) -> Tensor:
+        """
+        获取配额熵正则化损失 (MetricsSplitter Protocol 接口).
+
+        数学形式:
+            L_entropy = -Σ_d π_d log(π_d + ε)
+            鼓励配额分布保持多样性
+
+        Args:
+            weight: 熵损失权重
+
+        Returns:
+            Tensor: 熵损失值
+
+        Note:
+            此方法是 get_quota_entropy_loss() 的别名/快捷方式，
+            用于实现 MetricsSplitter Protocol 接口。
+        """
+        return self.get_quota_entropy_loss(weight=weight)
+
     def set_quota_grad(self, enabled: bool) -> None:
         """
         控制配额参数的梯度 (I30-10: freeze_quota 功能)。

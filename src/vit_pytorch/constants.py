@@ -30,18 +30,6 @@ LearnableSplitter 默认参数 (P11-10/P11-11 修复后):
 
 from __future__ import annotations
 
-# ==================== 层级相关常量 ====================
-
-#: 默认最大递归层级（当未指定 max_level 时使用）
-#: P11-2/I12-5: 与代码中的默认值保持一致
-DEFAULT_MAX_LEVEL: int = 8
-
-#: 系统支持的最大层级上限
-MAX_SUPPORTED_LEVEL: int = 50
-
-#: 递归深度安全余量（在 depth_limit 之上额外允许的层级）
-EXTRA_DEPTH_CAP: int = 5
-
 # ==================== 初始化相关常量 ====================
 
 #: 嵌入层权重初始化标准差
@@ -55,11 +43,7 @@ HILBERT_BIAS_SCALE: float = 0.1
 #: 层级偏置的缩放因子
 LEVEL_BIAS_SCALE: float = 0.05
 
-#: Hilbert/Level bias scale 上界 (CRIT-2)
-#: 数学: λ_max = 10.0 保证 max(bias * λ) ≤ 10.0 << FP32 安全边界 50
-BIAS_SCALE_MAX: float = 10.0
-
-# ==================== LearnableSplitter 默认参数 ====================
+# ==================== Splitter 温度常量 ====================
 
 #: Gumbel-Softmax 起始温度 T_start
 SPLITTER_TEMP_START: float = 1.0
@@ -76,25 +60,6 @@ SPLITTER_TEMP_END: float = 0.5
 #: 优势: 开始慢降(保持探索) → 中期快降(高效收敛) → 末期平稳(稳定决策)
 #: 数学: T(t) = T_end + (T_start - T_end) * (1 + cos(πt)) / 2
 SPLITTER_TEMP_SCHEDULE: str = 'cosine'
-
-#: 阈值衰减因子 γ ∈ (0, 1)，每层深度阈值为 τ_d = τ_base · γ^d
-SPLIT_GAMMA: float = 0.85
-
-#: LearnableSplitter 初始基础阈值 (用于 MLP 参数初始化)
-#: P11-10 修复: 使用 logit 空间初始化，τ₀ = 0.0 (对称初始化)
-#: 注意: split_adaptive.py 中硬编码为 0.0，此常量仅为文档目的
-LEARNABLE_INIT_TAU_BASE: float = 0.0
-
-#: LearnableSplitter 初始阈值衰减 (用于 MLP 参数初始化)
-LEARNABLE_INIT_TAU_GAMMA: float = 0.85
-
-# ==================== 数值稳定性常量 ====================
-
-#: Logits 截断的最小值（防止数值不稳定）
-LOGITS_CLAMP_MIN: float = -10.0
-
-#: Logits 截断的最大值（防止数值不稳定）
-LOGITS_CLAMP_MAX: float = 10.0
 
 # ==================== 数值稳定性常量 (I12-7) ====================
 # 数学分析见: workspace/numerical_constants_analysis.py
@@ -188,10 +153,7 @@ SOFT_EXCLUSION_MARGIN: float = 0.1
 #: 是否启用可学习配额方案 (替代 Log-Compensation)
 LEARNABLE_QUOTA_ENABLED: bool = True
 
-#: 每个深度的最小配额 (防止死区)
-#: 数学: K_d >= K_MIN_PER_DEPTH 保证梯度流
-#: I26-1: 从 1 增加到 2，防止 tree consistency 后完全清空
-#: I96-7: 已弃用，改为使用自适应比例 QUOTA_MIN_RATIO
+#: 每个深度的最小配额 (内部使用，I96-7: 推荐使用 QUOTA_MIN_RATIO)
 QUOTA_MIN_PER_DEPTH: int = 2
 
 #: I96-7: 最小采样比例 (自适应深度下界软目标)

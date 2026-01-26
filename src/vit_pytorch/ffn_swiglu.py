@@ -141,7 +141,7 @@ class AdaptiveFractalFeedForward(nn.Module):
     - 'swiglu': SwiGLU FFN (LLaMA-style, lightweight)
     - 'swiglu_level': SwiGLU + Level Adaptation (recommended, best balance)
     
-    P11-2 修复: 参数 max_level 现在应传入与 tokenizer.max_depth 一致的值，
+    P11-2 修复: 参数 max_depth 现在应传入与 tokenizer.max_depth 一致的值，
     而非硬编码的 50。这确保 level_embedding 和 level_mixing_weights 的
     Embedding 表大小与实际使用的深度范围匹配，减少约 90% 的参数浪费。
     
@@ -149,7 +149,7 @@ class AdaptiveFractalFeedForward(nn.Module):
         dim: Input/output dimension.
         hidden_dim: Hidden layer dimension.
         dropout: Dropout rate.
-        max_level: Maximum hierarchical level for embeddings (P11-2: should match tokenizer.max_depth).
+        max_depth: Maximum hierarchical level for embeddings (P11-2: should match tokenizer.max_depth).
         use_level_adaptation: Whether to use level-aware adaptation (only for 'gelu').
         ffn_type: FFN variant to use ('gelu', 'swiglu', 'swiglu_level').
         bias: Whether to use bias in linear layers (default: False for SwiGLU).
@@ -160,7 +160,7 @@ class AdaptiveFractalFeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         dropout: float = 0.0,
-        max_level: int = 8,  # P11-2: 默认改为 8，应由上层传入实际 max_depth
+        max_depth: int = 8,  # P11-2: 默认改为 8，应由上层传入实际 max_depth
         use_level_adaptation: bool = True,
         ffn_type: FFNType = 'swiglu_level',
         bias: bool = False,
@@ -168,7 +168,7 @@ class AdaptiveFractalFeedForward(nn.Module):
         super().__init__()
         self.dim = dim
         self.hidden_dim = hidden_dim
-        self.max_level = max_level
+        self.max_depth = max_depth
         self.ffn_type = ffn_type
         
         # For SwiGLU variants, level_adaptation is controlled by ffn_type
@@ -181,10 +181,10 @@ class AdaptiveFractalFeedForward(nn.Module):
         # 移除标准 LayerNorm，添加层级感知的 gamma/beta 参数
         # 数学形式: x_norm = (x - μ) / σ * γ[d] + β[d]
         # 其中 d 是 token 的深度层级
-        # I101-3: 深度边界处理 - 使用 max_level+2 以支持 padding sentinel
-        # index 0..max_level: 有效深度, index max_level+1: padding
-        self.ffn_gamma = nn.Embedding(max_level + 2, dim)
-        self.ffn_beta = nn.Embedding(max_level + 2, dim)
+        # I101-3: 深度边界处理 - 使用 max_depth+2 以支持 padding sentinel
+        # index 0..max_depth: 有效深度, index max_depth+1: padding
+        self.ffn_gamma = nn.Embedding(max_depth + 2, dim)
+        self.ffn_beta = nn.Embedding(max_depth + 2, dim)
 
         # 初始化为恒等变换: γ=1, β=0
         nn.init.ones_(self.ffn_gamma.weight)
@@ -210,7 +210,7 @@ class AdaptiveFractalFeedForward(nn.Module):
         
         # ========== Level Adaptation（仅对 swiglu_level 或 GELU + use_level_adaptation）==========
         if self.use_level_adaptation:
-            self.level_embedding: Optional[nn.Embedding] = nn.Embedding(max_level + 1, dim)
+            self.level_embedding: Optional[nn.Embedding] = nn.Embedding(max_depth + 1, dim)
             
             # I34-19: LLaMA 风格 adapter - D_adapter = dim / 2
             adapter_hidden = dim // 2 if ffn_type == 'swiglu_level' else hidden_dim // 2
@@ -222,7 +222,7 @@ class AdaptiveFractalFeedForward(nn.Module):
             )
             # P1-1: 初始化为 0，使 sigmoid(0)=0.5 作为中性起点
             # 语义: α_d = σ(w_d)，50% main FFN + 50% level adapter
-            self.level_mixing_weights: Optional[nn.Parameter] = nn.Parameter(torch.zeros(max_level + 1))
+            self.level_mixing_weights: Optional[nn.Parameter] = nn.Parameter(torch.zeros(max_depth + 1))
         else:
             self.level_embedding = None
             self.shared_level_adapter = None
@@ -254,8 +254,8 @@ class AdaptiveFractalFeedForward(nn.Module):
 
         # I98-4: 使用 LevelsInfo.depths，并 clamp 负值（padding sentinel）
         depths = levels_info.depths  # [B, S]
-        # I98-4: clamp depths to [0, max_level] to handle padding sentinel (-1)
-        depths_clamped = depths.clamp(min=0, max=self.max_level)
+        # I98-4: clamp depths to [0, max_depth] to handle padding sentinel (-1)
+        depths_clamped = depths.clamp(min=0, max=self.max_depth)
         level_embs = self.level_embedding(depths_clamped)
         # P1-1 修复: 使用 sigmoid 替代错误的 softmax(dim=1)
         mixing_weights = torch.sigmoid(self.level_mixing_weights[depths_clamped]).unsqueeze(-1)
@@ -289,10 +289,10 @@ class AdaptiveFractalFeedForward(nn.Module):
             depths = torch.zeros(batch, seq_len, dtype=torch.long, device=x.device)
         else:
             depths = levels_info.depths  # [B, S], 包含 padding sentinel -1
-            # I101-3: 深度边界处理 - padding (-1) 映射到 max_level+1
-            # 有效深度 0..max_level 保持不变
-            depths = depths.where(depths >= 0, torch.tensor(self.max_level + 1, device=depths.device))
-            depths = depths.clamp(min=0, max=self.max_level + 1)
+            # I101-3: 深度边界处理 - padding (-1) 映射到 max_depth+1
+            # 有效深度 0..max_depth 保持不变
+            depths = depths.where(depths >= 0, torch.tensor(self.max_depth + 1, device=depths.device))
+            depths = depths.clamp(min=0, max=self.max_depth + 1)
 
         # 标准 LayerNorm 计算
         mean = x.mean(dim=-1, keepdim=True)

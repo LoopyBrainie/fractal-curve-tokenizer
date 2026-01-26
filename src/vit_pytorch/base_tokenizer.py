@@ -313,7 +313,7 @@ class TokenizerOutput:
         否则回退到标准 padding 逻辑。
         
         Args:
-            info_dim: 目标 info 维度 (通常是 max_level + 4)
+            info_dim: 目标 info 维度 (通常是 max_depth + 4)
             
         Returns:
             padded_levels: [B, MaxN, info_dim] 填充后的 levels
