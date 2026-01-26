@@ -2579,8 +2579,12 @@ def main():
     parser.add_argument("--depth", type=int, default=8)
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--dim-head", type=int, default=32)
-    parser.add_argument("--max-level", type=int, default=None,
-                       help="Maximum quadtree level (I30-17: auto-computed from min_patch_size if None)")
+    # I30-17: max_depth 控制 Hilbert 四叉树递归深度
+    parser.add_argument("--max-depth", type=int, default=None,
+                       help="I30-17: Maximum quadtree depth (auto-computed from min_patch_size if None)")
+    # I136: mlp_dim FFN 隐藏维度
+    parser.add_argument("--mlp-dim", type=int, default=None,
+                       help="FFN hidden dimension (default: 4 * dim, use None for auto)")
     # I30-17: Replace num_scales with min_patch_size (max_depth auto-computed)
     parser.add_argument("--min-patch-size", type=int, default=4,
                        help="I30-17: Target minimum patch size for automatic depth computation")
@@ -2683,6 +2687,7 @@ def main():
                        help="Enable elastic budget loss (default: True, recommended)")
     parser.add_argument("--no-elastic-budget", action="store_false", dest="include_elastic_budget",
                        help="Disable elastic budget loss")
+    # I33: 相对覆盖率参数 (推荐使用)
     parser.add_argument("--elastic-coverage-min", type=float, default=0.03,
                        help="I33: Elastic budget minimum coverage ratio (dead zone lower bound, default: 0.03)")
     parser.add_argument("--elastic-coverage-max", type=float, default=0.25,
@@ -2829,7 +2834,7 @@ def main():
         depth=args.depth,
         heads=args.heads,
         dim_head=args.dim_head,
-        mlp_dim=args.dim * 4,
+        mlp_dim=args.mlp_dim if args.mlp_dim else args.dim * 4,
         pool=args.pool,
         image_size=spec.image_size,
         channels=spec.channels,
@@ -2837,7 +2842,7 @@ def main():
         token_coverage_min=args.token_coverage_min,
         token_coverage_max=args.token_coverage_max,
         K_min_abs=K_min,
-        max_depth_hard_limit=args.max_level if args.max_level is not None else 8,
+        max_depth_hard_limit=args.max_depth if args.max_depth is not None else 8,
         ffn_type=args.ffn_type,
         use_checkpoint=args.gradient_checkpoint,
         use_channels_last=getattr(args, 'channels_last', False),
@@ -2870,6 +2875,7 @@ def main():
             self.depth = arch_config.depth
             self.heads = arch_config.heads
             self.dim_head = arch_config.dim_head
+            self.mlp_dim = arch_config.mlp_dim
             self.pool = arch_config.pool
             self.ffn_type = arch_config.ffn_type
             self.min_patch_size = arch_config.min_patch_size
@@ -2965,7 +2971,7 @@ def main():
         dim=config.dim,
         depth=config.depth,
         heads=config.heads,
-        mlp_dim=config.dim * 4,
+        mlp_dim=config.mlp_dim,
         pool=config.pool,
         channels=spec.channels,
         dim_head=config.dim_head,

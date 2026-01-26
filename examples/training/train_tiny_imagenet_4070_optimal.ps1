@@ -79,8 +79,8 @@ uv run python src/training/train_fractal_vit.py `
   --soft-entropy-mode maximize `
   --soft-entropy-weight 0.05 `
   --include-elastic-budget `
-  --elastic-N-min 16 `
-  --elastic-N-max 128 `
+  --elastic-coverage-min 0.03 `
+  --elastic-coverage-max 0.25 `
   --elastic-lambda-over 0.1 `
   --elastic-lambda-under 0.01 `
   --use-amp `
