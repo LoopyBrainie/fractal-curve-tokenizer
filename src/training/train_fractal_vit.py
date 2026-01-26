@@ -3304,6 +3304,13 @@ def main():
 
             # I107-6: 使用 reduce-overhead 模式获得更好的 CUDA 性能
             compile_mode = 'reduce-overhead'
+
+            # I107-6: 在 compile 之前应用 channels_last，避免 cudagraphs 冲突
+            # 这样可以避免 device_put 时触发 CPU 操作
+            if config.channels_last and device.type == 'cuda':
+                model = model.to(memory_format=torch.channels_last)
+                print("[OK] Using channels-last memory format (before compile)")
+
             model = torch.compile(
                 model,
                 mode=compile_mode,
@@ -3313,11 +3320,6 @@ def main():
             print(f"[OK] Model compiled with torch.compile (mode={compile_mode})")
             if has_cuda:
                 print("[INFO] 首次运行会进行 JIT 编译，可能耗时 1-2 分钟")
-
-            # I107-3: 在 compile 之后应用 channels_last，避免 cudagraphs 冲突
-            if config.channels_last and device.type == 'cuda':
-                model = model.to(memory_format=torch.channels_last)
-                print("[OK] Using channels-last memory format (after compile)")
         except Exception as e:
             print(f"[WARN] torch.compile failed: {e}")
             print("[INFO] 回退到 eager 模式继续训练")
