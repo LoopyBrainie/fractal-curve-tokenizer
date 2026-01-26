@@ -19,6 +19,7 @@ from vit_pytorch.curve_hilbert import (
     HilbertCurve,
     PseudoHilbertCurve,
     HilbertLocalityMetrics,
+    HilbertProbabilityMetrics,
 )
 
 
@@ -174,3 +175,240 @@ class TestHilbertLocalityMetrics:
             # 所有情况都应该有合理的上界
             assert max_jump <= max(h, w), f"跳跃超出边界: {max_jump}"
             assert 1.0 <= avg_loss <= max(h, w), f"平均损失异常: {avg_loss}"
+
+
+# =============================================================================
+# I108-5: Hilbert Probability Metrics Tests
+# =============================================================================
+
+class TestHilbertProbabilityMetrics:
+    """HilbertProbabilityMetrics 工具类测试.
+
+    测试条件概率 P(d_S ≤ τ | d_H = k) 的精确计算。
+
+    关键发现: Hilbert 曲线保证 d_H = 1 时 d_S = 1 (确定性)。
+    这意味着 P(d_S = 1 | d_H = 1) = 1.0。
+    """
+
+    def test_condition_prob_exact_k1_tau_1_0(self):
+        """验证 k=1, τ=1.0 时的条件概率.
+
+        Hilbert 曲线核心性质: d_H=1 ⟹ d_S=1
+        P(d_S ≤ 1.0 | d_H = 1) = 1.0
+        """
+        prob = HilbertProbabilityMetrics.condition_prob_exact(
+            order=4, delta_d=1, spatial_threshold=1.0
+        )
+        assert abs(prob - 1.0) < 1e-6
+
+    def test_condition_prob_exact_k1_tau_1_5(self):
+        """验证 k=1, τ=1.5 时的条件概率.
+
+        τ ≥ 1.0 时，P = 1.0 (距离恒为 1.0)
+        """
+        prob = HilbertProbabilityMetrics.condition_prob_exact(
+            order=4, delta_d=1, spatial_threshold=1.5
+        )
+        assert abs(prob - 1.0) < 1e-6
+
+    def test_condition_prob_exact_k1_tau_2_0(self):
+        """验证 k=1, τ=2.0 时的条件概率.
+
+        τ ≥ 1.0 时，P = 1.0
+        """
+        prob = HilbertProbabilityMetrics.condition_prob_exact(
+            order=4, delta_d=1, spatial_threshold=2.0
+        )
+        assert abs(prob - 1.0) < 1e-6
+
+    def test_condition_prob_exact_k1_tau_0_5(self):
+        """验证 k=1, τ=0.5 时的条件概率.
+
+        τ < 1.0 时，P = 0.0 (距离恒为 1.0 > τ)
+        """
+        prob = HilbertProbabilityMetrics.condition_prob_exact(
+            order=4, delta_d=1, spatial_threshold=0.5
+        )
+        assert abs(prob - 0.0) < 1e-6
+
+    def test_condition_prob_exact_k1_order_8(self):
+        """验证不同阶数的概率一致性.
+
+        对于 k=1，所有阶数的概率都是 1.0 (确定性)
+        """
+        for order in [4, 5, 6, 7, 8]:
+            prob = HilbertProbabilityMetrics.condition_prob_exact(
+                order=order, delta_d=1, spatial_threshold=1.0
+            )
+            assert abs(prob - 1.0) < 1e-6, f"Order {order} 不一致"
+
+    def test_condition_prob_exact_delta_d_greater_than_1_raises(self):
+        """验证 delta_d > 1 时抛出 NotImplementedError (精确解不支持)."""
+        with pytest.raises(NotImplementedError):
+            HilbertProbabilityMetrics.condition_prob_exact(
+                order=4, delta_d=2, spatial_threshold=1.5
+            )
+
+    def test_condition_prob_approximate_k1_brute_force(self):
+        """验证暴力精确计算与解析解一致 (k=1).
+
+        brute_force 遍历所有点对，k=1 时所有距离都是 1.0
+        """
+        exact = HilbertProbabilityMetrics.condition_prob_exact(
+            order=4, delta_d=1, spatial_threshold=1.0
+        )
+        approx = HilbertProbabilityMetrics.condition_prob_approximate(
+            order=4, delta_d=1, spatial_threshold=1.0,
+            method="brute_force"
+        )
+        assert abs(exact - approx) < 1e-6
+
+    def test_condition_prob_approximate_k2_brute_force(self):
+        """验证 k=2 时的概率计算 (暴力法).
+
+        k=2 时距离分布: {√2: 约 80%, 2: 约 20%}
+        P(d_S ≤ 2.0 | d_H = 2) = 1.0
+        """
+        prob = HilbertProbabilityMetrics.condition_prob_approximate(
+            order=8, delta_d=2, spatial_threshold=2.0,
+            method="brute_force"
+        )
+        # k=2 时，最大距离为 2.0，所以 P = 1.0
+        assert abs(prob - 1.0) < 1e-6
+
+    def test_condition_prob_approximate_k2_threshold_1_5(self):
+        """验证 k=2, τ=1.5 时的概率计算.
+
+        k=2 时，部分点对距离为 √2 (≈1.414)，部分为 2.0
+        P(d_S ≤ 1.5 | d_H = 2) = P(d_S = √2)
+        """
+        prob = HilbertProbabilityMetrics.condition_prob_approximate(
+            order=8, delta_d=2, spatial_threshold=1.5,
+            method="brute_force"
+        )
+        # 验证概率在 (0, 1) 范围内
+        assert 0.0 < prob < 1.0
+        # 期望约 80% (50/62 = 0.806)
+        assert 0.7 < prob < 0.9
+
+    def test_condition_prob_approximate_monte_carlo_k2(self):
+        """验证蒙特卡洛估计的精度 (k=2, τ=1.5).
+
+        蒙特卡洛估计应接近暴力精确解，误差 < 0.05 (95% 置信度)
+        """
+        brute = HilbertProbabilityMetrics.condition_prob_approximate(
+            order=8, delta_d=2, spatial_threshold=1.5,
+            method="brute_force"
+        )
+        monte_carlo = HilbertProbabilityMetrics.condition_prob_approximate(
+            order=8, delta_d=2, spatial_threshold=1.5,
+            method="monte_carlo", samples=50000, seed=42
+        )
+        assert abs(brute - monte_carlo) < 0.05
+
+    def test_locality_entropy_k1(self):
+        """验证香农熵计算 (k=1).
+
+        k=1 时，所有距离都是 1.0 (确定性分布)
+        H = -1.0 * log2(1.0) = 0.0 bits
+        """
+        entropy = HilbertProbabilityMetrics.locality_entropy(order=4)
+        assert abs(entropy - 0.0) < 1e-6
+
+    def test_locality_entropy_k2(self):
+        """验证香农熵计算 (k=2).
+
+        k=2 时，距离分布为 {√2: 50/62, 2: 12/62}
+        H = -(50/62)*log2(50/62) - (12/62)*log2(12/62)
+        """
+        entropy = HilbertProbabilityMetrics.locality_entropy(order=8, delta_d=2)
+        # 熵应该 > 0 (非确定性分布)
+        assert entropy > 0.0
+        # 熵应该 < 1 (分布不完全均匀)
+        assert entropy < 1.0
+
+    def test_locality_entropy_bounds_k2(self):
+        """验证熵值在合理范围内 (k=2).
+
+        k=2 时，P(√2) ≈ 0.8, P(2.0) ≈ 0.2
+        H = -0.8*log2(0.8) - 0.2*log2(0.2) ≈ 0.72 bits
+        """
+        for n in [4, 5, 6, 7, 8]:
+            entropy = HilbertProbabilityMetrics.locality_entropy(order=n, delta_d=2)
+            # 熵应该在 0.7 ~ 0.75 范围内
+            assert 0.7 < entropy < 0.75, f"n={n}: 熵={entropy} 超出范围"
+
+    def test_distance_distribution_k1(self):
+        """验证距离分布计算 (k=1).
+
+        k=1 时，所有距离都是 1.0
+        """
+        dist = HilbertProbabilityMetrics._distance_distribution(order=4, delta_d=1)
+        # 验证分布概率和为 1
+        assert abs(sum(dist.values()) - 1.0) < 1e-6
+        # 验证距离值
+        assert 1.0 in dist
+        assert len(dist) == 1  # 只有一种距离
+
+    def test_distance_distribution_k2(self):
+        """验证距离分布计算 (k=2).
+
+        k=2 时，距离分布为 {√2: 50/62, 2: 12/62}
+        """
+        dist = HilbertProbabilityMetrics._distance_distribution(order=8, delta_d=2)
+        # 验证分布概率和为 1
+        assert abs(sum(dist.values()) - 1.0) < 1e-6
+        # 验证距离值
+        assert 1.414 in dist
+        assert 2.0 in dist
+
+    def test_full_probability_report_k1(self):
+        """验证完整概率报告生成 (k=1)."""
+        report = HilbertProbabilityMetrics.full_probability_report(order=4)
+
+        assert report["order"] == 4
+        assert report["delta_d"] == 1
+        assert "entropy_bits" in report
+        assert "distance_distribution" in report
+        assert "P(d_S <= 1.0)" in report
+        assert "P(d_S <= 1.414)" in report
+
+    def test_full_probability_report_k2(self):
+        """验证完整概率报告生成 (k=2)."""
+        report = HilbertProbabilityMetrics.full_probability_report(order=8, delta_d=2)
+
+        assert report["order"] == 8
+        assert report["delta_d"] == 2
+        assert report["entropy_bits"] > 0  # k=2 时有不确定性
+        assert "distance_distribution" in report
+
+    def test_cumulative_prob_threshold_1_0(self):
+        """验证累积概率计算 (τ=1.0).
+
+        分布 {1.0: 0.5, 1.414: 0.5}: P(d_S ≤ 1.0) = 0.5
+        """
+        distribution = {1.0: 0.5, 1.414: 0.5}
+        prob = HilbertProbabilityMetrics._cumulative_prob(distribution, 1.0)
+        assert abs(prob - 0.5) < 1e-6
+
+    def test_cumulative_prob_threshold_1_414(self):
+        """验证累积概率计算 (τ=1.414).
+
+        分布 {1.0: 0.5, 1.414: 0.5}: P(d_S ≤ 1.414) = 1.0
+        """
+        distribution = {1.0: 0.5, 1.414: 0.5}
+        prob = HilbertProbabilityMetrics._cumulative_prob(distribution, 1.414)
+        assert abs(prob - 1.0) < 1e-6
+
+    def test_probability_consistency_k1(self):
+        """验证 k=1 时解析解与暴力精确解一致."""
+        for order in [4, 5, 6]:
+            exact = HilbertProbabilityMetrics.condition_prob_exact(
+                order=order, delta_d=1, spatial_threshold=1.0
+            )
+            brute = HilbertProbabilityMetrics.condition_prob_approximate(
+                order=order, delta_d=1, spatial_threshold=1.0,
+                method="brute_force"
+            )
+            assert abs(exact - brute) < 1e-6, \
+                f"Order {order} 不一致: exact={exact}, brute={brute}"

@@ -33,6 +33,7 @@ Tokenizer 选项
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
@@ -46,6 +47,37 @@ from .block_transformer import FractalTransformer, FFNType
 from .utils import pair
 from .constants import DIVISION_EPSILON, PROB_EPSILON
 from .config import AttentionEncoderConfig  # I98-3
+
+
+@dataclass
+class TrainingStats:
+    """统一训练统计信息 (替代 aux_info 字典)
+
+    设计原则: 单一接口，配置驱动，无废弃参数
+    """
+    # 分类输出
+    logits: torch.Tensor              # [B, num_classes]
+
+    # Tokenization 统计
+    num_tokens: int                   # Token 数量
+    depth_used: int                   # 使用的深度
+    depth_distribution: Dict[int, float]  # 深度分布
+
+    # 特征输出
+    features: torch.Tensor            # [B, dim] 池化特征
+    transformer_tokens: torch.Tensor  # [B, N, dim] Transformer token
+
+    # 诊断信息
+    splitter_entropy: float = 0.0
+    temperature: float = 1.0
+
+    def validate(self) -> None:
+        """数学约束验证"""
+        assert 0 <= self.num_tokens <= 4096, f"Token 数异常: {self.num_tokens}"
+        assert 0 <= self.depth_used <= 50, f"深度越界: {self.depth_used}"
+        if self.depth_distribution:
+            total = sum(self.depth_distribution.values())
+            assert abs(total - 1.0) < 1e-5, f"分布未归一化: {total}"
 
 
 class FractalCurveViT(nn.Module):
@@ -769,102 +801,26 @@ class FractalCurveViT(nn.Module):
 
         return aux_infos, features_tensor if return_features else None
 
-    # H2: Protocol compliance - overload signatures for type checkers
     @overload
-    def forward(
-        self,
-        img: torch.Tensor,
-        return_aux_info: bool = False,
-        return_features: bool = False,
-        return_tokens: bool = False,
-    ) -> torch.Tensor: ...
-
-    @overload
-    def forward(
-        self,
-        img: torch.Tensor,
-        return_aux_info: bool = True,
-        return_features: bool = False,
-        return_tokens: bool = False,
-    ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]: ...
-
-    @overload
-    def forward(
-        self,
-        img: torch.Tensor,
-        return_aux_info: bool = False,
-        return_features: bool = True,
-        return_tokens: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
-
-    @overload
-    def forward(
-        self,
-        img: torch.Tensor,
-        return_aux_info: bool = True,
-        return_features: bool = True,
-        return_tokens: bool = False,
-    ) -> Tuple[torch.Tensor, List[Dict[str, Any]], torch.Tensor]: ...
-
-    @overload
-    def forward(
-        self,
-        img: torch.Tensor,
-        return_aux_info: bool = False,
-        return_features: bool = False,
-        return_tokens: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
+    def forward(self, img: torch.Tensor) -> TrainingStats: ...
 
     def forward(
         self,
         img: torch.Tensor,
-        return_aux_info: bool = False,
-        return_features: bool = False,
-        return_tokens: bool = False,
-    ) -> Union[
-        torch.Tensor,
-        Tuple[torch.Tensor, List[Dict[str, Any]]],
-        Tuple[torch.Tensor, List[Dict[str, Any]], torch.Tensor],
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],  # legacy: (logits, tokens, lengths)
-    ]:
+    ) -> Union[torch.Tensor, TrainingStats]:
         """前向传播。
+
+        设计原则: 单一接口，无废弃参数
 
         Args:
             img: 输入图像，形状为 [B, C, H, W]
-            return_aux_info: 是否返回辅助信息（推荐使用）
-            return_features: [废弃警告] 是否返回特征（合并到 aux_info）
-            return_tokens: [废弃警告] 是否返回 tokens（合并到 aux_info）
 
         Returns:
-            根据参数返回不同类型：
-            - 默认：分类 logits [B, num_classes]
-            - return_aux_info=True：(logits, aux_infos)
-              aux_infos 包含: features, tokens, lengths, depth_distribution 等
-            - return_tokens=True: [废弃] (logits, tokens, lengths)
-            - return_features=True: [废弃] (logits, features)
+            TrainingStats: 包含 logits, features, num_tokens, depth_distribution 等
         """
-        import warnings
-
-        # I36 Phase 2: 废弃警告
-        if return_features:
-            warnings.warn(
-                "return_features 已废弃，请使用 return_aux_info=True。"
-                "特征信息现在包含在 aux_info['features'] 中。",
-                DeprecationWarning,
-                stacklevel=2
-            )
-        if return_tokens:
-            warnings.warn(
-                "return_tokens 已废弃，请使用 return_aux_info=True。"
-                "tokens 和 lengths 现在包含在 aux_info['transformer_tokens'] 和 aux_info['lengths'] 中。",
-                DeprecationWarning,
-                stacklevel=2
-            )
-
         # P0-2: 自动转换 channels_last 内存格式以优化卷积性能
-        # 检测输入是否为 4D 且是 channels_first (stride(1) != stride(2))
         if (img.dim() == 4 and
-            img.stride(1) != img.stride(2) and
+            not img.is_contiguous(memory_format=torch.channels_last) and
             hasattr(self, '_channels_last_enabled') and
             self._channels_last_enabled):
             img = img.to(memory_format=torch.channels_last)
@@ -872,19 +828,17 @@ class FractalCurveViT(nn.Module):
         batch_size = img.shape[0]
         device = img.device
 
-        # 1. 准备 tokens (P11-3: 返回 token_output 用于获取 regions)
+        # 1. 准备 tokens
         padded_tokens, padded_levels, lengths, levels_list, token_output = self._prepare_tokens(img)
-        
+
         # P11-3: 获取 regions 和 image_size 用于正确的 LCA 偏置计算
         regions, image_size = token_output.get_padded_regions()
 
         # 2. 添加位置编码和 CLS token
-        # I31-3: 传递 regions 和 image_size 用于面积编码
-        # I98-4: 返回 (x, levels_info) 而非 (x, padded_levels)
         x, levels_info = self._apply_position_and_cls(
             padded_tokens, padded_levels, regions=regions, image_size=image_size
         )
-        
+
         # P11-3: 为 regions 添加 CLS 对应的零填充
         if regions is not None:
             cls_region = torch.zeros(batch_size, 1, 4, dtype=regions.dtype, device=device)
@@ -895,50 +849,65 @@ class FractalCurveViT(nn.Module):
             batch_size, x.shape[1], lengths, device
         )
 
-        # 4. Transformer 处理 (P11-3: 传递 regions 和 image_size)
-        # I98-4: 传递 LevelsInfo 而非 raw tensor
+        # 4. Transformer 处理
         x = self.transformer(x, levels_info, attn_mask, regions=regions, image_size=image_size)
-        
-        # I30-2: 保存 transformer 输出用于困难样本挖掘 (排除 CLS token)
-        transformer_tokens = x[:, 1:]  # [B, N, D] 排除 CLS
+
+        # 获取 transformer 输出 (排除 CLS token)
+        transformer_tokens = x[:, 1:]
 
         # I30-11: 获取 split_probs 用于加权池化
-        split_probs = token_output.get_padded_split_probs()  # [B, N] 或 None
+        split_probs = token_output.get_padded_split_probs()
 
         # 5. 池化
         pooled = self._apply_pooling(x, key_padding_mask, split_probs)
         pooled = self.to_latent(pooled)
         final_output = self.mlp_head(pooled)
 
-        # I30-2: Token 输出 (用于 HilbertAwareHardMining) - 保持向后兼容性
-        if return_tokens:
-            return final_output, transformer_tokens, lengths
+        # 6. 构建 TrainingStats
+        aux_infos, _ = self._prepare_auxiliary_output(
+            batch_size, lengths, levels_list, pooled, return_aux_info=True, return_features=False,
+            split_probs=split_probs
+        )
 
-        # 6. 辅助输出
-        if return_aux_info or return_features:
-            aux_infos, _ = self._prepare_auxiliary_output(
-                batch_size, lengths, levels_list, pooled, return_aux_info, return_features,
-                split_probs=split_probs
-            )
+        # 从 aux_infos 提取信息构建 TrainingStats
+        first_aux = aux_infos[0] if aux_infos else {}
 
-            # I36 Phase 2: 将 features 和 tokens 添加到 aux_info
-            if return_aux_info:
-                for i, aux in enumerate(aux_infos):
-                    # 添加特征（池化后的表示）
-                    aux['features'] = pooled[i]
-                    # 添加 transformer tokens 和长度（用于困难样本挖掘）
-                    aux['transformer_tokens'] = transformer_tokens[i] if i < len(transformer_tokens) else None
-                    aux['lengths'] = lengths[i].item() if hasattr(lengths[i], 'item') else lengths[i]
+        # 计算深度分布
+        depth_dist = first_aux.get('depth_distribution', {})
 
-            # 保持向后兼容性（带废弃警告）
-            if return_aux_info and return_features:
-                return final_output, aux_infos, pooled  # features = pooled
-            if return_aux_info:
-                return final_output, aux_infos
-            if return_features:
-                return final_output, pooled
+        # I135: 辅助函数 - 递归展平嵌套结构，提取所有整数值
+        def flatten_levels(item):
+            """递归展平嵌套结构，提取所有整数值"""
+            if isinstance(item, torch.Tensor):
+                # 展平张量为单一列表
+                return item.cpu().flatten().tolist()
+            elif isinstance(item, (list, tuple)):
+                result = []
+                for sub_item in item:
+                    result.extend(flatten_levels(sub_item))
+                return result
+            else:
+                return [int(item)]
 
-        return final_output
+        # 从 levels_list 推断主要使用的深度
+        if levels_list:
+            all_levels = []
+            for levels in levels_list:
+                all_levels.extend(flatten_levels(levels))
+            depth_used = int(max(all_levels)) if all_levels else 0
+        else:
+            depth_used = 0
+
+        stats = TrainingStats(
+            logits=final_output,
+            num_tokens=int(lengths.sum().item()),
+            depth_used=depth_used,
+            depth_distribution=depth_dist,
+            features=pooled,
+            transformer_tokens=transformer_tokens,
+        )
+
+        return stats
 
     def get_tokenizer_loss(
         self,
@@ -1051,27 +1020,6 @@ class FractalCurveViT(nn.Module):
                 }
 
             return analysis
-
-    # =========================================================================
-    # I36: FractalModelProtocol 接口实现
-    # =========================================================================
-
-    def get_extra_info(
-        self,
-        img: torch.Tensor,
-        return_aux_info: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[List[Dict[str, Any]]]]:
-        """获取辅助信息 (I36-3: FractalModelProtocol 实现)
-
-        Args:
-            img: 输入图像 [B, C, H, W]
-            return_aux_info: 是否返回 aux_info
-
-        Returns:
-            logits: 分类输出 [B, num_classes]
-            aux_infos: 辅助信息列表，每个元素对应一个样本
-        """
-        return self.forward(img, return_aux_info=return_aux_info)
 
     def configure_training(self, config: Dict[str, Any]) -> None:
         """配置训练相关参数 (I36-2: 解耦设计, I99-对齐修复)

@@ -44,6 +44,7 @@ import warnings
 from abc import ABC, abstractmethod
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -253,9 +254,11 @@ class LCAHilbertBias(HilbertBiasBase):
             self.lca_embedding.weight = nn.Parameter(
                 self.lca_embedding.weight.to(torch.float16)
             )
-            # 注册钩子以裁剪权重，防止 FP16 溢出
+            # I108-6: 注册钩子以裁剪梯度，防止 FP16 溢出
+            # 使用 GRAD_CLAMP_BOUND (20.0) 替代原 10.0
+            # 数学依据: P(|grad| > 20) ≈ 10^-6 << 4.5% (原边界裁剪率)
             self.lca_embedding.weight.register_hook(
-                lambda grad: grad.clamp(min=-10.0, max=10.0)
+                lambda grad: grad.clamp(min=-GRAD_CLAMP_BOUND, max=GRAD_CLAMP_BOUND)
             )
         
         # P6-2: 可学习温度参数
@@ -676,6 +679,19 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             torch.tensor(self.config.level_bias_init)
         )
 
+        # I108-1: Affine 偏置归一化参数
+        # 问题: B_a 量级 O(dim)，与 B_h(O(1)), B_l(O(10)) 量纲不一致
+        # 解决方案: B_a' = B_a / κ * γ
+        #   - κ = exp(φ) 归一化因子，初始化 log(dim) 使 κ ≈ dim
+        #   - γ = softplus(θ) 缩放因子，初始化 0 使 γ ≈ 1
+        # 预期效果: B_a' ≈ O(1)
+        self._affine_bias_norm_raw = nn.Parameter(
+            torch.tensor(np.log(dim))  # κ ≈ dim
+        )
+        self._affine_bias_scale_raw = nn.Parameter(
+            torch.tensor(0.0)  # γ ≈ 1
+        )
+
         # A19: 移除可学习 scale_weights，保留标准 1/√d_k
         # 理由: LayerNorm 已将 Q,K 方差控制在 1，1/√d_k 已足够
         # 双重缩放导致 Var(dots) ≈ 0.69 而非理论最优的 1.0
@@ -696,25 +712,54 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
     def hilbert_bias_scale(self) -> torch.Tensor:
         """获取 Hilbert 偏置缩放因子 (可学习, Softplus + Clamp 约束).
 
-        CRIT-2 修正: 添加 clamp(max=10.0) 防止数值溢出。
+        CRIT-2 修正: 添加 clamp(max=SCALE_CLAMP_BOUND) 防止数值溢出。
+        I108-6 修正: 从 10.0 提升到 15.0 覆盖更多 softplus 输出范围。
 
         数学:
-            λ = min(softplus(w), 10.0) ∈ [0, 10.0]
+            λ = min(softplus(w), SCALE_CLAMP_BOUND) ∈ [0, 15.0]
 
         理由:
             - Hilbert 偏置值域 [0, 1]，scale 过大导致 attention logits 爆炸
             - softplus 无上限，训练中可能增长到数千
-            - 10.0 上界保证: max(bias * scale) ≤ 10.0 << FP32 安全边界 50
+            - 15.0 上界保证: max(bias * scale) ≤ 15.0 << FP32 安全边界 50
         """
-        return F.softplus(self._hilbert_bias_scale_raw).clamp(max=10.0)
+        return F.softplus(self._hilbert_bias_scale_raw).clamp(max=SCALE_CLAMP_BOUND)
 
     @property
     def level_bias_scale(self) -> torch.Tensor:
         """获取层级偏置缩放因子 (可学习, Softplus + Clamp 约束).
 
-        CRIT-2 修正: 添加 clamp(max=10.0) 保持与 hilbert_bias_scale 一致。
+        CRIT-2 修正: 添加 clamp(max=SCALE_CLAMP_BOUND) 保持与 hilbert_bias_scale 一致。
+        I108-6 修正: 从 10.0 提升到 15.0。
         """
-        return F.softplus(self._level_bias_scale_raw).clamp(max=10.0)
+        return F.softplus(self._level_bias_scale_raw).clamp(max=SCALE_CLAMP_BOUND)
+
+    @property
+    def affine_bias_norm(self) -> torch.Tensor:
+        """获取 Affine 偏置归一化因子 κ = exp(φ).
+
+        I108-1 修复: B_a 量级 O(dim)，需要归一化到 O(1)。
+
+        数学:
+            κ = exp(_affine_bias_norm_raw) > 0
+
+        初始化: φ = log(dim)，使得 κ ≈ dim
+        预期效果: B_a / κ ≈ O(1)
+        """
+        return torch.exp(self._affine_bias_norm_raw)
+
+    @property
+    def affine_bias_scale(self) -> torch.Tensor:
+        """获取 Affine 偏置缩放因子 γ = softplus(θ).
+
+        I108-1 修复: 归一化后的 B_a 需要可学习的缩放控制。
+
+        数学:
+            γ = softplus(_affine_bias_scale_raw) ∈ (0, +∞)
+
+        初始化: θ = 0，使得 γ ≈ 1 (保持原有量级)
+        """
+        return F.softplus(self._affine_bias_scale_raw)
 
     def _compute_hilbert_bias(
         self,
@@ -813,14 +858,20 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         # 处理 Affine 偏置
         if affine_bias is not None:
             if affine_bias.dim() == 4:
-                # [B, dim, N, N] -> [B, 1, N, N] (对 heads 和 head_dim 求平均)
+                # I108-1: [B, dim, N, N] -> [B, 1, N, N] (对 heads 和 head_dim 求平均)
+                # 然后应用归一化和缩放: B_a' = B_a / κ * γ
                 # dim = heads * head_dim
                 actual_head_dim = affine_bias.shape[1] // self.heads
                 affine_avg = affine_bias.reshape(
                     affine_bias.shape[0], self.heads, actual_head_dim,
                     affine_bias.shape[2], affine_bias.shape[3]
-                ).mean(dim=[1, 2]).unsqueeze(1)  # 先对 heads 和 head_dim 求平均，再插入维度
-                biases.append(affine_avg)
+                ).mean(dim=[1, 2]).unsqueeze(1)  # [B, 1, N, N]
+
+                # I108-1: 归一化 + 缩放
+                # B_a' = B_a / κ * γ (κ = exp(φ), γ = softplus(θ))
+                affine_normalized = affine_avg / self.affine_bias_norm
+                affine_scaled = affine_normalized * self.affine_bias_scale
+                biases.append(affine_scaled)
 
         if not biases:
             return None
@@ -831,7 +882,10 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         for bias in biases[1:]:
             bias_total = bias_total + bias
 
-        return bias_total
+        # I108-1/I108-6: 安全 clamp 防止 softmax 饱和
+        # 使用 LOGIT_CLAMP_BOUND (50.0) 常量
+        # 数学依据: softmax(x > 50) ≈ one-hot，远小于 FP16 上界 65504
+        return bias_total.clamp(min=-LOGIT_CLAMP_BOUND, max=LOGIT_CLAMP_BOUND)
 
     def _forward_hierarchical(
         self,
@@ -894,6 +948,14 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         if self.use_hilbert_bias and self.hilbert_bias_impl is not None and regions is not None and image_size is not None:
             hilbert_bias_batch = self.hilbert_bias_impl.forward_from_regions(regions, image_size)
 
+        # I108-3: 预分配循环内复用的索引张量，避免重复计算
+        batch_indices = torch.arange(batch, device=x.device, dtype=torch.int64).view(-1, 1)  # [B, 1]
+        pos_indices = torch.arange(seq_len, device=x.device, dtype=torch.int64).view(1, -1)  # [1, N]
+        combined = (batch_indices * seq_len + pos_indices)  # [B, N]
+
+        # 预分配掩码缓冲区 (I108-3 优化)
+        mask_2d_buffer = torch.zeros(batch, seq_len, seq_len, dtype=torch.bool, device=x.device)
+
         # 遍历每个深度，分别计算 Attention
         for d in range(self.max_depth + 1):
             # 深度 d 的 token 掩码 [B, N]
@@ -917,10 +979,11 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             if hilbert_bias_batch is not None:
                 dots = dots + hilbert_bias_batch * self.hilbert_bias_scale
 
-            # 掩码: 只保留深度 d 的 token 之间的注意力
+            # 掩码: 只保留深度 d 的 token 之间的注意力 (I108-3: 使用预分配缓冲区)
             # mask_2d[b, i, j] = depth_mask[b, i] AND depth_mask[b, j]
-            mask_2d = depth_mask.unsqueeze(1) & depth_mask.unsqueeze(2)  # [B, N, N]
-            dots = dots.masked_fill(~mask_2d.unsqueeze(1), float('-inf'))
+            mask_2d_buffer.fill_(False)
+            mask_2d_buffer[:] = depth_mask.unsqueeze(1) & depth_mask.unsqueeze(2)
+            dots = dots.masked_fill(~mask_2d_buffer.unsqueeze(1), float('-inf'))
 
             # Softmax
             attn = self.attend(dots)
@@ -939,19 +1002,12 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             # out_d: [B, H, N, d_k] -> [B, N, H*d_k]
             out_flat = rearrange(out_d, "b h n d -> b n (h d)")
 
-            # 收集 depth_mask 为 True 的位置的值
+            # 收集 depth_mask 为 True 的位置的值 (I108-3: 使用预分配的 combined 索引)
             # 使用 masked_select 只保留有效位置的输出
             valid_mask = depth_mask  # [B, N]
             out_valid = out_flat[valid_mask]  # [M, H*d_k] where M = sum valid
 
-            # 创建索引张量 [B, N] -> [B*N]
-            # 对于 valid 位置，索引为 0..M-1
-            # 对于 invalid 位置，不需要处理（因为输出已经是 0）
-            batch_indices = torch.arange(batch, device=x.device, dtype=torch.int64).view(-1, 1)  # [B, 1]
-            pos_indices = torch.arange(seq_len, device=x.device, dtype=torch.int64).view(1, -1)  # [1, N]
-            combined = (batch_indices * seq_len + pos_indices)  # [B, N]
-
-            # 只收集有效位置的索引
+            # 只收集有效位置的索引 (使用预分配的 combined)
             valid_indices = combined[valid_mask]  # [M]
 
             # 使用 index_put 将有效值放回输出
@@ -1164,7 +1220,12 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                         affine_bias_avg = affine_bias.reshape(
                             batch, self.heads, actual_head_dim, N, N
                         ).mean(dim=2)
-                        dots = dots + affine_bias_avg * self.hilbert_bias_scale
+
+                        # I108-1: 归一化 + 缩放
+                        # B_a' = B_a / κ * γ (与 Flash Attention 路径一致)
+                        affine_normalized = affine_bias_avg / self.affine_bias_norm
+                        affine_scaled = affine_normalized * self.affine_bias_scale
+                        dots = dots + affine_scaled
             else:
                 hilbert_bias = self._compute_hilbert_bias(
                     levels_info=levels_info,

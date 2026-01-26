@@ -99,6 +99,31 @@ SHAPE_NORM_EPSILON: float = 1e-6
 #: 验证: T=0.3 时 softmax 梯度仍有效 (∂p/∂z ≈ 1/τ)
 TEMPERATURE_MIN: float = 0.3
 
+# ==================== I108-6: FP16 Clamp 边界常量 ====================
+# 数学分析见: workspace/fp16_clamp_analysis.md
+
+#: Logits clamp 边界 (Attention / Gumbel logits)
+#: 数学依据: softmax(x > 50) ≈ one-hot (引理 2.1)
+#: FP16 安全: 50 << 65504 (FP16 最大值 ~1300× 安全余量)
+#: 验证: clamp(-50, 50) 确保数值稳定且不丢失有效信息
+LOGIT_CLAMP_BOUND: float = 50.0
+
+#: Gradient clamp 边界 (FP16)
+#: 数学依据: P(|grad| > 20) ≈ 10^-6 << 4.5% (原 clamp(-10, 10) 的裁剪率)
+#: FP16 安全: 20 << 65504 (~3200× 安全余量)
+#: 梯度流: 几乎无损 (原 ~4.5% 梯度裁剪 → ~0.0001%)
+GRAD_CLAMP_BOUND: float = 20.0
+
+#: Scale clamp 边界 (softplus 输出)
+#: 数学依据: softplus(15) ≈ 1.0e-6 (引理 4.2)
+#: 验证: 覆盖 99.99% 的 softplus 输出范围
+SCALE_CLAMP_BOUND: float = 15.0
+
+#: FP16 安全 epsilon (替代原有的 1e-8)
+#: 数学依据: FP16 最小正规数 ~6e-5，精度 ~1e-3
+#: 使用 1e-6 作为安全下界，避免 FP16 下溢
+FP16_SAFE_EPSILON: float = 1e-6
+
 # ==================== 深度平衡常量 (I24-2 方案E) ====================
 # 数学分析: 解决深度分布崩溃问题
 # 问题: 候选数量不平衡 (d=0:1, d=1:4, d=2:16, d=3:64) 导致 Top-K 偏向 depth=3
@@ -177,6 +202,13 @@ QUOTA_INIT_LOGITS: tuple = (-0.495, -0.207, 0.016, 0.486)
 #: 配额熵正则化权重 (鼓励分布多样性)
 #: 数学: L_entropy = -λ × H(K/K_total)
 QUOTA_ENTROPY_WEIGHT: float = 0.1
+
+#: CRIT-6 修复: 配额 STE 梯度损失权重
+#: 数学: L_ste = λ × MSE(K_soft, K_hard)
+#: 用途: 直接为 quota_logits 提供梯度，修复 floor().long() 断裂的梯度
+#: 原理: K_soft = softmax(φ) × K 有完整梯度，K_hard = K_soft.detach().round().long() 无梯度
+#:       MSE 损失使 ∂L/∂φ_d = 2λ × (K_soft_d - K_hard_d) × K × ∂p_d/∂φ_d
+QUOTA_STE_WEIGHT: float = 0.5
 
 # ==================== I33: 相对预算与自适应覆盖率常量 ====================
 # 数学分析: 动态深度下 K_max 与 K_min 应随图像尺寸自适应

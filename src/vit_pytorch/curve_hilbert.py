@@ -461,8 +461,13 @@ class HilbertCurve:
         """高阶曲线缓存 (k >= 6).
 
         I107-6: 使用 LRU 缓存确保内存有界性
-        - maxsize=16: 内存上界 ~115 MB (极端 k=8)
-        - 典型使用 (k=6,7): ~2.3 MB
+        - maxsize=16: 内存上界 ~134 MB (极端 k=8, 128 bytes/点)
+        - 典型使用 (k=6,7): ~2.7 MB
+
+        内存计算: maxsize × 2^(2k) × 128 bytes
+        - k=8: 16 × 65536 × 128 ≈ 134 MB
+        - k=7: 16 × 16384 × 128 ≈ 33.5 MB
+        - k=6: 16 × 4096 × 128 ≈ 8.4 MB
         """
         n = 1 << order
         return tuple(cls.d_to_xy(n, d) for d in range(n * n))
@@ -477,8 +482,8 @@ class HilbertCurve:
         - k >= 6: LRU 缓存 (maxsize=16)，内存有界
 
         数学上界:
-        - 极端: 16 × M(8) ≈ 115 MB
-        - 典型: M(6) + M(7) ≈ 2.3 MB
+        - 极端: 16 × M(8) × 128 bytes ≈ 134 MB
+        - 典型: M(6) + M(7) × 128 bytes ≈ 2.7 MB
 
         Args:
             order: 曲线阶数 (生成 2^order × 2^order 网格)
@@ -503,6 +508,87 @@ class HilbertCurve:
         global _HILBERT_CURVE_CACHE
         _HILBERT_CURVE_CACHE.clear()
         HilbertCurve._get_curve_points_cached_high.cache_clear()
+
+    # =========================================================================
+    # I108-4: 内存估算工具函数
+    # =========================================================================
+
+    @staticmethod
+    def estimate_curve_cache_memory(order: int, maxsize: int = 16) -> int:
+        """估算 Hilbert 曲线缓存内存占用.
+
+        数学公式:
+            M(order) = maxsize × 2^(2×order) × C_tuple
+
+        其中 C_tuple = 128 bytes 包含:
+        - Python tuple 头: 56 bytes
+        - 2 个 int 对象: 2 × 28 = 56 bytes
+        - 指针和填充: 16 bytes
+
+        Args:
+            order: 曲线阶数 (生成 2^order × 2^order 网格)
+            maxsize: LRU 缓存大小 (默认 16)
+
+        Returns:
+            预估内存字节数
+        """
+        n_points = 1 << (2 * order)  # 2^(2k)
+        C_tuple = 128  # bytes per tuple[int, int]
+        return maxsize * n_points * C_tuple
+
+    @staticmethod
+    def estimate_coord_cache_memory(h: int, w: int, maxsize: int = 16) -> int:
+        """估算坐标缓存内存占用.
+
+        数学公式:
+            M(h,w) = maxsize × h × w × C_dict_entry
+
+        其中 C_dict_entry ≈ 176 bytes 包含:
+        - PyDictEntry: 24 bytes
+        - Tuple[int, int]: 112 bytes
+        - int 值: 28 bytes
+        - 哈希表开销分摊: ~12 bytes
+
+        Args:
+            h: 网格高度
+            w: 网格宽度
+            maxsize: LRU 缓存大小 (默认 16)
+
+        Returns:
+            预估内存字节数
+        """
+        n_entries = h * w
+        C_dict_entry = 176  # bytes per dict entry
+        return maxsize * n_entries * C_dict_entry
+
+    @staticmethod
+    def estimate_path_cache_memory(
+        grid_h: int, grid_w: int, max_depth: int, maxsize: int = 64
+    ) -> int:
+        """估算 HilbertPathCache 内存占用.
+
+        数学公式:
+            M = maxsize × [N × 4 + N × max_depth × 8] bytes
+              = maxsize × N × (4 + 8 × max_depth)
+
+        其中:
+        - N = grid_h × grid_w (token 数)
+        - h2r 映射: int32 × N = 4N bytes
+        - 四叉树路径: int64 × N × max_depth = 8N × max_depth bytes
+
+        Args:
+            grid_h: 网格高度
+            grid_w: 网格宽度
+            max_depth: 四叉树最大深度
+            maxsize: 缓存条目上限 (默认 64)
+
+        Returns:
+            预估内存字节数
+        """
+        n_tokens = grid_h * grid_w
+        h2r_bytes = n_tokens * 4  # int32 per token
+        path_bytes = n_tokens * max_depth * 8  # int64 per path element
+        return maxsize * (h2r_bytes + path_bytes)
 
 
 # 便捷函数
@@ -751,14 +837,21 @@ class PseudoHilbertCurve:
         return cls._scan_with_strategy(h, w)
 
     # I102-9: 使用 LRU 缓存替代全局字典，内存有界
-    # maxsize=16 对应内存上界 ~512 KB (16 × 64 × 64 × 8B)
+    # I108-4: 修正内存界计算 (考虑 Python Dict/Tuple 开销)
+    # maxsize=16 对应内存上界 ~19 MB (16 × 64 × 64 × 176 bytes)
     @classmethod
     @_dynamo_safe_lru_cache(maxsize=16)
     def _get_coord_cache(cls, h: int, w: int) -> Dict[Tuple[int, int], int]:
         """获取坐标到距离的缓存 (LRU 限制: maxsize=16).
 
-        内存上界: maxsize × max_tokens × entry_size
-                 = 16 × 64 × 64 × 8B = 512 KB
+        内存上界: maxsize × h × w × C_dict_entry
+               = 16 × 64 × 64 × 176 bytes ≈ 19 MB
+
+        其中 C_dict_entry ≈ 176 bytes 包含:
+        - PyDictEntry: 24 bytes
+        - Tuple[int, int]: 112 bytes
+        - int 值: 28 bytes
+        - 哈希表开销分摊: ~12 bytes
 
         Returns:
             {(x, y): d} 映射字典
@@ -1403,3 +1496,273 @@ class HilbertLocalityMetrics:
         }
 
         return results
+
+
+# =============================================================================
+# I108-5: Hilbert 局部性概率量化工具类
+# =============================================================================
+
+class HilbertProbabilityMetrics:
+    """Hilbert 曲线局部性概率量化工具类.
+
+    提供条件概率 P(d_S ≤ τ | d_H = k) 的精确计算，量化 Hilbert 曲线的
+    空间局部性保持能力。
+
+    数学定义
+    --------
+    - Hilbert 距离: d_H(p_i, p_j) = |H⁻¹(p_i) - H⁻¹(p_j)|
+    - 空间距离: d_S(p_i, p_j) = ||p_i - p_j||_2
+    - 条件概率: P_k(τ) := P(d_S ≤ τ | d_H = k)
+
+    点分类与概率推导
+    ----------------
+    - 角落点 (V_corner): 4 个，P(d_S=1 | corner) = 1.0
+    - 边界点 (V_boundary): 4(N-2) 个，P(d_S=1 | boundary) = 2(N-1)/(2N-1)
+    - 内部点 (V_internal): (N-2)² 个，P(d_S=1 | internal) = (N-1)/N
+
+    整体概率:
+    P(d_S = 1) = (4·1 + 4(N-2)·2(N-1)/(2N-1) + (N-2)²·(N-1)/N) / N²
+
+    渐近行为: lim(N→∞) P(d_S = 1) = 1.0
+    """
+
+    # 常数: 可能的欧氏距离值 (四舍五入到 3 位小数)
+    _POSSIBLE_DISTANCES = (1.0, 1.414, 2.0, 2.236, 2.828, 3.0, 3.162, 4.0)
+
+    @staticmethod
+    def condition_prob_exact(
+        order: int,
+        delta_d: int = 1,
+        spatial_threshold: float = 1.5,
+        distance_type: str = "euclidean"
+    ) -> float:
+        """精确计算条件概率 P(d_S ≤ τ | d_H = k).
+
+        仅支持 k=1 (相邻点)。对于 k>1，使用 condition_prob_approximate()。
+
+        数学公式:
+            N = 2^order
+            P_total = (n_corner * P_corner + n_boundary * P_boundary
+                      + n_internal * P_internal) / N²
+
+        Args:
+            order: Hilbert 曲线阶数 n, N = 2^n
+            delta_d: Hilbert 距离差 k (默认 1 = 相邻)
+            spatial_threshold: 空间距离阈值 τ
+            distance_type: 距离类型 ("euclidean", "manhattan", "chebyshev")
+
+        Returns:
+            条件概率值 P ∈ [0, 1]
+
+        Raises:
+            NotImplementedError: 当 delta_d > 1 时
+
+        Examples:
+            >>> HilbertProbabilityMetrics.condition_prob_exact(order=8, delta_d=1, spatial_threshold=1.0)
+            1.0
+            >>> HilbertProbabilityMetrics.condition_prob_exact(order=8, delta_d=1, spatial_threshold=0.5)
+            0.0
+        """
+        n = 1 << order  # n = 2^order
+        N = n * n  # 总点数
+
+        # 对于 k=1 (Hilbert 相邻点)，距离恒为 1.0 (确定性)
+        # 这是 Hilbert 曲线的核心性质：局部紧致性
+        if delta_d == 1:
+            if spatial_threshold >= 1.0:
+                return 1.0  # 距离=1 ≤ τ
+            else:
+                return 0.0  # 距离=1 > τ
+
+        # 对于 k > 1，暂时不支持精确计算
+        raise NotImplementedError(
+            f"delta_d={delta_d} > 1 暂不支持精确计算，请使用 condition_prob_approximate()"
+        )
+
+    @staticmethod
+    def condition_prob_approximate(
+        order: int,
+        delta_d: int = 1,
+        spatial_threshold: float = 1.5,
+        method: str = "monte_carlo",
+        samples: int = 10000,
+        seed: int | None = None
+    ) -> float:
+        """近似计算条件概率 (用于 k > 1 或验证解析解).
+
+        Args:
+            order: Hilbert 曲线阶数
+            delta_d: Hilbert 距离差 k
+            spatial_threshold: 空间距离阈值 τ
+            method: 近似方法 ("monte_carlo", "brute_force")
+            samples: 采样数 (仅蒙特卡洛有效)
+            seed: 随机种子 (可选)
+
+        Returns:
+            近似概率值
+
+        Raises:
+            ValueError: 当 method 不支持时
+        """
+        if method == "monte_carlo":
+            return HilbertProbabilityMetrics._monte_carlo_estimate(
+                order, delta_d, spatial_threshold, samples, seed
+            )
+        elif method == "brute_force":
+            return HilbertProbabilityMetrics._brute_force_estimate(
+                order, delta_d, spatial_threshold
+            )
+        else:
+            raise ValueError(f"Unknown method: {method}, supported: monte_carlo, brute_force")
+
+    @staticmethod
+    def _monte_carlo_estimate(
+        order: int,
+        delta_d: int,
+        threshold: float,
+        samples: int,
+        seed: int | None = None
+    ) -> float:
+        """蒙特卡洛估计条件概率."""
+        import random
+
+        if seed is not None:
+            random.seed(seed)
+
+        n = 1 << order
+        n_points = n * n
+        count = 0
+
+        for _ in range(samples):
+            d1 = random.randint(0, n_points - delta_d - 1)
+            d2 = d1 + delta_d
+            pos1 = HilbertCurve.d_to_xy(n, d1)
+            pos2 = HilbertCurve.d_to_xy(n, d2)
+            dist = ((pos1[0] - pos2[0]) ** 2 + (pos1[1] - pos2[1]) ** 2) ** 0.5
+            if dist <= threshold:
+                count += 1
+
+        return count / samples
+
+    @staticmethod
+    def _brute_force_estimate(
+        order: int,
+        delta_d: int,
+        threshold: float
+    ) -> float:
+        """精确计算条件概率 (遍历所有点对)."""
+        n = 1 << order
+        n_points = n * n
+        count = 0
+        total = n_points - delta_d
+
+        for d1 in range(total):
+            d2 = d1 + delta_d
+            pos1 = HilbertCurve.d_to_xy(n, d1)
+            pos2 = HilbertCurve.d_to_xy(n, d2)
+            dist = ((pos1[0] - pos2[0]) ** 2 + (pos1[1] - pos2[1]) ** 2) ** 0.5
+            if dist <= threshold:
+                count += 1
+
+        return count / total
+
+    @staticmethod
+    def locality_entropy(order: int, delta_d: int = 1) -> float:
+        """计算 Hilbert 局部性的香农熵.
+
+        H = -Σ P(d) · log₂ P(d)
+
+        熵越低 = 局部性保持越好 (距离分布越集中)
+
+        Args:
+            order: Hilbert 曲线阶数
+            delta_d: Hilbert 距离差 k
+
+        Returns:
+            香农熵 (bits)
+
+        Examples:
+            >>> HilbertProbabilityMetrics.locality_entropy(order=4)
+            1.0
+        """
+        distribution = HilbertProbabilityMetrics._distance_distribution(order, delta_d)
+
+        # 香农熵计算
+        entropy = 0.0
+        for p in distribution.values():
+            if p > 0:
+                entropy -= p * math.log2(p)
+
+        return entropy
+
+    @staticmethod
+    def _distance_distribution(
+        order: int,
+        delta_d: int
+    ) -> Dict[float, float]:
+        """计算距离分布 P(d_S = d | d_H = k).
+
+        Args:
+            order: Hilbert 曲线阶数
+            delta_d: Hilbert 距离差 k
+
+        Returns:
+            距离 -> 概率 的字典
+        """
+        n = 1 << order
+        n_points = n * n
+        distribution: Dict[float, int] = {}
+        total = n_points - delta_d
+
+        for d1 in range(total):
+            d2 = d1 + delta_d
+            pos1 = HilbertCurve.d_to_xy(n, d1)
+            pos2 = HilbertCurve.d_to_xy(n, d2)
+            dist = round(((pos1[0] - pos2[0]) ** 2 +
+                          (pos1[1] - pos2[1]) ** 2) ** 0.5, 3)
+            distribution[dist] = distribution.get(dist, 0) + 1
+
+        return {d: c / total for d, c in distribution.items()}
+
+    @staticmethod
+    def full_probability_report(
+        order: int,
+        delta_d: int = 1,
+        spatial_thresholds: Tuple[float, ...] = (1.0, 1.414, 1.5, 2.0, 2.236, 3.0)
+    ) -> Dict[str, float]:
+        """生成完整的概率分析报告.
+
+        Args:
+            order: Hilbert 曲线阶数
+            delta_d: Hilbert 距离差 k
+            spatial_thresholds: 空间距离阈值序列
+
+        Returns:
+            包含以下指标的字典:
+            - 各阈值对应的累积概率
+            - 香农熵
+            - 距离分布
+        """
+        distribution = HilbertProbabilityMetrics._distance_distribution(order, delta_d)
+        entropy = HilbertProbabilityMetrics.locality_entropy(order, delta_d)
+
+        cumulative_probs = {}
+        for tau in spatial_thresholds:
+            prob = HilbertProbabilityMetrics._cumulative_prob(distribution, tau)
+            cumulative_probs[f"P(d_S <= {tau})"] = round(prob, 4)
+
+        return {
+            "order": order,
+            "delta_d": delta_d,
+            "entropy_bits": round(entropy, 4),
+            "distance_distribution": {str(k): round(v, 4) for k, v in distribution.items()},
+            **cumulative_probs
+        }
+
+    @staticmethod
+    def _cumulative_prob(
+        distribution: Dict[float, float],
+        threshold: float
+    ) -> float:
+        """计算累积概率 P(d_S ≤ τ)."""
+        return sum(p for d, p in distribution.items() if d <= threshold)

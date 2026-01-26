@@ -78,6 +78,7 @@ from torch import Tensor
 # I30-10: 导入 SplitterConfig
 # I35: 移除死代码 DEPTH_KL_*, DEPTH_QUOTA_* 常量
 from .constants import (
+    LOGIT_CLAMP_BOUND,
     TEMPERATURE_MIN,
     GUMBEL_EPSILON,
     PROB_EPSILON,
@@ -97,6 +98,7 @@ from .constants import (
     QUOTA_MIN_LAMBDA,  # I96-7: 下界软正则化权重
     QUOTA_INIT_LOGITS,
     QUOTA_ENTROPY_WEIGHT,
+    QUOTA_STE_WEIGHT,  # CRIT-6: STE 梯度损失权重
     # I29-2: 阈值方差正则化
     THRESHOLD_VAR_REG_ENABLED,
     THRESHOLD_VAR_REG_WEIGHT,
@@ -1438,7 +1440,8 @@ class GumbelTopKSplitter(
 
         # I101-1: 添加 Quota Softmax 数值保护
         # 防止 quota_logits 幅度过大导致 softmax 溢出
-        quota_logits_clamped = self.quota_logits[:D].clamp(min=-50, max=50)
+        # I108-6: 使用 LOGIT_CLAMP_BOUND (50.0) 常量
+        quota_logits_clamped = self.quota_logits[:D].clamp(min=-LOGIT_CLAMP_BOUND, max=LOGIT_CLAMP_BOUND)
         p = F.softmax(quota_logits_clamped, dim=0)  # [D]
         p = p.to(device)
 
@@ -1492,7 +1495,8 @@ class GumbelTopKSplitter(
             return torch.tensor(0.0, device=self.candidate_depths.device)
 
         # I101-1: 添加 Quota Softmax 数值保护
-        quota_logits_clamped = self.quota_logits[:D].clamp(min=-50, max=50)
+        # I108-6: 使用 LOGIT_CLAMP_BOUND (50.0) 常量
+        quota_logits_clamped = self.quota_logits[:D].clamp(min=-LOGIT_CLAMP_BOUND, max=LOGIT_CLAMP_BOUND)
         # 计算软配额 (有梯度)
         p = F.softmax(quota_logits_clamped, dim=0)  # [D], 有梯度
         K_soft = p * K  # [D], 软配额
@@ -1538,6 +1542,41 @@ class GumbelTopKSplitter(
 
         # 添加软下界损失 (使用独立的 QUOTA_MIN_LAMBDA 权重)
         loss = loss + min_loss * QUOTA_MIN_LAMBDA
+
+        # ====================================================================
+        # CRIT-6 修复: 直接配额梯度损失
+        # ====================================================================
+        # 数学形式化
+        # ==========
+        #
+        # 问题:
+        #   floor_quota = (p * K).floor().long() 断裂梯度
+        #   ∂floor_quota/∂p = 0 (离散操作)
+        #
+        # 解决方案:
+        #   直接使用 K_soft = p × K 的梯度
+        #   L_quota_grad = λ × MSE(K_soft, K_hard)
+        #
+        # 梯度流:
+        #   ∂L/∂φ_d = 2λ × (K_soft_d - K_hard_d) × K × ∂p_d/∂φ_d
+        #           = 2λ × (K_soft_d - K_hard_d) × K × p_d × (1 - p_d)
+        #
+        # 优势:
+        #   - 梯度完整流过 quota_logits
+        #   - 不改变前向选择逻辑（保持 Hilbert 局部性）
+        #   - 与现有正则化损失正交
+        # ====================================================================
+        # I108-6: 使用 LOGIT_CLAMP_BOUND (50.0) 常量
+        quota_logits_clamped = self.quota_logits[:D].clamp(min=-LOGIT_CLAMP_BOUND, max=LOGIT_CLAMP_BOUND)
+        p_ste = F.softmax(quota_logits_clamped, dim=0)  # [D], 有梯度
+        K_soft_ste = p_ste * K  # [D], 软配额，有完整梯度
+        K_hard_ste = K_soft_ste.detach().round().long().float()  # [D], 硬配额，无梯度
+
+        # MSE 损失：软配额接近硬配额
+        ste_loss = F.mse_loss(K_soft_ste, K_hard_ste) * QUOTA_STE_WEIGHT
+
+        # 添加 STE 损失
+        loss = loss + ste_loss
 
         return loss
 
@@ -2166,28 +2205,33 @@ class GumbelTopKSplitter(
                 # Target mode: minimize |H - H_target|²
                 B, N = probs.shape
                 # I103-3: 使用设备端缓存
-                depths = self._get_device_tensor(
+                candidate_depths = self._get_device_tensor(
                     self.candidate_depths, "_cached_device_depths", probs.device
-                )
+                )  # [N]
 
-                # 计算当前熵
-                depth_probs = []
-                for d in range(self._current_max_depth + 1):
-                    mask = (depths == d)
-                    if mask.any():
-                        p_d = probs[:, mask].mean()
-                        depth_probs.append(p_d.clamp(min=PROB_EPSILON))
-                    else:
-                        depth_probs.append(torch.tensor(PROB_EPSILON, device=probs.device))
-                
-                depth_probs_t = torch.stack(depth_probs)
+                # I108-3: 向量化计算深度概率分布
+                # 原始: Python 循环 O(D) -> 向量化 O(1)
+                # probs: [B, N] 每个 token 的分裂概率
+                # candidate_depths: [N] 每个候选的深度 (广播到 batch)
+                D = self._current_max_depth + 1
+
+                # 使用 one-hot 编码 (与 get_depth_entropy_loss 相同的向量化策略)
+                depth_onehot = F.one_hot(candidate_depths, D).float()  # [N, D]
+                depth_counts = depth_onehot.sum(dim=0).clamp(min=1.0)  # [D]
+
+                # prob_sums[d] = sum_{b,i} probs[b,i] * 1[depth_i = d]
+                prob_sums = torch.einsum('bn,nd->d', probs, depth_onehot)  # [D]
+
+                # mean_probs[d] = prob_sums[d] / (B * depth_counts[d])
+                depth_probs_t = (prob_sums / (B * depth_counts)).clamp(min=PROB_EPSILON)
+
+                # 归一化
                 depth_probs_t = depth_probs_t / depth_probs_t.sum()
                 # I23-4: 归一化后再次 clamp，防止 FP16 下溢导致 log(0)
                 depth_probs_t = depth_probs_t.clamp(min=PROB_EPSILON)
                 current_entropy = -(depth_probs_t * depth_probs_t.log()).sum()
-                
                 entropy_loss = entropy_weight * (current_entropy - entropy_target).pow(2)
-            
+
             losses['soft_entropy_loss'] = entropy_loss
 
         # ====================================================================
@@ -2327,7 +2371,8 @@ class GumbelTopKSplitter(
             return torch.tensor(0.0, device=self.candidate_regions.device)
 
         # I101-1: 添加 Quota Softmax 数值保护
-        quota_logits_clamped = self.quota_logits.clamp(min=-50, max=50)
+        # I108-6: 使用 LOGIT_CLAMP_BOUND (50.0) 常量
+        quota_logits_clamped = self.quota_logits.clamp(min=-LOGIT_CLAMP_BOUND, max=LOGIT_CLAMP_BOUND)
         # Softmax 计算配额分布
         quota_probs = F.softmax(quota_logits_clamped, dim=0)  # [D]
         quota_probs = quota_probs.clamp(min=PROB_EPSILON)
@@ -2667,7 +2712,8 @@ class GumbelTopKSplitter(
         if self.quota_logits is None:
             return None
         # I101-1: 添加 Quota Softmax 数值保护
-        quota_logits_clamped = self.quota_logits.clamp(min=-50, max=50)
+        # I108-6: 使用 LOGIT_CLAMP_BOUND (50.0) 常量
+        quota_logits_clamped = self.quota_logits.clamp(min=-LOGIT_CLAMP_BOUND, max=LOGIT_CLAMP_BOUND)
         return F.softmax(quota_logits_clamped, dim=0)
 
     def get_variance_regularization(self) -> Tensor:
@@ -2686,7 +2732,8 @@ class GumbelTopKSplitter(
             return torch.tensor(0.0, device=self.candidate_regions.device)
 
         # I101-1: 添加 Quota Softmax 数值保护
-        quota_logits_clamped = self.quota_logits.clamp(min=-50, max=50)
+        # I108-6: 使用 LOGIT_CLAMP_BOUND (50.0) 常量
+        quota_logits_clamped = self.quota_logits.clamp(min=-LOGIT_CLAMP_BOUND, max=LOGIT_CLAMP_BOUND)
         # 计算配额分布
         quota_probs = F.softmax(quota_logits_clamped, dim=0)  # [D]
 

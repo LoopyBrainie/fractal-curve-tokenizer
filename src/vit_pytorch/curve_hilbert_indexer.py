@@ -66,11 +66,18 @@ class HilbertPathCache:
     支持设备感知缓存，避免重复的 .to(device) 调用，
     从而支持 CUDA graphs 优化。
     """
-    
+
+    # I108-4: 补充内存界计算
     # 类级别缓存 (CPU 版本，作为源)
     _cache: Dict[_HilbertCacheKey, Tuple[torch.Tensor, torch.Tensor]] = {}
     # 设备感知缓存: (key, device_str) -> (tensor, tensor)
     _device_cache: Dict[Tuple[_HilbertCacheKey, str], Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    # 内存上界计算:
+    # - _max_cache_size=64: maxsize × N × (4 + 8×max_depth) bytes
+    #   典型 (64×64, max_depth=8): 64 × 4096 × 68 ≈ 17.7 MB
+    #   极端 (128×128, max_depth=8): 64 × 16384 × 68 ≈ 71 MB
+    # - _max_device_cache_size=256: 4 × _max_cache_size
     _max_cache_size: int = 64
     _max_device_cache_size: int = 256
     

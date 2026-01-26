@@ -264,10 +264,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         device = images.device
 
         # I35: 转换为 channels_last 以优化卷积性能
-        # 检测当前内存格式，如果不是 channels_last 则转换
-        if (images.stride(1) != images.stride(2) and
-            images.dim() == 4 and
-            images.shape[1] == C):  # 确保是正确格式
+        # I108-2: 使用 is_contiguous() 正确检测内存格式，而非错误的 stride 比较
+        if images.dim() == 4 and not images.is_contiguous(memory_format=torch.channels_last):
             images = images.to(memory_format=torch.channels_last)
 
         # 1. 提取共享特征图
