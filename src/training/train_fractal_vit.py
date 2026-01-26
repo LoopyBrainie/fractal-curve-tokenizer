@@ -1891,12 +1891,10 @@ def train_epoch(
                 # 重新计算 features 会有轻微计算开销，但防止了显存泄露
                 features = model.tokenizer.shared_conv(imgs)
                 if hasattr(splitter, 'get_auxiliary_losses'):
-                    # I14-1 D1: 计算 batch 中的平均 token 数用于崩溃检测
+                    # I14-1 D1: 从 stats 获取 token 数用于崩溃检测
                     actual_token_count = None
-                    if aux_infos is not None and len(aux_infos) > 0:
-                        token_counts = [info.get('num_tokens', 0) for info in aux_infos if isinstance(info, dict)]
-                        if token_counts:
-                            actual_token_count = int(sum(token_counts) / len(token_counts))
+                    if stats is not None and hasattr(stats, 'num_tokens'):
+                        actual_token_count = int(stats.num_tokens)
 
                     aux_losses = splitter.get_auxiliary_losses(
                         features=features,
