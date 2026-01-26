@@ -193,6 +193,27 @@ from .visualization import (
 # Core
 from .core import ModelResourceStats, compute_resource_stats_batch
 
+# Fractal Proxy Experiments (I74)
+from .fractal_proxy_experiments import (
+    ExperimentMode,
+    ProxyExperimentConfig,
+    SSAConfig,
+    FERConfig,
+    GJPConfig,
+    TokenMetrics,
+    TokenMetricsCollector,
+    MemoryManager,
+    ExperimentWrapper,
+    SubsetSampler,
+    SparseAblationExperiment,
+    FeatureReconstructionLoss,
+    FrozenEncoderExperiment,
+    HilbertIndexShuffler,
+    GeometricJigsawLoss,
+    GeometricJigsawExperiment,
+    create_experiment,
+)
+
 __all__ = [
     # Samplers
     "ClassBalancedSampler",
@@ -307,4 +328,22 @@ __all__ = [
     # Core
     "ModelResourceStats",
     "compute_resource_stats_batch",
+    # Fractal Proxy Experiments (I74)
+    "ExperimentMode",
+    "ProxyExperimentConfig",
+    "SSAConfig",
+    "FERConfig",
+    "GJPConfig",
+    "TokenMetrics",
+    "TokenMetricsCollector",
+    "MemoryManager",
+    "ExperimentWrapper",
+    "SubsetSampler",
+    "SparseAblationExperiment",
+    "FeatureReconstructionLoss",
+    "FrozenEncoderExperiment",
+    "HilbertIndexShuffler",
+    "GeometricJigsawLoss",
+    "GeometricJigsawExperiment",
+    "create_experiment",
 ]
