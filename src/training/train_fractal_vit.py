@@ -429,9 +429,11 @@ class FractalViTConfig:
     # max_depth 由 min_patch_size 和 image_size 自动计算: floor(log2(min(H, W) / min_patch_size))
     min_patch_size: int  # 目标最小 patch 大小
 
-    # GumbelTopKSplitter (Scheme D) 参数
-    K_min: int = 16  # 最小 token 数量 (硬下界约束)
-    K_max: int = 64  # 最大 token 数量 (软上界约束)
+    # I33: 相对预算参数 (替代绝对 K_min/K_max)
+    # 覆盖率 = tokens / max_patches, 与图像分辨率无关
+    token_coverage_min: float = 0.01  # 最小覆盖率 (1% patches)
+    token_coverage_max: float = 0.05  # 最大覆盖率 (5% patches)
+    K_min_abs: int = 16  # 绝对下界保护 (无论覆盖率如何，至少 16 tokens)
 
     # I30-10: 可学习配额参数 (Scheme E)
     quota_learnable: bool = True  # 是否启用可学习配额
@@ -2616,11 +2618,12 @@ def main():
     parser.add_argument("--fourier-levels", type=int, default=4,
                        help="I31-3: Number of Fourier frequency levels for area encoding (default: 4)")
 
-    # GumbelTopKSplitter (Scheme D) 参数
-    parser.add_argument("--K-min", type=int, default=16,
-                       help="Minimum token count (hard lower bound, default: 16)")
-    parser.add_argument("--K-max", type=int, default=64,
-                       help="Maximum token count (soft upper bound, default: 64)")
+    # I33: 相对预算参数 (替代绝对 K_min/K_max)
+    # 覆盖率 = tokens / max_patches, 与图像分辨率无关
+    parser.add_argument("--token-coverage-min", type=float, default=0.01,
+                       help="I33: Minimum token coverage ratio (default: 0.01, 1% of patches)")
+    parser.add_argument("--token-coverage-max", type=float, default=0.05,
+                       help="I33: Maximum token coverage ratio (default: 0.05, 5% of patches)")
 
     # I30-10: 可学习配额参数 (Scheme E)
     parser.add_argument("--quota-learnable", type=bool, default=True,
@@ -2825,9 +2828,11 @@ def main():
         ffn_type=args.ffn_type,
         # I30-17: 动态深度配置 - max_depth 由 min_patch_size 自动计算
         min_patch_size=args.min_patch_size,
-        # GumbelTopKSplitter (Scheme D) 参数
-        K_min=args.K_min,
-        K_max=args.K_max,
+        # I33: 相对预算参数 (CLI) → 绝对 K 值 (模型)
+        # 转换公式: K = coverage * max_patches = coverage * (image_size/min_patch_size)^2
+        max_patches = (args.image_size // args.min_patch_size) ** 2
+        K_min=max(8, int(max_patches * args.token_coverage_min)),  # 至少 8 tokens
+        K_max=int(max_patches * args.token_coverage_max),
         # I30-10: 可学习配额参数
         quota_learnable=args.quota_learnable,
         quota_init_logits=tuple(map(float, args.quota_init_logits.split(','))) if args.quota_init_logits else None,
@@ -2964,10 +2969,12 @@ def main():
     params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     # I30-10: 配额信息添加到 split_info
+    # I33: 显示相对预算覆盖率
     quota_info = "Scheme E" if config.quota_learnable else "Scheme D (no quota)"
     if config.quota_learnable and config.freeze_quota:
         quota_info += " (frozen)"
-    split_info = f"GumbelTopKSplitter (K∈[{config.K_min}, {config.K_max}], {quota_info})"
+    # 显示覆盖率 (用户可见) 和 K 范围 (内部值)
+    split_info = f"GumbelTopKSplitter (coverage∈[{config.token_coverage_min:.0%}, {config.token_coverage_max:.0%}], K∈[{config.K_min}, {config.K_max}], {quota_info})"
     tokenizer_name = f'StreamingFractalTokenizerV3 ({split_info})'
 
     # P6-1/P6-2 信息
