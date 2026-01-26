@@ -300,15 +300,17 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             # I24-14: 无条件 clamp (torch.compile 安全)
             # 不使用 .item() 或数据依赖的 if，直接 clamp
             tokens_per_batch = tokens_per_batch.clamp(min=1)
-            num_tokens_list = tokens_per_batch.to('cpu', non_blocking=True).tolist()
-            
+            # P-OPT: 避免 .to('cpu') 导致的 cudagraphs 失败，保持 GPU 计算
+            # 使用 tensor 操作替代 Python list，以支持 torch.compile
+            max_tokens_per_batch = tokens_per_batch.max().item()  # 单个 scalar sync 可接受
+
             # 计算 depth distribution
             # P-OPT-3: 使用向量化操作，避免 Python for 循环
             depth_dists = []
             max_d = self.max_depth + 1
             depths = tensor_result.depths
             batch_indices = tensor_result.batch_indices
-            
+
             if tensor_result.num_tokens > 0:
                 count_matrix = torch.zeros(B, max_d, dtype=torch.long, device=device)
                 # I78: 添加 min clamp 防止负索引 (M3 修复)
@@ -320,9 +322,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 depth_dists = self._build_depth_dists_lazy(B, count_matrix)
             else:
                 depth_dists = [{} for _ in range(B)]
-        
+
         self._last_split_stats = {
-            'num_tokens': num_tokens_list,
+            'num_tokens': None,  # 延迟计算，按需在外部转换
             'depth_distributions': depth_dists,
         }
 
@@ -330,7 +332,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # I99-1 FIX: 使用每个 batch 的最大 token 数，而非总 token 数
         # N_total 是实际选择的 token 总数，但 max_tokens 应该是每个 batch 的最大 token 数
         N_total = tensor_result.num_tokens
-        max_tokens_per_batch = max(num_tokens_list) if num_tokens_list else 1
         max_tokens = max_tokens_per_batch  # 每个 batch 的最大 token 数
 
         # 3. 纯张量嵌入
@@ -342,12 +343,13 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             features, tensor_result, raw_probs, max_tokens=max_tokens,
             selected_mask=selected_mask
         )
-        
+
         # 4. 构建输出 (P-OPT-4: 向量化输出构建，避免 Python for 循环)
         # TokenSequence 对象仍需构建，但使用预计算的张量切片
         sequences = []
         for b in range(B):
-            num_tokens = num_tokens_list[b]
+            # P-OPT: 使用 tokens_per_batch[b] 替代 Python list 索引
+            num_tokens = int(tokens_per_batch[b].item())  # 单个 scalar .item() 可接受
             seq = TokenSequence(
                 tokens=tokens[b, :num_tokens],
                 metadata={
@@ -359,12 +361,11 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 },
             )
             sequences.append(seq)
-        
+
         # P9-5/P12-2 优化: 传入已 padding 的张量缓存，避免 model 中重复 padding
         # I20: 简化输出构建
-        # I24-14: num_tokens_list 已在前面 clamp 过，直接使用
-        # I30-11: 添加 _split_probs_cache 用于加权池化
-        lengths_tensor = torch.tensor(num_tokens_list, dtype=torch.long, device=device)
+        # I24-14: 使用 tokens_per_batch 作为 lengths_tensor (已在 GPU 上)
+        lengths_tensor = tokens_per_batch.long()
 
         return TokenizerOutput(
             sequences=sequences,

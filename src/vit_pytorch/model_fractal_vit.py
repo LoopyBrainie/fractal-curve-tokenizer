@@ -782,6 +782,8 @@ class FractalCurveViT(nn.Module):
                         n = min(depths.size(0), max_tokens)
                         padded_depths[i, :n] = depths[:n]
                         valid_counts.append(n)
+                    else:
+                        valid_counts.append(0)  # 确保 valid_counts 长度始终等于 B
 
                 # 向量化 depth 计数 [B, D]
                 all_depth_counts = torch.zeros(B, max_depth_range,
