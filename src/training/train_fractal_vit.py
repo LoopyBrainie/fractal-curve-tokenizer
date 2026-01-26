@@ -1699,32 +1699,36 @@ def train_epoch(
     correct = torch.tensor(0, device=device, dtype=torch.long)
     total = 0
     optimizer.zero_grad(set_to_none=True)
-    
+
     batch_times, data_times, forward_times = [], [], []
     entropy_losses = []  # P1-5: 收集熵损失用于统计
     cuda_mem_peak = 0.0
     use_mixup = mixup_fn is not None
     nan_count = 0  # NaN 计数器
-    
-    # P15: Warmup 后首次启用 Mixup 的调试信息
-    if use_mixup and epoch is not None:
+
+    # I107-7: 调试模式控制 - 默认关闭以提升性能
+    # 设置 DEBUG_MODE=1 启用调试输出
+    debug_mode = os.environ.get('DEBUG_MODE', '0') == '1'
+
+    # P15: Warmup 后首次启用 Mixup 的调试信息 (仅调试模式)
+    if debug_mode and use_mixup and epoch is not None:
         import sys
         print(f"[DEBUG] train_epoch started: epoch={epoch}, use_mixup=True", file=sys.stderr, flush=True)
-    
+
     # P15: 预先获取模型期望的 dtype (避免每次迭代都检查)
     model_dtype = get_model_input_dtype(model) if use_mixup else None
-    if model_dtype is not None:
+    if debug_mode and model_dtype is not None:
         print(f"[DEBUG] Model expects input dtype: {model_dtype}")
-    
+
     # 使用环境变量 DISABLE_PREFETCH=1 来禁用 CudaPrefetcher 进行调试
     use_prefetcher = device.type == 'cuda' and os.environ.get('DISABLE_PREFETCH', '0') != '1'
     if use_prefetcher:
         data_iter = CudaPrefetcher(loader, device, channels_last=config.channels_last)
-        if use_mixup:
+        if debug_mode and use_mixup:
             print(f"[DEBUG] 使用 CudaPrefetcher", flush=True)
     else:
         data_iter = loader
-        if use_mixup:
+        if debug_mode and use_mixup:
             print(f"[DEBUG] 不使用 CudaPrefetcher (DISABLE_PREFETCH={os.environ.get('DISABLE_PREFETCH', 'not set')})", flush=True)
     
     pbar = tqdm(data_iter, desc="Train", total=len(loader))
@@ -1734,13 +1738,13 @@ def train_epoch(
     stall_count = 0
     
     data_start = time.time()
-    
-    # P15: 在首个 Mixup epoch 添加额外诊断
-    debug_first_mixup_epoch = use_mixup and epoch is not None and os.environ.get('DISABLE_PREFETCH', '0') == '1'
-    
+
+    # P15: 在首个 Mixup epoch 添加额外诊断 (仅调试模式)
+    debug_first_mixup_epoch = debug_mode and use_mixup and epoch is not None and os.environ.get('DISABLE_PREFETCH', '0') == '1'
+
     for i, batch in enumerate(pbar):
-        
-        # P15: 额外诊断 - 检测数据加载卡顿
+
+        # P15: 额外诊断 - 检测数据加载卡顿 (仅调试模式)
         if debug_first_mixup_epoch and i <= 5:
             print(f"[DEBUG] Batch {i}: 数据加载完成", flush=True)
         
@@ -1778,30 +1782,30 @@ def train_epoch(
             inf_count_input = torch.isinf(imgs).sum().item()
             print(f"\n[WARN] Batch {i}: 输入图像包含 NaN={nan_count_input}, Inf={inf_count_input}，跳过此 batch")
             continue
-        
+
         # 应用 Mixup/CutMix
         mixed_labels: Optional[torch.Tensor] = None
         if use_mixup and mixup_fn is not None:
-            if i == 0:
+            if debug_mode and i == 0:
                 print(f"[DEBUG] Batch 0: 开始应用 Mixup...", flush=True)
             imgs, mixed_labels = mixup_fn(imgs, labels)
             # 确保 Mixup 后保持 channels_last 格式 (Mixup 的线性混合可能会破坏 memory format)
             if config.channels_last and imgs.device.type == 'cuda':
                 imgs = imgs.to(memory_format=torch.channels_last)
-            if i == 0:
+            if debug_mode and i == 0:
                 print(f"[DEBUG] Batch 0: Mixup 完成，mixed_labels.shape={mixed_labels.shape}", flush=True)
                 print(f"[DEBUG] Batch 0: imgs.dtype={imgs.dtype}, imgs.is_contiguous(memory_format=torch.channels_last)={imgs.is_contiguous(memory_format=torch.channels_last)}", flush=True)
-        
+
         forward_start = time.time()
-        
+
         # P15: 确保输入 dtype 与模型权重匹配 (torch.compile + AMP 可能导致不匹配)
         if model_dtype is not None and imgs.dtype != model_dtype:
             if i == 0:
                 print(f"[WARN] dtype 不匹配! 将 imgs 从 {imgs.dtype} 转换为 {model_dtype}")
             imgs = imgs.to(dtype=model_dtype)
-        elif i == 0 and use_mixup:
+        elif debug_mode and i == 0 and use_mixup:
             print(f"[DEBUG] Batch 0: 开始 forward pass, imgs.dtype={imgs.dtype}...", flush=True)
-        
+
         with get_amp_context(device, config.use_amp):
             # 单一接口: forward() 返回 TrainingStats
             if hard_mining is not None and not use_mixup:
@@ -1815,7 +1819,7 @@ def train_epoch(
                 tokens = None
                 token_lengths = None
                 outs = stats.logits
-            if i == 0 and use_mixup:
+            if debug_mode and i == 0 and use_mixup:
                 print(f"[DEBUG] Batch 0: forward 完成，outs.shape={outs.shape}", flush=True)
             
             # 检查 logits 范围，防止爆炸
@@ -1841,7 +1845,7 @@ def train_epoch(
             if use_mixup and mixed_labels is not None:
                 # 使用混合标签的交叉熵 (Mixup 模式下不使用 Focal Loss)
                 ce_loss = mixup_criterion(outs, mixed_labels) / config.accum_steps
-                if i == 0:
+                if debug_mode and i == 0:
                     print(f"[DEBUG] Batch 0: mixup_criterion 计算完成，ce_loss={ce_loss.item():.4f}", flush=True)
             else:
                 # P14: 使用自定义损失函数 (Focal Loss / Class-Balanced Loss)
@@ -1889,9 +1893,14 @@ def train_epoch(
             # I98-2: 使用 model.splitter (独立组件)
             if hasattr(model, 'splitter'):
                 splitter = model.splitter
-                # I107-2: 移除 _last_features 缓存，直接从 shared_conv 获取特征
-                # 重新计算 features 会有轻微计算开销，但防止了显存泄露
-                features = model.tokenizer.shared_conv(imgs)
+                # I107-7: 从 stats.shared_features 获取已计算的 features
+                # 避免重复调用 model.tokenizer.shared_conv(imgs) (节省 ~5-10% 计算开销)
+                if stats is not None and hasattr(stats, 'shared_features') and stats.shared_features is not None:
+                    splitter_features = stats.shared_features
+                else:
+                    # Fallback: 仍需计算时的回退方案
+                    splitter_features = model.tokenizer.shared_conv(imgs)
+
                 if hasattr(splitter, 'get_auxiliary_losses'):
                     # I14-1 D1: 从 stats 获取 token 数用于崩溃检测
                     actual_token_count = None
@@ -1899,7 +1908,7 @@ def train_epoch(
                         actual_token_count = int(stats.num_tokens)
 
                     aux_losses = splitter.get_auxiliary_losses(
-                        features=features,
+                        features=splitter_features,
                         image_size=(imgs.shape[2], imgs.shape[3]),
                         include_elastic_budget=config.include_elastic_budget,
                         include_soft_entropy=config.include_soft_entropy,

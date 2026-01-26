@@ -67,6 +67,9 @@ class TrainingStats:
     features: torch.Tensor            # [B, dim] 池化特征
     transformer_tokens: torch.Tensor  # [B, N, dim] Transformer token
 
+    # I107-7: 共享特征图 (避免训练循环中重复计算 shared_conv)
+    shared_features: Optional[torch.Tensor] = None  # [B, d_model, H/p, W/p]
+
     # 诊断信息
     splitter_entropy: float = 0.0
     temperature: float = 1.0
@@ -473,7 +476,7 @@ class FractalCurveViT(nn.Module):
     @torch._dynamo.disable
     def _prepare_tokens(
         self, img: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], "TokenizerOutput"]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], "TokenizerOutput", torch.Tensor]:
         """准备 tokens 和进行 padding。
 
         数学形式化：
@@ -492,16 +495,21 @@ class FractalCurveViT(nn.Module):
         I78: 动态分辨率支持
             当 image_size=None 时，根据实际输入图像大小动态更新 tokenizer 候选区域
 
+        I107-7: 返回 features 避免重复计算
+            原始流程: feature_extractor → splitter → tokenizer (再次计算 shared_conv)
+            优化后: feature_extractor → splitter → tokenizer (复用 features)
+
         Args:
             img: 输入图像 [B, C, H, W]
 
         Returns:
-            (padded_tokens, padded_levels, lengths, levels_list, token_output):
+            (padded_tokens, padded_levels, lengths, levels_list, token_output, features):
             - padded_tokens: tokens [B, MaxN, Dim] (padded)
             - padded_levels: 层级信息 [B, MaxN, InfoDim]
             - lengths: Tensor[B] 每个样本的实际 token 数量
             - levels_list: 原始层级列表（用于辅助输出）
             - token_output: TokenizerOutput (P11-3: 用于获取 regions)
+            - features: 共享特征图 [B, d_model, H/p, W/p] (I107-7: 避免重复计算)
         """
         # I78: 动态分辨率支持 - 根据实际输入更新 splitter 候选区域
         # I99-10: 仅在尺寸变化时更新，避免不必要的计算
@@ -541,8 +549,9 @@ class FractalCurveViT(nn.Module):
         # I24-14: 最终防御层 - 无条件 clamp (torch.compile 安全)
         # 不使用 .item() 或数据依赖的 if，直接 clamp
         lengths = lengths.clamp(min=1)
-        
-        return padded_tokens, padded_levels, lengths, levels_list, token_output
+
+        # I107-7: 返回 features 避免训练循环中重复计算 shared_conv
+        return padded_tokens, padded_levels, lengths, levels_list, token_output, features
 
     def _apply_position_and_cls(
         self,
@@ -829,7 +838,8 @@ class FractalCurveViT(nn.Module):
         device = img.device
 
         # 1. 准备 tokens
-        padded_tokens, padded_levels, lengths, levels_list, token_output = self._prepare_tokens(img)
+        # I107-7: _prepare_tokens 现在返回 features (避免重复计算)
+        padded_tokens, padded_levels, lengths, levels_list, token_output, features = self._prepare_tokens(img)
 
         # P11-3: 获取 regions 和 image_size 用于正确的 LCA 偏置计算
         regions, image_size = token_output.get_padded_regions()
@@ -898,6 +908,9 @@ class FractalCurveViT(nn.Module):
         else:
             depth_used = 0
 
+        # I107-7: 在 training 模式下返回 shared_features供 auxiliary loss 使用
+        return_features = features if self.training else None
+
         stats = TrainingStats(
             logits=final_output,
             num_tokens=int(lengths.sum().item()),
@@ -905,6 +918,7 @@ class FractalCurveViT(nn.Module):
             depth_distribution=depth_dist,
             features=pooled,
             transformer_tokens=transformer_tokens,
+            shared_features=return_features,  # I107-7: 避免训练循环重复计算
         )
 
         return stats
