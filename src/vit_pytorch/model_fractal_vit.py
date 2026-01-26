@@ -927,25 +927,16 @@ class FractalCurveViT(nn.Module):
         depth_dist = first_aux.get('depth_distribution', {})
 
         # I135: 辅助函数 - 递归展平嵌套结构，提取所有整数值
-        def flatten_levels(item):
-            """递归展平嵌套结构，提取所有整数值"""
-            if isinstance(item, torch.Tensor):
-                # 展平张量为单一列表
-                return item.cpu().flatten().tolist()
-            elif isinstance(item, (list, tuple)):
-                result = []
-                for sub_item in item:
-                    result.extend(flatten_levels(sub_item))
-                return result
-            else:
-                return [int(item)]
-
+        # P-OPT: 避免在 forward 中使用 .cpu()，使用 GPU 计算 max_depth
         # 从 levels_list 推断主要使用的深度
         if levels_list:
-            all_levels = []
+            max_depth = 0
             for levels in levels_list:
-                all_levels.extend(flatten_levels(levels))
-            depth_used = int(max(all_levels)) if all_levels else 0
+                if levels.numel() > 0:
+                    # 直接在 GPU 上计算 max_depth，避免 .cpu() 同步
+                    level_max = levels[:, 0].max().item() if levels.dim() > 0 else 0
+                    max_depth = max(max_depth, level_max)
+            depth_used = int(max_depth)
         else:
             depth_used = 0
 
