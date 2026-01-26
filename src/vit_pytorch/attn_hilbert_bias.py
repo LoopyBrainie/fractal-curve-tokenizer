@@ -246,11 +246,16 @@ class LCAHilbertBias(HilbertBiasBase):
         # 深度 0 表示完全不同的根节点，深度 max_depth 表示相邻或相同
         self.lca_embedding = nn.Embedding(max_depth + 1, heads)
 
-        # I104-3: 转换为 FP16 以节省内存
-        # 数学验证: FP16 精度 (~10⁻³) 满足 LCA 偏置需求 ([-2, 2] 范围)
+        # I104-3: FP16 转换 + 权重裁剪保护
+        # FP16 精度 (~10⁻³) 满足 LCA 偏置需求 ([-2, 2] 范围)
+        # 添加权重裁剪防止梯度爆炸导致数值不稳定
         if use_fp16:
             self.lca_embedding.weight = nn.Parameter(
                 self.lca_embedding.weight.to(torch.float16)
+            )
+            # 注册钩子以裁剪权重，防止 FP16 溢出
+            self.lca_embedding.weight.register_hook(
+                lambda grad: grad.clamp(min=-10.0, max=10.0)
             )
         
         # P6-2: 可学习温度参数
@@ -258,18 +263,7 @@ class LCAHilbertBias(HilbertBiasBase):
         self._lca_temperature_init = lca_temperature
         self._learnable_temperature = learnable_temperature
         self._init_temperature(lca_temperature, learnable_temperature)
-        
-        # P11-1 修复: LCA 深度矩阵缓存
-        # I30-9: 使用 data_ptr + PyTorch 版本校验
-        # 替代原 WeakRef 方案，解决身份检查无法捕获原地修改的问题
-        #
-        # 缓存结构: {data_ptr: (data_ptr, torch_version, lca_depths)}
-        # 缓存命中条件: data_ptr 匹配 AND PyTorch 版本号匹配
-        #
-        # PyTorch 版本号 (._version) 在每次 in-place 操作时自动递增
-        # 数学保证: hit ⇒ V(T_cache) = V(T_input) ⇒ D_cache = f(T_input)
-        self._lca_cache_inputs: Dict[int, Tuple[int, int, torch.Tensor]] = {}
-        
+
         # 初始化: 深度越大（越邻近）偏置越高
         # 使用对数衰减初始化，符合 Hilbert 曲线的 √ 局部性
         self._init_weights()
@@ -404,42 +398,23 @@ class LCAHilbertBias(HilbertBiasBase):
             )
         paths = paths.clamp(0, 3)  # 安全保护仍保留
 
-        # I30-9: 使用 data_ptr + PyTorch 版本校验
-        # 解决 WeakRef 身份检查无法捕获原地修改的问题
-        #
-        # 缓存命中条件:
-        #   data_ptr 匹配 AND PyTorch 版本号匹配
-        #
-        # PyTorch 版本号 (._version) 在每次 in-place 操作时自动递增
-        # 这确保了原地修改后的张量能正确触发缓存失效
-        data_ptr = data.data_ptr()
-        torch_version = data._version if hasattr(data, '_version') else 0
-        cache_hit = False
+        # CRIT-3: 移除缓存，直接计算 LCA
+        # 数学分析: 训练中每张图像不同，不存在等价输入复用
+        # 缓存命中率趋近于 0，缓存是过早优化，应移除
+        lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
 
-        if data_ptr in self._lca_cache_inputs:
-            cached_ptr, cached_version, cached_lca = self._lca_cache_inputs[data_ptr]
+        # I34-13: LCA 钳位改为异常 - 静默钳位掩盖计算 bug
+        # I102-5: 使用张量比较避免 GPU-CPU 同步
+        lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_depth).any()
+        if lca_invalid:
+            min_depth = lca_depths.min().item()
+            max_depth = lca_depths.max().item()
+            raise ValueError(
+                f"LCA depth out of bounds [0, {self.max_depth}]: "
+                f"min={min_depth:.2f}, max={max_depth:.2f}. "
+                "This indicates a bug in LCA computation."
+            )
 
-            # 双重校验: data_ptr 匹配 AND 版本匹配
-            if cached_ptr == data_ptr and cached_version == torch_version:
-                cache_hit = True
-                lca_depths = cached_lca
-
-        if not cache_hit:
-            # 缓存未命中，计算 LCA
-            lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
-            # I34-13: LCA 钳位警告 - 静默钳位可能隐藏计算 bug
-            # I102-5: 使用张量比较 + 延迟构造警告消息
-            lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_depth).any()
-            if lca_invalid:
-                warnings.warn(
-                    f"LCA depth clamped to [0, {self.max_depth}]. "
-                    f"Min: {lca_depths.min().item():.2f}, Max: {lca_depths.max().item():.2f}"
-                )
-            lca_depths = lca_depths.clamp(0, self.max_depth)
-
-            # I102-4: 使用 detach() 防止显存泄露
-            self._lca_cache_inputs[data_ptr] = (data_ptr, torch_version, lca_depths.detach())
-        
         # 批量嵌入: (B, S, S, H)
         bias = self.lca_embedding(lca_depths)
 
@@ -464,14 +439,15 @@ class LCAHilbertBias(HilbertBiasBase):
     def clear_cache(self) -> None:
         """清除 LCA 缓存。
 
-        在以下情况调用:
-        - 开始新的 batch 前
-        - 评估/推理前后
-        - 内存清理时
+        CRIT-3: 缓存已移除，此方法为空实现以保持 API 兼容性。
 
-        I30-9: 使用 data_ptr + PyTorch 版本校验后，此方法清空缓存。
+        历史说明:
+        - 原实现使用 data_ptr + 版本校验的 LRU 缓存
+        - 问题: 训练中每张图像不同，缓存命中率趋近于 0
+        - 风险: 无界缓存可导致 10K 步累积 2.5GB 显存
+        - 决策: 移除缓存，直接计算 LCA (仅占注意力 10% 开销)
         """
-        self._lca_cache_inputs.clear()
+        pass  # 缓存已移除，无操作
     
     def forward_from_regions(
         self,

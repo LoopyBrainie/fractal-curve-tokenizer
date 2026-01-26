@@ -5,15 +5,21 @@
 数学形式化
 ============
 
-Transformer Block:
+Transformer Block (I106-2 方案D):
     x' = x + DropPath(Attention(LN(x), L))
-    x'' = x' + DropPath(FFN(LN(x'), L))
+    x'' = x' + DropPath(FFN_d(x', L))
 
 其中:
-- Attention: HilbertAwareMultiScaleAttention
-- FFN: AdaptiveFractalFeedForward  
+- Attention: HilbertAwareMultiScaleAttention (使用标准 LN + Hilbert Bias)
+- FFN: AdaptiveFractalFeedForward (使用层级感知 LN: LN_d)
 - L: levels_info 层级信息
 - DropPath: 随机深度正则化
+
+I106-2 归一化设计 (方案D):
+    - Attention: LN(x) 标准 LayerNorm
+      理由: Hilbert Bias 已处理不同深度 token 的尺度校准
+    - FFN: LN_d(x) 层级感知 LayerNorm
+      理由: FFN 是逐元素变换，需要层级特定的归一化参数
 
 DropPath (Stochastic Depth):
     训练时: output = x * Bernoulli(1 - drop_prob) / (1 - drop_prob)
@@ -197,79 +203,11 @@ class FractalTransformerBlock(nn.Module):
         nn.init.zeros_(self._residual_gate.weight)
         
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        
-        # REFACTORED: Replaced ModuleList of LayerNorms with Embeddings for Gamma/Beta
-        # This reduces parameters from 50*2*dim to 2*dim (plus embedding table)
-        self.norm1_gamma = nn.Embedding(max_level + 1, dim)
-        self.norm1_beta = nn.Embedding(max_level + 1, dim)
-        self.norm2_gamma = nn.Embedding(max_level + 1, dim)
-        self.norm2_beta = nn.Embedding(max_level + 1, dim)
-        
-        # Initialize to identity (gamma=1, beta=0)
-        nn.init.ones_(self.norm1_gamma.weight)
-        nn.init.zeros_(self.norm1_beta.weight)
-        nn.init.ones_(self.norm2_gamma.weight)
-        nn.init.zeros_(self.norm2_beta.weight)
-        
-        self.default_norm1 = nn.LayerNorm(dim)
-        self.default_norm2 = nn.LayerNorm(dim)
 
-    def _apply_level_aware_norm(
-        self,
-        x: torch.Tensor,
-        levels_info: Optional[LevelsInfo],
-        gamma_emb: nn.Embedding,
-        beta_emb: nn.Embedding,
-        default_norm: nn.LayerNorm,
-    ) -> torch.Tensor:
-        """应用层级感知的 LayerNorm。
-
-        根据每个 token 的层级深度选择对应的 gamma 和 beta 参数。
-
-        Args:
-            x: 输入张量，形状为 [B, S, D]。
-            levels_info: LevelsInfo 实例，可为 None（将使用深度 0 作为默认）。
-            gamma_emb: Gamma 参数的嵌入表。
-            beta_emb: Beta 参数的嵌入表。
-            default_norm: 默认的 LayerNorm（现已弃用，保留用于向后兼容）。
-
-        Returns:
-            归一化后的张量，形状为 [B, S, D]。
-        """
-        # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
-        if isinstance(levels_info, torch.Tensor):
-            # 转换为 LevelsInfo，确保数据类型为 Long
-            if levels_info.dtype != torch.long:
-                levels_info = levels_info.long()
-
-            # 从数据形状推断 max_depth: info_dim = max_depth + 1
-            info_dim = levels_info.shape[-1]
-            inferred_max_depth = info_dim - 1
-            levels_info = LevelsInfo(data=levels_info, max_depth=inferred_max_depth)
-
-        # 验证输入维度
-        if x.dim() != 3:
-            raise ValueError(f"Expected x to be 3D [B, S, D], got {x.dim()}D with shape {x.shape}")
-
-        batch_size, seq_len, dim = x.shape
-
-        # 当 levels_info 为 None 时，生成深度 0 的默认值
-        if levels_info is None or levels_info.data.numel() == 0:
-            depths = torch.zeros(batch_size, seq_len, dtype=torch.long, device=x.device)
-        else:
-            depths = levels_info.depths  # (B, S)
-            # I98-4: clamp depths to [0, max_level] to handle padding sentinel (-1)
-            depths = depths.clamp(min=0, max=self.max_level)
-
-        gamma = gamma_emb(depths)  # (B, S, dim)
-        beta = beta_emb(depths)    # (B, S, dim)
-
-        # Manual LayerNorm: (x - mean) / std * gamma + beta
-        mean = x.mean(dim=-1, keepdim=True)
-        var = x.var(dim=-1, keepdim=True, unbiased=False)
-        x_norm = (x - mean) / torch.sqrt(var + 1e-5)
-
-        return x_norm * gamma + beta
+        # I106-2: 简化归一化层 (方案D)
+        # - Attention: 使用标准 LayerNorm (Hilbert Bias 已处理尺度校准)
+        # - FFN: 移除 Block 级别的归一化 (FFN 内部有自己的层级感知归一化)
+        self.norm1 = nn.LayerNorm(dim)
 
     def forward(
         self,
@@ -323,7 +261,9 @@ class FractalTransformerBlock(nn.Module):
             gate = torch.tanh(self._residual_gate.weight[0])  # scalar ∈ [-1, 1]
             gate = gate.view(1, 1, 1)  # (1, 1, 1) for broadcasting
 
-        norm1_x = self._apply_level_aware_norm(x, levels_info, self.norm1_gamma, self.norm1_beta, self.default_norm1)
+        # I106-2: 使用标准 LayerNorm (替代层级感知归一化)
+        # Hilbert Bias 已处理不同深度 token 的尺度校准
+        norm1_x = self.norm1(x)
         attn_out = self.attention(
             norm1_x,
             levels_info=levels_info,
@@ -335,8 +275,9 @@ class FractalTransformerBlock(nn.Module):
         # gate ∈ [-1, 1] → (1 + gate) ∈ [0, 2]
         x = x + self.drop_path(attn_out * (1.0 + gate))
 
-        norm2_x = self._apply_level_aware_norm(x, levels_info, self.norm2_gamma, self.norm2_beta, self.default_norm2)
-        ff_out = self.ff(norm2_x, levels_info)
+        # I106-2: FFN 跳过 Block 级别的归一化
+        # FFN 内部有自己的层级感知归一化 (ffn_swiglu.py)
+        ff_out = self.ff(x, levels_info)
         x = x + self.drop_path(ff_out * (1.0 + gate))
 
         return x

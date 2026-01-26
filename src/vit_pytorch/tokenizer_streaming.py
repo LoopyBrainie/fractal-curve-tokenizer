@@ -183,8 +183,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # self.splitter 已移除，改为外部传入
         # 保留统计变量用于 tokenize 输出
         self._last_split_stats: Optional[Dict[str, Any]] = None
-        self._last_depth_count_matrix: Optional[torch.Tensor] = None  # P11-9: 向量化缓存
-        self._last_features: Optional[torch.Tensor] = None
+        # I107-2: 移除调试缓存变量 (_last_features, _last_depth_count_matrix)
+        # 这些仅用于调试，会导致显存泄露
 
     @property
     def patch_sizes(self) -> List[int]:
@@ -272,8 +272,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         # 1. 提取共享特征图
         features = self.shared_conv(images)  # [B, d_model, H/p, W/p]
-        # I102-4: 使用 detach() 防止显存泄露，保留 no_grad 计算图以节省内存
-        self._last_features = features.detach()
+        # I107-2: 移除调试缓存，防止显存泄露
+        # 调试可视化可通过回调钩子实现，不应在核心代码中持有引用
 
         # 2. I98-1: 使用外部传入的 split_result
         # GumbelTopKResult → TensorSplitResult 转换
@@ -318,23 +318,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 ones = torch.ones_like(flat_idx)
                 count_matrix.view(-1).scatter_add_(0, flat_idx, ones)
 
-                # I102-4: 使用 detach() 防止显存泄露
-                self._last_depth_count_matrix = count_matrix.detach()
-                
-                # P-OPT-3: 延迟转换到 CPU，使用 non_blocking
-                # 仅在实际需要 depth_dists 时才转换（统计信息通常只用于日志）
-                # 将 dict 构建移到 _build_depth_dists_lazy 方法
-                # I103-5: 添加 detach() 防止显存泄露 (count_matrix 带梯度)
-                self._depth_count_matrix_for_stats = count_matrix.detach()
-                depth_dists = None  # 延迟构建
+                # I107-2: 移除统计缓存，直接传递 count_matrix
+                depth_dists = self._build_depth_dists_lazy(B, count_matrix)
             else:
                 depth_dists = [{} for _ in range(B)]
-                self._last_depth_count_matrix = None
-                self._depth_count_matrix_for_stats = None
-        
-        # P-OPT-3: 延迟构建 depth_dists (仅在需要时转换)
-        if depth_dists is None:
-            depth_dists = self._build_depth_dists_lazy(B)
         
         self._last_split_stats = {
             'num_tokens': num_tokens_list,
@@ -480,24 +467,24 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         
         return self.patch_embed.norm(tokens), levels_info
 
-    def _build_depth_dists_lazy(self, B: int) -> List[Dict[int, int]]:
+    def _build_depth_dists_lazy(self, B: int, count_matrix: Optional[torch.Tensor] = None) -> List[Dict[int, int]]:
         """延迟构建 depth distribution dicts (P-OPT-3).
-        
+
         性能优化:
             - 仅在实际需要时才从 GPU 拷贝到 CPU
             - 使用 non_blocking=True 避免同步等待
             - 使用 numpy 向量化操作替代 Python 循环
-        
+
         Args:
             B: batch size
-            
+            count_matrix: depth count matrix [B, max_d], 如果为 None 则返回空 dicts
+
         Returns:
             List of depth distribution dicts
         """
-        if self._depth_count_matrix_for_stats is None:
+        if count_matrix is None:
             return [{} for _ in range(B)]
-        
-        count_matrix = self._depth_count_matrix_for_stats
+
         max_d = count_matrix.shape[1]
         
         # 转换到 CPU (同步方式，确保数据完整)
@@ -751,7 +738,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
     def get_scale_entropy(self) -> Optional[float]:
         """获取尺度分布熵值 (I78: 添加 no_grad 避免梯度计算).
 
-        P11-9 优化: 使用向量化计算，避免 O(B × D) Python 循环。
+        I107-2: 移除了向量化张量缓存，仅使用 Python dict 方式计算。
 
         数学形式:
             H = -∑_d p_d log(p_d)
@@ -759,36 +746,23 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         """
         if self._last_split_stats is None:
             return None
-        
-        # P11-9: 如果有张量缓存，使用向量化计算
-        if self._last_depth_count_matrix is not None:
-            count_matrix = self._last_depth_count_matrix  # [B, max_d]
-            total_counts = count_matrix.sum(dim=0).float()  # [max_d]
-            total = total_counts.sum()
-            # I78: 使用 clamp 防止除零 (M4 修复)
-            total_safe = total.clamp(min=1e-8)
-            probs = total_counts / total_safe
-            # 避免 log(0)
-            log_probs = torch.log(probs + LOG_EPSILON)
-            entropy = -(probs * log_probs).sum().item()
-            return entropy
-        
-        # Fallback: 原始 Python 字典方式 (规则分割器路径)
+
+        # 使用 Python dict 方式计算 (从 depth_distributions)
         total_dist: Dict[int, int] = {}
         for dist in self._last_split_stats['depth_distributions']:
             for d, count in dist.items():
                 total_dist[d] = total_dist.get(d, 0) + count
-        
+
         total = sum(total_dist.values())
         if total == 0:
             return None
-        
+
         entropy = 0.0
         for count in total_dist.values():
             p = count / total
             if p > 0:
                 entropy -= p * math.log(p)
-        
+
         return entropy
 
     @torch.no_grad()
@@ -800,7 +774,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         """计算深度分布统计信息.
 
         I98-1: 需要外部传入 split_result，因为 Splitter 已不再是内部组件。
-        如果未提供 split_result，尝试从 model.splitter 获取。
+        I107-2: 移除了缓存依赖，不再使用 _last_features 和 _last_depth_count_matrix。
 
         Args:
             images: [B, C, H, W] 输入图像
@@ -820,14 +794,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 features = self.shared_conv(images)
                 # 调用 splitter
                 split_result = model.splitter(features, image_size=(images.shape[2], images.shape[3]))
-            elif hasattr(self, '_last_features') and self._last_features is not None:
-                # 使用缓存的特征图（如果有）
-                if hasattr(self, '_parent_model') and hasattr(self._parent_model, 'splitter'):
-                    model = self._parent_model
-                    split_result = model.splitter(
-                        self._last_features,
-                        image_size=(images.shape[2], images.shape[3]) if images.dim() == 4 else None
-                    )
 
             # 如果仍然无法获取 split_result，返回空统计
             if split_result is None:
@@ -841,7 +807,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 }
 
         _ = self.tokenize(images, split_result)
-        
+
         if self._last_split_stats is None:
             return {
                 'scale_ratios': {},
@@ -850,57 +816,13 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 'dominant_scale': self.base_patch_size,
                 'depth_distribution': {},
             }
-        
-        # P11-9: 优先使用向量化路径
-        if self._last_depth_count_matrix is not None:
-            count_matrix = self._last_depth_count_matrix  # [B, max_d]
-            total_counts = count_matrix.sum(dim=0)  # [max_d]
-            total_tokens = int(total_counts.sum().item())
-            
-            if total_tokens == 0:
-                return {
-                    'scale_ratios': {},
-                    'entropy': 0.0,
-                    'max_entropy': 0.0,
-                    'dominant_scale': self.base_patch_size,
-                    'depth_distribution': {},
-                }
-            
-            # 转换为 Python dict (用于返回值兼容性)
-            total_counts_cpu = total_counts.cpu().numpy()
-            total_dist = {d: int(c) for d, c in enumerate(total_counts_cpu) if c > 0}
-            
-            # 向量化计算 scale_ratios
-            scale_ratios: Dict[int, float] = {}
-            for depth, count in total_dist.items():
-                ps = self.base_patch_size * (2 ** (self.max_depth - depth))
-                scale_ratios[ps] = count / total_tokens
-            
-            # 向量化熵计算
-            probs = total_counts.float() / total_tokens
-            log_probs = torch.log(probs + LOG_EPSILON)
-            entropy = -(probs * log_probs).sum().item()
-            
-            num_depths = self.max_depth + 1
-            max_entropy = math.log(num_depths) if num_depths > 1 else 0.0
-            
-            dominant_depth = int(total_counts.argmax().item())
-            dominant_scale = self.base_patch_size * (2 ** (self.max_depth - dominant_depth))
-            
-            return {
-                'scale_ratios': scale_ratios,
-                'entropy': entropy,
-                'max_entropy': max_entropy,
-                'dominant_scale': dominant_scale,
-                'depth_distribution': total_dist,
-            }
-        
-        # Fallback: 原始 Python 字典方式 (规则分割器路径)
+
+        # 使用 Python dict 方式计算 (从 depth_distributions)
         total_dist: Dict[int, int] = {}
         for dist in self._last_split_stats['depth_distributions']:
             for d, count in dist.items():
                 total_dist[d] = total_dist.get(d, 0) + count
-        
+
         total_tokens = sum(total_dist.values())
         if total_tokens == 0:
             return {
@@ -910,24 +832,24 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 'dominant_scale': self.base_patch_size,
                 'depth_distribution': {},
             }
-        
+
         scale_ratios = {}
         for depth, count in total_dist.items():
             ps = self.base_patch_size * (2 ** (self.max_depth - depth))
             scale_ratios[ps] = count / total_tokens
-        
+
         entropy = 0.0
         for count in total_dist.values():
             p = count / total_tokens
             if p > 0:
                 entropy -= p * math.log(p)
-        
+
         num_depths = self.max_depth + 1
         max_entropy = math.log(num_depths) if num_depths > 1 else 0.0
-        
+
         dominant_depth = max(total_dist.keys(), key=lambda d: total_dist[d])
         dominant_scale = self.base_patch_size * (2 ** (self.max_depth - dominant_depth))
-        
+
         return {
             'scale_ratios': scale_ratios,
             'entropy': entropy,

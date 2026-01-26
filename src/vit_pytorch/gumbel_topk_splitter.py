@@ -467,13 +467,14 @@ class GumbelTopKSplitter(
         self._depth_var_normalized: Optional[Tensor] = None  # [D]
 
         # I35: EMA Running Statistics buffers (max_depth_limit + 1 维度)
-        # I99-1: 修改为 3D Buffer [B_max, D] 实现 per-sample EMA
-        #         每个样本独立累积 EMA，完全消除 batch 依赖
-        D = max_depth_limit + 1
-        self._max_batch_size = 256  # I99-1: 预设最大 batch size (支持 batch=192)
-        self.register_buffer('_depth_ema_mean', torch.zeros(self._max_batch_size, D))  # [B_max, D]
-        self.register_buffer('_depth_ema_var', torch.ones(self._max_batch_size, D))   # [B_max, D]
-        self._depth_ema_initialized = False  # 标记是否已初始化
+        # I99-1: 原实现使用固定 B_max=256 缓冲区
+        # I107-1: 优化为动态缓冲区，按需分配，消除内存浪费
+        self._depth_dim = max_depth_limit + 1  # I107-1: 保存深度维度
+        D = self._depth_dim
+        # I107-1: 动态缓冲区，不再使用 register_buffer (因为大小会变化)
+        self._depth_ema_mean: Optional[Tensor] = None  # [B, D]
+        self._depth_ema_var: Optional[Tensor] = None   # [B, D]
+        self._ema_buffer_initialized = False  # 标记是否已初始化
 
         # I103-3: 设备端张量惰性缓存 (避免重复 .to(device) 传输)
         self._cached_device_regions: Optional[torch.Tensor] = None
@@ -504,6 +505,36 @@ class GumbelTopKSplitter(
 
         nn.init.xavier_uniform_(self.depth_proj.weight)
         nn.init.zeros_(self.depth_proj.bias)
+
+    # I107-1: 动态 EMA 缓冲区管理
+    def _ensure_ema_buffers(self, batch_size: int, device: torch.device) -> None:
+        """确保 EMA 缓冲区足够大 (I107-1 动态分配).
+
+        数学:
+            M_alloc = batch_size × D × 4 bytes
+            M_waste = 0 (按需分配)
+
+        Args:
+            batch_size: 实际 batch size
+            device: 计算设备
+        """
+        D = self._depth_dim
+        if not self._ema_buffer_initialized:
+            # 首次分配：按实际 batch size 分配
+            self._depth_ema_mean = torch.zeros(batch_size, D, device=device)
+            self._depth_ema_var = torch.ones(batch_size, D, device=device)
+            self._ema_buffer_initialized = True
+        elif self._depth_ema_mean is not None and self._depth_ema_mean.size(0) < batch_size:
+            # 扩展缓冲区：当 batch size 增大时
+            padding_size = batch_size - self._depth_ema_mean.size(0)
+            self._depth_ema_mean = torch.cat([
+                self._depth_ema_mean,
+                torch.zeros(padding_size, D, device=device)
+            ], dim=0)
+            self._depth_ema_var = torch.cat([
+                self._depth_ema_var,
+                torch.ones(padding_size, D, device=device)
+            ], dim=0)
 
     # I103-3: 设备端张量惰性缓存方法
     def _get_device_tensor(
@@ -921,14 +952,16 @@ class GumbelTopKSplitter(
         #   3. Per-sample EMA 跟踪每个样本的统计量变化
         # ====================================================================
         if self.training:
-            # 训练模式: Per-sample EMA 更新
+            # I107-1: 训练模式: Per-sample EMA 更新
             # 对每个样本独立更新 EMA，不跨 batch 平均
-            B_effective = min(B, self._max_batch_size)  # 边界保护
-            for b in range(B_effective):
+            # I107-1: 确保 EMA 缓冲区足够大
+            self._ensure_ema_buffers(B, device)
+
+            for b in range(B):
                 mu_b = mu_per_batch[b]  # [D]
                 var_b = variance_per_batch[b]  # [D]
 
-                if not self._depth_ema_initialized:
+                if not self._ema_buffer_initialized:
                     # I100-5: 首次初始化 - 分层保守初始化
                     # 根据 batch size 的统计可靠性分级处理
                     safe_var = var_b.detach().clamp(min=DEPTH_VARIANCE_NORM_EPS)
@@ -958,7 +991,7 @@ class GumbelTopKSplitter(
                         (1 - DEPTH_EMA_ALPHA) * self._depth_ema_var[b, :D]
                     ).clamp(min=DEPTH_VARIANCE_NORM_EPS)
 
-            self._depth_ema_initialized = True
+            self._ema_buffer_initialized = True
 
             # 归一化使用当前 batch 的实时统计量 (非 EMA 累积值)
             # 这样确保不同 batch size 下的归一化行为一致
@@ -968,7 +1001,7 @@ class GumbelTopKSplitter(
             # ====================================================================
             # 评估模式
             # ====================================================================
-            if not self._depth_ema_initialized:
+            if not self._ema_buffer_initialized:
                 import warnings
                 warnings.warn(
                     f"[I99-1] 深度方差归一化未初始化 (model.eval() 前未进行训练)。"
@@ -1403,8 +1436,10 @@ class GumbelTopKSplitter(
             quota[D - 1] += K - quota.sum()
             return quota
 
-        # Softmax 计算配额概率
-        p = F.softmax(self.quota_logits[:D], dim=0)  # [D]
+        # I101-1: 添加 Quota Softmax 数值保护
+        # 防止 quota_logits 幅度过大导致 softmax 溢出
+        quota_logits_clamped = self.quota_logits[:D].clamp(min=-50, max=50)
+        p = F.softmax(quota_logits_clamped, dim=0)  # [D]
         p = p.to(device)
 
         # I100-7: 标准 Largest Remainder Method (LRM)
@@ -1456,8 +1491,10 @@ class GumbelTopKSplitter(
         if self.quota_logits is None or not self._enable_learnable_quota:
             return torch.tensor(0.0, device=self.candidate_depths.device)
 
+        # I101-1: 添加 Quota Softmax 数值保护
+        quota_logits_clamped = self.quota_logits[:D].clamp(min=-50, max=50)
         # 计算软配额 (有梯度)
-        p = F.softmax(self.quota_logits[:D], dim=0)  # [D], 有梯度
+        p = F.softmax(quota_logits_clamped, dim=0)  # [D], 有梯度
         K_soft = p * K  # [D], 软配额
 
         # 计算硬配额 (无梯度，用于比较)
@@ -2288,9 +2325,11 @@ class GumbelTopKSplitter(
         """
         if self.quota_logits is None:
             return torch.tensor(0.0, device=self.candidate_regions.device)
-        
+
+        # I101-1: 添加 Quota Softmax 数值保护
+        quota_logits_clamped = self.quota_logits.clamp(min=-50, max=50)
         # Softmax 计算配额分布
-        quota_probs = F.softmax(self.quota_logits, dim=0)  # [D]
+        quota_probs = F.softmax(quota_logits_clamped, dim=0)  # [D]
         quota_probs = quota_probs.clamp(min=PROB_EPSILON)
         
         # 熵
@@ -2353,11 +2392,11 @@ class GumbelTopKSplitter(
             total = depth_counts.sum().clamp(min=1.0)
             pi = depth_counts / total
 
-            # 熵
-            pi_safe = pi.clamp(min=PROB_EPSILON)
+            # 熵 - P2-1 修复: 使用加性 epsilon 替代 clamp
+            pi_safe = pi + (pi == 0).float() * PROB_EPSILON
             entropy = -(pi_safe * pi_safe.log()).sum().item()
 
-            # KL from uniform
+            # KL from uniform - P2-1 修复: 使用加性 epsilon
             uniform = torch.ones(D, device=device) / D
             kl = (pi_safe * (pi_safe.log() - uniform.log())).sum().item()
 
@@ -2607,7 +2646,9 @@ class GumbelTopKSplitter(
         """
         if self.quota_logits is None:
             return None
-        return F.softmax(self.quota_logits, dim=0)
+        # I101-1: 添加 Quota Softmax 数值保护
+        quota_logits_clamped = self.quota_logits.clamp(min=-50, max=50)
+        return F.softmax(quota_logits_clamped, dim=0)
 
     def get_variance_regularization(self) -> Tensor:
         """
@@ -2624,8 +2665,10 @@ class GumbelTopKSplitter(
         if self.quota_logits is None:
             return torch.tensor(0.0, device=self.candidate_regions.device)
 
+        # I101-1: 添加 Quota Softmax 数值保护
+        quota_logits_clamped = self.quota_logits.clamp(min=-50, max=50)
         # 计算配额分布
-        quota_probs = F.softmax(self.quota_logits, dim=0)  # [D]
+        quota_probs = F.softmax(quota_logits_clamped, dim=0)  # [D]
 
         # 计算期望深度 E[d]
         depths = torch.arange(

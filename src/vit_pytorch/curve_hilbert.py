@@ -450,47 +450,59 @@ class HilbertCurve:
         n = 1 << order  # 2^order
         return [cls.d_to_xy(n, d) for d in range(n * n)]
 
+    # I107-6: 阶数阈值缓存策略
+    # k < 6: 直接计算，不缓存 (计算开销 < 25ms)
+    # k >= 6: LRU 缓存 (maxsize=16)，内存上界 ~115 MB
+    _K_THRESHOLD = 6
+
+    @classmethod
+    @_dynamo_safe_lru_cache(maxsize=16)
+    def _get_curve_points_cached_high(cls, order: int) -> Tuple[Tuple[int, int], ...]:
+        """高阶曲线缓存 (k >= 6).
+
+        I107-6: 使用 LRU 缓存确保内存有界性
+        - maxsize=16: 内存上界 ~115 MB (极端 k=8)
+        - 典型使用 (k=6,7): ~2.3 MB
+        """
+        n = 1 << order
+        return tuple(cls.d_to_xy(n, d) for d in range(n * n))
+
     @classmethod
     def get_curve_points_cached(cls, order: int) -> Tuple[Tuple[int, int], ...]:
         """
-        获取缓存的 Hilbert 曲线点 (P-OPT-9)
+        获取缓存的 Hilbert 曲线点 (P-OPT-9, I107-6 优化)
 
-        数学形式化
-        ==========
+        I107-6 阶数阈值策略:
+        - k < 6: 直接计算，不缓存 (计算开销 < 25ms)
+        - k >= 6: LRU 缓存 (maxsize=16)，内存有界
 
-        缓存命中: O(1) 返回预计算结果
-        缓存未命中: O(n²) 计算后缓存，其中 n = 2^order
-
-        使用场景:
-            - Tokenizer 初始化时预计算常用阶数 (order ≤ 6)
-            - 避免运行时重复生成曲线点
+        数学上界:
+        - 极端: 16 × M(8) ≈ 115 MB
+        - 典型: M(6) + M(7) ≈ 2.3 MB
 
         Args:
             order: 曲线阶数 (生成 2^order × 2^order 网格)
 
         Returns:
             按 Hilbert 顺序排列的坐标点元组
-
-        示例
-        ----
-        >>> points = HilbertCurve.get_curve_points_cached(4)  # 16×16 网格
-        >>> len(points)
-        256
         """
-        global _HILBERT_CURVE_CACHE
-
-        if order not in _HILBERT_CURVE_CACHE:
-            n = 1 << order  # 2^order
-            points = tuple(cls.d_to_xy(n, d) for d in range(n * n))
-            _HILBERT_CURVE_CACHE[order] = points
-
-        return _HILBERT_CURVE_CACHE[order]
+        if order < cls._K_THRESHOLD:
+            # 低阶曲线直接计算，无需缓存
+            n = 1 << order
+            return tuple(cls.d_to_xy(n, d) for d in range(n * n))
+        return cls._get_curve_points_cached_high(order)
 
     @staticmethod
     def clear_curve_cache() -> None:
-        """清空 Hilbert 曲线缓存 (P-OPT-9)"""
+        """清空 Hilbert 曲线缓存 (P-OPT-9, I107-6).
+
+        清理策略:
+        - 旧全局缓存: 惰性清理
+        - 新 LRU 缓存: 调用 cache_clear()
+        """
         global _HILBERT_CURVE_CACHE
         _HILBERT_CURVE_CACHE.clear()
+        HilbertCurve._get_curve_points_cached_high.cache_clear()
 
 
 # 便捷函数
@@ -699,8 +711,9 @@ class PseudoHilbertCurve:
         points = PseudoHilbertCurve.scan(30, 20)
     """
 
-    # I102-9: 坐标到距离的缓存 {(h, w): {(x, y): d}}
-    # 首次查询 O(H×W)，后续 O(1)
+    # I102-9: 已迁移到 _get_coord_cache LRU 缓存 (maxsize=16)
+    # 内存上界: 16 × 64 × 64 × 8B = 512 KB
+    # 旧全局缓存保留用于向后兼容 (惰性清理)
     _coord_to_d_cache: Dict[Tuple[int, int], Dict[Tuple[int, int], int]] = {}
 
     # 混合策略阈值: ρ* = 4/3
@@ -736,7 +749,23 @@ class PseudoHilbertCurve:
         
         # 自动选择策略
         return cls._scan_with_strategy(h, w)
-    
+
+    # I102-9: 使用 LRU 缓存替代全局字典，内存有界
+    # maxsize=16 对应内存上界 ~512 KB (16 × 64 × 64 × 8B)
+    @classmethod
+    @_dynamo_safe_lru_cache(maxsize=16)
+    def _get_coord_cache(cls, h: int, w: int) -> Dict[Tuple[int, int], int]:
+        """获取坐标到距离的缓存 (LRU 限制: maxsize=16).
+
+        内存上界: maxsize × max_tokens × entry_size
+                 = 16 × 64 × 64 × 8B = 512 KB
+
+        Returns:
+            {(x, y): d} 映射字典
+        """
+        points = cls.scan(h, w)
+        return {pt: i for i, pt in enumerate(points)}
+
     @classmethod
     def _scan_with_strategy(cls, h: int, w: int) -> Tuple[Tuple[int, int], ...]:
         """根据混合策略选择最优扫描方法.
@@ -957,7 +986,8 @@ class PseudoHilbertCurve:
     def xy_to_d(cls, h: int, w: int, x: int, y: int) -> int:
         """将 2D 坐标转换为 Pseudo-Hilbert 距离.
 
-        I102-9 优化: 使用缓存将 O(H×W) 降至 O(1)
+        I102-9 优化: 使用 LRU 缓存将 O(H×W) 降至 O(1)
+        内存上界: maxsize=16 → ~512 KB
 
         Args:
             h: 矩形高度
@@ -968,22 +998,12 @@ class PseudoHilbertCurve:
         Returns:
             在 Pseudo-Hilbert 曲线上的距离
         """
-        cache_key = (h, w)
+        coord_cache = cls._get_coord_cache(h, w)
+        coord_key = (x, y)
 
-        # 缓存命中
-        if cache_key in cls._coord_to_d_cache:
-            coord_key = (x, y)
-            coord_cache = cls._coord_to_d_cache[cache_key]
-            if coord_key in coord_cache:
-                return coord_cache[coord_key]
-            raise ValueError(f"坐标 ({x}, {y}) 不在 {h}×{w} 网格范围内")
-
-        # 缓存未命中: 构建缓存
-        points = cls.scan(h, w)
-        cls._coord_to_d_cache[cache_key] = {pt: i for i, pt in enumerate(points)}
-
-        # 重试
-        return cls.xy_to_d(h, w, x, y)
+        if coord_key in coord_cache:
+            return coord_cache[coord_key]
+        raise ValueError(f"坐标 ({x}, {y}) 不在 {h}×{w} 网格范围内")
     
     @classmethod
     def d_to_xy(cls, h: int, w: int, d: int) -> Tuple[int, int]:
@@ -1026,8 +1046,17 @@ class PseudoHilbertCurve:
     
     @classmethod
     def clear_cache(cls) -> None:
-        """清空 LRU 缓存."""
+        """清空所有 LRU 缓存 (scan + 坐标缓存)."""
         cls.scan.cache_clear()
+        cls._get_coord_cache.cache_clear()
+
+    @classmethod
+    def clear_coord_cache(cls) -> None:
+        """清空坐标缓存 (xy_to_d 缓存).
+
+        I102-9: 显式清理方法，便于内存管理。
+        """
+        cls._get_coord_cache.cache_clear()
 
 
 # I25-12: Pseudo-Hilbert 局部性量化工具类

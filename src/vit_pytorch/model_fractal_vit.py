@@ -751,12 +751,12 @@ class FractalCurveViT(nn.Module):
                     depths = depths[depths >= 0]
                     if depths.numel() > 0:
                         # 使用 bincount 向量化计数
-                        d_max = int(depths.max().item())
-                        d_max = min(d_max, max_depth)
+                        d_max = min(int(depths.max().item()), max_depth)
                         counts = torch.bincount(depths, minlength=max_depth_range)[:max_depth_range].float()
                         all_depth_counts[i] = counts
-                        # 记录使用的层级
-                        all_levels_used[i] = [d for d in range(d_max + 1) if counts[d] > 0]
+                        # I107-4: 使用 nonzero() 替代列表推导，减少 Python 开销
+                        # 从 counts 中提取 >0 的索引 (使用 nonzero 获取非零位置)
+                        all_levels_used[i] = counts[:d_max + 1].nonzero(as_tuple=True)[0].tolist()
 
             # 计算归一化分布
             depth_sums = all_depth_counts.sum(dim=1, keepdim=True).clamp(min=1e-8)
@@ -765,12 +765,12 @@ class FractalCurveViT(nn.Module):
             for i in range(batch_size):
                 num_tokens = int(lengths_cpu[i].item())
 
-                # 构建稀疏分布字典
-                depth_distribution: Dict[int, float] = {}
-                for d in all_levels_used[i]:
-                    val = normalized_counts[i, d].item()
-                    if val > 0:
-                        depth_distribution[d] = val
+                # I107-4: 直接从 nonzero 索引构建字典，避免循环
+                # all_levels_used[i] 已经是 nonzero 索引列表
+                depth_distribution: Dict[int, float] = {
+                    d: normalized_counts[i, d].item()
+                    for d in all_levels_used[i]
+                }
 
                 aux_info = {
                     "num_tokens": num_tokens,
@@ -783,8 +783,10 @@ class FractalCurveViT(nn.Module):
                 # M3: 计算选择熵 (token_selection_entropy)
                 if split_probs is not None:
                     probs_i = split_probs[i, :lengths[i]]
-                    # 避免 log(0)
-                    probs_safe = probs_i.clamp(min=PROB_EPSILON)
+                    # P2-1 修复: 使用加性 epsilon 替代 clamp，避免改变分布
+                    # clamp 会将所有小于 epsilon 的值改为 epsilon，破坏分布
+                    # 加性方法只在零值处添加 epsilon，保持非零值不变
+                    probs_safe = probs_i + (probs_i == 0).float() * PROB_EPSILON
                     entropy = -(probs_safe * torch.log(probs_safe)).sum().item()
                     aux_info["token_selection_entropy"] = entropy
 
@@ -852,26 +854,43 @@ class FractalCurveViT(nn.Module):
     ) -> Union[
         torch.Tensor,
         Tuple[torch.Tensor, List[Dict[str, Any]]],
-        Tuple[torch.Tensor, List[torch.Tensor]],
-        Tuple[torch.Tensor, List[Dict[str, Any]], List[torch.Tensor]],
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],  # (logits, tokens, lengths)
+        Tuple[torch.Tensor, List[Dict[str, Any]], torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],  # legacy: (logits, tokens, lengths)
     ]:
         """前向传播。
 
         Args:
             img: 输入图像，形状为 [B, C, H, W]
-            return_aux_info: 是否返回辅助信息
-            return_features: 是否返回特征
-            return_tokens: 是否返回 transformer 输出 tokens (用于困难样本挖掘)
+            return_aux_info: 是否返回辅助信息（推荐使用）
+            return_features: [废弃警告] 是否返回特征（合并到 aux_info）
+            return_tokens: [废弃警告] 是否返回 tokens（合并到 aux_info）
 
         Returns:
             根据参数返回不同类型：
             - 默认：分类 logits [B, num_classes]
             - return_aux_info=True：(logits, aux_infos)
-            - return_features=True：(logits, features)
-            - return_tokens=True: (logits, tokens [B, N, D], lengths [B])
-            - 两者都为 True：(logits, aux_infos, features)
+              aux_infos 包含: features, tokens, lengths, depth_distribution 等
+            - return_tokens=True: [废弃] (logits, tokens, lengths)
+            - return_features=True: [废弃] (logits, features)
         """
+        import warnings
+
+        # I36 Phase 2: 废弃警告
+        if return_features:
+            warnings.warn(
+                "return_features 已废弃，请使用 return_aux_info=True。"
+                "特征信息现在包含在 aux_info['features'] 中。",
+                DeprecationWarning,
+                stacklevel=2
+            )
+        if return_tokens:
+            warnings.warn(
+                "return_tokens 已废弃，请使用 return_aux_info=True。"
+                "tokens 和 lengths 现在包含在 aux_info['transformer_tokens'] 和 aux_info['lengths'] 中。",
+                DeprecationWarning,
+                stacklevel=2
+            )
+
         # P0-2: 自动转换 channels_last 内存格式以优化卷积性能
         # 检测输入是否为 4D 且是 channels_first (stride(1) != stride(2))
         if (img.dim() == 4 and
@@ -920,24 +939,34 @@ class FractalCurveViT(nn.Module):
         pooled = self._apply_pooling(x, key_padding_mask, split_probs)
         pooled = self.to_latent(pooled)
         final_output = self.mlp_head(pooled)
-        
-        # I30-2: Token 输出 (用于 HilbertAwareHardMining)
+
+        # I30-2: Token 输出 (用于 HilbertAwareHardMining) - 保持向后兼容性
         if return_tokens:
             return final_output, transformer_tokens, lengths
 
         # 6. 辅助输出
         if return_aux_info or return_features:
-            aux_infos, features_tensor = self._prepare_auxiliary_output(
+            aux_infos, _ = self._prepare_auxiliary_output(
                 batch_size, lengths, levels_list, pooled, return_aux_info, return_features,
                 split_probs=split_probs
             )
 
+            # I36 Phase 2: 将 features 和 tokens 添加到 aux_info
+            if return_aux_info:
+                for i, aux in enumerate(aux_infos):
+                    # 添加特征（池化后的表示）
+                    aux['features'] = pooled[i]
+                    # 添加 transformer tokens 和长度（用于困难样本挖掘）
+                    aux['transformer_tokens'] = transformer_tokens[i] if i < len(transformer_tokens) else None
+                    aux['lengths'] = lengths[i].item() if hasattr(lengths[i], 'item') else lengths[i]
+
+            # 保持向后兼容性（带废弃警告）
             if return_aux_info and return_features:
-                return final_output, aux_infos, features_tensor
+                return final_output, aux_infos, pooled  # features = pooled
             if return_aux_info:
                 return final_output, aux_infos
             if return_features:
-                return final_output, features_tensor
+                return final_output, pooled
 
         return final_output
 
@@ -1143,6 +1172,8 @@ class FractalCurveViT(nn.Module):
                 - num_selected: int - 选中的 token 数
                 - has_splitter: bool - 是否有分割器 (L3: 新增)
                 - splitter_type: str - 分割器类型 (L3: 新增)
+                - gradient_coverage: float - 梯度覆盖率 (I36 Phase 3)
+                - temperature_status: str - 温度状态 (健康/过低)
         """
         diagnostics: Dict[str, Any] = {
             'current_temperature': 1.0,
@@ -1151,6 +1182,8 @@ class FractalCurveViT(nn.Module):
             'num_selected': 0,
             'has_splitter': False,
             'splitter_type': 'None',
+            'gradient_coverage': 0.0,
+            'temperature_status': 'unknown',
         }
 
         # 统一 Splitter 访问路径 (I99-对齐修复)
@@ -1169,11 +1202,36 @@ class FractalCurveViT(nn.Module):
 
             # 当前温度
             if hasattr(splitter, 'get_current_temperature'):
-                diagnostics['current_temperature'] = splitter.get_current_temperature()
+                current_temp = splitter.get_current_temperature()
+                diagnostics['current_temperature'] = current_temp
 
-            # 深度分布
-            if hasattr(splitter, 'get_depth_distribution'):
-                diagnostics['depth_distribution'] = splitter.get_depth_distribution()
+                # I36 Phase 3: 温度状态检查
+                if current_temp < 0.3:
+                    diagnostics['temperature_status'] = 'low_risk'  # T < 0.3 可能导致梯度消失
+                elif current_temp < 0.5:
+                    diagnostics['temperature_status'] = 'healthy'  # 健康范围
+                else:
+                    diagnostics['temperature_status'] = 'high_explore'  # 高温度，探索性强
+
+            # 深度分布 - 兼容多种返回格式 (P0-2 修复)
+            # Splitter 可能返回:
+            # - Dict[int, float]: 深度 -> 百分比 (base_splitter 协议)
+            # - Dict[str, Any]: {'pi': [...], 'entropy': ..., 'kl_from_uniform': ...} (GumbelTopKSplitter)
+            raw_depth_dist = splitter.get_depth_distribution()
+            if isinstance(raw_depth_dist, dict):
+                if 'pi' in raw_depth_dist and raw_depth_dist['pi'] is not None:
+                    # GumbelTopKSplitter 格式: {'pi': [D], ...}
+                    pi = raw_depth_dist['pi']
+                    diagnostics['depth_distribution'] = {
+                        int(d): float(p) for d, p in enumerate(pi) if p > 0
+                    }
+                else:
+                    # 已经是 Dict[int, float] 格式或空字典
+                    # 过滤掉无法转换为整数的键
+                    diagnostics['depth_distribution'] = {
+                        int(k): float(v) for k, v in raw_depth_dist.items()
+                        if self._is_convertible_to_int(k)
+                    }
 
             # 配额分配
             if hasattr(splitter, 'quota_logits') and hasattr(splitter, '_current_max_depth'):
@@ -1185,7 +1243,24 @@ class FractalCurveViT(nn.Module):
             if hasattr(splitter, '_avg_selected'):
                 diagnostics['num_selected'] = int(splitter._avg_selected)
 
+            # I36 Phase 3: 梯度覆盖率估算
+            # 数学: 梯度覆盖率 ≈ K_selected / N_candidates (Top-K 选择)
+            # GumbelTopK 使用分层选择，估算为选中 token 比例
+            if hasattr(splitter, '_avg_selected') and hasattr(splitter, '_num_candidates'):
+                num_selected = splitter._avg_selected
+                num_candidates = splitter._num_candidates
+                if num_candidates > 0:
+                    diagnostics['gradient_coverage'] = float(num_selected / num_candidates)
+
         return diagnostics
+
+    def _is_convertible_to_int(self, key) -> bool:
+        """检查键是否可以转换为整数 (P0-2 修复辅助方法)"""
+        try:
+            int(key)
+            return True
+        except (ValueError, TypeError):
+            return False
 
     def get_model_info(self) -> Dict[str, Any]:
         """获取模型诊断信息 (I36-7: 完整诊断)

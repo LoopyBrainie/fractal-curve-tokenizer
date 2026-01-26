@@ -48,8 +48,10 @@ from typing import Optional, Tuple
 import torch
 
 # I102-8: Hilbert 索引查找表 (预计算)
-# 约束: D_max <= 6 (空间复杂度 5460 条目 ≈ 22 KB)
-_MAX_HILBERT_DEPTH = 6
+# I101-2: 移除深度上限硬编码，扩展到 D_max=8
+# 空间复杂度: Σ_{d=1}^8 4^d = 4(4^8-1)/3 ≈ 21,844 条目 ≈ 175 KB
+# 对于 max_depth > 8，仍可使用但会回退到 Python 循环
+_MAX_HILBERT_DEPTH = 8
 
 from .curve_hilbert import xy_to_hilbert_distance
 

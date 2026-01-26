@@ -177,7 +177,18 @@ class AdaptiveFractalFeedForward(nn.Module):
         else:
             self.use_level_adaptation = use_level_adaptation
 
-        self.norm = nn.LayerNorm(dim)
+        # I106-2: 层级感知归一化 (方案D)
+        # 移除标准 LayerNorm，添加层级感知的 gamma/beta 参数
+        # 数学形式: x_norm = (x - μ) / σ * γ[d] + β[d]
+        # 其中 d 是 token 的深度层级
+        # I101-3: 深度边界处理 - 使用 max_level+2 以支持 padding sentinel
+        # index 0..max_level: 有效深度, index max_level+1: padding
+        self.ffn_gamma = nn.Embedding(max_level + 2, dim)
+        self.ffn_beta = nn.Embedding(max_level + 2, dim)
+
+        # 初始化为恒等变换: γ=1, β=0
+        nn.init.ones_(self.ffn_gamma.weight)
+        nn.init.zeros_(self.ffn_beta.weight)
         
         # ========== FFN 主网络 ==========
         if ffn_type in ('swiglu', 'swiglu_level'):
@@ -258,6 +269,10 @@ class AdaptiveFractalFeedForward(nn.Module):
         """前向传播。
 
         I98-4: levels_info 参数类型从 torch.Tensor 改为 LevelsInfo
+        I106-2: 使用层级感知归一化替代标准 LayerNorm
+
+        数学形式:
+            x_norm = (x - μ) / σ * γ[d] + β[d]
 
         Args:
             x: 输入张量，形状为 [B, S, D]。
@@ -267,7 +282,27 @@ class AdaptiveFractalFeedForward(nn.Module):
             输出张量，形状为 [B, S, D]。
         """
         batch, seq_len, _ = x.shape
-        x_norm = self.norm(x)
+
+        # ========== I106-2: 层级感知归一化 ==========
+        # 获取深度信息
+        if levels_info is None or levels_info.data.numel() == 0:
+            depths = torch.zeros(batch, seq_len, dtype=torch.long, device=x.device)
+        else:
+            depths = levels_info.depths  # [B, S], 包含 padding sentinel -1
+            # I101-3: 深度边界处理 - padding (-1) 映射到 max_level+1
+            # 有效深度 0..max_level 保持不变
+            depths = depths.where(depths >= 0, torch.tensor(self.max_level + 1, device=depths.device))
+            depths = depths.clamp(min=0, max=self.max_level + 1)
+
+        # 标准 LayerNorm 计算
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        x_norm = (x - mean) / torch.sqrt(var + 1e-5)
+
+        # 层级感知仿射变换
+        gamma = self.ffn_gamma(depths)  # [B, S, D]
+        beta = self.ffn_beta(depths)    # [B, S, D]
+        x_norm = x_norm * gamma + beta
 
         # ========== FFN 主网络 ==========
         if self.ffn_type in ('swiglu', 'swiglu_level'):
