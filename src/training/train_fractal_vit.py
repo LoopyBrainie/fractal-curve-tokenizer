@@ -3279,13 +3279,14 @@ def main():
                     pass
 
             # 设置编译缓存和错误处理
-            # I107-4: 增加缓存限制避免无限重编译
-            torch._dynamo.config.cache_size_limit = 128
-            torch._dynamo.config.suppress_errors = False  # 开启错误报告
+            # I107-5: 优化编译配置，避免长时间编译
+            torch._dynamo.config.cache_size_limit = 256
+            torch._dynamo.config.suppress_errors = False
 
-            # I107-4: 禁用自动调优 (笔记本 GPU 可能超时)
+            # I107-5: 禁用自动调优和复杂优化
             torch._inductor.config.max_autotune = False
-            torch._inductor.config.compile_threads = 1  # 减少并行编译开销
+            torch._inductor.config.compile_threads = 4  # 并行编译加速
+            torch._inductor.config.disable_cudnn = True  # 简化编译
 
             # 禁用 cudagraphs for laptop GPUs (RTX 4070 Laptop 不稳定)
             # I107-3: cudagraphs 在笔记本 GPU 上经常因为 TDP 限制失败
@@ -3307,9 +3308,8 @@ def main():
                 except AttributeError as cfg_e:
                     print(f"[INFO] CUDA inductor config not available: {cfg_e}")
 
-            # 使用 default 模式 for laptop GPUs (reduce-overhead 不稳定)
-            # I107-3: default 模式更兼容，但可能稍慢
-            compile_mode = 'default' if has_cuda else 'default'
+            # I107-5: 保持 dynamic=True (GumbelTopK 需要动态 token 数量)
+            compile_mode = 'default'
             model = torch.compile(
                 model,
                 mode=compile_mode,
