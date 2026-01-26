@@ -3254,13 +3254,10 @@ def main():
     # 注意: _configure_cuda_optimizations() 在文件顶部已调用
     # 重复设置无影响，仅跳过以避免重复日志
     
-    # Channels Last 内存格式 (卷积加速)
-    if config.channels_last and device.type == 'cuda':
-        model = model.to(memory_format=torch.channels_last)
-        print("[OK] Using channels-last memory format")
-
     # torch.compile 编译优化 (PyTorch 2.0+)
     # I107-2 修复: 添加 CUDA 检测，避免在无 CUDA 系统上设置不存在的配置
+    # I107-3 修复: 移动 channels_last 到 compile 之后，避免 cudagraphs 冲突
+    # 注意: cudagraphs 在 laptop GPU 上经常失败，需要禁用或使用更稳定的模式
     if config.compile_model:
         try:
             # 强制进行全面的垃圾回收
@@ -3279,8 +3276,16 @@ def main():
             torch._dynamo.config.cache_size_limit = 64
             torch._dynamo.config.suppress_errors = True
 
+            # 禁用 cudagraphs for laptop GPUs (RTX 4070 Laptop 不稳定)
+            # I107-3: cudagraphs 在笔记本 GPU 上经常因为 TDP 限制失败
+            if has_cuda:
+                try:
+                    torch._inductor.config.triton.cudagraphs = False
+                    torch._inductor.config.triton.cudagraphs_checkpoint = False
+                except AttributeError:
+                    pass
+
             # 仅在 CUDA 可用时设置 inductor CUDA 配置
-            # I107-2 修复: 检查配置是否存在后再设置
             if has_cuda:
                 try:
                     torch._inductor.config.max_autotune = False
@@ -3291,20 +3296,30 @@ def main():
                 except AttributeError as cfg_e:
                     print(f"[INFO] CUDA inductor config not available: {cfg_e}")
 
-            # 使用 reduce-overhead 模式，更稳定
+            # 使用 default 模式 for laptop GPUs (reduce-overhead 不稳定)
+            # I107-3: default 模式更兼容，但可能稍慢
+            compile_mode = 'default' if has_cuda else 'default'
             model = torch.compile(
                 model,
-                mode='reduce-overhead',
+                mode=compile_mode,
                 fullgraph=False,
                 dynamic=True,
             )
-            compile_mode = 'reduce-overhead' if has_cuda else 'default'
             print(f"[OK] Model compiled with torch.compile (mode={compile_mode})")
             if has_cuda:
                 print("[INFO] 首次运行会进行 JIT 编译，可能耗时 1-2 分钟")
+
+            # I107-3: 在 compile 之后应用 channels_last，避免 cudagraphs 冲突
+            if config.channels_last and device.type == 'cuda':
+                model = model.to(memory_format=torch.channels_last)
+                print("[OK] Using channels-last memory format (after compile)")
         except Exception as e:
             print(f"[WARN] torch.compile failed: {e}")
             print("[INFO] 回退到 eager 模式继续训练")
+            # 仍然应用 channels_last 如果需要
+            if config.channels_last and device.type == 'cuda':
+                model = model.to(memory_format=torch.channels_last)
+                print("[OK] Using channels-last memory format (eager mode)")
     
     # 诊断: 检查模型参数 dtype
     def check_model_dtypes(m, name="model"):
@@ -3404,26 +3419,27 @@ def main():
     # 编译预热: 在正式训练前触发 JIT 编译
     # P11-7 优化: 使用完整 batch size 预热，避免动态形状导致重新编译
     # P15 优化: 同时预热 Mixup 路径，避免 warmup 结束后的重编译延迟
+    # I107-3: 移除 synchronize() 调用，避免干扰 cudagraphs
     if config.compile_model:
         print("[INFO] Warming up compiled model with full batch size...")
         try:
             warmup_batch = next(iter(train_loader))
             if isinstance(warmup_batch, (list, tuple)):
-                warmup_imgs = warmup_batch[0].to(device)  # 使用完整 batch
-                warmup_labels = warmup_batch[1].to(device)
+                warmup_imgs = warmup_batch[0].to(device, non_blocking=True)  # 使用完整 batch
+                warmup_labels = warmup_batch[1].to(device, non_blocking=True)
             else:
-                warmup_imgs = warmup_batch.to(device)
+                warmup_imgs = warmup_batch.to(device, non_blocking=True)
                 warmup_labels = torch.zeros(warmup_imgs.shape[0], dtype=torch.long, device=device)
             if config.channels_last:
                 warmup_imgs = warmup_imgs.to(memory_format=torch.channels_last)
-            
-            # 阶段1: 预热标准 forward pass
+
+            # 阶段1: 预热标准 forward pass (移除 synchronize 以避免 cudagraphs 冲突)
             with torch.no_grad():
                 with get_amp_context(device, config.use_amp):
                     for _ in range(3):  # 3次预热确保编译稳定
                         _ = model(warmup_imgs)
-                        torch.cuda.synchronize()  # 确保编译完成
-            
+                    # I107-3: 不调用 synchronize()，让 cudagraphs 自动处理
+
             # 阶段2: 预热 Mixup 路径 (如果启用)
             if mixup_fn is not None:
                 print("[INFO] Pre-warming Mixup code path...")
@@ -3437,10 +3453,10 @@ def main():
                         # 测试 forward + Mixup loss
                         test_outs = model(test_imgs)
                         _ = mixup_criterion(test_outs, test_mixed_labels)
-                        torch.cuda.synchronize()
+                        # I107-3: 不调用 synchronize()
                         del test_imgs, test_mixed_labels, test_outs
                 print("[OK] Mixup path pre-warmed")
-            
+
             del warmup_imgs, warmup_labels
             torch.cuda.empty_cache()
             print("[OK] Compilation complete!")
