@@ -2812,7 +2812,13 @@ def main():
         device = torch.device(args.device)
     
     spec = DATASETS[args.dataset]
-    
+
+    # I33: 相对预算参数 (CLI) → 绝对 K 值 (模型)
+    # 转换公式: K = coverage * max_patches = coverage * (image_size/min_patch_size)^2
+    max_patches = (args.image_size // args.min_patch_size) ** 2
+    K_min = max(8, int(max_patches * args.token_coverage_min))  # 至少 8 tokens
+    K_max = int(max_patches * args.token_coverage_max)
+
     config = FractalViTConfig(
         dataset=args.dataset,
         batch_size=args.batch_size,
@@ -2828,11 +2834,9 @@ def main():
         ffn_type=args.ffn_type,
         # I30-17: 动态深度配置 - max_depth 由 min_patch_size 自动计算
         min_patch_size=args.min_patch_size,
-        # I33: 相对预算参数 (CLI) → 绝对 K 值 (模型)
-        # 转换公式: K = coverage * max_patches = coverage * (image_size/min_patch_size)^2
-        max_patches = (args.image_size // args.min_patch_size) ** 2
-        K_min=max(8, int(max_patches * args.token_coverage_min)),  # 至少 8 tokens
-        K_max=int(max_patches * args.token_coverage_max),
+        # I33: K 值 (从相对预算转换)
+        K_min=K_min,
+        K_max=K_max,
         # I30-10: 可学习配额参数
         quota_learnable=args.quota_learnable,
         quota_init_logits=tuple(map(float, args.quota_init_logits.split(','))) if args.quota_init_logits else None,
