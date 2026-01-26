@@ -664,28 +664,30 @@ def detect_environment() -> Dict[str, Any]:
         'cpu_count': _mp.cpu_count(),
         'recommended_workers': 4,
     }
-    
+
     if env['platform'] == 'Linux':
         try:
             import psutil
             shm = psutil.disk_usage('/dev/shm')
             shm_gb = shm.total / (1024**3)
-            # 容器环境优化：更激进的 workers 配置
+            # I136: 优化 workers 配置，避免 GPU 空转
+            # 原则: num_workers >= CPU核心数/2 以保持数据供给
+            cpu_cores = env['cpu_count']
             if env['in_container']:
+                # 容器环境：共享内存受限，但需要足够 workers 避免 GPU 空转
                 if shm_gb >= 8:
-                    env['recommended_workers'] = min(16, env['cpu_count'])
+                    env['recommended_workers'] = min(16, cpu_cores)
                 elif shm_gb >= 4:
-                    env['recommended_workers'] = min(12, env['cpu_count'])
+                    env['recommended_workers'] = min(12, cpu_cores)
                 else:
-                    env['recommended_workers'] = min(8, env['cpu_count'])
+                    env['recommended_workers'] = min(8, cpu_cores)
             else:
-                if shm_gb >= 8:
-                    env['recommended_workers'] = min(12, env['cpu_count'])
-                elif shm_gb >= 4:
-                    env['recommended_workers'] = min(8, env['cpu_count'])
+                # 非容器环境：可以使用更多 workers
+                # 推荐: min(16, CPU核心数) 确保数据预处理不成为瓶颈
+                env['recommended_workers'] = min(16, cpu_cores)
         except ImportError:
             pass
-    
+
     return env
 
 
@@ -1296,7 +1298,7 @@ def _compute_prefetch_factor(
     swap_memory_mb: float = 24576.0,  # 默认 24GB swap
     model_memory_mb: float = 2048.0,   # 模型内存估计
     sample_memory_mb: float = 2.0,     # 单样本内存估计 (MB)
-    prefetch_max: int = 8,             # prefetch_factor 上限
+    prefetch_max: int = 16,            # prefetch_factor 上限 (I136: 增加到 16 避免 GPU 空转)
 ) -> int:
     """
     计算安全的 DataLoader prefetch_factor

@@ -47,7 +47,7 @@ uv run python src/training/train_fractal_vit.py \
   --elastic-lambda-over 0.1 \
   --elastic-lambda-under 0.01 \
   --batch-size 192 \
-  --num-workers 4 \
+  --num-workers 8 \
   --lr 5e-4 \
   --weight-decay 0.15 \
   --warmup-epochs 15 \
@@ -71,4 +71,5 @@ uv run python src/training/train_fractal_vit.py \
   --gradient-clip 1.0 \
   --patience 20 \
   --min-delta 0.001 \
-  --exp-name tiny_imagenet_256d_8l_bs192_ep200
+  --compile 
+
