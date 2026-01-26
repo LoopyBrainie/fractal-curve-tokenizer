@@ -38,7 +38,7 @@ from training import (
 # 配置
 config = TrainerConfig(
     sampler_beta=0.5,
-    focal_gamma=2.0,
+    focal_gamma=2.5,  # I28-1: 统一为推荐值 (难/易样本比 243x)
     focal_alpha=None,  # 自动计算
 )
 

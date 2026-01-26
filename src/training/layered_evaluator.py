@@ -372,7 +372,7 @@ class FinegrainedClassificationEvaluator:
 
                     # I35: 优先使用 get_extra_info API（支持分词器诊断信息收集）
                     if hasattr(trainer.model, 'get_extra_info'):
-                        outputs, aux_infos = trainer.model.get_extra_info(inputs)
+                        outputs, aux_infos = trainer.model.get_extra_info(inputs, return_aux_info=True)
                     else:
                         outputs = trainer.model(inputs)
                         aux_infos = None

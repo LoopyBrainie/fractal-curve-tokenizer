@@ -49,7 +49,7 @@ class FinegrainedLossConfig:
     use_attention_entropy: bool = False
     attention_entropy_weight: float = 0.05
     use_focal: bool = False
-    focal_gamma: float = 2.0
+    focal_gamma: float = 2.5  # I28-1: 从 2.0 提升到 2.5 (难/易样本比 243x)
 
 
 class CenterLoss(nn.Module):

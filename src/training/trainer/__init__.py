@@ -527,22 +527,24 @@ class ModularTrainer:
     
     def train_epoch(self) -> Dict[str, float]:
         """单轮训练
-        
+
         Returns:
             训练指标字典
         """
         self.model.train()
-        total_loss = 0.0
-        num_batches = 0
-        
+        # CRIT-4: 使用 GPU 张量累积，避免 .item() 同步点
+        # 累积公式: L_epoch = sum(L_i * batch_size) / sum(batch_size)
+        loss_sum = torch.zeros(1, device=self.device)
+        num_samples = 0
+
         if self.metrics:
             self.metrics.reset()
-        
+
         for batch_idx, (inputs, targets) in enumerate(self.train_loader):
             # 调试模式限制 batch 数
             if self.config.max_batches_per_epoch and batch_idx >= self.config.max_batches_per_epoch:
                 break
-            
+
             # Callback: batch begin
             ctx = CallbackContext(
                 epoch=self.state.epoch,
@@ -550,35 +552,42 @@ class ModularTrainer:
                 global_step=self.state.global_step,
             )
             self.callbacks.on_batch_begin(self, ctx)
-            
+
             # 前向传播
             inputs = inputs.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
-            
+
+            batch_size = targets.size(0)
+
             with torch.amp.autocast('cuda', enabled=self.config.use_amp):
-                model_output = self.model(inputs)
-                # P0-Critical: 模型可能返回 (logits,) 或 (logits, aux_infos) 等元组
-                # 提取 logits 用于损失计算
-                if isinstance(model_output, tuple):
-                    outputs = model_output[0]
+                # I101-4: 优先使用 get_extra_info API 获取 aux_info
+                aux_info = None
+                if hasattr(self.model, 'get_extra_info'):
+                    outputs, aux_info = self.model.get_extra_info(inputs, return_aux_info=True)
                 else:
-                    outputs = model_output
+                    model_output = self.model(inputs)
+                    # P0-Critical: 模型可能返回 (logits,) 或 (logits, aux_infos) 等元组
+                    # 提取 logits 用于损失计算
+                    if isinstance(model_output, tuple):
+                        outputs = model_output[0]
+                    else:
+                        outputs = model_output
                 loss = self.loss_fn(outputs, targets)
-                
+
                 # 辅助损失
                 for name, (aux_fn, weight) in self.aux_losses.items():
                     aux_loss = aux_fn(outputs, targets)
                     loss = loss + weight * aux_loss
-                
+
                 # 梯度累积
                 loss = loss / self.config.accumulation_steps
-            
+
             # 反向传播
             if self.scaler:
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
-            
+
             # 梯度更新 (考虑累积)
             if (batch_idx + 1) % self.config.accumulation_steps == 0:
                 if self.config.gradient_clip_norm:
@@ -588,40 +597,48 @@ class ModularTrainer:
                         self.model.parameters(),
                         self.config.gradient_clip_norm
                     )
-                
+
                 if self.scaler:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     self.optimizer.step()
-                
+
                 self.optimizer.zero_grad()
+                # I107-3: 在累积步结束时清理 CUDA 缓存碎片
+                # 这有助于防止长时间训练时的显存碎片化
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 self.state.global_step += 1
-            
-            # 统计 (I78: 使用 detach().item() 支持 torch.compile)
-            batch_loss = loss.detach().item() * self.config.accumulation_steps
-            total_loss += batch_loss
-            num_batches += 1
-            
+
+            # CRIT-4: 累积到 GPU 张量 (不同步)
+            # 记录原始 loss 值用于 callback (不乘 accumulation_steps，保持语义一致性)
+            loss_for_callback = loss.detach()
+            loss_sum += loss_for_callback * batch_size
+            num_samples += batch_size
+
             # 更新指标 (使用已提取的 outputs)
             if self.metrics:
                 self.metrics.update(outputs.detach(), targets)
-            
+
             # Callback: batch end
-            ctx.loss = batch_loss
+            ctx.loss = loss_for_callback.item()  # 仅在 callback 时同步
             ctx.outputs = outputs
             ctx.targets = targets
             self.callbacks.on_batch_end(self, ctx)
-            
+
             if ctx.stop_training:
                 break
-        
+
+        # CRIT-4: Epoch 结束时同步一次
+        train_loss = (loss_sum / max(num_samples, 1)).item()
+
         # 计算 epoch 指标
-        result = {"train_loss": total_loss / max(num_batches, 1)}
+        result = {"train_loss": train_loss}
         if self.metrics:
             metrics_result = self.metrics.compute()
             result.update({f"train_{k}": v for k, v in metrics_result.items()})
-        
+
         self.state.train_loss = result["train_loss"]
         self.state.train_metrics = result
         
@@ -630,17 +647,18 @@ class ModularTrainer:
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
         """验证
-        
+
         Returns:
             验证指标字典
         """
         self.model.eval()
-        total_loss = 0.0
-        num_batches = 0
-        
+        # CRIT-4: 使用 GPU 张量累积，避免 .item() 同步点
+        val_loss_sum = torch.zeros(1, device=self.device)
+        val_num_samples = 0
+
         if self.metrics:
             self.metrics.reset()
-        
+
         # Callback: validation begin
         ctx = CallbackContext(
             epoch=self.state.epoch,
@@ -648,10 +666,12 @@ class ModularTrainer:
             global_step=self.state.global_step,
         )
         self.callbacks.on_validation_begin(self, ctx)
-        
+
         for inputs, targets in self.val_loader:
             inputs = inputs.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
+
+            batch_size = targets.size(0)
 
             # 验证禁用 AMP 以确保指标精度 (I78: 使用 detach().item() 支持 torch.compile)
             with torch.amp.autocast('cuda', enabled=False):
@@ -663,25 +683,29 @@ class ModularTrainer:
                     outputs = model_output
                 loss = self.loss_fn(outputs, targets)
 
-            total_loss += loss.detach().item()
-            num_batches += 1
+            # CRIT-4: 累积到 GPU 张量 (不同步)
+            val_loss_sum += loss.detach() * batch_size
+            val_num_samples += batch_size
 
             if self.metrics:
                 self.metrics.update(outputs, targets)
-        
+
+        # CRIT-4: Epoch 结束时同步一次
+        val_loss = (val_loss_sum / max(val_num_samples, 1)).item()
+
         # 计算指标
-        result = {"val_loss": total_loss / max(num_batches, 1)}
+        result = {"val_loss": val_loss}
         if self.metrics:
             metrics_result = self.metrics.compute()
             result.update({f"val_{k}": v for k, v in metrics_result.items()})
-        
+
         self.state.val_loss = result["val_loss"]
         self.state.val_metrics = result
-        
+
         # Callback: validation end
         ctx.metrics = result
         self.callbacks.on_validation_end(self, ctx)
-        
+
         return result
     
     def fit(self) -> Dict[str, List[float]]:

@@ -314,7 +314,7 @@ class CUB200TrainingConfig:
 
     # Focal Loss（处理困难样本）
     use_focal_loss: bool = True
-    focal_gamma: float = 2.0
+    focal_gamma: float = 2.5  # P1-2: 统一为推荐值 (I28-1 优化，难/易比 243x)
 
     # 早停
     patience: int = 15
@@ -366,14 +366,17 @@ class CUB200TrainingConfig:
     use_compile: bool = False        # I78: torch.compile 优化 (提升 ~30% 训练速度)
     compile_mode: str = "default"    # torch.compile 模式: default, reduce-overhead, max-autotune
 
-    # I99: 补充缺失的模型配置字段（用于检查点保存和模型重建）
-    dim_head: int = 64  # 每个注意力头的维度 (dim // heads)
-    channels: int = 3   # 输入图像通道数
-    K_min: int = 8      # 最少 token 数
-    K_max: int = 64     # 最多 token 数
+    # I99: tokenizer 类型 (不在 ModelArchitectureConfig 中定义)
     tokenizer_type: str = "streaming_v3"  # Tokenizer 类型
-    ffn_type: str = "swiglu_level"  # FFN 类型
-    # num_scales 已废弃，使用 min_patch_size 动态计算 max_depth
+
+    # =========================================================================
+    # P1 Fix: 移除冗余字段（应从 arch_config 获取）
+    # - dim_head: 从 arch_config.dim // arch_config.heads 计算
+    # - channels: 从 arch_config.channels 获取
+    # - K_min: 从 arch_config.K_min_abs 获取 (I33 相对预算)
+    # - K_max: 从 token_coverage_* 计算，不应硬编码
+    # - ffn_type: 从 arch_config.ffn_type 获取
+    # =========================================================================
 
     def __post_init__(self):
         """参数验证 - 数学约束"""
@@ -807,6 +810,9 @@ class CUB200Trainer:
 
             with autocast(device_type=self.device.type, enabled=self.config.use_amp):
                 # M2: 获取 logits 和 features（用于 Center Loss）
+                # I101-4: CUB200Trainer 使用 return_features=True 而非 get_extra_info()
+                # 这是因为 CUB200Trainer 是专用训练器，需要直接访问 features 用于 Center Loss
+                # 通用评估应使用 get_extra_info() 接口
                 if self.config.use_center_loss:
                     # P1 Fix: 模型现在直接返回 tensor [B, D]，不再需要 stack
                     logits, features = self.model(imgs, return_features=True)
@@ -936,6 +942,8 @@ class CUB200Trainer:
             # 验证禁用 AMP
             with autocast(device_type=self.device.type, enabled=False):
                 # M2: 统一使用 forward(return_features=True) 提取特征
+                # I101-4: CUB200Trainer 使用 return_features=True 而非 get_extra_info()
+                # 这是因为 CUB200Trainer 是专用训练器，需要直接访问 features
                 if return_features:
                     outs, features = self.model(imgs, return_features=True)
                     # P1 Fix: 模型直接返回 tensor [B, D]
@@ -1293,29 +1301,29 @@ class CUB200Trainer:
                 'use_amp': self.config.use_amp,
                 'validate_interval': self.config.validate_interval,
                 'gradient_clip_norm': self.config.gradient_clip_norm,
-                # 模型架构参数
-                'num_classes': self.config.num_classes,
-                'dim': self.config.dim,
-                'depth': self.config.depth,
-                'heads': self.config.heads,
-                'mlp_dim': self.config.mlp_dim,
-                'dim_head': self.config.dim_head,
+                # 模型架构参数 (P1: 从 arch_config 获取)
+                'num_classes': self.config.arch_config.num_classes,
+                'dim': self.config.arch_config.dim,
+                'depth': self.config.arch_config.depth,
+                'heads': self.config.arch_config.heads,
+                'mlp_dim': self.config.arch_config.mlp_dim,
+                'dim_head': self.config.arch_config.dim // self.config.arch_config.heads,
                 'drop_path_rate': self.config.drop_path_rate,
-                # Tokenizer 参数 (I99: num_scales 已废弃)
-                'min_patch_size': self.config.min_patch_size,
-                'K_min': self.config.K_min,
-                'K_max': self.config.K_max,
+                # Tokenizer 参数 (P1: K_min 从 arch_config.K_min_abs 获取)
+                'min_patch_size': self.config.arch_config.min_patch_size,
+                'K_min': self.config.arch_config.K_min_abs,
+                'K_max': None,  # P1: K_max 不再硬编码，使用相对预算
                 'tokenizer_type': self.config.tokenizer_type,
-                'ffn_type': self.config.ffn_type,
+                'ffn_type': self.config.arch_config.ffn_type,
                 'use_checkpoint': self.config.use_checkpoint,
                 'use_channels_last': self.config.use_channels_last,
                 'use_compile': self.config.use_compile,
                 'compile_mode': self.config.compile_mode,
-                'channels': self.config.channels,
+                'channels': self.config.arch_config.channels,
                 # I31 面积编码配置 (从 arch_config 获取)
-                'use_area_encoding': self.config.use_area_encoding,
-                'use_affine_modulation': self.config.use_affine_modulation,
-                'fourier_levels': self.config.fourier_levels,
+                'use_area_encoding': self.config.arch_config.use_area_encoding,
+                'use_affine_modulation': self.config.arch_config.use_affine_modulation,
+                'fourier_levels': self.config.arch_config.fourier_levels,
             },
         }
 
@@ -1523,6 +1531,7 @@ def create_cub200_trainer(
             'use_area_encoding': arch_config.use_area_encoding,
             'use_affine_modulation': arch_config.use_affine_modulation,
             'fourier_levels': arch_config.fourier_levels,
+            'ffn_type': arch_config.ffn_type,  # P1: 添加缺失的 ffn_type
         }
         kwargs.update(arch_dict)
 
@@ -1626,9 +1635,14 @@ class CUB200ModularTrainer:
         # 延迟导入 ModularTrainer
         ModularTrainer, TrainerConfig = _import_modular_trainer()
 
+        # 计算温度退火总步数 (P0-3 修复: 必须显式传递 total_steps)
+        batches_per_epoch = len(train_loader) // config.accum_steps
+        post_warmup_steps = max(1, (config.num_epochs - config.splitter_temp_warmup) * batches_per_epoch)
+
         # 1. 通过 FractalModelProtocol 配置模型 (I36-2 解耦)
         self.model.configure_training({
             'temperature_annealing': True,
+            'total_steps': post_warmup_steps,  # P0-3: 显式传递正确值
             'temp_start': config.splitter_temp_start,
             'temp_end': config.splitter_temp_end,
             'aux_loss_weights': {

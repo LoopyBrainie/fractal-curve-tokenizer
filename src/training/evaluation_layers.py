@@ -322,54 +322,48 @@ class L6StabilityMetrics:
 @dataclass
 class L7SplitterMetrics:
     """L7 分割器专项分析层指标
-    
+
     数学形式化
     ==========
     决策公式:
         logits_i = MLP(ROI_i) + b_explore + b_log_d + β·γ^{d_i} - τ_{d_i}
-    
+
     Log-Compensation (I21):
         b_log_d = log(N_total / N_d)
-    
+
     可学习配额 (I24-2):
         quota_d = softmax(quota_logits)[d]
         quota_entropy = -Σ_d q_d log(q_d)
-    
+
     深度崩塌诊断:
         - 熵比 < 0.5 → 崩塌
         - KL from uniform > 1.0 → 严重不均衡
+
+    I101-4: 移除 MLP 输出分析死代码
+    原 mlp_logits_*/selection_prob_* 字段已移除，因为它们需要访问 splitter
+    内部状态但从未正确实现。这些信息可从 splitter_diagnostics 获取。
     """
-    # MLP 输出分析
-    mlp_logits_mean: float = 0.0
-    mlp_logits_std: float = 0.0
-    mlp_logits_per_depth: Dict[int, Dict[str, float]] = field(default_factory=dict)  # depth -> {mean, std}
-    
-    # 概率分析
-    selection_prob_mean: float = 0.0
-    selection_prob_entropy: float = 0.0
-    
     # 温度状态
     temperature: float = 1.0
     temperature_schedule_progress: float = 0.0
-    
+
     # 可学习阈值
     thresholds: Dict[int, float] = field(default_factory=dict)  # depth -> threshold
-    threshold_gradients: Dict[int, float] = field(default_factory=dict)  # depth -> grad_norm
-    
+
     # 可学习配额 (I24-2)
     quotas: Dict[int, float] = field(default_factory=dict)  # depth -> quota
     quota_entropy: float = 0.0
     quota_kl_from_base: float = 0.0
-    
+
     # 深度平衡诊断
     log_compensation_enabled: bool = True
     depth_kl_weight: float = 0.1
     soft_entropy_bonus: float = 0.0
-    
-    # 决策质量
-    decision_confidence_mean: float = 0.0  # sigmoid(logits) 的平均值
-    decision_confidence_std: float = 0.0
-    
+
+    # 门控权重统计 (I101-4: 从 L7 移入的实际使用字段)
+    gate_weight_stats: Dict[int, Dict[str, float]] = field(default_factory=dict)
+    gate_imbalance_detected: bool = False
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -514,6 +508,7 @@ class ClassificationEvaluator:
         all_num_tokens: List[int] = []  # I35: 收集 token 数量
         all_depth_distributions: List[Dict[int, float]] = []  # I35: 收集深度分布
         total_loss = 0.0
+        total_samples = 0  # 用于加权平均损失计算
         
         with torch.no_grad():
             for imgs, labels in tqdm(data_loader, desc="L1: Classification"):
@@ -536,7 +531,9 @@ class ClassificationEvaluator:
                 all_preds.append(outputs.argmax(dim=1).cpu())
                 all_labels.append(labels.cpu())
                 all_probs.append(probs.cpu())
-                total_loss += loss.item()
+                batch_size = labels.size(0)
+                total_loss += loss.item() * batch_size  # 加权损失累加
+                total_samples += batch_size
 
                 # I35: 收集 tokenizer 诊断信息
                 if aux_infos is not None:
@@ -580,9 +577,9 @@ class ClassificationEvaluator:
                 metrics.per_class_accuracy[c] = 0.0
         
         metrics.mean_class_accuracy = np.mean(list(metrics.per_class_accuracy.values()))
-        
-        # Average loss
-        metrics.avg_loss = total_loss / len(data_loader)
+
+        # Average loss - 使用加权平均 (总损失 / 总样本数)
+        metrics.avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
         
         # ECE (Expected Calibration Error)
         metrics.ece, metrics.mce = self._compute_calibration_error(
@@ -1081,8 +1078,7 @@ class AttentionEvaluator:
             metrics._effective_token_counts.append(effective_count.item())
 
         # I78: 移除 LCA-Attention 相关性分析
-        # _last_lca_depths 在 HilbertAwareMultiScaleAttention 中不存在
-        # 此功能需要从 LCAHilbertBias._lca_cache_inputs 中提取，暂不实现
+        # _last_lca_depths 不再存在 (CRIT-3: 缓存已移除)
 
         # 按深度统计接收的注意力
         if self._token_depths and self._attention_maps:
@@ -2005,60 +2001,10 @@ class SplitterEvaluator:
         
         if hasattr(splitter, 'depth_kl_weight'):
             metrics.depth_kl_weight = splitter.depth_kl_weight
-        
-        # 运行时收集 MLP 输出分布
-        mlp_outputs_by_depth = defaultdict(list)
-        selection_probs = []
-        
-        with torch.no_grad():
-            for batch_idx, (imgs, _) in enumerate(tqdm(
-                data_loader, desc="L7: Splitter", total=min(max_batches, len(data_loader))
-            )):
-                if batch_idx >= max_batches:
-                    break
-                
-                imgs = imgs.to(device)
-                
-                # 触发 tokenizer 前向传播
-                try:
-                    output = model.tokenizer.tokenize(imgs)
 
-                    # P1 Fix: 移除对不存在的内部状态 _last_logits/_last_depths 的引用
-                    # GumbelTopKSplitter 使用 _last_probs 和 _last_selected_mask
-                    # 这些不包含 MLP logits 或 depth 信息，无需在此处处理
-                except Exception:
-                    pass
-        
-        # 汇总 MLP 输出统计
-        all_logits = []
-        for d, logits_list in mlp_outputs_by_depth.items():
-            if logits_list:
-                metrics.mlp_logits_per_depth[d] = {
-                    'mean': np.mean(logits_list),
-                    'std': np.std(logits_list),
-                    'count': len(logits_list),
-                }
-                all_logits.extend(logits_list)
-        
-        if all_logits:
-            metrics.mlp_logits_mean = np.mean(all_logits)
-            metrics.mlp_logits_std = np.std(all_logits)
-        
-        # 选择概率统计
-        if selection_probs:
-            probs_arr = np.array(selection_probs)
-            metrics.selection_prob_mean = np.mean(probs_arr)
-            # 选择概率熵
-            probs_arr = np.clip(probs_arr, 1e-10, 1 - 1e-10)
-            metrics.selection_prob_entropy = -np.mean(
-                probs_arr * np.log(probs_arr) + (1 - probs_arr) * np.log(1 - probs_arr)
-            )
-            
-            # 决策置信度
-            confidence = np.abs(probs_arr - 0.5) * 2  # 0 到 1，1 表示高置信
-            metrics.decision_confidence_mean = np.mean(confidence)
-            metrics.decision_confidence_std = np.std(confidence)
-        
+        # I101-4: 门控权重统计已移入 L7SplitterMetrics
+        # 门控权重在 L6StabilityEvaluator 中收集
+
         return metrics
 
 

@@ -93,6 +93,13 @@ class ModelArchitectureConfig:
     use_affine_modulation: bool = True  # A17: 默认为 True
     fourier_levels: int = 4             # 傅里叶特征级别数
 
+    # P6-1: 深度缩放参数 (从 FractalViTConfig 迁移)
+    depth_scale_range: Optional[tuple] = None  # (σ_min, σ_max)，默认 (0.5, 2.0)
+
+    # P6-2: LCA 温度参数 (从 FractalViTConfig 迁移)
+    lca_temperature: Optional[float] = 1.5  # LCA 偏置温度，默认 1.5
+    learnable_temperature: bool = True  # 是否可学习温度，默认 True
+
     # I27: 子模块 Dropout 配置
     splitter_dropout: Optional[float] = None  # None = 自动 = min(dropout, 0.15)
     pos_dropout: Optional[float] = None       # None = 自动 = dropout * 0.5
@@ -100,6 +107,13 @@ class ModelArchitectureConfig:
     # I24-2: 可学习配额控制
     # None = 使用常量默认值, True/False = 显式覆盖
     quota_learnable: Optional[bool] = None
+
+    # 训练策略参数 (从 FractalViTConfig 迁移)
+    pool: str = "cls"
+    max_level: int = 8  # 最大分割深度 (与 max_depth_hard_limit 对齐)
+    freeze_quota: bool = False  # 是否冻结配额参数
+    freeze_tokenizer: bool = False  # 是否冻结 tokenizer 参数
+    freeze_tokenizer_epochs: int = 0  # 前 N 个 epoch 冻结 (0=全程冻结)
 
     def __post_init__(self):
         """参数验证 - 数学约束"""
@@ -169,6 +183,163 @@ class ModelArchitectureConfig:
         cls = self.dim
 
         return int(transformer + head + cls)
+
+    def to_model_kwargs(self, image_size: int = 224) -> Dict[str, Any]:
+        """生成 FractalCurveViT 的构造函数参数
+
+        Returns:
+            Dict[str, Any]: FractalCurveViT.__init__ 所需的参数字典
+
+        数学映射:
+            - dim, depth, heads, mlp_dim -> 架构参数
+            - min_patch_size, max_level -> Tokenizer 参数
+            - lca_temperature, learnable_temperature -> 注意力偏置参数
+            - use_area_encoding, use_affine_modulation -> 形状编码参数
+        """
+        return {
+            # 架构参数
+            "image_size": image_size,
+            "num_classes": self.num_classes,
+            "dim": self.dim,
+            "depth": self.depth,
+            "heads": self.heads,
+            "mlp_dim": self.mlp_dim,
+            "dim_head": self.dim_head,
+            "pool": self.pool,
+            "channels": self.channels,
+            "dropout": 0.0,  # Dropout 由训练器控制
+            "emb_dropout": 0.0,
+            "drop_path_rate": 0.0,
+            "ffn_type": self.ffn_type,
+
+            # Tokenizer 参数
+            "min_patch_size": self.min_patch_size,
+            "max_level": self.max_level,
+
+            # 注意力偏置参数
+            "lca_temperature": self.lca_temperature,
+            "learnable_temperature": self.learnable_temperature,
+
+            # 形状编码参数
+            "use_area_encoding": self.use_area_encoding,
+            "use_affine_modulation": self.use_affine_modulation,
+            "fourier_levels": self.fourier_levels,
+
+            # 性能优化
+            "use_checkpoint": self.use_checkpoint,
+
+            # 配额控制
+            "quota_learnable": self.quota_learnable,
+        }
+
+    def to_tokenizer_kwargs(self, image_size: int = 224) -> Dict[str, Any]:
+        """生成 StreamingFractalTokenizerV3 的构造函数参数
+
+        Returns:
+            Dict[str, Any]: StreamingFractalTokenizerV3.__init__ 所需的参数字典
+        """
+        return {
+            "image_size": max(image_size, 32),
+            "channels": self.channels,
+            "d_model": self.dim,
+            "base_patch_size": self.min_patch_size,
+            "min_patch_size": self.min_patch_size,
+            "use_hilbert_order": True,
+            "depth_scale_range": self.depth_scale_range,
+        }
+
+    @classmethod
+    def from_fractal_vit_config(cls, config: "FractalViTConfig") -> "ModelArchitectureConfig":
+        """从 FractalViTConfig 迁移到 ModelArchitectureConfig
+
+        Args:
+            config: FractalViTConfig 实例（train_fractal_vit.py 中的旧配置类）
+
+        Returns:
+            ModelArchitectureConfig: 新配置实例
+
+        数学映射:
+            - K_min/K_max → token_coverage_min/max (I33 相对预算)
+            - quota_* → quota_learnable
+            - splitter_temp_* → 温度退火参数（由训练器管理）
+
+        Example:
+            >>> from training.config import ModelArchitectureConfig
+            >>> from training.train_fractal_vit import FractalViTConfig
+            >>> old_config = FractalViTConfig(dataset="cub200", dim=384, depth=8)
+            >>> new_config = ModelArchitectureConfig.from_fractal_vit_config(old_config)
+        """
+        import warnings
+        warnings.warn(
+            "FractalViTConfig 已废弃，请使用 ModelArchitectureConfig。\n"
+            "迁移方法: config = ModelArchitectureConfig.from_fractal_vit_config(old_config)",
+            DeprecationWarning,
+            stacklevel=2
+        )
+
+        # 计算覆盖率 (I33: 相对预算)
+        # K_min_abs 基于 min_patch_size 和 image_size 的估计
+        image_size_estimate = 224  # 默认假设
+        if hasattr(config, 'image_size') and config.image_size:
+            image_size_estimate = config.image_size
+
+        # 估计最大 token 数量
+        max_patches = (image_size_estimate // config.min_patch_size) ** 2
+        # 使用 K_max 作为覆盖率基准
+        token_coverage_max = config.K_max / max_patches if max_patches > 0 else 0.05
+        token_coverage_max = min(token_coverage_max, 0.5)  # 限制最大 50%
+
+        return cls(
+            # 核心架构参数
+            num_classes=getattr(config, 'num_classes', 200),
+            dim=config.dim,
+            depth=config.depth,
+            heads=config.heads,
+            dim_head=config.dim_head,
+            mlp_dim=config.mlp_dim * 4 if config.mlp_dim < config.dim else config.mlp_dim,
+
+            # 输入配置
+            image_size=getattr(config, 'image_size', 224),
+            patch_size=getattr(config, 'patch_size', 8),
+            channels=getattr(config, 'channels', 3),
+
+            # Tokenizer 参数
+            min_patch_size=config.min_patch_size,
+            token_coverage_min=0.01,  # 默认 1%
+            token_coverage_max=token_coverage_max,
+            K_min_abs=config.K_min,
+            max_depth_hard_limit=config.max_level,
+
+            # FFN 类型
+            ffn_type=config.ffn_type,
+
+            # 性能优化
+            use_checkpoint=getattr(config, 'gradient_checkpoint', False),
+            use_channels_last=getattr(config, 'channels_last', False),
+            compile_model=getattr(config, 'compile_model', False),
+
+            # 形状-尺度编码
+            use_area_encoding=getattr(config, 'use_area_encoding', False),
+            use_affine_modulation=getattr(config, 'use_affine_modulation', True),
+            fourier_levels=config.fourier_levels,
+
+            # 深度缩放参数
+            depth_scale_range=getattr(config, 'depth_scale_range', None),
+
+            # LCA 温度参数
+            lca_temperature=getattr(config, 'lca_temperature', 1.5),
+            learnable_temperature=getattr(config, 'learnable_temperature', True),
+
+            # I24-2: 可学习配额
+            quota_learnable=getattr(config, 'quota_learnable', None),
+
+            # 训练策略
+            pool=config.pool,
+            max_level=config.max_level,
+            freeze_quota=config.freeze_quota,
+            freeze_tokenizer=config.freeze_tokenizer,
+            freeze_tokenizer_epochs=config.freeze_tokenizer_epochs,
+        )
 
 
 # ============================================================================
@@ -679,7 +850,7 @@ def create_default_configs(output_dir: Union[str, Path] = "configs") -> None:
         ),
         loss=LossConfig(
             type="focal_cb",
-            focal_gamma=2.0,
+            focal_gamma=2.5,  # I28-1: 统一为推荐值 (难/易样本比 243x)
             cb_beta=0.9999,
         ),
         budget=BudgetConfig(

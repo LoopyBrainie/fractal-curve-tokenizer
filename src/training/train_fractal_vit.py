@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """Fractal ViT Training Script - V3 Variable Depth Tokens
 
-⚠️  **重要更新 (2026-01-05 - I15 完成)**:
-   training 模块现已可用（位于 examples/training/），提供以下增强功能：
+⚠️  **重要更新 (2026-01-26 - I36 Phase 1)**:
+   FractalViTConfig 已标记为废弃，请使用 ModelArchitectureConfig (training.config)
+   迁移方法:
+   ```python
+   from training.config import ModelArchitectureConfig
+   config = ModelArchitectureConfig.from_fractal_vit_config(old_config)
+   ```
+   training 模块提供以下增强功能:
    - ClassBalancedSampler / ProgressiveSampler - 类别平衡采样
    - FocalLoss / ClassBalancedCE - 长尾效应优化
    - ModularTrainer - 模块化训练器（替代手写循环）
    - ClassificationMetrics - 完整评估指标
    - ExperimentVisualizer - 统一可视化接口
-   
-   本脚本已导入 training 模块，但保留了手写训练循环以供参考。
-   如需使用 ModularTrainer，请参考 examples/training/README.md
 
 数学形式化
 ===========
@@ -400,8 +403,12 @@ class DatasetSpec:
 
 
 @dataclass
-class TrainingConfig:
-    """训练配置"""
+class FractalViTConfig:
+    """Fractal ViT 脚本配置 (包含模型架构和训练参数)
+
+    注意: 此配置类独立定义，避免与 config/__init__.py 中的 TrainingConfig 冲突。
+    config/__init__.py 中的 TrainingConfig 仅包含训练控制参数。
+    """
     # 数据集
     dataset: str
     batch_size: int
@@ -490,7 +497,7 @@ class TrainingConfig:
 
     # 长尾效应优化 (P14)
     use_focal_loss: bool = False  # 是否使用 Focal Loss
-    focal_gamma: float = 2.0  # Focal Loss 的 gamma 参数，默认 2.0
+    focal_gamma: float = 2.5  # Focal Loss 的 gamma 参数，I28-1 推荐 2.5 (难/易样本比 243x)
     use_class_balanced: bool = False  # 是否使用类别平衡损失权重
     class_balance_beta: float = 0.9999  # 类别平衡的 beta 参数，默认 0.9999
     progressive_aug: bool = False  # 是否使用渐进式数据增强
@@ -1339,7 +1346,7 @@ def _compute_prefetch_factor(
 
 def create_dataloaders(
     spec: DatasetSpec,
-    config: TrainingConfig,
+    config: FractalViTConfig,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """创建数据加载器"""
 
@@ -1676,7 +1683,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     scaler: GradScaler,
-    config: TrainingConfig,
+    config: FractalViTConfig,
     mixup_fn: Optional[MixupCutmix] = None,
     num_classes: int = 10,
     profile: bool = False,
@@ -1886,18 +1893,19 @@ def train_epoch(
             # I98-2: 使用 model.splitter (独立组件)
             if hasattr(model, 'splitter'):
                 splitter = model.splitter
-                # I24-ALIGN: 确保 _last_features 存在 (forward 后应已设置)
-                last_features = getattr(model.tokenizer, '_last_features', None)
-                if hasattr(splitter, 'get_auxiliary_losses') and last_features is not None:
+                # I107-2: 移除 _last_features 缓存，直接从 shared_conv 获取特征
+                # 重新计算 features 会有轻微计算开销，但防止了显存泄露
+                features = model.tokenizer.shared_conv(imgs)
+                if hasattr(splitter, 'get_auxiliary_losses'):
                     # I14-1 D1: 计算 batch 中的平均 token 数用于崩溃检测
                     actual_token_count = None
                     if aux_infos is not None and len(aux_infos) > 0:
                         token_counts = [info.get('num_tokens', 0) for info in aux_infos if isinstance(info, dict)]
                         if token_counts:
                             actual_token_count = int(sum(token_counts) / len(token_counts))
-                    
+
                     aux_losses = splitter.get_auxiliary_losses(
-                        features=last_features,
+                        features=features,
                         image_size=(imgs.shape[2], imgs.shape[3]),
                         include_elastic_budget=config.include_elastic_budget,
                         include_soft_entropy=config.include_soft_entropy,
@@ -2459,7 +2467,7 @@ def verify_train_eval_consistency(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-    config: TrainingConfig,
+    config: FractalViTConfig,
 ) -> Dict[str, Any]:
     """验证模型在 train/eval 模式下的输出一致性.
     
@@ -2802,7 +2810,7 @@ def main():
     
     spec = DATASETS[args.dataset]
     
-    config = TrainingConfig(
+    config = FractalViTConfig(
         dataset=args.dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
