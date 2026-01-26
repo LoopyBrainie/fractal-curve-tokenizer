@@ -43,8 +43,10 @@ class TestAttentionMaskEffectiveness:
             x[1] = x[0].clone()
 
             output = model(x)
+            # P-OPT fix: 模型返回 TrainingStats，需访问 .logits
+            logits = output.logits if hasattr(output, 'logits') else output
 
-            diff = torch.abs(output[0] - output[1]).max()
+            diff = torch.abs(logits[0] - logits[1]).max()
             assert diff < 1e-5, f"相同图像输出差异过大: {diff}"
 
     def test_different_padding_same_valid_output(self, model):
@@ -57,9 +59,12 @@ class TestAttentionMaskEffectiveness:
 
             out1 = model(x1)
             out2 = model(x2)
+            # P-OPT fix: 模型返回 TrainingStats，需访问 .logits
+            logits1 = out1.logits if hasattr(out1, 'logits') else out1
+            logits2 = out2.logits if hasattr(out2, 'logits') else out2
 
-            assert out1.shape == (1, 10)
-            assert out2.shape == (1, 10)
+            assert logits1.shape == (1, 10)
+            assert logits2.shape == (1, 10)
 
 
 class TestCreateAttentionMask:

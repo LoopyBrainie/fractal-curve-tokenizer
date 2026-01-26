@@ -211,7 +211,7 @@ def _configure_cuda_optimizations():
 
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader, SubsetRandomSampler, Subset
+from torch.utils.data import DataLoader, SubsetRandomSampler, Subset, default_collate
 from torchvision import datasets, transforms
 from tqdm import tqdm
 import atexit
@@ -1541,7 +1541,23 @@ def create_dataloaders(
         )
         # 添加 generator 参数以提高多进程随机性
         loader_kwargs['generator'] = torch.Generator().manual_seed(42)
-    
+
+    # P-OPT: channels_last 预格式 collate_fn
+    # 注意: cudagraphs 要求纯 GPU 操作，将此逻辑移回模型 forward
+    # collate_fn 仍可保留用于非编译场景的优化
+    def collate_fn_channels_last(batch):
+        """Collate 函数：转换为 channels_last 格式"""
+        imgs, labels = default_collate(batch)
+        # P-OPT: 仅在不编译时在 CPU 端预转换
+        # 编译模式下保持 channels_first，让模型中的转换处理
+        if not config.compile_model and imgs.dim() == 4:
+            imgs = imgs.to(memory_format=torch.channels_last)
+        return imgs, labels
+
+    # 使用自定义 collate_fn 仅在启用 channels_last 且不编译时
+    if config.channels_last and not config.compile_model:
+        loader_kwargs['collate_fn'] = collate_fn_channels_last
+
     train_loader = DataLoader(train_ds, sampler=SubsetRandomSampler(train_idx), **loader_kwargs)
     
     # 验证集不需要 drop_last
@@ -1598,27 +1614,29 @@ class CudaPrefetcher:
         self.stream = torch.cuda.Stream() if device.type == 'cuda' else None
         self._debug = False
         self._batch_count = 0
-        # 双缓冲状态
+        # 双缓冲状态: 使用双指针代替线性查找
         self._buffer = [None, None]  # (raw_batch, gpu_data)
-        self._buffer_idx = 0
-        
+        self._current_idx = 0  # 当前缓冲区指针
+        self._preload_idx = 1  # 预加载缓冲区指针
+
     def __iter__(self):
         self.loader_iter = iter(self.loader)
         self._batch_count = 0
         self._buffer = [None, None]
-        self._buffer_idx = 0
+        self._current_idx = 0
+        self._preload_idx = 1
         # 预加载两个 batch 填满双缓冲
         self._preload_next()
         self._preload_next()
         return self
-    
+
     def _preload_next(self):
-        """预加载下一个 batch 到空闲缓冲区"""
+        """预加载下一个 batch 到预加载缓冲区"""
         try:
             raw_batch = next(self.loader_iter)
         except StopIteration:
             return False
-        
+
         if self.stream is not None:
             with torch.cuda.stream(self.stream):
                 imgs = raw_batch[0].to(self.device, non_blocking=True)
@@ -1630,34 +1648,33 @@ class CudaPrefetcher:
                 )
         else:
             gpu_data = raw_batch
-        
-        # 找到空闲缓冲区
-        for i in range(2):
-            if self._buffer[i] is None:
-                self._buffer[i] = gpu_data
-                break
+
+        # 直接写入预加载缓冲区，无需查找
+        self._buffer[self._preload_idx] = gpu_data
         return True
-    
+
     def __next__(self):
         # 等待当前缓冲区的传输完成
         if self.stream is not None:
             torch.cuda.current_stream().wait_stream(self.stream)
-        
+
         # 获取当前缓冲区数据
-        current_data = self._buffer[self._buffer_idx]
+        current_data = self._buffer[self._current_idx]
         if current_data is None:
             raise StopIteration
-        
-        # 清空当前缓冲区，切换到下一个
-        self._buffer[self._buffer_idx] = None
-        self._buffer_idx = 1 - self._buffer_idx
+
+        # 清空当前缓冲区，切换指针
+        self._buffer[self._current_idx] = None
         self._batch_count += 1
-        
-        # 后台预加载下一个 batch
+
+        # 交换指针: current -> preload, preload -> current
+        self._current_idx, self._preload_idx = self._preload_idx, self._current_idx
+
+        # 后台预加载下一个 batch 到新的 preload 缓冲区
         self._preload_next()
-        
+
         return current_data
-    
+
     def __len__(self):
         return len(self.loader)
 
@@ -2002,15 +2019,16 @@ def train_epoch(
             correct += pred.eq(labels).sum()
         
         batch_times.append(time.time() - batch_start)
-        
+
         if device.type == 'cuda':
             cuda_mem_peak = max(cuda_mem_peak, torch.cuda.max_memory_allocated() / 1024**3)
-        
-        # P11-8: 减少 .item() 调用频率，仅每 10 个 batch 同步一次
-        if i % 10 == 0:
-            loss_val = loss.item() * config.accum_steps
-            # correct 现在是张量，需要 .item()
-            acc_val = 100. * correct.item() / total if total > 0 else 0
+
+        # P-OPT: 减少 .item() 调用频率，每 20 个 batch 同步一次
+        # 使用 torch.no_grad() 避免影响梯度计算
+        if i % 20 == 0:
+            with torch.no_grad():
+                loss_val = loss.detach().item() * config.accum_steps
+                acc_val = 100. * correct.detach().item() / total if total > 0 else 0
             if profile and (i < 5 or i % 100 == 0):
                 pbar.set_postfix(
                     loss=f'{loss_val:.3f}',
@@ -2020,12 +2038,11 @@ def train_epoch(
                 )
             else:
                 pbar.set_postfix(loss=f'{loss_val:.4f}', acc=f'{acc_val:.1f}%')
-        
-        # P13: 定期手动 GC，避免大量临时对象导致长时间暂停
-        if i > 0 and i % 50 == 0:
-            import gc
-            gc.collect()
-        
+
+        # P-OPT: 移除无意义的 GC 调用
+        # Python GC 对 GPU 内存无影响，使用 torch.cuda.empty_cache() 更有效
+        # 但 empty_cache() 也有开销，仅在真正需要时调用
+
         data_start = time.time()
     
     perf_stats = {
@@ -3292,8 +3309,10 @@ def main():
             torch._dynamo.config.cache_size_limit = 256
             torch._dynamo.config.suppress_errors = False
 
-            # I107-6: 启用 cudagraphs (关键性能优化)
+            # I107-8: 明确启用 cudagraphs (关键性能优化)
             # cudagraphs 是 CUDA inductor 的核心优化，禁用会导致 5-10× 性能下降
+            # 必须明确设置为 True，默认可能是 False
+            torch._inductor.config.triton.cudagraphs = True
             torch._inductor.config.max_autotune = False
             torch._inductor.config.compile_threads = 4  # 并行编译加速
 

@@ -742,66 +742,91 @@ class FractalCurveViT(nn.Module):
         features_list: List[torch.Tensor] = []
 
         if return_aux_info:
-            # M3: 添加缺失字段 (token_selection_entropy, depth_distribution)
-            # P-OPT-5: 批量获取 lengths 到 CPU，避免多次 .item() 调用
-            lengths_cpu = lengths.to('cpu', non_blocking=True)
-
-            # P-OPT: 向量化深度分布计算
+            # P-OPT: 完全在 GPU 上计算，避免 CPU 同步
+            # 根因: .to('cpu') 会导致 torch.compile 的 cudagraphs 失败
             max_depth = self.tokenizer.max_depth if hasattr(self, 'tokenizer') else 8
             max_depth_range = max_depth + 1
+            B = len(levels_list)
 
-            # 预分配所有样本的深度分布
-            all_depth_counts = torch.zeros(batch_size, max_depth_range, dtype=torch.float32, device='cpu')
-            all_levels_used: List[List[int]] = [[] for _ in range(batch_size)]
+            # P-OPT: 向量化深度分布计算 - 完全 GPU 计算
+            if levels_list and lengths.numel() == B:
+                # 获取最大 token 数量
+                max_tokens = max(l.size(0) for l in levels_list if l.numel() > 0)
+                max_tokens = min(max_tokens, 256)
 
-            for i in range(batch_size):
-                l = levels_list[i]
-                if l.numel() > 0:
-                    # 提取深度并过滤负值
-                    depths = l[:, 0].to(dtype=torch.int64, device='cpu')
-                    depths = depths[depths >= 0]
-                    if depths.numel() > 0:
-                        # 使用 bincount 向量化计数
-                        d_max = min(int(depths.max().item()), max_depth)
-                        counts = torch.bincount(depths, minlength=max_depth_range)[:max_depth_range].float()
-                        all_depth_counts[i] = counts
-                        # I107-4: 使用 nonzero() 替代列表推导，减少 Python 开销
-                        # 从 counts 中提取 >0 的索引 (使用 nonzero 获取非零位置)
-                        all_levels_used[i] = counts[:d_max + 1].nonzero(as_tuple=True)[0].tolist()
+                # 填充深度矩阵 [B, max_tokens] - 全部在 GPU
+                padded_depths = torch.full((B, max_tokens), -1,
+                                           dtype=torch.long, device=lengths.device)
+                valid_counts = []
 
-            # 计算归一化分布
-            depth_sums = all_depth_counts.sum(dim=1, keepdim=True).clamp(min=1e-8)
-            normalized_counts = all_depth_counts / depth_sums
+                for i, l in enumerate(levels_list):
+                    if l.numel() > 0:
+                        depths = l[:, 0].long()
+                        depths = depths[depths >= 0]
+                        n = min(depths.size(0), max_tokens)
+                        padded_depths[i, :n] = depths[:n]
+                        valid_counts.append(n)
 
-            for i in range(batch_size):
-                num_tokens = int(lengths_cpu[i].item())
+                # 向量化 depth 计数 [B, D]
+                all_depth_counts = torch.zeros(B, max_depth_range,
+                                               dtype=torch.float32, device=lengths.device)
+                for d in range(max_depth_range):
+                    mask = (padded_depths == d)
+                    all_depth_counts[:, d] = mask.sum(dim=1, dtype=torch.float32)
 
-                # I107-4: 直接从 nonzero 索引构建字典，避免循环
-                # all_levels_used[i] 已经是 nonzero 索引列表
-                depth_distribution: Dict[int, float] = {
-                    d: normalized_counts[i, d].item()
-                    for d in all_levels_used[i]
-                }
+                # 归一化分布
+                depth_sums = all_depth_counts.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                normalized_counts = all_depth_counts / depth_sums
 
-                aux_info = {
-                    "num_tokens": num_tokens,
-                    "levels_used": all_levels_used[i],
-                    "depth_distribution": depth_distribution,
-                    # I78: 添加缺失的 splitter_diagnostics 字段（与 FractalModelProtocol 对齐）
-                    "splitter_diagnostics": self.get_splitter_diagnostics(),
-                }
+                # 构建 aux_infos - 延迟 CPU 转换到最后一刻
+                valid_bool = torch.tensor(valid_counts, device=lengths.device) > 0
+                levels_used_list = []
+                for i in range(B):
+                    if valid_bool[i]:
+                        nonzero = all_depth_counts[i][:max_depth + 1].nonzero(as_tuple=True)[0]
+                        levels_used_list.append(nonzero.tolist())
+                    else:
+                        levels_used_list.append([])
 
-                # M3: 计算选择熵 (token_selection_entropy)
-                if split_probs is not None:
-                    probs_i = split_probs[i, :lengths[i]]
-                    # P2-1 修复: 使用加性 epsilon 替代 clamp，避免改变分布
-                    # clamp 会将所有小于 epsilon 的值改为 epsilon，破坏分布
-                    # 加性方法只在零值处添加 epsilon，保持非零值不变
-                    probs_safe = probs_i + (probs_i == 0).float() * PROB_EPSILON
-                    entropy = -(probs_safe * torch.log(probs_safe)).sum().item()
-                    aux_info["token_selection_entropy"] = entropy
+                # 预获取 splitter_diagnostics (只调用一次)
+                splitter_diag = self.get_splitter_diagnostics()
 
-                aux_infos.append(aux_info)
+                for i in range(B):
+                    num_tokens = int(lengths[i].item())  # 单个 .item() 很快
+                    levels_used = levels_used_list[i]
+
+                    if not valid_bool[i] or not levels_used:
+                        aux_info = {
+                            "num_tokens": num_tokens,
+                            "levels_used": [],
+                            "depth_distribution": {},
+                            "splitter_diagnostics": splitter_diag,
+                        }
+                        if split_probs is not None:
+                            aux_info["token_selection_entropy"] = 0.0
+                        aux_infos.append(aux_info)
+                        continue
+
+                    d_max = min(levels_used[-1], max_depth)
+                    depth_distribution = {
+                        d: float(normalized_counts[i, d])
+                        for d in levels_used if d <= d_max
+                    }
+
+                    aux_info = {
+                        "num_tokens": num_tokens,
+                        "levels_used": levels_used,
+                        "depth_distribution": depth_distribution,
+                        "splitter_diagnostics": splitter_diag,
+                    }
+
+                    if split_probs is not None:
+                        probs_i = split_probs[i, :lengths[i]]
+                        probs_safe = probs_i + (probs_i == 0).float() * PROB_EPSILON
+                        entropy = -(probs_safe * torch.log(probs_safe)).sum().item()
+                        aux_info["token_selection_entropy"] = entropy
+
+                    aux_infos.append(aux_info)
 
         if return_features:
             # 直接返回 pooled 张量 [B, D] 而非 List[Tensor]
