@@ -318,16 +318,17 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 flat_idx = batch_indices * max_d + depths.clamp(min=0, max=max_d - 1)
                 ones = torch.ones_like(flat_idx)
                 count_matrix.view(-1).scatter_add_(0, flat_idx, ones)
-
-                # I107-2: 移除统计缓存，直接传递 count_matrix
-                depth_dists = self._build_depth_dists_lazy(B, count_matrix)
             else:
-                depth_dists = [{} for _ in range(B)]
+                count_matrix = torch.zeros(B, max_d, dtype=torch.long, device=device)
 
+        # P-OPT: 延迟 depth_distributions 构建，避免 forward 路径中的 .cpu() 调用
+        # depth_dists 仅用于日志记录，不应在 forward 路径中阻塞
         self._last_split_stats = {
             'num_tokens': None,  # 延迟计算，按需在外部转换
-            'depth_distributions': depth_dists,
+            'depth_distributions': None,  # 延迟构建
         }
+        # 缓存 count_matrix 用于延迟构建 depth_distributions
+        self._count_matrix_cache: Optional[torch.Tensor] = count_matrix if tensor_result.num_tokens > 0 else None
         # 清空之前的缓存，强制重新计算
         self._num_tokens_list = None
         # 缓存 tokens_per_batch 用于 get_training_stats (延迟平均计算)
@@ -351,17 +352,23 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         # 4. 构建输出 (P-OPT-4: 向量化输出构建，避免 Python for 循环)
         # TokenSequence 对象仍需构建，但使用预计算的张量切片
+        # P-OPT: 从 count_matrix 直接在 GPU 上构建 depth_distribution，避免 .cpu()
         sequences = []
         for b in range(B):
             # P-OPT: 使用 tokens_per_batch[b] 替代 Python list 索引
             num_tokens = int(tokens_per_batch[b].item())  # 单个 scalar .item() 可接受
+            # 从 count_matrix[b] 在 GPU 上构建 depth_distribution
+            row = count_matrix[b]  # [max_d]
+            nonzero_mask = row > 0
+            nonzero_indices = nonzero_mask.nonzero(as_tuple=True)[0]
+            depth_dist = {int(d): int(row[d]) for d in nonzero_indices}
             seq = TokenSequence(
                 tokens=tokens[b, :num_tokens],
                 metadata={
                     "levels": levels_info[b, :num_tokens],
                     "split_stats": {
                         "num_tokens": num_tokens,
-                        "depth_distribution": depth_dists[b] if depth_dists else {},
+                        "depth_distribution": depth_dist,
                     },
                 },
             )
@@ -739,26 +746,19 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             H = -∑_d p_d log(p_d)
             其中 p_d = count_d / ∑_d' count_d'
         """
-        if self._last_split_stats is None:
+        if self._count_matrix_cache is None:
             return None
 
-        # 使用 Python dict 方式计算 (从 depth_distributions)
-        total_dist: Dict[int, int] = {}
-        for dist in self._last_split_stats['depth_distributions']:
-            for d, count in dist.items():
-                total_dist[d] = total_dist.get(d, 0) + count
-
-        total = sum(total_dist.values())
-        if total == 0:
-            return None
-
-        entropy = 0.0
-        for count in total_dist.values():
-            p = count / total
-            if p > 0:
-                entropy -= p * math.log(p)
-
-        return entropy
+        # P-OPT: 从 GPU tensor 直接计算熵，避免 .cpu()
+        count_matrix = self._count_matrix_cache  # [B, max_d]
+        # 计算每个 batch 的分布，然后取平均
+        row_sums = count_matrix.sum(dim=1, keepdim=True).clamp(min=1)
+        probs = count_matrix / row_sums  # [B, max_d]
+        # 计算熵: H = -sum(p * log(p))
+        # 避免 log(0) 问题
+        probs_safe = probs + (probs == 0).float() * 1e-10
+        entropy_per_batch = -(probs_safe * probs_safe.log()).sum(dim=1)
+        return float(entropy_per_batch.mean().item())
 
     @torch.no_grad()
     def compute_scale_distribution(

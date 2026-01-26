@@ -1734,6 +1734,9 @@ def train_epoch(
     total = 0
     optimizer.zero_grad(set_to_none=True)
 
+    # DEBUG: 检查迭代器是否可以正常工作
+    print(f"[DEBUG] train_epoch: loader len={len(loader)}, batch_size={loader.batch_size}")
+
     batch_times, data_times, forward_times = [], [], []
     entropy_losses = []  # P1-5: 收集熵损失用于统计
     cuda_mem_peak = 0.0
@@ -1766,7 +1769,12 @@ def train_epoch(
             print(f"[DEBUG] 不使用 CudaPrefetcher (DISABLE_PREFETCH={os.environ.get('DISABLE_PREFETCH', 'not set')})", flush=True)
     
     pbar = tqdm(data_iter, desc="Train", total=len(loader))
-    
+
+    # DEBUG: 检查 DataLoader 长度
+    if len(loader) == 0:
+        print(f"[ERROR] DataLoader 长度为 0！train_loader 有 {len(train_loader)} 个 batch")
+        return 0.0, 0.0, {}
+
     # P13: 卡顿诊断 - 检测异常长的批次时间
     stall_threshold = 5.0  # 超过 5 秒视为卡顿
     stall_count = 0
@@ -1777,6 +1785,9 @@ def train_epoch(
     debug_first_mixup_epoch = debug_mode and use_mixup and epoch is not None and os.environ.get('DISABLE_PREFETCH', '0') == '1'
 
     for i, batch in enumerate(pbar):
+        # DEBUG: 确认数据加载
+        if i == 0:
+            print(f"[DEBUG] 第一个 batch 加载成功: batch type={type(batch)}, len={len(batch) if hasattr(batch, '__len__') else 'N/A'}")
 
         # P15: 额外诊断 - 检测数据加载卡顿 (仅调试模式)
         if debug_first_mixup_epoch and i <= 5:
@@ -3783,7 +3794,10 @@ def main():
         
         # 选择使用的 loader
         current_train_loader = simple_train_loader if disable_prefetch_this_epoch else train_loader
-        
+
+        # DEBUG: 检查 loader 长度
+        print(f"[DEBUG] Epoch {epoch}: train_loader batches={len(current_train_loader)}, total_batches={len(train_loader)}")
+
         train_loss, train_acc, perf_stats = train_epoch(
             model, current_train_loader, optimizer, device, scaler, config,
             mixup_fn=current_mixup_fn,
