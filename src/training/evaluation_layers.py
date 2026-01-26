@@ -515,9 +515,9 @@ class ClassificationEvaluator:
                 imgs = imgs.to(device)
                 labels = labels.to(device)
 
-                # 单一接口: forward() 返回 TrainingStats
+                # 单一接口: forward() 返回 TrainingStats 或 Tensor
                 stats = model(imgs)
-                outputs = stats.logits
+                outputs = stats.logits if hasattr(stats, 'logits') else stats
 
                 loss = F.cross_entropy(outputs, labels)
                 probs = F.softmax(outputs, dim=1)

@@ -537,9 +537,9 @@ class ModularTrainer:
             batch_size = targets.size(0)
 
             with torch.amp.autocast('cuda', enabled=self.config.use_amp):
-                # 单一接口: forward() 返回 TrainingStats
+                # 单一接口: forward() 返回 TrainingStats 或 Tensor
                 stats = self.model(inputs)
-                outputs = stats.logits
+                outputs = stats.logits if hasattr(stats, 'logits') else stats
 
                 loss = self.loss_fn(outputs, targets)
 

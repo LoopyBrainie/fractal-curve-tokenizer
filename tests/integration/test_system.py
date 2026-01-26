@@ -66,7 +66,8 @@ def test_next_gen_fractal_vit_forward_pass(device: str) -> None:
     ).to(device)
     model.eval()
 
-    logits = model(images)
+    result = model(images)
+    logits = result.logits if hasattr(result, 'logits') else result
     assert logits.shape == (batch, 10)
     assert logits.device.type == device
 
@@ -91,7 +92,8 @@ def test_next_gen_fractal_vit_handles_varied_sizes(device: str) -> None:
         model.eval()
 
         images = torch.randn(2, 3, height, width, device=device)
-        logits = model(images)
+        result = model(images)
+        logits = result.logits if hasattr(result, 'logits') else result
         assert logits.shape == (2, 5)
         assert logits.device.type == device
 
@@ -156,12 +158,14 @@ def test_batch_size_independence() -> None:
     single_image = torch.randn(1, 3, 32, 32)
     batch_images = single_image.repeat(4, 1, 1, 1)
     
-    output_single = model(single_image)
-    output_batch = model(batch_images)
-    
+    result_single = model(single_image)
+    result_batch = model(batch_images)
+    logits_single = result_single.logits if hasattr(result_single, 'logits') else result_single
+    logits_batch = result_batch.logits if hasattr(result_batch, 'logits') else result_batch
+
     # 批次中的每个输出应该相同（在数值精度范围内）
     for i in range(4):
-        assert torch.allclose(output_single[0], output_batch[i], atol=1e-5)
+        assert torch.allclose(logits_single[0], logits_batch[i], atol=1e-5)
 
 
 @torch.no_grad()
@@ -178,11 +182,13 @@ def test_deterministic_eval_mode() -> None:
     model.eval()
     
     images = torch.randn(2, 3, 32, 32)
-    
-    output1 = model(images)
-    output2 = model(images)
-    
-    assert torch.equal(output1, output2)
+
+    result1 = model(images)
+    result2 = model(images)
+    logits1 = result1.logits if hasattr(result1, 'logits') else result1
+    logits2 = result2.logits if hasattr(result2, 'logits') else result2
+
+    assert torch.equal(logits1, logits2)
 
 
 @pytest.fixture
@@ -230,12 +236,13 @@ def test_batch_consistency(vectorization_audit_enabled) -> None:
         else:
             batch_images = base_image.repeat(batch_size, 1, 1, 1)
 
-        output = model(batch_images)
-        batch_outputs[batch_size] = output
+        result = model(batch_images)
+        logits = result.logits if hasattr(result, 'logits') else result
+        batch_outputs[batch_size] = logits
 
         # 验证输出形状
-        assert output.shape == (batch_size, num_classes), \
-            f"Batch size {batch_size}: expected {(batch_size, num_classes)}, got {output.shape}"
+        assert logits.shape == (batch_size, num_classes), \
+            f"Batch size {batch_size}: expected {(batch_size, num_classes)}, got {logits.shape}"
 
     # 验证批处理一致性：单个样本输出应与批中对应样本输出一致
     single_output = batch_outputs[1][0]

@@ -710,6 +710,7 @@ class FractalCurveViT(nn.Module):
         else:
             raise ValueError(f"Unknown pool type: {self.pool}")
 
+    @torch._dynamo.disable(recursive=False)
     def _prepare_auxiliary_output(
         self,
         batch_size: int,
@@ -750,9 +751,24 @@ class FractalCurveViT(nn.Module):
 
             # P-OPT: 向量化深度分布计算 - 完全 GPU 计算
             if levels_list and lengths.numel() == B:
-                # 获取最大 token 数量
-                max_tokens = max(l.size(0) for l in levels_list if l.numel() > 0)
+                # 获取最大 token 数量 (安全处理空列表)
+                max_tokens = 0
+                for l in levels_list:
+                    if l.numel() > 0:
+                        max_tokens = max(max_tokens, l.size(0))
                 max_tokens = min(max_tokens, 256)
+
+                # 空列表保护
+                if max_tokens == 0:
+                    for i in range(B):
+                        num_tokens = int(lengths[i].item())
+                        aux_infos.append({
+                            "num_tokens": num_tokens,
+                            "levels_used": [],
+                            "depth_distribution": {},
+                            "splitter_diagnostics": self.get_splitter_diagnostics(),
+                        })
+                    return aux_infos, None
 
                 # 填充深度矩阵 [B, max_tokens] - 全部在 GPU
                 padded_depths = torch.full((B, max_tokens), -1,

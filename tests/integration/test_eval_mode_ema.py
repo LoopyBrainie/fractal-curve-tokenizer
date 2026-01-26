@@ -80,8 +80,9 @@ class TestEvalModeEMAInitialization:
         x = torch.randn(2, 3, 224, 224)
         with torch.no_grad():
             output = model(x)
+            logits = output.logits if hasattr(output, 'logits') else output
 
-        assert output.shape == (2, 1000)
+        assert logits.shape == (2, 1000)
 
     def test_eval_mode_gradient_not_computed(self):
         """验证 eval 模式下不计算梯度."""
@@ -98,9 +99,10 @@ class TestEvalModeEMAInitialization:
         x = torch.randn(2, 3, 224, 224)
         with torch.no_grad():
             output = model(x)
+            logits = output.logits if hasattr(output, 'logits') else output
 
         # 输出不应该 require grad
-        assert not output.requires_grad
+        assert not logits.requires_grad
 
     def test_train_mode_gradient_computed(self):
         """验证 train 模式下计算梯度."""
@@ -116,8 +118,9 @@ class TestEvalModeEMAInitialization:
 
         x = torch.randn(2, 3, 224, 224)
         output = model(x)
+        logits = output.logits if hasattr(output, 'logits') else output
 
-        loss = output.sum()
+        loss = logits.sum()
         loss.backward()
 
         # 检查梯度存在
@@ -142,8 +145,9 @@ class TestBatchStability:
         x = torch.randn(1, 3, 224, 224)  # B=1
         with torch.no_grad():
             output = model(x)
+            logits = output.logits if hasattr(output, 'logits') else output
 
-        assert output.shape == (1, 1000)
+        assert logits.shape == (1, 1000)
 
     def test_batch_size_1_with_aux_info(self):
         """验证 B=1 支持 aux_info 返回."""
@@ -159,9 +163,10 @@ class TestBatchStability:
 
         x = torch.randn(1, 3, 224, 224)  # B=1
         with torch.no_grad():
-            output, aux_info = model(x, return_aux_info=True)
+            result, aux_info = model(x, return_aux_info=True)
+            logits = result.logits if hasattr(result, 'logits') else result
 
-        assert output.shape == (1, 1000)
+        assert logits.shape == (1, 1000)
         assert isinstance(aux_info, list)
         assert len(aux_info) == 1  # batch size = 1
 
@@ -188,7 +193,8 @@ class TestDynamicResolution:
             x = torch.randn(1, 3, *size)
             with torch.no_grad():
                 output = model(x)
-            assert output.shape == (1, 1000), f"Failed for size {size}"
+                logits = output.logits if hasattr(output, 'logits') else output
+            assert logits.shape == (1, 1000), f"Failed for size {size}"
 
 
 if __name__ == "__main__":

@@ -53,7 +53,8 @@ class TestDynamicResolution:
         for H, W in test_sizes:
             images = torch.randn(2, 3, H, W)
             with torch.no_grad():
-                logits = model(images)
+                result = model(images)
+            logits = result.logits if hasattr(result, 'logits') else result
             assert logits.shape == (2, 100), f"Failed for size {H}x{W}"
             assert not torch.isnan(logits).any(), f"NaN detected for size {H}x{W}"
 
@@ -70,7 +71,8 @@ class TestDynamicResolution:
         for B in [1, 4, 8, 16]:
             images = torch.randn(B, 3, 128, 128)  # Create fresh tensor for each batch size
             with torch.no_grad():
-                logits = model(images)
+                result = model(images)
+            logits = result.logits if hasattr(result, 'logits') else result
             assert logits.shape == (B, 50), f"Failed for batch size {B}"
 
     def test_aspect_ratios(self):
@@ -94,7 +96,8 @@ class TestDynamicResolution:
         for H, W in aspect_ratios:
             images = torch.randn(2, 3, H, W)
             with torch.no_grad():
-                logits = model(images)
+                result = model(images)
+            logits = result.logits if hasattr(result, 'logits') else result
             assert logits.shape == (2, 10)
 
     def test_gradient_flow_with_dynamic_size(self):
@@ -112,7 +115,8 @@ class TestDynamicResolution:
 
         images = torch.randn(4, 3, 128, 128, requires_grad=True)
 
-        logits = model(images)
+        result = model(images)
+        logits = result.logits if hasattr(result, 'logits') else result
         loss = logits.sum()
         loss.backward()
 

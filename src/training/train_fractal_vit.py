@@ -1849,18 +1849,18 @@ def train_epoch(
             print(f"[DEBUG] Batch 0: 开始 forward pass, imgs.dtype={imgs.dtype}...", flush=True)
 
         with get_amp_context(device, config.use_amp):
-            # 单一接口: forward() 返回 TrainingStats
+            # 单一接口: forward() 返回 TrainingStats 或 Tensor
             if hard_mining is not None and not use_mixup:
                 stats = model(imgs)
                 # 从 TrainingStats 提取信息
-                tokens = stats.transformer_tokens
-                token_lengths = stats.num_tokens
-                outs = stats.logits
+                tokens = stats.transformer_tokens if hasattr(stats, 'transformer_tokens') else None
+                token_lengths = stats.num_tokens if hasattr(stats, 'num_tokens') else None
+                outs = stats.logits if hasattr(stats, 'logits') else stats
             else:
                 stats = model(imgs)
                 tokens = None
                 token_lengths = None
-                outs = stats.logits
+                outs = stats.logits if hasattr(stats, 'logits') else stats
             if debug_mode and i == 0 and use_mixup:
                 print(f"[DEBUG] Batch 0: forward 完成，outs.shape={outs.shape}", flush=True)
             
@@ -2166,7 +2166,7 @@ def evaluate(
         
         with get_amp_context(device, use_amp):
             stats = model(imgs)
-            outs = stats.logits
+            outs = stats.logits if hasattr(stats, 'logits') else stats
 
             # 检查 logits 是否有问题
             if torch.isnan(outs).any() or torch.isinf(outs).any():
@@ -2539,12 +2539,12 @@ def verify_train_eval_consistency(
     model.eval()
     with get_amp_context(device, config.use_amp):
         stats_eval = model(imgs)
-        out_eval = stats_eval.logits
+        out_eval = stats_eval.logits if hasattr(stats_eval, 'logits') else stats_eval
 
     model.train()
     with get_amp_context(device, config.use_amp):
         stats_train = model(imgs)
-        out_train = stats_train.logits
+        out_train = stats_train.logits if hasattr(stats_train, 'logits') else stats_train
     model.eval()  # 恢复 eval 模式
     
     # 计算输出差异
@@ -3541,7 +3541,8 @@ def main():
                             test_imgs = test_imgs.to(memory_format=torch.channels_last)
                         # 测试 forward + Mixup loss
                         test_outs = model(test_imgs)
-                        _ = mixup_criterion(test_outs.logits, test_mixed_labels)
+                        test_logits = test_outs.logits if hasattr(test_outs, 'logits') else test_outs
+                        _ = mixup_criterion(test_logits, test_mixed_labels)
                         del test_imgs, test_mixed_labels, test_outs
                 print("[OK] Mixup path pre-warmed")
 

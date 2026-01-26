@@ -364,14 +364,14 @@ class FinegrainedClassificationEvaluator:
             all_preds = []
             all_probs = []
 
-            # 单一接口: forward() 返回 TrainingStats
+            # 单一接口: forward() 返回 TrainingStats 或 Tensor
             with torch.no_grad():
                 for inputs, labels in test_loader:
                     inputs = inputs.to(device)
                     labels = labels.to(device)
 
                     stats = trainer.model(inputs)
-                    outputs = stats.logits
+                    outputs = stats.logits if hasattr(stats, 'logits') else stats
 
                     probs = torch.softmax(outputs, dim=1)
                     preds = outputs.argmax(dim=1)

@@ -69,9 +69,9 @@ def diagnose_model_collapse(
             imgs = imgs.to(device)
             labels = labels.to(device)
 
-            # 单一接口: forward() 返回 TrainingStats
+            # 单一接口: forward() 返回 TrainingStats 或 Tensor
             stats = model(imgs)
-            outputs = stats.logits
+            outputs = stats.logits if hasattr(stats, 'logits') else stats
 
             predictions = outputs.argmax(dim=1)
             

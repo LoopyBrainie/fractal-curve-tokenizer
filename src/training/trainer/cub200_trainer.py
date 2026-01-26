@@ -809,9 +809,9 @@ class CUB200Trainer:
             scale_factor = 1.0 / accum_steps
 
             with autocast(device_type=self.device.type, enabled=self.config.use_amp):
-                # 单一接口: forward() 返回 TrainingStats
+                # 单一接口: forward() 返回 TrainingStats 或 Tensor
                 stats = self.model(imgs)
-                logits = stats.logits
+                logits = stats.logits if hasattr(stats, 'logits') else stats
 
                 if self.config.use_center_loss:
                     features = stats.features
@@ -939,9 +939,9 @@ class CUB200Trainer:
 
             # 验证禁用 AMP
             with autocast(device_type=self.device.type, enabled=False):
-                # 单一接口: forward() 返回 TrainingStats
+                # 单一接口: forward() 返回 TrainingStats 或 Tensor
                 stats = self.model(imgs)
-                outs = stats.logits
+                outs = stats.logits if hasattr(stats, 'logits') else stats
 
                 if return_features:
                     all_features.append(stats.features.cpu())

@@ -12,6 +12,7 @@ class DummyTokenizer(BaseTokenizer):
         super().__init__()
         self.token_dim = token_dim
         self.tokens_per_image = tokens_per_image
+        self.max_depth = 3  # 添加 max_depth 属性
         self.called = False
 
     def tokenize(self, images: torch.Tensor) -> TokenizerOutput:
@@ -93,7 +94,8 @@ def test_vit_uses_custom_components() -> None:
     )
 
     images = torch.randn(batch_size, 3, 32, 32)
-    outputs = model(images)
+    result = model(images)
+    outputs = result.logits if hasattr(result, 'logits') else result
 
     assert outputs.shape == (batch_size, 4)
     assert tokenizer.called
@@ -124,7 +126,8 @@ def test_next_gen_vit_single_training_step_updates_parameters() -> None:
     params_before = [p.detach().clone() for p in model.parameters() if p.requires_grad]
 
     optimizer.zero_grad()
-    logits = model(inputs)
+    result = model(inputs)
+    logits = result.logits if hasattr(result, 'logits') else result
     loss = criterion(logits, labels)
     
     # Handle auxiliary loss
