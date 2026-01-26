@@ -183,6 +183,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # self.splitter 已移除，改为外部传入
         # 保留统计变量用于 tokenize 输出
         self._last_split_stats: Optional[Dict[str, Any]] = None
+        self._tokens_per_batch: Optional[torch.Tensor] = None  # 延迟 GPU 计算
         # I107-2: 移除调试缓存变量 (_last_features, _last_depth_count_matrix)
         # 这些仅用于调试，会导致显存泄露
 
@@ -327,6 +328,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             'num_tokens': None,  # 延迟计算，按需在外部转换
             'depth_distributions': depth_dists,
         }
+        # 清空之前的缓存，强制重新计算
+        self._num_tokens_list = None
+        # 缓存 tokens_per_batch 用于 get_training_stats (延迟平均计算)
+        self._tokens_per_batch: Optional[torch.Tensor] = tokens_per_batch
 
         # I78: 计算 max_tokens 用于 _embed_with_tensor_result
         # I99-1 FIX: 使用每个 batch 的最大 token 数，而非总 token 数
@@ -865,9 +870,11 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         }
 
         if self._last_split_stats:
-            avg_tokens = sum(self._last_split_stats['num_tokens']) / len(self._last_split_stats['num_tokens'])
-            stats['avg_tokens_per_image'] = avg_tokens
-            stats['depth_entropy'] = self.get_scale_entropy()
+            # P-OPT: 从 GPU tensor 计算平均，避免 .to('cpu')
+            if self._tokens_per_batch is not None:
+                avg_tokens = self._tokens_per_batch.float().mean().item()
+                stats['avg_tokens_per_image'] = avg_tokens
+                stats['depth_entropy'] = self.get_scale_entropy()
 
         return stats
 

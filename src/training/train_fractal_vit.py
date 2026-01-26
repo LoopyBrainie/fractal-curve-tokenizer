@@ -220,13 +220,8 @@ def _configure_cuda_optimizations():
     if hasattr(torch.backends.cuda, 'enable_cudnn_sdp'):
         torch.backends.cuda.enable_cudnn_sdp(True)
 
-    # 打印当前优化状态
-    print("[I35] CUDA 优化配置:")
-    print(f"  TF32: {torch.backends.cuda.matmul.allow_tf32 if hasattr(torch.backends.cuda.matmul, 'allow_tf32') else 'N/A'}")
-    print(f"  cuDNN benchmark: {torch.backends.cudnn.benchmark if hasattr(torch.backends, 'cudnn') else 'N/A'}")
-    print(f"  Flash Attention: {torch.backends.cuda.flash_sdp_enabled() if hasattr(torch.backends.cuda, 'flash_sdp_enabled') else 'N/A'}")
-    print(f"  Memory-Efficient: {torch.backends.cuda.mem_efficient_sdp_enabled() if hasattr(torch.backends.cuda, 'mem_efficient_sdp_enabled') else 'N/A'}")
-    print(f"  cuDNN Attention: {torch.backends.cuda.cudnn_sdp_enabled() if hasattr(torch.backends.cuda, 'cudnn_sdp_enabled') else 'N/A'}")
+    # I35: CUDA 优化已静默启用，如需调试可取消注释
+    # print("[I35] CUDA 优化配置:")
 
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
