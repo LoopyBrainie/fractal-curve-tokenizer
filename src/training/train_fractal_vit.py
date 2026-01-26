@@ -3279,36 +3279,31 @@ def main():
                     pass
 
             # 设置编译缓存和错误处理
-            # I107-5: 优化编译配置，避免长时间编译
+            # I107-6: 优化编译配置，提升训练性能
             torch._dynamo.config.cache_size_limit = 256
             torch._dynamo.config.suppress_errors = False
 
-            # I107-5: 禁用自动调优和复杂优化
+            # I107-6: 启用 cudagraphs (关键性能优化)
+            # cudagraphs 是 CUDA inductor 的核心优化，禁用会导致 5-10× 性能下降
             torch._inductor.config.max_autotune = False
             torch._inductor.config.compile_threads = 4  # 并行编译加速
 
-            # 禁用 cudagraphs for laptop GPUs (RTX 4070 Laptop 不稳定)
-            # I107-3: cudagraphs 在笔记本 GPU 上经常因为 TDP 限制失败
-            if has_cuda:
-                try:
-                    torch._inductor.config.triton.cudagraphs = False
-                    torch._inductor.config.triton.cudagraphs_checkpoint = False
-                except AttributeError:
-                    pass
+            # I107-6: 优化动态编译，减少重复编译开销
+            # GumbelTopK 的 token 数量在 K_min=8 到 K_max=64 之间动态变化
+            torch._dynamo.config.assume_static_by_default = True  # 减少动态编译
 
-            # 仅在 CUDA 可用时设置 inductor CUDA 配置
-            if has_cuda:
-                try:
-                    torch._inductor.config.max_autotune = False
-                    if hasattr(torch._inductor.config.triton, 'cudnn'):
-                        torch._inductor.config.triton.cudnn = True
-                    if hasattr(torch._inductor.config.triton, 'use_cudnn'):
-                        torch._inductor.config.triton.use_cudnn = True
-                except AttributeError as cfg_e:
-                    print(f"[INFO] CUDA inductor config not available: {cfg_e}")
+            # I107-6: 移除 cudagraphs 相关禁用配置
+            # 之前禁用的原因 (TDP 限制不稳定) 已确认可启用
+            # 删除: torch._inductor.config.triton.cudagraphs = False
+            # 删除: torch._inductor.config.triton.cudagraphs_checkpoint = False
 
-            # I107-5: 保持 dynamic=True (GumbelTopK 需要动态 token 数量)
-            compile_mode = 'default'
+            # I107-6: 移除冲突的 cudnn 配置
+            # cudagraphs 与 cudnn 配置可能冲突，统一使用 inductor 默认
+            # 删除: torch._inductor.config.triton.cudnn = True
+            # 删除: torch._inductor.config.triton.use_cudnn = True
+
+            # I107-6: 使用 reduce-overhead 模式获得更好的 CUDA 性能
+            compile_mode = 'reduce-overhead'
             model = torch.compile(
                 model,
                 mode=compile_mode,
