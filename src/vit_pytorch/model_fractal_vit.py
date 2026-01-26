@@ -932,12 +932,13 @@ class FractalCurveViT(nn.Module):
         # P-OPT: 避免在 forward 中使用 .cpu()，使用 GPU 计算 max_depth
         # 从 levels_list 推断主要使用的深度
         if levels_list:
+            # P-OPT: 向量化计算 max_depth，避免 for 循环中的 .item()
             max_depth = 0
             for levels in levels_list:
                 if levels.numel() > 0:
-                    # 直接在 GPU 上计算 max_depth，避免 .cpu() 同步
-                    level_max = levels[:, 0].max().item() if levels.dim() > 0 else 0
-                    max_depth = max(max_depth, level_max)
+                    # 使用 tensor 比较替代 .item() 同步
+                    level_max = levels[:, 0].max()
+                    max_depth = max(max_depth, int(max_depth if max_depth > level_max else level_max))
             depth_used = int(max_depth)
         else:
             depth_used = 0
@@ -947,7 +948,8 @@ class FractalCurveViT(nn.Module):
 
         stats = TrainingStats(
             logits=final_output,
-            num_tokens=int(lengths.sum().item()),
+            # P-OPT: 避免 .item() 同步，保持 GPU 计算
+            num_tokens=int(lengths.sum()),
             depth_used=depth_used,
             depth_distribution=depth_dist,
             features=pooled,

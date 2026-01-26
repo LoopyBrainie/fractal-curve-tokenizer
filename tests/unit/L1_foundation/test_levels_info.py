@@ -126,7 +126,8 @@ class TestLevelsInfoFactoryMethods:
         for i, seq in enumerate(sequences):
             seq.metadata["levels"] = levels[i]
 
-        output = TokenizerOutput(sequences=sequences)
+        # P-OPT-11: 使用延迟构建 API
+        output = TokenizerOutput(_padded_tokens_cache=tokens, _padded_levels_cache=levels)
         levels_info = output.get_levels_info(max_depth=4)
 
         assert isinstance(levels_info, LevelsInfo)

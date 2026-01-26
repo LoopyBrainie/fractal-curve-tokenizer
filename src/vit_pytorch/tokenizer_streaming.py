@@ -301,9 +301,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             # I24-14: 无条件 clamp (torch.compile 安全)
             # 不使用 .item() 或数据依赖的 if，直接 clamp
             tokens_per_batch = tokens_per_batch.clamp(min=1)
-            # P-OPT: 避免 .to('cpu') 导致的 cudagraphs 失败，保持 GPU 计算
-            # 使用 tensor 操作替代 Python list，以支持 torch.compile
-            max_tokens_per_batch = tokens_per_batch.max().item()  # 单个 scalar sync 可接受
+            # P-OPT: 保持 GPU 计算，支持 torch.compile + cudagraphs
+            max_tokens_per_batch = tokens_per_batch.max()  # 保持在 GPU
 
             # 计算 depth distribution
             # P-OPT-3: 使用向量化操作，避免 Python for 循环
@@ -379,8 +378,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # I24-14: 使用 tokens_per_batch 作为 lengths_tensor (已在 GPU 上)
         lengths_tensor = tokens_per_batch.long()
 
+        # P-OPT: 使用延迟构建，不传递 sequences
+        # sequences 会在首次访问时通过 _build_sequences_from_cache() 延迟构建
         return TokenizerOutput(
-            sequences=sequences,
             _padded_tokens_cache=tokens,
             _padded_levels_cache=levels_info,
             _lengths_cache=lengths_tensor,

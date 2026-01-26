@@ -102,7 +102,7 @@ class TokenizerOutput:
         split_probs: 堆叠的分割概率 [B, N] 或 None (I30-11)
         batch_size: 批次大小
     """
-    sequences: Optional[List[TokenSequence]] = None
+    _sequences_data: Optional[List[TokenSequence]] = None
     _padded_tokens_cache: Optional[torch.Tensor] = field(default=None, repr=False)
     _padded_levels_cache: Optional[torch.Tensor] = field(default=None, repr=False)
     _lengths_cache: Optional[torch.Tensor] = field(default=None, repr=False)
@@ -116,14 +116,14 @@ class TokenizerOutput:
     def _build_sequences_from_cache(self) -> None:
         """从缓存张量构造 TokenSequence 列表 (P-OPT-11 Phase 9).
 
-        当 sequences=None 但有 _padded_tokens_cache 时，
+        当 _sequences_data=None 但有 _padded_tokens_cache 时，
         延迟构造 TokenSequence 列表供迭代使用。
         """
-        if self.sequences is not None or self._padded_tokens_cache is None:
+        if self._sequences_data is not None or self._padded_tokens_cache is None:
             return  # 已有序列或无缓存
 
         B = self._padded_tokens_cache.shape[0]
-        self.sequences = []
+        self._sequences_data = []
 
         for b in range(B):
             # 从 padded tensor 提取该样本的 tokens
@@ -136,8 +136,14 @@ class TokenizerOutput:
                 levels_b = self._padded_levels_cache[b, :token_count]
                 metadata["levels"] = levels_b
 
+            # 添加 split_stats (与原始 tokenize 行为一致)
+            metadata["split_stats"] = {
+                "num_tokens": token_count,
+                "depth_distribution": {},  # 延迟构建，不在这里计算
+            }
+
             seq = TokenSequence(tokens=tokens_b, metadata=metadata)
-            self.sequences.append(seq)
+            self._sequences_data.append(seq)
 
         self._lazy_sequences_built = True
 
@@ -159,7 +165,25 @@ class TokenizerOutput:
     def batch_size(self) -> int:
         """获取批次大小。"""
         return len(self)
-    
+
+    @property
+    def sequences(self) -> Optional[List["TokenSequence"]]:
+        """获取 TokenSequence 列表，支持延迟构建 (P-OPT-11).
+
+        当 _sequences_data 为 None 但有缓存时，自动触发延迟构建。
+
+        Returns:
+            TokenSequence 列表或 None (如果无缓存)
+        """
+        if self._sequences_data is None and self._padded_tokens_cache is not None:
+            self._build_sequences_from_cache()
+        return self._sequences_data
+
+    @sequences.setter
+    def sequences(self, value: Optional[List["TokenSequence"]]) -> None:
+        """设置 sequences，支持 None 值触发延迟构建."""
+        self._sequences_data = value
+
     @property
     def tokens(self) -> torch.Tensor:
         """获取堆叠的 tokens [B, N, D]。
