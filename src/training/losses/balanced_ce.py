@@ -143,9 +143,37 @@ class ClassBalancedCrossEntropy(nn.Module):
             reduction=self.reduction,
             label_smoothing=self.label_smoothing,
         )
-        
+
         return loss
-    
+
+    @staticmethod
+    def _compute_weights(class_counts: torch.Tensor, beta: float) -> torch.Tensor:
+        """计算类别权重 (静态方法，兼容 ClassBalancedCE 接口)
+
+        数学形式:
+            E_c = (1 - β^{n_c}) / (1 - β)
+            w_c = 1 / E_c
+
+        Args:
+            class_counts: [num_classes] 每个类别的样本数 (Tensor)
+            beta: 有效样本数参数
+
+        Returns:
+            weights: [num_classes] 类别权重
+        """
+        class_counts = class_counts.float().clamp(min=1)
+
+        # E_c = (1 - β^{n_c}) / (1 - β)
+        effective_num = (1.0 - torch.pow(beta, class_counts)) / (1.0 - beta)
+
+        # w_c = 1 / E_c
+        weights = 1.0 / effective_num
+
+        # 归一化
+        weights = weights / weights.sum() * len(weights)
+
+        return weights
+
     def get_weights(self) -> torch.Tensor:
         """
         获取类别权重

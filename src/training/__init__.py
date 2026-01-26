@@ -64,7 +64,6 @@ from .samplers import (
 # Losses
 from .losses import (
     FocalLoss,
-    ClassBalancedCE,
     ClassBalancedCrossEntropy,
     CompositeLoss,
     FocalClassBalancedLoss,
@@ -222,7 +221,6 @@ __all__ = [
     "get_class_counts",
     # Losses
     "FocalLoss",
-    "ClassBalancedCE",
     "ClassBalancedCrossEntropy",
     "CompositeLoss",
     "FocalClassBalancedLoss",

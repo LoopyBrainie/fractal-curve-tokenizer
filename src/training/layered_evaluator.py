@@ -1186,7 +1186,7 @@ class LayeredEvaluator:
             dropout=dropout,
             emb_dropout=emb_dropout,
             min_patch_size=min_patch_size,
-            max_level=None,  # P11-2: None = 自动从 tokenizer.max_depth 获取
+            max_depth=None,  # P11-2: None = 自动从 tokenizer.max_depth 获取
             # I30-17: 使用 num_scales 参数（兼容性）
             num_scales=num_scales,
             use_hilbert_encoding=use_hilbert_encoding,

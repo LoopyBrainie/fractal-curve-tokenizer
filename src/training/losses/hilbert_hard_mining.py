@@ -135,18 +135,31 @@ class HilbertAwareHardMining(nn.Module):
             # var(dim=1) 计算每个特征维度的方差, 然后 sum
             variances = tokens.var(dim=1, unbiased=False).sum(dim=-1)
         else:
-            # 变长序列: 需要 mask
-            variances = torch.zeros(B, device=device)
-            
-            for i in range(B):
-                L = int(lengths[i].item())
-                if L > 1:
-                    # 有效 tokens: [L, D]
-                    valid_tokens = tokens[i, :L]
-                    # 特征维度方差之和
-                    variances[i] = valid_tokens.var(dim=0, unbiased=False).sum()
-                # L <= 1 时方差为 0
-                
+            # P0 修复: 向量化实现 (替代 Python 循环)
+            # 数学形式: TokenVar(x_i) = (1/N_i) Σ_j ||f_ij - f̄_i||²
+            # 向量化计算所有样本的方差
+
+            # 创建有效区域掩码: [B, N]
+            max_len = int(lengths.max())
+            indices = torch.arange(N, device=device).unsqueeze(0)  # [1, N]
+            lengths_expanded = lengths.unsqueeze(1)  # [B, 1]
+            mask = (indices < lengths_expanded).float()  # [B, N], 有效位置为 1
+
+            # 计算有效 token 的加权均值
+            # weighted_mean = Σ(mask * f) / Σ(mask)
+            token_counts = lengths.clamp(min=1).unsqueeze(1)  # [B, 1], 避免除零
+            masked_tokens = tokens * mask.unsqueeze(-1)  # [B, N, D]
+            means = masked_tokens.sum(dim=1, keepdim=True) / token_counts  # [B, 1, D]
+
+            # 计算方差: Σ(||f_ij - mean_i||²) / N_i
+            # 使用加权方差公式避免显式循环
+            centered = masked_tokens - means  # [B, N, D]
+            squared_dist = (centered.pow(2) * mask.unsqueeze(-1)).sum(dim=1)  # [B, D]
+            variances = (squared_dist / token_counts.squeeze(-1)).sum(dim=-1)  # [B]
+
+            # 对于 L <= 1 的样本，方差设为 0
+            variances = variances * (lengths > 1).float()
+
         return variances
     
     def forward(

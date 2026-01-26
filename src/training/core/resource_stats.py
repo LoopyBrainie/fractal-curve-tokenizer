@@ -180,7 +180,7 @@ class ModelResourceStats:
         # 深度分布
         if hasattr(token_output, 'depths'):
             depths = token_output.depths.cpu().numpy()
-            max_depth = model_config.get('max_level', 4)
+            max_depth = model_config.get('max_depth', 4)
             depth_dist = np.bincount(depths.flatten(), minlength=max_depth+1).tolist()
             
             # 深度熵
@@ -318,7 +318,7 @@ def compute_resource_stats_batch(
     model_config = {
         'dim': getattr(model, 'dim', 384),
         'depth': getattr(model, 'depth', 10),
-        'max_level': getattr(model, 'max_level', 4),
+        'max_depth': getattr(model, 'max_depth', 4),
         'num_classes': getattr(model, 'num_classes', 200),
     }
     

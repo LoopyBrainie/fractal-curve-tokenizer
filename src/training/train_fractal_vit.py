@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
 """Fractal ViT Training Script - V3 Variable Depth Tokens
 
-⚠️  **重要更新 (2026-01-26 - I36 Phase 1)**:
-   FractalViTConfig 已标记为废弃，请使用 ModelArchitectureConfig (training.config)
-   迁移方法:
-   ```python
-   from training.config import ModelArchitectureConfig
-   config = ModelArchitectureConfig.from_fractal_vit_config(old_config)
-   ```
-   training 模块提供以下增强功能:
-   - ClassBalancedSampler / ProgressiveSampler - 类别平衡采样
-   - FocalLoss / ClassBalancedCE - 长尾效应优化
-   - ModularTrainer - 模块化训练器（替代手写循环）
-   - ClassificationMetrics - 完整评估指标
-   - ExperimentVisualizer - 统一可视化接口
+I36 配置系统重构:
+- 使用 ModelArchitectureConfig (training.config) 作为模型架构配置
+- 使用 TrainingConfig 包装器满足 FractalConfigProtocol 接口
 
 数学形式化
 ===========
@@ -151,62 +141,16 @@ from __future__ import annotations
 import os
 import sys
 import platform
-import multiprocessing as _mp
-
-# 强制 spawn 方法（CUDA + 容器必需）
-try:
-    _mp.set_start_method('spawn', force=True)
-except RuntimeError:
-    pass
-
-# CUDA 内存优化 - 使用更保守的分配策略
-import os
-import platform
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,expandable_segments:True,garbage_collection_threshold:0.8'
-
-# I101-1: torch.compile Windows 兼容性修复
-# Windows 用户名包含 \U 被 Python 解析为 unicode escape，导致 inductor 编译失败
-# 解决方案：设置缓存到纯 ASCII 路径
-if platform.system() == 'Windows':
-    # 使用纯 ASCII 路径避免 unicode escape 问题
-    os.environ['TORCHINDUCTOR_CACHE_DIR'] = 'D:/temp/torchinductor_cache'
-    os.environ['TMP'] = 'D:/temp'
-else:
-    os.environ['TORCHINDUCTOR_CACHE_DIR'] = '/tmp/torch_inductor_cache'
-
-os.environ['CUDNN_V8_API_ENABLED'] = '1'
-
-# 强制使用更保守的内存分配策略
-import torch
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-os.environ.setdefault('OMP_NUM_THREADS', '4')
-os.environ.setdefault('MKL_NUM_THREADS', '4')
-
-# 抑制 torch.compile 的符号形状警告和 checkpoint autocast 废弃警告
-import warnings
-warnings.filterwarnings('ignore', message='.*is not in var_ranges.*')
-warnings.filterwarnings('ignore', message='.*defaulting to unknown range.*')
-warnings.filterwarnings('ignore', message='.*torch.cpu.amp.autocast.*is deprecated.*', category=FutureWarning)
-warnings.filterwarnings('ignore', message='.*The epoch parameter in `scheduler.step\\(\\)`.*', category=UserWarning)
-
-import argparse
-import json
-import multiprocessing
-import random
-import shutil
 import time
-import zipfile
+import json
+import multiprocessing as _mp
+import argparse
+import random
+from typing import Protocol, runtime_checkable, Any, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
-import torch._dynamo
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.optim import AdamW
 
 # =========================================================================
 # I35: CUDA 优化配置 - 必须在第一次 torch 调用前设置
@@ -265,8 +209,7 @@ def _configure_cuda_optimizations():
     print(f"  Memory-Efficient: {torch.backends.cuda.mem_efficient_sdp_enabled() if hasattr(torch.backends.cuda, 'mem_efficient_sdp_enabled') else 'N/A'}")
     print(f"  cuDNN Attention: {torch.backends.cuda.cudnn_sdp_enabled() if hasattr(torch.backends.cuda, 'cudnn_sdp_enabled') else 'N/A'}")
 
-# 在导入后立即配置
-_configure_cuda_optimizations()
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, SubsetRandomSampler, Subset
 from torchvision import datasets, transforms
@@ -320,8 +263,12 @@ logging.getLogger('torch.fx.experimental.symbolic_shapes').setLevel(logging.ERRO
 logging.getLogger('torch._dynamo').setLevel(logging.ERROR)
 
 # AMP 兼容层 (I78: PyTorch 2.0+ 使用统一 API)
+import torch
 from torch.amp.autocast_mode import autocast
 from torch.amp.grad_scaler import GradScaler
+
+# P2 修复: 在导入 torch 后配置 CUDA 优化
+_configure_cuda_optimizations()
 
 # 项目路径
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -345,8 +292,8 @@ from training import (
     ClassBalancedSampler,
     ProgressiveSampler,
     # Losses
-    FocalLoss as FTFocalLoss,
-    ClassBalancedCE,
+    FocalLoss,
+    ClassBalancedCrossEntropy,
     FocalClassBalancedLoss,
     # I30-2: Hilbert-aware 困难样本挖掘
     HilbertAwareHardMining,
@@ -384,7 +331,156 @@ from training import (
     AttentionEntropyLoss,
     FinegrainedLoss,
     FinegrainedLossConfig,
+    # I36: ModelArchitectureConfig (替代 FractalViTConfig)
+    ModelArchitectureConfig,
 )
+
+
+# ============================================================================
+# I36: FractalConfigProtocol - 配置接口抽象 (替代弃用的 FractalViTConfig)
+# ============================================================================
+
+@runtime_checkable
+class FractalConfigProtocol(Protocol):
+    """训练配置协议 (Protocol)
+
+    定义训练脚本所需的最小配置接口。
+    ModelArchitectureConfig 自动满足此协议。
+
+    注意: FractalViTConfig 已移除，请使用 ModelArchitectureConfig。
+    """
+
+    # ========== 数据集配置 (create_dataloaders) ==========
+    @property
+    def subset_size(self) -> Optional[int]: ...
+    @property
+    def val_split(self) -> float: ...
+    @property
+    def seed(self) -> int: ...
+    @property
+    def num_workers(self) -> int: ...
+    @property
+    def batch_size(self) -> int: ...
+
+    # ========== 模型架构配置 (模型创建) ==========
+    @property
+    def dim(self) -> int: ...
+    @property
+    def depth(self) -> int: ...
+    @property
+    def heads(self) -> int: ...
+    @property
+    def dim_head(self) -> int: ...
+    @property
+    def pool(self) -> str: ...
+    @property
+    def ffn_type(self) -> str: ...
+    @property
+    def min_patch_size(self) -> int: ...
+    @property
+    def max_depth(self) -> int: ...
+    @property
+    def dropout(self) -> float: ...
+    @property
+    def emb_dropout(self) -> float: ...
+    @property
+    def drop_path_rate(self) -> float: ...
+    @property
+    def gradient_checkpoint(self) -> bool: ...
+    @property
+    def lca_temperature(self) -> Optional[float]: ...
+    @property
+    def learnable_temperature(self) -> bool: ...
+    @property
+    def use_area_encoding(self) -> bool: ...
+    @property
+    def use_affine_modulation(self) -> bool: ...
+    @property
+    def fourier_levels(self) -> int: ...
+    @property
+    def quota_learnable(self) -> Optional[bool]: ...
+    @property
+    def freeze_quota(self) -> bool: ...
+    @property
+    def freeze_tokenizer(self) -> bool: ...
+    @property
+    def freeze_tokenizer_epochs(self) -> int: ...
+    @property
+    def depth_scale_range(self) -> Optional[Tuple[float, float]]: ...
+
+    # ========== Tokenizer K 值 (I33 相对预算) ==========
+    @property
+    def K_min(self) -> int: ...
+    @property
+    def K_max(self) -> int: ...
+    @property
+    def token_coverage_min(self) -> float: ...
+    @property
+    def token_coverage_max(self) -> float: ...
+
+    # ========== 训练配置 (训练循环) ==========
+    @property
+    def channels_last(self) -> bool: ...
+    @property
+    def use_amp(self) -> bool: ...
+    @property
+    def learning_rate(self) -> float: ...
+    @property
+    def weight_decay(self) -> float: ...
+    @property
+    def gradient_clip(self) -> float: ...
+    @property
+    def accum_steps(self) -> int: ...
+    @property
+    def warmup_epochs(self) -> int: ...
+    @property
+    def epochs(self) -> int: ...
+    @property
+    def label_smoothing(self) -> float: ...
+    @property
+    def mixup_alpha(self) -> float: ...
+    @property
+    def cutmix_alpha(self) -> float: ...
+    @property
+    def mixup_prob(self) -> float: ...
+    @property
+    def use_focal_loss(self) -> bool: ...
+    @property
+    def focal_gamma(self) -> float: ...
+    @property
+    def use_class_balanced(self) -> bool: ...
+    @property
+    def class_balance_beta(self) -> float: ...
+    @property
+    def progressive_aug(self) -> bool: ...
+    @property
+    def use_hilbert_mining(self) -> bool: ...
+    @property
+    def hilbert_mining_lambda(self) -> float: ...
+    @property
+    def hilbert_mining_warmup(self) -> int: ...
+    @property
+    def patience(self) -> int: ...
+    @property
+    def min_delta(self) -> float: ...
+    @property
+    def compile_model(self) -> bool: ...
+    @property
+    def splitter_temp_start(self) -> float: ...
+    @property
+    def splitter_temp_end(self) -> float: ...
+    @property
+    def splitter_temp_warmup(self) -> int: ...
+    @property
+    def include_elastic_budget(self) -> bool: ...
+    @property
+    def include_soft_entropy(self) -> bool: ...
+    @property
+    def soft_entropy_target(self) -> Optional[float]: ...
+    @property
+    def soft_entropy_weight(self) -> float: ...
+    @property
+    def soft_entropy_mode(self) -> str: ...
 
 
 # ============================================================================
@@ -402,116 +498,10 @@ class DatasetSpec:
     std: Tuple[float, ...]
 
 
-@dataclass
-class FractalViTConfig:
-    """Fractal ViT 脚本配置 (包含模型架构和训练参数)
-
-    注意: 此配置类独立定义，避免与 config/__init__.py 中的 TrainingConfig 冲突。
-    config/__init__.py 中的 TrainingConfig 仅包含训练控制参数。
-    """
-    # 数据集
-    dataset: str
-    batch_size: int
-    num_workers: int
-    val_split: float
-    subset_size: Optional[int]
-    
-    # 模型
-    dim: int
-    depth: int
-    heads: int
-    dim_head: int
-    max_level: int
-    pool: str
-    ffn_type: str
-
-    # I30-17: 动态深度配置
-    # max_depth 由 min_patch_size 和 image_size 自动计算: floor(log2(min(H, W) / min_patch_size))
-    min_patch_size: int  # 目标最小 patch 大小
-
-    # I33: 相对预算参数 (替代绝对 K_min/K_max)
-    # 覆盖率 = tokens / max_patches, 与图像分辨率无关
-    token_coverage_min: float = 0.01  # 最小覆盖率 (1% patches)
-    token_coverage_max: float = 0.05  # 最大覆盖率 (5% patches)
-    K_min_abs: int = 16  # 绝对下界保护 (无论覆盖率如何，至少 16 tokens)
-
-    # I30-10: 可学习配额参数 (Scheme E)
-    quota_learnable: bool = True  # 是否启用可学习配额
-    quota_init_logits: Optional[Tuple[float, ...]] = None  # 配额初始化 logits
-    quota_min_per_depth: int = 2  # 每深度最小配额
-    freeze_quota: bool = False  # 是否冻结配额参数
-
-    # I24-1: Tokenizer 冻结选项
-    freeze_tokenizer: bool = False  # 是否冻结 tokenizer 可学习参数
-    freeze_tokenizer_epochs: int = 0  # 前 N 个 epoch 冻结 (0=全程冻结)
-
-    # P6-1: 深度缩放参数
-    depth_scale_range: Optional[Tuple[float, float]] = None  # (σ_min, σ_max)，默认 (0.5, 2.0)
-
-    # P6-2: LCA 温度参数
-    lca_temperature: Optional[float] = 1.5  # LCA 偏置温度，默认 1.5
-    learnable_temperature: bool = True  # 是否可学习温度，默认 True
-
-    # I31-3: 面积编码参数
-    use_area_encoding: bool = False  # 启用面积增强位置编码
-    use_affine_modulation: bool = False  # 启用仿射调制注意力偏置
-    fourier_levels: int = 4  # 傅里叶特征级别数
-
-    # P7-7: GumbelTopKSplitter 温度退火调度参数
-    splitter_temp_start: float = 1.0  # 起始温度 T_start
-    splitter_temp_end: float = 0.5  # 终止温度 T_end
-    splitter_temp_warmup: int = 10  # Warmup epoch 数 (固定 T_start)
-
-    # P10-4/P10-5: 软熵损失参数
-    include_soft_entropy: bool = True  # 是否启用软熵损失（推荐 True）
-    soft_entropy_mode: str = "maximize"  # 熵损失模式: 'maximize'（最大化熵）或 'target'（匹配目标）
-    soft_entropy_weight: float = 0.1  # 软熵损失权重
-    soft_entropy_target: Optional[float] = None  # 目标熵值（仅 mode='target' 时使用）
-
-    # P10-9: 弹性预算损失参数 (I33: 已改造为相对预算，使用常量)
-    include_elastic_budget: bool = True  # 是否启用弹性预算损失（推荐 True）
-    # 注: elastic_N_* 参数已移除，使用 ELASTIC_COVERAGE_* 常量保证跨尺度一致性
-
-    # 训练
-    epochs: int = 100
-    learning_rate: float = 3e-4
-    weight_decay: float = 0.1
-    dropout: float = 0.15
-    emb_dropout: float = 0.1
-    drop_path_rate: float = 0.2  # 统一命名: drop_path → drop_path_rate
-    label_smoothing: float = 0.1
-    gradient_clip: float = 1.0
-    use_amp: bool = False
-    accum_steps: int = 1
-    warmup_epochs: int = 10
-    gradient_checkpoint: bool = False
-    compile_model: bool = False
-    channels_last: bool = False
-
-    # 早停
-    patience: int = 15
-    min_delta: float = 0.001
-
-    # Mixup/CutMix
-    mixup_alpha: float = 0.4
-    cutmix_alpha: float = 1.0
-    mixup_prob: float = 0.5
-
-    # 长尾效应优化 (P14)
-    use_focal_loss: bool = False  # 是否使用 Focal Loss
-    focal_gamma: float = 2.5  # Focal Loss 的 gamma 参数，I28-1 推荐 2.5 (难/易样本比 243x)
-    use_class_balanced: bool = False  # 是否使用类别平衡损失权重
-    class_balance_beta: float = 0.9999  # 类别平衡的 beta 参数，默认 0.9999
-    progressive_aug: bool = False  # 是否使用渐进式数据增强
-
-    # I30-2: Hilbert-aware 困难样本挖掘
-    use_hilbert_mining: bool = False  # 是否使用基于 Token 方差的困难样本挖掘
-    hilbert_mining_lambda: float = 0.5  # 权重缩放系数 λ，默认 0.5
-    hilbert_mining_warmup: int = 100  # EMA 统计预热 batch 数，默认 100
-
-    # 系统
-    seed: int = 42
-    device: str = "cuda"
+# ============================================================================
+# I36: 训练配置类已移除
+# 使用 ModelArchitectureConfig (training.config) 配合 TrainingConfig 包装器
+# ============================================================================
 
 
 # ============================================================================
@@ -670,7 +660,7 @@ def detect_environment() -> Dict[str, Any]:
     env = {
         'in_container': os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv'),
         'platform': platform.system(),
-        'cpu_count': multiprocessing.cpu_count(),
+        'cpu_count': _mp.cpu_count(),
         'recommended_workers': 4,
     }
     
@@ -1348,7 +1338,7 @@ def _compute_prefetch_factor(
 
 def create_dataloaders(
     spec: DatasetSpec,
-    config: FractalViTConfig,
+    config: FractalConfigProtocol,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """创建数据加载器"""
 
@@ -1685,7 +1675,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     scaler: GradScaler,
-    config: FractalViTConfig,
+    config: FractalConfigProtocol,
     mixup_fn: Optional[MixupCutmix] = None,
     num_classes: int = 10,
     profile: bool = False,
@@ -1811,9 +1801,12 @@ def train_epoch(
         
         with get_amp_context(device, config.use_amp):
             # I30-2: 当启用 Hilbert 困难样本挖掘时，获取 tokens
+            # P0 修复: 使用 return_aux_info=True 替代废弃的 return_tokens=True
             if hard_mining is not None and not use_mixup:
-                outs, tokens, token_lengths = model(imgs, return_tokens=True)
-                aux_infos = None  # return_tokens 和 return_aux_info 不同时支持
+                outs, aux_infos = model(imgs, return_aux_info=True)
+                # 从 aux_infos 提取 tokens 和 lengths（替代废弃的 return_tokens=True）
+                tokens = aux_infos[0].get('transformer_tokens', None) if aux_infos else None
+                token_lengths = aux_infos[0].get('lengths', None) if aux_infos else None
             else:
                 outs, aux_infos = model(imgs, return_aux_info=True)  # I14-1 D1: 捕获 aux_info 用于崩溃检测
                 tokens = None
@@ -1883,11 +1876,8 @@ def train_epoch(
             
             # P1-5 修复: 收集熵正则化损失
             # 熵损失鼓励尺度分布多样性，防止 CrossScaleAttention 崩塌到单一尺度
-            # P15-FIX: 当使用新版 get_auxiliary_losses (包含 soft_entropy_loss) 时，
-            #          不再使用旧版 get_entropy_loss，避免重复添加熵损失
             entropy_loss = None
-            use_legacy_entropy = False  # 默认使用新版
-            
+
             # P10-4/P10-9: 可学习分割器辅助损失（推荐使用统一接口）
             # 包含: 软熵损失 + 弹性预算损失 + 阈值 barrier 正则化
             # I14-1 D1: 新增崩溃惩罚，需要传递 actual_token_count
@@ -1931,8 +1921,7 @@ def train_epoch(
                     # I102-4: splitter_metrics 是死代码，移除以防止显存泄露
                     # splitter_metrics = aux_losses  # 保留张量引用会导致内存累积
                     # GumbelTopKSplitter 的 get_auxiliary_losses 已包含所有必需损失
-                    use_legacy_entropy = False
-            
+
             # 组合损失 (在组合前检查每个损失项，并确保 dtype 一致)
             # P15-FIX: 在 AMP 混合精度训练中，不同损失可能有不同 dtype
             #          ce_loss 可能是 float16，而 splitter_loss/multi_layer_loss 是 float32
@@ -2469,7 +2458,7 @@ def verify_train_eval_consistency(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-    config: FractalViTConfig,
+    config: FractalConfigProtocol,
 ) -> Dict[str, Any]:
     """验证模型在 train/eval 模式下的输出一致性.
     
@@ -2647,13 +2636,13 @@ def main():
     parser.add_argument("--depth-scale-max", type=float, default=2.0,
                        help="Maximum depth scale σ_max (default: 2.0)")
     parser.add_argument("--no-learnable-depth-scale", action="store_true",
-                       help="Use fixed depth scale (legacy mode)")
+                       help="Use fixed depth scale")
     
     # P6-2: LCA 温度参数
     parser.add_argument("--lca-temperature", type=float, default=1.5,
                        help="LCA bias temperature τ (default: 1.5, SNR=1.5)")
     parser.add_argument("--no-lca-temperature", action="store_true",
-                       help="Disable LCA temperature scaling (legacy mode)")
+                       help="Disable LCA temperature scaling")
     parser.add_argument("--fixed-lca-temperature", action="store_true",
                        help="Use fixed (non-learnable) LCA temperature")
     
@@ -2815,90 +2804,123 @@ def main():
 
     # I33: 相对预算参数 (CLI) → 绝对 K 值 (模型)
     # 转换公式: K = coverage * max_patches = coverage * (image_size/min_patch_size)^2
-    max_patches = (args.image_size // args.min_patch_size) ** 2
+    # P2 修复: 使用 spec.image_size 而非 args.image_size
+    image_size_for_budget = spec.image_size if spec.image_size is not None else args.min_patch_size * 64
+    max_patches = (image_size_for_budget // args.min_patch_size) ** 2
     K_min = max(8, int(max_patches * args.token_coverage_min))  # 至少 8 tokens
     K_max = int(max_patches * args.token_coverage_max)
 
-    config = FractalViTConfig(
-        dataset=args.dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        val_split=args.val_split,
-        subset_size=args.subset_size,
+    # I36: 使用 ModelArchitectureConfig 作为配置基础
+    arch_config = ModelArchitectureConfig(
+        num_classes=spec.num_classes,
         dim=args.dim,
         depth=args.depth,
         heads=args.heads,
         dim_head=args.dim_head,
-        max_level=args.max_level,
+        mlp_dim=args.dim * 4,
         pool=args.pool,
-        ffn_type=args.ffn_type,
-        # I30-17: 动态深度配置 - max_depth 由 min_patch_size 自动计算
+        image_size=spec.image_size,
+        channels=spec.channels,
         min_patch_size=args.min_patch_size,
-        # I33: K 值 (从相对预算转换)
-        K_min=K_min,
-        K_max=K_max,
-        # I30-10: 可学习配额参数
-        quota_learnable=args.quota_learnable,
-        quota_init_logits=tuple(map(float, args.quota_init_logits.split(','))) if args.quota_init_logits else None,
-        quota_min_per_depth=args.quota_min_per_depth,
-        freeze_quota=args.freeze_quota,
-        # I24-1: Tokenizer 冻结配置
-        freeze_tokenizer=args.freeze_tokenizer,
-        freeze_tokenizer_epochs=args.freeze_tokenizer_epochs,
-        # P6-1: 深度缩放配置
-        depth_scale_range=(args.depth_scale_min, args.depth_scale_max) if not args.no_learnable_depth_scale else None,
-        # P6-2: LCA 温度配置
-        lca_temperature=None if args.no_lca_temperature else args.lca_temperature,
-        learnable_temperature=not args.fixed_lca_temperature,
-        # I31-3: 面积编码配置
+        token_coverage_min=args.token_coverage_min,
+        token_coverage_max=args.token_coverage_max,
+        K_min_abs=K_min,
+        max_depth_hard_limit=args.max_level if args.max_level is not None else 8,
+        ffn_type=args.ffn_type,
+        use_checkpoint=args.gradient_checkpoint,
+        use_channels_last=getattr(args, 'channels_last', False),
+        compile_model=getattr(args, 'compile', False),
         use_area_encoding=args.use_area_encoding,
         use_affine_modulation=args.use_affine_modulation,
         fourier_levels=args.fourier_levels,
-        # P7-7: GumbelTopKSplitter 温度退火调度配置
-        splitter_temp_start=args.splitter_temp_start,
-        splitter_temp_end=args.splitter_temp_end,
-        splitter_temp_warmup=args.splitter_temp_warmup,
-        # P10-4/P10-5: 软熵损失配置
-        include_soft_entropy=args.include_soft_entropy,
-        soft_entropy_mode=args.soft_entropy_mode,
-        soft_entropy_weight=args.soft_entropy_weight,
-        soft_entropy_target=args.soft_entropy_target,
-        # P10-9: 弹性预算损失配置 (I33: 已改造为相对预算，使用常量)
-        include_elastic_budget=args.include_elastic_budget,
-        # 注: elastic_N_* 参数已移除
-        # 训练配置
-        epochs=args.epochs,
-        learning_rate=args.lr,
-        weight_decay=args.weight_decay,
-        dropout=args.dropout,
-        emb_dropout=args.emb_dropout,
-        drop_path_rate=args.drop_path,
-        label_smoothing=args.label_smoothing,
-        gradient_clip=args.gradient_clip,
-        use_amp=args.use_amp,
-        accum_steps=args.accum_steps,
-        warmup_epochs=args.warmup_epochs,
-        gradient_checkpoint=args.gradient_checkpoint,
-        compile_model=getattr(args, 'compile', False),
-        channels_last=getattr(args, 'channels_last', False),
-        patience=args.patience,
-        min_delta=args.min_delta,
-        mixup_alpha=args.mixup_alpha,
-        cutmix_alpha=args.cutmix_alpha,
-        mixup_prob=args.mixup_prob,
-        # P14/I30-4: 长尾效应优化 - 默认启用，取反 no- 前缀参数
-        use_focal_loss=not args.no_focal_loss,
-        focal_gamma=args.focal_gamma,
-        use_class_balanced=not args.no_class_balanced,
-        class_balance_beta=args.class_balance_beta,
-        progressive_aug=args.progressive_aug,
-        # I30-2: Hilbert-aware 困难样本挖掘
-        use_hilbert_mining=getattr(args, 'use_hilbert_mining', False),
-        hilbert_mining_lambda=getattr(args, 'hilbert_mining_lambda', 0.5),
-        hilbert_mining_warmup=getattr(args, 'hilbert_mining_warmup', 100),
-        seed=args.seed,
-        device=str(device),
+        depth_scale_range=(args.depth_scale_min, args.depth_scale_max) if not args.no_learnable_depth_scale else None,
+        lca_temperature=None if args.no_lca_temperature else args.lca_temperature,
+        learnable_temperature=not args.fixed_lca_temperature,
+        quota_learnable=args.quota_learnable,
+        freeze_quota=args.freeze_quota,
+        freeze_tokenizer=args.freeze_tokenizer,
+        freeze_tokenizer_epochs=args.freeze_tokenizer_epochs,
     )
+
+    # 创建训练配置对象 (满足 FractalConfigProtocol)
+    class TrainingConfig:
+        """训练配置包装器 - 满足 FractalConfigProtocol"""
+        def __init__(self, args, arch_config, K_min, K_max):
+            # 数据集配置
+            self.subset_size = args.subset_size
+            self.val_split = args.val_split
+            self.seed = args.seed
+            self.num_workers = args.num_workers
+            self.batch_size = args.batch_size
+
+            # 模型架构配置 (从 arch_config 获取)
+            self.dim = arch_config.dim
+            self.depth = arch_config.depth
+            self.heads = arch_config.heads
+            self.dim_head = arch_config.dim_head
+            self.pool = arch_config.pool
+            self.ffn_type = arch_config.ffn_type
+            self.min_patch_size = arch_config.min_patch_size
+            self.max_depth = arch_config.max_depth
+            self.dropout = args.dropout
+            self.emb_dropout = args.emb_dropout
+            self.drop_path_rate = args.drop_path
+            self.gradient_checkpoint = arch_config.use_checkpoint
+            self.lca_temperature = arch_config.lca_temperature
+            self.learnable_temperature = arch_config.learnable_temperature
+            self.use_area_encoding = arch_config.use_area_encoding
+            self.use_affine_modulation = arch_config.use_affine_modulation
+            self.fourier_levels = arch_config.fourier_levels
+            self.quota_learnable = arch_config.quota_learnable
+            self.freeze_quota = arch_config.freeze_quota
+            self.freeze_tokenizer = arch_config.freeze_tokenizer
+            self.freeze_tokenizer_epochs = arch_config.freeze_tokenizer_epochs
+            self.depth_scale_range = arch_config.depth_scale_range
+
+            # Tokenizer K 值 (I33 相对预算)
+            self.K_min = K_min
+            self.K_max = K_max
+            self.token_coverage_min = args.token_coverage_min
+            self.token_coverage_max = args.token_coverage_max
+
+            # 训练配置
+            self.channels_last = arch_config.use_channels_last
+            self.use_amp = args.use_amp
+            self.learning_rate = args.lr
+            self.weight_decay = args.weight_decay
+            self.gradient_clip = args.gradient_clip
+            self.accum_steps = args.accum_steps
+            self.warmup_epochs = args.warmup_epochs
+            self.epochs = args.epochs
+            self.label_smoothing = args.label_smoothing
+            self.mixup_alpha = args.mixup_alpha
+            self.cutmix_alpha = args.cutmix_alpha
+            self.mixup_prob = args.mixup_prob
+            self.use_focal_loss = not args.no_focal_loss
+            self.focal_gamma = args.focal_gamma
+            self.use_class_balanced = not args.no_class_balanced
+            self.class_balance_beta = args.class_balance_beta
+            self.progressive_aug = args.progressive_aug
+            self.use_hilbert_mining = getattr(args, 'use_hilbert_mining', False)
+            self.hilbert_mining_lambda = getattr(args, 'hilbert_mining_lambda', 0.5)
+            self.hilbert_mining_warmup = getattr(args, 'hilbert_mining_warmup', 100)
+            self.patience = args.patience
+            self.min_delta = args.min_delta
+            self.compile_model = arch_config.compile_model
+
+            # Splitter 温度退火配置
+            self.splitter_temp_start = args.splitter_temp_start
+            self.splitter_temp_end = args.splitter_temp_end
+            self.splitter_temp_warmup = args.splitter_temp_warmup
+
+            # 损失函数配置
+            self.include_elastic_budget = args.include_elastic_budget
+            self.include_soft_entropy = args.include_soft_entropy
+            self.soft_entropy_target = args.soft_entropy_target
+            self.soft_entropy_weight = args.soft_entropy_weight
+            self.soft_entropy_mode = args.soft_entropy_mode
+
+    config = TrainingConfig(args, arch_config, K_min, K_max)
     
     # 创建 Tokenizer (默认使用 GumbelTopKSplitter - Scheme D)
     from vit_pytorch.tokenizer_streaming import StreamingFractalTokenizerV3
@@ -2936,7 +2958,7 @@ def main():
         drop_path_rate=config.drop_path_rate,
         # I30-17: 使用新的动态深度参数 (max_depth 自动从 min_patch_size 计算)
         min_patch_size=config.min_patch_size,
-        max_level=config.max_level,
+        max_depth=config.max_depth,
         use_checkpoint=config.gradient_checkpoint,
         ffn_type=config.ffn_type,
         # 使用自定义 tokenizer (支持高级分割参数)
@@ -2982,7 +3004,7 @@ def main():
     tokenizer_name = f'StreamingFractalTokenizerV3 ({split_info})'
 
     # P6-1/P6-2 信息
-    depth_scale_info = f"range={config.depth_scale_range}" if config.depth_scale_range else "legacy"
+    depth_scale_info = f"range={config.depth_scale_range}" if config.depth_scale_range else "fixed"
     temp_info = f"τ={config.lca_temperature}" if config.lca_temperature else "disabled"
     if config.lca_temperature and config.learnable_temperature:
         temp_info += " (learnable)"
@@ -3298,7 +3320,7 @@ def main():
         
         if config.use_focal_loss:
             # 创建 Focal Loss
-            loss_fn = FTFocalLoss(
+            loss_fn = FocalLoss(
                 gamma=config.focal_gamma,
                 alpha=class_weights,  # 可选，如果同时启用 class_balanced
                 label_smoothing=config.label_smoothing,
@@ -3393,8 +3415,9 @@ def main():
     (exp_dir / "logs").mkdir(exist_ok=True)
     
     # 保存配置
+    # P2 修复: TrainingConfig 不是 dataclass，使用 vars() 替代 asdict()
     with open(exp_dir / "logs" / "config.json", 'w') as f:
-        json.dump(asdict(config), f, indent=2)
+        json.dump(vars(config), f, indent=2)
     
     history = []
     
@@ -3856,8 +3879,7 @@ def cleanup_multiprocessing():
     
     # 强制终止所有子进程
     try:
-        import multiprocessing
-        for p in multiprocessing.active_children():
+        for p in _mp.active_children():
             p.terminate()
             p.join(timeout=1)
     except Exception:

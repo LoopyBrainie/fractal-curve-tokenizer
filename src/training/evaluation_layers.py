@@ -1490,8 +1490,8 @@ class EfficiencyEvaluator:
                     
                     # 2. 位置编码 + Transformer
                     # 获取 levels_info 用于位置编码
-                    # P9-5: info_dim = max_level + 4
-                    info_dim = getattr(model, 'max_level', 8) + 4
+                    # P9-5: info_dim = max_depth + 4
+                    info_dim = getattr(model, 'max_depth', 8) + 4
                     levels_info = tokenizer_output.get_padded_levels(info_dim)
                     
                     # 添加 CLS token

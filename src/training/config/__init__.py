@@ -110,7 +110,7 @@ class ModelArchitectureConfig:
 
     # 训练策略参数 (从 FractalViTConfig 迁移)
     pool: str = "cls"
-    max_level: int = 8  # 最大分割深度 (与 max_depth_hard_limit 对齐)
+    max_depth: int = 8  # P0 修复: 最大分割深度 (统一使用 max_depth)
     freeze_quota: bool = False  # 是否冻结配额参数
     freeze_tokenizer: bool = False  # 是否冻结 tokenizer 参数
     freeze_tokenizer_epochs: int = 0  # 前 N 个 epoch 冻结 (0=全程冻结)
@@ -192,10 +192,18 @@ class ModelArchitectureConfig:
 
         数学映射:
             - dim, depth, heads, mlp_dim -> 架构参数
-            - min_patch_size, max_level -> Tokenizer 参数
+            - min_patch_size, max_depth -> Tokenizer 参数
             - lca_temperature, learnable_temperature -> 注意力偏置参数
             - use_area_encoding, use_affine_modulation -> 形状编码参数
+            - K_min_abs, token_coverage_* -> Token 预算参数
         """
+        # 计算 K_max (基于覆盖率)
+        max_patches = (image_size // self.min_patch_size) ** 2
+        K_max = min(
+            int(self.token_coverage_max * max_patches),
+            self.K_min_abs * 8  # 合理上界
+        ) if max_patches > 0 else 64
+
         return {
             # 架构参数
             "image_size": image_size,
@@ -214,7 +222,9 @@ class ModelArchitectureConfig:
 
             # Tokenizer 参数
             "min_patch_size": self.min_patch_size,
-            "max_level": self.max_level,
+            "max_depth": self.max_depth,  # P0 修复: 统一使用 max_depth
+            "K_min": self.K_min_abs,
+            "K_max": K_max,
 
             # 注意力偏置参数
             "lca_temperature": self.lca_temperature,
@@ -308,7 +318,7 @@ class ModelArchitectureConfig:
             token_coverage_min=0.01,  # 默认 1%
             token_coverage_max=token_coverage_max,
             K_min_abs=config.K_min,
-            max_depth_hard_limit=config.max_level,
+            max_depth_hard_limit=config.max_depth,  # P0 修复: 统一使用 max_depth
 
             # FFN 类型
             ffn_type=config.ffn_type,
@@ -335,7 +345,7 @@ class ModelArchitectureConfig:
 
             # 训练策略
             pool=config.pool,
-            max_level=config.max_level,
+            max_depth=config.max_depth,  # P0 修复: 统一使用 max_depth
             freeze_quota=config.freeze_quota,
             freeze_tokenizer=config.freeze_tokenizer,
             freeze_tokenizer_epochs=config.freeze_tokenizer_epochs,
