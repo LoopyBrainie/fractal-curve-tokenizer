@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""自适应分形前馈网络模块
+r"""自适应分形前馈网络模块
 
 数学形式化
 ============
@@ -11,9 +11,10 @@ SwiGLU FFN (LLaMA/PaLM 风格):
 ### SiLU 与 Swish 等价性
 **SiLU (Sigmoid Linear Unit)** 和 **Swish** 是同一激活函数的两个名称：
 
-$$\text{SiLU}(x) = \text{Swish}(x) = x \cdot \sigma(x) = \frac{x}{1 + e^{-x}}$$
+.. math::
+    \text{SiLU}(x) = \text{Swish}(x) = x \cdot \sigma(x) = \frac{x}{1 + e^{-x}}
 
-其中 $\sigma(x) = \frac{1}{1 + e^{-x}}$ 是 sigmoid 函数。
+其中 :math:`\sigma(x) = \frac{1}{1 + e^{-x}}` 是 sigmoid 函数。
 
 **PyTorch 实现**:
 - `F.silu(x)` - PyTorch 内置 SiLU 激活函数

@@ -152,6 +152,25 @@ from pathlib import Path
 
 import numpy as np
 
+
+# =========================================================================
+# 工具函数
+# =========================================================================
+
+def obj_to_dict(obj: Any) -> Dict[str, Any]:
+    """将对象转换为字典 (支持 dataclass 和普通对象)"""
+    if hasattr(obj, '__dataclass_fields__'):
+        # dataclass
+        return asdict(obj)
+    elif hasattr(obj, '__dict__'):
+        # 普通对象
+        return {k: v for k, v in vars(obj).items() if not k.startswith('_')}
+    elif isinstance(obj, dict):
+        return obj
+    else:
+        return {'value': obj}
+
+
 # =========================================================================
 # I35: CUDA 优化配置 - 必须在第一次 torch 调用前设置
 # =========================================================================
@@ -1339,6 +1358,21 @@ def _compute_prefetch_factor(
 # 数据加载
 # ============================================================================
 
+# P-OPT: 模块级 collate_fn (可 pickle，用于多进程)
+def collate_fn_channels_last(batch, compile_model: bool = False):
+    """Collate 函数：转换为 channels_last 格式
+
+    Args:
+        batch: 数据批次
+        compile_model: 是否使用 torch.compile (编译时不在 CPU 端转换)
+    """
+    imgs, labels = default_collate(batch)
+    # P-OPT: 仅在不编译时在 CPU 端预转换
+    if not compile_model and imgs.dim() == 4:
+        imgs = imgs.to(memory_format=torch.channels_last)
+    return imgs, labels
+
+
 def create_dataloaders(
     spec: DatasetSpec,
     config: FractalConfigProtocol,
@@ -1542,21 +1576,12 @@ def create_dataloaders(
         # 添加 generator 参数以提高多进程随机性
         loader_kwargs['generator'] = torch.Generator().manual_seed(42)
 
-    # P-OPT: channels_last 预格式 collate_fn
-    # 注意: cudagraphs 要求纯 GPU 操作，将此逻辑移回模型 forward
-    # collate_fn 仍可保留用于非编译场景的优化
-    def collate_fn_channels_last(batch):
-        """Collate 函数：转换为 channels_last 格式"""
-        imgs, labels = default_collate(batch)
-        # P-OPT: 仅在不编译时在 CPU 端预转换
-        # 编译模式下保持 channels_first，让模型中的转换处理
-        if not config.compile_model and imgs.dim() == 4:
-            imgs = imgs.to(memory_format=torch.channels_last)
-        return imgs, labels
-
-    # 使用自定义 collate_fn 仅在启用 channels_last 且不编译时
+    # P-OPT: 使用模块级 collate_fn (可 pickle)
+    # 仅在启用 channels_last 且不编译时使用
     if config.channels_last and not config.compile_model:
-        loader_kwargs['collate_fn'] = collate_fn_channels_last
+        # 使用 functools.partial 绑定 compile_model 参数
+        from functools import partial
+        loader_kwargs['collate_fn'] = partial(collate_fn_channels_last, compile_model=False)
 
     train_loader = DataLoader(train_ds, sampler=SubsetRandomSampler(train_idx), **loader_kwargs)
     
@@ -3172,7 +3197,7 @@ def main():
         # 保存配置
         with open(exp_dir / "logs" / "config.json", 'w') as f:
             json.dump({
-                'training_config': asdict(config),
+                'training_config': obj_to_dict(config),
                 'cub200_config': {
                     'batch_size': cub200_config.batch_size,
                     'num_epochs': cub200_config.num_epochs,
@@ -3917,7 +3942,7 @@ def main():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_acc': val_acc,
                 'val_loss': val_loss,
-                'config': asdict(config),
+                'config': obj_to_dict(config),
             }, exp_dir / "checkpoints" / "best.pth")
             print(f"  [*] Best model saved: {val_acc:.2f}%")
         else:
