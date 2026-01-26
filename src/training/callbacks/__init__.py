@@ -362,17 +362,27 @@ class WandBCallback:
             splitter = getattr(tokenizer, 'splitter', None)
             if splitter is None or not hasattr(splitter, 'training') or not splitter.training:
                 return metrics
-            
-            # 提取可用指标 (I78: 使用 float() 替代 .item() 支持 torch.compile)
+
+            # 使用统一的 get_diagnostics() 接口
+            if hasattr(splitter, 'get_diagnostics'):
+                diag = splitter.get_diagnostics()
+                if diag:
+                    if 'temperature' in diag:
+                        metrics["splitter/temperature"] = float(diag['temperature'])
+                    if 'avg_selected' in diag:
+                        metrics["splitter/avg_tokens"] = float(diag['avg_selected'])
+
+            # 保留向后兼容的直接属性访问作为 fallback
             if hasattr(splitter, 'temperature') and splitter.temperature is not None:
-                metrics["splitter/temperature"] = float(splitter.temperature)
+                if "splitter/temperature" not in metrics:
+                    metrics["splitter/temperature"] = float(splitter.temperature)
 
             if hasattr(splitter, 'thresholds') and splitter.thresholds is not None:
                 thresh = splitter.thresholds
                 if hasattr(thresh, 'mean'):
                     metrics["splitter/threshold_mean"] = float(thresh.mean())
                     metrics["splitter/threshold_std"] = float(thresh.std())
-            
+
             # 尝试获取最近的性能统计
             if hasattr(splitter, '_last_perf_stats') and splitter._last_perf_stats:
                 stats = splitter._last_perf_stats

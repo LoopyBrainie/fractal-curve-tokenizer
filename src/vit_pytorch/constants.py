@@ -268,9 +268,13 @@ ELASTIC_COVERAGE_MAX: float = 0.25
 #: I36 优化: 与 K_MIN_SAMPLE_RATIO 保持一致
 ELASTIC_COVERAGE_MIN: float = 0.03
 
-#: Elastic Budget 损失权重
+#: Elastic Budget 损失权重 (Over)
 #: 数学: λ = 0.1 使损失量级与其他辅助损失匹配
 ELASTIC_LAMBDA_OVER: float = 0.1
+
+#: Elastic Budget 损失权重 (Under)
+#: 数学: λ_under < λ_over，因为欠采样比过采样危害小
+ELASTIC_LAMBDA_UNDER: float = 0.01
 
 #: 崩溃检测损失权重
 #: 数学: λ_collapse = 1.0 确保崩溃时强惩罚

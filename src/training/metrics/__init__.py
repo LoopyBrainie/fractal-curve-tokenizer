@@ -267,14 +267,15 @@ class ResourceMetrics:
         # Token 数量
         for count in token_counts.tolist():
             self._token_counts.append(count)
-        
+
         self._total_samples += token_counts.size(0)
-        
-        # 深度分布
+
+        # 深度分布 (I108-3: 向量化 bincount 替代 Python 循环)
         if depths is not None:
             depths = depths.clamp(0, self.max_depth)
-            for d in range(self.max_depth + 1):
-                self._depth_counts[d] += (depths == d).sum()
+            # bincount: counts[d] = |{i: depth_i = d}|
+            depth_counts_batch = torch.bincount(depths.long(), minlength=self.max_depth + 1)
+            self._depth_counts += depth_counts_batch
     
     def compute(self) -> Dict[str, float]:
         """计算资源指标"""
@@ -287,10 +288,12 @@ class ResourceMetrics:
             "std_tokens": token_counts.std().item() if len(token_counts) > 1 else 0,
         }
         
-        # 深度分布
+        # 深度分布 (I108-3: 向量化计算)
         total_tokens = self._depth_counts.sum().item()
         if total_tokens > 0:
-            for d in range(self.max_depth + 1):
-                results[f"depth_{d}_ratio"] = self._depth_counts[d].item() / total_tokens
+            # 向量化: ratios = counts / total
+            depth_ratios = (self._depth_counts.float() / total_tokens).tolist()
+            for d, ratio in enumerate(depth_ratios):
+                results[f"depth_{d}_ratio"] = ratio
         
         return results

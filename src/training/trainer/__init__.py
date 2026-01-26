@@ -36,8 +36,10 @@ import warnings
 # I36: 导入 BaseTokenizer 用于 FractalModelProtocol
 try:
     from vit_pytorch.tokenizer_streaming import BaseTokenizer
+    from vit_pytorch.model_fractal_vit import TrainingStats
 except ImportError:
     BaseTokenizer = None  # type: ignore
+    TrainingStats = None  # type: ignore
 
 
 # ============================================================================
@@ -59,37 +61,12 @@ class FractalModelProtocol(ModelProtocol):
     设计原则: 模型定义"我能做什么"，训练器决定"我怎么用你"
 
     数学形式化:
-        - get_extra_info() 返回辅助信息用于损失计算和监控
+        - forward() 返回 TrainingStats 用于损失计算和监控
         - configure_training() 接收训练配置，保持模型内部逻辑独立
         - get_splitter_diagnostics() 返回分割器诊断信息
     """
-
-    @property
-    def tokenizer(self) -> Optional[BaseTokenizer]:
-        """返回 tokenizer 实例"""
-        ...
-
-    def get_extra_info(
-        self,
-        img: torch.Tensor,
-        return_aux_info: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[List[Dict[str, Any]]]]:
-        """获取辅助信息
-
-        Args:
-            img: 输入图像 [B, C, H, W]
-            return_aux_info: 是否返回 aux_info
-
-        Returns:
-            logits: 分类输出 [B, num_classes]
-            aux_infos: 辅助信息列表，每个元素对应一个样本（I78: 修复后对齐实现）
-                - num_tokens: int - Token 数量
-                - levels_used: List[int] - 使用的深度列表
-                - depth_distribution: Dict[int, float] - 深度分布（归一化）
-                - splitter_diagnostics: Dict[str, Any] - 分割器诊断信息
-                - token_selection_entropy: float - 分割概率熵（可选，仅当 split_probs 可用时）
-        """
-        ...
+    # 前向传播返回 TrainingStats (单一接口)
+    def forward(self, img: torch.Tensor) -> TrainingStats: ...
 
     def configure_training(self, config: Dict[str, Any]) -> None:
         """配置训练相关参数
@@ -560,18 +537,10 @@ class ModularTrainer:
             batch_size = targets.size(0)
 
             with torch.amp.autocast('cuda', enabled=self.config.use_amp):
-                # I101-4: 优先使用 get_extra_info API 获取 aux_info
-                aux_info = None
-                if hasattr(self.model, 'get_extra_info'):
-                    outputs, aux_info = self.model.get_extra_info(inputs, return_aux_info=True)
-                else:
-                    model_output = self.model(inputs)
-                    # P0-Critical: 模型可能返回 (logits,) 或 (logits, aux_infos) 等元组
-                    # 提取 logits 用于损失计算
-                    if isinstance(model_output, tuple):
-                        outputs = model_output[0]
-                    else:
-                        outputs = model_output
+                # 单一接口: forward() 返回 TrainingStats
+                stats = self.model(inputs)
+                outputs = stats.logits
+
                 loss = self.loss_fn(outputs, targets)
 
                 # 辅助损失

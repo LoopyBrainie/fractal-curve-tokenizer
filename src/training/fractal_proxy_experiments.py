@@ -839,15 +839,15 @@ class FrozenEncoderExperiment(BaseExperiment):
                 # 1. 获取原始 ViT 特征 (冻结的 encoder)
                 with torch.no_grad():
                     if self.reference_model is not None:
-                        _, original_aux = self.reference_model(imgs, return_aux_info=True)
+                        original_stats = self.reference_model(imgs)
                     else:
                         # 使用当前模型但 encoder 冻结
-                        _, original_aux = self.wrapper.model(imgs, return_aux_info=True)
+                        original_stats = self.wrapper.model(imgs)
 
                     # 提取原始特征
-                    original_features = original_aux.get("transformer_tokens")
+                    original_features = original_stats.transformer_tokens
                     if original_features is None:
-                        original_features = original_aux.get("features")
+                        original_features = original_stats.features
 
                     if original_features is None:
                         logger.warning("无法提取原始特征，跳过 batch")

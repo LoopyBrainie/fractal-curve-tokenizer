@@ -128,7 +128,7 @@ class L1ClassificationMetrics:
     # 难样本分析
     hardest_classes: List[Tuple[int, float]] = field(default_factory=list)  # (class_id, error_rate)
 
-    # I35: Tokenizer 诊断信息 (从 get_extra_info 收集)
+    # Tokenizer 诊断信息 (从 TrainingStats 收集)
     avg_num_tokens: float = 0.0
     min_num_tokens: int = 0
     max_num_tokens: int = 0
@@ -515,15 +515,9 @@ class ClassificationEvaluator:
                 imgs = imgs.to(device)
                 labels = labels.to(device)
 
-                # I35: 使用 get_extra_info API 获取 logits 和辅助信息
-                # I78: 显式传递 return_aux_info=True，与训练器接口对齐
-                if hasattr(model, 'get_extra_info'):
-                    outputs, aux_infos = model.get_extra_info(imgs, return_aux_info=True)
-                else:
-                    outputs = model(imgs)
-                    if isinstance(outputs, tuple):
-                        outputs = outputs[0]
-                    aux_infos = None
+                # 单一接口: forward() 返回 TrainingStats
+                stats = model(imgs)
+                outputs = stats.logits
 
                 loss = F.cross_entropy(outputs, labels)
                 probs = F.softmax(outputs, dim=1)

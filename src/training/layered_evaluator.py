@@ -364,18 +364,14 @@ class FinegrainedClassificationEvaluator:
             all_preds = []
             all_probs = []
 
-            # I35: 使用 get_extra_info API 获取 logits 和辅助信息
+            # 单一接口: forward() 返回 TrainingStats
             with torch.no_grad():
                 for inputs, labels in test_loader:
                     inputs = inputs.to(device)
                     labels = labels.to(device)
 
-                    # I35: 优先使用 get_extra_info API（支持分词器诊断信息收集）
-                    if hasattr(trainer.model, 'get_extra_info'):
-                        outputs, aux_infos = trainer.model.get_extra_info(inputs, return_aux_info=True)
-                    else:
-                        outputs = trainer.model(inputs)
-                        aux_infos = None
+                    stats = trainer.model(inputs)
+                    outputs = stats.logits
 
                     probs = torch.softmax(outputs, dim=1)
                     preds = outputs.argmax(dim=1)

@@ -69,14 +69,9 @@ def diagnose_model_collapse(
             imgs = imgs.to(device)
             labels = labels.to(device)
 
-            # I35: 使用 get_extra_info API 获取 logits 和辅助信息
-            if hasattr(model, 'get_extra_info'):
-                outputs, aux_infos = model.get_extra_info(imgs)
-            else:
-                outputs = model(imgs)
-                if isinstance(outputs, tuple):
-                    outputs = outputs[0]
-                aux_infos = None
+            # 单一接口: forward() 返回 TrainingStats
+            stats = model(imgs)
+            outputs = stats.logits
 
             predictions = outputs.argmax(dim=1)
             

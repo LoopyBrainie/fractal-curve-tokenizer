@@ -113,6 +113,7 @@ from .constants import (
     ELASTIC_COVERAGE_MAX,
     ELASTIC_COVERAGE_MIN,
     ELASTIC_LAMBDA_OVER,
+    ELASTIC_LAMBDA_UNDER,
     ELASTIC_LAMBDA_COLLAPSE,
 )
 from .config import SplitterConfig
@@ -353,6 +354,12 @@ class GumbelTopKSplitter(
         self.K_max = K_max
         self.use_dynamic_k = use_dynamic_k
         self._config_image_size = image_size
+
+        # I136: 可配置的 Elastic Budget 覆盖率参数 (从 CLI 传入)
+        self._elastic_coverage_min = ELASTIC_COVERAGE_MIN
+        self._elastic_coverage_max = ELASTIC_COVERAGE_MAX
+        self._elastic_lambda_over = ELASTIC_LAMBDA_OVER
+        self._elastic_lambda_under = ELASTIC_LAMBDA_UNDER
 
         # 动态状态 (forward 中确定)
         self._current_max_depth: Optional[int] = None
@@ -2173,9 +2180,16 @@ class GumbelTopKSplitter(
             # I35: 移除死代码 DEPTH_KL_WEIGHT, DEPTH_QUOTA_ENABLED
             return losses
         
-        # 1. Elastic Budget Loss (I33: 相对预算版本)
+        # 1. Elastic Budget Loss (I33: 相对预算版本 - 死区设计)
         # I23-2 方案 B: 简化弹性惩罚
         # I33: 改造为相对覆盖率设计，与 _get_dynamic_k_bounds() 统一
+        # I136: 使用可配置的覆盖率参数，支持死区 (dead zone)
+        #
+        # 数学形式化:
+        #   Dead Zone: [β_min, β_max] 范围内无惩罚
+        #   Over penalty: L_over = λ_over × max(0, coverage - β_max)² × N
+        #   Under penalty: L_under = λ_under × max(0, β_min - coverage)² × N
+        #
         if include_elastic_budget:
             avg_tokens = self._avg_selected
             candidate_count = self.num_candidates
@@ -2183,16 +2197,20 @@ class GumbelTopKSplitter(
             # 相对覆盖率
             coverage = avg_tokens / candidate_count
 
-            # 相对损失: L = λ × max(0, coverage - β_max)² × N
-            # 梯度: ∂L/∂N_selected = 2 × λ × max(0, coverage - β_max) / N
-            over_loss = ELASTIC_LAMBDA_OVER * torch.relu(
-                coverage - ELASTIC_COVERAGE_MAX
+            # Over penalty: coverage > β_max
+            over_loss = self._elastic_lambda_over * torch.relu(
+                coverage - self._elastic_coverage_max
             ).pow(2) * candidate_count
 
-            losses['elastic_budget_loss'] = over_loss
+            # Under penalty: coverage < β_min
+            under_loss = self._elastic_lambda_under * torch.relu(
+                self._elastic_coverage_min - coverage
+            ).pow(2) * candidate_count
 
-            # 崩溃检测 (相对覆盖率 < 0.5%)
-            collapse_threshold = ELASTIC_COVERAGE_MIN * candidate_count
+            losses['elastic_budget_loss'] = over_loss + under_loss
+
+            # 崩溃检测 (相对覆盖率 < 下界的一半，触发强惩罚)
+            collapse_threshold = self._elastic_coverage_min * candidate_count * 0.5
             if actual_token_count is not None and actual_token_count < collapse_threshold:
                 collapse_loss = torch.tensor(ELASTIC_LAMBDA_COLLAPSE, device=device)
                 losses['collapse_loss'] = collapse_loss

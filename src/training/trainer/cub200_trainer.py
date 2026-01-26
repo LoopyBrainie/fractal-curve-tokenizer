@@ -809,16 +809,14 @@ class CUB200Trainer:
             scale_factor = 1.0 / accum_steps
 
             with autocast(device_type=self.device.type, enabled=self.config.use_amp):
-                # M2: 获取 logits 和 features（用于 Center Loss）
-                # I101-4: CUB200Trainer 使用 return_features=True 而非 get_extra_info()
-                # 这是因为 CUB200Trainer 是专用训练器，需要直接访问 features 用于 Center Loss
-                # 通用评估应使用 get_extra_info() 接口
+                # 单一接口: forward() 返回 TrainingStats
+                stats = self.model(imgs)
+                logits = stats.logits
+
                 if self.config.use_center_loss:
-                    # P1 Fix: 模型现在直接返回 tensor [B, D]，不再需要 stack
-                    logits, features = self.model(imgs, return_features=True)
+                    features = stats.features
                     loss, stats = self.compute_loss(logits, labels, features=features)
                 else:
-                    logits = self.model(imgs)
                     loss, stats = self.compute_loss(logits, labels)
 
                 # 累积归一化
@@ -941,16 +939,13 @@ class CUB200Trainer:
 
             # 验证禁用 AMP
             with autocast(device_type=self.device.type, enabled=False):
-                # M2: 统一使用 forward(return_features=True) 提取特征
-                # I101-4: CUB200Trainer 使用 return_features=True 而非 get_extra_info()
-                # 这是因为 CUB200Trainer 是专用训练器，需要直接访问 features
+                # 单一接口: forward() 返回 TrainingStats
+                stats = self.model(imgs)
+                outs = stats.logits
+
                 if return_features:
-                    outs, features = self.model(imgs, return_features=True)
-                    # P1 Fix: 模型直接返回 tensor [B, D]
-                    all_features.append(features.cpu())
+                    all_features.append(stats.features.cpu())
                     all_labels.append(labels.cpu())
-                else:
-                    outs = self.model(imgs)
 
                 # 检查 NaN/Inf
                 if torch.isnan(outs).any() or torch.isinf(outs).any():

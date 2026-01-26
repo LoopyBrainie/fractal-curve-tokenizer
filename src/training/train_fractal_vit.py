@@ -264,6 +264,7 @@ logging.getLogger('torch._dynamo').setLevel(logging.ERROR)
 
 # AMP 兼容层 (I78: PyTorch 2.0+ 使用统一 API)
 import torch
+import torch.nn.functional as F
 from torch.amp.autocast_mode import autocast
 from torch.amp.grad_scaler import GradScaler
 
@@ -1800,17 +1801,18 @@ def train_epoch(
             print(f"[DEBUG] Batch 0: 开始 forward pass, imgs.dtype={imgs.dtype}...", flush=True)
         
         with get_amp_context(device, config.use_amp):
-            # I30-2: 当启用 Hilbert 困难样本挖掘时，获取 tokens
-            # P0 修复: 使用 return_aux_info=True 替代废弃的 return_tokens=True
+            # 单一接口: forward() 返回 TrainingStats
             if hard_mining is not None and not use_mixup:
-                outs, aux_infos = model(imgs, return_aux_info=True)
-                # 从 aux_infos 提取 tokens 和 lengths（替代废弃的 return_tokens=True）
-                tokens = aux_infos[0].get('transformer_tokens', None) if aux_infos else None
-                token_lengths = aux_infos[0].get('lengths', None) if aux_infos else None
+                stats = model(imgs)
+                # 从 TrainingStats 提取信息
+                tokens = stats.transformer_tokens
+                token_lengths = stats.num_tokens
+                outs = stats.logits
             else:
-                outs, aux_infos = model(imgs, return_aux_info=True)  # I14-1 D1: 捕获 aux_info 用于崩溃检测
+                stats = model(imgs)
                 tokens = None
                 token_lengths = None
+                outs = stats.logits
             if i == 0 and use_mixup:
                 print(f"[DEBUG] Batch 0: forward 完成，outs.shape={outs.shape}", flush=True)
             
@@ -2112,8 +2114,9 @@ def evaluate(
             continue
         
         with get_amp_context(device, use_amp):
-            outs, _ = model(imgs, return_aux_info=True)
-            
+            stats = model(imgs)
+            outs = stats.logits
+
             # 检查 logits 是否有问题
             if torch.isnan(outs).any() or torch.isinf(outs).any():
                 nan_batches += 1
@@ -2484,11 +2487,13 @@ def verify_train_eval_consistency(
     # 检查 1: train/eval 输出差异
     model.eval()
     with get_amp_context(device, config.use_amp):
-        out_eval, aux_eval = model(imgs, return_aux_info=True)
-    
+        stats_eval = model(imgs)
+        out_eval = stats_eval.logits
+
     model.train()
     with get_amp_context(device, config.use_amp):
-        out_train, aux_train = model(imgs, return_aux_info=True)
+        stats_train = model(imgs)
+        out_train = stats_train.logits
     model.eval()  # 恢复 eval 模式
     
     # 计算输出差异
@@ -2673,12 +2678,19 @@ def main():
     parser.add_argument("--soft-entropy-target", type=float, default=None,
                        help="Target entropy for mode='target' (default: None, auto=ln(max_depth+1))")
     
-    # P10-9: 弹性预算损失参数
+    # P10-9: 弹性预算损失参数 (I33: 使用相对覆盖率)
     parser.add_argument("--include-elastic-budget", action="store_true", default=True,
                        help="Enable elastic budget loss (default: True, recommended)")
     parser.add_argument("--no-elastic-budget", action="store_false", dest="include_elastic_budget",
                        help="Disable elastic budget loss")
-    # I33: elastic-N-* CLI 参数已移除，使用 ELASTIC_COVERAGE_* 常量保证跨尺度一致性
+    parser.add_argument("--elastic-coverage-min", type=float, default=0.03,
+                       help="I33: Elastic budget minimum coverage ratio (dead zone lower bound, default: 0.03)")
+    parser.add_argument("--elastic-coverage-max", type=float, default=0.25,
+                       help="I33: Elastic budget maximum coverage ratio (dead zone upper bound, default: 0.25)")
+    parser.add_argument("--elastic-lambda-over", type=float, default=0.1,
+                       help="Penalty weight for tokens exceeding coverage_max (default: 0.1)")
+    parser.add_argument("--elastic-lambda-under", type=float, default=0.01,
+                       help="Penalty weight for tokens below coverage_min (default: 0.01)")
 
     # 训练
     parser.add_argument("--epochs", type=int, default=50)
@@ -2915,6 +2927,10 @@ def main():
 
             # 损失函数配置
             self.include_elastic_budget = args.include_elastic_budget
+            self.elastic_coverage_min = args.elastic_coverage_min
+            self.elastic_coverage_max = args.elastic_coverage_max
+            self.elastic_lambda_over = args.elastic_lambda_over
+            self.elastic_lambda_under = args.elastic_lambda_under
             self.include_soft_entropy = args.include_soft_entropy
             self.soft_entropy_target = args.soft_entropy_target
             self.soft_entropy_weight = args.soft_entropy_weight
@@ -2990,6 +3006,14 @@ def main():
         if frozen_tokenizer_params:
             freeze_mode = "permanent" if config.freeze_tokenizer_epochs == 0 else f"first {config.freeze_tokenizer_epochs} epochs"
             print(f"[I24-1] Frozen tokenizer params ({freeze_mode}): {frozen_tokenizer_params}")
+
+    # I136: 配置 Elastic Budget 覆盖率参数 (从 CLI 传入)
+    if hasattr(model, 'splitter'):
+        model.splitter._elastic_coverage_min = config.elastic_coverage_min
+        model.splitter._elastic_coverage_max = config.elastic_coverage_max
+        model.splitter._elastic_lambda_over = config.elastic_lambda_over
+        model.splitter._elastic_lambda_under = config.elastic_lambda_under
+        print(f"[I136] Elastic budget config: coverage∈[{config.elastic_coverage_min:.2%}, {config.elastic_coverage_max:.2%}], λ_over={config.elastic_lambda_over}, λ_under={config.elastic_lambda_under}")
     
     # 打印模型信息
     params = sum(p.numel() for p in model.parameters())
@@ -3230,25 +3254,36 @@ def main():
         print("[OK] Using channels-last memory format")
 
     # torch.compile 编译优化 (PyTorch 2.0+)
-    # 重要: 编译前强制清理所有 CUDA 缓存
+    # I107-2 修复: 添加 CUDA 检测，避免在无 CUDA 系统上设置不存在的配置
     if config.compile_model:
         try:
-            # 强制进行全面的垃圾回收和 CUDA 内存清理
+            # 强制进行全面的垃圾回收
             import gc
             gc.collect()
             gc.collect()
             gc.collect()
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+
+            # 仅在 CUDA 可用时清理 CUDA 缓存
+            has_cuda = torch.cuda.is_available()
+            if has_cuda:
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
 
             # 设置编译缓存和错误处理
             torch._dynamo.config.cache_size_limit = 64
             torch._dynamo.config.suppress_errors = True
 
-            # 禁用 inductor 的一些可能导致 CUDA 内存问题的优化
-            torch._inductor.config.max_autotune = False
-            torch._inductor.config.triton.cudnn = True
-            torch._inductor.config.triton.use_cudnn = True
+            # 仅在 CUDA 可用时设置 inductor CUDA 配置
+            # I107-2 修复: 检查配置是否存在后再设置
+            if has_cuda:
+                try:
+                    torch._inductor.config.max_autotune = False
+                    if hasattr(torch._inductor.config.triton, 'cudnn'):
+                        torch._inductor.config.triton.cudnn = True
+                    if hasattr(torch._inductor.config.triton, 'use_cudnn'):
+                        torch._inductor.config.triton.use_cudnn = True
+                except AttributeError as cfg_e:
+                    print(f"[INFO] CUDA inductor config not available: {cfg_e}")
 
             # 使用 reduce-overhead 模式，更稳定
             model = torch.compile(
@@ -3257,8 +3292,10 @@ def main():
                 fullgraph=False,
                 dynamic=True,
             )
-            print("[OK] Model compiled with torch.compile (mode=reduce-overhead, dynamic=True)")
-            print("[INFO] 首次运行会进行 JIT 编译，可能耗时 1-2 分钟")
+            compile_mode = 'reduce-overhead' if has_cuda else 'default'
+            print(f"[OK] Model compiled with torch.compile (mode={compile_mode})")
+            if has_cuda:
+                print("[INFO] 首次运行会进行 JIT 编译，可能耗时 1-2 分钟")
         except Exception as e:
             print(f"[WARN] torch.compile failed: {e}")
             print("[INFO] 回退到 eager 模式继续训练")
