@@ -247,7 +247,7 @@ class TestLevelsInfoBoundary:
         """大 max_depth 测试"""
         data = torch.zeros(1, 8, 9, dtype=torch.long)  # D+1=9
         info = LevelsInfo(data=data, max_depth=8)
-        assert info.max_level == 8
+        assert info.max_depth == 8
 
     def test_device_consistency(self):
         """设备一致性测试"""
@@ -262,7 +262,7 @@ class TestLevelsInfoBoundary:
         info = LevelsInfo.random(B=2, N=16, max_depth=4)
         assert info.batch_size == 2
         assert info.num_tokens == 16
-        assert info.max_level == 4
+        assert info.max_depth == 4
 
 
 class TestHilbertIndexBoundary:

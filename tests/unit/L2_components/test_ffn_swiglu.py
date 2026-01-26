@@ -206,12 +206,12 @@ class TestAdaptiveFractalFeedForward:
         # 输出应该不同
         assert not torch.allclose(out_gelu, out_swiglu, atol=1e-4)
 
-    def test_max_level_parameter(self):
-        """max_level 参数测试"""
+    def test_max_depth_parameter(self):
+        """max_depth 参数测试"""
         dim = 64
 
-        ffn_small = AdaptiveFractalFeedForward(dim, dim * 4, max_level=4, ffn_type='swiglu_level')
-        ffn_large = AdaptiveFractalFeedForward(dim, dim * 4, max_level=8, ffn_type='swiglu_level')
+        ffn_small = AdaptiveFractalFeedForward(dim, dim * 4, max_depth=4, ffn_type='swiglu_level')
+        ffn_large = AdaptiveFractalFeedForward(dim, dim * 4, max_depth=8, ffn_type='swiglu_level')
 
         x = torch.randn(2, 16, dim)
 

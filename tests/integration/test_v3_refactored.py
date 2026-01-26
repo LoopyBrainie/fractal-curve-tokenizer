@@ -81,8 +81,8 @@ def test_v3_basic():
     for k, v in tokenizer.get_training_stats().items():
         print(f"  {k}: {v}")
 
-    # Check entropy loss (should be None for Variable Depth)
-    print(f"\nEntropy loss: {tokenizer.get_entropy_loss()}")
+    # Check entropy loss (I107-3: splitter now handles entropy loss via MetricsSplitter interface)
+    print(f"\nEntropy loss: {splitter.get_entropy_loss()}")
     print(f"Scale entropy: {tokenizer.get_scale_entropy()}")
 
     print("\n Test 1 PASSED")

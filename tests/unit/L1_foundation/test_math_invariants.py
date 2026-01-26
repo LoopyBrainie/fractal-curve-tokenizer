@@ -377,7 +377,7 @@ class TestTensorShapeConsistency:
         assert info.shape == (B, N, D + 1)
         assert info.batch_size == B
         assert info.num_tokens == N
-        assert info.max_level == D
+        assert info.max_depth == D
 
     @pytest.mark.数学
     def test_depths_extraction(self):

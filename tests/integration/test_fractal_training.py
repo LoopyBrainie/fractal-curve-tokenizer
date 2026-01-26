@@ -23,7 +23,7 @@ from training.samplers import (
     ProgressiveSampler,
     compute_effective_sample_weights,
 )
-from training.losses import FocalLoss, ClassBalancedCE, FocalClassBalancedLoss
+from training.losses import FocalLoss, ClassBalancedCrossEntropy, FocalClassBalancedLoss
 from training.metrics import ClassificationMetrics
 from training.schedulers import (
     FLOPSConfig,
@@ -193,32 +193,32 @@ class TestFocalLoss:
             f"Hard ratio ({ratio_hard:.4f}) should be > Easy ratio ({ratio_easy:.4f})"
 
 
-class TestClassBalancedCE:
-    """ClassBalancedCE 数学验证"""
-    
+class TestClassBalancedCrossEntropy:
+    """ClassBalancedCrossEntropy 数学验证"""
+
     def test_weight_calculation(self):
         """验证有效样本数权重计算"""
         class_counts = torch.tensor([100.0, 10.0, 1.0])
         beta = 0.9999
-        
+
         weights = compute_effective_sample_weights(class_counts, beta)
-        
+
         # 样本越少，权重越大
         assert weights[2] > weights[1] > weights[0], \
             f"Weights should be increasing: {weights.tolist()}"
-        
+
         # 权重平均值应为 1
         assert abs(weights.mean() - 1.0) < 0.01
-    
+
     def test_loss_matches_weighted_ce(self):
-        """ClassBalancedCE 应该等于加权 CE"""
+        """ClassBalancedCrossEntropy 应该等于加权 CE"""
         torch.manual_seed(42)
-        
+
         class_counts = torch.tensor([100.0, 50.0, 10.0])
         logits = torch.randn(32, 3)
         targets = torch.randint(0, 3, (32,))
-        
-        cb_ce = ClassBalancedCE(class_counts, beta=0.9999)
+
+        cb_ce = ClassBalancedCrossEntropy(class_counts, beta=0.9999)
         
         # 手动计算权重并使用标准 CE
         weights = compute_effective_sample_weights(class_counts, 0.9999)

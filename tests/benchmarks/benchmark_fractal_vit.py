@@ -205,7 +205,7 @@ def benchmark_simple_fractal_vit(
         heads=4,
         mlp_dim=256,
         channels=3,
-        max_level=3,
+        max_depth=3,
     ).to(device)
     
     images = torch.randn(batch_size, 3, image_size, image_size, device=device)
@@ -231,7 +231,7 @@ def benchmark_next_gen_fractal_vit(
         heads=4,
         mlp_dim=256,
         channels=3,
-        max_level=3,
+        max_depth=3,
     ).to(device)
     
     images = torch.randn(batch_size, 3, image_size, image_size, device=device)
@@ -333,7 +333,7 @@ def run_tokenization_benchmark_suite(
                 heads=4,
                 mlp_dim=256,
                 channels=3,
-                max_level=3,
+                max_depth=3,
             ).to(device)
             
             for img_type, generator in [

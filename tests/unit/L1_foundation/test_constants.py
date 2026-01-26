@@ -282,39 +282,6 @@ class TestAttentionBiasScales:
         assert LEVEL_BIAS_SCALE <= HILBERT_BIAS_SCALE
 
 
-class TestSplitGamma:
-    """阈值衰减因子验证."""
-
-    def test_split_gamma_in_valid_range(self):
-        """SPLIT_GAMMA ∈ (0, 1)."""
-        from vit_pytorch.constants import SPLIT_GAMMA
-
-        assert 0 < SPLIT_GAMMA < 1
-
-
-class TestLogitsClamping:
-    """Logits 裁剪常量验证."""
-
-    def test_logits_clamp_bounds(self):
-        """LOGITS_CLAMP_MIN < LOGITS_CLAMP_MAX."""
-        from vit_pytorch.constants import (
-            LOGITS_CLAMP_MIN,
-            LOGITS_CLAMP_MAX,
-        )
-
-        assert LOGITS_CLAMP_MIN < LOGITS_CLAMP_MAX
-
-    def test_logits_clamp_range_wide_enough(self):
-        """Logits 裁剪范围足够宽以覆盖有效值."""
-        from vit_pytorch.constants import (
-            LOGITS_CLAMP_MIN,
-            LOGITS_CLAMP_MAX,
-        )
-
-        assert LOGITS_CLAMP_MIN <= -5
-        assert LOGITS_CLAMP_MAX >= 5
-
-
 class TestOverlapPenalty:
     """重叠惩罚常量验证."""
 

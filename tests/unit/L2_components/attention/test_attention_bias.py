@@ -173,7 +173,7 @@ class TestIntegrationWithAttention:
             dim=64,
             heads=4,
             dim_head=16,
-            max_level=8,
+            max_depth=8,  # P0 修复: 统一使用 max_depth
             use_hilbert_bias=True,
         )
 
@@ -201,7 +201,7 @@ class TestIntegrationWithAttention:
         attention = HilbertAwareMultiScaleAttention(
             dim=64,
             heads=4,
-            max_level=8,
+            max_depth=8,  # P0 修复: 统一使用 max_depth
             use_hilbert_bias=True,
         )
 
@@ -237,16 +237,15 @@ class TestEdgeCases:
         assert torch.allclose(bias[:, 0, 0], expected_bias)
 
     def test_max_depth_exceeded(self):
-        """超过最大深度测试"""
+        """超过最大深度测试 - I34-13: 超界时抛出异常而非静默钳位"""
         lca_bias = LCAHilbertBias(max_depth=4, heads=2, lca_temperature=None)
 
         levels_info = torch.randint(0, 4, (4, 10))
-        levels_info[:, 0] = 8
+        levels_info[:, 0] = 8  # 超出 max_depth=4 的范围
 
-        bias = lca_bias(levels_info)
-
-        assert bias is not None
-        assert bias.shape == (2, 4, 4)
+        # I34-13: 静默钳位掩盖 bug，改为抛出异常
+        with pytest.raises(ValueError, match="LCA depth out of bounds"):
+            lca_bias(levels_info)
 
     def test_device_transfer(self):
         """设备转移测试"""

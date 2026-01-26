@@ -16,6 +16,12 @@ from pathlib import Path
 import torch
 import pytest
 
+
+# P2-3 修复: 定义 PerformanceWarning 类
+class PerformanceWarning(UserWarning):
+    """Warning for performance-related issues detected by vectorization audit."""
+    pass
+
 # Add tests directory to path for vectorization_audit import
 _tests_dir = Path(__file__).parent.parent.parent
 if str(_tests_dir) not in sys.path:
@@ -56,8 +62,7 @@ def test_next_gen_fractal_vit_forward_pass(device: str) -> None:
         heads=4,
         mlp_dim=384,
         min_patch_size=(4, 4),  # 使用 2 的幂次
-        max_level=3,
-        num_scales=2,
+        max_depth=3,
     ).to(device)
     model.eval()
 
@@ -81,8 +86,7 @@ def test_next_gen_fractal_vit_handles_varied_sizes(device: str) -> None:
             heads=2,
             mlp_dim=256,
             min_patch_size=(4, 4),  # 使用 2 的幂次
-            max_level=3,
-            num_scales=2,
+            max_depth=3,
         ).to(device)
         model.eval()
 
@@ -145,7 +149,6 @@ def test_batch_size_independence() -> None:
         depth=2,
         heads=2,
         mlp_dim=128,
-        num_scales=2,
     )
     model.eval()
     
@@ -171,7 +174,6 @@ def test_deterministic_eval_mode() -> None:
         depth=2,
         heads=2,
         mlp_dim=128,
-        num_scales=2,
     )
     model.eval()
     
@@ -214,8 +216,7 @@ def test_batch_consistency(vectorization_audit_enabled) -> None:
         heads=4,
         mlp_dim=256,
         min_patch_size=(4, 4),
-        max_level=3,
-        num_scales=2,
+        max_depth=3,
     )
     model.eval()
 

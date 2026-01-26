@@ -452,7 +452,7 @@ def create_model_copy(model_name: str, template: nn.Module) -> nn.Module:
         heads=DEFAULT_HEADS,
         mlp_dim=DEFAULT_MLP_DIM,
         channels=DEFAULT_CHANNELS,
-        max_level=template.max_level,
+        max_depth=template.max_depth,
     )
 
 
@@ -518,7 +518,7 @@ def run_convergence_benchmark(
             heads=4,
             mlp_dim=256,
             channels=3,
-            max_level=2,
+            max_depth=2,
         ),
     }
     

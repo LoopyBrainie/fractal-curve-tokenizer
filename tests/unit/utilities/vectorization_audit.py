@@ -159,10 +159,12 @@ class ASTVectorizationAnalyzer:
     def __init__(self, ignore_init: bool = True):
         self.ignore_init = ignore_init
         self.issues: List[VectorizationIssue] = []
+        self._source_code: Optional[str] = None  # P2-3 修复: 存储 source_code 用于 AST 解析
 
     def analyze_module(self, module: Type, source_path: Optional[str] = None) -> List[VectorizationIssue]:
         """Analyze a module class for vectorization issues."""
         self.issues = []
+        self._source_code = None  # P2-3 修复: 重置 source_code
 
         # Get source code
         if source_path is None:
@@ -173,9 +175,9 @@ class ASTVectorizationAnalyzer:
 
         try:
             with open(source_path, "r", encoding="utf-8") as f:
-                source_code = f.read()
+                self._source_code = f.read()  # P2-3 修复: 存储 source_code
 
-            tree = ast.parse(source_code)
+            tree = ast.parse(self._source_code)
             self._analyze_tree(tree, module.__name__, source_path)
 
         except (SyntaxError, OSError, UnicodeDecodeError) as e:
@@ -197,8 +199,12 @@ class ASTVectorizationAnalyzer:
         file_path: str,
         in_forward_method: bool = False,
         current_function: Optional[str] = None,
+        source_code: Optional[str] = None,
     ) -> None:
         """Recursively analyze AST tree for issues."""
+        # P2-3 修复: 使用传入的 source_code 或实例变量
+        source_code = source_code or self._source_code
+
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
                 func_name = node.name
@@ -216,7 +222,7 @@ class ASTVectorizationAnalyzer:
                 # Analyze function body for loops
                 for child in ast.walk(node):
                     if isinstance(child, self.LOOP_NODES) and should_analyze:
-                        self._check_loop(node, child, file_path, module_name, current_function)
+                        self._check_loop(node, child, file_path, module_name, current_function, source_code)
 
                 # Check for recursion
                 if should_analyze:
@@ -231,6 +237,7 @@ class ASTVectorizationAnalyzer:
                             file_path,
                             in_forward_method=True,
                             current_function=f"{current_function}.{child.name}",
+                            source_code=source_code,
                         )
 
                 # Restore previous state
@@ -243,14 +250,18 @@ class ASTVectorizationAnalyzer:
         file_path: str,
         module_name: str,
         func_name: str,
+        source_code: Optional[str] = None,
     ) -> None:
         """Check if a loop represents a potential vectorization issue."""
         loop_type = "for" if isinstance(loop_node, ast.For) else "while"
 
-        # Check if this is a known vectorized pattern
-        loop_code = ast.get_source_segment(
-            inspect.getsource(func_node), loop_node
-        ) or ""
+        # P2-3 修复: 使用 source_code 而非 inspect.getsource(func_node)
+        # ast.get_source_segment 需要源代码字符串而非 AST 节点
+        source_code = source_code or self._source_code
+        if source_code:
+            loop_code = ast.get_source_segment(source_code, loop_node) or ""
+        else:
+            loop_code = ""
 
         # Skip known vectorized patterns
         if any(pattern in loop_code for pattern in ["torch.", "for ", "while "]):

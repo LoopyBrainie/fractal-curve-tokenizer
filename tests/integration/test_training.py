@@ -87,7 +87,7 @@ def test_vit_uses_custom_components() -> None:
         heads=2,
         mlp_dim=32,
         min_patch_size=(4, 4),
-        max_level=3,
+        max_depth=3,
         tokenizer=tokenizer,
         position_embedding=positional,
     )
@@ -111,7 +111,7 @@ def test_next_gen_vit_single_training_step_updates_parameters() -> None:
         heads=4,
         mlp_dim=128,
         min_patch_size=(4, 4),
-        max_level=2,
+        max_depth=2,
     )
 
     model.train()

@@ -52,19 +52,19 @@ class TestHierarchicalAttention:
         return 32
 
     @pytest.fixture
-    def max_level(self):
+    def max_depth(self):
         return 3
 
     @pytest.fixture
     def attn_module(
-        self, dim, heads, dim_head, max_level, device
+        self, dim, heads, dim_head, max_depth, device
     ):
         """创建带层级化注意力的Attention模块。"""
         return HilbertAwareMultiScaleAttention(
             dim=dim,
             heads=heads,
             dim_head=dim_head,
-            max_level=max_level,
+            max_depth=max_depth,
             use_hierarchical_attention=True,
             use_hilbert_bias=True,
             use_level_scaling=True,
@@ -72,24 +72,24 @@ class TestHierarchicalAttention:
 
     @pytest.fixture
     def attn_module_no_bias(
-        self, dim, heads, dim_head, max_level, device
+        self, dim, heads, dim_head, max_depth, device
     ):
         """创建不带偏置的层级化Attention模块（用于效率测试）。"""
         return HilbertAwareMultiScaleAttention(
             dim=dim,
             heads=heads,
             dim_head=dim_head,
-            max_level=max_level,
+            max_depth=max_depth,
             use_hierarchical_attention=True,
             use_hilbert_bias=False,
             use_level_scaling=False,
         ).to(device)
 
     @pytest.fixture
-    def levels_info(self, batch_size, seq_len, max_level, device):
+    def levels_info(self, batch_size, seq_len, max_depth, device):
         """生成模拟的levels_info（模拟四叉树深度分布）。
 
-        格式: [B, N, max_level+1]
+        格式: [B, N, max_depth+1]
         - 第一列 ([:,:,0]): 深度值
         - 后续列 ([:,:,1:]): 路径信息（全0）
         """
@@ -107,8 +107,8 @@ class TestHierarchicalAttention:
             depths.append(b_depths)
 
         depths_tensor = torch.tensor(depths, dtype=torch.long, device=device)  # [B, N]
-        # 扩展为 [B, N, max_level+1] 格式，第一列是深度值
-        levels_info_expanded = torch.zeros(batch_size, seq_len, max_level + 1, device=device, dtype=torch.long)
+        # 扩展为 [B, N, max_depth+1] 格式，第一列是深度值
+        levels_info_expanded = torch.zeros(batch_size, seq_len, max_depth + 1, device=device, dtype=torch.long)
         levels_info_expanded[:, :, 0] = depths_tensor  # 第一列是深度
 
         return levels_info_expanded
@@ -179,23 +179,23 @@ class TestHierarchicalAttention:
         assert output2.shape == (batch_size, seq_len, dim)
 
     def test_no_hierarchical_baseline(
-        self, batch_size, seq_len, dim, heads, dim_head, max_level, device
+        self, batch_size, seq_len, dim, heads, dim_head, max_depth, device
     ):
         """测试4: 基线（非层级化）注意力仍能正常工作。"""
         attn_baseline = HilbertAwareMultiScaleAttention(
             dim=dim,
             heads=heads,
             dim_head=dim_head,
-            max_level=max_level,
+            max_depth=max_depth,
             use_hierarchical_attention=False,
         ).to(device)
 
         x = torch.randn(batch_size, seq_len, dim, device=device)
 
-        levels_info = torch.zeros(batch_size, seq_len, max_level + 1, device=device, dtype=torch.long)
+        levels_info = torch.zeros(batch_size, seq_len, max_depth + 1, device=device, dtype=torch.long)
         for b in range(batch_size):
             for n in range(seq_len):
-                d = n % (max_level + 1)
+                d = n % (max_depth + 1)
                 levels_info[b, n, 0] = d  # 第一列是深度值
 
         with torch.no_grad():
@@ -205,7 +205,7 @@ class TestHierarchicalAttention:
             f"基线输出形状应为 {(batch_size, seq_len, dim)}，实际为 {output.shape}"
 
     def test_efficiency_comparison(
-        self, batch_size, seq_len, dim, heads, dim_head, max_level, device
+        self, batch_size, seq_len, dim, heads, dim_head, max_depth, device
     ):
         """测试5: 效率对比。
 
@@ -223,7 +223,7 @@ class TestHierarchicalAttention:
         pytest.skip("效率测试在CPU上不稳定，使用数学分析验证")
 
     def test_with_hilbert_bias(
-        self, batch_size, seq_len, dim, heads, dim_head, max_level, device
+        self, batch_size, seq_len, dim, heads, dim_head, max_depth, device
     ):
         """测试6: 带Hilbert偏置的层级化注意力。
 
@@ -232,11 +232,11 @@ class TestHierarchicalAttention:
         pytest.skip("需要完整的regions设置，暂不测试")
 
     def test_single_depth_tokens(
-        self, attn_module, batch_size, seq_len, dim, max_level, device
+        self, attn_module, batch_size, seq_len, dim, max_depth, device
     ):
         """测试7: 单一深度的tokens（边界情况）。"""
         # 所有tokens都在同一个深度
-        levels_info = torch.zeros(batch_size, seq_len, max_level + 1, device=device, dtype=torch.long)
+        levels_info = torch.zeros(batch_size, seq_len, max_depth + 1, device=device, dtype=torch.long)
         levels_info[:, :, 0] = 2  # 第一列是深度值，所有token在depth 2
 
         x = torch.randn(batch_size, seq_len, dim, device=device)
@@ -280,14 +280,14 @@ class TestHierarchicalAttention:
         assert output.shape == (batch_size, max_seq_len, dim)
 
     def test_gradient_flow_through_depth_scales(
-        self, dim, heads, dim_head, max_level, device
+        self, dim, heads, dim_head, max_depth, device
     ):
         """测试9: 深度缩放因子有梯度。"""
         attn = HilbertAwareMultiScaleAttention(
             dim=dim,
             heads=heads,
             dim_head=dim_head,
-            max_level=max_level,
+            max_depth=max_depth,
             use_hierarchical_attention=True,
             use_hilbert_bias=False,
             use_level_scaling=False,
@@ -296,10 +296,10 @@ class TestHierarchicalAttention:
         batch_size, seq_len = 2, 64
         x = torch.randn(batch_size, seq_len, dim, device=device, requires_grad=True)
 
-        levels_info = torch.zeros(batch_size, seq_len, max_level + 1, device=device, dtype=torch.long)
+        levels_info = torch.zeros(batch_size, seq_len, max_depth + 1, device=device, dtype=torch.long)
         for b in range(batch_size):
             for n in range(seq_len):
-                d = n % (max_level + 1)
+                d = n % (max_depth + 1)
                 levels_info[b, n, 0] = d  # 第一列是深度值
 
         output = attn(x, levels_info=levels_info)
@@ -337,14 +337,14 @@ class TestHierarchicalAttentionIntegration:
     ):
         """测试: Attention模块在模拟场景中正常工作。"""
         batch_size, seq_len, dim = 2, 64, 128
-        max_level = 3
+        max_depth = 3
 
         # 创建层级化注意力模块
         attn = HilbertAwareMultiScaleAttention(
             dim=dim,
             heads=4,
             dim_head=32,
-            max_level=max_level,
+            max_depth=max_depth,
             use_hierarchical_attention=True,
             use_hilbert_bias=False,
             use_level_scaling=True,
@@ -352,12 +352,12 @@ class TestHierarchicalAttentionIntegration:
 
         # 创建模拟输入
         x = torch.randn(batch_size, seq_len, dim, device=device)
-        levels_info = torch.zeros(batch_size, seq_len, max_level + 1, device=device, dtype=torch.long)
+        levels_info = torch.zeros(batch_size, seq_len, max_depth + 1, device=device, dtype=torch.long)
 
         # 模拟深度分布：depth 0有1个, depth 1有4个, depth 2有16个, depth 3有43个
         for b in range(batch_size):
             token_idx = 0
-            for d in range(max_level + 1):
+            for d in range(max_depth + 1):
                 if d == 0:
                     num = 1
                 elif d == 1:

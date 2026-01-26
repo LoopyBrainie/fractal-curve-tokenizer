@@ -203,28 +203,28 @@ class TestFractalTransformerDynamicDepth:
         return 12
 
     @pytest.fixture
-    def max_level(self):
+    def max_depth(self):
         return 3
 
     @pytest.fixture
-    def levels_info(self, max_level, batch_size=4, seq_len=64):
+    def levels_info(self, max_depth, batch_size=4, seq_len=64):
         """创建有效的levels_info。"""
-        levels_info = torch.zeros(batch_size, seq_len, max_level + 1, dtype=torch.long)
+        levels_info = torch.zeros(batch_size, seq_len, max_depth + 1, dtype=torch.long)
         for b in range(batch_size):
             for n in range(seq_len):
-                d = n % (max_level + 1)
+                d = n % (max_depth + 1)
                 levels_info[b, n, 0] = d  # 第一列是深度值
         return levels_info
 
     @pytest.fixture
-    def transformer(self, dim, depth, max_level, device):
+    def transformer(self, dim, depth, max_depth, device):
         return FractalTransformer(
             dim=dim,
             depth=depth,
             heads=4,
             dim_head=32,
             mlp_dim=256,
-            max_level=max_level,
+            max_depth=max_depth,
             use_dynamic_depth=True,
             min_layers=4,
         ).to(device)
@@ -279,7 +279,7 @@ class TestFractalTransformerDynamicDepth:
         assert x.grad is not None, "输入应有梯度"
 
     def test_no_dynamic_depth(
-        self, dim, depth, max_level, device, levels_info
+        self, dim, depth, max_depth, device, levels_info
     ):
         """测试10: 禁用动态深度时正常工作。
 
@@ -291,7 +291,7 @@ class TestFractalTransformerDynamicDepth:
             heads=4,
             dim_head=32,
             mlp_dim=256,
-            max_level=max_level,
+            max_depth=max_depth,
             use_dynamic_depth=False,
         ).to(device)
 
@@ -312,12 +312,12 @@ class TestComplexityFromDepthDistribution:
 
         预期: 返回有效的复杂度得分
         """
-        batch_size, seq_len, max_level = 4, 64, 3
+        batch_size, seq_len, max_depth = 4, 64, 3
 
         # 随机生成深度分布
-        depths = torch.randint(0, max_level + 1, (batch_size, seq_len))
+        depths = torch.randint(0, max_depth + 1, (batch_size, seq_len))
 
-        complexity = compute_complexity_from_depth_distribution(depths, max_level)
+        complexity = compute_complexity_from_depth_distribution(depths, max_depth)
 
         assert complexity.shape == (batch_size, 1)
         assert complexity.min() >= 0
@@ -328,7 +328,7 @@ class TestComplexityFromDepthDistribution:
 
         预期: 更多深层token → 更高复杂度
         """
-        batch_size, seq_len, max_level = 4, 64, 3
+        batch_size, seq_len, max_depth = 4, 64, 3
 
         # 浅层分布：只有深度0和1
         shallow_depths = torch.zeros(batch_size, seq_len, dtype=torch.long)
@@ -340,8 +340,8 @@ class TestComplexityFromDepthDistribution:
         deep_depths[:, :16] = 1  # 深度1
         deep_depths[:, 16:] = 3  # 深度3
 
-        shallow_complexity = compute_complexity_from_depth_distribution(shallow_depths, max_level)
-        deep_complexity = compute_complexity_from_depth_distribution(deep_depths, max_level)
+        shallow_complexity = compute_complexity_from_depth_distribution(shallow_depths, max_depth)
+        deep_complexity = compute_complexity_from_depth_distribution(deep_depths, max_depth)
 
         # 深层分布应该有更高的复杂度
         assert deep_complexity.mean() > shallow_complexity.mean(), \
@@ -364,21 +364,21 @@ class TestDynamicComputationIntegration:
         return 12
 
     @pytest.fixture
-    def max_level(self):
+    def max_depth(self):
         return 3
 
     @pytest.fixture
-    def levels_info(self, max_level, batch_size=2, seq_len=64):
+    def levels_info(self, max_depth, batch_size=2, seq_len=64):
         """创建有效的levels_info。"""
-        levels_info = torch.zeros(batch_size, seq_len, max_level + 1, dtype=torch.long)
+        levels_info = torch.zeros(batch_size, seq_len, max_depth + 1, dtype=torch.long)
         for b in range(batch_size):
             for n in range(seq_len):
-                d = n % (max_level + 1)
+                d = n % (max_depth + 1)
                 levels_info[b, n, 0] = d
         return levels_info
 
     def test_end_to_end_with_simple_image(
-        self, device, dim, depth, max_level, levels_info
+        self, device, dim, depth, max_depth, levels_info
     ):
         """测试13: 简单图像端到端测试。
 
@@ -390,7 +390,7 @@ class TestDynamicComputationIntegration:
             heads=4,
             dim_head=32,
             mlp_dim=256,
-            max_level=max_level,
+            max_depth=max_depth,
             use_dynamic_depth=True,
             min_layers=4,
         ).to(device)

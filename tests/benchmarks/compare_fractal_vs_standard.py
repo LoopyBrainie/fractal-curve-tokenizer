@@ -163,7 +163,7 @@ def create_comparison_models(
             heads=heads,
             mlp_dim=dim * 4,
             channels=3,
-            max_level=3,
+            max_depth=3,
         ),
     }
 
@@ -355,7 +355,7 @@ def create_model_copy(name: str, model: nn.Module) -> nn.Module:
             heads=DEFAULT_HEADS,
             mlp_dim=DEFAULT_MLP_DIM,
             channels=DEFAULT_CHANNELS,
-            max_level=model.max_level,
+            max_depth=model.max_depth,
         )
 
 

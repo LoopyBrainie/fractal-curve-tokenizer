@@ -172,13 +172,13 @@ class TestLevelsInfoProperties:
 
         assert levels.shape == (1, 2, 5)
 
-    def test_max_level_property(self):
-        """max_level 属性测试."""
+    def test_max_depth_property(self):
+        """max_depth 属性测试."""
         depths = torch.zeros(1, 4, dtype=torch.long)
         paths = torch.zeros(1, 4, 6, dtype=torch.long)
         levels = LevelsInfo.from_arrays(depths, paths, max_depth=6)
 
-        assert levels.max_level == 6
+        assert levels.max_depth == 6
 
     def test_len_and_num_tokens(self):
         """len() 和 num_tokens 测试."""
