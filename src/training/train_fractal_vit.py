@@ -3270,11 +3270,22 @@ def main():
             has_cuda = torch.cuda.is_available()
             if has_cuda:
                 torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+                # I107-4: 检查 GPU 状态
+                try:
+                    props = torch.cuda.get_device_properties(0)
+                    print(f"[INFO] GPU: {props.name} ({props.total_memory / 1024**3:.1f} GB)")
+                    print(f"[INFO] Compute capability: {props.major}.{props.minor}")
+                except Exception:
+                    pass
 
             # 设置编译缓存和错误处理
-            torch._dynamo.config.cache_size_limit = 64
-            torch._dynamo.config.suppress_errors = True
+            # I107-4: 增加缓存限制避免无限重编译
+            torch._dynamo.config.cache_size_limit = 128
+            torch._dynamo.config.suppress_errors = False  # 开启错误报告
+
+            # I107-4: 禁用自动调优 (笔记本 GPU 可能超时)
+            torch._inductor.config.max_autotune = False
+            torch._inductor.config.compile_threads = 1  # 减少并行编译开销
 
             # 禁用 cudagraphs for laptop GPUs (RTX 4070 Laptop 不稳定)
             # I107-3: cudagraphs 在笔记本 GPU 上经常因为 TDP 限制失败
@@ -3410,18 +3421,43 @@ def main():
     print("="*70)
     print("TRAINING START")
     print("="*70)
-    
+
     if config.compile_model:
         print("[INFO] First batch will be slow due to JIT compilation (1-3 minutes)...")
-    
+        print("[INFO] Tip: Run 'nvidia-smi -l 1' in another terminal to monitor GPU usage")
+        print("[INFO] If GPU usage stays at 0% for >5 minutes, there may be an issue")
+
     print()
-    
+
     # 编译预热: 在正式训练前触发 JIT 编译
     # P11-7 优化: 使用完整 batch size 预热，避免动态形状导致重新编译
     # P15 优化: 同时预热 Mixup 路径，避免 warmup 结束后的重编译延迟
     # I107-3: 移除 synchronize() 调用，避免干扰 cudagraphs
+    # I107-4: 添加编译超时检测和 GPU 状态监控
     if config.compile_model:
+        import threading
+        import time as time_module
+
+        # I107-4: 启动 GPU 监控线程
+        gpu_monitor_running = [True]
+        def gpu_monitor():
+            if device.type == 'cuda':
+                try:
+                    while gpu_monitor_running[0]:
+                        if torch.cuda.is_available():
+                            mem_used = torch.cuda.memory_allocated() / 1024**3
+                            util = torch.cuda.utilization() if hasattr(torch.cuda, 'utilization') else -1
+                            print(f"[GPU-MONITOR] Memory: {mem_used:.2f} GB, Util: {util}%")
+                        time_module.sleep(10)
+                except Exception:
+                    pass
+
+        monitor_thread = threading.Thread(target=gpu_monitor, daemon=True)
+        monitor_thread.start()
+
         print("[INFO] Warming up compiled model with full batch size...")
+        compile_start = time_module.time()
+
         try:
             warmup_batch = next(iter(train_loader))
             if isinstance(warmup_batch, (list, tuple)):
@@ -3436,9 +3472,13 @@ def main():
             # 阶段1: 预热标准 forward pass (移除 synchronize 以避免 cudagraphs 冲突)
             with torch.no_grad():
                 with get_amp_context(device, config.use_amp):
-                    for _ in range(3):  # 3次预热确保编译稳定
+                    for i in range(3):  # 3次预热确保编译稳定
+                        print(f"[WARMUP] Forward pass {i+1}/3...")
                         _ = model(warmup_imgs)
-                    # I107-3: 不调用 synchronize()，让 cudagraphs 自动处理
+                        # I107-4: 每次 forward 后检查 GPU 状态
+                        if device.type == 'cuda':
+                            mem = torch.cuda.memory_allocated() / 1024**3
+                            print(f"[WARMUP] GPU memory: {mem:.2f} GB")
 
             # 阶段2: 预热 Mixup 路径 (如果启用)
             if mixup_fn is not None:
@@ -3453,15 +3493,21 @@ def main():
                         # 测试 forward + Mixup loss
                         test_outs = model(test_imgs)
                         _ = mixup_criterion(test_outs, test_mixed_labels)
-                        # I107-3: 不调用 synchronize()
                         del test_imgs, test_mixed_labels, test_outs
                 print("[OK] Mixup path pre-warmed")
 
+            compile_time = time_module.time() - compile_start
             del warmup_imgs, warmup_labels
             torch.cuda.empty_cache()
-            print("[OK] Compilation complete!")
+            print(f"[OK] Compilation complete! Time: {compile_time:.1f}s")
+
         except Exception as e:
             print(f"[WARN] Warmup failed: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            gpu_monitor_running[0] = False
+            monitor_thread.join(timeout=5)
     
     best_val = 0.0
     patience_counter = 0
