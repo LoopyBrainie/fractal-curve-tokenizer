@@ -3286,7 +3286,6 @@ def main():
             # I107-5: 禁用自动调优和复杂优化
             torch._inductor.config.max_autotune = False
             torch._inductor.config.compile_threads = 4  # 并行编译加速
-            torch._inductor.config.disable_cudnn = True  # 简化编译
 
             # 禁用 cudagraphs for laptop GPUs (RTX 4070 Laptop 不稳定)
             # I107-3: cudagraphs 在笔记本 GPU 上经常因为 TDP 限制失败
@@ -3492,7 +3491,7 @@ def main():
                             test_imgs = test_imgs.to(memory_format=torch.channels_last)
                         # 测试 forward + Mixup loss
                         test_outs = model(test_imgs)
-                        _ = mixup_criterion(test_outs, test_mixed_labels)
+                        _ = mixup_criterion(test_outs.logits, test_mixed_labels)
                         del test_imgs, test_mixed_labels, test_outs
                 print("[OK] Mixup path pre-warmed")
 
