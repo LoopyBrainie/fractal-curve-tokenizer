@@ -2070,7 +2070,8 @@ def train_epoch(
                         param_with_grad += 1
                         total_grad_norm += p.grad.data.norm(2).item() ** 2
                 grad_norm = total_grad_norm ** 0.5
-            print(f"[DEBUG] After backward: grad_norm={grad_norm:.6f if grad_norm else 'None'}, has_grad={has_grad}")
+            grad_str = f"{grad_norm:.6f}" if grad_norm is not None else "None"
+            print(f"[DEBUG] After backward: grad_norm={grad_str}, has_grad={has_grad}")
             print(f"[DEBUG] Params with grad: {param_with_grad}/{total_params}")
 
         if (i + 1) % config.accum_steps == 0:
@@ -2119,6 +2120,9 @@ def train_epoch(
                 pbar.set_postfix(loss=f'{loss_val:.4f}', acc=f'{acc_val:.1f}%')
 
         print(f"[DEBUG] BATCH {i} DONE: loss={loss.item():.4f}, acc={(100.0 * correct / total).item() if total > 0 else 0:.1f}%")
+
+        # 显式更新进度条
+        pbar.update(1)
 
         # P-OPT: 移除无意义的 GC 调用
         # Python GC 对 GPU 内存无影响，使用 torch.cuda.empty_cache() 更有效
