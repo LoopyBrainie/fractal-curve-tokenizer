@@ -973,22 +973,7 @@ class LayeredEvaluator:
         # P11-2: 从检查点恢复所有架构参数（与训练器完全对齐）
         # 优先级：检查点 state_dict > config.json > 默认值
 
-        # 1. 检测 tokenizer_type（从 state_dict 结构）
-        tokenizer_type = config.get('tokenizer_type', None)
-        has_fractal_tokenizer = any(k.startswith('fractal_tokenizer') for k in state_dict.keys())
-        has_tokenizer = any(k.startswith('tokenizer') and not k.startswith('fractal_tokenizer') for k in state_dict.keys())
-        has_new_tokenizer = any(k.startswith('_orig_mod.tokenizer') for k in state_dict.keys())
-
-        if has_fractal_tokenizer and not has_tokenizer:
-            if tokenizer_type is None:
-                tokenizer_type = 'fractal'
-                print("Detected tokenizer_type='fractal' from checkpoint (old format)")
-        elif has_tokenizer or has_new_tokenizer:
-            if tokenizer_type is None:
-                tokenizer_type = 'streaming_v3'
-                print("Detected tokenizer_type='streaming_v3' from checkpoint (new format)")
-
-        # 2. 从 state_dict 推断 max_depth（当 config 中没有配置时）
+        # 1. 从 state_dict 推断 max_depth（当 config 中没有配置时）
         detected_min_patch_size = config.get('min_patch_size', None)
         if detected_min_patch_size is None and max_depth_limit is not None:
             # 从 max_depth 反推 min_patch_size
@@ -1111,8 +1096,6 @@ class LayeredEvaluator:
         use_affine_modulation = config.get('use_affine_modulation', True)
         fourier_levels = config.get('fourier_levels', 4)
 
-        # 子模块 Dropout
-        splitter_dropout = config.get('splitter_dropout', None)
         pos_dropout = config.get('pos_dropout', None)
 
         # 计算 mlp_dim（与训练器一致）
@@ -1141,15 +1124,12 @@ class LayeredEvaluator:
             use_checkpoint=use_checkpoint,
             drop_path_rate=drop_path_rate,
             ffn_type=ffn_type,
-            tokenizer_type=tokenizer_type if tokenizer_type else 'streaming_v3',
             lca_temperature=lca_temperature,
             learnable_temperature=learnable_temperature,
             # I23-2: Token 数量约束（使用检测或默认值）
             # I99: 优先从 checkpoint config 获取，否则使用默认值
             K_min=config.get('K_min', 16),
             K_max=config.get('K_max', 64),
-            # I27: 子模块 Dropout 配置
-            splitter_dropout=splitter_dropout,
             pos_dropout=pos_dropout,
             # I31-3: 形状-尺度编码配置
             use_area_encoding=use_area_encoding,
