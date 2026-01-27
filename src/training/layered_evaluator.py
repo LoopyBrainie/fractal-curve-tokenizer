@@ -1067,6 +1067,7 @@ class LayeredEvaluator:
             ckpt_dim_head = 64  # 默认值
 
         # 5. 检测 num_classes（从 mlp_head 或 head）
+        # 优先级: 显式参数 > config.json > checkpoint 检测 > 数据集默认
         detected_num_classes = config.get('num_classes', None)
         if detected_num_classes is None:
             for key in reversed(list(state_dict.keys())):
@@ -1078,9 +1079,18 @@ class LayeredEvaluator:
                     detected_num_classes = state_dict[key].shape[0]
                     print(f"Detected num_classes={detected_num_classes} from checkpoint")
                     break
-        if detected_num_classes is None:
-            detected_num_classes = num_classes
-        num_classes = detected_num_classes
+
+        # I140: 验证 num_classes 一致性
+        if num_classes is None:
+            # 未指定时使用检测值或数据集默认值
+            num_classes = detected_num_classes if detected_num_classes else self.dataset_config['num_classes']
+        elif detected_num_classes is not None and detected_num_classes != num_classes:
+            # 显式指定但与 checkpoint 不匹配
+            print(f"[I140] WARNING: num_classes={num_classes} differs from checkpoint's {detected_num_classes}")
+            print(f"  mlp_head weights will be SKIPPED (shape mismatch)")
+            print(f"  This will result in near-random accuracy (~{1.0/num_classes*100:.1f}%)!")
+
+        print(f"Using num_classes={num_classes}")
 
         # 6. 检测其他关键参数
         # dropout
