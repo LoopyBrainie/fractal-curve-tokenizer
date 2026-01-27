@@ -1728,6 +1728,16 @@ def train_epoch(
         exp_dir: 实验目录，用于保存 NaN/Inf 诊断日志
     """
     print(f"[DEBUG] train_epoch: 函数被调用, loader len={len(loader)}")
+
+    # 检查模型权重 norm（epoch 开始时）
+    if epoch == 1:
+        total_weight_norm = 0.0
+        for p in model.parameters():
+            if p.data.numel() > 0:
+                total_weight_norm += p.data.norm(2).item() ** 2
+        weight_norm = total_weight_norm ** 0.5
+        print(f"[DEBUG] Epoch {epoch} 开始: model weight_norm={weight_norm:.6f}")
+
     model.train()
     # P11-8: 使用张量累加，延迟 .item() 调用到 epoch 结束
     total_loss = torch.tensor(0.0, device=device)
@@ -1769,7 +1779,7 @@ def train_epoch(
         if debug_mode and use_mixup:
             print(f"[DEBUG] 不使用 CudaPrefetcher (DISABLE_PREFETCH={os.environ.get('DISABLE_PREFETCH', 'not set')})", flush=True)
     
-    pbar = tqdm(data_iter, desc="Train", total=len(loader))
+    pbar = tqdm(data_iter, desc="Train", total=len(loader), mininterval=0.5, dynamic_ncols=True)
 
     # DEBUG: 检查 DataLoader 长度
     if len(loader) == 0:
@@ -1984,7 +1994,15 @@ def train_epoch(
             #          ce_loss 可能是 float16，而 splitter_loss/multi_layer_loss 是 float32
             #          混合相加可能导致 NaN。统一转换为 float32 进行损失计算。
             loss = ce_loss.float()  # 确保基础损失是 float32
-            
+
+            if i == 0:
+                # 计算 pred 用于调试
+                _, pred_debug = outs.detach().max(1)
+                print(f"[DEBUG] loss={loss.item():.4f}, ce_loss={ce_loss.item():.4f}")
+                print(f"[DEBUG] logits shape={outs.shape}, logits[:3]={outs[0, :3] if outs.numel() > 3 else 'N/A'}")
+                print(f"[DEBUG] pred[:5]={pred_debug[:5] if pred_debug.numel() >= 5 else pred_debug}")
+                print(f"[DEBUG] labels[:5]={labels[:5]}")
+
             if entropy_loss is not None:
                 entropy_loss_f32 = entropy_loss.float()
                 if torch.isnan(entropy_loss_f32) or torch.isinf(entropy_loss_f32):
@@ -2031,13 +2049,40 @@ def train_epoch(
         forward_times.append(forward_time)
         
         scaler.scale(loss).backward()
-        
+
+        # 检查梯度是否有效
+        if i == 0:
+            grad_norm = None
+            has_grad = False
+            param_with_grad = 0
+            total_params = 0
+            if hasattr(model, 'parameters'):
+                total_grad_norm = 0.0
+                for p in model.parameters():
+                    total_params += 1
+                    if p.grad is not None:
+                        has_grad = True
+                        param_with_grad += 1
+                        total_grad_norm += p.grad.data.norm(2).item() ** 2
+                grad_norm = total_grad_norm ** 0.5
+            print(f"[DEBUG] After backward: grad_norm={grad_norm:.6f if grad_norm else 'None'}, has_grad={has_grad}")
+            print(f"[DEBUG] Params with grad: {param_with_grad}/{total_params}")
+
         if (i + 1) % config.accum_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+
+            # 检查权重更新（仅第一个 batch）
+            if i == 0:
+                total_weight_norm_after = 0.0
+                for p in model.parameters():
+                    if p.data.numel() > 0:
+                        total_weight_norm_after += p.data.norm(2).item() ** 2
+                weight_norm_after = total_weight_norm_after ** 0.5
+                print(f"[DEBUG] After optimizer step: weight_norm={weight_norm_after:.6f}")
         
         # P11-8: 使用 detach() 累加损失，避免保留计算图
         # .item() 延迟到 epoch 结束时调用
