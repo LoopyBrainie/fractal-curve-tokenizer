@@ -1680,9 +1680,11 @@ class CudaPrefetcher:
         if current_data is None:
             # 尝试预加载一次再检查（处理初始状态为空的情况）
             if not self._preload_next():
+                print(f"[DEBUG] CudaPrefetcher: _preload_next 返回 False，Raise StopIteration")
                 raise StopIteration
             current_data = self._buffer[self._current_idx]
             if current_data is None:
+                print(f"[DEBUG] CudaPrefetcher: 预加载后缓冲区仍为空，Raise StopIteration")
                 raise StopIteration
 
         # 清空当前缓冲区，切换指针
@@ -1763,9 +1765,17 @@ def train_epoch(
     use_prefetcher = device.type == 'cuda' and os.environ.get('DISABLE_PREFETCH', '0') != '1'
 
     if use_prefetcher:
-        data_iter = CudaPrefetcher(loader, device, channels_last=config.channels_last)
+        try:
+            data_iter = CudaPrefetcher(loader, device, channels_last=config.channels_last)
+            print(f"[DEBUG] CudaPrefetcher 初始化成功, len={len(data_iter)}")
+        except Exception as e:
+            print(f"[ERROR] CudaPrefetcher 初始化失败: {e}")
+            use_prefetcher = False
+            data_iter = loader
     else:
         data_iter = loader
+
+    print(f"[DEBUG] use_prefetcher={use_prefetcher}, data_iter type={type(data_iter).__name__}")
 
     pbar = tqdm(data_iter, desc="Train", total=len(loader), mininterval=0.5, dynamic_ncols=True)
 
