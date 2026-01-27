@@ -24,6 +24,7 @@ set -e
 #
 # Token Budget (I33 Relative Budget):
 #   - image_size=64, min_patch_size=4
+#   - max_depth = ceil(log2(64/4)) = 4 (auto-computed from min_patch_size)
 #   - max_patches = (64/4)^2 = 256
 #   - coverage: 1% → K_min=8, 5% → K_max=64
 #   - Avg tokens: ~32-48 per image
@@ -36,7 +37,6 @@ uv run python src/training/train_fractal_vit.py \
   --depth 8 \
   --heads 8 \
   --mlp-dim 512 \
-  --max-depth 6 \
   --pool cls \
   --ffn-type swiglu_level \
   --min-patch-size 4 \

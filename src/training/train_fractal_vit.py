@@ -1769,17 +1769,17 @@ def train_epoch(
         print(f"[DEBUG] Model expects input dtype: {model_dtype}")
 
     # 使用环境变量 DISABLE_PREFETCH=1 来禁用 CudaPrefetcher 进行调试
-    use_prefetcher = device.type == 'cuda' and os.environ.get('DISABLE_PREFETCH', '0') != '1'
+    # DEBUG: 总是禁用 prefetcher 来诊断问题
+    use_prefetcher = False
+    print(f"[DEBUG] use_prefetcher={use_prefetcher}")
+
     if use_prefetcher:
         data_iter = CudaPrefetcher(loader, device, channels_last=config.channels_last)
-        if debug_mode and use_mixup:
-            print(f"[DEBUG] 使用 CudaPrefetcher", flush=True)
     else:
         data_iter = loader
-        if debug_mode and use_mixup:
-            print(f"[DEBUG] 不使用 CudaPrefetcher (DISABLE_PREFETCH={os.environ.get('DISABLE_PREFETCH', 'not set')})", flush=True)
-    
+
     pbar = tqdm(data_iter, desc="Train", total=len(loader), mininterval=0.5, dynamic_ncols=True)
+    print(f"[DEBUG] tqdm created with total={len(loader)}")
 
     # DEBUG: 检查 DataLoader 长度
     if len(loader) == 0:
@@ -1795,10 +1795,15 @@ def train_epoch(
     # P15: 在首个 Mixup epoch 添加额外诊断 (仅调试模式)
     debug_first_mixup_epoch = debug_mode and use_mixup and epoch is not None and os.environ.get('DISABLE_PREFETCH', '0') == '1'
 
+    print(f"[DEBUG] 准备进入训练循环, pbar.iterable={type(pbar.iterable)}")
+    batch_count = 0
     for i, batch in enumerate(pbar):
+        batch_count += 1
+        print(f"[DEBUG] ====== BATCH {i} START ======")
+        print(f"[DEBUG] batch type: {type(batch)}")
+
         # DEBUG: 确认数据加载
-        if i == 0:
-            print(f"[DEBUG] 第一个 batch 加载成功: batch type={type(batch)}, len={len(batch) if hasattr(batch, '__len__') else 'N/A'}")
+        print(f"[DEBUG] 第一个 batch 加载成功: batch type={type(batch)}, len={len(batch) if hasattr(batch, '__len__') else 'N/A'}")
 
         # P15: 额外诊断 - 检测数据加载卡顿 (仅调试模式)
         if debug_first_mixup_epoch and i <= 5:
@@ -2113,12 +2118,17 @@ def train_epoch(
             else:
                 pbar.set_postfix(loss=f'{loss_val:.4f}', acc=f'{acc_val:.1f}%')
 
+        print(f"[DEBUG] BATCH {i} DONE: loss={loss.item():.4f}, acc={(100.0 * correct / total).item() if total > 0 else 0:.1f}%")
+
         # P-OPT: 移除无意义的 GC 调用
         # Python GC 对 GPU 内存无影响，使用 torch.cuda.empty_cache() 更有效
         # 但 empty_cache() 也有开销，仅在真正需要时调用
 
         data_start = time.time()
-    
+
+    print(f"[DEBUG] 训练循环结束: 实际处理了 {batch_count} 个 batches (原计划 {len(loader)} 个)")
+    print(f"[DEBUG] total_loss={total_loss.item() if hasattr(total_loss, 'item') else total_loss}, total={total}, correct={correct.item() if hasattr(correct, 'item') else correct}")
+
     perf_stats = {
         'avg_batch_time': np.mean(batch_times) if batch_times else 0,
         'avg_data_time': np.mean(data_times) if data_times else 0,
