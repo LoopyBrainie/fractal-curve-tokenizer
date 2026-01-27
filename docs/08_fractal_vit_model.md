@@ -4,13 +4,25 @@
 
 `FractalCurveViT` is the complete Vision Transformer model that integrates all components: tokenization, position encoding, transformer encoder, and classification head.
 
+**Architecture Note**: The model internally creates a `GumbelTopKSplitter` (Scheme D/E) for token selection. The tokenizer expects split results from the splitter, following the I98-1 pipeline architecture.
+
 ---
 
 ## 8.2 Mathematical Formulation
 
 ### End-to-End Pipeline
 
-$$I \xrightarrow{\text{Tokenize}} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{CLS}} [c; T'] \xrightarrow{\text{Transformer}} X' \xrightarrow{\text{Pool}} z \xrightarrow{\text{MLP}} \hat{y}$$
+$$I \xrightarrow{\text{Splitter}} \text{split\_result} \xrightarrow{\text{Tokenizer}} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{CLS}} [c; T'] \xrightarrow{\text{Transformer}} X' \xrightarrow{\text{Pool}} z \xrightarrow{\text{MLP}} \hat{y}$$
+
+### Return Format
+
+The `forward()` method returns classification logits with optional auxiliary information:
+
+$$\text{forward}(I) \rightarrow (\hat{y}, \text{aux\_infos})$$
+
+where $\text{aux\_infos}$ contains:
+- `num_tokens`: Number of valid tokens per sample
+- `levels_used`: Maximum depth actually used
 
 ### Loss Function
 

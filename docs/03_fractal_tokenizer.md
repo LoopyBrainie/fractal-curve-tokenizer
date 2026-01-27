@@ -4,6 +4,10 @@
 
 The `StreamingFractalTokenizerV3` implements **Variable Depth Tokenization** via adaptive quadtree splitting and Hilbert curve reordering. It adopts the **Gumbel-Top-K (Scheme D)** mechanism with **Learnable Quota Allocation (Scheme E)** for ~K/N gradient coverage (~37.6%) and parallel execution, replacing earlier BFS-based approaches.
 
+**Efficiency Note**: The ~40× computational reduction comes from token count reduction ($N_{V3} \approx 32$ vs $N_{ViT} \approx 307K$), not from asymptotic complexity change. Attention remains $O(N^2 \cdot D)$, but with $N$ reduced by ~40×.
+
+**Parallelism Constraint**: Complete dynamic depth per token is incompatible with GPU SIMT parallelism. Current implementation uses batch-level fixed depth for parallel efficiency.
+
 ---
 
 ## 3.2 Mathematical Formulation
@@ -299,11 +303,32 @@ $$\tau(t) = \tau_{start} \cdot \left(\frac{\tau_{end}}{\tau_{start}}\right)^{t /
 
 All numerical stability constants are centralized in `constants.py`:
 
-| Constant | Value | Purpose |
-|:---------|:------|:--------|
-| `GUMBEL_EPSILON` | $1e-8$ | Gumbel noise stability |
+| Constant | Value | Mathematical Basis |
+|:---------|:------|:-------------------|
+| `GUMBEL_EPSILON` | $1e-8$ | FP16 safe lower bound |
 | `LOG_EPSILON` | $1e-8$ | Logarithm stability |
 | `DIVISION_EPSILON` | $1e-8$ | Division stability |
 | `PROB_EPSILON` | $1e-5$ | Probability clamping |
+| `LOGIT_CLAMP_BOUND` | $50.0$ | $\text{softmax}(x > 50) \approx \text{one-hot}$ |
+| `GRAD_CLAMP_BOUND` | $20.0$ | $P(\|grad\| > 20) \approx 10^{-6}$ |
+| `TEMPERATURE_MIN` | $0.3$ | Prevents gradient saturation |
+
+### Mathematical Formulation of Key Constants
+
+**Level Aggregator Initialization**:
+
+$$\gamma = \log(e^{1.3133} - 1) \approx 0.26$$
+
+This gives $\text{softplus}(\gamma) \approx 1.0$, ensuring initial scale is neutral.
+
+**Gumbel Temperature Bound**:
+
+$$\tau \geq 0.3$$
+
+Below this threshold, softmax gradients vanish exponentially. The bound is derived from:
+
+$$\frac{\partial \text{softmax}(x/\tau)}{\partial x} = \frac{\text{softmax}(x/\tau)(1 - \text{softmax}(x/\tau))}{\tau}$$
+
+For $\tau < 0.3$, gradient magnitude drops below $10^{-5}$.
 
 > **Next**: [04_positional_embedding.md](04_positional_embedding.md) - Position Encoding

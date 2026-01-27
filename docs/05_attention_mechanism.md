@@ -4,6 +4,13 @@
 
 The `HilbertAwareMultiScaleAttention` extends standard multi-head attention with **Hilbert curve-derived attention biases**, encoding spatial proximity and hierarchical relationships explicitly. It supports **affine modulation** (I31-3) for area-aware attention biasing.
 
+**Complexity Note**: Attention complexity remains $O(N^2 \cdot D)$. The ~40× efficiency gain comes from token count reduction ($N \approx 32$ vs $307K$), not asymptotic complexity change.
+
+**Temperature Selection**: The default $\tau_h \approx 1.5$ is chosen to:
+1. Provide meaningful bias magnitude (not too small to be ignored)
+2. Allow gradient flow through the Softplus parameterization
+3. Balance spatial locality prior strength
+
 ---
 
 ## 5.2 Mathematical Formulation

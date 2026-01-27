@@ -88,15 +88,11 @@ Input Image (B, C, H, W)
 | **L4** | Application | `model_fractal_vit.py` | `FractalCurveViT` |
 | **L3** | Pipeline | `tokenizer_streaming.py` | `StreamingFractalTokenizerV3` |
 |        |          | `block_transformer.py` | `FractalTransformer` |
-| **L2** | Components | `attn_hilbert_bias.py` | `HilbertAwareMultiScaleAttention`, `LCAHilbertBias` |
-|        |            | `split_adaptive.py` | `LearnableSplitter` (Scheme L) |
-|        |            | `embed_hilbert_patch.py` | `HilbertNativePatchEmbed` |
+| **L2** | Components | `gumbel_topk_splitter.py` | `GumbelTopKSplitter` (Scheme D/E) |
+|        |            | `attn_hilbert_bias.py` | `HilbertAwareMultiScaleAttention`, `LCAHilbertBias` |
 |        |            | `ffn_swiglu.py` | `SwiGLUFFN`, `AdaptiveFractalFeedForward` |
 |        |            | `embed_fractal_position.py` | `FractalPositionEmbedding` |
 | **L1** | Foundation | `curve_hilbert.py` | `HilbertCurve`, `PseudoHilbertCurve` |
-|        |            | `config_fractal.py` | `FractalConfig` |
-|        |            | `embed_fractal_path.py` | `VectorizedPathEncoder` |
-|        |            | `base_tokenizer.py` | `BaseTokenizer`, `TokenizerOutput` |
 
 ---
 
@@ -167,12 +163,16 @@ model = FractalCurveViT(
 
 ## 1.6 Complexity Analysis
 
+> **Key Clarification**: The "40× reduction" refers to **token count reduction**, not asymptotic complexity. Token count reduces from ~307K (standard ViT 16×16 patches for 224×224) to ~32 (V3 variable-depth tokens).
+
 | Operation | Complexity | Notes |
 |:----------|:-----------|:------|
-| Quadtree Split | $O(N \cdot d_{max})$ | N = max tokens |
+| Tokenization | $O(N_{cand} \cdot D)$ | $N_{cand} = \sum_{d=0}^{D} 4^d$ (e.g., 85 for D=3) |
 | Hilbert Reordering | $O(N \log N)$ | Sort by Hilbert index |
 | LCA Computation | $O(N^2)$ | Cached, amortized $O(1)$ |
-| Attention | $O(N^2 \cdot D)$ | Standard transformer |
-| Total | $O(N^2 \cdot D)$ | Dominated by attention |
+| Attention | $O(N^2 \cdot D)$ | Standard transformer (N ≈ 32) |
+| **Effective Computation** | ~40× reduction | $N_{V3} \approx 32$ vs $N_{ViT} \approx 307K$ |
+
+> **Note**: Complete dynamic depth adaptation is deferred due to fundamental incompatibility with GPU SIMT parallelism. Current implementation uses fixed `depth // 2` for parallel efficiency.
 
 > **Next**: [02_data_structures.md](02_data_structures.md) - Core Data Structures

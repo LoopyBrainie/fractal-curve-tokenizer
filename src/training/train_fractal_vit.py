@@ -1776,17 +1776,9 @@ def train_epoch(
     use_prefetcher = device.type == 'cuda' and os.environ.get('DISABLE_PREFETCH', '0') != '1'
 
     if use_prefetcher:
-        try:
-            data_iter = CudaPrefetcher(loader, device, channels_last=config.channels_last)
-            print(f"[DEBUG] CudaPrefetcher 初始化成功, len={len(data_iter)}")
-        except Exception as e:
-            print(f"[ERROR] CudaPrefetcher 初始化失败: {e}")
-            use_prefetcher = False
-            data_iter = loader
+        data_iter = CudaPrefetcher(loader, device, channels_last=config.channels_last)
     else:
         data_iter = loader
-
-    print(f"[DEBUG] use_prefetcher={use_prefetcher}, data_iter type={type(data_iter).__name__}")
 
     pbar = tqdm(data_iter, desc="Train", total=len(loader), mininterval=0.5, dynamic_ncols=True)
 
@@ -1804,10 +1796,7 @@ def train_epoch(
     # P15: 在首个 Mixup epoch 添加额外诊断 (仅调试模式)
     debug_first_mixup_epoch = debug_mode and use_mixup and epoch is not None and os.environ.get('DISABLE_PREFETCH', '0') == '1'
 
-    # 调试：检查 DataLoader 是否有数据
-    batch_count = 0
     for i, batch in enumerate(pbar):
-        batch_count += 1
         # 总是更新进度条（即使有 continue 也需要更新）
         pbar.update(1)
 

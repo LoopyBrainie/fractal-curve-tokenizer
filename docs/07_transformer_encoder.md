@@ -13,24 +13,27 @@ The `FractalTransformer` stacks multiple `FractalTransformerBlock` layers with *
 $$x' = x + \text{DropPath}(\text{Attn}(\text{LN}_1(x)))$$
 $$x'' = x' + \text{DropPath}(\text{FFN}(\text{LN}_2(x')))$$
 
-### 7.2.2 Level-Aware Layer Norm
+### 7.2.2 Layer Norm
 
-$$\text{LevelNorm}(x, d) = \gamma_d \cdot \frac{x - \mu}{\sigma} + \beta_d$$
+The implementation uses standard `nn.LayerNorm` for both attention and FFN sub-layers (I106-2):
 
-where $\gamma_d, \beta_d \in \mathbb{R}^D$ are depth-dependent learnable parameters.
+$$\text{LayerNorm}(x) = \gamma \cdot \frac{x - \mu}{\sigma} + \beta$$
 
-### 7.2.3 Residual Gate (STAB-5)
+Hilbert bias handles scale calibration across different token depths, eliminating the need for depth-dependent normalization parameters.
 
-The residual gate modulates the contribution of attention and FFN outputs based on token depth:
+### 7.2.3 Residual Gate (STAB-5, I34-10)
 
-$$w_1(d) = 2 \cdot \sigma(g_1[d]), \quad w_2(d) = 2 \cdot \sigma(g_2[d])$$
-$$x' = x + w_1(d) \cdot \text{DropPath}(\text{Attn}(\cdot))$$
-$$x'' = x' + w_2(d) \cdot \text{DropPath}(\text{FFN}(\cdot))$$
+The residual gate modulates the contribution of attention and FFN outputs using **tanh** activation:
+
+$$g_{raw} \in \mathbb{R}, \quad g = \tanh(g_{raw}) \in [-1, 1]$$
+$$x' = x + (1 + g) \cdot \text{DropPath}(\text{Attn}(\text{LN}(x)))$$
+$$x'' = x' + (1 + g) \cdot \text{DropPath}(\text{FFN}(\text{LN}(x')))$$
 
 where:
-- $g_1, g_2 \in \mathbb{R}^{D_{max}+1}$: Learnable gate parameters per depth
-- $\sigma$: Sigmoid function
 - Gate range: $[0, 2]$ (values $>1$ amplify, $<1$ attenuate)
+- $1 + g$ ensures residual connection is always open (avoiding dead paths)
+
+**Rationale**: Using $\tanh$ directly instead of $2 \cdot \sigma$ provides more stable gradient flow for values near 0, and the additive form $(1 + g)$ guarantees non-zero residual paths.
 
 **V-Shaped Gate Pattern (I24-6)**:
 

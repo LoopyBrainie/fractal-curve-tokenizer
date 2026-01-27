@@ -301,8 +301,7 @@ class FractalCurveViT(nn.Module):
         self.tokenizer = tokenizer
 
         # I98-1: 设置 tokenizer 对 model 的引用，以便 compute_scale_distribution 能够访问 splitter
-        if hasattr(tokenizer, '_model'):
-            tokenizer._model = self
+        tokenizer._model = self
 
         # P11-2 修复: 从 tokenizer 动态获取 max_depth 作为 max_depth
         if max_depth is None:
