@@ -2,6 +2,7 @@
 """诊断训练问题的测试脚本"""
 import sys
 sys.path.insert(0, 'src')
+sys.path.insert(0, 'src/training')
 
 import torch
 from torch.utils.data import DataLoader
@@ -10,7 +11,7 @@ from torch.utils.data import DataLoader
 print("="*60)
 print("TEST 1: DataLoader")
 print("="*60)
-from training.dataset_factory import create_dataset
+from dataset_factory import create_dataset
 
 train_ds, val_ds, _ = create_dataset('tiny-imagenet', 'data', batch_size=192, num_workers=0, pin_memory=False)
 train_loader = DataLoader(train_ds, batch_size=192, shuffle=True, num_workers=0, pin_memory=False)
