@@ -87,18 +87,10 @@ class L7SplitterVisualizer(VisualizationLayer):
             result.descriptions.append("每深度可学习阈值")
         
         # 3. MLP Logits 分布
-        if metrics.mlp_logits_per_depth:
-            fig = self._plot_mlp_logits(metrics)
+        # I101-4: decision_confidence_mean/selection_prob_mean 字段已移除，跳过可视化
+        if metrics.gate_weight_stats:
+            fig = self._plot_gate_weight_stats(metrics)
             result.figures.append(fig)
-            result.names.append("L7_mlp_logits")
-            result.descriptions.append("MLP Logits 分布（按深度）")
-        
-        # 4. 决策置信度分析
-        if metrics.decision_confidence_mean > 0:
-            fig = self._plot_decision_confidence(metrics)
-            result.figures.append(fig)
-            result.names.append("L7_decision_confidence")
-            result.descriptions.append("分割决策置信度分析")
         
         # 5. I21 深度平衡诊断
         fig = self._plot_depth_balance_diagnosis(metrics)
@@ -190,111 +182,7 @@ class L7SplitterVisualizer(VisualizationLayer):
         safe_tight_layout()
         self._add_watermark(fig)
         return fig
-    
-    def _plot_mlp_logits(self, metrics: Any) -> Figure:
-        """MLP Logits 分布箱线图"""
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
-        if not metrics.mlp_logits_per_depth:
-            ax.text(0.5, 0.5, "No MLP logits data available", ha='center', va='center',
-                   fontsize=14, transform=ax.transAxes)
-            ax.axis('off')
-            safe_tight_layout()
-            self._add_watermark(fig)
-            return fig
-        
-        depths = sorted(metrics.mlp_logits_per_depth.keys())
-        
-        positions = []
-        box_data = []
-        labels = []
-        
-        for d in depths:
-            info = metrics.mlp_logits_per_depth[d]
-            mean = info.get('mean', 0)
-            std = info.get('std', 0)
-            count = info.get('count', 0)
-            
-            if count > 0 and std > 0:
-                simulated = np.random.normal(mean, std, min(count, 100))
-                box_data.append(simulated)
-                positions.append(d)
-                labels.append(f"D{d}\n(n={count})")
-        
-        if box_data:
-            bp = ax.boxplot(
-                box_data, positions=positions,
-                patch_artist=True, widths=0.6,
-            )
-            
-            colors = plt.cm.viridis(np.linspace(0.2, 0.8, len(positions)))
-            for patch, color in zip(bp['boxes'], colors):
-                patch.set_facecolor(color)
-                patch.set_alpha(0.7)
-            
-            ax.set_xticks(positions)
-            ax.set_xticklabels(labels)
-        else:
-            ax.text(0.5, 0.5, "Insufficient data for box plot", ha='center', va='center',
-                   fontsize=12, transform=ax.transAxes, color='gray')
-        
-        ax.set_xlabel("深度")
-        ax.set_ylabel("MLP Logits")
-        # 防止 NaN 或 Inf 在格式化中引起问题
-        mean_val = metrics.mlp_logits_mean if np.isfinite(metrics.mlp_logits_mean) else 0
-        std_val = metrics.mlp_logits_std if np.isfinite(metrics.mlp_logits_std) else 0
-        ax.set_title(f"MLP 输出分布\n(全局 mean={mean_val:.2f}, std={std_val:.2f})")
-        ax.axhline(y=0, color='red', linestyle='--', alpha=0.5, label='决策边界')
-        ax.legend()
-        
-        safe_tight_layout()
-        self._add_watermark(fig)
-        return fig
-    
-    def _plot_decision_confidence(self, metrics: Any) -> Figure:
-        """决策置信度分析"""
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        
-        # 左图：置信度仪表盘
-        ax_gauge = axes[0]
-        self._draw_gauge(
-            ax_gauge,
-            value=metrics.decision_confidence_mean,
-            min_val=0.0,
-            max_val=1.0,
-            title="平均决策置信度",
-            unit="",
-            thresholds=[(0.3, 'red'), (0.5, 'yellow'), (0.7, 'green')],
-        )
-        ax_gauge.text(
-            0.5, -0.1,
-            f"std = {metrics.decision_confidence_std:.3f}",
-            ha='center', va='top',
-            transform=ax_gauge.transAxes,
-            fontsize=10,
-        )
-        
-        # 右图：选择概率分布
-        ax_prob = axes[1]
-        mean_prob = metrics.selection_prob_mean if metrics.selection_prob_mean > 0 else 0.5
-        # 防止 beta 分布参数为 0 或负数
-        mean_prob = np.clip(mean_prob, 0.01, 0.99)
-        alpha = max(mean_prob * 10, 0.5)
-        beta = max((1 - mean_prob) * 10, 0.5)
-        samples = np.random.beta(alpha, beta, 1000)
-        
-        ax_prob.hist(samples, bins=30, color='steelblue', edgecolor='white', alpha=0.7)
-        ax_prob.axvline(x=0.5, color='red', linestyle='--', label='决策边界')
-        ax_prob.axvline(x=mean_prob, color='green', linestyle='-', linewidth=2, label=f'均值={mean_prob:.3f}')
-        ax_prob.set_xlabel("选择概率 P(select)")
-        ax_prob.set_ylabel("频数")
-        ax_prob.set_title("选择概率分布\n(越集中在 0 或 1 = 越确定)")
-        ax_prob.legend()
-        
-        safe_tight_layout()
-        self._add_watermark(fig)
-        return fig
-    
+
     def _plot_depth_balance_diagnosis(self, metrics: Any) -> Figure:
         """I21 深度平衡诊断"""
         fig, ax = plt.subplots(figsize=(8, 6))
@@ -350,9 +238,8 @@ class L7SplitterVisualizer(VisualizationLayer):
             f"Temperature tau = {metrics.temperature:.3f}",
             f"Annealing Progress = {metrics.temperature_schedule_progress:.1%}" if metrics.temperature_schedule_progress > 0 else "Annealing Progress = N/A",
             f"",
-            f"MLP Logits: mean = {metrics.mlp_logits_mean:.2f}, std = {metrics.mlp_logits_std:.2f}",
-            f"Selection Prob: mean = {metrics.selection_prob_mean:.3f}",
-            f"Decision Conf: mean = {metrics.decision_confidence_mean:.3f}, std = {metrics.decision_confidence_std:.3f}",
+            # I101-4: mlp_logits_*/selection_prob_*/decision_confidence_* 字段已移除
+            f"Gate Weight Stats: {len(metrics.gate_weight_stats)} depths tracked" if metrics.gate_weight_stats else "Gate Weight Stats: N/A",
             f"",
             f"Quota Entropy = {metrics.quota_entropy:.2f}" if metrics.quota_entropy > 0 else "Quota Entropy = N/A",
             f"Log Compensation = {'ON' if metrics.log_compensation_enabled else 'OFF'}",

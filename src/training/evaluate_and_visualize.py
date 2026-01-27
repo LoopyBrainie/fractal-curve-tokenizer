@@ -614,7 +614,8 @@ def _print_summary(report: LayeredEvaluationReport) -> None:
         print(f"\n[L7] Splitter:")
         if l7.temperature > 0:
             print(f"     Temperature: {l7.temperature:.3f}")
-            print(f"     Decision Confidence: {l7.decision_confidence_mean:.2f}")
+        # I101-4: decision_confidence_mean 字段已移除
+        print(f"     Quota Entropy: {l7.quota_entropy:.3f}")
 
     # L8: Gradient Flow
     if hasattr(report, 'L8_gradient_flow') and report.L8_gradient_flow is not None:

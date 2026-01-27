@@ -1826,13 +1826,7 @@ class LayeredEvaluator:
         
         # L7: 分割器健康
         if report.L7_splitter is not None:
-            if report.L7_splitter.decision_confidence_mean < 0.3:
-                summary['warnings'].append(
-                    f"Low splitter confidence: {report.L7_splitter.decision_confidence_mean:.2f}"
-                )
-                summary['recommendations'].append(
-                    "Splitter is uncertain - consider lower temperature or more training"
-                )
+            # I101-4: decision_confidence_mean 字段已移除，跳过置信度检查
             
             if report.L7_splitter.quota_entropy > 0 and report.L7_splitter.quota_entropy < 0.5:
                 summary['warnings'].append("Quotas collapsing to single depth")
