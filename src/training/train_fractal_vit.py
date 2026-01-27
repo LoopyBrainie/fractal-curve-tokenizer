@@ -1755,7 +1755,8 @@ def train_epoch(
         print(f"[DEBUG] Model expects input dtype: {model_dtype}")
 
     # 使用环境变量 DISABLE_PREFETCH=1 来禁用 CudaPrefetcher
-    use_prefetcher = device.type == 'cuda' and os.environ.get('DISABLE_PREFETCH', '0') != '1'
+    use_prefetcher = False  # device.type == 'cuda' and os.environ.get('DISABLE_PREFETCH', '0') != '1'
+    print(f"[DEBUG] use_prefetcher={use_prefetcher}")
 
     if use_prefetcher:
         data_iter = CudaPrefetcher(loader, device, channels_last=config.channels_last)
