@@ -821,6 +821,10 @@ class LayeredEvaluator:
         device: Optional[str] = None,
         data_root: Optional[str] = None,
         exp_config: Optional[Dict[str, Any]] = None,  # 实验配置（从 config.json 加载）
+        # I140: Splitter 配置参数
+        splitter_feature_dim: Optional[int] = None,
+        splitter_pool_size: Optional[int] = None,
+        splitter_hidden_dim: Optional[int] = None,
     ):
         """初始化分层评估器
 
@@ -840,12 +844,22 @@ class LayeredEvaluator:
             数据根目录，默认为项目 data 目录
         exp_config : dict, optional
             从 config.json 加载的实验配置
+        splitter_feature_dim : int, optional
+            Splitter 特征维度（必须与检查点匹配）
+        splitter_pool_size : int, optional
+            Splitter 池化大小（必须与检查点匹配）
+        splitter_hidden_dim : int, optional
+            Splitter 复杂度 MLP 隐藏层维度（必须与检查点匹配）
         """
         self.checkpoint_path = Path(checkpoint_path)
         self.dataset_name = dataset_name.lower()
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.exp_config = exp_config or {}  # 保存实验配置
+        # I140: 保存 Splitter 配置参数
+        self.splitter_feature_dim = splitter_feature_dim
+        self.splitter_pool_size = splitter_pool_size
+        self.splitter_hidden_dim = splitter_hidden_dim
 
         # 设备设置
         if device is None:
@@ -1106,12 +1120,12 @@ class LayeredEvaluator:
         channels = config.get('channels', 3)
 
         # I140: 从检查点检测 splitter 关键参数（避免 complexity_mlp 维度不匹配）
-        # 优先使用 config 中的配置
-        splitter_hidden_dim = config.get('splitter_hidden_dim', None)
-        splitter_feature_dim = config.get('splitter_feature_dim', None)
-        splitter_pool_size = config.get('splitter_pool_size', None)
+        # 优先级：命令行参数 > config.json > state_dict 检测 > 默认值
+        splitter_hidden_dim = self.splitter_hidden_dim or config.get('splitter_hidden_dim', None)
+        splitter_feature_dim = self.splitter_feature_dim or config.get('splitter_feature_dim', None)
+        splitter_pool_size = self.splitter_pool_size or config.get('splitter_pool_size', None)
 
-        print(f"[I140] Initial from config: hidden_dim={splitter_hidden_dim}, feature_dim={splitter_feature_dim}, pool_size={splitter_pool_size}")
+        print(f"[I140] Initial: hidden_dim={splitter_hidden_dim}, feature_dim={splitter_feature_dim}, pool_size={splitter_pool_size}")
 
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']

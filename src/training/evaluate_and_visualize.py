@@ -226,6 +226,10 @@ def run_evaluation_and_visualization(
     evaluate_train: bool = False,       # 是否评估训练集（CUB-200 专用）
     use_config_json: bool = True,       # 是否自动从 config.json 加载参数
     exp_config: Optional[Dict[str, Any]] = None,  # 预加载的实验配置
+    # I140: Splitter 配置参数
+    splitter_feature_dim: Optional[int] = None,
+    splitter_pool_size: Optional[int] = None,
+    splitter_hidden_dim: Optional[int] = None,
 ) -> Tuple[LayeredEvaluationReport, Optional[LayeredVisualizationReport]]:
     """执行完整的分层评估与可视化
 
@@ -272,6 +276,12 @@ def run_evaluation_and_visualization(
         是否自动从 config.json 加载参数
     exp_config : dict, optional
         预加载的实验配置（与 use_config_json 配合使用）
+    splitter_feature_dim : int, optional
+        Splitter 特征维度（必须与检查点匹配，解决配置不兼容问题）
+    splitter_pool_size : int, optional
+        Splitter 池化大小（必须与检查点匹配）
+    splitter_hidden_dim : int, optional
+        Splitter 复杂度 MLP 隐藏层维度（必须与检查点匹配）
 
     Returns
     -------
@@ -328,6 +338,10 @@ def run_evaluation_and_visualization(
             num_workers=num_workers,
             device=device,
             exp_config=exp_config,  # 传递实验配置
+            # I140: Splitter 配置参数
+            splitter_feature_dim=splitter_feature_dim,
+            splitter_pool_size=splitter_pool_size,
+            splitter_hidden_dim=splitter_hidden_dim,
         )
 
         eval_report = evaluator.run_full_evaluation(
@@ -764,6 +778,29 @@ Examples:
         help="Do not auto-load config.json from experiment directory",
     )
 
+    # I140: Splitter 配置参数（解决模型配置不兼容问题）
+    parser.add_argument(
+        "--splitter-feature-dim",
+        type=int,
+        default=None,
+        dest="splitter_feature_dim",
+        help="Splitter feature_dim (must match checkpoint, e.g., 48, 192, 256)",
+    )
+    parser.add_argument(
+        "--splitter-pool-size",
+        type=int,
+        default=None,
+        dest="splitter_pool_size",
+        help="Splitter pool_size (must match checkpoint, e.g., 4, 8)",
+    )
+    parser.add_argument(
+        "--splitter-hidden-dim",
+        type=int,
+        default=None,
+        dest="splitter_hidden_dim",
+        help="Splitter hidden_dim for complexity MLP (must match checkpoint)",
+    )
+
     return parser.parse_args()
 
 
@@ -819,6 +856,10 @@ def main():
             evaluate_train=args.evaluate_train,
             use_config_json=not args.no_config_json,
             exp_config=exp_config,
+            # I140: Splitter 配置参数
+            splitter_feature_dim=args.splitter_feature_dim,
+            splitter_pool_size=args.splitter_pool_size,
+            splitter_hidden_dim=args.splitter_hidden_dim,
         )
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user")
