@@ -184,6 +184,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 保留统计变量用于 tokenize 输出
         self._last_split_stats: Optional[Dict[str, Any]] = None
         self._tokens_per_batch: Optional[torch.Tensor] = None  # 延迟 GPU 计算
+        self._count_matrix_cache: Optional[torch.Tensor] = None  # P-OPT: 延迟构建 depth_distributions
         # I107-2: 移除调试缓存变量 (_last_features, _last_depth_count_matrix)
         # 这些仅用于调试，会导致显存泄露
 
