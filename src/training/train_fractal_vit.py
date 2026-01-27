@@ -1723,10 +1723,11 @@ def train_epoch(
     hard_mining: Optional[HilbertAwareHardMining] = None,
 ) -> Tuple[float, float, Dict[str, float]]:
     """训练一个 epoch
-    
+
     Args:
         exp_dir: 实验目录，用于保存 NaN/Inf 诊断日志
     """
+    print(f"[DEBUG] train_epoch: 函数被调用, loader len={len(loader)}")
     model.train()
     # P11-8: 使用张量累加，延迟 .item() 调用到 epoch 结束
     total_loss = torch.tensor(0.0, device=device)
@@ -3671,6 +3672,9 @@ def main():
     print()
     
     for epoch in range(1, config.epochs + 1):
+        print(f"\n{'='*60}")
+        print(f"EPOCH {epoch}/{config.epochs} - STARTING")
+        print(f"{'='*60}")
         start = time.time()
         
         # P13: 每个 epoch 开始时手动 GC
@@ -3798,6 +3802,7 @@ def main():
         # DEBUG: 检查 loader 长度
         print(f"[DEBUG] Epoch {epoch}: train_loader batches={len(current_train_loader)}, total_batches={len(train_loader)}")
 
+        print(f"[INFO] Epoch {epoch}: 即将开始 train_epoch...")
         train_loss, train_acc, perf_stats = train_epoch(
             model, current_train_loader, optimizer, device, scaler, config,
             mixup_fn=current_mixup_fn,
@@ -3809,7 +3814,8 @@ def main():
             epoch=epoch,
             hard_mining=hard_mining,
         )
-        
+        print(f"[INFO] Epoch {epoch}: train_epoch 完成, loss={train_loss:.4f}, acc={train_acc:.2f}%")
+
         # P15: 恢复 CudaPrefetcher 和清理临时 loader
         if disable_prefetch_this_epoch:
             os.environ.pop('DISABLE_PREFETCH', None)
