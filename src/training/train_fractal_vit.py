@@ -1807,6 +1807,8 @@ def train_epoch(
         # 检查 label 范围
         if labels.min() < 0 or labels.max() >= num_classes:
             print(f"\n[WARN] Label 范围异常: min={labels.min().item()}, max={labels.max().item()}, num_classes={num_classes}")
+            # 临时调试：打印所有标签值
+            print(f"[DEBUG] labels[:10]={labels[:10].tolist()}")
             continue
         
         # I23-4-FIX: 检查输入图像是否包含 NaN/Inf
