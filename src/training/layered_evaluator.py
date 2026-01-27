@@ -1134,30 +1134,44 @@ class LayeredEvaluator:
         else:
             state_dict = checkpoint
 
-        # 从 state_dict 检测 complexity_mlp 维度（如果 config 中没有指定）
-        if splitter_feature_dim is None or splitter_pool_size is None:
-            complexity_mlp_keys = [k for k in state_dict.keys() if 'complexity_mlp' in k]
-            if complexity_mlp_keys:
-                print(f"[I140] Found complexity_mlp keys: {complexity_mlp_keys[:5]}...")
-                for k in complexity_mlp_keys:
-                    if '.weight' in k and ('.0.' in k or '.0.weight' in k):
-                        weight = state_dict[k]
-                        print(f"[I140] complexity_mlp weight '{k}': shape={tuple(weight.shape)}")
-                        input_dim = weight.shape[1] if len(weight.shape) == 2 else weight.shape[-1]
-                        detected_hidden_dim = weight.shape[0]
+        # 从 state_dict 检测 complexity_mlp 维度
+        complexity_mlp_input_dim = None
+        complexity_mlp_hidden_dim = None
+        complexity_mlp_keys = [k for k in state_dict.keys() if 'complexity_mlp' in k and '.weight' in k and ('.0.' in k or '.0.weight' in k)]
+        if complexity_mlp_keys:
+            weight = state_dict[complexity_mlp_keys[0]]
+            complexity_mlp_input_dim = weight.shape[1] if len(weight.shape) == 2 else weight.shape[-1]
+            complexity_mlp_hidden_dim = weight.shape[0]
+            print(f"[I140] complexity_mlp weight: shape={tuple(weight.shape)}, input_dim={complexity_mlp_input_dim}")
 
-                        # 反推 feature_dim 和 pool_size
-                        for ps in [8, 4, 2, 16]:
-                            if input_dim % (ps * ps) == 0:
-                                detected_feature_dim = input_dim // (ps * ps)
-                                print(f"[I140] Inferred from checkpoint: feature_dim={detected_feature_dim}, pool_size={ps}, hidden_dim={detected_hidden_dim}")
-                                if splitter_feature_dim is None:
-                                    splitter_feature_dim = detected_feature_dim
-                                if splitter_pool_size is None:
-                                    splitter_pool_size = ps
-                                if splitter_hidden_dim is None:
-                                    splitter_hidden_dim = detected_hidden_dim
-                                break
+        # I140: 根据 complexity_mlp 维度推断正确的 dim
+        # 模型代码中: input_dim = dim * pool_size * pool_size
+        # 如果 config 中的 dim 与 complexity_mlp 不匹配，使用推断值
+        if complexity_mlp_input_dim is not None:
+            # 假设 pool_size=4（模型默认值），推断 dim
+            inferred_dim = complexity_mlp_input_dim // 16
+            if ckpt_dim != inferred_dim:
+                print(f"[I140] WARNING: config.dim={ckpt_dim} != complexity_mlp inferred dim={inferred_dim}")
+                print(f"  Using inferred dim={inferred_dim} for model compatibility")
+                ckpt_dim = inferred_dim
+                # 更新 config 中的 dim 以保持一致
+                config['dim'] = ckpt_dim
+                # 同步更新 mlp_dim
+                mlp_dim = ckpt_dim * 4
+                config['mlp_dim'] = mlp_dim
+                print(f"[I140] Updated mlp_dim to {mlp_dim}")
+
+        # 从 state_dict 检测 splitter 参数
+        if splitter_feature_dim is None or splitter_pool_size is None:
+            if complexity_mlp_input_dim is not None:
+                # 根据 complexity_mlp input_dim 反推
+                # input_dim = feature_dim * pool_size^2
+                for ps in [8, 4, 2, 16]:
+                    if complexity_mlp_input_dim % (ps * ps) == 0:
+                        splitter_feature_dim = complexity_mlp_input_dim // (ps * ps)
+                        splitter_pool_size = ps
+                        splitter_hidden_dim = complexity_mlp_hidden_dim or 128
+                        print(f"[I140] Inferred from complexity_mlp: feature_dim={splitter_feature_dim}, pool_size={splitter_pool_size}")
                         break
 
         # 如果 config 中没有配置，使用检测到的值，否则使用默认值
@@ -1168,7 +1182,7 @@ class LayeredEvaluator:
         if splitter_pool_size is None:
             splitter_pool_size = 4
 
-        print(f"[I140] Final splitter params: feature_dim={splitter_feature_dim}, pool_size={splitter_pool_size}, hidden_dim={splitter_hidden_dim}")
+        print(f"[I140] Final: dim={ckpt_dim}, feature_dim={splitter_feature_dim}, pool_size={splitter_pool_size}, hidden_dim={splitter_hidden_dim}")
 
         # I140: 创建与检查点匹配的 splitter（避免 complexity_mlp 维度不匹配）
         splitter = create_gumbel_topk_from_config(
