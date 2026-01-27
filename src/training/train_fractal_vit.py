@@ -1779,6 +1779,9 @@ def train_epoch(
     debug_first_mixup_epoch = debug_mode and use_mixup and epoch is not None and os.environ.get('DISABLE_PREFETCH', '0') == '1'
 
     for i, batch in enumerate(pbar):
+        # 总是更新进度条（即使有 continue 也需要更新）
+        pbar.update(1)
+
         # P13: 检测数据加载卡顿
         data_time = time.time() - data_start
         if data_time > stall_threshold:
@@ -2052,9 +2055,6 @@ def train_epoch(
                 )
             else:
                 pbar.set_postfix(loss=f'{loss_val:.4f}', acc=f'{acc_val:.1f}%')
-
-        # 显式更新进度条
-        pbar.update(1)
 
         # P-OPT: 移除无意义的 GC 调用
         # Python GC 对 GPU 内存无影响，使用 torch.cuda.empty_cache() 更有效
