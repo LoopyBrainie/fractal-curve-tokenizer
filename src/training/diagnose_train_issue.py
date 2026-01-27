@@ -1,17 +1,36 @@
 #!/usr/bin/env python
 """诊断训练问题的测试脚本"""
 import sys
-sys.path.insert(0, 'src')
-sys.path.insert(0, 'src/training')
+import os
+# 确保路径正确
+if os.path.exists('src'):
+    sys.path.insert(0, os.path.abspath('src'))
+if os.path.exists('src/training'):
+    sys.path.insert(0, os.path.abspath('src/training'))
 
 import torch
 from torch.utils.data import DataLoader
+
+print(f"Python path: {sys.path[:3]}...")
+print(f"Working dir: {os.getcwd()}")
 
 # 测试 1: DataLoader
 print("="*60)
 print("TEST 1: DataLoader")
 print("="*60)
-from dataset_factory import create_dataset
+
+# 尝试多种导入方式
+try:
+    from dataset_factory import create_dataset
+except ImportError:
+    try:
+        from training.dataset_factory import create_dataset
+    except ImportError:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("dataset_factory", "src/training/dataset_factory.py")
+        dataset_factory = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(dataset_factory)
+        create_dataset = dataset_factory.create_dataset
 
 train_ds, val_ds, _ = create_dataset('tiny-imagenet', 'data', batch_size=192, num_workers=0, pin_memory=False)
 train_loader = DataLoader(train_ds, batch_size=192, shuffle=True, num_workers=0, pin_memory=False)
@@ -62,14 +81,14 @@ print("="*60)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = model.to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-scaler = torch.amp.GradScaler('cuda')
+scaler = torch.amp.GradScaler('cuda') if torch.cuda.is_available() else None
 
 imgs, labels = next(iter(train_loader))
 imgs = imgs.to(device)
 labels = labels.to(device)
 
 print("Running forward + backward...")
-with torch.amp.autocast('cuda', enabled=torch.cuda.is_available()):
+with torch.amp.autocast('cuda', enabled=torch.cuda.is_available() and scaler is not None):
     stats = model(imgs)
     loss = torch.nn.functional.cross_entropy(stats.logits, labels)
     print(f"  Loss: {loss.item():.4f}")
