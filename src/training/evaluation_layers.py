@@ -1453,21 +1453,32 @@ class EfficiencyEvaluator:
             metrics.throughput_samples_per_sec = 1000 / estimated_latency_ms
             metrics.peak_memory_mb = total_params * 4 / (1024 ** 2) * 3  # 粗略估算
 
-        # 组件级延迟分解（已跳过，如果推理失败）
-        if self.measure_components:
+        # 组件级延迟分解（如果推理失败则跳过）
+        inference_works = metrics.avg_latency_ms > 0 and metrics.throughput_samples_per_sec > 0
+        if self.measure_components and inference_works:
             component_latencies = self._measure_component_latencies(
                 model, sample_input, device, n_warmup=5, n_runs=20
             )
             metrics.tokenizer_latency_ms = component_latencies.get('tokenizer', 0.0)
             metrics.transformer_latency_ms = component_latencies.get('transformer', 0.0)
             metrics.head_latency_ms = component_latencies.get('head', 0.0)
-        
-        # 内存估算
-        if device.type == 'cuda':
-            torch.cuda.reset_peak_memory_stats()
-            with torch.no_grad():
-                _ = model(sample_input)
-            metrics.peak_memory_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        else:
+            metrics.tokenizer_latency_ms = 0.0
+            metrics.transformer_latency_ms = 0.0
+            metrics.head_latency_ms = 0.0
+
+        # 内存估算（如果推理失败则跳过）
+        if device.type == 'cuda' and inference_works:
+            try:
+                torch.cuda.reset_peak_memory_stats()
+                with torch.no_grad():
+                    _ = model(sample_input)
+                metrics.peak_memory_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+            except RuntimeError:
+                metrics.peak_memory_mb = total_params * 4 / (1024 ** 2) * 3  # 回退到估算
+        elif not inference_works:
+            # 已经使用估算值
+            pass
         else:
             # CPU 内存估算 (参数 + 激活)
             param_memory = total_params * 4 / (1024 ** 2)  # float32
@@ -1611,12 +1622,21 @@ class EfficiencyEvaluator:
         n_runs: int = 20,
     ) -> Dict[str, float]:
         """估算组件延迟（当直接测量失败时）
-        
+
         使用基于参数量的启发式估算:
         - Tokenizer: ~15% 总延迟 (包含卷积、分割决策)
         - Transformer: ~80% 总延迟 (主要计算量)
         - Head: ~5% 总延迟 (MLP)
         """
+        # 检查是否可以直接测量（模型可能配置不兼容）
+        try:
+            with torch.no_grad():
+                _ = model(sample_input)
+        except RuntimeError:
+            # 模型推理失败，返回空字典
+            print(f"  [L5] Warning: Cannot measure component latencies, model inference failed")
+            return {}
+
         # 测量总延迟
         latencies = []
         with torch.no_grad():
