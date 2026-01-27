@@ -941,14 +941,7 @@ class LayeredEvaluator:
         # 获取 tokenizer 相关配置
         # I30-17: 优先使用 checkpoint 中保存的配置
         # 优先级：checkpoint config > state_dict 推断 > 默认值
-        max_depth_limit = config.get('max_depth_limit', None)
-        num_scales_from_config = config.get('num_scales', None)
-
-        # 如果 config 中有 num_scales，优先使用
-        if num_scales_from_config is not None and max_depth_limit is None:
-            max_depth_limit = num_scales_from_config - 1
-            print(f"Using num_scales={num_scales_from_config} from checkpoint config")
-
+        max_depth_limit = config.get('max_depth', None)  # P0: 使用正确的字段名
         min_patch_size = config.get('min_patch_size', 4)
         if isinstance(min_patch_size, int):
             min_patch_size = (min_patch_size, min_patch_size)
@@ -995,60 +988,24 @@ class LayeredEvaluator:
                 tokenizer_type = 'streaming_v3'
                 print("Detected tokenizer_type='streaming_v3' from checkpoint (new format)")
 
-        # 2. 检测 num_scales（仅当 config 中没有配置时）
-        # I78: 修复混合版本 checkpoint 问题
-        num_scales = None  # 初始化，确保在 if 块外可用
-        if max_depth_limit is None:
-            from collections import Counter
-            depth_related_keys = []
-
-            for k in state_dict.keys():
-                # 收集所有与深度相关的参数
-                if any(pattern in k for pattern in [
-                    'threshold_offsets', 'quota_logits', '_depth_ema_mean', '_depth_ema_var',
-                    'depth_embedding', '_depth_scale_raw', 'depth_embed'
-                ]):
-                    param_shape = state_dict[k].shape
-                    # 处理 torch.Size 对象（支持索引访问）
-                    if hasattr(param_shape, '__len__') and len(param_shape) > 0:
-                        depth_related_keys.append((k, int(param_shape[0])))
-
-            if depth_related_keys:
-                # 统计各维度的出现次数，取众数（出现最频繁的维度）
-                dim_counts = Counter(dim for _, dim in depth_related_keys)
-                detected_num_scales = dim_counts.most_common(1)[0][0]
-                num_scales = detected_num_scales
-                max_depth_limit = detected_num_scales - 1
-
-                # 打印维度分布
-                dims_summary = ', '.join([f"{dim}×{count}" for dim, count in dim_counts.most_common()])
-                print(f"Detected num_scales={num_scales} (max_depth_limit={max_depth_limit}) from {len(depth_related_keys)} depth-related parameters")
-                print(f"  Dimension distribution: {dims_summary}")
-        elif num_scales_from_config is not None:
-            # 如果 max_depth_limit 来自 config，使用 num_scales_from_config
-            num_scales = num_scales_from_config
-        elif max_depth_limit is not None:
-            # 如果 max_depth_limit 有值但 num_scales 未设置，从 max_depth_limit 推断
-            num_scales = max_depth_limit + 1
-
-        # 3. 从 num_scales 反推 min_patch_size（与训练器逻辑一致）
-        # 公式: min_patch_size = image_size / 2^max_depth
+        # 2. 从 state_dict 推断 max_depth（当 config 中没有配置时）
         detected_min_patch_size = config.get('min_patch_size', None)
-        if detected_min_patch_size is None and num_scales is not None:
-            # 从 num_scales 反推: max_depth = num_scales - 1
-            max_depth = num_scales - 1
-            # 假设正方形图像: min_patch_size = image_size / 2^max_depth
+        if detected_min_patch_size is None and max_depth_limit is not None:
+            # 从 max_depth 反推 min_patch_size
+            # 公式: min_patch_size = image_size / 2^max_depth
+            max_depth = max_depth_limit
             if isinstance(image_size, int):
                 effective_image_size = (image_size, image_size)
             elif isinstance(image_size, tuple):
                 effective_image_size = image_size
             else:
-                effective_image_size = (224, 224)  # 默认值
+                effective_image_size = (224, 224)
             min_size = min(effective_image_size)
             detected_min_patch_size = max(1, min_size // (2 ** max_depth))
-            print(f"Inferred min_patch_size={detected_min_patch_size} from num_scales={num_scales}")
+            print(f"Inferred min_patch_size={detected_min_patch_size} from max_depth={max_depth}")
+
         if detected_min_patch_size is None:
-            detected_min_patch_size = 4  # 默认值
+            detected_min_patch_size = 4
         if isinstance(detected_min_patch_size, int):
             min_patch_size = (detected_min_patch_size, detected_min_patch_size)
         else:
@@ -1179,8 +1136,6 @@ class LayeredEvaluator:
             emb_dropout=emb_dropout,
             min_patch_size=min_patch_size,
             max_depth=None,  # P11-2: None = 自动从 tokenizer.max_depth 获取
-            # I30-17: 使用 num_scales 参数（兼容性）
-            num_scales=num_scales,
             use_hilbert_encoding=use_hilbert_encoding,
             use_spatial_encoding=use_spatial_encoding,
             use_checkpoint=use_checkpoint,
