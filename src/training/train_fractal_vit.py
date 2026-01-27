@@ -1778,7 +1778,10 @@ def train_epoch(
     # P15: 在首个 Mixup epoch 添加额外诊断 (仅调试模式)
     debug_first_mixup_epoch = debug_mode and use_mixup and epoch is not None and os.environ.get('DISABLE_PREFETCH', '0') == '1'
 
+    # 调试：检查 DataLoader 是否有数据
+    batch_count = 0
     for i, batch in enumerate(pbar):
+        batch_count += 1
         # 总是更新进度条（即使有 continue 也需要更新）
         pbar.update(1)
 
@@ -2063,6 +2066,9 @@ def train_epoch(
         # 但 empty_cache() 也有开销，仅在真正需要时调用
 
         data_start = time.time()
+
+    # 调试：确认循环是否执行
+    print(f"[DEBUG] train_epoch 循环结束: batch_count={batch_count}, total={total}")
 
     perf_stats = {
         'avg_batch_time': np.mean(batch_times) if batch_times else 0,
