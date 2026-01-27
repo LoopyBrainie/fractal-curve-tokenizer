@@ -937,6 +937,7 @@ class LayeredEvaluator:
 
         # 构建模型
         from vit_pytorch import FractalCurveViT
+        from vit_pytorch.gumbel_topk_splitter import create_gumbel_topk_from_config
 
         # 获取 tokenizer 相关配置
         # I30-17: 优先使用 checkpoint 中保存的配置
@@ -1104,6 +1105,66 @@ class LayeredEvaluator:
         # channels
         channels = config.get('channels', 3)
 
+        # I140: 从检查点检测 splitter 关键参数（避免 complexity_mlp 维度不匹配）
+        splitter_hidden_dim = config.get('splitter_hidden_dim', None)
+        splitter_feature_dim = config.get('splitter_feature_dim', None)
+        splitter_pool_size = config.get('splitter_pool_size', None)
+
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        elif 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            state_dict = checkpoint
+
+        # 从 state_dict 检测 complexity_mlp 维度
+        if any('complexity_mlp.0.weight' in k for k in state_dict.keys()):
+            complexity_weight = None
+            for k in state_dict.keys():
+                if 'complexity_mlp.0.weight' in k:
+                    complexity_weight = state_dict[k]
+                    break
+            if complexity_weight is not None:
+                # complexity_mlp.0.weight shape: [hidden_dim, input_dim]
+                # input_dim = feature_dim * pool_size * pool_size
+                splitter_hidden_dim = complexity_weight.shape[0]
+                input_dim = complexity_weight.shape[1]
+                print(f"Detected splitter_hidden_dim={splitter_hidden_dim} from checkpoint")
+
+                # 反推 feature_dim 和 pool_size
+                # 常见组合: pool_size=4, feature_dim=input_dim/16
+                # 或者 pool_size=8, feature_dim=input_dim/64
+                if splitter_pool_size is None:
+                    for ps in [8, 4, 2]:
+                        if input_dim % (ps * ps) == 0:
+                            splitter_feature_dim = input_dim // (ps * ps)
+                            splitter_pool_size = ps
+                            print(f"  Inferred splitter_feature_dim={splitter_feature_dim}, pool_size={splitter_pool_size}")
+                            break
+                else:
+                    splitter_feature_dim = input_dim // (splitter_pool_size * splitter_pool_size)
+
+        # 使用默认值（如果未检测到）
+        if splitter_hidden_dim is None:
+            splitter_hidden_dim = config.get('splitter_hidden_dim', 128)
+        if splitter_feature_dim is None:
+            splitter_feature_dim = config.get('splitter_feature_dim', 256)
+        if splitter_pool_size is None:
+            splitter_pool_size = config.get('splitter_pool_size', 4)
+
+        # I140: 创建与检查点匹配的 splitter（避免 complexity_mlp 维度不匹配）
+        splitter = create_gumbel_topk_from_config(
+            feature_dim=splitter_feature_dim,
+            min_patch_size=min_patch_size[0] if isinstance(min_patch_size, tuple) else min_patch_size,
+            max_depth_limit=config.get('max_depth', 8),
+            hidden_dim=splitter_hidden_dim,
+            pool_size=splitter_pool_size,
+            K_min=config.get('K_min', 16),
+            K_max=config.get('K_max', 64),
+            image_size=(image_size, image_size) if isinstance(image_size, int) else image_size,
+        )
+        print(f"Created splitter with feature_dim={splitter_feature_dim}, hidden_dim={splitter_hidden_dim}, pool_size={splitter_pool_size}")
+
         # 创建模型（使用检测到的所有参数）
         model = FractalCurveViT(
             image_size=image_size,
@@ -1126,6 +1187,8 @@ class LayeredEvaluator:
             ffn_type=ffn_type,
             lca_temperature=lca_temperature,
             learnable_temperature=learnable_temperature,
+            # I140: 注入已配置好的 splitter（避免重新创建不匹配的）
+            splitter=splitter,
             # I23-2: Token 数量约束（使用检测或默认值）
             # I99: 优先从 checkpoint config 获取，否则使用默认值
             K_min=config.get('K_min', 16),
