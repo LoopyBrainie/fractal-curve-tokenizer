@@ -2139,11 +2139,16 @@ class GradientFlowEvaluator:
         try:
             # Forward + backward
             outputs = model(sample_input)
-            if isinstance(outputs, tuple):
+
+            # I140: 模型返回 TrainingStats 对象，不是元组
+            # 兼容处理 TrainingStats 和旧版 tuple 返回格式
+            if hasattr(outputs, 'logits'):
+                logits = outputs.logits
+            elif isinstance(outputs, tuple):
                 logits = outputs[0]
             else:
                 logits = outputs
-            
+
             loss = F.cross_entropy(logits, sample_labels)
             loss.backward()
             
