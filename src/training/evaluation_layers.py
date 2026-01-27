@@ -529,14 +529,12 @@ class ClassificationEvaluator:
                 total_loss += loss.item() * batch_size  # 加权损失累加
                 total_samples += batch_size
 
-                # I35: 收集 tokenizer 诊断信息
-                if aux_infos is not None:
-                    for aux_info in aux_infos:
-                        if isinstance(aux_info, dict):
-                            if 'num_tokens' in aux_info:
-                                all_num_tokens.append(aux_info['num_tokens'])
-                            if 'depth_distribution' in aux_info:
-                                all_depth_distributions.append(aux_info['depth_distribution'])
+                # I35: 从 TrainingStats 直接获取 tokenizer 诊断信息
+                # 修复: aux_infos 未定义Bug，现在从 stats 直接访问字段
+                if hasattr(stats, 'num_tokens'):
+                    all_num_tokens.append(stats.num_tokens)
+                if hasattr(stats, 'depth_distribution') and stats.depth_distribution:
+                    all_depth_distributions.append(stats.depth_distribution)
         
         all_preds = torch.cat(all_preds)
         all_labels = torch.cat(all_labels)

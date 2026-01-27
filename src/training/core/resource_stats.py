@@ -306,13 +306,14 @@ def compute_resource_stats_batch(
         # 获取 tokenizer 输出
         if hasattr(model, 'get_tokenizer_output'):
             token_output = model.get_tokenizer_output(batch_input)
-        else:
+        elif hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'last_output'):
             # 如果模型没有专门接口，通过 forward 获取
             _ = model(batch_input)
-            if hasattr(model.tokenizer, 'last_output'):
-                token_output = model.tokenizer.last_output
-            else:
-                raise ValueError("Model must provide tokenizer output interface")
+            token_output = model.tokenizer.last_output
+        else:
+            # 无法获取 tokenizer 输出，返回 None
+            logger.warning("Model does not provide tokenizer output interface, skipping token statistics")
+            return None
     
     # 构建配置字典
     model_config = {

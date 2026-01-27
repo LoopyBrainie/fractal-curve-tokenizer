@@ -83,8 +83,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-# 导入评估层
-from .evaluation_layers import (
+# 导入评估层 (使用绝对导入，因为本模块被独立运行)
+from training.evaluation_layers import (
     LayeredEvaluationReport,
     L1ClassificationMetrics,
     L2TokenizerMetrics,
@@ -944,10 +944,6 @@ class LayeredEvaluator:
         max_depth_limit = config.get('max_depth_limit', None)
         num_scales_from_config = config.get('num_scales', None)
 
-        # 兼容旧检查点：max_depth_hard_limit -> max_depth_limit
-        if max_depth_limit is None:
-            max_depth_limit = config.get('max_depth_hard_limit', None)
-
         # 如果 config 中有 num_scales，优先使用
         if num_scales_from_config is not None and max_depth_limit is None:
             max_depth_limit = num_scales_from_config - 1
@@ -1136,7 +1132,7 @@ class LayeredEvaluator:
         drop_path_rate = config.get('drop_path_rate', 0.15)
 
         # Pool 类型
-        pool = config.get('pool', 'cls')
+        pool = config.get('pool', 'weighted')
 
         # 编码器选项
         use_hilbert_encoding = config.get('use_hilbert_encoding', True)

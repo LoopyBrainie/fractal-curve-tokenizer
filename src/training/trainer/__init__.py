@@ -539,7 +539,17 @@ class ModularTrainer:
             with torch.amp.autocast('cuda', enabled=self.config.use_amp):
                 # 单一接口: forward() 返回 TrainingStats 或 Tensor
                 stats = self.model(inputs)
-                outputs = stats.logits if hasattr(stats, 'logits') else stats
+                # 类型检查优先于 hasattr (I112)
+                if TrainingStats is not None and isinstance(stats, TrainingStats):
+                    outputs = stats.logits
+                else:
+                    # 兼容旧接口: 可能是 tuple 或纯 Tensor
+                    if hasattr(stats, 'logits'):
+                        outputs = stats.logits
+                    elif isinstance(stats, tuple):
+                        outputs = stats[0]
+                    else:
+                        outputs = stats
 
                 loss = self.loss_fn(outputs, targets)
 

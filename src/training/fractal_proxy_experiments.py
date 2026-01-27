@@ -168,57 +168,82 @@ class TokenMetrics:
 
 
 class TokenMetricsCollector:
-    """Token 指标收集器 - 从 model.forward() aux_infos 提取"""
+    """Token 指标收集器 - 从 TrainingStats 提取"""
 
     def __init__(self, max_depth: int = 8):
         self.max_depth = max_depth
 
     def compute_metrics(
         self,
-        aux_infos: Dict[str, Any],
+        stats,
         num_total_patches: int,
         batch_size: int = 1,
     ) -> TokenMetrics:
-        """从 aux_infos 计算指标"""
+        """从 TrainingStats 计算指标 (I139: 适配新接口)"""
 
-        # 1. Token Density: 活跃 token / 总 patch
-        num_tokens = aux_infos.get("num_tokens", 0)
-        if isinstance(num_tokens, torch.Tensor):
-            num_tokens = num_tokens.item()
+        # I139: 支持 TrainingStats 或旧版 aux_infos 字典
+        if hasattr(stats, 'num_tokens'):
+            # TrainingStats 模式
+            num_tokens = stats.num_tokens
+            if isinstance(num_tokens, list):
+                num_tokens = sum(num_tokens)  # 批次总 token 数
+            if isinstance(num_tokens, torch.Tensor):
+                num_tokens = num_tokens.item()
 
+            # 从 split_info 获取 levels_used
+            split_info = getattr(stats, 'split_info', {})
+            levels_list = split_info.get('levels_list', None)
+
+            # 计算深度方差
+            if levels_list:
+                all_levels = []
+                for levels in levels_list:
+                    if levels.numel() > 0:
+                        all_levels.extend(levels[:, 0].cpu().tolist())
+                depth_variance = self._compute_depth_variance(all_levels) if all_levels else 0.0
+            else:
+                depth_variance = 0.0
+
+            # 深度分布
+            depth_dist = getattr(stats, 'depth_distribution', {})
+            if isinstance(depth_dist, dict):
+                num_tokens_per_depth = {k: int(v * num_tokens) for k, v in depth_dist.items()}
+            else:
+                num_tokens_per_depth = {}
+        else:
+            # 旧版 aux_infos 字典模式 (向后兼容)
+            aux_infos = stats
+            num_tokens = aux_infos.get("num_tokens", 0)
+            if isinstance(num_tokens, torch.Tensor):
+                num_tokens = num_tokens.item()
+
+            levels_used = aux_infos.get("levels_used", None)
+            if levels_used is not None:
+                if isinstance(levels_used, torch.Tensor):
+                    levels_used = levels_used.cpu().tolist()
+                depth_variance = self._compute_depth_variance(levels_used)
+            else:
+                depth_variance = 0.0
+
+            levels_distribution = aux_infos.get("levels_distribution", None)
+            if levels_distribution is not None:
+                if isinstance(levels_distribution, torch.Tensor):
+                    levels_distribution = levels_distribution.cpu().tolist()
+                num_tokens_per_depth = {
+                    i: levels_distribution[i] for i in range(len(levels_distribution))
+                }
+            else:
+                num_tokens_per_depth = {}
+
+        # Token Density: 活跃 token / 总 patch
         token_density = num_tokens / num_total_patches if num_total_patches > 0 else 0.0
-
-        # 2. Recursive Depth Variance
-        levels_used = aux_infos.get("levels_used", None)
-        if levels_used is not None:
-            if isinstance(levels_used, torch.Tensor):
-                levels_used = levels_used.cpu().tolist()
-            depth_variance = self._compute_depth_variance(levels_used)
-        else:
-            depth_variance = 0.0
-
-        # 3. 每层 Token 分布
-        levels_distribution = aux_infos.get("levels_distribution", None)
-        if levels_distribution is not None:
-            if isinstance(levels_distribution, torch.Tensor):
-                levels_distribution = levels_distribution.cpu().tolist()
-            num_tokens_per_depth = {
-                i: levels_distribution[i] for i in range(len(levels_distribution))
-            }
-        else:
-            num_tokens_per_depth = {}
-
-        # 4. Hilbert Locality Score (可选)
-        hilbert_locality = aux_infos.get("hilbert_locality_score", 0.0)
-        if isinstance(hilbert_locality, torch.Tensor):
-            hilbert_locality = hilbert_locality.item()
 
         return TokenMetrics(
             token_density=token_density,
             recursive_depth_variance=depth_variance,
             num_tokens_per_depth=num_tokens_per_depth,
             avg_tokens_per_sample=num_tokens / batch_size if batch_size > 0 else 0.0,
-            hilbert_locality_score=hilbert_locality,
+            hilbert_locality_score=0.0,  # TrainingStats 不提供此字段
             batch_size=batch_size,
         )
 
@@ -616,12 +641,15 @@ class SparseAblationExperiment(BaseExperiment):
             try:
                 if self.config.use_compile:
                     with torch.compiler.disable():
-                        logits, aux_infos = self.wrapper.model(imgs)
+                        stats = self.wrapper.model(imgs)
                 else:
-                    logits, aux_infos = self.wrapper.model(imgs)
+                    stats = self.wrapper.model(imgs)
             except Exception as e:
                 self._handle_compile_warning(e)
                 continue
+
+            # I139: 从 TrainingStats 提取 logits
+            logits = stats.logits if hasattr(stats, 'logits') else stats
 
             # 收集指标
             img_size = imgs.shape[2:]
@@ -629,7 +657,7 @@ class SparseAblationExperiment(BaseExperiment):
             num_patches = (img_size[0] // patch_size) * (img_size[1] // patch_size)
 
             metrics = self.metrics_collector.compute_metrics(
-                aux_infos,
+                stats,
                 num_total_patches=num_patches,
                 batch_size=imgs.shape[0],
             )
@@ -857,15 +885,18 @@ class FrozenEncoderExperiment(BaseExperiment):
                 try:
                     if self.config.use_compile:
                         with torch.compiler.disable():
-                            logits, aux_infos = self.wrapper.model(imgs)
+                            stats = self.wrapper.model(imgs)
                     else:
-                        logits, aux_infos = self.wrapper.model(imgs)
+                        stats = self.wrapper.model(imgs)
                 except Exception as e:
                     self._handle_compile_warning(e)
                     continue
 
-                # 3. 获取重构特征
-                recon_features = aux_infos.get("reconstructed_features", logits)
+                # I139: 从 TrainingStats 提取
+                logits = stats.logits if hasattr(stats, 'logits') else stats
+
+                # 3. 获取重构特征 (TrainingStats 不提供此字段，使用 logits)
+                recon_features = logits  # FER 模式需要重构特征，TrainingStats 暂不提供
 
                 # 4. 计算重构损失
                 loss, info = self.recon_loss_fn(original_features, recon_features)
@@ -890,7 +921,7 @@ class FrozenEncoderExperiment(BaseExperiment):
                 num_patches = (img_size[0] // patch_size) * (img_size[1] // patch_size)
 
                 metrics = self.metrics_collector.compute_metrics(
-                    aux_infos,
+                    stats,
                     num_total_patches=num_patches,
                     batch_size=imgs.shape[0],
                 )
@@ -1192,17 +1223,23 @@ class GeometricJigsawExperiment(BaseExperiment):
                 try:
                     if self.config.use_compile:
                         with torch.compiler.disable():
-                            logits, aux_infos = self.wrapper.model(imgs)
+                            stats = self.wrapper.model(imgs)
                     else:
-                        logits, aux_infos = self.wrapper.model(imgs)
+                        stats = self.wrapper.model(imgs)
                 except Exception as e:
                     self._handle_compile_warning(e)
                     continue
 
-                # 2. 提取 levels_info
-                levels_info = aux_infos.get("levels_info")
+                # I139: 从 TrainingStats 提取
+                logits = stats.logits if hasattr(stats, 'logits') else stats
+
+                # 2. 提取 levels_info (I139: TrainingStats 暂不直接提供，需要额外适配)
+                # 注意: GJP 模式需要 tokenizer 的 levels_info，当前 TrainingStats 不包含此字段
+                # split_info = stats.split_info if hasattr(stats, 'split_info') else {}
+                # levels_info = split_info.get('levels_list')  # 需要转换为 LevelsInfo 格式
+                levels_info = None  # TODO: I139 需要完整适配 GJP 模式
                 if levels_info is None:
-                    logger.warning("无法获取 levels_info，跳过 batch")
+                    logger.warning("GJP 模式: levels_info 不可用，跳过 batch (I139: 需要适配)")
                     continue
 
                 # 3. 计算拼图损失
@@ -1232,7 +1269,7 @@ class GeometricJigsawExperiment(BaseExperiment):
                 num_patches = (img_size[0] // patch_size) * (img_size[1] // patch_size)
 
                 metrics = self.metrics_collector.compute_metrics(
-                    aux_infos,
+                    stats,
                     num_total_patches=num_patches,
                     batch_size=imgs.shape[0],
                 )

@@ -401,7 +401,7 @@ class FractalConfigProtocol(Protocol):
     @property
     def drop_path_rate(self) -> float: ...
     @property
-    def gradient_checkpoint(self) -> bool: ...
+    def use_checkpoint(self) -> bool: ...  # I139: 统一命名 (原 use_checkpoint)
     @property
     def lca_temperature(self) -> Optional[float]: ...
     @property
@@ -435,7 +435,7 @@ class FractalConfigProtocol(Protocol):
 
     # ========== 训练配置 (训练循环) ==========
     @property
-    def channels_last(self) -> bool: ...
+    def use_channels_last(self) -> bool: ...  # I139: 统一命名
     @property
     def use_amp(self) -> bool: ...
     @property
@@ -1354,8 +1354,8 @@ def _compute_prefetch_factor(
 # ============================================================================
 
 # P-OPT: 模块级 collate_fn (可 pickle，用于多进程)
-def collate_fn_channels_last(batch, compile_model: bool = False):
-    """Collate 函数：转换为 channels_last 格式
+def collate_fn_use_channels_last(batch, compile_model: bool = False):
+    """Collate 函数：转换为 use_channels_last 格式
 
     Args:
         batch: 数据批次
@@ -1364,7 +1364,7 @@ def collate_fn_channels_last(batch, compile_model: bool = False):
     imgs, labels = default_collate(batch)
     # P-OPT: 仅在不编译时在 CPU 端预转换
     if not compile_model and imgs.dim() == 4:
-        imgs = imgs.to(memory_format=torch.channels_last)
+        imgs = imgs.to(memory_format=torch.use_channels_last)
     return imgs, labels
 
 
@@ -1569,11 +1569,11 @@ def create_dataloaders(
         loader_kwargs['generator'] = torch.Generator().manual_seed(42)
 
     # P-OPT: 使用模块级 collate_fn (可 pickle)
-    # 仅在启用 channels_last 且不编译时使用
-    if config.channels_last and not config.compile_model:
+    # 仅在启用 use_channels_last 且不编译时使用
+    if config.use_channels_last and not config.compile_model:
         # 使用 functools.partial 绑定 compile_model 参数
         from functools import partial
-        loader_kwargs['collate_fn'] = partial(collate_fn_channels_last, compile_model=False)
+        loader_kwargs['collate_fn'] = partial(collate_fn_use_channels_last, compile_model=False)
 
     train_loader = DataLoader(train_ds, sampler=SubsetRandomSampler(train_idx), **loader_kwargs)
     
@@ -1623,10 +1623,10 @@ class CudaPrefetcher:
     当 T_load ≈ T_compute 时，理论加速比接近 2x
     """
     
-    def __init__(self, loader: DataLoader, device: torch.device, channels_last: bool = False):
+    def __init__(self, loader: DataLoader, device: torch.device, use_channels_last: bool = False):
         self.loader = loader
         self.device = device
-        self.channels_last = channels_last
+        self.use_channels_last = use_channels_last
         # 双缓冲: 使用两个 CUDA stream 实现流水线
         self.stream = torch.cuda.Stream() if device.type == 'cuda' else None
         self._debug = False
@@ -1657,8 +1657,8 @@ class CudaPrefetcher:
         if self.stream is not None:
             with torch.cuda.stream(self.stream):
                 imgs = raw_batch[0].to(self.device, non_blocking=True)
-                if self.channels_last:
-                    imgs = imgs.to(memory_format=torch.channels_last)
+                if self.use_channels_last:
+                    imgs = imgs.to(memory_format=torch.use_channels_last)
                 gpu_data = (
                     imgs,
                     raw_batch[1].to(self.device, non_blocking=True),
@@ -1776,7 +1776,7 @@ def train_epoch(
     use_prefetcher = device.type == 'cuda' and os.environ.get('DISABLE_PREFETCH', '0') != '1'
 
     if use_prefetcher:
-        data_iter = CudaPrefetcher(loader, device, channels_last=config.channels_last)
+        data_iter = CudaPrefetcher(loader, device, use_channels_last=config.use_channels_last)
     else:
         data_iter = loader
 
@@ -1815,12 +1815,12 @@ def train_epoch(
             imgs = imgs.to(device)
             labels = labels.to(device)
         else:
-            # 当不使用 CudaPrefetcher 时，需要手动处理 GPU 传输和 channels_last
+            # 当不使用 CudaPrefetcher 时，需要手动处理 GPU 传输和 use_channels_last
             if not use_prefetcher:
                 imgs = imgs.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
-                if config.channels_last:
-                    imgs = imgs.to(memory_format=torch.channels_last)
+                if config.use_channels_last:
+                    imgs = imgs.to(memory_format=torch.use_channels_last)
         
         # 检查 label 范围
         if labels.min() < 0 or labels.max() >= num_classes:
@@ -1841,12 +1841,12 @@ def train_epoch(
             if debug_mode and i == 0:
                 print(f"[DEBUG] Batch 0: 开始应用 Mixup...", flush=True)
             imgs, mixed_labels = mixup_fn(imgs, labels)
-            # 确保 Mixup 后保持 channels_last 格式 (Mixup 的线性混合可能会破坏 memory format)
-            if config.channels_last and imgs.device.type == 'cuda':
-                imgs = imgs.to(memory_format=torch.channels_last)
+            # 确保 Mixup 后保持 use_channels_last 格式 (Mixup 的线性混合可能会破坏 memory format)
+            if config.use_channels_last and imgs.device.type == 'cuda':
+                imgs = imgs.to(memory_format=torch.use_channels_last)
             if debug_mode and i == 0:
                 print(f"[DEBUG] Batch 0: Mixup 完成，mixed_labels.shape={mixed_labels.shape}", flush=True)
-                print(f"[DEBUG] Batch 0: imgs.dtype={imgs.dtype}, imgs.is_contiguous(memory_format=torch.channels_last)={imgs.is_contiguous(memory_format=torch.channels_last)}", flush=True)
+                print(f"[DEBUG] Batch 0: imgs.dtype={imgs.dtype}, imgs.is_contiguous(memory_format=torch.use_channels_last)={imgs.is_contiguous(memory_format=torch.use_channels_last)}", flush=True)
 
         forward_start = time.time()
 
@@ -2139,7 +2139,7 @@ def evaluate(
     use_amp: bool,
     num_classes: int = 10,
     return_per_class: bool = False,
-    channels_last: bool = False,
+    use_channels_last: bool = False,
 ) -> Tuple[float, float, Optional[Dict[str, Any]]]:
     """评估
     
@@ -2165,8 +2165,8 @@ def evaluate(
     for batch in tqdm(loader, desc="Eval"):
         imgs, labels = batch
         imgs = imgs.to(device)
-        if channels_last:
-            imgs = imgs.to(memory_format=torch.channels_last)
+        if use_channels_last:
+            imgs = imgs.to(memory_format=torch.use_channels_last)
         labels = labels.to(device)
         
         # I23-4-FIX: 检查输入图像是否包含 NaN/Inf
@@ -2542,8 +2542,8 @@ def verify_train_eval_consistency(
     # 获取一个 batch 用于测试
     sample_batch = next(iter(loader))
     imgs = sample_batch[0][:4].to(device)  # 只用 4 张图
-    if config.channels_last:
-        imgs = imgs.to(memory_format=torch.channels_last)
+    if config.use_channels_last:
+        imgs = imgs.to(memory_format=torch.use_channels_last)
     
     # 检查 1: train/eval 输出差异
     model.eval()
@@ -2649,8 +2649,8 @@ def main():
     # I30-17: Replace num_scales with min_patch_size (max_depth auto-computed)
     parser.add_argument("--min-patch-size", type=int, default=4,
                        help="I30-17: Target minimum patch size for automatic depth computation")
-    # I30-11: 添加 weighted 池化选项
-    parser.add_argument("--pool", type=str, default="cls", choices=["cls", "mean", "weighted"])
+    # I30-11: weighted 池化利用 split_probs 作为重要性权重
+    parser.add_argument("--pool", type=str, default="weighted", choices=["weighted", "mean"])
     parser.add_argument("--ffn-type", type=str, default="swiglu_level",
                        choices=["gelu", "swiglu", "swiglu_level"])
     # P11-8: hilbert_bias_mode 已移除，仅使用 LCA 模式
@@ -2885,7 +2885,7 @@ def main():
     # P2 修复: 使用 spec.image_size 而非 args.image_size
     image_size_for_budget = spec.image_size if spec.image_size is not None else args.min_patch_size * 64
     max_patches = (image_size_for_budget // args.min_patch_size) ** 2
-    K_min = max(8, int(max_patches * args.token_coverage_min))  # 至少 8 tokens
+    K_min = max(4, int(max_patches * args.token_coverage_min))  # 至少 8 tokens
     K_max = int(max_patches * args.token_coverage_max)
 
     # I36: 使用 ModelArchitectureConfig 作为配置基础
@@ -2903,10 +2903,10 @@ def main():
         token_coverage_min=args.token_coverage_min,
         token_coverage_max=args.token_coverage_max,
         K_min_abs=K_min,
-        max_depth_hard_limit=args.max_depth if args.max_depth is not None else 8,
+        max_depth=args.max_depth if args.max_depth is not None else 8,
         ffn_type=args.ffn_type,
-        use_checkpoint=args.gradient_checkpoint,
-        use_channels_last=getattr(args, 'channels_last', False),
+        use_checkpoint=args.use_checkpoint,
+        use_channels_last=args.use_channels_last if hasattr(args, 'use_channels_last') else False,
         compile_model=getattr(args, 'compile', False),
         use_area_encoding=args.use_area_encoding,
         use_affine_modulation=args.use_affine_modulation,
@@ -2944,7 +2944,7 @@ def main():
             self.dropout = args.dropout
             self.emb_dropout = args.emb_dropout
             self.drop_path_rate = args.drop_path
-            self.gradient_checkpoint = arch_config.use_checkpoint
+            self.use_checkpoint = arch_config.use_checkpoint
             self.lca_temperature = arch_config.lca_temperature
             self.learnable_temperature = arch_config.learnable_temperature
             self.use_area_encoding = arch_config.use_area_encoding
@@ -2962,8 +2962,8 @@ def main():
             self.token_coverage_min = args.token_coverage_min
             self.token_coverage_max = args.token_coverage_max
 
-            # 训练配置
-            self.channels_last = arch_config.use_channels_last
+            # 训练配置 (use_channels_last 是 CLI 参数)
+            self.use_channels_last = getattr(args, 'use_channels_last', False)
             self.use_amp = args.use_amp
             self.learning_rate = args.lr
             self.weight_decay = args.weight_decay
@@ -3042,7 +3042,7 @@ def main():
         # I30-17: 使用新的动态深度参数 (max_depth 自动从 min_patch_size 计算)
         min_patch_size=config.min_patch_size,
         max_depth=config.max_depth,
-        use_checkpoint=config.gradient_checkpoint,
+        use_checkpoint=config.use_checkpoint,
         ffn_type=config.ffn_type,
         # 使用自定义 tokenizer (支持高级分割参数)
         tokenizer=tokenizer,
@@ -3112,9 +3112,9 @@ def main():
         print(f"  - Tokenizer Frozen (I24-1): {len(frozen_tokenizer_params)} params")
     if config.freeze_quota:
         print(f"  - Quota Frozen (I30-10): quota_logits will not learn")
-    print(f"Gradient Checkpoint: {config.gradient_checkpoint}")
+    print(f"Gradient Checkpoint: {config.use_checkpoint}")
     print(f"Compile Model: {config.compile_model}")
-    print(f"Channels Last: {config.channels_last}")
+    print(f"Channels Last: {config.use_channels_last}")
     print(f"{'='*70}\n")
     
     # =========================================================================
@@ -3317,7 +3317,7 @@ def main():
     
     # torch.compile 编译优化 (PyTorch 2.0+)
     # I107-2 修复: 添加 CUDA 检测，避免在无 CUDA 系统上设置不存在的配置
-    # I107-3 修复: 移动 channels_last 到 compile 之后，避免 cudagraphs 冲突
+    # I107-3 修复: 移动 use_channels_last 到 compile 之后，避免 cudagraphs 冲突
     # 注意: cudagraphs 在 laptop GPU 上经常失败，需要禁用或使用更稳定的模式
     if config.compile_model:
         try:
@@ -3368,10 +3368,10 @@ def main():
             # I107-6: 使用 reduce-overhead 模式获得更好的 CUDA 性能
             compile_mode = 'reduce-overhead'
 
-            # I107-6: 在 compile 之前应用 channels_last，避免 cudagraphs 冲突
+            # I107-6: 在 compile 之前应用 use_channels_last，避免 cudagraphs 冲突
             # 这样可以避免 device_put 时触发 CPU 操作
-            if config.channels_last and device.type == 'cuda':
-                model = model.to(memory_format=torch.channels_last)
+            if config.use_channels_last and device.type == 'cuda':
+                model = model.to(memory_format=torch.use_channels_last)
                 print("[OK] Using channels-last memory format (before compile)")
 
             model = torch.compile(
@@ -3386,9 +3386,9 @@ def main():
         except Exception as e:
             print(f"[WARN] torch.compile failed: {e}")
             print("[INFO] 回退到 eager 模式继续训练")
-            # 仍然应用 channels_last 如果需要
-            if config.channels_last and device.type == 'cuda':
-                model = model.to(memory_format=torch.channels_last)
+            # 仍然应用 use_channels_last 如果需要
+            if config.use_channels_last and device.type == 'cuda':
+                model = model.to(memory_format=torch.use_channels_last)
                 print("[OK] Using channels-last memory format (eager mode)")
     
     # 诊断: 检查模型参数 dtype
@@ -3522,8 +3522,8 @@ def main():
             else:
                 warmup_imgs = warmup_batch.to(device, non_blocking=True)
                 warmup_labels = torch.zeros(warmup_imgs.shape[0], dtype=torch.long, device=device)
-            if config.channels_last:
-                warmup_imgs = warmup_imgs.to(memory_format=torch.channels_last)
+            if config.use_channels_last:
+                warmup_imgs = warmup_imgs.to(memory_format=torch.use_channels_last)
 
             # 阶段1: 预热标准 forward pass (移除 synchronize 以避免 cudagraphs 冲突)
             with torch.no_grad():
@@ -3543,9 +3543,9 @@ def main():
                     with get_amp_context(device, config.use_amp):
                         # 测试 Mixup 数据变换
                         test_imgs, test_mixed_labels = mixup_fn(warmup_imgs.clone(), warmup_labels.clone())
-                        # 确保 Mixup 后保持 channels_last 格式
-                        if config.channels_last:
-                            test_imgs = test_imgs.to(memory_format=torch.channels_last)
+                        # 确保 Mixup 后保持 use_channels_last 格式
+                        if config.use_channels_last:
+                            test_imgs = test_imgs.to(memory_format=torch.use_channels_last)
                         # 测试 forward + Mixup loss
                         test_outs = model(test_imgs)
                         test_logits = test_outs.logits if hasattr(test_outs, 'logits') else test_outs
@@ -3813,7 +3813,7 @@ def main():
         
         val_loss, val_acc, per_class_stats = evaluate(
             model, val_loader, device, config.use_amp, spec.num_classes,
-            channels_last=config.channels_last
+            use_channels_last=config.use_channels_last
         )
         
         # P14: 类别平衡分析
@@ -3909,8 +3909,8 @@ def main():
         max_entropy_value = 1.609  # 默认: log(5) for max_depth=4
         if perf_stats.get('max_entropy') is not None:
             max_entropy_value = perf_stats['max_entropy']
-        elif hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
-            # 从 splitter.max_depth 动态计算
+        elif hasattr(model, 'splitter'):
+            # I98-2: 新架构使用 model.splitter (依赖注入模式)
             splitter = model.splitter
             if hasattr(splitter, 'max_depth'):
                 import math
@@ -3982,7 +3982,7 @@ def main():
     test_loss, test_acc, per_class_stats = evaluate(
         model, test_loader, device, config.use_amp, 
         spec.num_classes, return_per_class=True,
-        channels_last=config.channels_last
+        use_channels_last=config.use_channels_last
     )
     
     print(f"Test: loss={test_loss:.4f}, acc={test_acc:.2f}%")

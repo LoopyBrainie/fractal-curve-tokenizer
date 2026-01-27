@@ -120,7 +120,6 @@ from .trainer import (
 from .config import (
     ModelArchitectureConfig,  # I36: 统一架构配置
     DataConfig,
-    ModelConfig,
     LossConfig,
     BudgetConfig,
     OptimizerConfig,
@@ -268,7 +267,6 @@ __all__ = [
     # Config
     "ModelArchitectureConfig",  # I36: 统一架构配置
     "DataConfig",
-    "ModelConfig",
     "LossConfig",
     "BudgetConfig",
     "OptimizerConfig",
