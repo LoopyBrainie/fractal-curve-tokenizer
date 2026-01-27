@@ -246,50 +246,6 @@ def compute_total_candidates(
     return (4 ** (max_depth + 1) - 1) // 3
 
 
-def compute_effective_depth(
-    image_size: Tuple[int, int],
-    min_patch_size: int,
-    base_patch_size: int = 4,
-) -> int:
-    """
-    计算有效的四叉树深度（考虑 base_patch_size）。
-
-    有效深度是指从 base_patch_size 开始，
-    达到 min_patch_size 所需的分裂次数。
-
-    数学形式:
-        d_effective = max(0, floor(log2(min_patch_size / base_patch_size)))
-
-    参数
-    ----
-    image_size : Tuple[int, int]
-        (H, W) 输入图像尺寸
-    min_patch_size : int
-        目标最小 patch 大小
-    base_patch_size : int, optional
-        基础 patch 大小，默认 4
-
-    返回
-    ----
-    int
-        有效深度
-
-    示例
-    ----
-    >>> compute_effective_depth((64, 64), 4)
-    0
-    >>> compute_effective_depth((64, 64), 8)
-    1
-    >>> compute_effective_depth((64, 64), 16)
-    2
-    """
-    if min_patch_size <= base_patch_size:
-        return 0
-
-    ratio = min_patch_size / base_patch_size
-    return max(0, int(math.log2(ratio)))
-
-
 # ==================== I31: 形状-尺度计算函数 ====================
 
 def compute_region_shape_scale(

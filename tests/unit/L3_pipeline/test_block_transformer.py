@@ -308,42 +308,23 @@ class TestFractalTransformer:
 
         assert x.grad is not None
 
-    def test_dynamic_depth_inference(self):
-        """推理时动态深度"""
+    def test_effective_depth_info(self):
+        """测试有效深度信息返回"""
         transformer = FractalTransformer(
             dim=64,
             depth=4,
             heads=4,
             dim_head=16,
             mlp_dim=256,
-            use_dynamic_depth=True,
-            min_layers=2,
         )
 
-        transformer.eval()
         x = torch.randn(2, 16, 64)
 
         output, extra_info = transformer(x, return_extra_info=True)
 
         assert output.shape == (2, 16, 64)
         assert 'effective_depth' in extra_info
-        assert extra_info['effective_depth'] >= 2  # min_layers
-
-    def test_without_dynamic_depth(self):
-        """不使用动态深度"""
-        transformer = FractalTransformer(
-            dim=64,
-            depth=4,
-            heads=4,
-            dim_head=16,
-            mlp_dim=256,
-            use_dynamic_depth=False,
-        )
-
-        x = torch.randn(2, 16, 64)
-
-        output = transformer(x)
-        assert output.shape == (2, 16, 64)
+        assert extra_info['effective_depth'] == 2  # depth // 2 = 4 // 2
 
     def test_drop_path_rate(self):
         """DropPath 率"""

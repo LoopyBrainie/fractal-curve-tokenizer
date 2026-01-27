@@ -783,13 +783,15 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         # I98-1: 如果未提供 split_result，尝试从外部获取
         if split_result is None:
-            # 尝试从 model.splitter 获取
-            if hasattr(self, '_model') and hasattr(self._model, 'splitter'):
-                model = self._model
-                # 获取特征图
-                features = self.shared_conv(images)
-                # 调用 splitter
-                split_result = model.splitter(features, image_size=(images.shape[2], images.shape[3]))
+            # 尝试从 model.splitter 获取 (使用 weakref 避免循环引用)
+            if hasattr(self, '_model') and callable(self._model):
+                model_ref = self._model()
+                if model_ref is not None and hasattr(model_ref, 'splitter'):
+                    model = model_ref
+                    # 获取特征图
+                    features = self.shared_conv(images)
+                    # 调用 splitter
+                    split_result = model.splitter(features, image_size=(images.shape[2], images.shape[3]))
 
             # 如果仍然无法获取 split_result，返回空统计
             if split_result is None:
@@ -813,11 +815,21 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 'depth_distribution': {},
             }
 
-        # 使用 Python dict 方式计算 (从 depth_distributions)
-        total_dist: Dict[int, int] = {}
-        for dist in self._last_split_stats['depth_distributions']:
-            for d, count in dist.items():
-                total_dist[d] = total_dist.get(d, 0) + count
+        # I112: 使用 _count_matrix_cache 计算深度分布
+        if self._count_matrix_cache is None:
+            return {
+                'scale_ratios': {},
+                'entropy': 0.0,
+                'max_entropy': 0.0,
+                'dominant_scale': self.base_patch_size,
+                'depth_distribution': {},
+            }
+
+        # 从 count_matrix_cache 计算总分布
+        count_matrix = self._count_matrix_cache  # [B, max_d]
+        # 对所有 batch 求和
+        total_counts = count_matrix.sum(dim=0)  # [max_d]
+        total_dist = {int(d): int(total_counts[d]) for d in range(len(total_counts)) if total_counts[d] > 0}
 
         total_tokens = sum(total_dist.values())
         if total_tokens == 0:

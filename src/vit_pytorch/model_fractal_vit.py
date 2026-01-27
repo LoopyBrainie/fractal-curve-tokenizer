@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
+import weakref
 
 import torch
 import torch.nn as nn
@@ -55,28 +56,33 @@ class TrainingStats:
 
     设计原则: 单一接口，配置驱动，无废弃参数
     """
-    # 分类输出
+    # === 必需字段 ===
     logits: torch.Tensor              # [B, num_classes]
-
-    # Tokenization 统计
-    num_tokens: int                   # Token 数量
+    # I139: num_tokens 现在支持 int (单样本) 或 List[int] (多样本批次)
+    num_tokens: Union[int, List[int]]                   # Token 数量
     depth_used: int                   # 使用的深度
     depth_distribution: Dict[int, float]  # 深度分布
-
-    # 特征输出
     features: torch.Tensor            # [B, dim] 池化特征
     transformer_tokens: torch.Tensor  # [B, N, dim] Transformer token
 
-    # I107-7: 共享特征图 (避免训练循环中重复计算 shared_conv)
+    # === 可选字段 ===
     shared_features: Optional[torch.Tensor] = None  # [B, d_model, H/p, W/p]
-
-    # 诊断信息
     splitter_entropy: float = 0.0
     temperature: float = 1.0
 
+    # === 向后兼容字段 (I112) ===
+    aux_infos: Optional[List[Dict[str, Any]]] = None  # 评估层期望的 aux_infos 格式
+    ema_stats: Optional[torch.Tensor] = None           # I99-1: EMA buffer 统计信息
+    split_info: Dict[str, Any] = field(default_factory=dict)  # 分割决策详情
+
     def validate(self) -> None:
         """数学约束验证"""
-        assert 0 <= self.num_tokens <= 4096, f"Token 数异常: {self.num_tokens}"
+        # I139: 支持列表类型的 num_tokens
+        if isinstance(self.num_tokens, list):
+            for i, n in enumerate(self.num_tokens):
+                assert 0 <= n <= 4096, f"Batch[{i}] Token 数异常: {n}"
+        else:
+            assert 0 <= self.num_tokens <= 4096, f"Token 数异常: {self.num_tokens}"
         assert 0 <= self.depth_used <= 50, f"深度越界: {self.depth_used}"
         if self.depth_distribution:
             total = sum(self.depth_distribution.values())
@@ -129,7 +135,7 @@ class FractalCurveViT(nn.Module):
         depth: int = 6,
         heads: int = 8,
         mlp_dim: int = 1024,
-        pool: str = "cls",
+        pool: str = "weighted",
         channels: int = 3,
         dim_head: int = 64,
         dropout: float = 0.0,
@@ -173,7 +179,7 @@ class FractalCurveViT(nn.Module):
             depth: Transformer 层数
             heads: 注意力头数
             mlp_dim: MLP 隐藏层维度
-            pool: 池化策略 ('cls', 'mean' 或混合)
+            pool: 池化策略 ('weighted' 或 'mean')
             channels: 输入图像通道数
             dim_head: 每个注意力头的维度
             dropout: Dropout 比率
@@ -300,8 +306,8 @@ class FractalCurveViT(nn.Module):
 
         self.tokenizer = tokenizer
 
-        # I98-1: 设置 tokenizer 对 model 的引用，以便 compute_scale_distribution 能够访问 splitter
-        tokenizer._model = self
+        # I98-1: 设置 tokenizer 对 model 的弱引用，避免循环引用导致递归遍历失败
+        tokenizer._model = weakref.ref(self)
 
         # P11-2 修复: 从 tokenizer 动态获取 max_depth 作为 max_depth
         if max_depth is None:
@@ -382,8 +388,7 @@ class FractalCurveViT(nn.Module):
         if mlp_head is not None:
             self.mlp_head = mlp_head
         else:
-            # 动态创建 MLP Head（向后兼容）
-            self.to_latent = nn.Identity()
+            # 动态创建 MLP Head
             self.mlp_head = nn.Sequential(
                 nn.LayerNorm(dim),
                 nn.Linear(dim, mlp_dim // 2),
@@ -656,7 +661,9 @@ class FractalCurveViT(nn.Module):
     ) -> torch.Tensor:
         """应用池化策略。
 
-        I30-11: 支持 weighted 池化，利用 GumbelTopKSplitter 的 split_probs 作为权重。
+        数学形式:
+        - mean: z = (1/N) * Σ_i x_i
+        - weighted: z = Σ_i (w_i / Σ_j w_j) * x_i, 其中 w_i = split_prob_i
 
         Args:
             x: transformer 输出 [B, Seq, Dim]
@@ -666,48 +673,20 @@ class FractalCurveViT(nn.Module):
         Returns:
             pooled: 池化后的表示 [B, Dim]
         """
-        if self.pool == "cls":
-            return x[:, 0]
-        elif self.pool == "mean":
-            # 标准 mean pooling
-            token_x = x[:, 1:]
-            token_mask = ~key_padding_mask[:, 1:]
-            token_x = token_x * token_mask.unsqueeze(-1).float()
-            sum_x = token_x.sum(dim=1)
-            valid_counts = token_mask.sum(dim=1, keepdim=True).float().clamp(min=DIVISION_EPSILON)
-            return sum_x / valid_counts
-        elif self.pool == "weighted":
+        token_x = x[:, 1:]  # [B, N, D] - 排除 CLS
+        token_mask = ~key_padding_mask[:, 1:]  # [B, N] - 排除 CLS
+
+        if self.pool == "weighted" and split_probs is not None:
             # I30-11: 加权池化，利用 split_probs 作为 token 重要性权重
-            # 数学形式: z = sum(w_i * x_i) / sum(w_i), 其中 w_i = split_prob_i
-            if split_probs is None:
-                # 回退到 mean pooling
-                token_x = x[:, 1:]
-                token_mask = ~key_padding_mask[:, 1:]
-                token_x = token_x * token_mask.unsqueeze(-1).float()
-                sum_x = token_x.sum(dim=1)
-                valid_counts = token_mask.sum(dim=1, keepdim=True).float().clamp(min=DIVISION_EPSILON)
-                return sum_x / valid_counts
-
-            token_x = x[:, 1:]  # [B, N, D] - 排除 CLS
-            token_mask = ~key_padding_mask[:, 1:]  # [B, N] - 排除 CLS
-
-            # I30-11: split_probs 形状为 [B, N]，与 token_x/token_mask 对齐
-            # 无需再切片，直接使用
-            token_probs = split_probs  # [B, N]
-
-            # 有效性 mask
-            token_probs = token_probs * token_mask.float()
-
-            # 权重归一化: w_norm = w / sum(w)
+            token_probs = split_probs * token_mask.float()
             weight_sum = token_probs.sum(dim=-1, keepdim=True).clamp(min=PROB_EPSILON)
-            normalized_weights = token_probs / weight_sum  # [B, N]
-
-            # 加权平均: z = sum(w_i * x_i)
-            weighted = (token_x * normalized_weights.unsqueeze(-1)).sum(dim=1)  # [B, D]
-
-            return weighted
+            normalized_weights = token_probs / weight_sum
+            return (token_x * normalized_weights.unsqueeze(-1)).sum(dim=1)
         else:
-            raise ValueError(f"Unknown pool type: {self.pool}")
+            # mean pooling 作为默认
+            masked_x = token_x * token_mask.unsqueeze(-1).float()
+            valid_counts = token_mask.sum(dim=1, keepdim=True).float().clamp(min=DIVISION_EPSILON)
+            return masked_x.sum(dim=1) / valid_counts
 
     @torch._dynamo.disable(recursive=False)
     def _prepare_auxiliary_output(
@@ -910,12 +889,20 @@ class FractalCurveViT(nn.Module):
         # I30-11: 获取 split_probs 用于加权池化
         split_probs = token_output.get_padded_split_probs()
 
-        # 5. 池化
+        # 5. 池化 + 分类
         pooled = self._apply_pooling(x, key_padding_mask, split_probs)
-        pooled = self.to_latent(pooled)
         final_output = self.mlp_head(pooled)
 
         # 6. 构建 TrainingStats
+        # I139: 修复 - num_tokens 应为每个样本的 token 数量列表，而非批次总和
+        num_tokens_list = lengths.cpu().tolist()
+
+        # 构建 split_info 字典
+        split_info = {
+            'levels_list': levels_list,
+            'batch_size': batch_size,
+        }
+
         aux_infos, _ = self._prepare_auxiliary_output(
             batch_size, lengths, levels_list, pooled, return_aux_info=True, return_features=False,
             split_probs=split_probs
@@ -945,15 +932,16 @@ class FractalCurveViT(nn.Module):
         # I107-7: 在 training 模式下返回 shared_features供 auxiliary loss 使用
         return_features = features if self.training else None
 
+        # I139: 修复 - num_tokens 使用列表类型，depth_distribution 使用真实分布
         stats = TrainingStats(
             logits=final_output,
-            # P-OPT: 避免 .item() 同步，保持 GPU 计算
-            num_tokens=int(lengths.sum()),
+            num_tokens=num_tokens_list[0] if len(num_tokens_list) == 1 else num_tokens_list,  # 兼容: 单样本用标量，多样本用列表
             depth_used=depth_used,
             depth_distribution=depth_dist,
             features=pooled,
             transformer_tokens=transformer_tokens,
             shared_features=return_features,  # I107-7: 避免训练循环重复计算
+            split_info=split_info,
         )
 
         return stats
@@ -1404,7 +1392,7 @@ def create_fractal_vit(
     use_affine_modulation: bool = True,
     fourier_levels: int = 4,
     # 输出配置
-    pool: str = "cls",
+    pool: str = "weighted",
     # 编码器配置 (I98-3)
     encoder_config: Optional[AttentionEncoderConfig] = None,
     # I104-3: FP16 存储 LCA embedding
@@ -1446,7 +1434,7 @@ def create_fractal_vit(
         use_area_encoding: 是否使用面积编码
         use_affine_modulation: 是否使用仿射调制
         fourier_levels: 傅里叶特征级别数
-        pool: 池化策略 ('cls', 'mean', 'weighted')
+        pool: 池化策略 ('weighted' 或 'mean')
         encoder_config: 注意力编码器配置
 
     Returns:

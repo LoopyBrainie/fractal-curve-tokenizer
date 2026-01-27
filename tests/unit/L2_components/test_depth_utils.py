@@ -20,7 +20,6 @@ from vit_pytorch.depth_utils import (
     compute_patch_sizes,
     compute_depth_distribution,
     compute_total_candidates,
-    compute_effective_depth,
     compute_region_shape_scale,
     compute_shape_scale_similarity,
     compute_normalized_area,
@@ -151,25 +150,6 @@ class TestComputeTotalCandidates:
         # 1 + 4 + 16 + 64 + 256 = 341
         result = compute_total_candidates((224, 224), 4)
         assert result == 341
-
-
-class TestComputeEffectiveDepth:
-    """compute_effective_depth 函数测试"""
-
-    def test_equal_sizes(self):
-        """相等大小"""
-        result = compute_effective_depth((64, 64), 4)
-        assert result == 0
-
-    def test_double_size(self):
-        """两倍大小"""
-        result = compute_effective_depth((64, 64), 8)
-        assert result == 1
-
-    def test_quadruple_size(self):
-        """四倍大小"""
-        result = compute_effective_depth((64, 64), 16)
-        assert result == 2
 
 
 class TestComputeRegionShapeScale:

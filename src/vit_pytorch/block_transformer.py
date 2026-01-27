@@ -75,7 +75,6 @@ from .attn_hilbert_bias import HilbertAwareMultiScaleAttention
 from .ffn_swiglu import AdaptiveFractalFeedForward, FFNType
 from .config import AttentionEncoderConfig  # I98-3
 from .levels_info import LevelsInfo  # I98-4
-from .complexity_estimator import ComplexityEstimator  # I97-11
 
 
 class DropPath(nn.Module):
@@ -334,10 +333,6 @@ class FractalTransformer(nn.Module):
         use_affine_modulation: bool = True,  # A17: 启用 ShapeScaleEncoder
         fourier_levels: int = 4,
         encoder_config: Optional[AttentionEncoderConfig] = None,  # I98-3
-        # I97-11: 动态计算参数
-        use_dynamic_depth: bool = True,
-        min_layers: int | None = None,
-        complexity_hidden_dim: int | None = None,
         use_fp16: bool = False,  # I104-3: FP16 存储 LCA embedding
     ):
         super().__init__()
@@ -347,20 +342,6 @@ class FractalTransformer(nn.Module):
         self.ffn_type = ffn_type
         self.use_checkpoint = use_checkpoint
         self.use_fp16 = use_fp16  # I104-3
-
-        # I97-11: 动态深度配置
-        self.use_dynamic_depth = use_dynamic_depth
-        self.min_layers = min_layers or (depth // 2)
-
-        # I97-11: 复杂度估计器
-        if use_dynamic_depth:
-            self.complexity_estimator = ComplexityEstimator(
-                dim=dim,
-                hidden_dim=complexity_hidden_dim,
-                use_cls=False,
-            )
-        else:
-            self.complexity_estimator = None
 
         # Stochastic depth decay rule
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
@@ -456,16 +437,11 @@ class FractalTransformer(nn.Module):
 
         batch_size, seq_len, dim = x.shape
 
-        # I100-6: 使用固定深度 (depth // 2) 而非动态深度
-        # 原因：动态深度的条件计算与 GPU SIMT 并行存在根本矛盾
-        #       - 条件计算要求 per-sample 独立深度 L_i
-        #       - GPU SIMT 要求 batch 内同一深度
-        #       固定深度可实现 50% FLOPs 节省，同时保持 Hilbert 局部性
+        # I100-6: 使用固定有效深度 depth // 2
         effective_depth = self.depth // 2
-
         extra_info = {'effective_depth': effective_depth}
 
-        # 执行transformer层
+        # 执行 transformer 层
         for i, layer in enumerate(self.layers):
             if i >= effective_depth:
                 break
