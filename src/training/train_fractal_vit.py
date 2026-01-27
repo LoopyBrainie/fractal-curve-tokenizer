@@ -1671,21 +1671,32 @@ class CudaPrefetcher:
         return True
 
     def __next__(self):
-        # 等待当前缓冲区的传输完成
+        # 获取当前缓冲区数据（优先使用 _current_idx，如果为空则尝试 _preload_idx）
+        current_data = self._buffer[self._current_idx]
+        preload_data = self._buffer[self._preload_idx]
+
+        if current_data is None and preload_data is None:
+            # 两个缓冲区都为空，尝试预加载
+            if not self._preload_next():
+                raise StopIteration
+            current_data = self._buffer[self._preload_idx]
+            if current_data is None:
+                raise StopIteration
+            # 交换指针并返回
+            self._current_idx, self._preload_idx = self._preload_idx, self._current_idx
+            self._buffer[self._current_idx] = None
+            self._batch_count += 1
+            self._preload_next()
+            return current_data
+
+        # 如果 _current_idx 为空但 _preload_idx 有数据，交换它们
+        if current_data is None:
+            current_data = preload_data
+            self._buffer[self._preload_idx] = None
+
+        # 等待 CUDA stream 完成（如果使用 CUDA）
         if self.stream is not None:
             torch.cuda.current_stream().wait_stream(self.stream)
-
-        # 获取当前缓冲区数据
-        current_data = self._buffer[self._current_idx]
-        if current_data is None:
-            # 尝试预加载一次再检查（处理初始状态为空的情况）
-            if not self._preload_next():
-                print(f"[DEBUG] CudaPrefetcher: _preload_next 返回 False，Raise StopIteration")
-                raise StopIteration
-            current_data = self._buffer[self._current_idx]
-            if current_data is None:
-                print(f"[DEBUG] CudaPrefetcher: 预加载后缓冲区仍为空，Raise StopIteration")
-                raise StopIteration
 
         # 清空当前缓冲区，切换指针
         self._buffer[self._current_idx] = None
