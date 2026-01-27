@@ -1678,7 +1678,12 @@ class CudaPrefetcher:
         # 获取当前缓冲区数据
         current_data = self._buffer[self._current_idx]
         if current_data is None:
-            raise StopIteration
+            # 尝试预加载一次再检查（处理初始状态为空的情况）
+            if not self._preload_next():
+                raise StopIteration
+            current_data = self._buffer[self._current_idx]
+            if current_data is None:
+                raise StopIteration
 
         # 清空当前缓冲区，切换指针
         self._buffer[self._current_idx] = None
@@ -1755,8 +1760,7 @@ def train_epoch(
         print(f"[DEBUG] Model expects input dtype: {model_dtype}")
 
     # 使用环境变量 DISABLE_PREFETCH=1 来禁用 CudaPrefetcher
-    use_prefetcher = False  # device.type == 'cuda' and os.environ.get('DISABLE_PREFETCH', '0') != '1'
-    print(f"[DEBUG] use_prefetcher={use_prefetcher}")
+    use_prefetcher = device.type == 'cuda' and os.environ.get('DISABLE_PREFETCH', '0') != '1'
 
     if use_prefetcher:
         data_iter = CudaPrefetcher(loader, device, channels_last=config.channels_last)
@@ -1765,7 +1769,7 @@ def train_epoch(
 
     pbar = tqdm(data_iter, desc="Train", total=len(loader), mininterval=0.5, dynamic_ncols=True)
 
-    # DEBUG: 检查 DataLoader 长度
+    # 检查 DataLoader 长度
     if len(loader) == 0:
         print(f"[ERROR] DataLoader 长度为 0！train_loader 有 {len(train_loader)} 个 batch")
         return 0.0, 0.0, {}
@@ -1811,8 +1815,6 @@ def train_epoch(
         # 检查 label 范围
         if labels.min() < 0 or labels.max() >= num_classes:
             print(f"\n[WARN] Label 范围异常: min={labels.min().item()}, max={labels.max().item()}, num_classes={num_classes}")
-            # 临时调试：打印所有标签值
-            print(f"[DEBUG] labels[:10]={labels[:10].tolist()}")
             continue
         
         # I23-4-FIX: 检查输入图像是否包含 NaN/Inf
@@ -2067,9 +2069,6 @@ def train_epoch(
         # 但 empty_cache() 也有开销，仅在真正需要时调用
 
         data_start = time.time()
-
-    # 调试：确认循环是否执行
-    print(f"[DEBUG] train_epoch 循环结束: batch_count={batch_count}, total={total}")
 
     perf_stats = {
         'avg_batch_time': np.mean(batch_times) if batch_times else 0,
