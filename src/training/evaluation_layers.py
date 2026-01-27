@@ -708,7 +708,10 @@ class TokenizerEvaluator:
                 needs_split_result = hasattr(tokenizer, 'shared_conv')
                 if needs_split_result:
                     if hasattr(model, 'splitter'):
-                        split_result = model.splitter(imgs)
+                        # I140: 修复 - splitter 期望特征图，不是原始图像
+                        # 先用 tokenizer 的 shared_conv 提取特征
+                        features = tokenizer.shared_conv(imgs)  # [B, C, H', W']
+                        split_result = model.splitter(features)
                         output = tokenizer.tokenize(imgs, split_result)
                     else:
                         raise ValueError("Tokenizer requires splitter but model has no 'splitter' attribute")
@@ -959,7 +962,10 @@ class AttentionEvaluator:
                         tokenizer = model.tokenizer
                         needs_split_result = hasattr(tokenizer, 'shared_conv')
                         if needs_split_result and hasattr(model, 'splitter'):
-                            split_result = model.splitter(imgs)
+                            # I140: 修复 - splitter 期望特征图，不是原始图像
+                            # 先用 tokenizer 的 shared_conv 提取特征
+                            features = tokenizer.shared_conv(imgs)  # [B, C, H', W']
+                            split_result = model.splitter(features)
                             tok_output = tokenizer.tokenize(imgs, split_result)
                         else:
                             tok_output = tokenizer.tokenize(imgs)

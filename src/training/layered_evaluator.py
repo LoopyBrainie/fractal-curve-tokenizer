@@ -1145,40 +1145,44 @@ class LayeredEvaluator:
             print(f"[I140] complexity_mlp weight: shape={tuple(weight.shape)}, input_dim={complexity_mlp_input_dim}")
 
         # I140: 根据 complexity_mlp 维度推断正确的 dim
-        # 模型代码中: input_dim = dim * pool_size * pool_size
-        # 如果 config 中的 dim 与 complexity_mlp 不匹配，使用推断值
+        # 注意: 模型代码中 tokenizer 的 encoder 使用 dim 作为输出通道数
+        # 而 splitter 的 complexity_mlp input = feature_dim * pool_size^2
+        # 为了使 tokenizer 输出与 splitter 兼容，需要确保 feature_dim = dim
         if complexity_mlp_input_dim is not None:
             # 假设 pool_size=4（模型默认值），推断 dim
             inferred_dim = complexity_mlp_input_dim // 16
             if ckpt_dim != inferred_dim:
-                print(f"[I140] WARNING: config.dim={ckpt_dim} != complexity_mlp inferred dim={inferred_dim}")
-                print(f"  Using inferred dim={inferred_dim} for model compatibility")
+                print(f"[I140] WARNING: config.dim={ckpt_dim} != complexity_mlp expected dim={inferred_dim}")
+                print(f"  Adjusting model dimensions for checkpoint compatibility:")
                 ckpt_dim = inferred_dim
-                # 更新 config 中的 dim 以保持一致
+                # 更新 config 中的 dim 和 mlp_dim
                 config['dim'] = ckpt_dim
-                # 同步更新 mlp_dim
                 mlp_dim = ckpt_dim * 4
                 config['mlp_dim'] = mlp_dim
-                print(f"[I140] Updated mlp_dim to {mlp_dim}")
+                print(f"[I140] Updated dim={ckpt_dim}, mlp_dim={mlp_dim}")
 
-        # 从 state_dict 检测 splitter 参数
-        if splitter_feature_dim is None or splitter_pool_size is None:
-            if complexity_mlp_input_dim is not None:
-                # 根据 complexity_mlp input_dim 反推
-                # input_dim = feature_dim * pool_size^2
-                for ps in [8, 4, 2, 16]:
-                    if complexity_mlp_input_dim % (ps * ps) == 0:
-                        splitter_feature_dim = complexity_mlp_input_dim // (ps * ps)
-                        splitter_pool_size = ps
+        # 同步设置 feature_dim = dim（确保 tokenizer 输出与 splitter 兼容）
+        # 这一点至关重要：tokenizer 的 encoder 使用 dim 作为输出通道数
+        # splitter 的 complexity_mlp 期望输入 feature_dim * pool_size^2 维
+        # 如果 feature_dim != dim，会导致维度不匹配
+        splitter_feature_dim = ckpt_dim
+        print(f"[I140] Setting feature_dim={splitter_feature_dim} to match dim={ckpt_dim}")
+
+        # 从 state_dict 检测 splitter pool_size（仅当未设置时）
+        if splitter_pool_size is None and complexity_mlp_input_dim is not None:
+            # 根据 complexity_mlp input_dim 反推 pool_size
+            # input_dim = feature_dim * pool_size^2 = dim * pool_size^2
+            for ps in [8, 4, 2, 16]:
+                if complexity_mlp_input_dim % (ps * ps) == 0:
+                    splitter_pool_size = ps
+                    if splitter_hidden_dim is None:
                         splitter_hidden_dim = complexity_mlp_hidden_dim or 128
-                        print(f"[I140] Inferred from complexity_mlp: feature_dim={splitter_feature_dim}, pool_size={splitter_pool_size}")
-                        break
+                    print(f"[I140] Inferred pool_size={splitter_pool_size} from complexity_mlp")
+                    break
 
         # 如果 config 中没有配置，使用检测到的值，否则使用默认值
         if splitter_hidden_dim is None:
             splitter_hidden_dim = 128
-        if splitter_feature_dim is None:
-            splitter_feature_dim = 256
         if splitter_pool_size is None:
             splitter_pool_size = 4
 
@@ -1274,7 +1278,7 @@ class LayeredEvaluator:
 
         # 加载过滤后的权重
         missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
-        
+
         if missing_keys:
             print(f"Warning: Missing {len(missing_keys)} keys in state_dict")
             # 只打印前 5 个
@@ -1282,14 +1286,50 @@ class LayeredEvaluator:
                 print(f"  - {k}")
             if len(missing_keys) > 5:
                 print(f"  ... and {len(missing_keys) - 5} more")
-        
+
         if unexpected_keys:
             print(f"Warning: Unexpected {len(unexpected_keys)} keys in state_dict")
             for k in unexpected_keys[:5]:
                 print(f"  - {k}")
             if len(unexpected_keys) > 5:
                 print(f"  ... and {len(unexpected_keys) - 5} more")
-        
+
+        # I140: 修复 complexity_mlp 维度不匹配问题
+        # 当 checkpoint 的 complexity_mlp input_dim 与模型实际产生的特征维度不匹配时，
+        # 需要调整第一层线性层以接受正确维度的输入
+        if complexity_mlp_input_dim is not None:
+            # 计算模型实际产生的 complexity_mlp 输入维度
+            # tokenizer 使用 dim 作为特征维度，complexity_mlp input = dim * pool_size^2
+            actual_input_dim = ckpt_dim * splitter_pool_size * splitter_pool_size
+            if actual_input_dim != complexity_mlp_input_dim:
+                print(f"[I140] Fixing complexity_mlp dimension mismatch:")
+                print(f"  - Checkpoint expects: {complexity_mlp_input_dim}")
+                print(f"  - Model produces: {actual_input_dim}")
+                print(f"  - Resizing complexity_mlp.0 to accept {actual_input_dim} features")
+
+                # 访问 splitter 的 complexity_mlp
+                splitter = model.splitter
+                if hasattr(splitter, 'complexity_mlp') and len(splitter.complexity_mlp) > 0:
+                    old_linear = splitter.complexity_mlp[0]
+                    old_weight = old_linear.weight.data
+                    old_bias = old_linear.bias.data if old_linear.bias is not None else None
+
+                    # 创建新的线性层
+                    hidden_dim = old_weight.shape[0]
+                    new_linear = nn.Linear(actual_input_dim, hidden_dim).to(old_weight.device)
+
+                    # 将旧权重复制到新层（只复制兼容的部分）
+                    # 旧权重形状: [hidden_dim, complexity_mlp_input_dim]
+                    # 新权重形状: [hidden_dim, actual_input_dim]
+                    copy_dim = min(complexity_mlp_input_dim, actual_input_dim)
+                    new_linear.weight.data[:, :copy_dim] = old_weight[:, :copy_dim]
+                    if old_bias is not None:
+                        new_linear.bias.data = old_bias
+
+                    # 用新层替换旧层
+                    splitter.complexity_mlp[0] = new_linear
+                    print(f"[I140] complexity_mlp.0 resized: {complexity_mlp_input_dim} -> {actual_input_dim}")
+
         model = model.to(self.device)
         model.eval()
         
@@ -1564,8 +1604,7 @@ class LayeredEvaluator:
             )
             if report.L7_splitter.temperature > 0:
                 print(f"  - Temperature: {report.L7_splitter.temperature:.3f}")
-                print(f"  - Selection prob mean: {report.L7_splitter.selection_prob_mean:.3f}")
-                print(f"  - Decision confidence: {report.L7_splitter.decision_confidence_mean:.3f}")
+                print(f"  - Quota entropy: {report.L7_splitter.quota_entropy:.3f}")
                 if report.L7_splitter.quotas:
                     print(f"  - Quotas: {report.L7_splitter.quotas}")
             else:
