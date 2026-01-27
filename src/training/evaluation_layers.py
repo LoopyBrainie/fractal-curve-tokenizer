@@ -702,9 +702,18 @@ class TokenizerEvaluator:
                 
                 imgs = imgs.to(device)
                 B, C, H, W = imgs.shape
-                
-                # Tokenize
-                output = tokenizer.tokenize(imgs)
+
+                # I139: 获取 split_result（新版 tokenizer 需要）
+                # 检查 tokenizer 是否需要 split_result
+                needs_split_result = hasattr(tokenizer, 'shared_conv')
+                if needs_split_result:
+                    if hasattr(model, 'splitter'):
+                        split_result = model.splitter(imgs)
+                        output = tokenizer.tokenize(imgs, split_result)
+                    else:
+                        raise ValueError("Tokenizer requires splitter but model has no 'splitter' attribute")
+                else:
+                    output = tokenizer.tokenize(imgs)
                 padded_tokens, lengths = output.get_padded_tokens()
                 
                 # I24-12: 防御性检查 - 确保 lengths 是合理的 token 数量
@@ -944,10 +953,16 @@ class AttentionEvaluator:
                         break
                     
                     imgs = imgs.to(device)
-                    
-                    # 先获取 tokenizer 输出以获取深度信息
+
+                    # I139: 先获取 tokenizer 输出以获取深度信息
                     if hasattr(model, 'tokenizer'):
-                        tok_output = model.tokenizer.tokenize(imgs)
+                        tokenizer = model.tokenizer
+                        needs_split_result = hasattr(tokenizer, 'shared_conv')
+                        if needs_split_result and hasattr(model, 'splitter'):
+                            split_result = model.splitter(imgs)
+                            tok_output = tokenizer.tokenize(imgs, split_result)
+                        else:
+                            tok_output = tokenizer.tokenize(imgs)
                         # 提取深度信息
                         if hasattr(tok_output, 'sequences'):
                             for seq in tok_output.sequences:
@@ -1474,8 +1489,15 @@ class EfficiencyEvaluator:
                     if device.type == 'cuda':
                         torch.cuda.synchronize()
                     t0 = time.perf_counter()
-                    
-                    tokenizer_output = model.tokenizer.tokenize(sample_input)
+
+                    # I139: 检查 tokenizer 是否需要 split_result
+                    tokenizer = model.tokenizer
+                    needs_split_result = hasattr(tokenizer, 'shared_conv')
+                    if needs_split_result and hasattr(model, 'splitter'):
+                        split_result = model.splitter(sample_input)
+                        tokenizer_output = tokenizer.tokenize(sample_input, split_result)
+                    else:
+                        tokenizer_output = tokenizer.tokenize(sample_input)
                     tokens, lengths = tokenizer_output.get_padded_tokens()
                     
                     if device.type == 'cuda':
