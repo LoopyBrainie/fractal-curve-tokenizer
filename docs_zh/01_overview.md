@@ -1,35 +1,35 @@
-# Chapter 1: System Architecture
+# 第一章：系统架构
 
-## 1.1 Overview
+## 1.1 概述
 
-This chapter describes the complete data flow and module structure of the Fractal Curve ViT architecture.
+本章描述了 Fractal Curve ViT 架构的完整数据流和模块结构。
 
-### High-Level Pipeline
+### 高级管道
 
 $$I \xrightarrow{\text{Tokenize}} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{CLS}} [c; T'] \xrightarrow{\text{Transformer}} X' \xrightarrow{\text{Pool}} z \xrightarrow{\text{MLP}} \hat{y}$$
 
-where:
-- $I \in \mathbb{R}^{B \times C \times H \times W}$: Input image batch
-- $T \in \mathbb{R}^{B \times N \times D}$: Token embeddings
-- $L \in \mathbb{Z}^{B \times N \times \text{Info}}$: Level information (depth + quadtree path)
-- $X' \in \mathbb{R}^{B \times (N+1) \times D}$: Encoded sequence (with CLS token)
-- $\hat{y} \in \mathbb{R}^{B \times C_{out}}$: Class logits
+其中：
+- $I \in \mathbb{R}^{B \times C \times H \times W}$：输入图像批次
+- $T \in \mathbb{R}^{B \times N \times D}$：Token 嵌入
+- $L \in \mathbb{Z}^{B \times N \times \text{Info}}$：深度信息（四叉树路径）
+- $X' \in \mathbb{R}^{B \times (N+1) \times D}$：编码序列（带 CLS token）
+- $\hat{y} \in \mathbb{R}^{B \times C_{out}}$：分类 logits
 
 ---
 
-## 1.2 Data Flow Diagram
+## 1.2 数据流图
 
 ```
-Input Image (B, C, H, W)
+输入图像 (B, C, H, W)
         │
         ▼
 ┌───────────────────────────────────────────────┐
 │       StreamingFractalTokenizerV3             │
 │  ┌─────────────────────────────────────────┐  │
-│  │ 1. Learnable Complexity: C_theta(R)     │  │
-│  │ 2. Differentiable Quadtree Split        │  │
-│  │ 3. Region Pooling via ROI-Align         │  │
-│  │ 4. Hilbert Curve Reordering             │  │
+│  │ 1. 可学习复杂度: C_theta(R)              │  │
+│  │ 2. 可微四叉树分割                        │  │
+│  │ 3. 通过 ROI-Align 的区域池化             │  │
+│  │ 4. Hilbert 曲线重排序                    │  │
 │  └─────────────────────────────────────────┘  │
 └───────────────────────────────────────────────┘
         │
@@ -47,7 +47,7 @@ Input Image (B, C, H, W)
         │
         ▼
 ┌───────────────────────────────────────────────┐
-│            Add CLS Token                      │
+│            添加 CLS Token                      │
 │       [CLS; T'] → (B, N+1, D)                 │
 └───────────────────────────────────────────────┘
         │
@@ -55,24 +55,24 @@ Input Image (B, C, H, W)
 ┌───────────────────────────────────────────────┐
 │         FractalTransformer × L                │
 │  ┌─────────────────────────────────────────┐  │
-│  │ Level-Aware LayerNorm                   │  │
+│  │ 深度感知 LayerNorm                       │  │
 │  │ HilbertAwareMultiScaleAttention         │  │
-│  │   + LCA Hilbert Bias                    │  │
-│  │ DropPath + Residual                     │  │
-│  │ Level-Aware LayerNorm                   │  │
+│  │   + LCA Hilbert 偏置                     │  │
+│  │ DropPath + 残差连接                       │  │
+│  │ 深度感知 LayerNorm                       │  │
 │  │ AdaptiveFractalFeedForward (SwiGLU)     │  │
-│  │ DropPath + Residual                     │  │
+│  │ DropPath + 残差连接                       │  │
 │  └─────────────────────────────────────────┘  │
 └───────────────────────────────────────────────┘
         │
         ▼
 ┌───────────────────────────────────────────────┐
-│     Pooling: CLS or Mean                      │
+│     池化: CLS 或 Mean                          │
 └───────────────────────────────────────────────┘
         │
         ▼
 ┌───────────────────────────────────────────────┐
-│     MLP Head: LN → Linear → GELU → Linear     │
+│     MLP 头: LN → Linear → GELU → Linear       │
 └───────────────────────────────────────────────┘
         │
         ▼
@@ -81,52 +81,52 @@ Input Image (B, C, H, W)
 
 ---
 
-## 1.3 Module Hierarchy
+## 1.3 模块层次结构
 
-| Layer | Module | File | Core Functionality |
+| 层级 | 模块 | 文件 | 核心功能 |
 |:------|:-------|:-----|:-------------------|
-| **L4** | Application | `model_fractal_vit.py` | `FractalCurveViT` |
-| **L3** | Pipeline | `tokenizer_streaming.py` | `StreamingFractalTokenizerV3` |
+| **L4** | 应用层 | `model_fractal_vit.py` | `FractalCurveViT` |
+| **L3** | 管道层 | `tokenizer_streaming.py` | `StreamingFractalTokenizerV3` |
 |        |          | `block_transformer.py` | `FractalTransformer` |
-| **L2** | Components | `gumbel_topk_splitter.py` | `GumbelTopKSplitter` (Scheme D/E) |
+| **L2** | 组件层 | `gumbel_topk_splitter.py` | `GumbelTopKSplitter` (方案 D/E) |
 |        |            | `attn_hilbert_bias.py` | `HilbertAwareMultiScaleAttention`, `LCAHilbertBias` |
 |        |            | `ffn_swiglu.py` | `SwiGLUFFN`, `AdaptiveFractalFeedForward` |
 |        |            | `embed_fractal_position.py` | `FractalPositionEmbedding` |
-| **L1** | Foundation | `curve_hilbert.py` | `HilbertCurve`, `PseudoHilbertCurve` |
+| **L1** | 基础层 | `curve_hilbert.py` | `HilbertCurve`, `PseudoHilbertCurve` |
 
 ---
 
-## 1.4 Key Innovations
+## 1.4 关键创新
 
-### 1.4.1 Variable Depth Tokens (V3)
+### 1.4.1 变深度 Tokens (V3)
 
-Unlike fixed-grid tokenization, V3 performs **content-adaptive quadtree splitting**:
+与固定网格分词不同，V3 执行**内容自适应四叉树分割**：
 
 $$\text{Split}(R) \iff C(R) > \tau_d$$
 
-where:
+其中：
 - $C(R) = \alpha \cdot \frac{\text{Var}(R)}{\text{Var}(R) + \sigma_0^2} + (1-\alpha) \cdot \frac{G(R)}{G(R) + g_0^2}$
-- $\tau_d = \tau_0 \cdot \gamma^d$ (depth-dependent threshold)
+- $\tau_d = \tau_0 \cdot \gamma^d$（深度相关阈值）
 
-### 1.4.2 LCA Hilbert Bias
+### 1.4.2 LCA Hilbert 偏置
 
-Attention bias derived from quadtree LCA (Lowest Common Ancestor) depth:
+从四叉树 LCA（最近公共祖先）深度派生的注意力偏置：
 
 $$B[i,j] = \text{LCAEmbed}(\text{LCA}(i, j))$$
 
-This provides explicit geometric meaning with only ~100 learnable parameters.
+这提供了明确的几何意义，仅需 ~100 个可学习参数。
 
-### 1.4.3 SwiGLU FFN with Level Adaptation
+### 1.4.3 带深度自适应的 SwiGLU FFN
 
 $$\text{SwiGLU}(x) = W_{out} \cdot (\text{Swish}(W_{gate} \cdot x) \odot W_{value} \cdot x)$$
 
-Extended with level-adaptive residual:
+扩展为深度自适应残差：
 
 $$\text{Output} = (1 - \alpha_d) \cdot \text{FFN}(x) + \alpha_d \cdot \text{Adapter}([x; E_{level}(d)])$$
 
 ---
 
-## 1.5 Configuration
+## 1.5 配置
 
 ### FractalConfig
 
@@ -141,7 +141,7 @@ config = FractalConfig(
 )
 ```
 
-### Model Instantiation
+### 模型实例化
 
 ```python
 from vit_pytorch import FractalCurveViT
@@ -161,18 +161,18 @@ model = FractalCurveViT(
 
 ---
 
-## 1.6 Complexity Analysis
+## 1.6 复杂度分析
 
-> **Key Clarification**: The "40× reduction" refers to **token count reduction**, not asymptotic complexity. Token count reduces from ~307K (standard ViT 16×16 patches for 224×224) to ~32 (V3 variable-depth tokens).
+> **关键说明**："40×  reduction" 指的是 **token 数量减少**，而非渐近复杂度。Token 数量从 ~307K（224×224 图像的标准 ViT 16×16 patches）减少到 ~32（V3 变深度 tokens）。
 
-| Operation | Complexity | Notes |
+| 操作 | 复杂度 | 备注 |
 |:----------|:-----------|:------|
-| Tokenization | $O(N_{cand} \cdot D)$ | $N_{cand} = \sum_{d=0}^{D} 4^d$ (e.g., 85 for D=3) |
-| Hilbert Reordering | $O(N \log N)$ | Sort by Hilbert index |
-| LCA Computation | $O(N^2)$ | Cached, amortized $O(1)$ |
-| Attention | $O(N^2 \cdot D)$ | Standard transformer (N ≈ 32) |
-| **Effective Computation** | ~40× reduction | $N_{V3} \approx 32$ vs $N_{ViT} \approx 307K$ |
+| 分词 | $O(N_{cand} \cdot D)$ | $N_{cand} = \sum_{d=0}^{D} 4^d$（例如 D=3 时为 85） |
+| Hilbert 重排序 | $O(N \log N)$ | 按 Hilbert 索引排序 |
+| LCA 计算 | $O(N^2)$ | 缓存后摊销为 $O(1)$ |
+| 注意力 | $O(N^2 \cdot D)$ | 标准 transformer（N ≈ 32） |
+| **有效计算量** | ~40× 减少 | $N_{V3} \approx 32$ vs $N_{ViT} \approx 307K$ |
 
-> **Note**: Transformer effective depth is fixed at `depth // 2`. The original dynamic depth mechanism (I97-11) was removed as it offered no practical benefit while adding complexity.
+> **注意**：由于与 GPU SIMT 并行性的根本不兼容性，完整的动态深度自适应已推迟。当前实现使用固定的 `depth // 2` 以提高并行效率。
 
-> **Next**: [02_data_structures.md](02_data_structures.md) - Core Data Structures
+> **下一章**: [02_data_structures.md](02_data_structures.md) - 核心数据结构

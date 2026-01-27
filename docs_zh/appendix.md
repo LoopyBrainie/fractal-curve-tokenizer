@@ -1,6 +1,6 @@
-# Appendix
+# 附录
 
-## A. Class Hierarchy
+## A. 类层次结构
 
 ```mermaid
 classDiagram
@@ -20,29 +20,29 @@ classDiagram
     HilbertAwareMultiScaleAttention *-- LCAHilbertBias
     HilbertAwareMultiScaleAttention *-- LowRankHilbertBias
     AdaptiveFractalFeedForward *-- SwiGLUFFN
-    
+
     StreamingFractalTokenizerV3 *-- HilbertNativePatchEmbed
     StreamingFractalTokenizerV3 *-- LearnableSplitter
     StreamingFractalTokenizerV3 *-- BalancedGreedySplitter
-    
+
     LearnableSplitter *-- ComplexityMLP
     LearnableSplitter *-- TemperatureScheduler
 ```
 
 ---
 
-## B. Data Flow Diagram
+## B. 数据流图
 
 ```
-1. Input Image (B, C, H, W)
+1. 输入图像 (B, C, H, W)
         │
         ▼
 2. StreamingFractalTokenizerV3
-   ├── GumbelTopKSplitter (Scheme D/E)
+   ├── GumbelTopKSplitter (方案 D/E)
    │   └── ROI-Pool → MLP → Gumbel-Softmax → Top-K
    ├── HilbertNativePatchEmbed
    │   └── t = Pool(F[R]) · σ_d + E_d
-   └── HilbertIndexer (Reordering)
+   └── HilbertIndexer (重排序)
         │
         ▼
 3. TokenizerOutput
@@ -50,7 +50,7 @@ classDiagram
    └── levels: (B, N, max_depth+1)
         │
         ▼
-4. Batch Padding
+4. 批次填充
    ├── padded_tokens: (B, N_max, D)
    ├── padded_levels: (B, N_max, Info)
    └── mask: (B, N_max)
@@ -60,29 +60,29 @@ classDiagram
    └── E_pos = Fusion(E_depth(d) + E_path(p))
         │
         ▼
-6. Add CLS Token → (B, N_max+1, D)
+6. 添加 CLS Token → (B, N_max+1, D)
         │
         ▼
 7. FractalTransformer × L
-   ├── Level-Aware LayerNorm
+   ├── 级别感知 LayerNorm
    ├── HilbertAwareMultiScaleAttention
-   │   ├── QKV Projection
-   │   ├── Level Scaling
-   │   ├── Hilbert Bias (LCA)
-   │   └── Level Bias
-   ├── DropPath + Residual
-   ├── Level-Aware LayerNorm
+   │   ├── QKV 投影
+   │   ├── 级别缩放
+   │   ├── Hilbert 偏置 (LCA)
+   │   └── 级别偏置
+   ├── DropPath + 残差
+   ├── 级别感知 LayerNorm
    ├── AdaptiveFractalFeedForward (SwiGLU)
-   └── DropPath + Residual
+   └── DropPath + 残差
         │
         ▼
-8. Level Aggregator
+8. 级别聚合器
         │
         ▼
-9. Pooling (CLS / Mean)
+9. 池化 (CLS / Mean)
         │
         ▼
-10. MLP Head
+10. MLP 头
     └── LN → Linear → GELU → Linear
         │
         ▼
@@ -91,11 +91,11 @@ classDiagram
 
 ---
 
-## C. Hyperparameter Reference
+## C. 超参数参考
 
-### Model Parameters
+### 模型参数
 
-| Parameter | CIFAR-10 | Tiny-ImageNet | ImageNet |
+| 参数 | CIFAR-10 | Tiny-ImageNet | ImageNet |
 |:----------|:---------|:--------------|:---------|
 | `dim` | 192 | 256 | 512 |
 | `depth` | 9 | 10 | 12 |
@@ -104,9 +104,9 @@ classDiagram
 | `patch_size` | 4 | 4 | 16 |
 | `max_depth` | 3 | 4 | 4 |
 
-### Training Parameters
+### 训练参数
 
-| Parameter | Default | Range |
+| 参数 | 默认值 | 范围 |
 |:----------|:--------|:------|
 | `lr` | 5e-4 | [1e-4, 1e-3] |
 | `weight_decay` | 0.03 | [0.01, 0.1] |
@@ -115,26 +115,26 @@ classDiagram
 | `warmup_epochs` | 5 | [3, 10] |
 | `batch_size` | 128 | [64, 256] |
 
-### Tokenizer Parameters
+### 分词器参数
 
-| Parameter | Default | Range | Description |
+| 参数 | 默认值 | 范围 | 描述 |
 |:----------|:--------|:------|:------------|
-| `alpha` | 0.5 | [0.3, 0.7] | Variance weight |
-| `tau_0` | 0.15 | [0.08, 0.25] | Root threshold |
-| `gamma` | 0.85 | [0.75, 0.92] | Decay factor |
-| `sigma_0_sq` | 0.01 | [0.005, 0.03] | Variance normalization |
-| `g_0_sq` | 0.08 | [0.03, 0.15] | Gradient normalization |
+| `alpha` | 0.5 | [0.3, 0.7] | 方差权重 |
+| `tau_0` | 0.15 | [0.08, 0.25] | 根阈值 |
+| `gamma` | 0.85 | [0.75, 0.92] | 衰减因子 |
+| `sigma_0_sq` | 0.01 | [0.005, 0.03] | 方差归一化 |
+| `g_0_sq` | 0.08 | [0.03, 0.15] | 梯度归一化 |
 
 ---
 
-## D. API Quick Reference
+## D. API 快速参考
 
-### Model Initialization
+### 模型初始化
 
 ```python
 from vit_pytorch import FractalCurveViT, FractalConfig
 
-# Method 1: Direct parameters
+# 方法 1: 直接参数
 model = FractalCurveViT(
     image_size=224,
     num_classes=1000,
@@ -147,7 +147,7 @@ model = FractalCurveViT(
     ffn_type='swiglu_level',
 )
 
-# Method 2: Using FractalConfig
+# 方法 2: 使用 FractalConfig
 config = FractalConfig(d_model=384, num_heads=6)
 model = FractalCurveViT(
     image_size=224,
@@ -158,17 +158,17 @@ model = FractalCurveViT(
 )
 ```
 
-### Forward Pass
+### 前向传播
 
 ```python
-# Basic
+# 基本用法
 logits = model(images)  # (B, num_classes)
 
-# With auxiliary info
+# 带辅助信息
 logits, aux = model(images, return_aux_info=True)
 ```
 
-### Tokenizer Standalone
+### 独立分词器
 
 ```python
 from vit_pytorch import StreamingFractalTokenizerV3
@@ -187,7 +187,7 @@ for seq in output.sequences:
     print(f"Levels: {seq.get_levels().shape}")
 ```
 
-### Individual Components
+### 独立组件
 
 ```python
 from vit_pytorch import (
@@ -197,7 +197,7 @@ from vit_pytorch import (
     LCAHilbertBias,
 )
 
-# Attention
+# 注意力
 attn = HilbertAwareMultiScaleAttention(
     dim=384, heads=6, bias_mode='lca'
 )
@@ -205,29 +205,29 @@ attn = HilbertAwareMultiScaleAttention(
 # FFN
 ffn = SwiGLUFFN(dim=384, hidden_dim=512)
 
-# Position embedding
+# 位置嵌入
 pos_emb = FractalPositionEmbedding(dim=384, max_level=50)
 
-# LCA Bias
+# LCA 偏置
 lca_bias = LCAHilbertBias(num_heads=6, max_lca_depth=10)
 ```
 
 ---
 
-## E. Common Imports
+## E. 常见导入
 
 ```python
-# Core model
+# 核心模型
 from vit_pytorch import FractalCurveViT
 
-# Configuration
+# 配置
 from vit_pytorch import FractalConfig
 from vit_pytorch.split_adaptive import AdaptiveSplitConfig
 
-# Tokenizer
+# 分词器
 from vit_pytorch import StreamingFractalTokenizerV3
 
-# Components
+# 组件
 from vit_pytorch import (
     HilbertAwareMultiScaleAttention,
     LCAHilbertBias,
@@ -238,34 +238,34 @@ from vit_pytorch import (
     FractalTransformer,
 )
 
-# Utilities
+# 工具
 from vit_pytorch.utils import extract_depths, normalize_levels_info
 from vit_pytorch.curve_hilbert import HilbertCurve
 ```
 
 ---
 
-## F. Mathematical Notation
+## F. 数学符号
 
-| Symbol | Definition |
+| 符号 | 定义 |
 |:-------|:-----------|
-| $I$ | Input image $\in \mathbb{R}^{C \times H \times W}$ |
-| $T$ | Token sequence $\in \mathbb{R}^{N \times D}$ |
-| $L$ | Level information $\in \mathbb{Z}^{N \times (d_{max}+1)}$ |
-| $d$ | Quadtree depth $\in [0, d_{max}]$ |
-| $p$ | Quadtree path $\in [0,3]^{d}$ |
-| $C(R)$ | Region complexity $\in [0, 1]$ |
-| $\tau_d$ | Depth-dependent threshold |
-| $H$ | Hilbert curve mapping |
-| $\text{LCA}(i,j)$ | Lowest common ancestor depth |
-| $B_{hilbert}$ | Hilbert attention bias |
-| $\alpha_d$ | Level mixing weight |
+| $I$ | 输入图像 $\in \mathbb{R}^{C \times H \times W}$ |
+| $T$ | Token 序列 $\in \mathbb{R}^{N \times D}$ |
+| $L$ | 级别信息 $\in \mathbb{Z}^{N \times (d_{max}+1)}$ |
+| $d$ | 四叉树深度 $\in [0, d_{max}]$ |
+| $p$ | 四叉树路径 $\in [0,3]^{d}$ |
+| $C(R)$ | 区域复杂度 $\in [0, 1]$ |
+| $\tau_d$ | 深度相关阈值 |
+| $H$ | Hilbert 曲线映射 |
+| $\text{LCA}(i,j)$ | 最近公共祖先深度 |
+| $B_{hilbert}$ | Hilbert 注意力偏置 |
+| $\alpha_d$ | 级别混合权重 |
 
 ---
 
-## G. File Reference
+## G. 文件参考
 
-| File | Primary Classes |
+| 文件 | 主要类 |
 |:-----|:----------------|
 | `model_fractal_vit.py` | `FractalCurveViT` |
 | `tokenizer_streaming.py` | `StreamingFractalTokenizerV3` |
@@ -278,5 +278,5 @@ from vit_pytorch.curve_hilbert import HilbertCurve
 | `curve_hilbert.py` | `HilbertCurve`, `PseudoHilbertCurve` |
 | `config_fractal.py` | `FractalConfig` |
 | `base_tokenizer.py` | `BaseTokenizer`, `TokenizerOutput` |
-| `utils.py` | Utility functions |
-| `constants.py` | Default hyperparameters |
+| `utils.py` | 工具函数 |
+| `constants.py` | 默认超参数 |

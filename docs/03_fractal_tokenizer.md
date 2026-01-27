@@ -6,7 +6,7 @@ The `StreamingFractalTokenizerV3` implements **Variable Depth Tokenization** via
 
 **Efficiency Note**: The ~40× computational reduction comes from token count reduction ($N_{V3} \approx 32$ vs $N_{ViT} \approx 307K$), not from asymptotic complexity change. Attention remains $O(N^2 \cdot D)$, but with $N$ reduced by ~40×.
 
-**Parallelism Constraint**: Complete dynamic depth per token is incompatible with GPU SIMT parallelism. Current implementation uses batch-level fixed depth for parallel efficiency.
+**Architecture**: Token depth is determined by the Gumbel-Top-K selection mechanism. Transformer effective depth is fixed at `depth // 2`.
 
 ---
 
