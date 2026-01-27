@@ -530,9 +530,12 @@ class ClassificationEvaluator:
                 total_samples += batch_size
 
                 # I35: 从 TrainingStats 直接获取 tokenizer 诊断信息
-                # 修复: aux_infos 未定义Bug，现在从 stats 直接访问字段
-                if hasattr(stats, 'num_tokens'):
-                    all_num_tokens.append(stats.num_tokens)
+                # I139: num_tokens 现在是每个样本的列表，需要展平
+                if hasattr(stats, 'num_tokens') and stats.num_tokens:
+                    if isinstance(stats.num_tokens, list):
+                        all_num_tokens.extend(stats.num_tokens)
+                    else:
+                        all_num_tokens.append(stats.num_tokens)
                 if hasattr(stats, 'depth_distribution') and stats.depth_distribution:
                     all_depth_distributions.append(stats.depth_distribution)
         
