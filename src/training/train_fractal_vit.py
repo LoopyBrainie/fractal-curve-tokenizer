@@ -1727,26 +1727,12 @@ def train_epoch(
     Args:
         exp_dir: 实验目录，用于保存 NaN/Inf 诊断日志
     """
-    print(f"[DEBUG] train_epoch: 函数被调用, loader len={len(loader)}")
-
-    # 检查模型权重 norm（epoch 开始时）
-    if epoch == 1:
-        total_weight_norm = 0.0
-        for p in model.parameters():
-            if p.data.numel() > 0:
-                total_weight_norm += p.data.norm(2).item() ** 2
-        weight_norm = total_weight_norm ** 0.5
-        print(f"[DEBUG] Epoch {epoch} 开始: model weight_norm={weight_norm:.6f}")
-
     model.train()
     # P11-8: 使用张量累加，延迟 .item() 调用到 epoch 结束
     total_loss = torch.tensor(0.0, device=device)
     correct = torch.tensor(0, device=device, dtype=torch.long)
     total = 0
     optimizer.zero_grad(set_to_none=True)
-
-    # DEBUG: 检查迭代器是否可以正常工作
-    print(f"[DEBUG] train_epoch: loader len={len(loader)}, batch_size={loader.batch_size}")
 
     batch_times, data_times, forward_times = [], [], []
     entropy_losses = []  # P1-5: 收集熵损失用于统计
@@ -1768,10 +1754,8 @@ def train_epoch(
     if debug_mode and model_dtype is not None:
         print(f"[DEBUG] Model expects input dtype: {model_dtype}")
 
-    # 使用环境变量 DISABLE_PREFETCH=1 来禁用 CudaPrefetcher 进行调试
-    # DEBUG: 总是禁用 prefetcher 来诊断问题
-    use_prefetcher = False
-    print(f"[DEBUG] use_prefetcher={use_prefetcher}")
+    # 使用环境变量 DISABLE_PREFETCH=1 来禁用 CudaPrefetcher
+    use_prefetcher = device.type == 'cuda' and os.environ.get('DISABLE_PREFETCH', '0') != '1'
 
     if use_prefetcher:
         data_iter = CudaPrefetcher(loader, device, channels_last=config.channels_last)
@@ -1779,7 +1763,6 @@ def train_epoch(
         data_iter = loader
 
     pbar = tqdm(data_iter, desc="Train", total=len(loader), mininterval=0.5, dynamic_ncols=True)
-    print(f"[DEBUG] tqdm created with total={len(loader)}")
 
     # DEBUG: 检查 DataLoader 长度
     if len(loader) == 0:
@@ -1795,27 +1778,14 @@ def train_epoch(
     # P15: 在首个 Mixup epoch 添加额外诊断 (仅调试模式)
     debug_first_mixup_epoch = debug_mode and use_mixup and epoch is not None and os.environ.get('DISABLE_PREFETCH', '0') == '1'
 
-    print(f"[DEBUG] 准备进入训练循环, pbar.iterable={type(pbar.iterable)}")
-    batch_count = 0
     for i, batch in enumerate(pbar):
-        batch_count += 1
-        print(f"[DEBUG] ====== BATCH {i} START ======")
-        print(f"[DEBUG] batch type: {type(batch)}")
-
-        # DEBUG: 确认数据加载
-        print(f"[DEBUG] 第一个 batch 加载成功: batch type={type(batch)}, len={len(batch) if hasattr(batch, '__len__') else 'N/A'}")
-
-        # P15: 额外诊断 - 检测数据加载卡顿 (仅调试模式)
-        if debug_first_mixup_epoch and i <= 5:
-            print(f"[DEBUG] Batch {i}: 数据加载完成", flush=True)
-        
         # P13: 检测数据加载卡顿
         data_time = time.time() - data_start
         if data_time > stall_threshold:
             stall_count += 1
             if stall_count <= 3:
                 print(f"\n[STALL] Batch {i}: 数据加载耗时 {data_time:.1f}s (可能是 GC/编译/I/O)")
-        
+
         data_times.append(data_time)
         batch_start = time.time()
         
@@ -2000,14 +1970,6 @@ def train_epoch(
             #          混合相加可能导致 NaN。统一转换为 float32 进行损失计算。
             loss = ce_loss.float()  # 确保基础损失是 float32
 
-            if i == 0:
-                # 计算 pred 用于调试
-                _, pred_debug = outs.detach().max(1)
-                print(f"[DEBUG] loss={loss.item():.4f}, ce_loss={ce_loss.item():.4f}")
-                print(f"[DEBUG] logits shape={outs.shape}, logits[:3]={outs[0, :3] if outs.numel() > 3 else 'N/A'}")
-                print(f"[DEBUG] pred[:5]={pred_debug[:5] if pred_debug.numel() >= 5 else pred_debug}")
-                print(f"[DEBUG] labels[:5]={labels[:5]}")
-
             if entropy_loss is not None:
                 entropy_loss_f32 = entropy_loss.float()
                 if torch.isnan(entropy_loss_f32) or torch.isinf(entropy_loss_f32):
@@ -2055,25 +2017,6 @@ def train_epoch(
         
         scaler.scale(loss).backward()
 
-        # 检查梯度是否有效
-        if i == 0:
-            grad_norm = None
-            has_grad = False
-            param_with_grad = 0
-            total_params = 0
-            if hasattr(model, 'parameters'):
-                total_grad_norm = 0.0
-                for p in model.parameters():
-                    total_params += 1
-                    if p.grad is not None:
-                        has_grad = True
-                        param_with_grad += 1
-                        total_grad_norm += p.grad.data.norm(2).item() ** 2
-                grad_norm = total_grad_norm ** 0.5
-            grad_str = f"{grad_norm:.6f}" if grad_norm is not None else "None"
-            print(f"[DEBUG] After backward: grad_norm={grad_str}, has_grad={has_grad}")
-            print(f"[DEBUG] Params with grad: {param_with_grad}/{total_params}")
-
         if (i + 1) % config.accum_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
@@ -2081,15 +2024,6 @@ def train_epoch(
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-            # 检查权重更新（仅第一个 batch）
-            if i == 0:
-                total_weight_norm_after = 0.0
-                for p in model.parameters():
-                    if p.data.numel() > 0:
-                        total_weight_norm_after += p.data.norm(2).item() ** 2
-                weight_norm_after = total_weight_norm_after ** 0.5
-                print(f"[DEBUG] After optimizer step: weight_norm={weight_norm_after:.6f}")
-        
         # P11-8: 使用 detach() 累加损失，避免保留计算图
         # .item() 延迟到 epoch 结束时调用
         with torch.no_grad():
@@ -2119,8 +2053,6 @@ def train_epoch(
             else:
                 pbar.set_postfix(loss=f'{loss_val:.4f}', acc=f'{acc_val:.1f}%')
 
-        print(f"[DEBUG] BATCH {i} DONE: loss={loss.item():.4f}, acc={(100.0 * correct / total).item() if total > 0 else 0:.1f}%")
-
         # 显式更新进度条
         pbar.update(1)
 
@@ -2129,9 +2061,6 @@ def train_epoch(
         # 但 empty_cache() 也有开销，仅在真正需要时调用
 
         data_start = time.time()
-
-    print(f"[DEBUG] 训练循环结束: 实际处理了 {batch_count} 个 batches (原计划 {len(loader)} 个)")
-    print(f"[DEBUG] total_loss={total_loss.item() if hasattr(total_loss, 'item') else total_loss}, total={total}, correct={correct.item() if hasattr(correct, 'item') else correct}")
 
     perf_stats = {
         'avg_batch_time': np.mean(batch_times) if batch_times else 0,
@@ -3446,12 +3375,9 @@ def main():
     
     # 诊断: 检查模型参数 dtype
     def check_model_dtypes(m, name="model"):
-        dtypes = set()
         for n, p in m.named_parameters():
-            dtypes.add(str(p.dtype))
             if p.dtype == torch.float16:
                 print(f"[WARN] {name}.{n} is float16!")
-        print(f"[DEBUG] {name} param dtypes: {dtypes}")
     check_model_dtypes(model)
     
     # 创建 Mixup/CutMix 增强器
@@ -3822,18 +3748,7 @@ def main():
         if epoch == config.warmup_epochs + 1 and mixup_fn is not None:
             print(f"[INFO] Epoch {epoch}: 启用 Mixup/CutMix 增强")
             print(f"[INFO] 首次 Mixup epoch：暂时禁用 CUDA Prefetcher 以确保稳定性")
-            
-            # 诊断: 检查此时模型的 dtype
-            print("[DEBUG] 检查模型参数 dtype...")
-            first_conv_bias = None
-            for name, param in model.named_parameters():
-                if 'conv' in name.lower() and 'bias' in name.lower():
-                    first_conv_bias = param
-                    print(f"[DEBUG] {name}: dtype={param.dtype}, device={param.device}")
-                    break
-            if first_conv_bias is not None and first_conv_bias.dtype == torch.float16:
-                print("[WARN] 模型 bias 已被转换为 float16!")
-            
+
             os.environ['DISABLE_PREFETCH'] = '1'
             disable_prefetch_this_epoch = True
             # 添加同步点，确保之前的 CUDA 操作完成
@@ -3857,9 +3772,6 @@ def main():
         
         # 选择使用的 loader
         current_train_loader = simple_train_loader if disable_prefetch_this_epoch else train_loader
-
-        # DEBUG: 检查 loader 长度
-        print(f"[DEBUG] Epoch {epoch}: train_loader batches={len(current_train_loader)}, total_batches={len(train_loader)}")
 
         print(f"[INFO] Epoch {epoch}: 即将开始 train_epoch...")
         train_loss, train_acc, perf_stats = train_epoch(
