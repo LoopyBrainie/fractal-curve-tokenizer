@@ -45,60 +45,12 @@ from shapely.ops import unary_union
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-
-# =============================================================================
-# Fallback Hilbert 曲线实现（如果原生实现不可用）
-# =============================================================================
-
-def _xy_to_d_fallback(x: int, y: int, n: int) -> int:
-    """将 2D 坐标转换为 Hilbert 曲线距离"""
-    d = 0
-    s = n // 2
-    while s > 0:
-        rx = 1 if (x & s) > 0 else 0
-        ry = 1 if (y & s) > 0 else 0
-        d += s * s * ((3 * rx) ^ ry)
-        if ry == 0:
-            if rx == 1:
-                x = n - 1 - x
-                y = n - 1 - y
-            x, y = y, x
-        s //= 2
-    return d
-
-
-def _d_to_xy_fallback(d: int, n: int) -> Tuple[int, int]:
-    """将 Hilbert 曲线距离转换为 2D 坐标"""
-    def rot(n, x, y, rx, ry):
-        if ry == 0:
-            if rx == 1:
-                x = n - 1 - x
-                y = n - 1 - y
-            x, y = y, x
-        return x, y
-
-    x = y = 0
-    s = 1
-    t = d
-    while s < n:
-        rx = (t // 2) & 1
-        ry = (t ^ rx) & 1
-        x, y = rot(s, x, y, rx, ry)
-        x += s * rx
-        y += s * ry
-        t //= 4
-        s *= 2
-    return x, y
-
-
-def generate_hilbert_curve(order: int) -> List[Tuple[int, int]]:
-    """生成指定阶数的 Hilbert 曲线坐标序列"""
-    n = 2 ** order
-    coords = []
-    for d in range(n * n):
-        x, y = _d_to_xy_fallback(d, n)
-        coords.append((x, y))
-    return coords
+# 导入集中的 Hilbert 工具函数（来自 utils/hilbert_utils.py）
+from ..utils.hilbert_utils import (
+    generate_hilbert_curve,
+    d_to_xy,
+    xy_to_d,
+)
 
 
 # =============================================================================
@@ -512,7 +464,9 @@ def plot_hilbert_curve(
         )
 
     ax.scatter([0], [0], c='green', s=150, marker='o', zorder=5, label='Start')
-    ax.scatter([n-1], [n-1], c='red', s=150, marker='X', zorder=5, label='End')
+    # 使用实际的终点坐标，而非假设 (n-1, n-1)
+    end_x, end_y = coords[-1]
+    ax.scatter([end_x], [end_y], c='red', s=150, marker='X', zorder=5, label='End')
 
     step = len(coords) // 8
     for i in range(0, len(coords), step):
@@ -526,6 +480,10 @@ def plot_hilbert_curve(
     ax.set_title(f'Hilbert Curve (Order {order}, n={n}x{n})', fontsize=14, fontweight='bold')
     ax.legend(loc='upper right')
     ax.grid(True, alpha=0.3)
+
+    # 设置刻度间隔为2，避免刻度过密
+    ax.set_xticks(range(0, n, 2))
+    ax.set_yticks(range(0, n, 2))
 
     # 右图: 对比栅格顺序
     ax = axes[1]
@@ -1075,10 +1033,14 @@ def visualize_mixed_depth_regions(
     draw_image_background(ax, image, image_size)
 
     def get_hilbert_index(x, y, order):
+        """将图像坐标转换为 Hilbert 曲线索引"""
         n = 2 ** order
         xn = int(x * n / image_size)
         yn = int(y * n / image_size)
-        return _xy_to_d_fallback(xn, yn, n)
+        # clamp 到有效范围 [0, n-1]，避免边界溢出
+        xn = min(max(xn, 0), n - 1)
+        yn = min(max(yn, 0), n - 1)
+        return xy_to_d(xn, yn, n)
 
     region_infos = []
     flat_selected = []

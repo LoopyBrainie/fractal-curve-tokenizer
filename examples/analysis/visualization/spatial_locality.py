@@ -28,43 +28,11 @@ import seaborn as sns
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-
-def _generate_hilbert_curve(order: int) -> List[Tuple[int, int]]:
-    """生成 Hilbert 曲线坐标 - 正确实现"""
-    def rot(n, x, y, rx, ry):
-        """旋转/翻转象限"""
-        if ry == 0:
-            if rx == 1:
-                x = n - 1 - x
-                y = n - 1 - y
-            x, y = y, x
-        return x, y
-
-    def d_to_xy(n, d):
-        """d 到 (x,y) 转换"""
-        x = y = 0
-        s = 1
-        t = d
-        while s < n:
-            rx = (t // 2) & 1
-            ry = (t ^ rx) & 1
-            x, y = rot(s, x, y, rx, ry)
-            x += s * rx
-            y += s * ry
-            t //= 4
-            s *= 2
-        return x, y
-
-    n = 2 ** order
-    coords = []
-    for d in range(n * n):
-        coords.append(d_to_xy(n, d))
-    return coords
-
-
-def _generate_raster_curve(size: int) -> List[Tuple[int, int]]:
-    """生成栅格曲线坐标"""
-    return [(x, y) for y in range(size) for x in range(size)]
+# 导入集中的 Hilbert 工具函数（来自 utils/hilbert_utils.py）
+from ..utils.hilbert_utils import (
+    generate_hilbert_curve,
+    generate_raster_curve,
+)
 
 
 def plot_hilbert_vs_raster(
@@ -105,7 +73,7 @@ def plot_hilbert_vs_raster(
     # Hilbert 曲线
     # =========================================================================
     ax = axes[0]
-    hilbert_coords = _generate_hilbert_curve(order)
+    hilbert_coords = generate_hilbert_curve(order)
     hilbert_array = np.array(hilbert_coords)
 
     # 颜色映射
@@ -134,7 +102,7 @@ def plot_hilbert_vs_raster(
     # 栅格顺序 - 高亮对角线跳跃问题
     # =========================================================================
     ax = axes[1]
-    raster_coords = _generate_raster_curve(n)
+    raster_coords = generate_raster_curve(n)
     raster_array = np.array(raster_coords)
 
     # 绘制曲线
@@ -216,8 +184,8 @@ def plot_locality_preservation(
     fig, axes = plt.subplots(1, 3, figsize=figsize)
 
     n = 2 ** order
-    hilbert_coords = _generate_hilbert_curve(order)
-    raster_coords = _generate_raster_curve(n)
+    hilbert_coords = generate_hilbert_curve(order)
+    raster_coords = generate_raster_curve(n)
 
     # 计算局部性指标
     rng = np.random.default_rng(seed)
@@ -374,7 +342,7 @@ def animate_hilbert_curve(
     fig, ax = plt.subplots(figsize=(8, 8))
 
     n = 2 ** order
-    coords = _generate_hilbert_curve(order)
+    coords = generate_hilbert_curve(order)
 
     points, = ax.plot([], [], 'o-', markersize=3, linewidth=1)
     start_marker, = ax.plot([], [], 'go', markersize=15, label='Start')

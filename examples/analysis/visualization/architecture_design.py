@@ -449,17 +449,20 @@ def plot_position_encoding_comparison(
     ]
 
     colors = ['#e3f2fd', '#e8f5e9', '#fff3e0', '#fce4ec']
+    # 调整 y 位置以适应 tight_layout，避免超出边界
+    # 4个框: y起始=0.82，间距=0.18，每个高度=0.16
     for i, (title, desc) in enumerate(advantages):
-        y = 0.9 - i * 0.22
-        rect = plt.Rectangle((0.05, y - 0.08), 0.9, 0.18, transform=ax.transAxes,
+        y = 0.82 - i * 0.18
+        rect = plt.Rectangle((0.05, y - 0.08), 0.9, 0.16, transform=ax.transAxes,
                              facecolor=colors[i], edgecolor='gray', linewidth=1)
         ax.add_patch(rect)
         ax.text(0.1, y, title, transform=ax.transAxes, fontsize=10,
                fontweight='bold', va='center')
-        ax.text(0.1, y - 0.04, desc, transform=ax.transAxes, fontsize=8,
+        ax.text(0.1, y - 0.035, desc, transform=ax.transAxes, fontsize=8,
                va='center')
 
-    plt.tight_layout(pad=2.0, h_pad=3.0)
+    # 使用 constrained_layout 避免文本被裁剪
+    fig.tight_layout(pad=2.0, h_pad=3.0)
 
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
