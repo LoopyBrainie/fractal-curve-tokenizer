@@ -331,9 +331,9 @@ def compute_ece(probs: torch.Tensor, labels: torch.Tensor, n_bins: int = 15) -> 
 # ============================================================================
 
 class AmpContext:
-    """AMP 上下文管理器
+    """AMP 上下文管理器 (I146: 更新使用新版 torch.amp.autocast)
 
-    封装 torch.cuda.amp.autocast，提供统一的上下文接口。
+    封装 torch.amp.autocast，提供统一的上下文接口。
     """
 
     def __init__(self, device: torch.device, use_amp: bool):
@@ -343,7 +343,8 @@ class AmpContext:
 
     def __enter__(self):
         if self.use_amp and self.device.type == 'cuda':
-            self.ctx = torch.cuda.amp.autocast()
+            # I146: 使用新版 torch.amp.autocast 替代弃用的 torch.cuda.amp.autocast
+            self.ctx = torch.amp.autocast('cuda')
             self.ctx.__enter__()
         return self
 
