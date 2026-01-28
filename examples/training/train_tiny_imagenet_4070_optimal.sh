@@ -71,5 +71,4 @@ uv run python src/training/train_fractal_vit.py \
   --channels-last \
   --gradient-clip 1.0 \
   --patience 20 \
-  --min-delta 0.001 \
-  --exp-name tiny_imagenet_256d_8l_bs192_ep100_v2
+  --min-delta 0.001 
