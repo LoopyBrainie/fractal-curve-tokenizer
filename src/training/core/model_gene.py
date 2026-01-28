@@ -77,6 +77,7 @@ class ModelGene:
 
     # ==================== I24-2: 可学习配额 ====================
     quota_learnable: Optional[bool] = None  # 是否启用可学习配额
+    quota_entropy_weight: float = 0.01  # 配额熵正则化权重
 
     # ==================== I31-3: 形状-尺度编码 ====================
     use_area_encoding: bool = False      # 使用面积编码
@@ -136,6 +137,7 @@ class ModelGene:
 
             # I24-2
             'quota_learnable': self.quota_learnable,
+            'quota_entropy_weight': self.quota_entropy_weight,
 
             # I31-3
             'use_area_encoding': self.use_area_encoding,

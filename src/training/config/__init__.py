@@ -106,6 +106,7 @@ class ModelArchitectureConfig:
     # I24-2: 可学习配额控制
     # None = 使用常量默认值, True/False = 显式覆盖
     quota_learnable: Optional[bool] = None
+    quota_entropy_weight: float = 0.01  # 配额熵正则化权重
 
     # 训练策略参数 (从 FractalViTConfig 迁移)
     pool: str = "weighted"

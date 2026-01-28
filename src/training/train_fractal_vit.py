@@ -2671,8 +2671,7 @@ def main():
                        help="I33: Maximum token coverage ratio (default: 0.05, 5% of patches)")
 
     # I30-10: 可学习配额参数 (Scheme E)
-    parser.add_argument("--quota-learnable", type=bool, default=True,
-                       help="I30-10: Enable learnable quota allocation (Scheme E, default: True)")
+    # I24-2: 迁移到命令行 choices 模式
     parser.add_argument("--quota-init-logits", type=str, default=None,
                        help="I30-10: Quota initialization logits as comma-separated values (e.g., '-0.5,-0.2,0.0,0.5')")
     parser.add_argument("--quota-min-per-depth", type=int, default=2,
@@ -2715,6 +2714,13 @@ def main():
     parser.add_argument("--temp-schedule", type=str, default=SPLITTER_TEMP_SCHEDULE,
                        choices=["linear", "cosine", "exponential"],
                        help=f"Temperature annealing schedule (default: {SPLITTER_TEMP_SCHEDULE})")
+
+    # I24-2: 可学习配额参数 (Scheme E)
+    parser.add_argument("--quota-learnable", type=str, default="default",
+                       choices=["default", "enable", "disable"],
+                       help="Learnable quota (Scheme E): 'default'=use global, 'enable'=force on, 'disable'=force off")
+    parser.add_argument("--quota-entropy-weight", type=float, default=0.01,
+                       help="Weight for quota entropy regularization (default: 0.01)")
 
     # P10-4/P10-5: 软熵损失参数
     parser.add_argument("--include-soft-entropy", action="store_true", default=True,
@@ -2874,6 +2880,14 @@ def main():
     K_min = max(4, int(max_patches * args.token_coverage_min))  # 至少 8 tokens
     K_max = int(max_patches * args.token_coverage_max)
 
+    # I24-2: 转换 quota_learnable 字符串到布尔值
+    if args.quota_learnable == "enable":
+        quota_learnable_value = True
+    elif args.quota_learnable == "disable":
+        quota_learnable_value = False
+    else:
+        quota_learnable_value = None  # 使用全局默认值
+
     # I36: 使用 ModelArchitectureConfig 作为配置基础
     arch_config = ModelArchitectureConfig(
         num_classes=spec.num_classes,
@@ -2900,7 +2914,8 @@ def main():
         depth_scale_range=(args.depth_scale_min, args.depth_scale_max) if not args.no_learnable_depth_scale else None,
         lca_temperature=None if args.no_lca_temperature else args.lca_temperature,
         learnable_temperature=not args.fixed_lca_temperature,
-        quota_learnable=args.quota_learnable,
+        quota_learnable=quota_learnable_value,
+        quota_entropy_weight=args.quota_entropy_weight,
         freeze_quota=args.freeze_quota,
         freeze_tokenizer=args.freeze_tokenizer,
         freeze_tokenizer_epochs=args.freeze_tokenizer_epochs,
@@ -2937,6 +2952,7 @@ def main():
             self.use_affine_modulation = arch_config.use_affine_modulation
             self.fourier_levels = arch_config.fourier_levels
             self.quota_learnable = arch_config.quota_learnable
+            self.quota_entropy_weight = arch_config.quota_entropy_weight
             self.freeze_quota = arch_config.freeze_quota
             self.freeze_tokenizer = arch_config.freeze_tokenizer
             self.freeze_tokenizer_epochs = arch_config.freeze_tokenizer_epochs
@@ -3039,6 +3055,8 @@ def main():
         use_area_encoding=config.use_area_encoding,
         use_affine_modulation=config.use_affine_modulation,
         fourier_levels=config.fourier_levels,
+        # I24-2: 可学习配额控制 (Scheme E)
+        quota_learnable=config.quota_learnable,
     )
 
     model = FractalCurveViT(**model_kwargs).to(device)
@@ -3061,12 +3079,15 @@ def main():
             print(f"[I24-1] Frozen tokenizer params ({freeze_mode}): {frozen_tokenizer_params}")
 
     # I136: 配置 Elastic Budget 覆盖率参数 (从 CLI 传入)
+    # I24-2: 配置配额熵权重 (Scheme E)
     if hasattr(model, 'splitter'):
         model.splitter._elastic_coverage_min = config.elastic_coverage_min
         model.splitter._elastic_coverage_max = config.elastic_coverage_max
         model.splitter._elastic_lambda_over = config.elastic_lambda_over
         model.splitter._elastic_lambda_under = config.elastic_lambda_under
+        model.splitter._quota_entropy_weight = config.quota_entropy_weight
         print(f"[I136] Elastic budget config: coverage∈[{config.elastic_coverage_min:.2%}, {config.elastic_coverage_max:.2%}], λ_over={config.elastic_lambda_over}, λ_under={config.elastic_lambda_under}")
+        print(f"[I24-2] Quota entropy weight: {config.quota_entropy_weight}")
     
     # 打印模型信息
     params = sum(p.numel() for p in model.parameters())

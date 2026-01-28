@@ -1166,6 +1166,7 @@ class LayeredEvaluator:
 
         # I24-2: 可学习配额
         quota_learnable = config.get('quota_learnable', None)
+        quota_entropy_weight = config.get('quota_entropy_weight', 0.01)
 
         # I31-3: 形状-尺度编码
         use_area_encoding = config.get('use_area_encoding', False)
@@ -1409,6 +1410,11 @@ class LayeredEvaluator:
                     # 用新层替换旧层
                     splitter.complexity_mlp[0] = new_linear
                     print(f"[I140] complexity_mlp.0 resized: {complexity_mlp_input_dim} -> {actual_input_dim}")
+
+        # I24-2: 配置配额熵权重 (Scheme E)
+        if hasattr(model, 'splitter'):
+            model.splitter._quota_entropy_weight = quota_entropy_weight
+            print(f"[I24-2] Set quota_entropy_weight: {quota_entropy_weight}")
 
         model = model.to(self.device)
         model.eval()
