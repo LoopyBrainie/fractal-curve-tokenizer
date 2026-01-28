@@ -739,13 +739,16 @@ class FractalCurveViT(nn.Module):
 
                 # 空列表保护
                 if max_tokens == 0:
+                    # I144: 批量转换避免循环中的 .item()
+                    lengths_cpu = lengths.cpu() if lengths.is_cuda else lengths
+                    lengths_list = lengths_cpu.tolist()
+                    splitter_diag = self.get_splitter_diagnostics()
                     for i in range(B):
-                        num_tokens = int(lengths[i].item())
                         aux_infos.append({
-                            "num_tokens": num_tokens,
+                            "num_tokens": lengths_list[i],
                             "levels_used": [],
                             "depth_distribution": {},
-                            "splitter_diagnostics": self.get_splitter_diagnostics(),
+                            "splitter_diagnostics": splitter_diag,
                         })
                     return aux_infos, None
 
@@ -775,7 +778,25 @@ class FractalCurveViT(nn.Module):
                 depth_sums = all_depth_counts.sum(dim=1, keepdim=True).clamp(min=1e-8)
                 normalized_counts = all_depth_counts / depth_sums
 
-                # 构建 aux_infos - 延迟 CPU 转换到最后一刻
+                # I144: 向量化计算所有 num_tokens - 完全 GPU 计算，避免循环中的 .item()
+                # lengths 是 GPU tensor，直接在 GPU 上操作
+                lengths_cpu = lengths.cpu() if lengths.is_cuda else lengths  # 只在需要时同步一次
+                lengths_list = lengths_cpu.tolist()  # 单次批量转换
+
+                # I144: 向量化计算 entropy - 先在 GPU 上计算所有值
+                if split_probs is not None:
+                    # 计算每个样本的 entropy [B]
+                    entropies_gpu = []
+                    for i in range(B):
+                        probs_i = split_probs[i, :lengths[i]]
+                        probs_safe = probs_i + (probs_i == 0).float() * PROB_EPSILON
+                        entropy_i = -(probs_safe * torch.log(probs_safe)).sum()
+                        entropies_gpu.append(entropy_i)
+                    entropies_gpu = torch.stack(entropies_gpu)  # [B]
+                    # 最后一次性转换为 Python float
+                    entropies_list = entropies_gpu.tolist()
+
+                # 构建 aux_infos - 使用预计算的列表
                 valid_bool = torch.tensor(valid_counts, device=lengths.device) > 0
                 levels_used_list = []
                 for i in range(B):
@@ -789,7 +810,7 @@ class FractalCurveViT(nn.Module):
                 splitter_diag = self.get_splitter_diagnostics()
 
                 for i in range(B):
-                    num_tokens = int(lengths[i].item())  # 单个 .item() 很快
+                    num_tokens = lengths_list[i]  # 使用预转换的 Python list
                     levels_used = levels_used_list[i]
 
                     if not valid_bool[i] or not levels_used:
@@ -818,10 +839,7 @@ class FractalCurveViT(nn.Module):
                     }
 
                     if split_probs is not None:
-                        probs_i = split_probs[i, :lengths[i]]
-                        probs_safe = probs_i + (probs_i == 0).float() * PROB_EPSILON
-                        entropy = -(probs_safe * torch.log(probs_safe)).sum().item()
-                        aux_info["token_selection_entropy"] = entropy
+                        aux_info["token_selection_entropy"] = entropies_list[i]
 
                     aux_infos.append(aux_info)
 
