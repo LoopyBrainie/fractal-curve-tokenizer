@@ -190,6 +190,20 @@ from .visualization import (
 
 # Core
 from .core import ModelResourceStats, compute_resource_stats_batch
+from .core.model_gene import ModelGene
+from .core.inference_wrapper import (
+    inference,
+    evaluate,
+    InferenceStats,
+    EvalResult,
+)
+from .core.checkpoint import (
+    load_checkpoint,
+    load_model,
+    build_model,
+    save_checkpoint_with_gene,
+    get_checkpoint_info,
+)
 
 # Fractal Proxy Experiments (I74)
 from .fractal_proxy_experiments import (
@@ -324,6 +338,17 @@ __all__ = [
     # Core
     "ModelResourceStats",
     "compute_resource_stats_batch",
+    "ModelGene",
+    "inference",
+    "evaluate",
+    "InferenceStats",
+    "EvalResult",
+    # Checkpoint (shared between trainer and evaluator)
+    "load_checkpoint",
+    "load_model",
+    "build_model",
+    "save_checkpoint_with_gene",
+    "get_checkpoint_info",
     # Fractal Proxy Experiments (I74)
     "ExperimentMode",
     "ProxyExperimentConfig",

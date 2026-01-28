@@ -118,6 +118,15 @@ except ImportError as e:
     CUB200_AVAILABLE = False
     CUB200_IMPORT_ERROR = str(e)
 
+# 导入共享 Checkpoint 加载模块
+from training.core.checkpoint import (
+    load_checkpoint,
+    load_model,
+    load_model_legacy,
+    get_checkpoint_info,
+)
+from training.core.model_gene import ModelGene
+
 
 # ============================================================================
 # CUB-200 细粒度分类专用评估层
@@ -895,11 +904,53 @@ class LayeredEvaluator:
             )
     
     def _load_model(self) -> nn.Module:
-        """加载模型 checkpoint"""
+        """加载模型 checkpoint
+
+        优先使用 model_gene（自包含配置），回退到传统推断逻辑。
+        使用共享的 checkpoint 加载模块确保与训练器一致。
+        """
         print(f"Loading checkpoint: {self.checkpoint_path}")
 
-        checkpoint = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
+        # 加载 checkpoint
+        checkpoint = load_checkpoint(self.checkpoint_path, device=str(self.device))
 
+        # 优先尝试使用 model_gene（自包含配置）
+        if 'model_gene' in checkpoint:
+            print("[INFO] Found embedded model_gene - using self-contained config")
+            return self._load_model_from_gene(checkpoint)
+
+        # 回退到传统推断逻辑（兼容旧 checkpoint）
+        print("[WARN] No embedded model_gene found - using legacy inference")
+        return self._load_model_legacy(checkpoint)
+
+    def _load_model_from_gene(self, checkpoint: Dict[str, Any]) -> nn.Module:
+        """从 ModelGene 加载模型（自包含配置）
+
+        使用共享的 load_model 函数确保与训练器一致。
+        """
+        gene_dict = checkpoint['model_gene']
+        gene = ModelGene.from_dict(gene_dict)
+
+        # 更新数据集配置
+        if gene.dataset_name and gene.dataset_name in SUPPORTED_DATASETS:
+            if gene.dataset_name != self.dataset_name:
+                print(f"  [INFO] Overriding dataset to '{gene.dataset_name}' from checkpoint")
+            self.dataset_name = gene.dataset_name
+            self.dataset_config = SUPPORTED_DATASETS[self.dataset_name]
+
+        # 使用共享函数加载模型（与训练器完全一致的代码路径）
+        model, gene = load_model(
+            checkpoint['model_gene'],
+            state_dict=checkpoint.get('model_state_dict', checkpoint),
+            device=self.device,
+            strict=False,
+            verbose=True,
+        )
+
+        return model
+
+    def _load_model_legacy(self, checkpoint: Dict[str, Any]) -> nn.Module:
+        """从旧 checkpoint 加载模型（推断架构参数）"""
         # 获取模型配置
         raw_config = None
         if 'config' in checkpoint:
@@ -940,7 +991,7 @@ class LayeredEvaluator:
         # 从 checkpoint 的 config 中检测数据集，如果与用户指定不同则警告
         ckpt_dataset = config.get('dataset', self.dataset_name)
         if ckpt_dataset != self.dataset_name:
-            print(f"⚠️  Warning: Checkpoint was trained on '{ckpt_dataset}', but you specified '{self.dataset_name}'")
+            print(f"  Warning: Checkpoint was trained on '{ckpt_dataset}', but you specified '{self.dataset_name}'")
             print(f"    Overriding to use '{ckpt_dataset}' from checkpoint config")
             self.dataset_name = ckpt_dataset
             if self.dataset_name not in SUPPORTED_DATASETS:
@@ -1123,11 +1174,28 @@ class LayeredEvaluator:
 
         pos_dropout = config.get('pos_dropout', None)
 
-        # 计算 mlp_dim（与训练器一致）
-        mlp_dim = config.get('mlp_dim', ckpt_dim * 4)
-
         # channels
         channels = config.get('channels', 3)
+
+        # I140: 从检查点检测 mlp_dim（避免 FFN 权重不匹配）
+        # 优先级: 检测值 > config.json > 默认值
+        detected_mlp_dim = None
+        for key in state_dict.keys():
+            # Swiglu: w_gate.weight shape = [mlp_dim, dim]
+            if ('.ff.swiglu.w_gate.weight' in key or '.ff.0.w_gate.weight' in key):
+                w_shape = state_dict[key].shape
+                if len(w_shape) == 2:
+                    detected_mlp_dim = w_shape[0]
+                    expansion_ratio = detected_mlp_dim / ckpt_dim
+                    print(f"[I140] Detected mlp_dim={detected_mlp_dim} from checkpoint (expansion={expansion_ratio:.2f}x)")
+                    break
+
+        # 检测值优先于 config，确保与 checkpoint 兼容
+        if detected_mlp_dim is not None:
+            mlp_dim = detected_mlp_dim
+            print(f"[I140] Using detected mlp_dim={mlp_dim} for checkpoint compatibility")
+        else:
+            mlp_dim = config.get('mlp_dim', ckpt_dim * 4)
 
         # I140: 从检查点检测 splitter 关键参数（避免 complexity_mlp 维度不匹配）
         # 优先级：命令行参数 > config.json > state_dict 检测 > 默认值
@@ -1165,10 +1233,12 @@ class LayeredEvaluator:
                 print(f"[I140] WARNING: config.dim={ckpt_dim} != complexity_mlp expected dim={inferred_dim}")
                 print(f"  Adjusting model dimensions for checkpoint compatibility:")
                 ckpt_dim = inferred_dim
-                # 更新 config 中的 dim 和 mlp_dim
+                # 更新 config 中的 dim
                 config['dim'] = ckpt_dim
-                mlp_dim = ckpt_dim * 4
-                config['mlp_dim'] = mlp_dim
+                # 如果没有检测到 mlp_dim，则重新计算
+                if detected_mlp_dim is None:
+                    mlp_dim = ckpt_dim * 4
+                    config['mlp_dim'] = mlp_dim
                 print(f"[I140] Updated dim={ckpt_dim}, mlp_dim={mlp_dim}")
 
         # 同步设置 feature_dim = dim（确保 tokenizer 输出与 splitter 兼容）

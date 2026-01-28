@@ -740,16 +740,14 @@ class TokenizerEvaluator:
                     token_counts.append(n_tokens)
                     per_class_tokens[labels[i].item()].append(n_tokens)
                 
-                # 深度分布
-                for seq in output.sequences:
-                    if 'levels' in seq.metadata and seq.metadata['levels'] is not None:
-                        levels = seq.metadata['levels']
-                        if levels.dim() > 1:
-                            depths = levels[:, 0]
-                        else:
-                            depths = levels
-                        for d in depths.cpu().numpy():
-                            depth_counts[int(d)] += 1
+                # 深度分布 (I139: 修复 - 使用 levels_list() 方法替代废弃的 output.sequences)
+                levels_list = output.levels_list()
+                for i in range(B):
+                    levels = levels_list[i]
+                    # 修复: 展平并确保每个元素是 Python 标量
+                    for d in levels.cpu().flatten().numpy():
+                        d_val = d.item() if isinstance(d, (list, tuple, torch.Tensor)) else d
+                        depth_counts[int(d_val)] += 1
                 
                 # 空间覆盖率
                 regions, _ = output.get_padded_regions()
@@ -969,15 +967,12 @@ class AttentionEvaluator:
                             tok_output = tokenizer.tokenize(imgs, split_result)
                         else:
                             tok_output = tokenizer.tokenize(imgs)
-                        # 提取深度信息
-                        if hasattr(tok_output, 'sequences'):
-                            for seq in tok_output.sequences:
-                                if 'levels' in seq.metadata and seq.metadata['levels'] is not None:
-                                    levels = seq.metadata['levels']
-                                    if levels.dim() > 1:
-                                        self._token_depths.append(levels[:, 0].cpu())
-                                    else:
-                                        self._token_depths.append(levels.cpu())
+                        # 提取深度信息 (I139: 修复 - 使用 levels_list() 方法替代废弃的 sequences)
+                        if hasattr(tok_output, 'levels_list'):
+                            levels_list = tok_output.levels_list()
+                            for levels in levels_list:
+                                if levels.numel() > 0:
+                                    self._token_depths.append(levels.cpu())
                     
                     # 完整前向传播
                     _ = model(imgs)
@@ -1108,7 +1103,12 @@ class AttentionEvaluator:
                     
                     N = min(len(depths_tensor), len(attention_received))
                     for i in range(N):
-                        depth = int(depths_tensor[i].item())
+                        # depths_tensor 格式为 [B, N, num_levels]，取第一个深度级别
+                        depth_val = depths_tensor[i]
+                        if depth_val.dim() > 0:
+                            depth = int(depth_val[0].item())  # 取主要深度级别
+                        else:
+                            depth = int(depth_val.item())
                         self._depth_attention_received[depth].append(attention_received[i].item())
     
     def _finalize_metrics(self, metrics: L3AttentionMetrics):
@@ -1918,31 +1918,40 @@ class StabilityEvaluator:
         """执行训练稳定性评估"""
         metrics = L6StabilityMetrics()
         
-        # 权重统计
-        weight_stats = {}
-        has_nan = False
-        has_inf = False
-        
-        for name, param in model.named_parameters():
-            if param.numel() == 0:
-                continue
-            
-            data = param.data
-            
-            # 检查 NaN/Inf
-            if torch.isnan(data).any():
-                has_nan = True
-            if torch.isinf(data).any():
-                has_inf = True
-            
-            # 统计 (处理 numel <= 1 的情况)
-            weight_stats[name] = {
-                'mean': data.mean().item(),
-                'std': data.std().item() if data.numel() > 1 else 0.0,
-                'min': data.min().item(),
-                'max': data.max().item(),
-                'norm': data.norm().item(),
+        # 权重统计 - I139: 向量化计算，移除 GPU 同步点
+        # P-OPT: 使用 torch.stack 批量操作，避免 O(N) 次 GPU 同步
+        params = [p.data for p in model.parameters() if p.numel() > 0]
+        param_names = [n for n, p in model.named_parameters() if p.numel() > 0]
+
+        # 批量计算统计 (GPU 内计算)
+        all_means = torch.stack([p.mean() for p in params])
+        all_stds = torch.stack([p.std() if p.numel() > 1 else torch.tensor(0.0, device=p.device) for p in params])
+        all_mins = torch.stack([p.min() for p in params])
+        all_maxs = torch.stack([p.max() for p in params])
+        all_norms = torch.stack([p.norm() for p in params])
+
+        # 检查 NaN/Inf
+        has_nan = any(torch.isnan(p).any() for p in params)
+        has_inf = any(torch.isinf(p).any() for p in params)
+
+        # 批量转换为 CPU 列表 (单次同步)
+        weight_stats = {
+            name: {
+                'mean': mean.item(),
+                'std': std.item() if std > 0 else 0.0,
+                'min': min.item(),
+                'max': max.item(),
+                'norm': norm.item(),
             }
+            for name, mean, std, min, max, norm in zip(
+                param_names,
+                all_means.cpu(),
+                all_stds.cpu(),
+                all_mins.cpu(),
+                all_maxs.cpu(),
+                all_norms.cpu()
+            )
+        }
         
         metrics.weight_norm_stats = weight_stats
         metrics.has_nan_weights = has_nan

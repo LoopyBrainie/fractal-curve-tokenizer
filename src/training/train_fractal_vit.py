@@ -348,6 +348,15 @@ from training import (
     FinegrainedLossConfig,
     # I36: ModelArchitectureConfig (替代 FractalViTConfig)
     ModelArchitectureConfig,
+    # ModelGene (自包含 checkpoint)
+    ModelGene,
+    # Checkpoint 工具 (与评估器共享)
+    save_checkpoint_with_gene,
+    load_checkpoint,
+    load_model,
+    # InferenceWrapper (与 eval.py 共享推理逻辑)
+    evaluate as inference_evaluate,
+    EvalResult,
 )
 
 
@@ -1864,7 +1873,14 @@ def train_epoch(
                 stats = model(imgs)
                 # 从 TrainingStats 提取信息
                 tokens = stats.transformer_tokens if hasattr(stats, 'transformer_tokens') else None
-                token_lengths = stats.num_tokens if hasattr(stats, 'num_tokens') else None
+                # I139: 修复 - num_tokens 可能为 int 或 List[int]，需转换为 tensor
+                raw_lengths = stats.num_tokens if hasattr(stats, 'num_tokens') else None
+                if raw_lengths is None:
+                    token_lengths = None
+                elif isinstance(raw_lengths, list):
+                    token_lengths = torch.tensor(raw_lengths, device=device, dtype=torch.long)
+                else:
+                    token_lengths = raw_lengths  # 已是 tensor 或 int
                 outs = stats.logits if hasattr(stats, 'logits') else stats
             else:
                 stats = model(imgs)
@@ -1955,9 +1971,15 @@ def train_epoch(
 
                 if hasattr(splitter, 'get_auxiliary_losses'):
                     # I14-1 D1: 从 stats 获取 token 数用于崩溃检测
+                    # I139: 修复 - num_tokens 可能为 int 或 List[int]
                     actual_token_count = None
                     if stats is not None and hasattr(stats, 'num_tokens'):
-                        actual_token_count = int(stats.num_tokens)
+                        num_tokens = stats.num_tokens
+                        if isinstance(num_tokens, list):
+                            # 列表格式: 取第一个样本的值（用于崩溃检测）
+                            actual_token_count = int(num_tokens[0]) if num_tokens else 0
+                        else:
+                            actual_token_count = int(num_tokens)
 
                     aux_losses = splitter.get_auxiliary_losses(
                         features=splitter_features,
@@ -2141,91 +2163,46 @@ def evaluate(
     return_per_class: bool = False,
     use_channels_last: bool = False,
 ) -> Tuple[float, float, Optional[Dict[str, Any]]]:
-    """评估
-    
-    Args:
-        model: 模型
-        loader: 数据加载器
-        device: 设备
-        use_amp: 是否使用混合精度
-        num_classes: 类别数
-        return_per_class: 是否返回逐类别统计
-        
-    Returns:
-        (loss, accuracy, per_class_stats)
-    """
+    """评估 - 使用 InferenceWrapper 确保与 eval.py 推理逻辑一致"""
     model.eval()
-    total_loss, correct, total = 0.0, 0, 0
-    nan_batches = 0
-    
-    # 逐类别统计
-    class_correct = torch.zeros(num_classes, device=device)
-    class_total = torch.zeros(num_classes, device=device)
-    
-    for batch in tqdm(loader, desc="Eval"):
-        imgs, labels = batch
-        imgs = imgs.to(device)
-        if use_channels_last:
-            imgs = imgs.to(memory_format=torch.use_channels_last)
-        labels = labels.to(device)
-        
-        # I23-4-FIX: 检查输入图像是否包含 NaN/Inf
-        if torch.isnan(imgs).any() or torch.isinf(imgs).any():
-            nan_batches += 1
-            continue
-        
-        with get_amp_context(device, use_amp):
-            stats = model(imgs)
-            outs = stats.logits if hasattr(stats, 'logits') else stats
 
-            # 检查 logits 是否有问题
-            if torch.isnan(outs).any() or torch.isinf(outs).any():
-                nan_batches += 1
-                continue
-            
-            loss = F.cross_entropy(outs, labels)
-        
-        if not (torch.isnan(loss) or torch.isinf(loss)):
-            total_loss += loss.item()
-        else:
-            nan_batches += 1
-            continue
-            
-        _, pred = outs.max(1)
-        total += labels.size(0)
-        correct += pred.eq(labels).sum().item()
-        
-        # 逐类别统计
-        for c in range(num_classes):
-            mask = labels == c
-            class_total[c] += mask.sum()
-            class_correct[c] += (pred[mask] == c).sum()
-    
-    if nan_batches > 0:
-        print(f"[WARN] 评估时跳过 {nan_batches} 个包含 NaN 的 batch")
-    
-    if total == 0:
-        return float('inf'), 0.0, None
-    
-    # 计算逐类别准确率
+    # 应用 channels_last 格式（如果需要）
+    if use_channels_last:
+        model = model.to(memory_format=torch.channels_last)
+
+    # 使用共享的 inference_wrapper 进行评估
+    result: EvalResult = inference_evaluate(
+        model, loader,
+        device=device,
+        use_amp=use_amp,
+        num_classes=num_classes,
+        return_per_class=return_per_class,
+    )
+
+    # 转换为旧接口格式（保持向后兼容）
     per_class_stats = None
-    if return_per_class:
-        class_correct = class_correct.cpu().numpy()
-        class_total = class_total.cpu().numpy()
-        class_acc = np.divide(class_correct, class_total, out=np.zeros_like(class_correct), where=class_total > 0) * 100
-        
+    if return_per_class and result.per_class_accuracy:
+        class_correct = np.zeros(num_classes)
+        class_total = np.zeros(num_classes)
+        for cls_id, acc in result.per_class_accuracy.items():
+            if cls_id < num_classes:
+                class_correct[cls_id] = acc / 100.0 * (1.0 / num_classes)  # 近似值
+                class_total[cls_id] = 1.0  # 近似值
+
+        class_acc = np.array([result.per_class_accuracy.get(i, 0.0) for i in range(num_classes)])
+
         per_class_stats = {
             'class_accuracy': class_acc.tolist(),
             'class_correct': class_correct.tolist(),
             'class_total': class_total.tolist(),
             'worst_classes': np.argsort(class_acc)[:10].tolist(),
             'best_classes': np.argsort(class_acc)[-10:][::-1].tolist(),
-            'accuracy_std': float(np.std(class_acc[class_total > 0])),
+            'accuracy_std': float(np.std(class_acc[class_total > 0])) if np.any(class_total > 0) else 0.0,
             'accuracy_min': float(np.min(class_acc[class_total > 0])) if np.any(class_total > 0) else 0.0,
             'accuracy_max': float(np.max(class_acc[class_total > 0])) if np.any(class_total > 0) else 0.0,
         }
-    
-    return total_loss / max(len(loader) - nan_batches, 1), 100.0 * correct / total, per_class_stats
+
+    return result.avg_loss, result.accuracy, per_class_stats
 
 
 def analyze_class_balance(
@@ -3938,15 +3915,22 @@ def main():
         if val_acc > best_val + config.min_delta:
             best_val = val_acc
             patience_counter = 0
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc,
-                'val_loss': val_loss,
-                'config': obj_to_dict(config),
-            }, exp_dir / "checkpoints" / "best.pth")
-            print(f"  [*] Best model saved: {val_acc:.2f}%")
+
+            # 提取模型基因（用于自包含 checkpoint）
+            dataset_name = getattr(config, 'dataset', spec.name)
+            gene = ModelGene.from_model(model, dataset_name=dataset_name, epoch=epoch)
+
+            # 使用共享的 checkpoint 保存函数（与评估器使用相同的保存逻辑）
+            save_checkpoint_with_gene(
+                path=exp_dir / "checkpoints" / "best.pth",
+                model=model,
+                gene=gene,
+                optimizer_state=optimizer.state_dict(),
+                epoch=epoch,
+                val_acc=val_acc,
+                val_loss=val_loss,
+                extra={'config': obj_to_dict(config)},
+            )
         else:
             patience_counter += 1
             print(f"  [!] No improvement ({patience_counter}/{config.patience})")
@@ -3975,10 +3959,16 @@ def main():
     print("\n" + "="*70)
     print("TESTING")
     print("="*70 + "\n")
-    
-    ckpt = torch.load(exp_dir / "checkpoints" / "best.pth", weights_only=True)
-    model.load_state_dict(ckpt['model_state_dict'])
-    
+
+    # 使用共享的 load_model 函数（与评估器完全一致的代码路径）
+    # 这确保从 checkpoint 的 model_gene 重建模型，架构与训练时一致
+    model, gene = load_model(
+        str(exp_dir / "checkpoints" / "best.pth"),
+        device=str(device),
+        strict=True,
+        verbose=True,
+    )
+
     test_loss, test_acc, per_class_stats = evaluate(
         model, test_loader, device, config.use_amp, 
         spec.num_classes, return_per_class=True,
