@@ -1384,13 +1384,18 @@ class GumbelTopKSplitter(
             # 找到每个 batch 中达到 90% 累积概率的位置
             threshold_mask = cumsum < 0.9 * total_prob  # [B, N]
             k_90_per_batch = threshold_mask.sum(dim=1).float() + 1  # [B]
-            k_90_mean = k_90_per_batch.mean().item()
+            k_90_mean = k_90_per_batch.mean()  # GPU tensor
 
-            # 综合估计: 取两种方法的最大值
-            K_est = int(max(high_prob_count.item(), k_90_mean))
             # I33: 使用动态边界（如果启用）
             if self.use_dynamic_k:
                 K_min, K_max = self._get_dynamic_k_bounds(N, image_size)
+            else:
+                K_min, K_max = self.K_min, self.K_max
+
+            # 综合估计: 取两种方法的最大值 (全部在 GPU 上计算)
+            K_est_tensor = torch.stack([high_prob_count, k_90_mean]).max()
+            # I143: 使用 clamp 确保 K_est 是合理的整数范围，然后转 CPU
+            K_est = int(K_est_tensor.clamp(min=K_min, max=K_max))
             K = max(K_min, min(K_max, K_est, N))
 
             return K
