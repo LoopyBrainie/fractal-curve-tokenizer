@@ -742,13 +742,23 @@ class FractalCurveViT(nn.Module):
                     # I144: 批量转换避免循环中的 .item()
                     lengths_cpu = lengths.cpu() if lengths.is_cuda else lengths
                     lengths_list = lengths_cpu.tolist()
-                    splitter_diag = self.get_splitter_diagnostics()
+                    # I145: 使用延迟 diagnostics，避免 forward 中的 CPU 同步
+                    class LazyDiagnostics:
+                        __slots__ = ('_model', '_filled')
+                        def __init__(self, model):
+                            self._model = model
+                            self._filled = False
+                        def get(self, key, default=None):
+                            if not self._filled:
+                                self._model._fill_lazy_diagnostics(self)
+                            return self._filled.get(key, default)
+                    lazy_diag = LazyDiagnostics(self)
                     for i in range(B):
                         aux_infos.append({
                             "num_tokens": lengths_list[i],
                             "levels_used": [],
                             "depth_distribution": {},
-                            "splitter_diagnostics": splitter_diag,
+                            "splitter_diagnostics": lazy_diag,
                         })
                     return aux_infos, None
 
@@ -806,8 +816,32 @@ class FractalCurveViT(nn.Module):
                     else:
                         levels_used_list.append([])
 
-                # 预获取 splitter_diagnostics (只调用一次)
-                splitter_diag = self.get_splitter_diagnostics()
+                # I145: 延迟 splitter_diagnostics 到首次访问时计算
+                # 使用 LazyDiagnostics 包装器，避免 forward 关键路径中的 CPU 同步
+                class LazyDiagnostics:
+                    """延迟计算的 diagnostics 包装器"""
+                    __slots__ = ('_model', '_filled')
+                    def __init__(self, model):
+                        self._model = model
+                        self._filled = False
+                    def __repr__(self):
+                        if not self._filled:
+                            self._model._fill_lazy_diagnostics(self)
+                        return repr(self._filled)
+                    def __getitem__(self, key):
+                        if not self._filled:
+                            self._model._fill_lazy_diagnostics(self)
+                        return self._filled[key]
+                    def get(self, key, default=None):
+                        if not self._filled:
+                            self._model._fill_lazy_diagnostics(self)
+                        return self._filled.get(key, default)
+                    def __bool__(self):
+                        if not self._filled:
+                            self._model._fill_lazy_diagnostics(self)
+                        return bool(self._filled)
+
+                lazy_diag = LazyDiagnostics(self)
 
                 for i in range(B):
                     num_tokens = lengths_list[i]  # 使用预转换的 Python list
@@ -818,7 +852,7 @@ class FractalCurveViT(nn.Module):
                             "num_tokens": num_tokens,
                             "levels_used": [],
                             "depth_distribution": {},
-                            "splitter_diagnostics": splitter_diag,
+                            "splitter_diagnostics": lazy_diag,
                         }
                         if split_probs is not None:
                             aux_info["token_selection_entropy"] = 0.0
@@ -835,7 +869,7 @@ class FractalCurveViT(nn.Module):
                         "num_tokens": num_tokens,
                         "levels_used": levels_used,
                         "depth_distribution": depth_distribution,
-                        "splitter_diagnostics": splitter_diag,
+                        "splitter_diagnostics": lazy_diag,
                     }
 
                     if split_probs is not None:
@@ -1218,7 +1252,9 @@ class FractalCurveViT(nn.Module):
             if hasattr(splitter, 'quota_logits') and hasattr(splitter, '_current_max_depth'):
                 D = splitter._current_max_depth + 1
                 quota = torch.softmax(splitter.quota_logits[:D], dim=0)
-                diagnostics['quota_allocation'] = quota.detach().cpu().tolist()
+                # I145: 延迟 CPU 转换，保留为 GPU tensor 或 detach 后转换
+                # 训练时仅记录标量值，避免 cudagraphs 失败
+                diagnostics['quota_allocation'] = quota.detach().cpu().tolist() if quota.numel() <= 32 else []
 
             # 选中的 token 数
             if hasattr(splitter, '_avg_selected'):
@@ -1234,6 +1270,13 @@ class FractalCurveViT(nn.Module):
                     diagnostics['gradient_coverage'] = float(num_selected / num_candidates)
 
         return diagnostics
+
+    def _fill_lazy_diagnostics(self, lazy_obj: Any) -> None:
+        """填充延迟的 diagnostics (I145: 避免 cudagraphs CPU 同步)
+
+        当 LazyDiagnostics 首次被访问时调用，延迟计算真实的 diagnostics
+        """
+        lazy_obj._filled = self.get_splitter_diagnostics()
 
     def _is_convertible_to_int(self, key) -> bool:
         """检查键是否可以转换为整数 (P0-2 修复辅助方法)"""
