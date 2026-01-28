@@ -531,14 +531,23 @@ class ClassificationEvaluator:
 
                 # I35: 从 TrainingStats 直接获取 tokenizer 诊断信息
                 # I141: num_tokens 可能为 int, List[int], 或 torch.Tensor
-                if hasattr(stats, 'num_tokens') and stats.num_tokens:
-                    if isinstance(stats.num_tokens, torch.Tensor):
-                        # I141: GPU tensor，展平到列表
-                        all_num_tokens.extend(stats.num_tokens.cpu().tolist())
-                    elif isinstance(stats.num_tokens, list):
-                        all_num_tokens.extend(stats.num_tokens)
-                    else:
-                        all_num_tokens.append(stats.num_tokens)
+                # I145: 修复布尔判断 - tensor 不能直接用于 if 语句
+                if hasattr(stats, 'num_tokens'):
+                    num_tokens = stats.num_tokens
+                    # 非空检查：Tensor 用 numel()，其他用 bool
+                    is_non_empty = (
+                        num_tokens.numel() > 0 if isinstance(num_tokens, torch.Tensor)
+                        else bool(num_tokens) if not isinstance(num_tokens, (list, tuple))
+                        else len(num_tokens) > 0
+                    )
+                    if is_non_empty:
+                        if isinstance(num_tokens, torch.Tensor):
+                            all_num_tokens.extend(num_tokens.cpu().tolist())
+                        elif isinstance(num_tokens, (list, tuple)):
+                            all_num_tokens.extend(num_tokens)
+                        else:
+                            all_num_tokens.append(num_tokens)
+                # I145: 统一非空检查模式
                 if hasattr(stats, 'depth_distribution') and stats.depth_distribution:
                     all_depth_distributions.append(stats.depth_distribution)
         

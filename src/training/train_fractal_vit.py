@@ -2532,17 +2532,19 @@ def verify_train_eval_consistency(
         imgs = imgs.to(memory_format=torch.use_channels_last)
     
     # 检查 1: train/eval 输出差异
+    # 注意: CUDA graphs 下，第二次推理会覆盖第一次的输出缓冲区
+    # 必须先克隆再计算差异
     model.eval()
     with get_amp_context(device, config.use_amp):
         stats_eval = model(imgs)
-        out_eval = stats_eval.logits if hasattr(stats_eval, 'logits') else stats_eval
+        out_eval = (stats_eval.logits if hasattr(stats_eval, 'logits') else stats_eval).clone()
 
     model.train()
     with get_amp_context(device, config.use_amp):
         stats_train = model(imgs)
-        out_train = stats_train.logits if hasattr(stats_train, 'logits') else stats_train
+        out_train = (stats_train.logits if hasattr(stats_train, 'logits') else stats_train).clone()
     model.eval()  # 恢复 eval 模式
-    
+
     # 计算输出差异
     output_diff = (out_eval - out_train).abs()
     max_diff = output_diff.max().item()
