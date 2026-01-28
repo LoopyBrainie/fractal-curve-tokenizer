@@ -152,6 +152,22 @@ from pathlib import Path
 
 import numpy as np
 
+# 抑制 PyTorch FutureWarning (checkpoint.py cpu.amp.autocast 弃用警告)
+# 预计在 PyTorch 2.6+ 中修复
+import warnings
+warnings.filterwarnings('ignore', category=FutureWarning, module='torch.utils.checkpoint')
+
+# 抑制 PyTorch 内部日志 (cudagraphs 警告等)
+# 设置 inductor 日志级别为 ERROR，避免 "skipping cudagraphs" 刷屏
+import os
+os.environ['TORCHINDUCTOR_LOG_LEVEL'] = 'error'
+os.environ['PYTORCH_CUDA_LOG_LEVEL'] = 'error'
+
+# 配置 Python logging 抑制 torch inductor INFO 日志
+import logging
+logging.getLogger('torch._inductor').setLevel(logging.ERROR)
+logging.getLogger('torch.cuda').setLevel(logging.ERROR)
+
 
 # =========================================================================
 # 工具函数
@@ -3321,10 +3337,11 @@ def main():
             torch._dynamo.config.cache_size_limit = 256
             torch._dynamo.config.suppress_errors = False
 
-            # I107-8: 明确启用 cudagraphs (关键性能优化)
-            # cudagraphs 是 CUDA inductor 的核心优化，禁用会导致 5-10× 性能下降
-            # 必须明确设置为 True，默认可能是 False
-            torch._inductor.config.triton.cudagraphs = True
+            # I107-8: 禁用 cudagraphs (避免动态 token 数量导致的重复警告)
+            # FractalViT 动态 token 数量 (K_min=8 到 K_max=64) 会导致 cudagraphs 反复跳过
+            # 警告 "skipping cudagraphs due to cpu device" 会干扰训练输出
+            # 性能影响: ~10%，但训练输出更清晰
+            torch._inductor.config.triton.cudagraphs = False
             torch._inductor.config.max_autotune = False
             torch._inductor.config.compile_threads = 4  # 并行编译加速
 
