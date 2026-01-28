@@ -207,9 +207,9 @@ def clear_tokenizer_cache(self):
 ┌─────────────────────────────────┐
 │  StreamingFractalTokenizerV3    │
 │  ├── 复杂度估计                  │
-│  ├── 自适应四叉树分割            │
+│  ├── 自适应四叉树分割             │
 │  ├── HilbertNativePatchEmbed    │
-│  └── Hilbert 重排序             │
+│  └── Hilbert 重排序              │
 └─────────────────────────────────┘
         │
         ▼
@@ -218,7 +218,7 @@ def clear_tokenizer_cache(self):
         ▼
 ┌─────────────────────────────────┐
 │     FractalPositionEmbedding    │
-│     深度 + 路径编码             │
+│     深度 + 路径编码               │
 └─────────────────────────────────┘
         │
         ▼
@@ -230,15 +230,15 @@ def clear_tokenizer_cache(self):
 ┌─────────────────────────────────┐
 │     FractalTransformer × L      │
 │  ┌────────────────────────────┐ │
-│  │ 级别感知 LayerNorm         │ │
+│  │ 级别感知 LayerNorm          │ │
 │  │ HilbertAwareAttention      │ │
 │  │   + LCA Hilbert 偏置       │ │
 │  │ DropPath + 残差            │ │
-│  │ 级别感知 LayerNorm         │ │
-│  │ SwiGLU FFN + 级别自适应    │ │
+│  │ 级别感知 LayerNorm          │ │
+│  │ SwiGLU FFN + 级别自适应     │ │
 │  │ DropPath + 残差            │ │
 │  └────────────────────────────┘ │
-│     级别聚合器                  │
+│     级别聚合器                   │
 └─────────────────────────────────┘
         │
         ▼

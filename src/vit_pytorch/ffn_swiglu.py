@@ -193,9 +193,10 @@ class AdaptiveFractalFeedForward(nn.Module):
         
         # ========== FFN 主网络 ==========
         if ffn_type in ('swiglu', 'swiglu_level'):
-            # I34-19: LLaMA 风格 SwiGLU - Dff = 4 * dim
-            # 移除与 GELU 的参数匹配约束，简化设计
-            swiglu_hidden = dim * 4
+            # I34-19: LLaMA 风格 SwiGLU - 默认 Dff = 4 * dim
+            # I140: 支持可配置的 expansion ratio（兼容旧 checkpoint）
+            # 注意: 使用 hidden_dim 参数而非硬编码 dim * 4
+            swiglu_hidden = hidden_dim  # 使用传入的 hidden_dim，支持 2.67x 等不同 expansion
             self.swiglu = SwiGLUFFN(dim, swiglu_hidden, dropout, bias=bias)
             self.main_net = None
         else:
@@ -212,9 +213,14 @@ class AdaptiveFractalFeedForward(nn.Module):
         # ========== Level Adaptation（仅对 swiglu_level 或 GELU + use_level_adaptation）==========
         if self.use_level_adaptation:
             self.level_embedding: Optional[nn.Embedding] = nn.Embedding(max_depth + 1, dim)
-            
+
             # I34-19: LLaMA 风格 adapter - D_adapter = dim / 2
-            adapter_hidden = dim // 2 if ffn_type == 'swiglu_level' else hidden_dim // 2
+            # I140: 支持可配置的 adapter expansion（兼容旧 checkpoint）
+            # 原始设计: adapter_hidden = dim // 2 (0.5x)
+            # 但 checkpoint 可能使用不同 expansion，根据 hidden_dim 比例计算
+            base_adapter_hidden = hidden_dim // 2 if hidden_dim > dim else dim // 2
+            # 确保至少有一个合理的最小值
+            adapter_hidden = max(base_adapter_hidden, 128)
             self.shared_level_adapter: Optional[nn.Sequential] = nn.Sequential(
                 nn.Linear(dim * 2, adapter_hidden),
                 nn.SiLU() if ffn_type == 'swiglu_level' else nn.ReLU(),
