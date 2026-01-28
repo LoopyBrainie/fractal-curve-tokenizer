@@ -1989,28 +1989,15 @@ def train_epoch(
                     splitter_features = model.tokenizer.shared_conv(imgs)
 
                 if hasattr(splitter, 'get_auxiliary_losses'):
-                    # I14-1 D1: 从 stats 获取 token 数用于崩溃检测
-                    # I141: num_tokens 可能为 int, List[int], 或 torch.Tensor
-                    actual_token_count = None
-                    if stats is not None and hasattr(stats, 'num_tokens'):
-                        num_tokens = stats.num_tokens
-                        if isinstance(num_tokens, torch.Tensor):
-                            # I141: GPU tensor，提取第一个值
-                            actual_token_count = int(num_tokens[0].item()) if num_tokens.numel() > 0 else 0
-                        elif isinstance(num_tokens, list):
-                            # 列表格式: 取第一个样本的值（用于崩溃检测）
-                            actual_token_count = int(num_tokens[0]) if num_tokens else 0
-                        else:
-                            actual_token_count = int(num_tokens)
-
+                    # I142: 不再需要传递 actual_token_count，splitter 内部使用 _avg_selected 进行崩溃检测
+                    # 这避免了训练循环中的 .item() 调用导致的 CPU 同步
                     aux_losses = splitter.get_auxiliary_losses(
                         features=splitter_features,
                         image_size=(imgs.shape[2], imgs.shape[3]),
                         include_elastic_budget=config.include_elastic_budget,
                         include_soft_entropy=config.include_soft_entropy,
                         batch_size=imgs.shape[0],
-                        # I33: elastic_N_* 参数已移除，使用 ELASTIC_COVERAGE_* 常量
-                        actual_token_count=actual_token_count,
+                        # I142: 移除 actual_token_count 参数，使用内部缓存值
                         entropy_target=config.soft_entropy_target,
                         entropy_weight=config.soft_entropy_weight,
                         entropy_mode=config.soft_entropy_mode,

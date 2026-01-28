@@ -919,15 +919,20 @@ class FractalCurveViT(nn.Module):
         # I135: 辅助函数 - 递归展平嵌套结构，提取所有整数值
         # P-OPT: 避免在 forward 中使用 .cpu()，使用 GPU 计算 max_depth
         # 从 levels_list 推断主要使用的深度
-        if levels_list:
-            # P-OPT: 向量化计算 max_depth，避免 for 循环中的 .item()
-            max_depth = 0
+        # I142: 使用向量化操作替代 for 循环中的 int() 转换，避免 CPU 同步
+        if levels_list and len(levels_list) > 0:
+            # 向量化计算所有 depths 的最大值
+            all_max_depths = []
             for levels in levels_list:
                 if levels.numel() > 0:
-                    # 使用 tensor 比较替代 .item() 同步
-                    level_max = levels[:, 0].max()
-                    max_depth = max(max_depth, int(max_depth if max_depth > level_max else level_max))
-            depth_used = int(max_depth)
+                    # 获取每个样本的最大深度
+                    all_max_depths.append(levels[:, 0].max())
+            if all_max_depths:
+                # 使用 torch.stack 和 max，避免 CPU 同步
+                max_depth_tensor = torch.stack(all_max_depths).max()
+                depth_used = int(max_depth_tensor)  # 只有一次 CPU 同步
+            else:
+                depth_used = 0
         else:
             depth_used = 0
 

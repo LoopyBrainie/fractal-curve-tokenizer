@@ -2210,10 +2210,15 @@ class GumbelTopKSplitter(
             losses['elastic_budget_loss'] = over_loss + under_loss
 
             # 崩溃检测 (相对覆盖率 < 下界的一半，触发强惩罚)
-            collapse_threshold = self._elastic_coverage_min * candidate_count * 0.5
-            if actual_token_count is not None and actual_token_count < collapse_threshold:
-                collapse_loss = torch.tensor(ELASTIC_LAMBDA_COLLAPSE, device=device)
-                losses['collapse_loss'] = collapse_loss
+            # I142: 使用内部缓存的 _avg_selected 值，避免依赖外部传入的 actual_token_count
+            # 这避免了训练循环中的 .item() 调用导致的 CPU 同步
+            avg_selected = getattr(self, '_avg_selected', None)
+            if avg_selected is not None:
+                collapse_threshold = self._elastic_coverage_min * candidate_count * 0.5
+                # 使用 tensor 比较，避免 CPU 同步
+                if avg_selected < collapse_threshold:
+                    collapse_loss = torch.tensor(ELASTIC_LAMBDA_COLLAPSE, device=device)
+                    losses['collapse_loss'] = collapse_loss
         
         # 2. Soft Entropy Loss
         if include_soft_entropy and probs is not None:
