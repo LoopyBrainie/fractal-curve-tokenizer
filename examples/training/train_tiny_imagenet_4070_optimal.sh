@@ -51,7 +51,7 @@ uv run python src/training/train_fractal_vit.py \
   --elastic-lambda-over 0.1 \
   --elastic-lambda-under 0.01 \
   --batch-size 192 \
-  --num-workers 4 \
+  --num-workers 8 \
   --lr 5e-4 \
   --weight-decay 0.1 \
   --warmup-epochs 10 \

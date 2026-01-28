@@ -1889,14 +1889,17 @@ def train_epoch(
                 stats = model(imgs)
                 # 从 TrainingStats 提取信息
                 tokens = stats.transformer_tokens if hasattr(stats, 'transformer_tokens') else None
-                # I139: 修复 - num_tokens 可能为 int 或 List[int]，需转换为 tensor
+                # I141: num_tokens 可能为 int, List[int], 或 torch.Tensor
                 raw_lengths = stats.num_tokens if hasattr(stats, 'num_tokens') else None
                 if raw_lengths is None:
                     token_lengths = None
+                elif isinstance(raw_lengths, torch.Tensor):
+                    # I141: GPU tensor 直接使用，无需 CPU 转换
+                    token_lengths = raw_lengths.to(device=device, non_blocking=True)
                 elif isinstance(raw_lengths, list):
                     token_lengths = torch.tensor(raw_lengths, device=device, dtype=torch.long)
                 else:
-                    token_lengths = raw_lengths  # 已是 tensor 或 int
+                    token_lengths = raw_lengths  # int 类型
                 outs = stats.logits if hasattr(stats, 'logits') else stats
             else:
                 stats = model(imgs)
@@ -1987,11 +1990,14 @@ def train_epoch(
 
                 if hasattr(splitter, 'get_auxiliary_losses'):
                     # I14-1 D1: 从 stats 获取 token 数用于崩溃检测
-                    # I139: 修复 - num_tokens 可能为 int 或 List[int]
+                    # I141: num_tokens 可能为 int, List[int], 或 torch.Tensor
                     actual_token_count = None
                     if stats is not None and hasattr(stats, 'num_tokens'):
                         num_tokens = stats.num_tokens
-                        if isinstance(num_tokens, list):
+                        if isinstance(num_tokens, torch.Tensor):
+                            # I141: GPU tensor，提取第一个值
+                            actual_token_count = int(num_tokens[0].item()) if num_tokens.numel() > 0 else 0
+                        elif isinstance(num_tokens, list):
                             # 列表格式: 取第一个样本的值（用于崩溃检测）
                             actual_token_count = int(num_tokens[0]) if num_tokens else 0
                         else:

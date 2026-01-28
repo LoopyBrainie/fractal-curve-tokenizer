@@ -123,9 +123,12 @@ class TestModelOutputInterface:
         assert output.logits.shape == (batch_size, num_classes)
         assert output.features.shape == (batch_size, dim)
         assert output.transformer_tokens.ndim == 3  # [B, N, dim]
-        # I139: num_tokens 现在是列表类型（每个样本一个值）
-        assert isinstance(output.num_tokens, list) and len(output.num_tokens) == batch_size
-        assert all(n > 0 for n in output.num_tokens) if isinstance(output.num_tokens, list) else output.num_tokens > 0
+        # I141: num_tokens 支持 int, List[int], 或 torch.Tensor
+        assert isinstance(output.num_tokens, (list, torch.Tensor))
+        if isinstance(output.num_tokens, torch.Tensor):
+            assert output.num_tokens.shape == (batch_size,)
+        else:
+            assert len(output.num_tokens) == batch_size
         assert 0 <= output.depth_used <= 50
 
 

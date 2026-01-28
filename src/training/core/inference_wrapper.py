@@ -50,7 +50,8 @@ class InferenceStats:
     保持与 model_fractal_vit.py 中 TrainingStats 的兼容性
     """
     logits: torch.Tensor                    # [B, num_classes]
-    num_tokens: Union[int, List[int]]       # Token 数量
+    # I141: 添加 torch.Tensor 支持，与 TrainingStats 保持一致
+    num_tokens: Union[int, List[int], torch.Tensor]  # Token 数量
     depth_used: int                         # 使用的深度
     depth_distribution: Dict[int, float]    # 深度分布
     features: torch.Tensor                  # [B, dim] 池化特征

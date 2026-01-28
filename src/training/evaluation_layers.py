@@ -530,9 +530,12 @@ class ClassificationEvaluator:
                 total_samples += batch_size
 
                 # I35: 从 TrainingStats 直接获取 tokenizer 诊断信息
-                # I139: num_tokens 现在是每个样本的列表，需要展平
+                # I141: num_tokens 可能为 int, List[int], 或 torch.Tensor
                 if hasattr(stats, 'num_tokens') and stats.num_tokens:
-                    if isinstance(stats.num_tokens, list):
+                    if isinstance(stats.num_tokens, torch.Tensor):
+                        # I141: GPU tensor，展平到列表
+                        all_num_tokens.extend(stats.num_tokens.cpu().tolist())
+                    elif isinstance(stats.num_tokens, list):
                         all_num_tokens.extend(stats.num_tokens)
                     else:
                         all_num_tokens.append(stats.num_tokens)

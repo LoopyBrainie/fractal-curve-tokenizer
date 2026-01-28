@@ -59,7 +59,8 @@ class TrainingStats:
     # === 必需字段 ===
     logits: torch.Tensor              # [B, num_classes]
     # I139: num_tokens 现在支持 int (单样本) 或 List[int] (多样本批次)
-    num_tokens: Union[int, List[int]]                   # Token 数量
+    # I141: 添加 torch.Tensor 支持，避免 forward 中的 .cpu() 调用导致 cudagraphs 失败
+    num_tokens: Union[int, List[int], torch.Tensor]  # Token 数量
     depth_used: int                   # 使用的深度
     depth_distribution: Dict[int, float]  # 深度分布
     features: torch.Tensor            # [B, dim] 池化特征
@@ -894,8 +895,9 @@ class FractalCurveViT(nn.Module):
         final_output = self.mlp_head(pooled)
 
         # 6. 构建 TrainingStats
-        # I139: 修复 - num_tokens 应为每个样本的 token 数量列表，而非批次总和
-        num_tokens_list = lengths.cpu().tolist()
+        # I141: 直接返回 GPU tensor，避免 .cpu() 调用导致 cudagraphs 失败
+        # 训练器负责转换为 Python list
+        num_tokens_tensor = lengths  # GPU tensor
 
         # 构建 split_info 字典
         split_info = {
@@ -932,10 +934,11 @@ class FractalCurveViT(nn.Module):
         # I107-7: 在 training 模式下返回 shared_features供 auxiliary loss 使用
         return_features = features if self.training else None
 
-        # I139: 修复 - num_tokens 使用列表类型，depth_distribution 使用真实分布
+        # I141: num_tokens 直接使用 GPU tensor，训练器负责转换
+        # 保持原始 tensor 格式，避免 .cpu() 调用
         stats = TrainingStats(
             logits=final_output,
-            num_tokens=num_tokens_list[0] if len(num_tokens_list) == 1 else num_tokens_list,  # 兼容: 单样本用标量，多样本用列表
+            num_tokens=num_tokens_tensor,  # GPU tensor，避免 CPU 同步
             depth_used=depth_used,
             depth_distribution=depth_dist,
             features=pooled,

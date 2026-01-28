@@ -182,13 +182,16 @@ class TokenMetricsCollector:
         """从 TrainingStats 计算指标 (I139: 适配新接口)"""
 
         # I139: 支持 TrainingStats 或旧版 aux_infos 字典
+        # I141: num_tokens 可能为 int, List[int], 或 torch.Tensor
         if hasattr(stats, 'num_tokens'):
             # TrainingStats 模式
             num_tokens = stats.num_tokens
-            if isinstance(num_tokens, list):
-                num_tokens = sum(num_tokens)  # 批次总 token 数
             if isinstance(num_tokens, torch.Tensor):
-                num_tokens = num_tokens.item()
+                # I141: GPU tensor 转换为标量
+                num_tokens = num_tokens.sum().item()  # 批次总 token 数
+            elif isinstance(num_tokens, list):
+                # I141: 列表类型，求和
+                num_tokens = sum(num_tokens)  # 批次总 token 数
 
             # 从 split_info 获取 levels_used
             split_info = getattr(stats, 'split_info', {})
