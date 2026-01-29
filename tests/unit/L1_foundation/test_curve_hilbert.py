@@ -147,6 +147,37 @@ class TestAdaptiveMapping:
         mapping = HilbertCurve.adaptive_mapping(64, 16)
         assert sorted(mapping) == [0, 1, 2, 3]
 
+    # I109-5: 边缘情况测试
+    def test_adaptive_mapping_1x1(self):
+        """I109-5: 1x1 退化情况 - 单点网格返回 Hilbert 固有顺序"""
+        # 1x1 网格应返回 Hilbert 曲线在 2x2 网格上的标准遍历顺序
+        mapping = HilbertCurve.adaptive_mapping(1, 1)
+        assert mapping == [0, 2, 3, 1], f"1x1 网格应返回 [0, 2, 3, 1]，实际返回 {mapping}"
+
+    def test_adaptive_mapping_1x2(self):
+        """I109-5: 1x2 边缘情况 - 单列网格"""
+        mapping = HilbertCurve.adaptive_mapping(1, 2)
+        # 单列网格，左上和左下应该在垂直方向相邻
+        # 右上和右下也应该垂直相邻
+        assert sorted(mapping) == [0, 1, 2, 3], f"1x2 映射应包含所有象限，实际返回 {mapping}"
+
+    def test_adaptive_mapping_2x1(self):
+        """I109-5: 2x1 边缘情况 - 单行网格"""
+        mapping = HilbertCurve.adaptive_mapping(2, 1)
+        # 单行网格，左上和右上应该在水平方向相邻
+        # 左下和右下也应该水平相邻
+        assert sorted(mapping) == [0, 1, 2, 3], f"2x1 映射应包含所有象限，实际返回 {mapping}"
+
+    def test_adaptive_mapping_1x3(self):
+        """I109-5: 1x3 边缘情况 - 单列网格 (宽度大于2)"""
+        mapping = HilbertCurve.adaptive_mapping(1, 3)
+        assert sorted(mapping) == [0, 1, 2, 3], f"1x3 映射应包含所有象限，实际返回 {mapping}"
+
+    def test_adaptive_mapping_3x1(self):
+        """I109-5: 3x1 边缘情况 - 单行网格 (高度大于2)"""
+        mapping = HilbertCurve.adaptive_mapping(3, 1)
+        assert sorted(mapping) == [0, 1, 2, 3], f"3x1 映射应包含所有象限，实际返回 {mapping}"
+
 
 class TestHilbertLocality:
     """Hilbert 曲线局部性测试"""
