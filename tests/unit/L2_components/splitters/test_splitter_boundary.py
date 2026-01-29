@@ -44,7 +44,7 @@ class TestMaxDepthBoundary:
             splitter = GumbelTopKSplitter(
                 feature_dim=256,
                 min_patch_size=4,
-                max_depth_limit=1,
+                max_level_limit=1,
                 image_size=(64, 64),
             )
 
@@ -54,7 +54,7 @@ class TestMaxDepthBoundary:
             splitter = GumbelTopKSplitter(
                 feature_dim=256,
                 min_patch_size=4,
-                max_depth_limit=0,
+                max_level_limit=0,
                 image_size=(64, 64),
             )
 
@@ -63,7 +63,7 @@ class TestMaxDepthBoundary:
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=4,
-            max_depth_limit=1,
+            max_level_limit=1,
             image_size=(64, 64),
         )
         features = torch.randn(1, 256, 16, 16)
@@ -78,7 +78,7 @@ class TestMaxDepthBoundary:
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=4,
-            max_depth_limit=1,
+            max_level_limit=1,
             image_size=(64, 64),
         )
         features = torch.randn(4, 256, 16, 16)
@@ -94,7 +94,7 @@ class TestMaxDepthBoundary:
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=4,
-            max_depth_limit=1,
+            max_level_limit=1,
             image_size=(64, 64),
         )
         features = torch.randn(1, 256, 16, 16, requires_grad=True)
@@ -112,7 +112,7 @@ class TestMaxDepthBoundary:
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=4,
-            max_depth_limit=1,
+            max_level_limit=1,
             image_size=(64, 64),
         )
         features = torch.randn(1, 256, 16, 16)
@@ -131,7 +131,7 @@ class TestMaxDepthBoundary:
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=4,
-            max_depth_limit=1,
+            max_level_limit=1,
             image_size=(64, 64),
         )
         features = torch.randn(1, 256, 16, 16)
@@ -150,7 +150,7 @@ class TestMaxDepthBoundary:
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=4,
-            max_depth_limit=1,
+            max_level_limit=1,
             image_size=(64, 64),
         )
 
@@ -169,21 +169,21 @@ class TestSplitterConfigValidation:
 
     def test_config_validate_max_depth_1(self):
         """验证 SplitterConfig.validate() 对 max_depth=1 抛出异常."""
-        config = SplitterConfig(max_depth_limit=1)
+        config = SplitterConfig(max_level_limit=1)
 
-        with pytest.raises(ValueError, match="max_depth_limit.*2"):
+        with pytest.raises(ValueError, match="max_level_limit.*2"):
             config.validate()
 
     def test_config_validate_max_depth_2(self):
         """验证 SplitterConfig.validate() 对 max_depth=2 通过."""
-        config = SplitterConfig(max_depth_limit=2)
+        config = SplitterConfig(max_level_limit=2)
 
         # 不应该抛出异常
         config.validate()
 
     def test_config_validate_max_depth_8(self):
         """验证 SplitterConfig.validate() 对 max_depth=8 通过."""
-        config = SplitterConfig(max_depth_limit=8)
+        config = SplitterConfig(max_level_limit=8)
 
         # 不应该抛出异常
         config.validate()
@@ -197,13 +197,13 @@ class TestMaxDepthBoundaryComparison:
         splitter_1 = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=4,
-            max_depth_limit=1,
+            max_level_limit=1,
             image_size=(64, 64),
         )
         splitter_2 = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=4,
-            max_depth_limit=2,
+            max_level_limit=2,
             image_size=(64, 64),
         )
 
@@ -218,7 +218,7 @@ class TestMaxDepthBoundaryComparison:
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=4,
-            max_depth_limit=1,
+            max_level_limit=1,
             image_size=(64, 64),
         )
 

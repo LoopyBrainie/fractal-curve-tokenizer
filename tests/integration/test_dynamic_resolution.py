@@ -29,7 +29,7 @@ class TestDynamicResolution:
             image_size=None,  # Dynamic resolution
             num_classes=1000,
             dim=256,
-            depth=4,
+            num_layers=4,
             heads=4,
         )
 
@@ -43,7 +43,7 @@ class TestDynamicResolution:
             image_size=None,
             num_classes=100,
             dim=128,
-            depth=2,
+            num_layers=2,
             heads=2,
         )
 
@@ -64,7 +64,7 @@ class TestDynamicResolution:
             image_size=None,
             num_classes=50,
             dim=128,
-            depth=2,
+            num_layers=2,
             heads=2,
         )
 
@@ -81,7 +81,7 @@ class TestDynamicResolution:
             image_size=None,
             num_classes=10,
             dim=64,
-            depth=2,
+            num_layers=2,
             heads=2,
         )
 
@@ -106,7 +106,7 @@ class TestDynamicResolution:
             image_size=None,
             num_classes=10,
             dim=64,
-            depth=2,
+            num_layers=2,
             heads=2,
         )
 
@@ -138,13 +138,13 @@ class TestTokenizerDynamicResolution:
         tokenizer = StreamingFractalTokenizerV3(
             image_size=(64, 64),  # Base size for initialization
             base_patch_size=4,
-            max_depth=8,
+            max_level=8,
         )
 
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=4,
-            max_depth_limit=8,
+            max_level_limit=8,
         )
 
         # Test with different sizes - tokenizer should adapt to input

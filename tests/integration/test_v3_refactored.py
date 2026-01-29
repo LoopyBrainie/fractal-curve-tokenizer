@@ -17,13 +17,13 @@ def _create_pipeline():
         image_size=64,
         d_model=128,
         base_patch_size=4,
-        max_depth=3,
+        max_level=3,
     )
 
     splitter_config = SplitterConfig(
         feature_dim=128,
         min_patch_size=4,
-        max_depth_limit=3,
+        max_level_limit=3,
         hidden_dim=64,
         intermediate_dim=64,
         pool_size=4,

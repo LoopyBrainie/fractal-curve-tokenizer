@@ -58,11 +58,11 @@ def test_next_gen_fractal_vit_forward_pass(device: str) -> None:
         image_size=(height, width),
         num_classes=10,
         dim=192,
-        depth=2,
+        num_layers=2,
         heads=4,
         mlp_dim=384,
         min_patch_size=(4, 4),  # 使用 2 的幂次
-        max_depth=3,
+        max_level=3,
     ).to(device)
     model.eval()
 
@@ -83,11 +83,11 @@ def test_next_gen_fractal_vit_handles_varied_sizes(device: str) -> None:
             image_size=(height, width),
             num_classes=5,
             dim=128,
-            depth=2,
+            num_layers=2,
             heads=2,
             mlp_dim=256,
             min_patch_size=(4, 4),  # 使用 2 的幂次
-            max_depth=3,
+            max_level=3,
         ).to(device)
         model.eval()
 
@@ -109,7 +109,7 @@ def test_streaming_v3_tokenizer_device_consistency(device: str) -> None:
         channels=3,
         d_model=64,
         base_patch_size=4,
-        max_depth=3,
+        max_level=3,
     ).to(device)
 
     # I98-1: 创建独立的 Splitter
@@ -119,7 +119,7 @@ def test_streaming_v3_tokenizer_device_consistency(device: str) -> None:
     splitter_config = SplitterConfig(
         feature_dim=64,
         min_patch_size=4,
-        max_depth_limit=3,
+        max_level_limit=3,
         hidden_dim=32,
         intermediate_dim=32,
         pool_size=4,
@@ -148,7 +148,7 @@ def test_batch_size_independence() -> None:
         image_size=32,
         num_classes=10,
         dim=64,
-        depth=2,
+        num_layers=2,
         heads=2,
         mlp_dim=128,
     )
@@ -175,7 +175,7 @@ def test_deterministic_eval_mode() -> None:
         image_size=32,
         num_classes=10,
         dim=64,
-        depth=2,
+        num_layers=2,
         heads=2,
         mlp_dim=128,
     )
@@ -218,11 +218,11 @@ def test_batch_consistency(vectorization_audit_enabled) -> None:
         image_size=image_size,
         num_classes=num_classes,
         dim=128,
-        depth=2,
+        num_layers=2,
         heads=4,
         mlp_dim=256,
         min_patch_size=(4, 4),
-        max_depth=3,
+        max_level=3,
     )
     model.eval()
 

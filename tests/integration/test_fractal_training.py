@@ -413,7 +413,7 @@ class TestBudgetLoss:
             budget_tokens=50.0,
             alpha=0.5,
             lambda_weight=0.01,
-            max_depth=4,
+            max_level=4,
         )
         
         # 浅层 tokens (应该权重低)

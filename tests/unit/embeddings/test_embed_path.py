@@ -34,7 +34,7 @@ class TestFractalConfig:
 
         assert config.image_size == 64
         assert config.min_patch_size == 4
-        assert config.max_depth == 4  # log2(64/4) = 4
+        assert config.max_level == 4  # log2(64/4) = 4
         assert config.num_scales == 5  # 0, 1, 2, 3, 4
         assert config.patch_sizes == (4, 8, 16, 32, 64)
         assert config.grid_size == 16  # 64/4
@@ -46,7 +46,7 @@ class TestFractalConfig:
 
         assert config.image_size == 256
         assert config.min_patch_size == 16
-        assert config.max_depth == 4  # log2(256/16) = 4
+        assert config.max_level == 4  # log2(256/16) = 4
         assert config.num_scales == 5
         assert config.patch_sizes == (16, 32, 64, 128, 256)
         assert config.grid_size == 16
@@ -56,7 +56,7 @@ class TestFractalConfig:
         """测试 32×32 图像 (CIFAR) 的配置."""
         config = FractalConfig(32, 4)
 
-        assert config.max_depth == 3  # log2(32/4) = 3
+        assert config.max_level == 3  # log2(32/4) = 3
         assert config.num_scales == 4
         assert config.patch_sizes == (4, 8, 16, 32)
         assert config.grid_size == 8
@@ -113,7 +113,7 @@ class TestFractalConfig:
         """测试便捷函数."""
         config = create_fractal_config(64, 4)
         assert isinstance(config, FractalConfig)
-        assert config.max_depth == 4
+        assert config.max_level == 4
 
     def test_config_repr(self) -> None:
         """测试配置的字符串表示."""
@@ -128,11 +128,11 @@ class TestVectorizedPathEncoder:
 
     def test_compute_quadrant_paths_basic(self) -> None:
         """测试基本的四叉树路径计算."""
-        # 2×2 网格，max_depth=1
+        # 2×2 网格，max_level=1
         x = torch.tensor([0, 1, 0, 1])
         y = torch.tensor([0, 0, 1, 1])
 
-        paths = VectorizedPathEncoder.compute_quadrant_paths(x, y, max_depth=1)
+        paths = VectorizedPathEncoder.compute_quadrant_paths(x, y, max_level=1)
 
         # 象限: (0,0)→0, (1,0)→1, (0,1)→2, (1,1)→3
         expected = torch.tensor([[0], [1], [2], [3]])
@@ -140,12 +140,12 @@ class TestVectorizedPathEncoder:
 
     def test_compute_quadrant_paths_deeper(self) -> None:
         """测试更深的四叉树路径."""
-        # 4×4 网格，max_depth=2
+        # 4×4 网格，max_level=2
         # (0,0): path=[0,0], (3,3): path=[3,3]
         x = torch.tensor([0, 3])
         y = torch.tensor([0, 3])
 
-        paths = VectorizedPathEncoder.compute_quadrant_paths(x, y, max_depth=2)
+        paths = VectorizedPathEncoder.compute_quadrant_paths(x, y, max_level=2)
 
         assert paths.shape == (2, 2)
         assert paths[0].tolist() == [0, 0]  # 左上→左上
@@ -181,7 +181,7 @@ class TestFractalPathEmbedding:
         """测试初始化."""
         emb = FractalPathEmbedding(dim=64, config=config)
 
-        assert emb.max_depth == 3
+        assert emb.max_level == 3
         assert emb.scale_embedding.num_embeddings == 4
         assert emb.quadrant_embedding.num_embeddings == 4 * 3  # 4 象限 × 3 层
 
@@ -222,8 +222,8 @@ class TestHierarchicalAttentionBias:
         """测试初始化."""
         bias_module = HierarchicalAttentionBias(config=config, heads=4)
 
-        assert bias_module.max_depth == 3
-        assert bias_module.ancestor_bias.num_embeddings == 5  # max_depth + 2
+        assert bias_module.max_level == 3
+        assert bias_module.ancestor_bias.num_embeddings == 5  # max_level + 2
 
     def test_forward_shape(self, config: FractalConfig) -> None:
         """测试前向传播输出形状."""
@@ -248,7 +248,7 @@ class TestHierarchicalAttentionBias:
 
         bias = bias_module(seq_len=64, batch_size=1)
 
-        # 对角线元素 (共同祖先深度 = max_depth) 应该有一致的值
+        # 对角线元素 (共同祖先深度 = max_level) 应该有一致的值
         diag = torch.diagonal(bias[0, 0])
         assert torch.allclose(diag, diag[0].expand_as(diag))
 

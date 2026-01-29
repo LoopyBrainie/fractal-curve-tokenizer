@@ -634,7 +634,7 @@ def create_model(config: ExperimentConfig) -> nn.Module:
             image_size=config.image_size,
             num_classes=config.num_classes,
             dim=config.dim,
-            depth=config.depth,
+            num_layers=config.num_layers,
             heads=config.heads,
             mlp_dim=int(config.dim * config.mlp_ratio),
             # 正则化 (I30-3 最佳实践)

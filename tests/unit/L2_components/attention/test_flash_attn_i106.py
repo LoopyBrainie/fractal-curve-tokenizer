@@ -29,7 +29,7 @@ class TestFlashAttention2Integration:
             dim=64,
             heads=8,
             dim_head=8,  # 64 // 8
-            max_depth=3,
+            max_level=3,
             use_hilbert_bias=True,
             use_level_scaling=True,
             use_affine_modulation=False,  # 简化测试
@@ -44,7 +44,7 @@ class TestFlashAttention2Integration:
         depths = torch.randint(0, 4, (batch, seq_len))
         paths = torch.randint(0, 4, (batch, seq_len, 3))  # 3 层路径
         data = torch.cat([depths.unsqueeze(-1), paths], dim=-1)
-        levels_info = LevelsInfo(data=data, max_depth=3)
+        levels_info = LevelsInfo(data=data, max_level=3)
         return x, levels_info
 
     def test_flash_attn_availability(self):
@@ -121,7 +121,7 @@ class TestFlashAttention2Integration:
             dim=64,
             heads=8,
             dim_head=8,
-            max_depth=3,
+            max_level=3,
             use_hilbert_bias=False,
             use_level_scaling=False,
             use_affine_modulation=False,
@@ -169,7 +169,7 @@ class TestFlashAttention2BiasFusion:
         attn = HilbertAwareMultiScaleAttention(
             dim=64,
             heads=8,
-            max_depth=3,
+            max_level=3,
         )
 
         B, H, N = 2, 8, 16

@@ -12,7 +12,7 @@ class DummyTokenizer(BaseTokenizer):
         super().__init__()
         self.token_dim = token_dim
         self.tokens_per_image = tokens_per_image
-        self.max_depth = 3  # 添加 max_depth 属性
+        self.max_level = 3  # I145: 添加 max_level 属性
         self.called = False
 
     def tokenize(self, images: torch.Tensor) -> TokenizerOutput:
@@ -84,11 +84,11 @@ def test_vit_uses_custom_components() -> None:
         image_size=32,
         num_classes=4,
         dim=dim,
-        depth=1,
+        num_layers=1,
         heads=2,
         mlp_dim=32,
         min_patch_size=(4, 4),
-        max_depth=3,
+        max_level=3,
         tokenizer=tokenizer,
         position_embedding=positional,
     )
@@ -109,11 +109,11 @@ def test_next_gen_vit_single_training_step_updates_parameters() -> None:
         image_size=32,
         num_classes=5,
         dim=64,
-        depth=2,
+        num_layers=2,
         heads=4,
         mlp_dim=128,
         min_patch_size=(4, 4),
-        max_depth=2,
+        max_level=2,
     )
 
     model.train()

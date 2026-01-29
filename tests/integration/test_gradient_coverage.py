@@ -183,7 +183,7 @@ class TestI96_6SchemeDvsE:
         config = SplitterConfig(
             feature_dim=256,
             min_patch_size=4,
-            max_depth_limit=4,
+            max_level_limit=4,
             enable_learnable_quota=False,  # Scheme D: fixed quota
         )
         return GumbelTopKSplitter(
@@ -197,7 +197,7 @@ class TestI96_6SchemeDvsE:
         config = SplitterConfig(
             feature_dim=256,
             min_patch_size=4,
-            max_depth_limit=4,
+            max_level_limit=4,
             enable_learnable_quota=True,  # Scheme E: learnable quota
         )
         return GumbelTopKSplitter(

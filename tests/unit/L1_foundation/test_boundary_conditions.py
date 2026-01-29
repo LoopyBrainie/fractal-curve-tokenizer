@@ -215,14 +215,14 @@ class TestLevelsInfoBoundary:
         # B=0 的情况
         empty = torch.tensor([]).reshape(0, 5, 3)  # B=0, N=5, D+1=3
         # LevelsInfo 应该能处理空 batch（不抛出异常）
-        info = LevelsInfo(data=empty, max_depth=2)
+        info = LevelsInfo(data=empty, max_level=2)
         assert info.batch_size == 0
         assert info.num_tokens == 5
 
     def test_single_token(self):
         """单 token 测试"""
         data = torch.zeros(1, 1, 4, dtype=torch.long)  # B=1, N=1, D+1=3
-        info = LevelsInfo(data=data, max_depth=3)
+        info = LevelsInfo(data=data, max_level=3)
         assert info.num_tokens == 1
         assert info.batch_size == 1
 
@@ -232,37 +232,37 @@ class TestLevelsInfoBoundary:
             [[0, 1, 2, 3]],  # 深度 0，有效
             [[-1, 0, 0, 0]],  # 深度 -1，填充
         ], dtype=torch.long)
-        info = LevelsInfo(data=data, max_depth=3)
+        info = LevelsInfo(data=data, max_level=3)
         depths = info.depths
         assert depths[0, 0] == 0
         assert depths[1, 0] == -1
 
-    def test_max_depth_zero(self):
-        """max_depth=0 测试"""
+    def test_max_level_zero(self):
+        """max_level=0 测试"""
         data = torch.zeros(2, 4, 1, dtype=torch.long)  # D+1=1
-        info = LevelsInfo(data=data, max_depth=0)
-        assert info.max_depth == 0
+        info = LevelsInfo(data=data, max_level=0)
+        assert info.max_level == 0
 
-    def test_large_max_depth(self):
-        """大 max_depth 测试"""
+    def test_large_max_level(self):
+        """大 max_level 测试"""
         data = torch.zeros(1, 8, 9, dtype=torch.long)  # D+1=9
-        info = LevelsInfo(data=data, max_depth=8)
-        assert info.max_depth == 8
+        info = LevelsInfo(data=data, max_level=8)
+        assert info.max_level == 8
 
     def test_device_consistency(self):
         """设备一致性测试"""
         data = torch.zeros(2, 4, 3, dtype=torch.long)
-        info = LevelsInfo(data=data, max_depth=2)
+        info = LevelsInfo(data=data, max_level=2)
 
         info_cpu = info.cpu()
         assert info_cpu.data.device.type == "cpu"
 
     def test_random_levels_info(self):
         """随机 LevelsInfo 测试"""
-        info = LevelsInfo.random(B=2, N=16, max_depth=4)
+        info = LevelsInfo.random(B=2, N=16, max_level=4)
         assert info.batch_size == 2
         assert info.num_tokens == 16
-        assert info.max_depth == 4
+        assert info.max_level == 4
 
 
 class TestHilbertIndexBoundary:
@@ -270,20 +270,20 @@ class TestHilbertIndexBoundary:
 
     def test_depth_zero(self):
         """深度为 0"""
-        info = LevelsInfo.random(B=1, N=1, max_depth=4)
+        info = LevelsInfo.random(B=1, N=1, max_level=4)
         indices = info.get_hilbert_indices()
         # 深度为 0 时应该返回 0
         assert indices.shape == (1, 1)
 
     def test_all_depths(self):
         """所有深度"""
-        info = LevelsInfo.random(B=2, N=16, max_depth=4)
+        info = LevelsInfo.random(B=2, N=16, max_level=4)
         indices = info.get_hilbert_indices()
         assert indices.shape == (2, 16)
 
     def test_lca_matrix(self):
         """LCA 矩阵测试"""
-        info = LevelsInfo.random(B=2, N=8, max_depth=4)
+        info = LevelsInfo.random(B=2, N=8, max_level=4)
         lca = info.get_lca_matrix()
         assert lca.shape == (2, 8, 8)
         # 对角线应该为 0（与自己的 LCA 深度为 0）

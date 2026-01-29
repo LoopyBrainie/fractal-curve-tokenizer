@@ -28,7 +28,7 @@ class TestFractalConfigBasic:
 
         assert config.image_size == 64
         assert config.min_patch_size == 4
-        assert config.max_depth == 4  # log2(64/4) = 4
+        assert config.max_level == 4  # log2(64/4) = 4
         assert config.num_scales == 5
         assert config.patch_sizes == (4, 8, 16, 32, 64)
         assert config.grid_size == 16

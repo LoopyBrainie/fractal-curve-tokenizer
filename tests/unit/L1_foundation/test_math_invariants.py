@@ -40,61 +40,61 @@ class TestLevelsInfoInvariants:
 
     @pytest.mark.数学
     def test_c1_depth_range_valid(self):
-        """C1: depth ∈ [-1, max_depth] - valid range.
+        """C1: depth ∈ [-1, max_level] - valid range.
 
         数学形式化:
-            depth ∈ {-1} ∪ [0, max_depth]
+            depth ∈ {-1} ∪ [0, max_level]
             -1 表示 padding sentinel (无有效数据)
 
         测试用例:
             -1: padding sentinel
-            0-4: valid depths for max_depth=4
+            0-4: valid depths for max_level=4
         """
-        max_depth = 4
+        max_level = 4
         B, N = 2, 8
 
         # Valid depths: -1 (padding), 0, 1, 2, 3, 4
         for depth in [-1, 0, 1, 2, 3, 4]:
-            data = torch.zeros(B, N, max_depth + 1, dtype=torch.long)
+            data = torch.zeros(B, N, max_level + 1, dtype=torch.long)
             data[:, :, 0] = depth  # Set all depths to test value
 
             # Valid depth should not raise
-            info = LevelsInfo(data=data, max_depth=max_depth)
-            assert info.max_depth == max_depth
+            info = LevelsInfo(data=data, max_level=max_level)
+            assert info.max_level == max_level
 
     @pytest.mark.数学
     def test_c1_depth_range_invalid_low(self):
-        """C1: depth ∈ [-1, max_depth] - invalid depth < -1.
+        """C1: depth ∈ [-1, max_level] - invalid depth < -1.
 
         数学形式化:
             depth < -1 违反 C1 约束
             应抛出异常
         """
-        max_depth = 4
+        max_level = 4
         B, N = 2, 8
 
-        data = torch.zeros(B, N, max_depth + 1, dtype=torch.long)
+        data = torch.zeros(B, N, max_level + 1, dtype=torch.long)
         data[:, :, 0] = -2  # Invalid: less than -1
 
         with pytest.raises(AssertionError):
-            LevelsInfo(data=data, max_depth=max_depth)
+            LevelsInfo(data=data, max_level=max_level)
 
     @pytest.mark.数学
     def test_c1_depth_range_invalid_high(self):
-        """C1: depth ∈ [-1, max_depth] - invalid depth > max_depth.
+        """C1: depth ∈ [-1, max_level] - invalid depth > max_level.
 
         数学形式化:
-            depth > max_depth 违反 C1 约束
+            depth > max_level 违反 C1 约束
             应抛出异常
         """
-        max_depth = 4
+        max_level = 4
         B, N = 2, 8
 
-        data = torch.zeros(B, N, max_depth + 1, dtype=torch.long)
-        data[:, :, 0] = 5  # Invalid: greater than max_depth
+        data = torch.zeros(B, N, max_level + 1, dtype=torch.long)
+        data[:, :, 0] = 5  # Invalid: greater than max_level
 
         with pytest.raises(AssertionError):
-            LevelsInfo(data=data, max_depth=max_depth)
+            LevelsInfo(data=data, max_level=max_level)
 
     @pytest.mark.数学
     def test_c2_path_quadrant_encoding(self):
@@ -107,17 +107,17 @@ class TestLevelsInfoInvariants:
 
         四象限编码是 Hilbert 曲线的基础
         """
-        max_depth = 4
+        max_level = 4
         B, N = 2, 4
 
         # Test valid quadrant values: 0, 1, 2, 3
         for path_value in range(4):
-            data = torch.zeros(B, N, max_depth + 1, dtype=torch.long)
+            data = torch.zeros(B, N, max_level + 1, dtype=torch.long)
             data[:, :, 0] = 1  # depth = 1
             data[:, :, 1] = path_value  # Valid path value
 
             # Valid path should not raise
-            info = LevelsInfo(data=data, max_depth=max_depth)
+            info = LevelsInfo(data=data, max_level=max_level)
             hilbert_idx = info.get_hilbert_indices()
             assert hilbert_idx.shape == (B, N)
 
@@ -129,17 +129,17 @@ class TestLevelsInfoInvariants:
             path < 0 或 path > 3 违反 C2 约束
             应抛出异常
         """
-        max_depth = 4
+        max_level = 4
         B, N = 2, 8
 
         # Test invalid path values
         for invalid_path in [-1, 4, 5]:
-            data = torch.zeros(B, N, max_depth + 1, dtype=torch.long)
+            data = torch.zeros(B, N, max_level + 1, dtype=torch.long)
             data[:, :, 0] = 1  # depth = 1
             data[:, :, 1] = invalid_path  # Invalid path value
 
             with pytest.raises(AssertionError):
-                LevelsInfo(data=data, max_depth=max_depth)
+                LevelsInfo(data=data, max_level=max_level)
 
     @pytest.mark.数学
     def test_c3_path_depth_consistency(self):
@@ -152,11 +152,11 @@ class TestLevelsInfoInvariants:
         C3 由数据结构保证 (data[:, :, 1:1+depth])
         此测试验证路径计算正确性
         """
-        max_depth = 4
+        max_level = 4
         B, N = 2, 4
 
-        for d in range(max_depth + 1):
-            data = torch.zeros(B, N, max_depth + 1, dtype=torch.long)
+        for d in range(max_level + 1):
+            data = torch.zeros(B, N, max_level + 1, dtype=torch.long)
             data[:, :, 0] = d  # Set depth to d
 
             # Fill paths with d valid digits
@@ -164,7 +164,7 @@ class TestLevelsInfoInvariants:
                 for i in range(d):
                     data[:, :, 1 + i] = i % 4  # Valid quadrant values
 
-            info = LevelsInfo(data=data, max_depth=max_depth)
+            info = LevelsInfo(data=data, max_level=max_level)
 
             # Verify paths are correctly extracted
             paths = info.paths
@@ -177,16 +177,16 @@ class TestLevelsInfoInvariants:
         数学形式化:
             random() 方法应生成满足 C1-C3 的随机 LevelsInfo
         """
-        max_depth = 4
-        info = LevelsInfo.random(B=4, N=16, max_depth=max_depth)
+        max_level = 4
+        info = LevelsInfo.random(B=4, N=16, max_level=max_level)
 
-        assert info.max_depth == max_depth
+        assert info.max_level == max_level
         assert info.batch_size == 4
         assert info.num_tokens == 16
 
         depths = info.depths
         assert (depths >= -1).all()
-        assert (depths <= max_depth).all()
+        assert (depths <= max_level).all()
 
 
 class TestHilbertCurveProperties:
@@ -321,10 +321,10 @@ class TestQuadtreeProperties:
             深度 d 的区域大小为: n/2^d × n/2^d
             深度 d+1 的子区域是父区域的 1/4
         """
-        max_depth = 4
+        max_level = 4
         n = 64  # Image size
 
-        for depth in range(max_depth):
+        for depth in range(max_level):
             # Region size at depth
             region_size = n / (2 ** depth)
 
@@ -341,20 +341,20 @@ class TestQuadtreeProperties:
 
         数学形式化:
             深度 d 有 4^d 个候选区域
-            总区域数 = Σ_{d=0}^{max_depth} 4^d = (4^{max_depth+1} - 1) / 3
+            总区域数 = Σ_{d=0}^{max_level} 4^d = (4^{max_level+1} - 1) / 3
         """
-        for max_depth in [1, 2, 3, 4]:
+        for max_level in [1, 2, 3, 4]:
             # Expected total regions
-            expected_total = (4 ** (max_depth + 1) - 1) // 3
+            expected_total = (4 ** (max_level + 1) - 1) // 3
 
             # Count regions per depth
             total = 0
-            for d in range(max_depth + 1):
+            for d in range(max_level + 1):
                 regions_at_d = 4 ** d
                 total += regions_at_d
 
             assert total == expected_total, \
-                f"max_depth={max_depth}: expected {expected_total}, got {total}"
+                f"max_level={max_level}: expected {expected_total}, got {total}"
 
 
 class TestTensorShapeConsistency:
@@ -366,18 +366,18 @@ class TestTensorShapeConsistency:
 
         数学形式化:
             data.shape = (B, N, D+1)
-            其中 D = max_depth
+            其中 D = max_level
         """
         B, N, D = 4, 16, 4
 
         # Create valid data
         data = torch.zeros(B, N, D + 1, dtype=torch.long)
-        info = LevelsInfo(data=data, max_depth=D)
+        info = LevelsInfo(data=data, max_level=D)
 
         assert info.shape == (B, N, D + 1)
         assert info.batch_size == B
         assert info.num_tokens == N
-        assert info.max_depth == D
+        assert info.max_level == D
 
     @pytest.mark.数学
     def test_depths_extraction(self):
@@ -399,7 +399,7 @@ class TestTensorShapeConsistency:
                 for i in range(d):
                     data[b, n, 1 + i] = i % 4
 
-        info = LevelsInfo(data=data, max_depth=D)
+        info = LevelsInfo(data=data, max_level=D)
 
         depths = info.depths
         assert depths.shape == (B, N)
@@ -424,7 +424,7 @@ class TestTensorShapeConsistency:
                 for i in range(d):
                     data[b, n, 1 + i] = i % 4
 
-        info = LevelsInfo(data=data, max_depth=D)
+        info = LevelsInfo(data=data, max_level=D)
 
         paths = info.paths
         assert paths.shape == (B, N, D)

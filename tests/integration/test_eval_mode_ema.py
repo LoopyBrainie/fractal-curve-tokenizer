@@ -30,7 +30,7 @@ class TestEvalModeEMAInitialization:
             image_size=224,
             num_classes=1000,
             dim=256,
-            depth=4,
+            num_layers=4,
             heads=4,
             mlp_dim=512,
         )
@@ -49,7 +49,7 @@ class TestEvalModeEMAInitialization:
             image_size=224,
             num_classes=1000,
             dim=256,
-            depth=4,
+            num_layers=4,
             heads=4,
             mlp_dim=512,
         )
@@ -71,7 +71,7 @@ class TestEvalModeEMAInitialization:
             image_size=224,
             num_classes=1000,
             dim=256,
-            depth=4,
+            num_layers=4,
             heads=4,
             mlp_dim=512,
         )
@@ -90,7 +90,7 @@ class TestEvalModeEMAInitialization:
             image_size=224,
             num_classes=1000,
             dim=256,
-            depth=4,
+            num_layers=4,
             heads=4,
             mlp_dim=512,
         )
@@ -110,7 +110,7 @@ class TestEvalModeEMAInitialization:
             image_size=224,
             num_classes=1000,
             dim=256,
-            depth=4,
+            num_layers=4,
             heads=4,
             mlp_dim=512,
         )
@@ -136,7 +136,7 @@ class TestBatchStability:
             image_size=224,
             num_classes=1000,
             dim=256,
-            depth=4,
+            num_layers=4,
             heads=4,
             mlp_dim=512,
         )
@@ -155,7 +155,7 @@ class TestBatchStability:
             image_size=224,
             num_classes=1000,
             dim=256,
-            depth=4,
+            num_layers=4,
             heads=4,
             mlp_dim=512,
         )
@@ -185,7 +185,7 @@ class TestDynamicResolution:
             image_size=None,  # 动态分辨率
             num_classes=1000,
             dim=256,
-            depth=4,
+            num_layers=4,
             heads=4,
             mlp_dim=512,
         )

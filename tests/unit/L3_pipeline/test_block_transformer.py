@@ -202,8 +202,8 @@ class TestFractalTransformerBlock:
         """max_depth 参数"""
         x = torch.randn(2, 16, 64)
 
-        block_small = FractalTransformerBlock(dim=64, heads=4, dim_head=16, mlp_dim=256, max_depth=4)
-        block_large = FractalTransformerBlock(dim=64, heads=4, dim_head=16, mlp_dim=256, max_depth=8)
+        block_small = FractalTransformerBlock(dim=64, heads=4, dim_head=16, mlp_dim=256, max_level=4)
+        block_large = FractalTransformerBlock(dim=64, heads=4, dim_head=16, mlp_dim=256, max_level=8)
 
         out_small = block_small(x)
         out_large = block_large(x)
@@ -399,7 +399,7 @@ class TestBlockTransformerIntegration:
         batch, seq_len, dim = 2, 16, 64
         max_depth = 4
 
-        block = FractalTransformerBlock(dim=dim, heads=4, dim_head=16, mlp_dim=256, max_depth=max_depth)
+        block = FractalTransformerBlock(dim=dim, heads=4, dim_head=16, mlp_dim=256, max_level=max_depth)
         x = torch.randn(batch, seq_len, dim)
 
         # 不同深度的 LevelsInfo

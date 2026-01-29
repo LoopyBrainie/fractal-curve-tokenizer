@@ -37,7 +37,7 @@ class TestLevelsInfoContract:
         """C1: depth ∈ [-1, D] (有效情况)."""
         depths = torch.tensor([[0, 1, 2, -1]], dtype=torch.long)
         paths = torch.zeros(1, 4, 3, dtype=torch.long)
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=3)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=3)
         assert levels.depths.equal(depths)
 
     def test_c1_depth_violation_negative(self):
@@ -45,20 +45,20 @@ class TestLevelsInfoContract:
         depths = torch.tensor([[-2]], dtype=torch.long)
         paths = torch.zeros(1, 1, 3, dtype=torch.long)
         with pytest.raises(AssertionError):
-            LevelsInfo.from_arrays(depths, paths, max_depth=3)
+            LevelsInfo.from_arrays(depths, paths, max_level=3)
 
     def test_c1_depth_violation_exceeds_max(self):
-        """C1 违反: depth > max_depth."""
+        """C1 违反: depth > max_level."""
         depths = torch.tensor([[5]], dtype=torch.long)
         paths = torch.zeros(1, 1, 3, dtype=torch.long)
         with pytest.raises(AssertionError):
-            LevelsInfo.from_arrays(depths, paths, max_depth=3)
+            LevelsInfo.from_arrays(depths, paths, max_level=3)
 
     def test_c2_path_range_valid(self):
         """C2: path ∈ [0, 3] (有效情况)."""
         depths = torch.tensor([[0, 1, 2]], dtype=torch.long)
         paths = torch.tensor([[[0, 0, 0], [1, 2, 0], [3, 1, 0]]], dtype=torch.long)
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=3)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=3)
         assert (levels.paths >= 0).all() and (levels.paths <= 3).all()
 
     def test_c2_path_violation(self):
@@ -66,27 +66,27 @@ class TestLevelsInfoContract:
         depths = torch.tensor([[1]], dtype=torch.long)
         paths = torch.tensor([[[5, 0, 0]]], dtype=torch.long)
         with pytest.raises(AssertionError):
-            LevelsInfo.from_arrays(depths, paths, max_depth=3)
+            LevelsInfo.from_arrays(depths, paths, max_level=3)
 
     def test_c2_path_negative_violation(self):
         """C2 违反: path < 0."""
         depths = torch.tensor([[1]], dtype=torch.long)
         paths = torch.tensor([[[-1, 0, 0]]], dtype=torch.long)
         with pytest.raises(AssertionError):
-            LevelsInfo.from_arrays(depths, paths, max_depth=3)
+            LevelsInfo.from_arrays(depths, paths, max_level=3)
 
     def test_padding_sentinel_allowed(self):
         """Padding sentinel (-1) 应该被允许."""
         depths = torch.tensor([[-1, 0, 1]], dtype=torch.long)
         paths = torch.zeros(1, 3, 3, dtype=torch.long)
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=3)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=3)
         assert (levels.depths == -1).any()
 
     def test_c3_path_length_consistency(self):
         """C3: 路径长度应与深度一致."""
         depths = torch.tensor([[2, 1, 0]], dtype=torch.long)
         paths = torch.tensor([[[0, 1, 2], [3, 0, 0], [0, 0, 0]]], dtype=torch.long)
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=3)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=3)
         assert levels.paths.shape == (1, 3, 3)
 
 
@@ -97,10 +97,10 @@ class TestLevelsInfoFactoryMethods:
         """基础 from_arrays 测试."""
         depths = torch.tensor([[1, 2, 3]], dtype=torch.long)
         paths = torch.zeros(1, 3, 4, dtype=torch.long)
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=4)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=4)
 
         assert levels.data.shape == (1, 3, 5)
-        assert levels.max_depth == 4
+        assert levels.max_level == 4
         assert levels.batch_size == 1
         assert levels.num_tokens == 3
         assert levels.paths.shape == (1, 3, 4)
@@ -109,7 +109,7 @@ class TestLevelsInfoFactoryMethods:
         """Batch 处理测试."""
         depths = torch.tensor([[1, 2], [3, 0]], dtype=torch.long)
         paths = torch.zeros(2, 2, 4, dtype=torch.long)
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=4)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=4)
 
         assert levels.batch_size == 2
         assert levels.num_tokens == 2
@@ -128,19 +128,19 @@ class TestLevelsInfoFactoryMethods:
 
         # P-OPT-11: 使用延迟构建 API
         output = TokenizerOutput(_padded_tokens_cache=tokens, _padded_levels_cache=levels)
-        levels_info = output.get_levels_info(max_depth=4)
+        levels_info = output.get_levels_info(max_level=4)
 
         assert isinstance(levels_info, LevelsInfo)
         assert levels_info.batch_size == 2
-        assert levels_info.max_depth == 4
+        assert levels_info.max_level == 4
 
     def test_random_levels_info(self):
         """随机 LevelsInfo 生成."""
-        levels = LevelsInfo.random(B=4, N=16, max_depth=6, device='cpu')
+        levels = LevelsInfo.random(B=4, N=16, max_level=6, device='cpu')
 
         assert levels.batch_size == 4
         assert levels.num_tokens == 16
-        assert levels.max_depth == 6
+        assert levels.max_level == 6
         assert levels.depths.shape == (4, 16)
         assert levels.paths.shape == (4, 16, 6)
 
@@ -152,7 +152,7 @@ class TestLevelsInfoProperties:
         """depths 属性测试."""
         depths = torch.tensor([[1, 2, 3]], dtype=torch.long)
         paths = torch.zeros(1, 3, 4, dtype=torch.long)
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=4)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=4)
 
         assert levels.depths.equal(depths)
         assert levels.depths.shape == (1, 3)
@@ -161,7 +161,7 @@ class TestLevelsInfoProperties:
         """paths 属性测试."""
         depths = torch.tensor([[1, 2]], dtype=torch.long)
         paths = torch.randint(0, 4, (1, 2, 5), dtype=torch.long)
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=5)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=5)
 
         assert levels.paths.shape == (1, 2, 5)
 
@@ -169,23 +169,23 @@ class TestLevelsInfoProperties:
         """shape 属性测试."""
         depths = torch.tensor([[1, 2]], dtype=torch.long)
         paths = torch.zeros(1, 2, 4, dtype=torch.long)
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=4)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=4)
 
         assert levels.shape == (1, 2, 5)
 
-    def test_max_depth_property(self):
-        """max_depth 属性测试."""
+    def test_max_level_property(self):
+        """max_level 属性测试."""
         depths = torch.zeros(1, 4, dtype=torch.long)
         paths = torch.zeros(1, 4, 6, dtype=torch.long)
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=6)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=6)
 
-        assert levels.max_depth == 6
+        assert levels.max_level == 6
 
     def test_len_and_num_tokens(self):
         """len() 和 num_tokens 测试."""
         depths = torch.zeros(3, 8, dtype=torch.long)
         paths = torch.zeros(3, 8, 5, dtype=torch.long)
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=5)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=5)
 
         assert len(levels) == 8
         assert levels.num_tokens == 8
@@ -198,7 +198,7 @@ class TestLevelsInfoDeviceMigration:
         """迁移到 CPU."""
         depths = torch.tensor([[1, 2]], dtype=torch.long)
         paths = torch.zeros(1, 2, 4, dtype=torch.long)
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=4)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=4)
 
         levels_cpu = levels.cpu()
         assert levels_cpu.data.device.type == 'cpu'
@@ -207,7 +207,7 @@ class TestLevelsInfoDeviceMigration:
         """迁移到指定设备."""
         depths = torch.tensor([[1, 2]], dtype=torch.long)
         paths = torch.zeros(1, 2, 4, dtype=torch.long)
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=4)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=4)
 
         levels_gpu = levels.to(torch.device('cpu'))
         assert levels_gpu.data.device.type == 'cpu'
@@ -223,7 +223,7 @@ class TestLevelsInfoHilbertTools:
         paths[0, 0, 0] = 1
         paths[0, 1, :2] = torch.tensor([1, 2])
 
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=4)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=4)
         hilbert_indices = levels.get_hilbert_indices()
 
         assert hilbert_indices.shape == (1, 2)
@@ -237,7 +237,7 @@ class TestLevelsInfoHilbertTools:
         paths[0, 1, 0] = 1
         paths[0, 2, :2] = torch.tensor([1, 2])
 
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=4)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=4)
         lca_matrix = levels.get_lca_matrix()
 
         assert lca_matrix.shape == (1, 3, 3)
@@ -254,17 +254,17 @@ class TestLevelsInfoEdgeCases:
         paths = torch.zeros(1, 1, 4, dtype=torch.long)
         paths[0, 0, :2] = torch.tensor([0, 1])
 
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=4)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=4)
         assert levels.num_tokens == 1
         assert levels.depths[0, 0] == 2
 
-    def test_max_depth(self):
+    def test_max_level(self):
         """最大深度情况."""
         depths = torch.tensor([[8]], dtype=torch.long)
         paths = torch.randint(0, 4, (1, 1, 8), dtype=torch.long)
 
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=8)
-        assert levels.max_depth == 8
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=8)
+        assert levels.max_level == 8
         assert levels.paths.shape == (1, 1, 8)
 
     def test_empty_paths_padding(self):
@@ -272,7 +272,7 @@ class TestLevelsInfoEdgeCases:
         depths = torch.tensor([[0, 8]], dtype=torch.long)
         paths = torch.zeros(1, 2, 8, dtype=torch.long)
 
-        levels = LevelsInfo.from_arrays(depths, paths, max_depth=8)
+        levels = LevelsInfo.from_arrays(depths, paths, max_level=8)
         assert levels.paths[0, 0].sum() == 0
 
 

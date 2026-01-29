@@ -222,8 +222,96 @@ def load_model(
 
         if missing and verbose:
             print(f"  [WARN] Missing keys: {len(missing)}")
+            # I145: 详细诊断 - 显示关键 missing keys 示例
+            if len(missing) > 0:
+                missing_examples = list(missing)[:10]
+                print(f"  [WARN] Missing key examples: {missing_examples}")
         if unexpected and verbose:
             print(f"  [WARN] Unexpected keys: {len(unexpected)}")
+            # I145: 详细诊断 - 显示关键 unexpected keys 示例
+            if len(unexpected) > 0:
+                unexpected_examples = list(unexpected)[:10]
+                print(f"  [WARN] Unexpected key examples: {unexpected_examples}")
+
+        # I145: 诊断模型是否基本未加载 (50% 准确率 = 随机)
+        if len(missing) > 100 or len(unexpected) > 100:
+            print(f"  [WARN] 大量 key 不匹配 ({len(missing)} missing, {len(unexpected)} unexpected)")
+            print(f"  [WARN] 尝试从 state_dict 推断配置并重新构建模型...")
+
+            # 尝试从 state_dict 推断完整模型配置
+            inferred_config = _infer_model_config_from_state_dict(tensor_state, verbose)
+            if inferred_config:
+                if verbose:
+                    print(f"  [I145] 推断的配置: {inferred_config}")
+
+                # 更新 gene 的核心配置
+                if inferred_config.get('dim') is not None:
+                    gene.dim = inferred_config['dim']
+                if inferred_config.get('depth') is not None:
+                    gene.depth = inferred_config['depth']
+                if inferred_config.get('heads') is not None:
+                    gene.heads = inferred_config['heads']
+
+                # I145: 更新 gene 的 max_depth 配置（两个字段分离）
+                # 注意：推断函数返回 'max_depth' (用于 Transformer) 和 'tokenizer_max_depth' (用于 Splitter)
+                if inferred_config.get('tokenizer_max_depth') is not None:
+                    gene.tokenizer_max_depth = inferred_config['tokenizer_max_depth']
+                if inferred_config.get('max_depth') is not None:
+                    gene.transformer_max_depth = inferred_config['max_depth']
+
+                # 更新 gene 的 Splitter 配置
+                if inferred_config.get('hidden_dim') is not None:
+                    gene.splitter_hidden_dim = inferred_config['hidden_dim']
+                if inferred_config.get('feature_dim') is not None:
+                    gene.splitter_feature_dim = inferred_config['feature_dim']
+                if inferred_config.get('pool_size') is not None:
+                    gene.splitter_pool_size = inferred_config['pool_size']
+
+                # 重新构建模型
+                model = gene.build_model()
+                model = model.to(torch.device(device))
+
+                # 清理 _orig_mod. 前缀
+                cleaned_state = {k.replace('_orig_mod.', ''): v for k, v in tensor_state.items()}
+
+                # 尝试部分加载（跳过不匹配的层）
+                try:
+                    # 先尝试严格加载
+                    missing, unexpected = model.load_state_dict(cleaned_state, strict=False)
+                except RuntimeError as e:
+                    # 如果失败，尝试逐个加载匹配的层
+                    print(f"  [I145] 严格加载失败，尝试部分加载...")
+                    model_dict = model.state_dict()
+                    loaded_keys = []
+                    for name, param in cleaned_state.items():
+                        if name in model_dict and model_dict[name].shape == param.shape:
+                            model_dict[name] = param
+                            loaded_keys.append(name)
+                    model.load_state_dict(model_dict, strict=False)
+                    missing = [k for k in cleaned_state.keys() if k not in loaded_keys]
+                    unexpected = []
+                    if verbose:
+                        print(f"  [I145] 部分加载成功: {len(loaded_keys)} layers loaded")
+
+                # 统计加载情况
+                loaded_count = len(cleaned_state) - len(missing)
+                total_count = len(cleaned_state)
+                load_ratio = loaded_count / total_count * 100 if total_count > 0 else 0
+
+                if verbose:
+                    print(f"  [I145] 加载完成: {loaded_count}/{total_count} ({load_ratio:.1f}%)")
+
+                # 警告：架构不匹配可能导致性能下降
+                if load_ratio < 80:
+                    transformer_max_depth = inferred_config.get('max_depth', 8)
+                    tokenizer_max_depth = inferred_config.get('tokenizer_max_depth', 4)
+                    print(f"  [WARN] 警告: 仅加载了 {load_ratio:.1f}% 的权重")
+                    print(f"  [WARN] 这可能是因为:")
+                    print(f"  [WARN]   - Transformer max_depth={transformer_max_depth} 与 tokenizer max_depth={tokenizer_max_depth} 不同")
+                    print(f"  [WARN]   - 代码版本与 checkpoint 不兼容")
+                    print(f"  [WARN] 建议: 使用保存 checkpoint 时的代码版本进行评估")
+            else:
+                print(f"  [ERROR] 无法从 state_dict 推断配置，请手动指定 Splitter 参数")
 
     if verbose:
         print(f"  [OK] Model loaded successfully")
@@ -246,6 +334,9 @@ def load_model_legacy(
     """
     从旧版 checkpoint 加载模型（无 model_gene）
 
+    警告：此函数现在会直接报错，因为旧版格式不包含 token_coverage_* 字段。
+    请使用新版训练脚本重新训练，新版 checkpoint 会保存覆盖率参数而非绝对 K 值。
+
     Args:
         checkpoint_path: checkpoint 文件路径
         device: 设备
@@ -255,78 +346,52 @@ def load_model_legacy(
 
     Returns:
         (model, config) 元组
+
+    Raises:
+        ValueError: 旧版 checkpoint 不再支持加载
     """
-    from vit_pytorch import FractalCurveViT
-
-    checkpoint = load_checkpoint(checkpoint_path, device=device)
-
-    # 提取配置
-    raw_config = None
-    if 'config' in checkpoint:
-        raw_config = checkpoint['config']
-    elif 'model_config' in checkpoint:
-        raw_config = checkpoint['model_config']
-    elif config_path:
-        config_path = Path(config_path)
-        if config_path.exists():
-            with open(config_path) as f:
-                raw_config = json.load(f)
-
-    if raw_config is None:
-        raise ValueError(
-            f"Cannot find model config in checkpoint: {checkpoint_path}\n"
-            f"Please provide config_path or retrain with updated script."
-        )
-
-    # 处理配置格式
-    if hasattr(raw_config, '__dict__'):
-        raw_config = vars(raw_config)
-    elif hasattr(raw_config, '_asdict'):
-        raw_config = raw_config._asdict()
-
-    # 处理嵌套结构
-    if 'model' in raw_config and isinstance(raw_config['model'], dict):
-        config = raw_config['model']
-    else:
-        config = raw_config
-
-    # 合并训练配置（如果有）
-    if 'training' in raw_config and isinstance(raw_config['training'], dict):
-        for key, value in raw_config['training'].items():
-            if key not in config or config[key] is None:
-                config[key] = value
-
-    # 构建模型
-    if verbose:
-        print(f"  Building model from legacy config...")
-
-    model = _build_model_from_config(config)
-
-    # 加载权重
-    state_dict = checkpoint.get('model_state_dict', checkpoint)
-
-    if isinstance(state_dict, dict):
-        tensor_state = {k: v for k, v in state_dict.items() if isinstance(v, torch.Tensor)}
-    else:
-        tensor_state = state_dict
-
-    missing, unexpected = model.load_state_dict(tensor_state, strict=strict)
-
-    if missing and verbose:
-        print(f"  [WARN] Missing keys: {len(missing)}")
-    if unexpected and verbose:
-        print(f"  [WARN] Unexpected keys: {len(unexpected)}")
-
-    if verbose:
-        print(f"  [OK] Legacy model loaded")
-
-    return model, config
+    # I33: 强制迁移检查
+    raise ValueError(
+        "旧版 checkpoint 不再支持加载。"
+        " 旧版格式使用 K_min/K_max 绝对值，无法在不同分辨率下正确复算。"
+        " 请使用包含 token_coverage_* 字段的新版 checkpoint，"
+        " 或使用新版训练脚本重新训练。"
+    )
 
 
 def _build_model_from_config(config: Dict[str, Any]) -> ModelType:
-    """从配置字典构建模型（兼容旧版配置格式）"""
+    """从配置字典构建模型
+
+    强制迁移检查：配置必须包含 token_coverage_* 字段。
+    旧版配置格式使用 K_min/K_max 绝对值，无法在不同分辨率下正确复算。
+
+    Args:
+        config: 配置字典
+
+    Returns:
+        构建的模型
+
+    Raises:
+        ValueError: 旧版配置格式不支持
+    """
     from vit_pytorch import FractalCurveViT
     from vit_pytorch.gumbel_topk_splitter import create_gumbel_topk_from_config
+
+    # I33: 强制迁移检查 - 必须有 token_coverage_* 字段
+    if 'token_coverage_min' not in config or 'token_coverage_max' not in config:
+        # 检查是否有旧的 K_min/K_max 字段（用于生成更友好的错误信息）
+        has_old_format = 'K_min' in config or 'K_max' in config
+        if has_old_format:
+            raise ValueError(
+                "旧版配置格式不支持：请使用包含 token_coverage_* 字段的新版配置。"
+                " 旧版使用 K_min/K_max 绝对值，无法在不同分辨率下正确复算。"
+                " 请使用新版训练脚本重新训练。"
+            )
+        else:
+            raise ValueError(
+                "配置中缺少必需字段 token_coverage_min 和 token_coverage_max。"
+                " 请使用新版训练脚本重新训练。"
+            )
 
     # 提取配置值，设置合理的默认值
     dim = config.get('dim', 256)
@@ -339,8 +404,12 @@ def _build_model_from_config(config: Dict[str, Any]) -> ModelType:
     # Tokenizer 配置
     pool = config.get('pool', 'weighted')
     min_patch_size = config.get('min_patch_size', 4)
-    K_min = config.get('K_min', 16)
-    K_max = config.get('K_max', 64)
+    # I33: 从 coverage 复算 K 值
+    token_coverage_min = config['token_coverage_min']
+    token_coverage_max = config['token_coverage_max']
+    max_patches = (image_size // min_patch_size) ** 2 if image_size else (224 // min_patch_size) ** 2
+    K_min = max(4, int(max_patches * token_coverage_min))
+    K_max = int(max_patches * token_coverage_max)
     max_depth = config.get('max_depth', None)
 
     # Splitter 配置
@@ -397,6 +466,225 @@ def _build_model_from_config(config: Dict[str, Any]) -> ModelType:
 # ============================================================================
 # 工具函数
 # ============================================================================
+
+def _infer_model_config_from_state_dict(state_dict: Dict[str, Any], verbose: bool = False) -> Optional[Dict[str, Any]]:
+    """I145: 从 state_dict 推断完整模型配置
+
+    分析 state_dict 中的权重形状，推断完整的模型参数。
+    处理 torch.compile 产生的 _orig_mod. 前缀。
+
+    关键推断逻辑:
+    - lca_embedding.weight shape = [max_depth+1, num_heads] → max_depth, heads (用于 Transformer)
+    - depth_embedding.weight shape = [max_depth+1, dim] → max_depth, dim (用于 Tokenizer)
+    - to_qkv.weight shape = [3*dim*heads, dim] → dim
+    - complexity_mlp.0.weight shape = [hidden_dim, feature_dim * pool_size^2] → hidden_dim, pool_size
+
+    Returns:
+        dict with keys: dim, depth, heads, mlp_dim, max_depth, hidden_dim, feature_dim, pool_size
+    """
+    import math
+
+    result = {
+        'dim': None,
+        'depth': None,
+        'heads': None,
+        'mlp_dim': None,
+        'max_depth': None,  # 用于 Transformer/Attention
+        'tokenizer_max_depth': None,  # 用于 Tokenizer/Splitter
+        'hidden_dim': None,
+        'feature_dim': None,
+        'pool_size': None,
+    }
+
+    # 清理 _orig_mod. 前缀
+    cleaned_keys = {k.replace('_orig_mod.', ''): k for k in state_dict.keys()}
+
+    # 1. 从 to_qkv 推断真实的 dim 和 heads（最先执行，因为最可靠）
+    # 注意：to_qkv.shape = [3*dim*heads, dim] → heads = shape[0] / (3 * dim)
+    # lca_embedding.shape = [max_depth+1, lca_heads] → lca_heads 不是 attention heads!
+    for key in cleaned_keys.keys():
+        if '.attention.to_qkv.weight' in key:
+            orig_key = cleaned_keys[key]
+            tensor = state_dict[orig_key]
+            if len(tensor.shape) == 2:
+                result['dim'] = tensor.shape[1]
+                result['heads'] = tensor.shape[0] // (3 * tensor.shape[1])
+                if verbose:
+                    print(f"  [I145] 发现 to_qkv: {key}, shape={tuple(tensor.shape)}")
+                    print(f"  [I145]   推断: dim={result['dim']}, heads={result['heads']}")
+                break
+
+    # 2. 从 lca_embedding 推断 Transformer 的 max_depth（lca_embedding 第二个维度是 lca_heads，不是 attention heads）
+    for key in cleaned_keys.keys():
+        if 'lca_embedding' in key and 'weight' in key:
+            orig_key = cleaned_keys[key]
+            tensor = state_dict[orig_key]
+            if len(tensor.shape) == 2:
+                # lca_embedding.weight shape = [max_depth+1, lca_heads]
+                # 注意：第二个维度是 lca_heads（用于 Hilbert bias），不是 attention heads
+                result['max_depth'] = tensor.shape[0] - 1  # Transformer 用的 max_depth
+                lca_heads = tensor.shape[1]
+                if verbose:
+                    print(f"  [I145] 发现 lca_embedding: {key}, shape={tuple(tensor.shape)}")
+                    print(f"  [I145]   推断: transformer_max_depth={result['max_depth']}, lca_heads={lca_heads}")
+                break
+
+    # 3. 从 splitter.threshold_offsets 推断 tokenizer 的 max_depth（最可靠）
+    # threshold_offsets.shape = [max_depth] → tokenizer max_depth = shape[0]
+    for key in cleaned_keys.keys():
+        if 'splitter.threshold_offsets' in key:
+            orig_key = cleaned_keys[key]
+            tensor = state_dict[orig_key]
+            if len(tensor.shape) == 1:
+                result['tokenizer_max_depth'] = tensor.shape[0] - 1
+                if verbose:
+                    print(f"  [I145] 发现 splitter.threshold_offsets: {key}, shape={tuple(tensor.shape)}")
+                    print(f"  [I145]   推断: tokenizer_max_depth={result['tokenizer_max_depth']}")
+                break
+
+    # 5. 从 complexity_mlp.0.weight 推断 hidden_dim, feature_dim, pool_size
+    for key in cleaned_keys.keys():
+        if 'complexity_mlp' in key and '.0.weight' in key:
+            orig_key = cleaned_keys[key]
+            tensor = state_dict[orig_key]
+            if len(tensor.shape) == 2:
+                # hidden_dim = out_features
+                result['hidden_dim'] = tensor.shape[0]
+                # in_features = feature_dim * pool_size^2
+                in_features = tensor.shape[1]
+                # 推断 feature_dim 和 pool_size
+                if result.get('dim') is not None:
+                    feature_dim = result['dim']
+                    if in_features % feature_dim == 0:
+                        pool_sq = in_features // feature_dim
+                        pool_size = int(math.sqrt(pool_sq)) if pool_sq > 0 else 1
+                        if pool_size * pool_size == pool_sq:
+                            result['feature_dim'] = feature_dim
+                            result['pool_size'] = pool_size
+                if verbose := False:
+                    print(f"  [I145] 发现 complexity_mlp.0: {key}, shape={tuple(tensor.shape)}")
+                    print(f"  [I145]   推断: hidden_dim={result['hidden_dim']}, feature_dim={result['feature_dim']}, pool_size={result['pool_size']}")
+            break
+
+    # 6. 推断 depth（Transformer 层数）
+    depth_count = 0
+    for key in cleaned_keys.keys():
+        if '.attention.to_qkv.weight' in key:
+            depth_count += 1
+    if depth_count > 0:
+        result['depth'] = depth_count
+
+    return result if any(v is not None for v in result.values()) else None
+
+
+def _infer_splitter_config_from_state_dict(state_dict: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """I145: 从 state_dict 推断 Splitter 配置
+
+    分析 state_dict 中的权重形状，推断正确的 Splitter 参数。
+
+    关键推断逻辑:
+    - complexity_mlp.0.weight shape = [hidden_dim, feature_dim * pool_size^2]
+    - 已知 feature_dim 通常等于 model.dim
+
+    Returns:
+        dict with keys: hidden_dim, feature_dim, pool_size (may be None if not found)
+    """
+    import math
+
+    result = {
+        'hidden_dim': None,
+        'feature_dim': None,
+        'pool_size': None,
+    }
+
+    # 1. 查找 complexity_mlp.0.weight 的形状，推断 hidden_dim 和 pool_size
+    # shape = [hidden_dim, feature_dim * pool_size^2]
+    for key in state_dict.keys():
+        if 'complexity_mlp' in key and '.0.weight' in key:
+            tensor = state_dict[key]
+            if len(tensor.shape) == 2:
+                # hidden_dim = out_features
+                result['hidden_dim'] = tensor.shape[0]
+                # 计算 feature_dim * pool_size^2 = in_features
+                in_features = tensor.shape[1]
+                # 常见配置: feature_dim ∈ {192, 256, 320, 384}
+                # 推断 feature_dim 和 pool_size
+                if result.get('hidden_dim') is not None:
+                    # 尝试从 in_features 推断 pool_size
+                    # in_features = feature_dim * pool_size^2
+                    # 常见组合:
+                    #   feature_dim=256, pool_size=4 → 256*16=4096
+                    #   feature_dim=256, pool_size=2 → 256*4=1024
+                    #   feature_dim=384, pool_size=4 → 384*16=6144
+                    #   feature_dim=192, pool_size=4 → 192*16=3072
+                    for feature_dim in [192, 256, 320, 384]:
+                        if in_features % (feature_dim * feature_dim) == 0:
+                            pool_sq = in_features // feature_dim
+                            pool_size = int(math.sqrt(pool_sq))
+                            if pool_size * pool_size == pool_sq:
+                                result['feature_dim'] = feature_dim
+                                result['pool_size'] = pool_size
+                                break
+                        elif in_features % feature_dim == 0:
+                            pool_sq = in_features // feature_dim
+                            pool_size = int(math.sqrt(pool_sq)) if pool_sq > 0 else 1
+                            if pool_size * pool_size == pool_sq:
+                                result['feature_dim'] = feature_dim
+                                result['pool_size'] = pool_size
+                                break
+                if verbose := False:  # debug
+                    print(f"  [I145] 发现 complexity_mlp.0: {key}, shape={tuple(tensor.shape)}")
+                    print(f"  [I145]   推断: hidden_dim={result['hidden_dim']}, feature_dim={result['feature_dim']}, pool_size={result['pool_size']}")
+            break
+
+    # 2. 如果 pool_size 仍未知，尝试从其他层推断
+    if result['pool_size'] is None:
+        for key in state_dict.keys():
+            if 'depth_proj' in key and 'weight' in key:
+                tensor = state_dict[key]
+                if len(tensor.shape) == 1:
+                    # depth_proj.weight shape = [feature_dim]
+                    result['feature_dim'] = tensor.shape[0]
+                    break
+
+    return result if any(v is not None for v in result.values()) else None
+
+
+def _diagnose_splitter_config(state_dict: Dict[str, Any], gene: "ModelGene") -> None:
+    """I145: 从 state_dict 推断 Splitter 配置，帮助诊断权重不匹配问题"""
+    print(f"\n  [I145] 尝试从 state_dict 推断 Splitter 配置...")
+
+    # 查找 splitter 相关的 key
+    splitter_keys = [k for k in state_dict.keys() if 'splitter' in k.lower() or 'mlp' in k.lower()]
+
+    if not splitter_keys:
+        print(f"  [I145] 未找到 splitter 相关的 state_dict keys")
+        return
+
+    # 尝试从 MLP 层推断 hidden_dim
+    for key in splitter_keys:
+        if '.0.' in key and 'weight' in key:
+            tensor = state_dict[key]
+            if len(tensor.shape) == 2:
+                # tensor.shape = [out_features, in_features]
+                inferred_hidden = tensor.shape[0]
+                inferred_in = tensor.shape[1]
+                print(f"  [I145] 发现 MLP 层: {key}")
+                print(f"  [I145]   推断 in_features={inferred_in}, out_features={inferred_hidden}")
+                print(f"  [I145]   建议设置: splitter_hidden_dim={inferred_hidden}")
+
+    # 查找 complexity_logits 相关层
+    for key in state_dict.keys():
+        if 'complexity' in key.lower() and 'weight' in key:
+            tensor = state_dict[key]
+            if len(tensor.shape) == 2:
+                print(f"  [I145] 发现 complexity 层: {key}")
+                print(f"  [I145]   shape={tuple(tensor.shape)}")
+                print(f"  [I145]   建议设置: splitter_feature_dim={tensor.shape[1]}")
+
+    print(f"\n  [I145] 提示: 使用命令行参数覆盖 Splitter 配置:")
+    print(f"  [I145]   --splitter-hidden-dim <值> --splitter-feature-dim <值> --splitter-pool-size <值>")
+
 
 def save_checkpoint_with_gene(
     path: Path,

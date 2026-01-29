@@ -27,19 +27,19 @@ class TestLCAHilbertBiasBasic:
     @pytest.fixture
     def lca_bias(self):
         """创建 LCA Bias 实例"""
-        return LCAHilbertBias(max_depth=8, heads=4)
+        return LCAHilbertBias(max_level=8, heads=4)
 
     def test_init(self, lca_bias):
         """初始化测试"""
-        assert lca_bias.max_depth == 8
+        assert lca_bias.max_level == 8
         assert lca_bias.heads == 4
-        assert lca_bias.lca_embedding.num_embeddings == 9  # 0 to max_depth
+        assert lca_bias.lca_embedding.num_embeddings == 9  # 0 to max_level
         assert lca_bias.lca_embedding.embedding_dim == 4
 
     def test_parameter_count(self, lca_bias):
         """参数量测试 - 验证参数量极少"""
         num_params = sum(p.numel() for p in lca_bias.parameters())
-        assert num_params == 40  # (max_depth + 1) * heads + heads
+        assert num_params == 40  # (max_level + 1) * heads + heads
         assert num_params < 100, f"LCA params ({num_params}) should be < 100"
 
     def test_forward_2d(self, lca_bias):
@@ -141,7 +141,7 @@ class TestLCAComputation:
 
     def test_lca_to_bias_mapping(self):
         """LCA 到偏置的映射测试"""
-        lca_bias = LCAHilbertBias(max_depth=4, heads=2)
+        lca_bias = LCAHilbertBias(max_level=4, heads=2)
 
         paths = torch.tensor([
             [0, 0, 0, 0],
@@ -173,7 +173,7 @@ class TestIntegrationWithAttention:
             dim=64,
             heads=4,
             dim_head=16,
-            max_depth=8,  # P0 修复: 统一使用 max_depth
+            max_level=8,  # P0 修复: 统一使用 max_level
             use_hilbert_bias=True,
         )
 
@@ -201,7 +201,7 @@ class TestIntegrationWithAttention:
         attention = HilbertAwareMultiScaleAttention(
             dim=64,
             heads=4,
-            max_depth=8,  # P0 修复: 统一使用 max_depth
+            max_level=8,  # P0 修复: 统一使用 max_level
             use_hilbert_bias=True,
         )
 
@@ -224,7 +224,7 @@ class TestEdgeCases:
 
     def test_single_token(self):
         """单 token 测试"""
-        lca_bias = LCAHilbertBias(max_depth=4, heads=2, lca_temperature=None)
+        lca_bias = LCAHilbertBias(max_level=4, heads=2, lca_temperature=None)
 
         levels_info = torch.randint(0, 4, (1, 5))
         levels_info[0, 0] = 4
@@ -236,12 +236,12 @@ class TestEdgeCases:
         expected_bias = lca_bias.lca_embedding.weight[expected_depth]
         assert torch.allclose(bias[:, 0, 0], expected_bias)
 
-    def test_max_depth_exceeded(self):
+    def test_max_level_exceeded(self):
         """超过最大深度测试 - I34-13: 超界时抛出异常而非静默钳位"""
-        lca_bias = LCAHilbertBias(max_depth=4, heads=2, lca_temperature=None)
+        lca_bias = LCAHilbertBias(max_level=4, heads=2, lca_temperature=None)
 
         levels_info = torch.randint(0, 4, (4, 10))
-        levels_info[:, 0] = 8  # 超出 max_depth=4 的范围
+        levels_info[:, 0] = 8  # 超出 max_level=4 的范围
 
         # I34-13: 静默钳位掩盖 bug，改为抛出异常
         with pytest.raises(ValueError, match="LCA depth out of bounds"):
@@ -252,7 +252,7 @@ class TestEdgeCases:
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
 
-        lca_bias = LCAHilbertBias(max_depth=4, heads=2).cuda()
+        lca_bias = LCAHilbertBias(max_level=4, heads=2).cuda()
         levels_info = torch.randint(0, 4, (2, 16, 5)).cuda()
 
         bias = lca_bias(levels_info)
@@ -266,7 +266,7 @@ class TestPerformance:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_large_sequence(self):
         """大序列长度测试"""
-        lca_bias = LCAHilbertBias(max_depth=12, heads=8).cuda()
+        lca_bias = LCAHilbertBias(max_level=12, heads=8).cuda()
 
         seq_len = 196
         levels_info = torch.randint(0, 4, (4, seq_len, 13)).cuda()

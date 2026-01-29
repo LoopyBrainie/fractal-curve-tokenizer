@@ -19,8 +19,8 @@ from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
 from vit_pytorch.constants import (
     LEARNABLE_QUOTA_ENABLED,
     QUOTA_MIN_RATIO,
-    QUOTA_INIT_LOGITS,
     QUOTA_ENTROPY_WEIGHT,
+    compute_quota_init_logits,
 )
 
 DEPTH_QUOTA_TARGET = (0.15, 0.20, 0.25, 0.40)
@@ -37,7 +37,7 @@ class TestLearnableQuotaInit:
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=8,
-            max_depth_limit=3,
+            max_level_limit=3,
             image_size=(64, 64),
         )
 
@@ -48,21 +48,32 @@ class TestLearnableQuotaInit:
         assert splitter.quota_logits.shape == (D,)
 
     def test_quota_init_produces_target_distribution(self):
-        """验证初始化配额 softmax 等于目标分布"""
+        """验证初始化配额 softmax 等于逆深度加权目标分布
+
+        新的初始化算法使用逆深度加权: p_d ∝ 1/(d+1)
+        验证初始化符合预期的数学公式
+        """
         if not LEARNABLE_QUOTA_ENABLED:
             pytest.skip("LEARNABLE_QUOTA_ENABLED is False")
 
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=8,
-            max_depth_limit=3,
+            max_level_limit=3,
             image_size=(64, 64),
         )
 
         quota_probs = F.softmax(splitter.quota_logits, dim=0)
 
-        target = torch.tensor(DEPTH_QUOTA_TARGET[:4])
-        torch.testing.assert_close(quota_probs, target, atol=1e-3, rtol=1e-3)
+        # 验证 softmax 归一化
+        torch.testing.assert_close(quota_probs.sum(), torch.tensor(1.0), atol=1e-5, rtol=1e-5)
+
+        # 验证逆深度加权: 较浅深度有更高的初始配额
+        # p_d ∝ 1/(d+1)
+        inverse_depth = torch.tensor([1.0 / (d + 1) for d in range(4)])
+        expected = inverse_depth / inverse_depth.sum()
+
+        torch.testing.assert_close(quota_probs, expected, atol=1e-3, rtol=1e-3)
 
 
 class TestQuotaAllocation:
@@ -76,7 +87,7 @@ class TestQuotaAllocation:
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=8,
-            max_depth_limit=3,
+            max_level_limit=3,
             image_size=(64, 64),
         )
 
@@ -92,7 +103,7 @@ class TestQuotaAllocation:
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=8,
-            max_depth_limit=3,
+            max_level_limit=3,
             image_size=(64, 64),
         )
 
@@ -106,22 +117,29 @@ class TestQuotaAllocation:
         assert not torch.isnan(min_loss)
 
     def test_quota_proportional_to_target(self):
-        """验证配额近似与目标分布成比例"""
+        """验证配额近似与逆深度加权目标分布成比例
+
+        新的初始化算法使用逆深度加权: p_d ∝ 1/(d+1)
+        配额分配应遵循此分布
+        """
         if not LEARNABLE_QUOTA_ENABLED:
             pytest.skip("LEARNABLE_QUOTA_ENABLED is False")
 
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=8,
-            max_depth_limit=3,
+            max_level_limit=3,
             image_size=(64, 64),
         )
 
         K = 32
         quota = splitter._compute_quota_allocation(K).float()
-        target = torch.tensor(DEPTH_QUOTA_TARGET[:4]) * K
 
-        torch.testing.assert_close(quota, target, atol=2.0, rtol=0.1)
+        # 逆深度加权目标分布
+        inverse_depth = torch.tensor([1.0 / (d + 1) for d in range(4)])
+        expected = inverse_depth / inverse_depth.sum() * K
+
+        torch.testing.assert_close(quota, expected, atol=2.0, rtol=0.1)
 
 
 class TestStratifiedTopK:
@@ -135,7 +153,7 @@ class TestStratifiedTopK:
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=8,
-            max_depth_limit=4,
+            max_level_limit=4,
             image_size=(64, 64),
             K_min=16,
             K_max=48,
@@ -159,7 +177,7 @@ class TestStratifiedTopK:
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=8,
-            max_depth_limit=4,
+            max_level_limit=4,
             image_size=(64, 64),
             K_min=16,
             K_max=32,
@@ -201,7 +219,7 @@ class TestQuotaEntropyLoss:
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=8,
-            max_depth_limit=3,
+            max_level_limit=3,
             image_size=(64, 64),
         )
 
@@ -220,7 +238,7 @@ class TestQuotaEntropyLoss:
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=8,
-            max_depth_limit=3,
+            max_level_limit=3,
             image_size=(64, 64),
         )
 
@@ -238,7 +256,7 @@ class TestQuotaEntropyLoss:
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=8,
-            max_depth_limit=3,
+            max_level_limit=3,
             image_size=(64, 64),
         )
         splitter.train()
@@ -255,10 +273,14 @@ class TestMathematicalProperties:
     """数学性质验证"""
 
     def test_softmax_init_equals_target(self):
-        """验证 softmax(QUOTA_INIT_LOGITS) ≈ DEPTH_QUOTA_TARGET"""
-        init_logits = torch.tensor(QUOTA_INIT_LOGITS)
+        """验证 softmax(compute_quota_init_logits(3)) ≈ 逆深度加权分布"""
+        # max_level_limit=3 => D=4
+        init_logits = torch.tensor(compute_quota_init_logits(3))
         probs = F.softmax(init_logits, dim=0)
-        target = torch.tensor(DEPTH_QUOTA_TARGET[:len(init_logits)])
+
+        # 逆深度加权: p_d ∝ 1/(d+1)
+        inverse_depth = torch.tensor([1.0 / (d + 1) for d in range(4)])
+        target = inverse_depth / inverse_depth.sum()
 
         torch.testing.assert_close(probs, target, atol=1e-2, rtol=1e-2)
 
@@ -270,7 +292,7 @@ class TestMathematicalProperties:
         splitter = GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=8,
-            max_depth_limit=3,
+            max_level_limit=3,
             image_size=(64, 64),
         )
 

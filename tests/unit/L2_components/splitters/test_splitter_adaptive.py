@@ -59,7 +59,7 @@ def splitter():
     return GumbelTopKSplitter(
         feature_dim=256,
         min_patch_size=4,
-        max_depth_limit=4,
+        max_level_limit=4,
         hidden_dim=128,
         pool_size=4,
         K_max=32,

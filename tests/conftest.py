@@ -216,12 +216,12 @@ def default_splitter_config() -> dict:
     数学: 使用标准配置参数空间
         - feature_dim = 256
         - min_patch_size = 4
-        - max_depth_limit = 8
+        - max_level_limit = 8
     """
     return {
         "feature_dim": 256,
         "min_patch_size": 4,
-        "max_depth_limit": 8,
+        "max_level_limit": 8,
     }
 
 

@@ -350,7 +350,7 @@ class CUB200TrainingConfig:
     arch_config: ModelArchitectureConfig = field(default_factory=lambda: ModelArchitectureConfig(
         num_classes=200,
         dim=384,
-        depth=8,
+        num_layers=8,
         heads=6,
         image_size=None,  # I78: 动态分辨率
         min_patch_size=4,
@@ -401,23 +401,29 @@ class CUB200TrainingConfig:
         """P1 Fix: 验证 CUB200TrainingConfig 与 ModelArchitectureConfig 的一致性
 
         检查训练配置参数与模型架构配置是否一致，避免运行时错误。
+        注意: K_min/K_max 由模型根据 token_coverage_* 动态计算，不再硬编码检查。
 
         Raises:
             ValueError: 当配置不一致时
         """
         issues = []
 
-        # 检查 K_min/K_max 约束
-        if self.K_min > self.K_max:
-            issues.append(f"K_min={self.K_min} > K_max={self.K_max}")
+        # 通过便捷属性从 arch_config 获取参数
+        arch = self.arch_config
 
-        # 检查 dim_head 兼容性
+        # 检查 dim_head 兼容性 (通过便捷属性访问)
         if self.dim % self.heads != 0:
             issues.append(f"dim={self.dim} 不能被 heads={self.heads} 整除")
 
-        # 检查 min_patch_size 合理性
+        # 检查 min_patch_size 合理性 (通过便捷属性访问)
         if self.min_patch_size < 1:
             issues.append(f"min_patch_size={self.min_patch_size} 必须 >= 1")
+
+        # 检查覆盖率约束 (从 arch_config 验证)
+        if not (0 < arch.token_coverage_min < arch.token_coverage_max < 1):
+            issues.append(
+                f"覆盖率约束违反: 0 < {arch.token_coverage_min} < {arch.token_coverage_max} < 1"
+            )
 
         if issues:
             raise ValueError(
@@ -439,9 +445,9 @@ class CUB200TrainingConfig:
         return self.arch_config.dim
 
     @property
-    def depth(self) -> int:
-        """从 arch_config 获取 Transformer 层数"""
-        return self.arch_config.depth
+    def num_layers(self) -> int:
+        """从 arch_config 获取 Transformer 层数 (原 depth)"""
+        return self.arch_config.num_layers
 
     @property
     def heads(self) -> int:

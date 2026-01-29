@@ -116,10 +116,10 @@ class TestHilbertAwareMultiScaleAttentionConfig:
         return 4
 
     @pytest.fixture
-    def max_depth(self):
+    def max_level(self):
         return 3
 
-    def test_level_scale_init_from_config(self, dim, heads, max_depth):
+    def test_level_scale_init_from_config(self, dim, heads, max_level):
         """level_scale_raw 从配置初始化."""
         custom_init = 0.7
         config = AttentionEncoderConfig(level_scale_init=custom_init)
@@ -127,7 +127,7 @@ class TestHilbertAwareMultiScaleAttentionConfig:
         attn = HilbertAwareMultiScaleAttention(
             dim=dim,
             heads=heads,
-            max_depth=max_depth,
+            max_level=max_level,
             use_level_scaling=True,
             encoder_config=config,
         )
@@ -135,7 +135,7 @@ class TestHilbertAwareMultiScaleAttentionConfig:
         init_value = attn._level_scale_raw.weight.mean().item()
         assert abs(init_value - custom_init) < 1e-6
 
-    def test_hierarchical_scale_bounds_from_config(self, dim, heads, max_depth):
+    def test_hierarchical_scale_bounds_from_config(self, dim, heads, max_level):  # max_level fixture defined above
         """hierarchical_depth_scale 从配置初始化."""
         low, high = 0.3, 1.2
         config = AttentionEncoderConfig(hierarchical_scale_bounds=(low, high))
@@ -143,7 +143,7 @@ class TestHilbertAwareMultiScaleAttentionConfig:
         attn = HilbertAwareMultiScaleAttention(
             dim=dim,
             heads=heads,
-            max_depth=max_depth,
+            max_level=max_level,
             use_hierarchical_attention=True,
             encoder_config=config,
         )
@@ -152,7 +152,7 @@ class TestHilbertAwareMultiScaleAttentionConfig:
         assert scale_values.min() >= low - 1e-6
         assert scale_values.max() <= high + 1e-6
 
-    def test_bias_init_from_config(self, dim, heads, max_depth):
+    def test_bias_init_from_config(self, dim, heads, max_level):
         """偏置缩放从配置初始化."""
         hilbert_init = -1.5
         level_init = -2.0
@@ -164,19 +164,19 @@ class TestHilbertAwareMultiScaleAttentionConfig:
         attn = HilbertAwareMultiScaleAttention(
             dim=dim,
             heads=heads,
-            max_depth=max_depth,
+            max_level=max_level,
             encoder_config=config,
         )
 
         assert abs(attn._hilbert_bias_scale_raw.item() - hilbert_init) < 1e-6
         assert abs(attn._level_bias_scale_raw.item() - level_init) < 1e-6
 
-    def test_default_config_when_none(self, dim, heads, max_depth):
+    def test_default_config_when_none(self, dim, heads, max_level):  # max_level fixture defined above
         """未提供配置时使用默认配置."""
         attn = HilbertAwareMultiScaleAttention(
             dim=dim,
             heads=heads,
-            max_depth=max_depth,
+            max_level=max_level,
             use_level_scaling=True,
             use_hierarchical_attention=True,
         )
@@ -187,13 +187,13 @@ class TestHilbertAwareMultiScaleAttentionConfig:
         assert attn.config.hilbert_bias_init == default_config.hilbert_bias_init
         assert attn.config.level_bias_init == default_config.level_bias_init
 
-    def test_get_config_method(self, dim, heads, max_depth):
+    def test_get_config_method(self, dim, heads, max_level):  # max_level fixture defined above
         """get_config 方法返回配置."""
         config = AttentionEncoderConfig(level_scale_init=0.9)
         attn = HilbertAwareMultiScaleAttention(
             dim=dim,
             heads=heads,
-            max_depth=max_depth,
+            max_level=max_level,
             encoder_config=config,
         )
 
@@ -284,7 +284,7 @@ class TestConfigBackwardCompatibility:
         attn = HilbertAwareMultiScaleAttention(
             dim=128,
             heads=4,
-            max_depth=3,
+            max_level=3,
             use_level_scaling=True,
             use_hierarchical_attention=True,
         )

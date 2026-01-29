@@ -27,7 +27,7 @@ def splitter_base():
     return GumbelTopKSplitter(
         feature_dim=64,
         min_patch_size=4,
-        max_depth_limit=3,
+        max_level_limit=3,
         image_size=(32, 32),
         hidden_dim=32,
         pool_size=2,
@@ -48,7 +48,7 @@ def splitter_with_quota():
     return GumbelTopKSplitter(
         feature_dim=64,
         min_patch_size=8,
-        max_depth_limit=4,
+        max_level_limit=4,
         image_size=(64, 64),
         hidden_dim=32,
         pool_size=2,
@@ -70,7 +70,7 @@ def splitter_for_ema():
     return GumbelTopKSplitter(
         feature_dim=256,
         min_patch_size=4,
-        max_depth_limit=8,
+        max_level_limit=8,
         image_size=(64, 64),
         hidden_dim=128,
         pool_size=2,

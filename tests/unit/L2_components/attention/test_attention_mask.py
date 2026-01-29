@@ -27,11 +27,11 @@ class TestAttentionMaskEffectiveness:
             image_size=32,
             num_classes=10,
             dim=64,
-            depth=2,
+            num_layers=2,
             heads=4,
             mlp_dim=128,
             min_patch_size=(4, 4),
-            max_depth=3,
+            max_level=3,
         )
 
     def test_padding_tokens_masked_in_attention(self, model):

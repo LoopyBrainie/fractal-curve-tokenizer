@@ -212,14 +212,14 @@ class TestStreamingFractalTokenizerV3Full:
             channels=3,
             d_model=64,
             base_patch_size=4,
-            max_depth=4,
+            max_level=4,
         )
 
         # I98-1: 创建独立的 splitter
         splitter_config = SplitterConfig(
             feature_dim=64,
             min_patch_size=4,
-            max_depth_limit=4,
+            max_level_limit=4,
             hidden_dim=64,
             intermediate_dim=64,
             pool_size=4,

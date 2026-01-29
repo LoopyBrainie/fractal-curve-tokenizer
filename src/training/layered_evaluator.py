@@ -1007,7 +1007,7 @@ class LayeredEvaluator:
         # 获取 tokenizer 相关配置
         # I30-17: 优先使用 checkpoint 中保存的配置
         # 优先级：checkpoint config > state_dict 推断 > 默认值
-        max_depth_limit = config.get('max_depth', None)  # P0: 使用正确的字段名
+        max_level = config.get('max_level', None)  # P0: 使用正确的字段名 (原 max_depth)
         min_patch_size = config.get('min_patch_size', 4)
         if isinstance(min_patch_size, int):
             min_patch_size = (min_patch_size, min_patch_size)
@@ -1039,12 +1039,12 @@ class LayeredEvaluator:
         # P11-2: 从检查点恢复所有架构参数（与训练器完全对齐）
         # 优先级：检查点 state_dict > config.json > 默认值
 
-        # 1. 从 state_dict 推断 max_depth（当 config 中没有配置时）
+        # 1. 从 state_dict 推断 max_level（当 config 中没有配置时）
         detected_min_patch_size = config.get('min_patch_size', None)
-        if detected_min_patch_size is None and max_depth_limit is not None:
-            # 从 max_depth 反推 min_patch_size
-            # 公式: min_patch_size = image_size / 2^max_depth
-            max_depth = max_depth_limit
+        if detected_min_patch_size is None and max_level is not None:
+            # 从 max_level 反推 min_patch_size
+            # 公式: min_patch_size = image_size / 2^max_level
+            inferred_max_level = max_level
             if isinstance(image_size, int):
                 effective_image_size = (image_size, image_size)
             elif isinstance(image_size, tuple):
@@ -1052,8 +1052,8 @@ class LayeredEvaluator:
             else:
                 effective_image_size = (224, 224)
             min_size = min(effective_image_size)
-            detected_min_patch_size = max(1, min_size // (2 ** max_depth))
-            print(f"Inferred min_patch_size={detected_min_patch_size} from max_depth={max_depth}")
+            detected_min_patch_size = max(1, min_size // (2 ** inferred_max_level))
+            print(f"Inferred min_patch_size={detected_min_patch_size} from max_level={inferred_max_level}")
 
         if detected_min_patch_size is None:
             detected_min_patch_size = 4
@@ -1064,7 +1064,7 @@ class LayeredEvaluator:
 
         # 4. 检测模型架构参数（dim, depth, heads, dim_head）
         ckpt_dim = config.get('dim', None)
-        ckpt_depth = config.get('depth', None)
+        ckpt_depth = config.get('num_layers', config.get('depth', None))  # P0: 优先使用 num_layers，兼容 depth
         ckpt_heads = config.get('heads', None)
         ckpt_dim_head = config.get('dim_head', None)
 
@@ -1273,11 +1273,11 @@ class LayeredEvaluator:
         splitter = create_gumbel_topk_from_config(
             feature_dim=splitter_feature_dim,
             min_patch_size=min_patch_size[0] if isinstance(min_patch_size, tuple) else min_patch_size,
-            max_depth_limit=config.get('max_depth', 8),
+            max_level_limit=config.get('max_level', 8),  # P0: 使用正确的字段名
             hidden_dim=splitter_hidden_dim,
             pool_size=splitter_pool_size,
-            K_min=config.get('K_min', 16),
-            K_max=config.get('K_max', 64),
+            token_coverage_min=config.get('token_coverage_min', 0.01),  # I33: 使用覆盖率参数
+            token_coverage_max_hard=config.get('token_coverage_max', 0.05),
             image_size=(image_size, image_size) if isinstance(image_size, int) else image_size,
         )
         print(f"Created splitter with feature_dim={splitter_feature_dim}, hidden_dim={splitter_hidden_dim}, pool_size={splitter_pool_size}")
@@ -1287,7 +1287,7 @@ class LayeredEvaluator:
             image_size=image_size,
             num_classes=num_classes,
             dim=ckpt_dim,
-            depth=ckpt_depth,
+            num_layers=ckpt_depth,  # P0: 使用正确的字段名 (原 depth)
             heads=ckpt_heads,
             mlp_dim=mlp_dim,
             pool=pool,
@@ -1296,7 +1296,7 @@ class LayeredEvaluator:
             dropout=dropout,
             emb_dropout=emb_dropout,
             min_patch_size=min_patch_size,
-            max_depth=None,  # P11-2: None = 自动从 tokenizer.max_depth 获取
+            max_level=None,  # P0: None = 自动从 tokenizer.max_level 获取 (原 max_depth)
             use_hilbert_encoding=use_hilbert_encoding,
             use_spatial_encoding=use_spatial_encoding,
             use_checkpoint=use_checkpoint,
@@ -1306,10 +1306,9 @@ class LayeredEvaluator:
             learnable_temperature=learnable_temperature,
             # I140: 注入已配置好的 splitter（避免重新创建不匹配的）
             splitter=splitter,
-            # I23-2: Token 数量约束（使用检测或默认值）
-            # I99: 优先从 checkpoint config 获取，否则使用默认值
-            K_min=config.get('K_min', 16),
-            K_max=config.get('K_max', 64),
+            # I33: Token 覆盖率约束（K 值由模型内部从覆盖率计算）
+            token_coverage_min=config.get('token_coverage_min', 0.01),
+            token_coverage_max=config.get('token_coverage_max', 0.05),
             pos_dropout=pos_dropout,
             # I31-3: 形状-尺度编码配置
             use_area_encoding=use_area_encoding,

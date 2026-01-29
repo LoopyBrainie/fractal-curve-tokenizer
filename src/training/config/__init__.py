@@ -52,12 +52,12 @@ class ModelArchitectureConfig:
     Tokenizer 参数:
         - min_patch_size: 最小 patch 大小
         - K_min/K_max: Token 数量范围 (I33: 相对预算)
-        - max_depth: 最大分割深度
+        - max_level: 最大分割深度 (原 max_depth)
     """
     # 核心架构参数
     num_classes: int = 200
     dim: int = 384
-    depth: int = 8
+    num_layers: int = 8  # Transformer 层数 (原 depth)
     heads: int = 6
     mlp_dim: int = 1536  # dim * mlp_ratio (default 4.0)
     dim_head: int = 64   # dim / heads
@@ -110,7 +110,7 @@ class ModelArchitectureConfig:
 
     # 训练策略参数 (从 FractalViTConfig 迁移)
     pool: str = "weighted"
-    max_depth: int = 8  # P0 修复: 最大分割深度 (统一使用 max_depth)
+    max_level: int = 8  # P0 修复: 最大分割深度 (统一使用 max_level)
     freeze_quota: bool = False  # 是否冻结配额参数
     freeze_tokenizer: bool = False  # 是否冻结 tokenizer 参数
     freeze_tokenizer_epochs: int = 0  # 前 N 个 epoch 冻结 (0=全程冻结)
@@ -123,7 +123,7 @@ class ModelArchitectureConfig:
     def __post_init__(self):
         """参数验证 - 数学约束"""
         assert self.dim > 0, f"dim={self.dim} 必须 > 0"
-        assert self.depth >= 1, f"depth={self.depth} 必须 >= 1"
+        assert self.num_layers >= 1, f"num_layers={self.num_layers} 必须 >= 1"
         assert self.heads >= 1, f"heads={self.heads} 必须 >= 1"
         assert self.num_classes >= 1, f"num_classes={self.num_classes} 必须 >= 1"
 
@@ -134,8 +134,8 @@ class ModelArchitectureConfig:
         # 验证 K 边界: K_min_abs > 0
         assert self.K_min_abs > 0, f"K_min_abs={self.K_min_abs} 必须 > 0"
 
-        # 验证 max_depth: >= 1
-        assert self.max_depth >= 1, f"max_depth={self.max_depth} 必须 >= 1"
+        # 验证 max_level: >= 1
+        assert self.max_level >= 1, f"max_level={self.max_level} 必须 >= 1"
 
         # 验证 dim_head 一致性
         expected_dim_head = self.dim // self.heads
@@ -176,7 +176,7 @@ class ModelArchitectureConfig:
         ffn = 3 * 2 * self.dim * self.mlp_dim
         params_per_layer = attention + ffn
 
-        transformer = self.depth * params_per_layer
+        transformer = self.num_layers * params_per_layer
 
         # MLP Head: LayerNorm + Linear projection
         head = (

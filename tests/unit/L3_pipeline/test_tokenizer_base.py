@@ -27,19 +27,19 @@ from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
 
 
 # I98-1: Pipeline API 辅助函数
-def create_v3_pipeline(image_size, max_depth=4):
+def create_v3_pipeline(image_size, max_level=4):
     """创建 V3 tokenizer-splitter pipeline (I98-1 解耦架构)."""
     tokenizer = StreamingFractalTokenizerV3(
         image_size=image_size,
         channels=3,
         d_model=64,
         base_patch_size=4,
-        max_depth=max_depth,
+        max_level=max_level,
     )
     splitter = GumbelTopKSplitter(
         feature_dim=64,
         min_patch_size=4,
-        max_depth_limit=max_depth,
+        max_level_limit=max_level,
         hidden_dim=64,
         intermediate_dim=64,
         pool_size=4,
@@ -147,7 +147,7 @@ class TestStreamingFractalTokenizerV3:
     @pytest.fixture
     def pipeline(self):
         """创建 V3 pipeline (I98-1 解耦架构)."""
-        return create_v3_pipeline(image_size=32, max_depth=4)
+        return create_v3_pipeline(image_size=32, max_level=4)
 
     def test_tokenize_basic(self, pipeline):
         """测试 V3 基础 tokenization (Pipeline API)."""
