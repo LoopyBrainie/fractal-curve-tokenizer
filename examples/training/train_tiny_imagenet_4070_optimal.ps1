@@ -34,7 +34,6 @@ uv run python src/training/train_fractal_vit.py `
   --min-patch-size 4 `
   --token-coverage-min 0.02 `
   --token-coverage-max 0.05 `
-  --quota-learnable `
   --freeze-tokenizer `
   --freeze-tokenizer-epochs 10 `
   --elastic-coverage-min 0.02 `
