@@ -2937,6 +2937,7 @@ def main():
             # 模型架构配置 (从 arch_config 获取)
             self.dim = arch_config.dim
             self.depth = arch_config.num_layers  # I145: depth <- num_layers
+            self.num_layers = arch_config.num_layers  # For FractalCurveViT
             self.heads = arch_config.heads
             self.dim_head = arch_config.dim_head
             self.mlp_dim = arch_config.mlp_dim
@@ -2944,6 +2945,7 @@ def main():
             self.ffn_type = arch_config.ffn_type
             self.min_patch_size = arch_config.min_patch_size
             self.max_depth = arch_config.max_level  # I145: max_depth <- max_level
+            self.max_level = arch_config.max_level  # For FractalCurveViT
             self.dropout = args.dropout
             self.emb_dropout = args.emb_dropout
             self.drop_path_rate = args.drop_path
@@ -3034,7 +3036,7 @@ def main():
         image_size=spec.image_size,
         num_classes=spec.num_classes,
         dim=config.dim,
-        depth=config.depth,
+        num_layers=config.num_layers,  # FractalCurveViT 使用 num_layers
         heads=config.heads,
         mlp_dim=config.mlp_dim,
         pool=config.pool,
@@ -3045,7 +3047,7 @@ def main():
         drop_path_rate=config.drop_path_rate,
         # I30-17: 使用新的动态深度参数 (max_depth 自动从 min_patch_size 计算)
         min_patch_size=config.min_patch_size,
-        max_depth=config.max_depth,
+        max_level=config.max_level,  # FractalCurveViT 使用 max_level
         use_checkpoint=config.use_checkpoint,
         ffn_type=config.ffn_type,
         # 使用自定义 tokenizer (支持高级分割参数)
