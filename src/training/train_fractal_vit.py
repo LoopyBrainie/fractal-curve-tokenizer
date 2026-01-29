@@ -2894,7 +2894,7 @@ def main():
     arch_config = ModelArchitectureConfig(
         num_classes=spec.num_classes,
         dim=args.dim,
-        depth=args.depth,
+        num_layers=args.depth,  # I145: depth -> num_layers
         heads=args.heads,
         dim_head=args.dim_head,
         mlp_dim=args.mlp_dim if args.mlp_dim else args.dim * 4,
@@ -2905,7 +2905,7 @@ def main():
         token_coverage_min=args.token_coverage_min,
         token_coverage_max=args.token_coverage_max,
         K_min_abs=K_min,
-        max_depth=args.max_depth if args.max_depth is not None else 8,
+        max_level=args.max_depth if args.max_depth is not None else 8,  # I145: max_depth -> max_level
         ffn_type=args.ffn_type,
         use_checkpoint=args.gradient_checkpoint,
         use_channels_last=args.channels_last,
@@ -2936,14 +2936,14 @@ def main():
 
             # 模型架构配置 (从 arch_config 获取)
             self.dim = arch_config.dim
-            self.depth = arch_config.depth
+            self.depth = arch_config.num_layers  # I145: depth <- num_layers
             self.heads = arch_config.heads
             self.dim_head = arch_config.dim_head
             self.mlp_dim = arch_config.mlp_dim
             self.pool = arch_config.pool
             self.ffn_type = arch_config.ffn_type
             self.min_patch_size = arch_config.min_patch_size
-            self.max_depth = arch_config.max_depth
+            self.max_depth = arch_config.max_level  # I145: max_depth <- max_level
             self.dropout = args.dropout
             self.emb_dropout = args.emb_dropout
             self.drop_path_rate = args.drop_path
