@@ -246,6 +246,13 @@ def compute_total_candidates(
     return (4 ** (max_depth + 1) - 1) // 3
 
 
+# ==================== 向后兼容别名 ====================
+
+# I145: max_level 是新的标准术语，max_depth 是旧名
+# 提供别名以保持向后兼容
+compute_max_level = compute_max_depth
+
+
 # ==================== I31: 形状-尺度计算函数 ====================
 
 def compute_region_shape_scale(

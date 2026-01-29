@@ -46,7 +46,12 @@ from .tokenizer_streaming import StreamingFractalTokenizerV3
 from .base_tokenizer import BaseTokenizer, TokenizerOutput
 from .block_transformer import FractalTransformer, FFNType
 from .utils import pair
-from .constants import DIVISION_EPSILON, PROB_EPSILON
+from .constants import (
+    DIVISION_EPSILON, PROB_EPSILON,
+    TEMPERATURE_MIN,
+    compute_max_level, compute_num_candidates, compute_k_bounds,
+    clamp_temperature
+)
 from .config import AttentionEncoderConfig  # I98-3
 
 
@@ -101,7 +106,7 @@ class FractalCurveViT(nn.Module):
     - 边缘检测和纹理复杂度分析
     - 自适应多尺度处理
     
-    P0 修复: max_depth 参数统一为标准数学术语（分形四叉树递归深度），
+    P0 修复: max_level 参数统一为标准数学术语（分形四叉树递归深度），
     与 FractalConfig, LevelsInfo, StreamingFractalTokenizerV3 保持一致。
     这确保所有 Embedding 表大小与实际使用的深度范围匹配，减少约 90% 的参数浪费。
 
@@ -110,7 +115,7 @@ class FractalCurveViT(nn.Module):
         num_classes: 分类类别数
         dim: 模型维度
         pool: 池化策略 ('cls', 'mean' 或其他)
-        max_depth: 最大递归深度 (统一使用 max_depth)
+        max_level: 最大递归深度 (统一使用 max_level)
         tokenizer: 图像 tokenizer
         token_processor: token 处理器
         pos_embedding: 位置编码
@@ -133,7 +138,7 @@ class FractalCurveViT(nn.Module):
         image_size: Optional[Union[int, Tuple[int, int]]] = None,
         num_classes: int = 1000,
         dim: int = 512,
-        depth: int = 6,
+        num_layers: int = 6,  # Transformer 层数
         heads: int = 8,
         mlp_dim: int = 1024,
         pool: str = "weighted",
@@ -142,7 +147,7 @@ class FractalCurveViT(nn.Module):
         dropout: float = 0.0,
         emb_dropout: float = 0.0,
         min_patch_size: Union[int, Tuple[int, int]] = 4,
-        max_depth: Optional[int] = None,  # P0 修复: 统一使用 max_depth
+        max_level: Optional[int] = None,  # Hilbert 四叉树最大分割级数
         use_hilbert_encoding: bool = True,
         use_spatial_encoding: bool = True,
         use_checkpoint: bool = False,
@@ -150,8 +155,10 @@ class FractalCurveViT(nn.Module):
         ffn_type: FFNType = 'swiglu_level',
         lca_temperature: Optional[float] = 1.5,
         learnable_temperature: bool = True,
-        K_min: int = 8,
-        K_max: int = 64,
+        # I33: 覆盖率参数（用于在不同分辨率下正确复算 K 值）
+        # K_min/K_max 现在作为计算属性，不再是直接参数
+        token_coverage_min: float = 0.01,
+        token_coverage_max: float = 0.05,
         pos_dropout: Optional[float] = None,
         use_area_encoding: bool = False,
         use_affine_modulation: bool = True,
@@ -185,8 +192,8 @@ class FractalCurveViT(nn.Module):
             dim_head: 每个注意力头的维度
             dropout: Dropout 比率
             emb_dropout: 嵌入层 Dropout 比率
-            min_patch_size: 目标最小 patch 大小，用于动态计算 max_depth
-            max_depth: 最大递归深度 (P0: 统一使用 max_depth)
+            min_patch_size: 目标最小 patch 大小，用于动态计算 max_level
+            max_level: 最大递归深度 (P0: 统一使用 max_level)
             use_hilbert_encoding: 是否使用 Hilbert 编码
             use_spatial_encoding: 是否使用空间编码
             ffn_type: FFN 变体 ('gelu', 'swiglu', 'swiglu_level')
@@ -214,11 +221,19 @@ class FractalCurveViT(nn.Module):
         self.num_classes = num_classes
         self.dim = dim
         self.pool = pool
-        # P0 修复: max_depth 将在 tokenizer 创建后从 tokenizer.max_depth 获取
+        # P0 修复: max_level 将在 tokenizer 创建后从 tokenizer.max_level 获取
         self.use_checkpoint = use_checkpoint
         self.ffn_type = ffn_type
 
-        self.lca_temperature = lca_temperature
+        # I33: 存储覆盖率参数（用于 K 值计算）
+        self.token_coverage_min = token_coverage_min
+        self.token_coverage_max = token_coverage_max
+
+        # 温度钳制（防止梯度饱和）
+        self.lca_temperature = clamp_temperature(
+            lca_temperature if lca_temperature is not None else 1.5,
+            TEMPERATURE_MIN
+        )
         self.learnable_temperature = learnable_temperature
         self.lca_fp16 = lca_fp16  # I104-3
 
@@ -241,11 +256,22 @@ class FractalCurveViT(nn.Module):
         else:
             effective_min_patch_size = min_patch_size
 
+        # 存储几何配置和编码选项
+        self.min_patch_size = effective_min_patch_size
+        self.use_hilbert_encoding = use_hilbert_encoding
+        self.use_spatial_encoding = use_spatial_encoding
+        self.use_area_encoding = use_area_encoding
+        self.use_affine_modulation = use_affine_modulation
+        self.fourier_levels = fourier_levels
+        self.dropout = dropout
+        self.emb_dropout = emb_dropout
+        self.drop_path_rate = drop_path_rate
+
         # I78: 处理动态分辨率模式 (必须在使用 effective_min_patch_size 之后)
         if image_size is None:
             # 使用 min_patch_size 估算默认图像尺寸用于初始化
             # 估算公式: min(H, W) ≈ min_patch_size × 2^6 = min_patch_size × 64
-            # max_depth 将由 StreamingFractalTokenizerV3 根据实际输入图像自动计算
+            # max_level 将由 StreamingFractalTokenizerV3 根据实际输入图像自动计算
             estimated_size = effective_min_patch_size * 64
             self.image_size = pair(estimated_size)
             self._dynamic_image_size = True
@@ -267,24 +293,35 @@ class FractalCurveViT(nn.Module):
             from .gumbel_topk_splitter import GumbelTopKSplitter
             from .config import SplitterConfig
 
-            # I98-1: 确定 max_depth_limit (根据 tokenizer 或默认值)
-            max_depth_limit = 8  # 默认值
+            # I98-1: 确定 max_level_limit (根据 tokenizer 或默认值)
+            max_level_limit = 8  # 默认值
             if tokenizer is not None:
-                if hasattr(tokenizer, 'max_depth'):
-                    max_depth_limit = tokenizer.max_depth
+                if hasattr(tokenizer, 'max_level'):
+                    max_level_limit = tokenizer.max_level
+
+            # I33: 使用 compute_k_bounds 从 coverage 计算 K 值
+            K_min_computed, K_max_computed = compute_k_bounds(
+                max_level=max_level_limit,
+                token_coverage_min=token_coverage_min,
+                token_coverage_max=token_coverage_max,
+                image_size=min(self.image_size) if self.image_size else None,
+            )
 
             splitter_config = SplitterConfig(
                 feature_dim=dim,
                 min_patch_size=effective_min_patch_size,
-                max_depth_limit=max_depth_limit,
+                max_level_limit=max_level_limit,
                 hidden_dim=64,
                 intermediate_dim=64,
                 pool_size=4,
-                K_min=K_min,
-                K_max=K_max,
+                K_min=K_min_computed,
+                K_max=K_max_computed,
                 use_dynamic_k=True,
                 dropout=min(dropout, 0.15),
                 enable_learnable_quota=quota_learnable if quota_learnable is not None else True,
+                # I33: 传递覆盖率参数（用于 ModelGene 保存）
+                token_coverage_min=token_coverage_min,
+                token_coverage_max_hard=token_coverage_max,
             )
             self.splitter = GumbelTopKSplitter(
                 config=splitter_config,
@@ -301,8 +338,8 @@ class FractalCurveViT(nn.Module):
                 base_patch_size=effective_min_patch_size,
                 min_patch_size=effective_min_patch_size,
             )
-            if max_depth is not None:
-                tokenizer_kwargs['max_depth'] = max_depth
+            if max_level is not None:
+                tokenizer_kwargs['max_level'] = max_level
             tokenizer = StreamingFractalTokenizerV3(**tokenizer_kwargs)
 
         self.tokenizer = tokenizer
@@ -310,13 +347,13 @@ class FractalCurveViT(nn.Module):
         # I98-1: 设置 tokenizer 对 model 的弱引用，避免循环引用导致递归遍历失败
         tokenizer._model = weakref.ref(self)
 
-        # P11-2 修复: 从 tokenizer 动态获取 max_depth 作为 max_depth
-        if max_depth is None:
-            if hasattr(tokenizer, 'max_depth'):
-                max_depth = tokenizer.max_depth
+        # P11-2 修复: 从 tokenizer 动态获取 max_level 作为 max_level
+        if max_level is None:
+            if hasattr(tokenizer, 'max_level'):
+                max_level = tokenizer.max_level
             else:
-                max_depth = 8
-        self.max_depth = max_depth
+                max_level = 8
+        self.max_level = max_level
 
         self.token_processor = None
 
@@ -329,7 +366,7 @@ class FractalCurveViT(nn.Module):
                 from .embed_fractal_position import AreaEnhancedPositionEmbedding
                 position_embedding = AreaEnhancedPositionEmbedding(
                     dim=dim,
-                    max_depth=max_depth,
+                    max_level=max_level,
                     fourier_levels=fourier_levels,
                     use_hilbert_encoding=use_hilbert_encoding,
                     use_spatial_encoding=use_spatial_encoding,
@@ -338,7 +375,7 @@ class FractalCurveViT(nn.Module):
             else:
                 position_embedding = FractalPositionEmbedding(
                     dim=dim,
-                    max_depth=max_depth,
+                    max_level=max_level,
                     max_seq_len=10000,
                     use_hilbert_encoding=use_hilbert_encoding,
                     use_spatial_encoding=use_spatial_encoding,
@@ -354,7 +391,8 @@ class FractalCurveViT(nn.Module):
         else:
             self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
 
-        self.dropout = nn.Dropout(emb_dropout)
+        # I145: 使用单独的变量名避免覆盖 self.dropout（保存了 dropout float 值）
+        self.emb_dropout_module = nn.Dropout(emb_dropout)
 
         # I30-11: 已删除 Mixed Pooling
         self.register_buffer("aux_loss_weight", torch.tensor(0.0))
@@ -368,12 +406,12 @@ class FractalCurveViT(nn.Module):
             # 动态创建 Transformer（向后兼容）
             self.transformer = FractalTransformer(
                 dim=dim,
-                depth=depth,
+                depth=num_layers,
                 heads=heads,
                 dim_head=dim_head,
                 mlp_dim=mlp_dim,
                 dropout=dropout,
-                max_depth=max_depth,
+                max_level=max_level,
                 drop_path_rate=drop_path_rate,
                 ffn_type=ffn_type,
                 use_checkpoint=use_checkpoint,
@@ -399,12 +437,122 @@ class FractalCurveViT(nn.Module):
             )
             self.num_classes = num_classes
             self.dim = dim
-            self.depth = depth
+            self.num_layers = num_layers
             self.heads = heads
             self.mlp_dim = mlp_dim
 
         # 权重初始化 - 关键改进，防止类别偏差
         self._init_weights()
+
+    # =========================================================================
+    # TIER 2: 变参数计算属性 (Variables)
+    # =========================================================================
+    # 这些属性根据模型参数动态计算，确保 K 值在不同分辨率下正确复算。
+
+    @property
+    def K_min(self) -> int:
+        """最少 token 数量（Tier 2: 变参数）。
+
+        数学形式化:
+            K_min = max(K_MIN_HARD, ceil(N_candidates × coverage_min))
+            N_candidates = Σ(4^d), d=0..max_level
+
+        计算时机:
+            - 访问时动态计算
+            - 基于存储的 coverage 参数和 max_level
+
+        Returns:
+            最少 token 数量
+        """
+        max_level = self.max_level if self.max_level is not None else 8
+        K_min, _ = compute_k_bounds(
+            max_level=max_level,
+            token_coverage_min=self.token_coverage_min,
+            token_coverage_max=self.token_coverage_max,
+            image_size=min(self.image_size) if self.image_size else None,
+        )
+        return K_min
+
+    @property
+    def K_max(self) -> int:
+        """最多 token 数量（Tier 2: 变参数）。
+
+        数学形式化:
+            K_max = min(K_MAX_HARD, ceil(N_candidates × coverage_max × scale))
+            N_candidates = Σ(4^d), d=0..max_level
+            scale = sqrt(min(H, W) / 224)
+
+        计算时机:
+            - 访问时动态计算
+            - 基于存储的 coverage 参数、max_level 和 image_size
+
+        Returns:
+            最多 token 数量
+        """
+        max_level = self.max_level if self.max_level is not None else 8
+        _, K_max = compute_k_bounds(
+            max_level=max_level,
+            token_coverage_min=self.token_coverage_min,
+            token_coverage_max=self.token_coverage_max,
+            image_size=min(self.image_size) if self.image_size else None,
+        )
+        return K_max
+
+    @property
+    def num_candidates(self) -> int:
+        """候选节点总数（Tier 2: 变参数）。
+
+        数学形式化:
+            N_candidates = Σ(4^d), d=0..max_level = (4^(max_level+1) - 1) / 3
+
+        Returns:
+            四叉树候选节点总数
+        """
+        max_level = self.max_level if self.max_level is not None else 8
+        return compute_num_candidates(max_level)
+
+    def get_model_config(self) -> Dict[str, Any]:
+        """获取模型参数字典（Tier 3: 参数快照）。
+
+        用于 checkpoint 序列化，确保模型可复现。
+
+        Returns:
+            包含所有 Tier 3 参数的字典
+        """
+        # I145: 安全获取 quota_learnable（可能在某些配置中不存在）
+        quota_learnable = getattr(self, 'quota_learnable', None)
+
+        return {
+            # 核心架构
+            'num_classes': self.num_classes,
+            'dim': self.dim,
+            'num_layers': self.num_layers,
+            'heads': self.heads,
+            'mlp_dim': self.mlp_dim,
+            # 几何配置
+            'image_size': self.image_size,
+            'min_patch_size': self.min_patch_size,
+            'max_level': self.max_level,
+            # 覆盖率预算 (I33)
+            'token_coverage_min': self.token_coverage_min,
+            'token_coverage_max': self.token_coverage_max,
+            # 编码选项
+            'lca_temperature': self.lca_temperature,
+            'learnable_temperature': self.learnable_temperature,
+            'use_hilbert_encoding': self.use_hilbert_encoding,
+            'use_spatial_encoding': self.use_spatial_encoding,
+            'use_area_encoding': self.use_area_encoding,
+            'use_affine_modulation': self.use_affine_modulation,
+            'fourier_levels': self.fourier_levels,
+            # 正则化
+            'dropout': self.dropout,
+            'emb_dropout': self.emb_dropout,
+            'drop_path_rate': self.drop_path_rate,
+            # FFN
+            'ffn_type': self.ffn_type,
+            # I24-2: 可学习配额
+            'quota_learnable': quota_learnable,
+        }
 
     # I98-2: 特征提取器抽象 - 封装 tokenizer.shared_conv
     @property
@@ -545,8 +693,8 @@ class FractalCurveViT(nn.Module):
             token_output = self.tokenizer.tokenize(img)
 
         # P9-5 优化: 使用预填充缓存接口，避免 O(B) Python 循环
-        # I98-4: info_dim = max_depth + 1 对应 levels_info 的 (depth + paths) 结构
-        info_dim = self.max_depth + 1
+        # I98-4: info_dim = max_level + 1 对应 levels_info 的 (depth + paths) 结构
+        info_dim = self.max_level + 1
         padded_tokens, lengths = token_output.get_padded_tokens()
         padded_levels = token_output.get_padded_levels(info_dim)
         levels_list = token_output.levels_list()
@@ -571,7 +719,7 @@ class FractalCurveViT(nn.Module):
 
         Args:
             padded_tokens: 填充后的 tokens [B, MaxLen, Dim]
-            padded_levels: 填充后的层级信息 [B, MaxLen, max_depth+1]
+            padded_levels: 填充后的层级信息 [B, MaxLen, max_level+1]
             regions: (I31-3) 区域边界张量，形状 [B, N, 4]
             image_size: (I31-3) 图像尺寸，可以是整数或 (W, H) 元组
 
@@ -585,7 +733,7 @@ class FractalCurveViT(nn.Module):
 
         # I98-4: 将 raw tensor 转换为 LevelsInfo
         from .levels_info import LevelsInfo
-        levels_info = LevelsInfo(data=padded_levels, max_depth=self.max_depth)
+        levels_info = LevelsInfo(data=padded_levels, max_level=self.max_level)
 
         # I31-3: 传递 regions 和 image_size 给位置编码器（用于面积编码）
         pos_emb = self.pos_embedding(levels_info, regions=regions, image_size=image_size)
@@ -598,13 +746,13 @@ class FractalCurveViT(nn.Module):
         cls_level = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         cls_depths = levels_info.depths  # (B, MaxLen)
         all_depths = torch.cat([cls_level, cls_depths], dim=1)  # (B, 1+MaxLen)
-        # all_paths shape: (B, 1+MaxLen, max_depth)
-        all_paths = torch.zeros(batch_size, all_depths.shape[1], self.max_depth, dtype=torch.long, device=device)
-        all_paths[:, 1:, :] = levels_info.paths  # (B, 1+MaxLen, max_depth)
+        # all_paths shape: (B, 1+MaxLen, max_level)
+        all_paths = torch.zeros(batch_size, all_depths.shape[1], self.max_level, dtype=torch.long, device=device)
+        all_paths[:, 1:, :] = levels_info.paths  # (B, 1+MaxLen, max_level)
 
-        levels_info_with_cls = LevelsInfo.from_arrays(all_depths, all_paths, max_depth=self.max_depth)
+        levels_info_with_cls = LevelsInfo.from_arrays(all_depths, all_paths, max_level=self.max_level)
 
-        x = self.dropout(x)
+        x = self.emb_dropout_module(x)
 
         return x, levels_info_with_cls
 
@@ -724,8 +872,8 @@ class FractalCurveViT(nn.Module):
         if return_aux_info:
             # P-OPT: 完全在 GPU 上计算，避免 CPU 同步
             # 根因: .to('cpu') 会导致 torch.compile 的 cudagraphs 失败
-            max_depth = self.tokenizer.max_depth if hasattr(self, 'tokenizer') else 8
-            max_depth_range = max_depth + 1
+            max_level = self.tokenizer.max_level if hasattr(self, 'tokenizer') else 8
+            max_level_range = max_level + 1
             B = len(levels_list)
 
             # P-OPT: 向量化深度分布计算 - 完全 GPU 计算
@@ -778,9 +926,9 @@ class FractalCurveViT(nn.Module):
                         valid_counts.append(0)  # 确保 valid_counts 长度始终等于 B
 
                 # 向量化 depth 计数 [B, D]
-                all_depth_counts = torch.zeros(B, max_depth_range,
+                all_depth_counts = torch.zeros(B, max_level_range,
                                                dtype=torch.float32, device=lengths.device)
-                for d in range(max_depth_range):
+                for d in range(max_level_range):
                     mask = (padded_depths == d)
                     all_depth_counts[:, d] = mask.sum(dim=1, dtype=torch.float32)
 
@@ -811,7 +959,7 @@ class FractalCurveViT(nn.Module):
                 levels_used_list = []
                 for i in range(B):
                     if valid_bool[i]:
-                        nonzero = all_depth_counts[i][:max_depth + 1].nonzero(as_tuple=True)[0]
+                        nonzero = all_depth_counts[i][:max_level + 1].nonzero(as_tuple=True)[0]
                         levels_used_list.append(nonzero.tolist())
                     else:
                         levels_used_list.append([])
@@ -859,7 +1007,7 @@ class FractalCurveViT(nn.Module):
                         aux_infos.append(aux_info)
                         continue
 
-                    d_max = min(levels_used[-1], max_depth)
+                    d_max = min(levels_used[-1], max_level)
                     depth_distribution = {
                         d: float(normalized_counts[i, d])
                         for d in levels_used if d <= d_max
@@ -969,20 +1117,20 @@ class FractalCurveViT(nn.Module):
         depth_dist = first_aux.get('depth_distribution', {})
 
         # I135: 辅助函数 - 递归展平嵌套结构，提取所有整数值
-        # P-OPT: 避免在 forward 中使用 .cpu()，使用 GPU 计算 max_depth
+        # P-OPT: 避免在 forward 中使用 .cpu()，使用 GPU 计算 max_level
         # 从 levels_list 推断主要使用的深度
         # I142: 使用向量化操作替代 for 循环中的 int() 转换，避免 CPU 同步
         if levels_list and len(levels_list) > 0:
             # 向量化计算所有 depths 的最大值
-            all_max_depths = []
+            all_max_levels = []
             for levels in levels_list:
                 if levels.numel() > 0:
                     # 获取每个样本的最大深度
-                    all_max_depths.append(levels[:, 0].max())
-            if all_max_depths:
+                    all_max_levels.append(levels[:, 0].max())
+            if all_max_levels:
                 # 使用 torch.stack 和 max，避免 CPU 同步
-                max_depth_tensor = torch.stack(all_max_depths).max()
-                depth_used = int(max_depth_tensor)  # 只有一次 CPU 同步
+                max_level_tensor = torch.stack(all_max_levels).max()
+                depth_used = int(max_level_tensor)  # 只有一次 CPU 同步
             else:
                 depth_used = 0
         else:
@@ -1078,18 +1226,18 @@ class FractalCurveViT(nn.Module):
                     image_stats = {
                         "num_tokens": 0,
                         "levels_used": [],
-                        "max_depth": 0,
+                        "max_level": 0,
                         "level_distribution": [],
                     }
                 else:
                     depths = levels[:, 0] if levels.numel() > 0 else levels.new_empty(0)
                     unique_levels = depths.unique().tolist()
-                    max_depth = depths.max().item() if depths.numel() > 0 else 0
+                    max_level = depths.max().item() if depths.numel() > 0 else 0
 
                     image_stats = {
                         "num_tokens": tokens.shape[0],
                         "levels_used": unique_levels,
-                        "max_depth": max_depth,
+                        "max_level": max_level,
                         "level_distribution": torch.bincount(depths.long()).tolist() if depths.numel() > 0 else [],
                     }
 
@@ -1104,7 +1252,7 @@ class FractalCurveViT(nn.Module):
                     "total_tokens": total_tokens,
                     "avg_tokens_per_image": total_tokens / len(tokens_list),
                     "unique_levels_used": sorted(list(set(all_levels))),
-                    "max_depth_overall": max(all_levels),
+                    "max_level_overall": max(all_levels),
                     "level_usage_distribution": dict(zip(*torch.unique(level_tensor.cpu(), return_counts=True))),
                 }
             else:
@@ -1112,7 +1260,7 @@ class FractalCurveViT(nn.Module):
                     "total_tokens": 0,
                     "avg_tokens_per_image": 0,
                     "unique_levels_used": [],
-                    "max_depth_overall": 0,
+                    "max_level_overall": 0,
                     "level_usage_distribution": {},
                 }
 
@@ -1249,8 +1397,8 @@ class FractalCurveViT(nn.Module):
                     }
 
             # 配额分配
-            if hasattr(splitter, 'quota_logits') and hasattr(splitter, '_current_max_depth'):
-                D = splitter._current_max_depth + 1
+            if hasattr(splitter, 'quota_logits') and hasattr(splitter, '_current_max_level'):
+                D = splitter._current_max_level + 1
                 quota = torch.softmax(splitter.quota_logits[:D], dim=0)
                 # I145: 延迟 CPU 转换，保留为 GPU tensor 或 detach 后转换
                 # 训练时仅记录标量值，避免 cudagraphs 失败
@@ -1304,7 +1452,7 @@ class FractalCurveViT(nn.Module):
         architecture = {
             'num_classes': self.num_classes,
             'dim': self.dim,
-            'depth': self.depth,
+            'num_layers': self.num_layers,
             'heads': self.heads,
             'mlp_dim': self.mlp_dim,
             'pool': self.pool,
@@ -1317,8 +1465,8 @@ class FractalCurveViT(nn.Module):
             tokenizer_info = {
                 'type': type(t).__name__,
             }
-            if hasattr(t, 'max_depth'):
-                tokenizer_info['max_depth'] = t.max_depth
+            if hasattr(t, 'max_level'):
+                tokenizer_info['max_level'] = t.max_level
             if hasattr(t, 'K_min'):
                 tokenizer_info['K_min'] = t.K_min
             if hasattr(t, 'K_max'):
@@ -1436,13 +1584,13 @@ def create_fractal_vit(
     *,
     # 模型维度配置
     dim: int = 512,
-    depth: int = 6,
+    num_layers: int = 6,
     heads: int = 8,
     mlp_dim: int = 1024,
     # 图像处理配置
     channels: int = 3,
     min_patch_size: Union[int, Tuple[int, int]] = 4,
-    max_depth: Optional[int] = None,
+    max_level: Optional[int] = None,
     # Tokenizer 配置
     use_hilbert_encoding: bool = True,
     use_spatial_encoding: bool = True,
@@ -1484,12 +1632,12 @@ def create_fractal_vit(
         image_size: 输入图像尺寸，None 表示动态分辨率
         num_classes: 分类类别数
         dim: 模型嵌入维度
-        depth: Transformer 层数
+        num_layers: Transformer 层数
         heads: 注意力头数
         mlp_dim: MLP 隐藏层维度
         channels: 输入图像通道数
-        min_patch_size: 最小 patch 大小（用于动态计算 max_depth）
-        max_depth: 最大递归层级，None 表示自动计算
+        min_patch_size: 最小 patch 大小（用于动态计算 max_level）
+        max_level: 最大递归层级，None 表示自动计算
         use_hilbert_encoding: 是否使用 Hilbert 编码
         use_spatial_encoding: 是否使用空间编码
         K_min: 最少 token 数量
@@ -1515,7 +1663,7 @@ def create_fractal_vit(
         ...     image_size=None,
         ...     num_classes=200,
         ...     dim=384,
-        ...     depth=8,
+        ...     num_layers=8,
         ... )
         >>> # 固定分辨率模式
         >>> model = create_fractal_vit(
@@ -1543,15 +1691,15 @@ def create_fractal_vit(
         actual_image_size = pair(image_size)
         dynamic_image_size = False
 
-    # 确定 max_depth
-    if max_depth is None:
-        max_depth = 8  # 默认值
+    # 确定 max_level
+    if max_level is None:
+        max_level = 8  # 默认值
 
     # 创建 Splitter
     splitter_config = SplitterConfig(
         feature_dim=dim,
         min_patch_size=effective_min_patch_size,
-        max_depth_limit=max_depth,
+        max_level_limit=max_level,
         hidden_dim=64,
         intermediate_dim=64,
         pool_size=4,
@@ -1572,7 +1720,7 @@ def create_fractal_vit(
         channels=channels,
         d_model=dim,
         base_patch_size=effective_min_patch_size,
-        max_depth=max_depth,
+        max_level=max_level,
         min_patch_size=effective_min_patch_size,
     )
 
@@ -1581,7 +1729,7 @@ def create_fractal_vit(
         from .embed_fractal_position import AreaEnhancedPositionEmbedding
         position_embedding = AreaEnhancedPositionEmbedding(
             dim=dim,
-            max_depth=max_depth,
+            max_level=max_level,
             fourier_levels=fourier_levels,
             use_hilbert_encoding=use_hilbert_encoding,
             use_spatial_encoding=use_spatial_encoding,
@@ -1590,7 +1738,7 @@ def create_fractal_vit(
     else:
         position_embedding = FractalPositionEmbedding(
             dim=dim,
-            max_depth=max_depth,
+            max_level=max_level,
             max_seq_len=10000,
             use_hilbert_encoding=use_hilbert_encoding,
             use_spatial_encoding=use_spatial_encoding,
@@ -1600,12 +1748,12 @@ def create_fractal_vit(
     # 创建 Transformer
     transformer = FractalTransformer(
         dim=dim,
-        depth=depth,
+        depth=num_layers,
         heads=heads,
         dim_head=dim // heads,
         mlp_dim=mlp_dim,
         dropout=dropout,
-        max_depth=max_depth,
+        max_level=max_level,
         drop_path_rate=drop_path_rate,
         ffn_type=ffn_type,
         use_checkpoint=use_checkpoint,
@@ -1641,12 +1789,12 @@ def create_fractal_vit(
         # 配置
         num_classes=num_classes,
         dim=dim,
-        depth=depth,
+        num_layers=num_layers,
         heads=heads,
         mlp_dim=mlp_dim,
         pool=pool,
         image_size=actual_image_size,
-        max_depth=max_depth,
+        max_level=max_level,
         dynamic_image_size=dynamic_image_size,
     )
 

@@ -81,7 +81,7 @@ class SplitterConfig:
     # 核心架构参数
     feature_dim: int = 256
     min_patch_size: int = 4
-    max_depth_limit: int = 8
+    max_level_limit: int = 8
     hidden_dim: int = 64
     intermediate_dim: int = 64
     pool_size: int = 4
@@ -144,10 +144,10 @@ class SplitterConfig:
     # I24-4: 边界条件验证
     def validate(self) -> None:
         """验证配置参数的有效性"""
-        if self.max_depth_limit < 2:
+        if self.max_level_limit < 2:
             raise ValueError(
-                "I24-4: max_depth_limit >= 2 是推荐配置。"
-                f"当前 max_depth_limit={self.max_depth_limit} 是边界情况，"
+                "I24-4: max_level_limit >= 2 是推荐配置。"
+                f"当前 max_level_limit={self.max_level_limit} 是边界情况，"
                 "支持但可能导致不平衡的 token 分布。"
             )
 
@@ -171,7 +171,7 @@ class AttentionConfig:
 
     # Hilbert 偏置参数
     lca_bias: bool = True
-    max_depth: int = 8
+    max_level: int = 8
     lca_embedding_dim: int = 128
     lca_temperature: Optional[float] = None  # None = 自动
     learnable_temperature: bool = True
@@ -205,7 +205,7 @@ class TokenizerConfig:
     embed_dim: int = 256
 
     # 深度参数
-    max_depth: int = 8
+    max_level: int = 8
 
     # Hilbert 排序
     use_hilbert_order: bool = True
@@ -229,7 +229,7 @@ class TransformerConfig:
     FractalTransformer 配置
     """
     dim: int = 256
-    depth: int = 8
+    num_layers: int = 8
     heads: int = 8
     head_dim: Optional[int] = None
 
@@ -302,7 +302,7 @@ class FractalViTConfig:
                 'channels': self.tokenizer_config.channels,
                 'patch_size': self.tokenizer_config.patch_size,
                 'embed_dim': self.tokenizer_config.embed_dim,
-                'max_depth': self.tokenizer_config.max_depth,
+                'max_level': self.tokenizer_config.max_level,
                 'use_hilbert_order': self.tokenizer_config.use_hilbert_order,
                 'splitter_config': {
                     'enable_learnable_quota': self.tokenizer_config.splitter_config.enable_learnable_quota,
@@ -314,7 +314,7 @@ class FractalViTConfig:
             },
             'transformer_config': {
                 'dim': self.transformer_config.dim,
-                'depth': self.transformer_config.depth,
+                'num_layers': self.transformer_config.num_layers,
                 'heads': self.transformer_config.heads,
                 'mlp_ratio': self.transformer_config.mlp_ratio,
                 'use_swiglu': self.transformer_config.use_swiglu,
@@ -568,9 +568,9 @@ class FractalConfig:
     数学形式化
     ==========
     推导链:
-        max_depth = ⌈log₂(image_size / min_patch_size)⌉
-        num_scales = max_depth + 1
-        patch_sizes = (min_patch_size × 2^i)_{i=0}^{max_depth}
+        max_level = ⌈log₂(image_size / min_patch_size)⌉
+        num_scales = max_level + 1
+        patch_sizes = (min_patch_size × 2^i)_{i=0}^{max_level}
         grid_size = image_size / min_patch_size
         num_tokens = grid_size²
 
@@ -587,7 +587,7 @@ class FractalConfig:
     tokenizer_type: TokenizerType = 'streaming_v3'
 
     # ========== 推导参数 (自动计算) ==========
-    max_depth: int = field(init=False)
+    max_level: int = field(init=False)
     num_scales: int = field(init=False)
     patch_sizes: Tuple[int, ...] = field(init=False)
     grid_size: int = field(init=False)
@@ -617,14 +617,14 @@ class FractalConfig:
 
         # 计算推导参数
         if ratio > 1:
-            max_depth = math.ceil(math.log2(ratio))
+            max_level = math.ceil(math.log2(ratio))
         else:
-            max_depth = 0
+            max_level = 0
 
-        object.__setattr__(self, 'max_depth', max_depth)
-        object.__setattr__(self, 'num_scales', max_depth + 1)
+        object.__setattr__(self, 'max_level', max_level)
+        object.__setattr__(self, 'num_scales', max_level + 1)
         object.__setattr__(self, 'patch_sizes', tuple(
-            self.min_patch_size * (2 ** i) for i in range(max_depth + 1)
+            self.min_patch_size * (2 ** i) for i in range(max_level + 1)
         ))
         object.__setattr__(self, 'grid_size', ratio)
         object.__setattr__(self, 'num_tokens', ratio * ratio)
@@ -644,11 +644,11 @@ class FractalConfig:
 
     def scale_to_depth(self, scale_idx: int) -> int:
         """将尺度索引转换为四叉树深度."""
-        return self.max_depth - scale_idx
+        return self.max_level - scale_idx
 
     def depth_to_scale(self, depth: int) -> int:
         """将四叉树深度转换为尺度索引."""
-        return self.max_depth - depth
+        return self.max_level - depth
 
     def patch_size_at_scale(self, scale_idx: int) -> int:
         """获取指定尺度的 patch 大小."""
@@ -672,7 +672,7 @@ class FractalConfig:
             f"FractalConfig(\n"
             f"  # Geometry\n"
             f"  image_size={self.image_size}, min_patch_size={self.min_patch_size}\n"
-            f"  max_depth={self.max_depth}, num_scales={self.num_scales}\n"
+            f"  max_level={self.max_level}, num_scales={self.num_scales}\n"
             f"  patch_sizes={self.patch_sizes}\n"
             f"  grid_size={self.grid_size}{grid_note}, num_tokens={self.num_tokens}\n"
             f"  # Hilbert Strategy\n"

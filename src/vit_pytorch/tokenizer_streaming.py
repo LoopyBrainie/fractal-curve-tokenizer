@@ -84,7 +84,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         channels: 图像通道数
         d_model: 输出嵌入维度
         base_patch_size: 最细粒度 patch 大小
-        max_depth: 最大四叉树深度
+        max_level: 最大四叉树深度
         use_hilbert_order: 是否使用 Hilbert 曲线排序
         target_tokens: 目标 token 数量
         enforce_balance: 是否强制 2:1 平衡约束
@@ -107,11 +107,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         channels: int = 3,
         d_model: int = 256,
         base_patch_size: int = 4,
-        # I30-17: 替换固定 max_depth 为动态计算
+        # I30-17: 替换固定 max_level 为动态计算
         # 支持 Union[int, Tuple[int, int]] 用于向后兼容
         min_patch_size: Union[int, Tuple[int, int]] = 4,
-        # 保留 max_depth 用于向后兼容 (可选，如果指定则使用该值)
-        max_depth: Optional[int] = None,
+        max_level: Optional[int] = None,
         use_hilbert_order: bool = True,
         # I98-1: 移除 Splitter 相关参数
         # Splitter 现在是独立组件，通过 tokenize() 参数传入
@@ -141,29 +140,29 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # I30-17: 动态深度计算
         self.min_patch_size = effective_min_patch_size  # 存储规范化后的值
 
-        # 动态计算 max_depth (用于 splitter)
+        # 动态计算 max_level (用于 splitter)
         # 公式: L_max = max(0, floor(log2(min(H, W) / min_patch_size)))
-        from .depth_utils import compute_max_depth
-        self._computed_max_depth = compute_max_depth(
+        from .depth_utils import compute_max_level
+        self._computed_max_level = compute_max_level(
             image_size, effective_min_patch_size
         )
 
-        # I30-17-EXT: 确定最终使用的 max_depth
-        # 优先级: 显式指定 max_depth > 动态计算
-        self.max_depth = max_depth if max_depth is not None else self._computed_max_depth
+        # I30-17-EXT: 确定最终使用的 max_level
+        # 优先级: 显式指定 max_level > 动态计算
+        self.max_level = max_level if max_level is not None else self._computed_max_level
 
         # =====================================================================
         # Hilbert-Native Patch Embedding (包含 SharedConv)
         # =====================================================================
         from .embed_hilbert_patch import HilbertNativePatchEmbed
-        # I30-17-EXT: 使用动态计算的 max_depth
+        # I30-17-EXT: 使用动态计算的 max_level
         # 对于 embedding 层，需要在 __init__ 时确定深度
-        # 使用 self.max_depth (可能由用户显式指定，也可能由动态计算得到)
+        # 使用 self.max_level (可能由用户显式指定，也可能由动态计算得到)
         self.patch_embed = HilbertNativePatchEmbed(
             channels=channels,
             dim=d_model,
             base_patch_size=base_patch_size,
-            max_depth=self.max_depth,  # 保持使用计算后的深度
+            max_level=self.max_level,  # 保持使用计算后的深度
             conv_layers=2,
             use_batch_norm=True,
             depth_scale_range=depth_scale_range,
@@ -190,19 +189,19 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
     @property
     def patch_sizes(self) -> List[int]:
-        """兼容性属性: 从 base_patch_size 和 max_depth 计算等效的 patch 大小列表.
-        
+        """兼容性属性: 从 base_patch_size 和 max_level 计算等效的 patch 大小列表.
+
         数学形式:
-            patch_sizes[d] = base_patch_size × 2^d, d ∈ [0, max_depth]
-            
-        例如: base_patch_size=4, max_depth=4
+            patch_sizes[d] = base_patch_size × 2^d, d ∈ [0, max_level]
+
+        例如: base_patch_size=4, max_level=4
             → patch_sizes = [4, 8, 16, 32, 64]
             
         Note:
             这是为了向后兼容旧版评估脚本。V3 tokenizer 使用可变深度 token,
             实际 patch 大小由 LearnableSplitter 动态决定。
         """
-        return [self.base_patch_size * (2 ** d) for d in range(self.max_depth + 1)]
+        return [self.base_patch_size * (2 ** d) for d in range(self.max_level + 1)]
     
     @property 
     def shared_conv(self) -> nn.Module:
@@ -222,7 +221,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             channels=channels,
             d_model=d_model,
             base_patch_size=config.patch_sizes[0] if config.patch_sizes else 4,
-            max_depth=config.max_depth,
+            max_level=config.max_level,
             use_hilbert_order=True,
         )
     
@@ -308,7 +307,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             # 计算 depth distribution
             # P-OPT-3: 使用向量化操作，避免 Python for 循环
             depth_dists = []
-            max_d = self.max_depth + 1
+            max_d = self.max_level + 1
             depths = tensor_result.depths
             batch_indices = tensor_result.batch_indices
 
@@ -411,16 +410,16 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         
         if total_tokens == 0:
             tokens = torch.zeros(B, 1, dim, device=device, dtype=dtype)
-            levels_info = torch.zeros(B, 1, self.max_depth + 1, dtype=torch.long, device=device)
+            levels_info = torch.zeros(B, 1, self.max_level + 1, dtype=torch.long, device=device)
             return self.patch_embed.norm(tokens), levels_info
-        
+
         # 收集所有 region 的 boxes 和 depths
         all_boxes = []
         all_depths = []
         all_levels_info = []
         batch_indices = []
         token_indices = []
-        
+
         p = self.base_patch_size
         for b, sr in enumerate(split_results):
             for i, token in enumerate(sr.tokens):
@@ -428,13 +427,13 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 fy1 = token.region.y1 / p
                 fx2 = token.region.x2 / p
                 fy2 = token.region.y2 / p
-                
+
                 fx2 = max(fx1 + 0.5, fx2)
                 fy2 = max(fy1 + 0.5, fy2)
-                
+
                 all_boxes.append([b, fx1, fy1, fx2, fy2])
-                all_depths.append(min(token.depth, self.max_depth))
-                all_levels_info.append(token.to_levels_info(self.max_depth))
+                all_depths.append(min(token.depth, self.max_level))
+                all_levels_info.append(token.to_levels_info(self.max_level))
                 batch_indices.append(b)
                 token_indices.append(i)
         
@@ -464,7 +463,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         
         # 分配到输出 buffer (P-PERF-3: 向量化分配)
         tokens = torch.zeros(B, max_tokens, dim, device=device, dtype=dtype)
-        levels_info = torch.zeros(B, max_tokens, self.max_depth + 1, dtype=torch.long, device=device)
+        levels_info = torch.zeros(B, max_tokens, self.max_level + 1, dtype=torch.long, device=device)
         
         # 使用高级索引进行向量化分配
         batch_idx_tensor = torch.tensor(batch_indices, device=device, dtype=torch.long)
@@ -550,7 +549,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         Returns:
             (tokens, levels_info, padded_regions):
             - tokens: [B, MaxN, D] 嵌入后的 tokens
-            - levels_info: [B, MaxN, max_depth+1] 层级信息
+            - levels_info: [B, MaxN, max_level+1] 层级信息
             - padded_regions: [B, MaxN, 4] 区域边界 (P11-3 新增)
         """
         from .gumbel_topk_splitter import TensorSplitResult
@@ -564,7 +563,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         if N_total == 0:
             tokens = torch.zeros(B, 1, dim, device=device, dtype=dtype)
             # I32-2: 使用-1 sentinel标识padding token，避免与有效depth=0混淆
-            levels_info = torch.full((B, 1, self.max_depth + 1), -1, dtype=torch.long, device=device)
+            levels_info = torch.full((B, 1, self.max_level + 1), -1, dtype=torch.long, device=device)
             padded_regions = torch.zeros(B, 1, 4, dtype=torch.long, device=device)
             return self.patch_embed.norm(tokens), levels_info, padded_regions
 
@@ -607,7 +606,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 深度编码 (向量化)
         # ====================================================================
         # I34-7 Fix: Add min=0 boundary protection to prevent negative depth index errors
-        depths = tensor_result.depths.clamp(min=0, max=self.max_depth)
+        depths = tensor_result.depths.clamp(min=0, max=self.max_level)
         scales = self.patch_embed.depth_scale[depths]  # [N]
         embeds = self.patch_embed.depth_embed(depths)   # [N, D]
         all_tokens = pooled * scales.unsqueeze(-1) + embeds  # [N, D]
@@ -619,7 +618,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         max_tokens_safe = max(1, max_tokens)
         tokens = torch.zeros(B, max_tokens_safe, dim, device=device, dtype=dtype)
         # I32-2: 使用-1 sentinel标识padding token，避免与有效depth=0混淆
-        levels_info = torch.full((B, max_tokens_safe, self.max_depth + 1), -1, dtype=torch.long, device=device)
+        levels_info = torch.full((B, max_tokens_safe, self.max_level + 1), -1, dtype=torch.long, device=device)
         padded_regions = torch.zeros(B, max_tokens_safe, 4, dtype=torch.long, device=device)  # P11-3
 
         # I99-1: 修复 batch 独立性 - 确保按 (batch_idx, hilbert_idx) 排序
@@ -693,18 +692,18 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         levels_info[batch_indices, token_positions, 0] = depths
 
         # 计算四叉树路径 (基于区域中心的空间位置)
-        # regions: [N_total, 4] -> paths: [N_total, max_depth]
+        # regions: [N_total, 4] -> paths: [N_total, max_level]
         if N_total > 0:
             # 获取图像尺寸 (Hilbert 曲线要求方形，使用较大边)
             img_size = max(self.image_size) if isinstance(self.image_size, tuple) else self.image_size
             paths = VectorizedPathEncoder.compute_paths_from_regions(
                 tensor_result_regions_sorted,  # [N_total, 4] - 使用排序后的 regions
                 img_size,
-                self.max_depth
-            )  # [N_total, max_depth]
+                self.max_level
+            )  # [N_total, max_level]
 
             # 填充路径到 levels_info
-            # levels_info 格式: [depth, path[0], path[1], ..., path[max_depth-1]]
+            # levels_info 格式: [depth, path[0], path[1], ..., path[max_level-1]]
             levels_info[batch_indices, token_positions, 1:] = paths
 
         # P11-3: 分配 regions 到 padded buffer
@@ -843,7 +842,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         scale_ratios = {}
         for depth, count in total_dist.items():
-            ps = self.base_patch_size * (2 ** (self.max_depth - depth))
+            ps = self.base_patch_size * (2 ** (self.max_level - depth))
             scale_ratios[ps] = count / total_tokens
 
         entropy = 0.0
@@ -852,11 +851,11 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             if p > 0:
                 entropy -= p * math.log(p)
 
-        num_depths = self.max_depth + 1
+        num_depths = self.max_level + 1
         max_entropy = math.log(num_depths) if num_depths > 1 else 0.0
 
         dominant_depth = max(total_dist.keys(), key=lambda d: total_dist[d])
-        dominant_scale = self.base_patch_size * (2 ** (self.max_depth - dominant_depth))
+        dominant_scale = self.base_patch_size * (2 ** (self.max_level - dominant_depth))
 
         return {
             'scale_ratios': scale_ratios,
@@ -878,7 +877,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         stats = {
             'tokenizer_version': 'v3_unified',
             'architecture': 'shared_conv + hilbert_embed',
-            'max_depth': self.max_depth,
+            'max_level': self.max_level,
             'learnable_split': True,
         }
 

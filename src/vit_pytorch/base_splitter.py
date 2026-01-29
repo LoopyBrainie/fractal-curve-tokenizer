@@ -85,7 +85,7 @@ class CoreSplitter(Protocol):
         根据输入尺寸动态更新候选区域。
 
         数学:
-            L_max = min(max_depth_limit, floor(log2(min(H, W) / min_patch_size)))
+            L_max = min(max_level_limit, floor(log2(min(H, W) / min_patch_size)))
             N = Σ_{d=0}^{L_max} 4^d = (4^{L_max+1} - 1) / 3
 
         Args:
@@ -98,7 +98,7 @@ class CoreSplitter(Protocol):
         ...
 
     @property
-    def max_depth_limit(self) -> int:
+    def max_level_limit(self) -> int:
         """
         获取最大深度限制。
 
@@ -448,7 +448,7 @@ def validate_core_splitter(splitter: Any, name: str = "Splitter") -> None:
         AssertionError: 如果缺少必需方法
     """
     required_methods = ['forward', 'update_candidates']
-    required_properties = ['max_depth_limit', 'num_candidates', 'is_training']
+    required_properties = ['max_level_limit', 'num_candidates', 'is_training']
 
     for method in required_methods:
         assert hasattr(splitter, method), f"{name} 缺少必需方法: {method}"

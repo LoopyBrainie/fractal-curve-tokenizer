@@ -283,14 +283,14 @@ class TokenizerOutput:
         # 从缓存张量构造 LevelsInfo
         if self._padded_levels_cache is not None:
             D = self._padded_levels_cache.shape[-1] - 1
-            info = LevelsInfo(data=self._padded_levels_cache, max_depth=D)
+            info = LevelsInfo(data=self._padded_levels_cache, max_level=D)
         else:
             # 从 sequences 构造
             all_levels = self._build_levels_info_tensor()
             if all_levels is None:
                 return None
             D = all_levels.shape[-1] - 1
-            info = LevelsInfo(data=all_levels, max_depth=D)
+            info = LevelsInfo(data=all_levels, max_level=D)
 
         self._levels_info_cache = info
         return info
@@ -337,7 +337,7 @@ class TokenizerOutput:
         否则回退到标准 padding 逻辑。
         
         Args:
-            info_dim: 目标 info 维度 (通常是 max_depth + 4)
+            info_dim: 目标 info 维度 (通常是 max_level + 4)
             
         Returns:
             padded_levels: [B, MaxN, info_dim] 填充后的 levels
@@ -422,14 +422,14 @@ class TokenizerOutput:
         """
         return self._split_probs_cache
 
-    def get_levels_info(self, max_depth: int) -> "LevelsInfo":
+    def get_levels_info(self, max_level: int) -> "LevelsInfo":
         """获取 LevelsInfo 实例 (I98-4 新增, I98-5 简化).
 
         I98-5: 现在直接使用 levels_info 属性（返回 LevelsInfo）。
         仅在 levels_info 为 None 时创建新的 LevelsInfo。
 
         Args:
-            max_depth: 四叉树最大深度
+            max_level: 四叉树最大深度
 
         Returns:
             LevelsInfo 实例
@@ -442,8 +442,8 @@ class TokenizerOutput:
         from .levels_info import LevelsInfo
         B = self.batch_size
         N = 1
-        all_levels = torch.zeros(B, N, max_depth + 1, dtype=torch.long)
-        return LevelsInfo(data=all_levels, max_depth=max_depth)
+        all_levels = torch.zeros(B, N, max_level + 1, dtype=torch.long)
+        return LevelsInfo(data=all_levels, max_level=max_level)
 
     def to_legacy(self) -> "LegacyTokenizerOutput":
         return LegacyTokenizerOutput(

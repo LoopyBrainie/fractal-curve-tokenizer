@@ -114,7 +114,7 @@ class HilbertBiasBase(ABC, nn.Module):
                 was_2d = True
                 levels_info = levels_info.unsqueeze(0)  # (1, S, Info)
 
-            # 从数据形状推断 max_depth: info_dim = max_depth + 1
+            # 从数据形状推断 max_level: info_dim = max_level + 1
             info_dim = levels_info.shape[-1]
 
             # I98-4: 如果 info_dim == 1（只有深度列），返回 None
@@ -122,9 +122,9 @@ class HilbertBiasBase(ABC, nn.Module):
             if info_dim <= 1:
                 return None
 
-            inferred_max_depth = info_dim - 1
+            inferred_max_level = info_dim - 1
 
-            levels_info = LevelsInfo(data=levels_info, max_depth=inferred_max_depth)
+            levels_info = LevelsInfo(data=levels_info, max_level=inferred_max_level)
 
         if levels_info.data.numel() == 0:
             return None
@@ -217,7 +217,7 @@ class LCAHilbertBias(HilbertBiasBase):
     
     def __init__(
         self,
-        max_depth: int,
+        max_level: int,
         heads: int,
         lca_temperature: Optional[float] = 1.5,
         learnable_temperature: bool = True,
@@ -226,7 +226,7 @@ class LCAHilbertBias(HilbertBiasBase):
         """初始化 LCA Hilbert Bias。
 
         Args:
-            max_depth: 最大四叉树深度 (决定 LCA 取值范围)
+            max_level: 最大四叉树深度 (决定 LCA 取值范围)
             heads: 注意力头数
             lca_temperature: LCA 偏置温度参数初始值
                 - None: 不使用温度缩放 (兼容旧版，等效 τ=1)
@@ -239,13 +239,13 @@ class LCAHilbertBias(HilbertBiasBase):
                 - False: 使用 FP32 (默认)
         """
         super().__init__()
-        self.max_depth = max_depth
+        self.max_level = max_level
         self.heads = heads
         self.use_fp16 = use_fp16
 
-        # LCA 深度嵌入表: depth ∈ {0, 1, ..., max_depth} → R^heads
-        # 深度 0 表示完全不同的根节点，深度 max_depth 表示相邻或相同
-        self.lca_embedding = nn.Embedding(max_depth + 1, heads)
+        # LCA 深度嵌入表: depth ∈ {0, 1, ..., max_level} → R^heads
+        # 深度 0 表示完全不同的根节点，深度 max_level 表示相邻或相同
+        self.lca_embedding = nn.Embedding(max_level + 1, heads)
 
         # I104-3: FP16 转换 + 权重裁剪保护
         # FP16 精度 (~10⁻³) 满足 LCA 偏置需求 ([-2, 2] 范围)
@@ -332,17 +332,17 @@ class LCAHilbertBias(HilbertBiasBase):
     
     def _init_weights(self) -> None:
         """初始化 LCA 嵌入权重。
-        
+
         采用对数衰减初始化:
-            embed[d] ∝ log(1 + d) / log(1 + max_depth)
-            
+            embed[d] ∝ log(1 + d) / log(1 + max_level)
+
         这样深层 (邻近) token 获得更高的初始偏置。
         """
         with torch.no_grad():
-            depths = torch.arange(self.max_depth + 1, dtype=torch.float32)
+            depths = torch.arange(self.max_level + 1, dtype=torch.float32)
             # 归一化对数深度: [0, 1]
             log_depths = torch.log1p(depths) / torch.log1p(
-                torch.tensor(float(self.max_depth))
+                torch.tensor(float(self.max_level))
             )
             # 广播到所有 heads，加小随机扰动
             init_values = log_depths.unsqueeze(1).expand(-1, self.heads)
@@ -409,13 +409,13 @@ class LCAHilbertBias(HilbertBiasBase):
 
         # I34-13: LCA 钳位改为异常 - 静默钳位掩盖计算 bug
         # I102-5: 使用张量比较避免 GPU-CPU 同步
-        lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_depth).any()
+        lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_level).any()
         if lca_invalid:
             min_depth = lca_depths.min().item()
-            max_depth = lca_depths.max().item()
+            max_level = lca_depths.max().item()
             raise ValueError(
-                f"LCA depth out of bounds [0, {self.max_depth}]: "
-                f"min={min_depth:.2f}, max={max_depth:.2f}. "
+                f"LCA depth out of bounds [0, {self.max_level}]: "
+                f"min={min_depth:.2f}, max={max_level:.2f}. "
                 "This indicates a bug in LCA computation."
             )
 
@@ -482,20 +482,20 @@ class LCAHilbertBias(HilbertBiasBase):
 
         # 从 regions 计算四叉树路径
         paths = VectorizedPathEncoder.compute_paths_from_regions(
-            regions, image_size, self.max_depth
-        )  # [B, N, max_depth]
+            regions, image_size, self.max_level
+        )  # [B, N, max_level]
         
         # 计算 LCA 深度矩阵
         lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
         # I34-13: LCA 钳位警告 - 静默钳位可能隐藏计算 bug
         # I102-5: 使用张量比较 + 延迟构造警告消息
-        lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_depth).any()
+        lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_level).any()
         if lca_invalid:
             warnings.warn(
-                f"LCA depth clamped to [0, {self.max_depth}]. "
+                f"LCA depth clamped to [0, {self.max_level}]. "
                 f"Min: {lca_depths.min().item():.2f}, Max: {lca_depths.max().item():.2f}"
             )
-        lca_depths = lca_depths.clamp(0, self.max_depth)  # [B, N, N]
+        lca_depths = lca_depths.clamp(0, self.max_level)  # [B, N, N]
         
         # 批量嵌入: (B, N, N, H)
         bias = self.lca_embedding(lca_depths)
@@ -521,7 +521,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
 
     通过编码层级深度和 Hilbert 路径关系来调制注意力权重。
 
-    P0 修复: max_depth 参数统一为标准数学术语（分形四叉树递归深度），
+    P0 修复: max_level 参数统一为标准数学术语（分形四叉树递归深度），
     与 FractalConfig, LevelsInfo, StreamingFractalTokenizerV3 保持一致。
 
     P11-8 简化: 移除 bias_mode 和 low_rank_r 参数，仅保留 LCA 模式。
@@ -531,7 +531,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
     Attributes:
         heads: 注意力头数
         dim_head: 每个头的维度
-        max_depth: 最大深度 (应与 tokenizer.max_depth 匹配)
+        max_level: 最大深度 (应与 tokenizer.max_level 匹配)
         use_hilbert_bias: 是否使用 Hilbert 偏置
         use_level_scaling: 是否使用层级缩放
         scale: 注意力缩放因子
@@ -544,7 +544,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         heads: int = 8,
         dim_head: int = 64,
         dropout: float = 0.0,
-        max_depth: int = 8,  # P0 修复: 统一使用 max_depth
+        max_level: int = 8,  # P0 修复: 统一使用 max_level
         use_hilbert_bias: bool = True,
         use_level_scaling: bool = True,
         lca_temperature: Optional[float] = 1.5,
@@ -561,10 +561,10 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
     ) -> None:
         """初始化 HilbertAwareMultiScaleAttention (I98-3 协议驱动版本).
 
-        P0 修复: max_depth 是标准数学术语，直接描述四叉树递归深度：
+        P0 修复: max_level 是标准数学术语，直接描述四叉树递归深度：
             - 深度 0: 整幅图像（根节点）
             - 深度 d: 图像被划分为 4^d 个 patch
-            - 深度 D: 最细粒度 (max_depth)
+            - 深度 D: 最细粒度 (max_level)
 
         P11-8 简化: 移除 bias_mode 和 low_rank_r 参数，仅保留 LCA 模式。
 
@@ -581,7 +581,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             heads: 注意力头数
             dim_head: 每个头的维度
             dropout: Dropout 比率
-            max_depth: 最大深度 (P0: 统一使用 max_depth，与 tokenizer.max_depth 对齐)
+            max_level: 最大深度 (P0: 统一使用 max_level，与 tokenizer.max_level 对齐)
             use_hilbert_bias: 是否使用 Hilbert 路径偏置 (使用 LCA 模式)
             use_level_scaling: 是否使用层级缩放
             lca_temperature: (P6-2) LCA 偏置温度参数，默认 1.5
@@ -597,7 +597,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         super().__init__()
         self.heads = heads
         self.dim_head = dim_head
-        self.max_depth = max_depth  # P0 修复: 统一使用 max_depth
+        self.max_level = max_level  # P0 修复: 统一使用 max_level
         self.use_hilbert_bias = use_hilbert_bias
         self.use_level_scaling = use_level_scaling
         self.use_fp16 = use_fp16  # I104-3
@@ -629,7 +629,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         # P11-8 简化: 仅使用 LCA 模式
         if use_hilbert_bias:
             self.hilbert_bias_impl: Optional[nn.Module] = LCAHilbertBias(
-                max_depth=max_depth,
+                max_level=max_level,
                 heads=heads,
                 lca_temperature=lca_temperature,
                 learnable_temperature=learnable_temperature,
@@ -642,7 +642,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         if self.use_affine_modulation:
             self.affine_modulated_bias: Optional[nn.Module] = AffineModulatedBias(
                 dim=dim,
-                max_depth=max_depth,
+                max_level=max_level,
                 config=self.config,
                 use_fp16=use_fp16,  # I104-3
             )
@@ -654,7 +654,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             # 原设计使用 N(1.0, 0.1) 初始化，但无正性约束，有偏梯度可导致负值
             # 新设计: softplus(_level_scale_raw) ∈ (0, +∞)
             # I98-3: 从配置读取初始化值，默认 softplus(0.54) ≈ 1.0
-            self._level_scale_raw: Optional[nn.Embedding] = nn.Embedding(max_depth + 1, heads)
+            self._level_scale_raw: Optional[nn.Embedding] = nn.Embedding(max_level + 1, heads)
             nn.init.constant_(self._level_scale_raw.weight, self.config.level_scale_init)
         else:
             self._level_scale_raw = None
@@ -662,7 +662,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         # I97-10: 层级化注意力的深度缩放因子
         # 每个深度有独立的缩放因子，用于深度内 Attention
         if use_hierarchical_attention:
-            self._hierarchical_depth_scale = nn.Parameter(torch.ones(max_depth + 1, heads))
+            self._hierarchical_depth_scale = nn.Parameter(torch.ones(max_level + 1, heads))
             # I98-3: 从配置读取初始化边界，默认 [0.5, 1.5]
             low, high = self.config.hierarchical_scale_bounds
             nn.init.uniform_(self._hierarchical_depth_scale, low, high)
@@ -696,7 +696,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         # 理由: LayerNorm 已将 Q,K 方差控制在 1，1/√d_k 已足够
         # 双重缩放导致 Var(dots) ≈ 0.69 而非理论最优的 1.0
         self._scale_weights_raw = None
-        self.relative_pos_embedding = nn.Embedding(2 * max_depth + 1, heads)
+        self.relative_pos_embedding = nn.Embedding(2 * max_level + 1, heads)
 
         self.attend = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
@@ -809,7 +809,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
 
         depths = levels_info.depths  # (B, S)
         level_diff = depths.unsqueeze(2) - depths.unsqueeze(1)  # (B, S, S)
-        level_diff = level_diff.clamp(-self.max_depth, self.max_depth) + self.max_depth
+        level_diff = level_diff.clamp(-self.max_level, self.max_level) + self.max_level
         rel_pos_bias = self.relative_pos_embedding(level_diff)  # (B, S, S, H)
         return rel_pos_bias.permute(0, 3, 1, 2)  # (B, H, S, S)
 
@@ -938,7 +938,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
 
         # 深度缩放因子 (用于层级化注意力)
         if self._hierarchical_depth_scale is not None:
-            depth_scales = self._hierarchical_depth_scale  # [max_depth+1, heads]
+            depth_scales = self._hierarchical_depth_scale  # [max_level+1, heads]
         else:
             depth_scales = None
 
@@ -957,7 +957,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         mask_2d_buffer = torch.zeros(batch, seq_len, seq_len, dtype=torch.bool, device=x.device)
 
         # 遍历每个深度，分别计算 Attention
-        for d in range(self.max_depth + 1):
+        for d in range(self.max_level + 1):
             # 深度 d 的 token 掩码 [B, N]
             depth_mask = (depths == d)
             depth_count = depth_mask.sum(dim=1)  # [B]
@@ -1055,11 +1055,11 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             if levels_info.dim() == 2:
                 levels_info = levels_info.unsqueeze(0)  # (1, S, Info)
 
-            # 从数据形状推断 max_depth: info_dim = max_depth + 1
+            # 从数据形状推断 max_level: info_dim = max_level + 1
             info_dim = levels_info.shape[-1]
-            inferred_max_depth = info_dim - 1
+            inferred_max_level = info_dim - 1
 
-            levels_info = LevelsInfo(data=levels_info, max_depth=inferred_max_depth)
+            levels_info = LevelsInfo(data=levels_info, max_level=inferred_max_level)
 
         # I97-10: 层级化注意力模式
         if self.use_hierarchical_attention and levels_info is not None and levels_info.data.numel() > 0:
@@ -1121,7 +1121,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             if has_level_scaling:
                 assert self._level_scale_raw is not None
                 depths = levels_info.depths
-                depths_clamped = depths.clamp(min=0, max=self.max_depth)
+                depths_clamped = depths.clamp(min=0, max=self.max_level)
                 level_scaling_tensor = F.softplus(self._level_scale_raw(depths_clamped))  # (B, S, H)
 
             # Flash Attention 2 需要变长序列参数
@@ -1190,8 +1190,8 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             assert self._level_scale_raw is not None
 
             depths = levels_info.depths  # [B, S]
-            # I98-4: clamp depths to [0, max_depth] to handle padding sentinel (-1)
-            depths_clamped = depths.clamp(min=0, max=self.max_depth)
+            # I98-4: clamp depths to [0, max_level] to handle padding sentinel (-1)
+            depths_clamped = depths.clamp(min=0, max=self.max_level)
             # I34-15: 移除 2D 分支死代码，levels_info 始终为 3D
             # P11-4: Softplus 约束确保 level_scales ∈ (0, +∞)
             level_scales = F.softplus(self._level_scale_raw(depths_clamped))  # (B, S, H)
@@ -1543,7 +1543,7 @@ class LCAHilbertBiasWithShapeScale(nn.Module):
     def __init__(
         self,
         dim: int,
-        max_depth: int,
+        max_level: int,
         lca_embedding_dim: Optional[int] = None,
         enable_shape_scale: bool = True,
         shape_scale_dim: Optional[int] = None,
@@ -1557,7 +1557,7 @@ class LCAHilbertBiasWithShapeScale(nn.Module):
         ----
         dim : int
             注意力维度
-        max_depth : int
+        max_level : int
             最大四叉树深度
         lca_embedding_dim : int, optional
             LCA 嵌入维度，默认等于 dim
@@ -1583,7 +1583,7 @@ class LCAHilbertBiasWithShapeScale(nn.Module):
         # LCA 嵌入层
         lca_embed_dim = lca_embedding_dim or dim
         self.lca_embedding = nn.Embedding(
-            num_embeddings=max_depth + 1,
+            num_embeddings=max_level + 1,
             embedding_dim=lca_embed_dim
         )
 
@@ -2077,7 +2077,7 @@ class AffineModulatedBias(nn.Module):
     def __init__(
         self,
         dim: int,
-        max_depth: int,
+        max_level: int,
         config: Optional[AttentionEncoderConfig] = None,
         use_fp16: bool = False,  # I104-3: FP16 存储选项
     ):
@@ -2087,7 +2087,7 @@ class AffineModulatedBias(nn.Module):
         ----
         dim : int
             注意力维度
-        max_depth : int
+        max_level : int
             最大四叉树深度
         config : AttentionEncoderConfig, optional
             编码器配置，为 None 时使用默认配置
@@ -2102,7 +2102,7 @@ class AffineModulatedBias(nn.Module):
 
         self.config = config
         self.dim = dim
-        self.max_depth = max_depth
+        self.max_level = max_level
         self.enable_area_modulation = config.area.fourier_levels > 0
 
         # I98-3: 从配置获取 scale_init_factor
@@ -2111,7 +2111,7 @@ class AffineModulatedBias(nn.Module):
         # 空间偏置 (LCA) - 始终使用 dim 作为嵌入维度以保持一致性
         # config.lca.embedding_dim 仅用于配置记录，实际使用 dim
         self.lca_embedding = nn.Embedding(
-            num_embeddings=max_depth + 1,
+            num_embeddings=max_level + 1,
             embedding_dim=dim
         )
 
@@ -2197,12 +2197,12 @@ class AffineModulatedBias(nn.Module):
 
         # 从 regions 计算四叉树路径
         paths = VectorizedPathEncoder.compute_paths_from_regions(
-            regions_int, image_size, self.max_depth
+            regions_int, image_size, self.max_level
         )
 
         # 计算 LCA 深度矩阵
         lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
-        lca_depths = lca_depths.clamp(0, self.max_depth)
+        lca_depths = lca_depths.clamp(0, self.max_level)
 
         # 嵌入 [B, N, N, dim]
         bias = self.lca_embedding(lca_depths)

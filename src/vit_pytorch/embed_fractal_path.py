@@ -112,31 +112,31 @@ class VectorizedPathEncoder:
     def compute_quadrant_paths(
         x: torch.Tensor,
         y: torch.Tensor,
-        max_depth: int,
+        max_level: int,
     ) -> torch.Tensor:
         """向量化计算四叉树路径.
         
-        数学: q_l = bit(x, max_depth-l) + 2 × bit(y, max_depth-l)
+        数学: q_l = bit(x, max_level-l) + 2 × bit(y, max_level-l)
         
         Args:
             x: [N] x 坐标
             y: [N] y 坐标
-            max_depth: 最大深度
+            max_level: 最大深度
             
         Returns:
-            paths: [N, max_depth] 四叉树路径，每个元素 ∈ {0, 1, 2, 3}
+            paths: [N, max_level] 四叉树路径，每个元素 ∈ {0, 1, 2, 3}
         """
         N = x.shape[0]
         device = x.device
         
-        if max_depth == 0:
+        if max_level == 0:
             return torch.zeros(N, 1, dtype=torch.long, device=device)
         
-        # 创建深度索引 [0, 1, ..., max_depth-1]
-        depths = torch.arange(max_depth, device=device)
+        # 创建深度索引 [0, 1, ..., max_level-1]
+        depths = torch.arange(max_level, device=device)
         
-        # 计算每个深度的位移量 [max_depth-1, max_depth-2, ..., 0]
-        shifts = max_depth - 1 - depths  # [D]
+        # 计算每个深度的位移量 [max_level-1, max_level-2, ..., 0]
+        shifts = max_level - 1 - depths  # [D]
         
         # 扩展维度以支持广播
         x_exp = x.unsqueeze(1)  # [N, 1]
@@ -157,17 +157,17 @@ class VectorizedPathEncoder:
     def compute_paths_from_regions(
         regions: torch.Tensor,
         image_size: Union[int, Tuple[int, int]],
-        max_depth: int,
+        max_level: int,
     ) -> torch.Tensor:
         """从区域边界向量化计算四叉树路径.
         
         数学原理:
             对于区域中心 (cx, cy)，第 d 层的象限由以下决定:
             
-            grid_size = 2^max_depth
+            grid_size = 2^max_level
             normalized_x = cx * grid_size / image_size
-            qx_d = (normalized_x >> (max_depth - 1 - d)) & 1
-            qy_d = (normalized_y >> (max_depth - 1 - d)) & 1
+            qx_d = (normalized_x >> (max_level - 1 - d)) & 1
+            qy_d = (normalized_y >> (max_level - 1 - d)) & 1
             quadrant_d = qx_d + 2 * qy_d
         
         这与 compute_quadrant_paths 使用相同的数学公式，但输入是像素坐标而非网格坐标。
@@ -175,10 +175,10 @@ class VectorizedPathEncoder:
         Args:
             regions: [N, 4] 或 [B, N, 4]，格式 (x1, y1, x2, y2)
             image_size: 图像边长 (int 或 (H, W) tuple，Hilbert 曲线要求方形)
-            max_depth: 最大四叉树深度
+            max_level: 最大四叉树深度
             
         Returns:
-            paths: [N, max_depth] 或 [B, N, max_depth] 四叉树路径
+            paths: [N, max_level] 或 [B, N, max_level] 四叉树路径
         """
         # 处理 image_size 元组 (Hilbert 曲线要求方形，使用较大边)
         if isinstance(image_size, tuple):
@@ -197,7 +197,7 @@ class VectorizedPathEncoder:
         B, N, _ = regions.shape
         device = regions.device
         
-        if max_depth == 0:
+        if max_level == 0:
             result = torch.zeros(B, N, 1, dtype=torch.long, device=device)
             return result.squeeze(0) if was_2d else result
         
@@ -208,8 +208,8 @@ class VectorizedPathEncoder:
         
         # 将像素坐标转换为网格坐标
         # 使用位移运算替代幂运算，避免 Triton 编译问题
-        # grid_size = 2^max_depth = 1 << max_depth
-        grid_size = 1 << max_depth
+        # grid_size = 2^max_level = 1 << max_level
+        grid_size = 1 << max_level
         # 缩放: grid_x = cx * grid_size // img_size
         gx = cx * grid_size // img_size  # [B, N]
         gy = cy * grid_size // img_size  # [B, N]
@@ -220,8 +220,8 @@ class VectorizedPathEncoder:
         
         # 使用 compute_quadrant_paths 的相同位运算逻辑
         # 但这里需要处理 batch 维度
-        depths = torch.arange(max_depth, device=device)  # [D]
-        shifts = max_depth - 1 - depths  # [D]
+        depths = torch.arange(max_level, device=device)  # [D]
+        shifts = max_level - 1 - depths  # [D]
         
         # 扩展维度: [B, N, 1] 和 [1, 1, D]
         gx_exp = gx.unsqueeze(-1)  # [B, N, 1]
@@ -320,7 +320,7 @@ class FractalPathEmbedding(nn.Module):
         super().__init__()
         self.dim = dim
         self.config = config
-        self.max_depth = config.max_depth
+        self.max_level = config.max_level
         
         # 路径编码器
         self.path_encoder = VectorizedPathEncoder(config)
@@ -329,8 +329,8 @@ class FractalPathEmbedding(nn.Module):
         self.scale_embedding = nn.Embedding(config.num_scales, dim)
         
         # 四叉树路径编码
-        # 每层 4 个象限，共 max_depth 层
-        self.quadrant_embedding = nn.Embedding(4 * max(config.max_depth, 1), dim)
+        # 每层 4 个象限，共 max_level 层
+        self.quadrant_embedding = nn.Embedding(4 * max(config.max_level, 1), dim)
         
         # 融合网络
         self.fusion = nn.Sequential(
@@ -346,7 +346,7 @@ class FractalPathEmbedding(nn.Module):
         
         # 预计算最细网格的路径
         paths = VectorizedPathEncoder.compute_quadrant_paths(
-            x_coords, y_coords, config.max_depth
+            x_coords, y_coords, config.max_level
         )
         self.register_buffer('base_paths', paths)
         
@@ -364,7 +364,7 @@ class FractalPathEmbedding(nn.Module):
         """编码四叉树路径.
         
         Args:
-            paths: [B, N, max_depth] 四叉树路径
+            paths: [B, N, max_level] 四叉树路径
             depths: [B, N] 每个 token 的有效深度
             
         Returns:
@@ -422,14 +422,14 @@ class FractalPathEmbedding(nn.Module):
         
         # 2. 路径编码
         # 获取预计算的路径并扩展到 batch
-        paths = self.base_paths[:N].unsqueeze(0).expand(B, -1, -1)  # [B, N, max_depth]
+        paths = self.base_paths[:N].unsqueeze(0).expand(B, -1, -1)  # [B, N, max_level]
         paths = paths.to(device)
         
         # 计算每个 token 的有效深度
-        # scale_idx=0 (最细) → depth=max_depth
+        # scale_idx=0 (最细) → depth=max_level
         # scale_idx=num_scales-1 (最粗) → depth=1
-        depths = self.max_depth - scale_indices + 1  # [B, N]
-        depths = depths.clamp(min=1, max=self.max_depth)
+        depths = self.max_level - scale_indices + 1  # [B, N]
+        depths = depths.clamp(min=1, max=self.max_level)
         
         path_emb = self._encode_paths(paths, depths)  # [B, N, dim]
         
@@ -465,17 +465,17 @@ class HierarchicalAttentionBias(nn.Module):
         super().__init__()
         self.config = config
         self.heads = heads
-        self.max_depth = config.max_depth
+        self.max_level = config.max_level
         
         # 共同祖先深度 → 偏置值
         # depth 0 = 无共同祖先 (除根)
-        # depth max_depth = 完全相同的路径
-        self.ancestor_bias = nn.Embedding(config.max_depth + 2, heads)
+        # depth max_level = 完全相同的路径
+        self.ancestor_bias = nn.Embedding(config.max_level + 2, heads)
         
         # 预计算共同祖先深度矩阵
         path_encoder = VectorizedPathEncoder(config)
         x, y = path_encoder._get_hilbert_coords(config.grid_size)
-        paths = VectorizedPathEncoder.compute_quadrant_paths(x, y, config.max_depth)
+        paths = VectorizedPathEncoder.compute_quadrant_paths(x, y, config.max_level)
         common_depth = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
         self.register_buffer('common_depth_matrix', common_depth)
         
@@ -484,9 +484,9 @@ class HierarchicalAttentionBias(nn.Module):
     def _init_weights(self) -> None:
         # 初始化: 共同祖先越近，偏置越正
         with torch.no_grad():
-            for i in range(self.max_depth + 2):
+            for i in range(self.max_level + 2):
                 # 线性增长: depth 0 → -0.1, depth max → +0.1
-                value = (i / (self.max_depth + 1) - 0.5) * 0.2
+                value = (i / (self.max_level + 1) - 0.5) * 0.2
                 self.ancestor_bias.weight[i].fill_(value)
     
     def forward(

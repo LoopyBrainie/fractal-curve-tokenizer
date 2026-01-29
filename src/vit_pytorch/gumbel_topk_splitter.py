@@ -96,7 +96,6 @@ from .constants import (
     QUOTA_MIN_PER_DEPTH,
     QUOTA_MIN_RATIO,  # I96-7: 自适应深度下界最小采样比例
     QUOTA_MIN_LAMBDA,  # I96-7: 下界软正则化权重
-    QUOTA_INIT_LOGITS,
     QUOTA_ENTROPY_WEIGHT,
     QUOTA_STE_WEIGHT,  # CRIT-6: STE 梯度损失权重
     # I29-2: 阈值方差正则化
@@ -115,6 +114,8 @@ from .constants import (
     ELASTIC_LAMBDA_OVER,
     ELASTIC_LAMBDA_UNDER,
     ELASTIC_LAMBDA_COLLAPSE,
+    # Tier 2: 变参数计算函数
+    compute_quota_init_logits,
 )
 from .config import SplitterConfig
 from .base_splitter import (
@@ -263,9 +264,9 @@ class GumbelTopKSplitter(
         self,
         config: Optional[SplitterConfig] = None,
         feature_dim: int = 256,
-        # I30-17-EXT: 替换固定 max_depth 为 min_patch_size + max_depth_limit
+        # I30-17-EXT: 替换固定 max_depth 为 min_patch_size + max_level_limit
         min_patch_size: int = 4,
-        max_depth_limit: int = 8,  # 参数上界，用于可学习参数分配
+        max_level_limit: int = 8,  # 参数上界，用于可学习参数分配
         hidden_dim: int = 128,
         intermediate_dim: int = 64,
         pool_size: int = 4,
@@ -281,7 +282,7 @@ class GumbelTopKSplitter(
             config: SplitterConfig 统一配置（推荐）
             feature_dim: 输入特征通道数 C
             min_patch_size: 目标最小 patch 大小，用于动态计算 max_depth
-            max_depth_limit: max_depth 硬上限，用于可学习参数分配
+            max_level_limit: max_depth 硬上限，用于可学习参数分配
             hidden_dim: MLP 第一隐藏层维度
             intermediate_dim: MLP 第二隐藏层维度
             pool_size: ROI-Align 输出尺寸 k×k
@@ -301,7 +302,7 @@ class GumbelTopKSplitter(
             self._use_config = True
             feature_dim = config.feature_dim
             min_patch_size = config.min_patch_size
-            max_depth_limit = config.max_depth_limit
+            max_level_limit = config.max_level_limit
             hidden_dim = config.hidden_dim
             intermediate_dim = config.intermediate_dim
             pool_size = config.pool_size
@@ -348,7 +349,7 @@ class GumbelTopKSplitter(
         # I30-17-EXT: 存储配置，不预计算
         self.feature_dim = feature_dim
         self.min_patch_size = min_patch_size
-        self._current_max_depth_limit = max_depth_limit
+        self._current_max_level_limit = max_level_limit
         self.pool_size = pool_size
         self.K_min = K_min
         self.K_max = K_max
@@ -368,8 +369,8 @@ class GumbelTopKSplitter(
         # I30-17-EXT: LRU 缓存用于候选区域
         self._candidate_cache: Dict[Tuple[int, int, int], Tuple] = {}
 
-        # 可学习参数基于 max_depth_limit 上界
-        self._embed_max_depth = max_depth_limit
+        # 可学习参数基于 max_level_limit 上界
+        self._embed_max_depth = max_level_limit
 
         # 复杂度 MLP (输出 logit, 非概率)
         input_dim = feature_dim * pool_size * pool_size
@@ -387,18 +388,18 @@ class GumbelTopKSplitter(
         # I20: 深度嵌入维度基于信息论下界自适应选择
         # 数学: E = max(4, min(8, ceil(log2(D)))) 确保 E >= log2(D)
         # 理由: depth_bias 是标量输出，16维过度冗余
-        def _compute_depth_embed_dim(max_depth_limit: int) -> int:
+        def _compute_depth_embed_dim(max_level_limit: int) -> int:
             """计算深度嵌入维度，基于信息论下界"""
-            D = max_depth_limit + 1
+            D = max_level_limit + 1
             min_required = math.ceil(math.log2(D)) if D > 1 else 1
             return min(8, max(4, min_required))
 
-        depth_embed_dim = _compute_depth_embed_dim(max_depth_limit)
-        self.depth_embedding = nn.Embedding(max_depth_limit + 1, depth_embed_dim)
+        depth_embed_dim = _compute_depth_embed_dim(max_level_limit)
+        self.depth_embedding = nn.Embedding(max_level_limit + 1, depth_embed_dim)
         self.depth_proj = nn.Linear(depth_embed_dim, 1)
 
         # I30-17-EXT: 可学习阈值使用上界维度
-        self.threshold_offsets = nn.Parameter(torch.zeros(max_depth_limit + 1))
+        self.threshold_offsets = nn.Parameter(torch.zeros(max_level_limit + 1))
 
         # 可学习温度
         self.log_temperature = nn.Parameter(torch.tensor(math.log(temperature)))
@@ -418,25 +419,21 @@ class GumbelTopKSplitter(
         #   selected_d = TopK(logits[depth=d], K_d)
         #
         # 初始化:
-        #   φ^(0) = log(p_target) - mean(log(p_target))
-        #   使得 softmax(φ^(0)) = p_target = (0.15, 0.20, 0.25, 0.40)
-        #   对于 D > 4，扩展为均匀分布
+        #   φ^(0) = compute_quota_init_logits(D)
+        #   使用逆深度加权: p_d ∝ 1/(d+1)，支持任意 max_depth
         # ====================================================================
-        # I30-17-EXT: 使用 max_depth_limit 上界
+        # I30-17-EXT: 使用 max_level_limit 上界
         if self._enable_learnable_quota:
-            D = max_depth_limit + 1
+            D = max_level_limit + 1
             if self.config is not None:
-                # 使用 config 中的初始化 logits
+                # 使用 config 中的初始化 logits（向后兼容）
                 quota_init_vals = self.config.get_quota_init_tensor(D)
                 quota_init = torch.tensor(quota_init_vals, dtype=torch.float32)
-            elif D <= len(QUOTA_INIT_LOGITS):
-                quota_init = torch.tensor(QUOTA_INIT_LOGITS[:D], dtype=torch.float32)
             else:
-                # 扩展: 前 4 个用预计算值，后续用均匀分布 (log(1/D))
-                base_init = list(QUOTA_INIT_LOGITS)
-                # 均匀分布的 logit = 0 (因为 softmax 对平移不变)
-                extra_init = [0.0] * (D - len(base_init))
-                quota_init = torch.tensor(base_init + extra_init, dtype=torch.float32)
+                # 使用 compute_quota_init_logits 动态生成初始化值
+                # 替代硬编码的 QUOTA_INIT_LOGITS，支持任意 max_depth
+                quota_init_vals = compute_quota_init_logits(max_level_limit)
+                quota_init = torch.tensor(quota_init_vals, dtype=torch.float32)
             self.quota_logits = nn.Parameter(quota_init)
         else:
             self.quota_logits = None
@@ -475,10 +472,10 @@ class GumbelTopKSplitter(
         # - α=0.1, 有效样本量 ≈ 10
         self._depth_var_normalized: Optional[Tensor] = None  # [D]
 
-        # I35: EMA Running Statistics buffers (max_depth_limit + 1 维度)
+        # I35: EMA Running Statistics buffers (max_level_limit + 1 维度)
         # I99-1: 原实现使用固定 B_max=256 缓冲区
         # I107-1: 优化为动态缓冲区，按需分配，消除内存浪费
-        self._depth_dim = max_depth_limit + 1  # I107-1: 保存深度维度
+        self._depth_dim = max_level_limit + 1  # I107-1: 保存深度维度
         D = self._depth_dim
         # I107-1: 动态缓冲区，不再使用 register_buffer (因为大小会变化)
         self._depth_ema_mean: Optional[Tensor] = None  # [B, D]
@@ -495,9 +492,9 @@ class GumbelTopKSplitter(
         self._init_weights()
 
         # I24-4: 边界条件验证
-        if max_depth_limit < 2:
+        if max_level_limit < 2:
             warnings.warn(
-                "I24-4: max_depth_limit < 2 是边界情况。 "
+                "I24-4: max_level_limit < 2 是边界情况。 "
                 "depth=0 只有 1 个候选区域，depth=1 有 4 个候选区域。 "
                 "此配置可能导致不平衡的 token 分布。建议使用 max_depth >= 2。",
                 UserWarning,
@@ -586,9 +583,9 @@ class GumbelTopKSplitter(
     # ============================================================================
 
     @property
-    def max_depth_limit(self) -> int:
+    def max_level_limit(self) -> int:
         """获取最大深度限制。"""
-        return self._current_max_depth_limit
+        return self._current_max_level_limit
 
     @property
     def num_candidates(self) -> int:
@@ -611,7 +608,7 @@ class GumbelTopKSplitter(
         根据输入尺寸动态更新候选区域。
 
         数学形式:
-            L(X) = min(max_depth_limit, max(0, floor(log2(min(H, W) / min_patch_size))))
+            L(X) = min(max_level_limit, max(0, floor(log2(min(H, W) / min_patch_size))))
 
         Args:
             image_size: (H, W) 输入图像尺寸
@@ -622,7 +619,7 @@ class GumbelTopKSplitter(
 
         # 动态计算 max_depth
         computed_max_depth = compute_max_depth(
-            image_size, self.min_patch_size, self._current_max_depth_limit
+            image_size, self.min_patch_size, self._current_max_level_limit
         )
 
         # 检查缓存
@@ -2820,24 +2817,27 @@ class GumbelTopKSplitter(
 
 def create_gumbel_topk_from_config(
     feature_dim: int = 256,
-    # I30-17-EXT: 替换 max_depth 为 min_patch_size + max_depth_limit
+    # I30-17-EXT: 替换 max_depth 为 min_patch_size + max_level_limit
     # 兼容旧 API: max_depth 仍可用，通过转换得到 min_patch_size
     max_depth: Optional[int] = None,
     min_patch_size: Optional[int] = None,
-    max_depth_limit: int = 8,
+    max_level_limit: int = 8,
     hidden_dim: int = 128,
     pool_size: int = 4,
     temperature: float = 1.0,
     image_size: Tuple[int, int] = (64, 64),
     K_min: int = 8,
     K_max: int = 64,
+    # I33: 覆盖率参数（用于正确复算 K 值）
+    token_coverage_min: float = 0.01,
+    token_coverage_max_hard: float = 0.25,
     **kwargs
 ) -> GumbelTopKSplitter:
     """
     从配置创建 GumbelTopKSplitter。
 
     I30-17-EXT 更新: 支持动态深度计算
-        - 新 API: 使用 min_patch_size + max_depth_limit
+        - 新 API: 使用 min_patch_size + max_level_limit
         - 旧 API: 仍支持 max_depth (自动转换)
 
     使用方法:
@@ -2848,7 +2848,7 @@ def create_gumbel_topk_from_config(
         splitter = create_gumbel_topk_from_config(
             feature_dim=256,
             min_patch_size=4,      # 目标最小 patch 大小
-            max_depth_limit=8,     # 硬上限
+            max_level_limit=8,     # 硬上限
             K_min=8,
             K_max=64,
         )
@@ -2870,20 +2870,29 @@ def create_gumbel_topk_from_config(
         # 旧 API: 从 max_depth 计算 min_patch_size
         min_dim = min(image_size)
         min_patch_size = max(1, min_dim // (2 ** max_depth))
-        max_depth_limit = max(max_depth, max_depth_limit)
+        max_level_limit = max(max_depth, max_level_limit)
 
     if min_patch_size is None:
         min_patch_size = 4  # 默认值
 
-    return GumbelTopKSplitter(
+    # I33: 创建 SplitterConfig 传递覆盖率参数
+    config = SplitterConfig(
         feature_dim=feature_dim,
         min_patch_size=min_patch_size,
-        max_depth_limit=max_depth_limit,
+        max_level_limit=max_level_limit,
         hidden_dim=hidden_dim,
+        intermediate_dim=hidden_dim // 2 if hidden_dim else 64,
         pool_size=pool_size,
-        temperature=temperature,
-        image_size=image_size,
+        dropout=0.1,  # 默认 dropout
         K_min=K_min,
         K_max=K_max,
-        **kwargs
+        use_dynamic_k=True,
+        token_coverage_min=token_coverage_min,
+        token_coverage_max_hard=token_coverage_max_hard,
+    )
+
+    return GumbelTopKSplitter(
+        config=config,
+        image_size=image_size,
+        temperature=temperature,
     )

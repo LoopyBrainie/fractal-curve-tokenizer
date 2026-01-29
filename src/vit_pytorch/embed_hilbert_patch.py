@@ -107,17 +107,17 @@ class HilbertNativePatchEmbed(nn.Module):
     4. LCA 兼容性: 与现有 LCA bias 无缝工作
 
     I30-17-EXT: 支持动态深度计算
-        - 新 API: 使用 min_patch_size + max_depth_limit
-        - 旧 API: 直接指定 max_depth (自动转换)
+        - 新 API: 使用 min_patch_size + max_level_limit
+        - 旧 API: 直接指定 max_level (自动转换)
 
     Args:
         channels: 输入图像通道数
         dim: 输出嵌入维度
         base_patch_size: 最细粒度 patch 大小 (共享 Conv 的 stride)
-        min_patch_size: [新 API] 目标最小 patch 大小，用于动态计算 max_depth
-        max_depth_limit: [新 API] max_depth 硬上限
-        max_depth: [旧 API] 最大四叉树深度 (直接指定)
-        image_size: [新 API] 输入图像尺寸，用于计算 max_depth
+        min_patch_size: [新 API] 目标最小 patch 大小，用于动态计算 max_level
+        max_level_limit: [新 API] max_level 硬上限
+        max_level: [旧 API] 最大四叉树深度 (直接指定)
+        image_size: [新 API] 输入图像尺寸，用于计算 max_level
         conv_layers: SharedConv 层数 (1-3)
         use_batch_norm: 是否使用 BatchNorm
         depth_scale_beta: [已废弃] 使用 depth_scale_range 替代
@@ -133,9 +133,9 @@ class HilbertNativePatchEmbed(nn.Module):
         base_patch_size: int = 4,
         # I30-17-EXT: 新 API 参数
         min_patch_size: Optional[int] = None,
-        max_depth_limit: int = 8,
-        # 旧 API 参数 (直接指定 max_depth)
-        max_depth: Optional[int] = None,
+        max_level_limit: int = 8,
+        # 旧 API 参数 (直接指定 max_level)
+        max_level: Optional[int] = None,
         image_size: Optional[Tuple[int, int]] = None,
         conv_layers: int = 2,
         use_batch_norm: bool = True,
@@ -151,19 +151,19 @@ class HilbertNativePatchEmbed(nn.Module):
         self.depth_scale_range = depth_scale_range
 
         # I30-17-EXT: 处理新旧 API
-        if max_depth is not None:
-            # 旧 API: 直接使用指定的 max_depth
-            self.max_depth = max_depth
+        if max_level is not None:
+            # 旧 API: 直接使用指定的 max_level
+            self.max_level = max_level
         elif min_patch_size is not None and image_size is not None:
-            # 新 API: 从 min_patch_size 计算 max_depth
-            from .depth_utils import compute_max_depth
+            # 新 API: 从 min_patch_size 计算 max_level
+            from .depth_utils import compute_max_level
             H, W = image_size
-            self.max_depth = compute_max_depth(
-                (H, W), min_patch_size, max_depth_limit
+            self.max_level = compute_max_level(
+                (H, W), min_patch_size, max_level_limit
             )
         else:
             # 默认值
-            self.max_depth = max_depth_limit
+            self.max_level = max_level_limit
         
         # =====================================================================
         # SharedConv: 统一的特征提取器
@@ -202,7 +202,7 @@ class HilbertNativePatchEmbed(nn.Module):
         # I24: 使用较小的初始化标准差 (0.02)，避免淹没 pooled features
         # 原问题: nn.Embedding 默认初始化 std~1.0，而 ROI-Align pooled std~0.2
         # 这导致 96% 的 token (同一 depth) 共享几乎相同的表示
-        self.depth_embed = nn.Embedding(max_depth + 1, dim)
+        self.depth_embed = nn.Embedding(max_level + 1, dim)
         nn.init.normal_(self.depth_embed.weight, mean=0.0, std=0.02)
         
         # 深度缩放: 乘法因子，编码 region 的「信息密度」
@@ -210,12 +210,12 @@ class HilbertNativePatchEmbed(nn.Module):
         if depth_scale_range is not None:
             # 新版: 可学习 sigmoid 参数化
             # σ_d = σ_min + (σ_max - σ_min) · sigmoid(γ_d)
-            self._depth_scale_raw = nn.Parameter(torch.zeros(max_depth + 1))
+            self._depth_scale_raw = nn.Parameter(torch.zeros(max_level + 1))
             self._init_depth_scale_learnable()
         else:
             # 旧版: 固定线性初始化 (向后兼容)
             self._depth_scale_raw = None
-            self._depth_scale_fixed = nn.Parameter(torch.ones(max_depth + 1))
+            self._depth_scale_fixed = nn.Parameter(torch.ones(max_level + 1))
             self._init_depth_scale_legacy()
         
         # 层归一化 (可选，用于稳定训练)
@@ -239,9 +239,9 @@ class HilbertNativePatchEmbed(nn.Module):
         sigma_min, sigma_max = self.depth_scale_range
         
         with torch.no_grad():
-            for d in range(self.max_depth + 1):
+            for d in range(self.max_level + 1):
                 # 目标值: 与旧版初始化一致
-                target_sigma = 1.0 + self.depth_scale_beta * d / self.max_depth
+                target_sigma = 1.0 + self.depth_scale_beta * d / self.max_level
                 # 裁剪到有效范围
                 target_sigma = max(sigma_min + 0.01, min(sigma_max - 0.01, target_sigma))
                 # 计算 sigmoid 目标值
@@ -252,12 +252,12 @@ class HilbertNativePatchEmbed(nn.Module):
     def _init_depth_scale_legacy(self) -> None:
         """旧版初始化 (向后兼容).
         
-        初始化: σ_d = 1.0 + β * d / max_depth ∈ [1.0, 1.0+β]
+        初始化: σ_d = 1.0 + β * d / max_level ∈ [1.0, 1.0+β]
         """
         assert self._depth_scale_fixed is not None
         with torch.no_grad():
-            for d in range(self.max_depth + 1):
-                self._depth_scale_fixed[d] = 1.0 + self.depth_scale_beta * d / self.max_depth
+            for d in range(self.max_level + 1):
+                self._depth_scale_fixed[d] = 1.0 + self.depth_scale_beta * d / self.max_level
     
     @property
     def depth_scale(self) -> torch.Tensor:
@@ -266,7 +266,7 @@ class HilbertNativePatchEmbed(nn.Module):
         P6-1 改进: 使用 sigmoid 参数化确保值在 [σ_min, σ_max] 范围内
         
         Returns:
-            shape: (max_depth + 1,) 的缩放因子张量
+            shape: (max_level + 1,) 的缩放因子张量
         """
         if self._depth_scale_raw is not None:
             # 新版: sigmoid 参数化
@@ -303,7 +303,7 @@ class HilbertNativePatchEmbed(nn.Module):
             
         Returns:
             tokens: [B, N_max, dim] token 序列 (已按 Hilbert 顺序排列)
-            levels_info: [B, N_max, max_depth+1] 层级信息 [depth, q1, q2, ...]
+            levels_info: [B, N_max, max_level+1] 层级信息 [depth, q1, q2, ...]
         """
         B, C, H, W = images.shape
         device = images.device
@@ -321,7 +321,7 @@ class HilbertNativePatchEmbed(nn.Module):
         if total_tokens == 0:
             # 边界情况: 无 token
             tokens = torch.zeros(B, 1, self.dim, device=device, dtype=dtype)
-            levels_info = torch.zeros(B, 1, self.max_depth + 1, dtype=torch.long, device=device)
+            levels_info = torch.zeros(B, 1, self.max_level + 1, dtype=torch.long, device=device)
             return self.norm(tokens), levels_info
         
         # 3. 收集所有 region 的 boxes 和 depths (向量化准备)
@@ -346,8 +346,8 @@ class HilbertNativePatchEmbed(nn.Module):
                 fy2 = max(fy1 + 0.5, fy2)
                 
                 all_boxes.append([b, fx1, fy1, fx2, fy2])
-                all_depths.append(min(token.depth, self.max_depth))
-                all_levels_info.append(token.to_levels_info(self.max_depth))
+                all_depths.append(min(token.depth, self.max_level))
+                all_levels_info.append(token.to_levels_info(self.max_level))
                 batch_indices.append(b)
                 token_indices.append(i)
         
@@ -375,7 +375,7 @@ class HilbertNativePatchEmbed(nn.Module):
         
         # 7. 分配到输出 buffer
         tokens = torch.zeros(B, max_tokens, self.dim, device=device, dtype=dtype)
-        levels_info = torch.zeros(B, max_tokens, self.max_depth + 1, dtype=torch.long, device=device)
+        levels_info = torch.zeros(B, max_tokens, self.max_level + 1, dtype=torch.long, device=device)
         
         for idx, (b, i) in enumerate(zip(batch_indices, token_indices)):
             tokens[b, i] = all_tokens[idx]
@@ -405,7 +405,7 @@ class HilbertNativePatchEmbed(nn.Module):
             
         Returns:
             tokens: [B, grid_h * grid_w, dim]
-            levels_info: [B, grid_h * grid_w, max_depth+1]
+            levels_info: [B, grid_h * grid_w, max_level+1]
         """
         B, C, H, W = images.shape
         device = images.device
@@ -421,7 +421,7 @@ class HilbertNativePatchEmbed(nn.Module):
         # 3. 确定统一深度
         # log2(image_size / patch_size) 对应固定网格的深度
         depth = int(math.log2(max(grid_h, grid_w)))
-        depth = min(depth, self.max_depth)
+        depth = min(depth, self.max_level)
         
         # 应用深度编码
         scale = self.depth_scale[depth]
@@ -434,7 +434,7 @@ class HilbertNativePatchEmbed(nn.Module):
         # 5. 创建 levels_info (统一深度)
         N = tokens.shape[1]
         levels_info = torch.zeros(
-            B, N, self.max_depth + 1,
+            B, N, self.max_level + 1,
             dtype=torch.long, device=device
         )
         levels_info[:, :, 0] = depth
@@ -442,9 +442,9 @@ class HilbertNativePatchEmbed(nn.Module):
         # 填充四叉树路径 (从 HilbertPathCache 获取)
         from .curve_hilbert_indexer import HilbertPathCache
         _, quadtree_paths = HilbertPathCache.get_or_compute(
-            grid_h=fh, grid_w=fw, max_depth=self.max_depth, device=device
+            grid_h=fh, grid_w=fw, max_level=self.max_level, device=device
         )
-        path_len = min(quadtree_paths.shape[1], self.max_depth)
+        path_len = min(quadtree_paths.shape[1], self.max_level)
         actual_n = min(N, quadtree_paths.shape[0])
         levels_info[:, :actual_n, 1:path_len+1] = quadtree_paths[:actual_n, :path_len]
         
@@ -465,7 +465,7 @@ class DepthAwarePositionalEncoding(nn.Module):
         self,
         dim: int,
         max_tokens: int = 1024,
-        max_depth: int = 4,
+        max_level: int = 4,
     ) -> None:
         super().__init__()
         
@@ -483,7 +483,7 @@ class DepthAwarePositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
         
         # 深度嵌入
-        self.depth_embed = nn.Embedding(max_depth + 1, dim)
+        self.depth_embed = nn.Embedding(max_level + 1, dim)
     
     def forward(
         self,

@@ -306,3 +306,195 @@ OVERLAP_PENALTY_WEIGHT: float = 0.1
 
 #: levels_info 的最小长度
 MIN_INFO_LEN: int = 16
+
+
+# ============================================================================
+# TIER 2: 变参数计算函数 (Variables)
+# ============================================================================
+# 这些函数根据传入的参数动态计算变参数。
+# 设计原则：计算在模型架构内部进行，而非由训练器/评估器计算。
+
+import math
+from typing import Optional, Tuple
+
+
+def compute_max_level(image_size: int, min_patch_size: int) -> int:
+    """计算四叉树最大深度。
+
+    数学形式化:
+        max_depth = ceil(log2(min(H, W) / min_patch_size))
+
+    推导:
+        - 深度 d 的 patch 尺寸 = min_patch_size × 2^d
+        - 目标: min_patch_size × 2^max_depth ≈ min(H, W)
+        - 解: max_depth ≈ log2(min(H, W) / min_patch_size)
+
+    示例:
+        224×224 图像, min_patch_size=4
+        -> 224/4 = 56
+        -> log2(56) ≈ 5.81
+        -> ceil = 6
+
+    Args:
+        image_size: 输入图像尺寸（最小边长）
+        min_patch_size: 最小 patch 尺寸
+
+    Returns:
+        四叉树分区的最大递归深度
+
+    Raises:
+        ValueError: 当 image_size 或 min_patch_size 非正数时
+    """
+    if image_size <= 0:
+        raise ValueError(f"image_size 必须为正数, 得到 {image_size}")
+    if min_patch_size <= 0:
+        raise ValueError(f"min_patch_size 必须为正数, 得到 {min_patch_size}")
+
+    ratio = image_size // min_patch_size
+    if ratio <= 1:
+        return 0
+
+    return math.ceil(math.log2(ratio))
+
+
+def compute_num_candidates(max_level: int) -> int:
+    """计算四叉树候选节点总数。
+
+    数学形式化:
+        N_candidates = Σ(4^d), d=0..max_level = (4^(max_level+1) - 1) / 3
+
+    示例:
+        max_level=0: N=1
+        max_level=1: N=1+4=5
+        max_level=2: N=1+4+16=21
+        max_level=6: N=5461
+
+    Args:
+        max_level: 四叉树最大深度
+
+    Returns:
+        候选节点总数
+    """
+    if max_level < 0:
+        raise ValueError(f"max_level 必须非负, 得到 {max_level}")
+    return (4 ** (max_level + 1) - 1) // 3
+
+
+def compute_k_bounds(
+    max_level: int,
+    token_coverage_min: float,
+    token_coverage_max: float,
+    image_size: Optional[int] = None,
+) -> Tuple[int, int]:
+    """从覆盖率参数计算 K_min 和 K_max。
+
+    数学形式化:
+        N = Σ(4^d), d=0..max_level
+        scale = sqrt(min(H, W) / 224)  # 分辨率自适应
+        K_min = max(K_MIN_HARD, ceil(N × coverage_min))
+        K_max = min(K_MAX_HARD, ceil(N × coverage_max × scale))
+
+    设计原理:
+        - 覆盖率保证跨分辨率的尺度不变性
+        - 硬上限约束防止显存溢出
+        - scale 因子适应不同分辨率的上下文需求
+
+    Args:
+        max_level: 四叉树最大深度
+        token_coverage_min: 最小覆盖率 α
+        token_coverage_max: 最大覆盖率 β
+        image_size: 输入图像尺寸（用于 scale 计算）
+
+    Returns:
+        (K_min, K_max) 元组
+    """
+    # 计算候选节点总数
+    N = compute_num_candidates(max_level)
+
+    # 计算分辨率自适应 scale 因子
+    if image_size is not None:
+        scale = math.sqrt(image_size / K_ADAPTIVE_REFERENCE_SIZE)
+    else:
+        scale = 1.0
+
+    # 计算 K_min（确保最小表达能力）
+    K_min = max(
+        K_MIN_HARD_LIMIT,
+        int(math.ceil(N * token_coverage_min))
+    )
+
+    # 计算 K_max（确保不超显存）
+    K_max = min(
+        K_MAX_HARD_LIMIT,
+        int(math.ceil(N * token_coverage_max * scale))
+    )
+
+    return K_min, K_max
+
+
+def compute_quota_init_logits(max_level: int) -> Tuple[float, ...]:
+    """计算配额初始化的 logits 值。
+
+    数学形式化:
+        使用逆深度加权: p_d ∝ 1/(d+1)
+        logits[d] = log(p_d) - mean(log(p))
+
+    设计原理:
+        - 逆深度权重使较浅深度获得略高配额（粗粒度特征）
+        - 转换为 log space 确保 softmax 初始化的合理性
+        - 支持任意 max_level，不再硬编码 max_level=4
+
+    示例:
+        max_level=4:
+        -> weights = [1/1, 1/2, 1/3, 1/4, 1/5] = [1.0, 0.5, 0.333, 0.25, 0.2]
+        -> logits 调整使 softmax 后分布更均匀
+
+    Args:
+        max_level: 四叉树最大深度
+
+    Returns:
+        初始化的 logits 元组，长度为 max_level + 1
+
+    Raises:
+        ValueError: 当 max_level < 0 时
+    """
+    if max_level < 0:
+        raise ValueError(f"max_level 必须非负, 得到 {max_level}")
+    if max_level == 0:
+        return (0.0,)
+
+    import math
+
+    # 逆深度权重: p_d ∝ 1/(d+1)
+    raw_weights = [1.0 / (d + 1) for d in range(max_level + 1)]
+
+    # 转换为 log space
+    log_weights = [math.log(w + 1e-8) for w in raw_weights]
+    mean_log = sum(log_weights) / len(log_weights)
+
+    # 归一化使均值为 0
+    logits = tuple(w - mean_log for w in log_weights)
+
+    return logits
+
+
+# 向后兼容别名
+compute_max_depth = compute_max_level
+
+
+def clamp_temperature(temperature: float, min_val: float = TEMPERATURE_MIN) -> float:
+    """钳制温度参数到安全范围。
+
+    数学形式化:
+        T_safe = max(T, TEMPERATURE_MIN)
+        softmax 梯度: ∂p/∂z ≈ p × (1-p) / T
+        T >= 0.3 确保梯度流健康
+
+    Args:
+        temperature: 原始温度值
+        min_val: 最小安全温度（默认 TEMPERATURE_MIN = 0.3）
+
+    Returns:
+        钳制后的安全温度值
+    """
+    return max(temperature, min_val)

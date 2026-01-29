@@ -110,7 +110,7 @@ class FractalTransformerBlock(nn.Module):
     This block combines Hilbert-aware attention with adaptive feed-forward,
     using level-dependent normalization for depth-aware processing.
 
-    P11-2 修复: 参数 max_depth 现在应传入与 tokenizer.max_depth 一致的值，
+    P11-2 修复: 参数 max_level 现在应传入与 tokenizer.max_level 一致的值，
     而非硬编码的 50。这确保 Embedding 表大小与实际使用的深度范围匹配，
     减少约 90% 的参数浪费。
 
@@ -124,7 +124,7 @@ class FractalTransformerBlock(nn.Module):
         dim_head: Dimension per head.
         mlp_dim: Feed-forward hidden dimension.
         dropout: Dropout rate.
-        max_depth: Maximum hierarchical level (P11-2: should match tokenizer.max_depth).
+        max_level: Maximum hierarchical level (P11-2: should match tokenizer.max_level).
         drop_path: DropPath rate for stochastic depth.
         ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
         lca_temperature: (P6-2) LCA bias temperature, default 1.5.
@@ -141,7 +141,7 @@ class FractalTransformerBlock(nn.Module):
         dim_head: int,
         mlp_dim: int,
         dropout: float = 0.0,
-        max_depth: int = 8,  # P11-2: 默认改为 8，应由上层传入实际 max_depth
+        max_level: int = 8,  # P11-2: 默认改为 8，应由上层传入实际 max_level
         drop_path: float = 0.0,
         ffn_type: FFNType = 'swiglu_level',
         lca_temperature: Optional[float] = 1.5,
@@ -153,7 +153,7 @@ class FractalTransformerBlock(nn.Module):
     ):
         super().__init__()
         self.dim = dim
-        self.max_depth = max_depth
+        self.max_level = max_level
 
         # I98-3: 支持协议驱动配置
         self.attention = HilbertAwareMultiScaleAttention(
@@ -161,7 +161,7 @@ class FractalTransformerBlock(nn.Module):
             heads=heads,
             dim_head=dim_head,
             dropout=dropout,
-            max_depth=max_depth,
+            max_level=max_level,
             lca_temperature=lca_temperature,
             learnable_temperature=learnable_temperature,
             use_affine_modulation=use_affine_modulation,
@@ -174,7 +174,7 @@ class FractalTransformerBlock(nn.Module):
             dim=dim,
             hidden_dim=mlp_dim,
             dropout=dropout,
-            max_depth=max_depth,
+            max_level=max_level,
             ffn_type=ffn_type,
         )
 
@@ -190,7 +190,7 @@ class FractalTransformerBlock(nn.Module):
         #   - depth=1: w ≈ 1.0 → 保持原样
         #   - depth=2: w ≈ 0.85 → 轻微抑制
         #   - depth=3 (细粒度): w ≈ 0.65 → 抑制细节
-        # 
+        #
         # 使用 inverse_sigmoid 反算: sigmoid(x) * 2 = target → x = logit(target/2)
         # target=0.7 → x ≈ -0.36, target=1.0 → x = 0, target=0.65 → x ≈ -0.54
         #
@@ -198,7 +198,7 @@ class FractalTransformerBlock(nn.Module):
         # - 降低参数量: 2×D → 1×D (减少50%)
         # - 零初始化确保训练初期残差路径畅通
         # - tanh激活支持双向调制 [-1, 1]
-        self._residual_gate = nn.Embedding(max_depth + 1, 1)
+        self._residual_gate = nn.Embedding(max_level + 1, 1)
         nn.init.zeros_(self._residual_gate.weight)
         
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -236,17 +236,17 @@ class FractalTransformerBlock(nn.Module):
             if levels_info.dtype != torch.long:
                 levels_info = levels_info.long()
 
-            # 从数据形状推断 max_depth: info_dim = max_depth + 1
+            # 从数据形状推断 max_level: info_dim = max_level + 1
             info_dim = levels_info.shape[-1]
-            inferred_max_depth = info_dim - 1
-            levels_info = LevelsInfo(data=levels_info, max_depth=inferred_max_depth)
+            inferred_max_level = info_dim - 1
+            levels_info = LevelsInfo(data=levels_info, max_level=inferred_max_level)
 
         # I34-10 修复: 使用单门控设计
         # gate ∈ [-1, 1] 支持双向调制 (抑制/增强)
         if levels_info is not None and levels_info.data.numel() > 0:
             depths = levels_info.depths  # (B, S)
-            # I98-4: clamp depths to [0, max_depth] to handle padding sentinel (-1)
-            depths_clamped = depths.clamp(min=0, max=self.max_depth)
+            # I98-4: clamp depths to [0, max_level] to handle padding sentinel (-1)
+            depths_clamped = depths.clamp(min=0, max=self.max_level)
             gate_raw = self._residual_gate(depths_clamped)  # (..., 1)
             gate = torch.tanh(gate_raw)  # (..., 1) ∈ [-1, 1]
 
@@ -291,7 +291,7 @@ class FractalTransformer(nn.Module):
 
     Supports gradient checkpointing for memory-efficient training.
 
-    P11-2 修复: 参数 max_depth 现在应传入与 tokenizer.max_depth 一致的值，
+    P11-2 修复: 参数 max_level 现在应传入与 tokenizer.max_level 一致的值，
     而非硬编码的 50。这确保所有子模块的 Embedding 表大小与实际使用的深度范围匹配。
 
     P11-8 简化: 移除 hilbert_bias_mode 和 low_rank_r 参数，仅保留 LCA 模式。
@@ -300,12 +300,12 @@ class FractalTransformer(nn.Module):
 
     Args:
         dim: Input/output dimension.
-        depth: Number of transformer blocks.
+        num_layers: Number of transformer blocks.
         heads: Number of attention heads.
         dim_head: Dimension per head.
         mlp_dim: Feed-forward hidden dimension.
         dropout: Dropout rate.
-        max_depth: Maximum hierarchical level (P11-2: should match tokenizer.max_depth).
+        max_level: Maximum hierarchical level (P11-2: should match tokenizer.max_level).
         drop_path_rate: Maximum DropPath rate (linearly increased).
         ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
         use_checkpoint: Whether to use gradient checkpointing (saves memory).
@@ -319,12 +319,12 @@ class FractalTransformer(nn.Module):
     def __init__(
         self,
         dim: int,
-        depth: int,
+        depth: int,  # 保持 depth 作为参数名以保持 API 兼容
         heads: int,
         dim_head: int,
         mlp_dim: int,
         dropout: float = 0.0,
-        max_depth: int = 8,  # P11-2: 默认改为 8，应由上层传入实际 max_depth
+        max_level: int = 8,  # P11-2: 默认改为 8，应由上层传入实际 max_level
         drop_path_rate: float = 0.1,
         ffn_type: FFNType = 'swiglu_level',
         use_checkpoint: bool = False,
@@ -337,8 +337,8 @@ class FractalTransformer(nn.Module):
     ):
         super().__init__()
         self.dim = dim
-        self.depth = depth
-        self.max_depth = max_depth
+        self.num_layers = depth  # 使用 num_layers 作为属性名
+        self.max_level = max_level
         self.ffn_type = ffn_type
         self.use_checkpoint = use_checkpoint
         self.use_fp16 = use_fp16  # I104-3
@@ -354,7 +354,7 @@ class FractalTransformer(nn.Module):
                     dim_head=dim_head,
                     mlp_dim=mlp_dim,
                     dropout=dropout,
-                    max_depth=max_depth,
+                    max_level=max_level,
                     drop_path=dpr[i],
                     ffn_type=ffn_type,
                     lca_temperature=lca_temperature,
@@ -371,7 +371,7 @@ class FractalTransformer(nn.Module):
         # ARCH-R1: 删除了冗余的 global_context_attn
         # 原因: HilbertAwareMultiScaleAttention 已经保留了 78.9% 的全局注意力权重
         # Hilbert Bias 只是软约束，不需要额外的全局注意力纠正
-        
+
         # ARCH-R2 方案 B: 真正的层级感知聚合器 (I32-11 优化初始化)
         # 数学形式化:
         #   s_ℓ = σ(Embed_level(ℓ)) ∈ (0, 1)^D  — 每个层级的 D 维缩放向量
@@ -384,7 +384,7 @@ class FractalTransformer(nn.Module):
         # 物理意义:
         #   - 浅层级 (level=0,1,2): 大区域，学习保留全局语义的特征维度
         #   - 深层级 (level=5,6,7): 小区域，学习增强局部细节的特征维度
-        self._level_aggregator_scale = nn.Embedding(max_depth + 1, dim)
+        self._level_aggregator_scale = nn.Embedding(max_level + 1, dim)
         nn.init.xavier_uniform_(self._level_aggregator_scale.weight)  # I32-11: Xavier 初始化
 
         self._level_aggregator_bottleneck = nn.Sequential(
@@ -430,15 +430,15 @@ class FractalTransformer(nn.Module):
             if levels_info.dtype != torch.long:
                 levels_info = levels_info.long()
 
-            # 从数据形状推断 max_depth: info_dim = max_depth + 1
+            # 从数据形状推断 max_level: info_dim = max_level + 1
             info_dim = levels_info.shape[-1]
-            inferred_max_depth = info_dim - 1
-            levels_info = LevelsInfo(data=levels_info, max_depth=inferred_max_depth)
+            inferred_max_level = info_dim - 1
+            levels_info = LevelsInfo(data=levels_info, max_level=inferred_max_level)
 
         batch_size, seq_len, dim = x.shape
 
-        # I100-6: 使用固定有效深度 depth // 2
-        effective_depth = self.depth // 2
+        # I100-6: 使用固定有效深度 num_layers // 2
+        effective_depth = self.num_layers // 2
         extra_info = {'effective_depth': effective_depth}
 
         # 执行 transformer 层
@@ -468,8 +468,8 @@ class FractalTransformer(nn.Module):
         # ARCH-R2 方案 B: 层级感知的特征聚合
         if levels_info is not None and levels_info.data.numel() > 0:
             depths = levels_info.depths  # (B, S)
-            # I98-4: clamp depths to [0, max_depth] to handle padding sentinel (-1)
-            depths_clamped = depths.clamp(min=0, max=self.max_depth)
+            # I98-4: clamp depths to [0, max_level] to handle padding sentinel (-1)
+            depths_clamped = depths.clamp(min=0, max=self.max_level)
             scale = torch.sigmoid(self._level_aggregator_scale(depths_clamped))  # (..., D)
             
             # 调整形状以匹配 x: [B, S, D]

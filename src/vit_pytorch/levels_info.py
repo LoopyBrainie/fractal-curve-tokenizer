@@ -106,7 +106,7 @@ class LevelsInfo:
     data: torch.Tensor  # [B, N, D+1]
 
     # 元数据
-    max_depth: int
+    max_level: int
 
     # 缓存字段 (惰性求值)
     _depths: Optional[torch.Tensor] = field(default=None, repr=False)
@@ -115,7 +115,7 @@ class LevelsInfo:
     def __post_init__(self):
         """Invariant validation - Hilbert Curve ViT 核心契约检查。"""
         B, N, K = self.data.shape
-        D = self.max_depth
+        D = self.max_level
 
         # C0: 维度约束
         assert K == D + 1, \
@@ -124,7 +124,7 @@ class LevelsInfo:
         # C1: depth 范围 [-1, D]
         depths = self._compute_depths()
         assert (depths >= -1).all(), "depth < -1 (padding sentinel 违反)"
-        assert (depths <= D).all(), f"depth > {D} (超过 max_depth)"
+        assert (depths <= D).all(), f"depth > {D} (超过 max_level)"
 
         # C2: path 范围 [0, 3] (仅有效 token)
         valid_mask = depths >= 0
@@ -173,11 +173,6 @@ class LevelsInfo:
         """N"""
         return self.data.shape[1]
 
-    @property
-    def max_level(self) -> int:
-        """D: 返回 max_depth 字段 (property 接口)"""
-        return self.max_depth
-
     def __len__(self) -> int:
         """返回 token 数量 N"""
         return self.num_tokens
@@ -186,7 +181,7 @@ class LevelsInfo:
         """设备迁移 (保持 cache)"""
         return LevelsInfo(
             data=self.data.to(device, non_blocking=non_blocking),
-            max_depth=self.max_depth,
+            max_level=self.max_level,
             _depths=self._depths.to(device, non_blocking=non_blocking) if self._depths is not None else None,
             _paths=self._paths.to(device, non_blocking=non_blocking) if self._paths is not None else None,
         )
@@ -204,7 +199,7 @@ class LevelsInfo:
     @staticmethod
     def from_tokenizer_output(
         output: "TokenizerOutput",
-        max_depth: int,
+        max_level: int,
     ) -> "LevelsInfo":
         """从 TokenizerOutput 创建 LevelsInfo (I98-5 简化).
 
@@ -213,7 +208,7 @@ class LevelsInfo:
 
         Args:
             output: TokenizerOutput 实例
-            max_depth: 四叉树最大深度
+            max_level: 四叉树最大深度
 
         Returns:
             LevelsInfo 实例
@@ -225,45 +220,45 @@ class LevelsInfo:
         # 空输出时创建默认 LevelsInfo
         B = output.batch_size
         N = 1
-        all_levels = torch.zeros(B, N, max_depth + 1, dtype=torch.long)
-        return LevelsInfo(data=all_levels, max_depth=max_depth)
+        all_levels = torch.zeros(B, N, max_level + 1, dtype=torch.long)
+        return LevelsInfo(data=all_levels, max_level=max_level)
 
     @staticmethod
     def from_arrays(
         depths: torch.Tensor,  # [B, N]
         paths: torch.Tensor,  # [B, N, D]
-        max_depth: int,
+        max_level: int,
     ) -> "LevelsInfo":
         """从 depths 和 paths 数组创建 LevelsInfo。
 
         Args:
             depths: 深度张量
             paths: 路径张量
-            max_depth: 最大深度
+            max_level: 最大深度
 
         Returns:
             LevelsInfo 实例
         """
         B, N = depths.shape
-        D = paths.size(2) if paths.dim() == 3 else max_depth
+        D = paths.size(2) if paths.dim() == 3 else max_level
 
-        data = torch.zeros(B, N, max_depth + 1, dtype=torch.long, device=depths.device)
+        data = torch.zeros(B, N, max_level + 1, dtype=torch.long, device=depths.device)
         data[:, :, 0] = depths
         data[:, :, 1 : 1 + D] = paths
 
-        return LevelsInfo(data=data, max_depth=max_depth)
+        return LevelsInfo(data=data, max_level=max_level)
 
     @staticmethod
     def random(
         B: int,
         N: int,
-        max_depth: int,
+        max_level: int,
         device: Optional[torch.device] = None,
     ) -> "LevelsInfo":
         """创建随机 LevelsInfo (测试用)。
 
         生成有效的四叉树结构：
-        - depth 均匀分布在 [0, max_depth]
+        - depth 均匀分布在 [0, max_level]
         - path 均匀分布在 [0, 3]
         """
         import random
@@ -273,19 +268,19 @@ class LevelsInfo:
 
         for b in range(B):
             for n in range(N):
-                d = random.randint(0, max_depth)
+                d = random.randint(0, max_level)
                 depths_list.append(d)
                 path = [random.randint(0, 3) for _ in range(d)]
-                paths_list.append(path + [0] * (max_depth - d))
+                paths_list.append(path + [0] * (max_level - d))
 
         depths = torch.tensor(depths_list, dtype=torch.long).view(B, N)
-        paths = torch.tensor(paths_list, dtype=torch.long).view(B, N, max_depth)
+        paths = torch.tensor(paths_list, dtype=torch.long).view(B, N, max_level)
 
         if device:
             depths = depths.to(device)
             paths = paths.to(device)
 
-        return LevelsInfo.from_arrays(depths, paths, max_depth)
+        return LevelsInfo.from_arrays(depths, paths, max_level)
 
     # ========== I103-2: 权重缓存方法 ==========
 
