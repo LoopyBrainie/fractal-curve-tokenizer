@@ -8,32 +8,33 @@ set -e
 # ============================================================================
 # Mathematical Verification Results (2026-01-29 Update)
 # ============================================================================
-# VRAM: 8GB RTX 4070 Laptop
-# Configuration: dim=320, depth=12, heads=8, mlp_dim=1280, batch=192
+# VRAM: 8GB RTX 4070 Laptop (6.5GB effective with 20% safety margin)
 #
-# Recommended Configuration:
-#   - Parameters: 34.56M
-#   - Memory: 763 MB (88.3% safety margin)
-#   - Token coverage: 2%-5% (5-12 tokens)
+# [EXPLICITLY CALCULATED PARAMETERS]
+#   --dim 320        : From memory constraint M_total ≤ 763 MB
+#   --depth 12       : Optimal for Tiny-ImageNet capacity
+#   --heads 8        : Required: dim_head = dim/heads = 320/8 = 40
+#   --mlp-dim 1280   : SwiGLU formula: 4 × dim
+#   --batch-size 192 : Memory budget: 763 MB available
+#   --token-coverage-min 0.02 : 2% coverage = 5 tokens (K_min)
+#   --token-coverage-max 0.05 : 5% coverage = 12 tokens (K_max)
 #
-# Memory Breakdown (batch=192):
-#   - Model params (FP32): 131.8 MB
-#   - Gradients (FP32): 131.8 MB
-#   - Optimizer (FP32): 263.7 MB
-#   - Activations (FP16): 36.0 MB
-#   - CUDA overhead: 200 MB
-#   - Total: 763 MB
+# [EXPERIMENTAL FEATURES]
+#   --quota-learnable        : Enable learnable token quota
+#   --freeze-tokenizer       : Freeze tokenizer for 10 epochs
+#   --elastic-coverage-*     : Elastic budget regularization
 #
-# Model Parameter Formula: P = L × (16 × d²) + 2.5 × d × C
-#   P = 12 × (16 × 320²) + 2.5 × 320 × 200 = 34.56M params
+# [OPTIMIZATION FLAGS]
+#   --use-amp, --gradient-checkpoint, --compile, --channels-last
 #
-# Key Insight: dim_head = dim / heads = 320 / 8 = 40 [OK]
+# [DEFAULT VALUES USED]
+#   --lr=5e-4, --weight-decay=0.15, --warmup-epochs=10
+#   --dropout=0.25, --drop-path=0.25, --label-smoothing=0.1
+#   --mixup-alpha=0.4, --cutmix-alpha=1.0, --mixup-prob=0.5
+#   --elastic-lambda-over=0.1, --elastic-lambda-under=0.01
+#   --soft-entropy-weight=0.1, --pool=weighted, --ffn-type=swiglu_level
 #
-# Token Budget (I33 Relative Budget):
-#   - image_size=64, min_patch_size=4
-#   - max_patches = (64/4)² = 256
-#   - coverage_min=0.02 (2%): K_min = max(4, 256×0.02) = 5
-#   - coverage_max=0.05 (5%): K_max = 256×0.05 = 12
+# Model: 34.56M params | Memory: 763 MB | Tokens: 5-12 (2%-5% coverage)
 # ============================================================================
 
 uv run python src/training/train_fractal_vit.py \
