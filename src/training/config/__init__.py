@@ -75,7 +75,7 @@ class ModelArchitectureConfig:
     min_patch_size: int = 4
     # I33: 相对预算参数 (替代绝对 K_min/K_max)
     token_coverage_min: float = 0.01   # α = 1% 最小覆盖率
-    token_coverage_max: float = 0.05   # β = 5% 最大覆盖率
+    token_coverage_max: float = 0.25   # β = 25% 最大覆盖率，参与自适应计算
     K_min_abs: int = 8                 # 绝对下界保护
 
     # FFN 类型
@@ -108,9 +108,15 @@ class ModelArchitectureConfig:
     quota_learnable: Optional[bool] = None
     quota_entropy_weight: float = 0.01  # 配额熵正则化权重
 
+    # I140: Splitter 架构参数
+    # 这些参数控制 Splitter 内部 MLP 的维度配置
+    splitter_hidden_dim: Optional[int] = None  # Splitter MLP 隐藏层维度 (默认 64)
+    splitter_feature_dim: Optional[int] = None  # Splitter 特征维度 (默认等于 dim)
+    splitter_pool_size: Optional[int] = None    # Splitter 池化大小 (默认 4)
+
     # 训练策略参数 (从 FractalViTConfig 迁移)
     pool: str = "weighted"
-    max_level: int = 8  # P0 修复: 最大分割深度 (统一使用 max_level)
+    max_level: Optional[int] = None  # 变参数，完全由模型架构内部计算，外部不应传入
     freeze_quota: bool = False  # 是否冻结配额参数
     freeze_tokenizer: bool = False  # 是否冻结 tokenizer 参数
     freeze_tokenizer_epochs: int = 0  # 前 N 个 epoch 冻结 (0=全程冻结)
@@ -134,8 +140,8 @@ class ModelArchitectureConfig:
         # 验证 K 边界: K_min_abs > 0
         assert self.K_min_abs > 0, f"K_min_abs={self.K_min_abs} 必须 > 0"
 
-        # 验证 max_level: >= 1
-        assert self.max_level >= 1, f"max_level={self.max_level} 必须 >= 1"
+        # 注意: max_level 是变参数，完全由模型架构内部计算，不进行验证
+        # assert self.max_level >= 1, f"max_level={self.max_level} 必须 >= 1"
 
         # 验证 dim_head 一致性
         expected_dim_head = self.dim // self.heads

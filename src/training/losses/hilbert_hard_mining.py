@@ -234,12 +234,14 @@ class HilbertAwareHardMining(nn.Module):
             return base_loss.mean(), info
         
         info['in_warmup'] = False
-        
+
         # 计算样本权重
         # z = (variance - μ) / (τ × σ)
+        # I109-2: 添加温度下界保护，防止除零
+        temp_safe = max(self.temperature, 1e-6)
         running_std = (self.running_var + 1e-8).sqrt()
-        z = (variances - self.running_mean) / (self.temperature * running_std)
-        
+        z = (variances - self.running_mean) / (temp_safe * running_std)
+
         # w = 1 + λ × σ(z)
         weights = 1.0 + self.lambda_weight * torch.sigmoid(z)
         

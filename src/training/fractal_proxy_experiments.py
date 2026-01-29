@@ -1450,7 +1450,7 @@ def main():
     model = FractalCurveViT(
         num_classes=200,
         dim=384,
-        depth=8,
+        num_layers=8,  # I145: depth -> num_layers
         heads=6,
     )
 

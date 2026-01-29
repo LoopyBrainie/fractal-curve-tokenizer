@@ -41,6 +41,13 @@ except ImportError:
     BaseTokenizer = None  # type: ignore
     TrainingStats = None  # type: ignore
 
+# 延迟导入 ModelArchitectureConfig（避免循环导入）
+def _get_model_arch_config():
+    from ..config import ModelArchitectureConfig
+    return ModelArchitectureConfig
+
+ModelArchitectureConfig = None  # type: ignore
+
 
 # ============================================================================
 # 协议定义 (Protocol Interfaces)
@@ -481,6 +488,7 @@ class ModularTrainer:
         aux_losses: Optional[Dict[str, Callable]] = None,  # 辅助损失 {name: (fn, lambda)}
         callbacks: Optional[List[Callback]] = None,
         config: Optional[TrainerConfig] = None,
+        arch_config: Optional["ModelArchitectureConfig"] = None,  # 模型架构配置（用于构造 ModelGene）
     ):
         self.model = model
         self.train_loader = train_loader
@@ -491,6 +499,7 @@ class ModularTrainer:
         self.aux_losses = aux_losses or {}
         self.callbacks = CallbackList(callbacks)
         self.config = config or TrainerConfig()
+        self.arch_config = arch_config  # 用于构造 ModelGene
         
         # 状态
         self.state = TrainerState()
@@ -751,29 +760,40 @@ class ModularTrainer:
         return self.state.history
     
     def save_checkpoint(self, path: Union[str, Path]) -> None:
-        """保存检查点"""
+        """保存检查点 (使用 ModelGene 自包含格式)
+
+        优先使用 from_config() 从配置构造 ModelGene（单一数据源）。
+        如果没有 arch_config，回退到 from_model()。
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        
-        checkpoint = {
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "state": {
-                "epoch": self.state.epoch,
-                "global_step": self.state.global_step,
-                "best_metric": self.state.best_metric,
-                "best_epoch": self.state.best_epoch,
-            },
-            "config": {
-                "num_epochs": self.config.num_epochs,
-                "gradient_clip_norm": self.config.gradient_clip_norm,
-            },
-        }
-        
-        if self.scaler:
-            checkpoint["scaler_state_dict"] = self.scaler.state_dict()
-        
-        torch.save(checkpoint, path)
+
+        # 构造 ModelGene
+        if self.arch_config is not None:
+            # 单一数据源：从配置构造
+            gene = ModelGene.from_config(
+                self.arch_config,
+                dataset_name=getattr(self.config, 'dataset', 'unknown'),
+                epoch=self.state.epoch,
+            )
+        else:
+            # 回退：从模型提取（通用训练器）
+            from training.core.model_gene import ModelGene
+            gene = ModelGene.from_model(
+                self.model,
+                dataset_name=getattr(self.config, 'dataset', 'unknown'),
+                epoch=self.state.epoch,
+            )
+
+        # 使用共享的 checkpoint 保存函数
+        save_checkpoint_with_gene(
+            path=path,
+            model=self.model,
+            gene=gene,
+            optimizer_state=self.optimizer.state_dict(),
+            epoch=self.state.epoch,
+            val_acc=self.state.best_metric,
+        )
     
     def load_checkpoint(self, path: Union[str, Path]) -> None:
         """加载检查点"""

@@ -882,6 +882,18 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         for bias in biases[1:]:
             bias_total = bias_total + bias
 
+        # I109-1: 监控偏置量级（调试模式）
+        # 数学依据: clamp(-50, 50) 是数值稳定设计，softmax(50) ≈ one-hot
+        if torch.is_grad_enabled() and bias_total.numel() > 0:
+            bias_abs_max = bias_total.abs().max().item()
+            # 当偏置量级接近 clamp 边界时发出警告
+            if bias_abs_max > 40:  # 接近 50 的 80%
+                import warnings
+                warnings.warn(
+                    f"I109-1: Bias magnitude {bias_abs_max:.1f} approaching clamp bound {LOGIT_CLAMP_BOUND}. "
+                    f"This indicates strong attention bias signals."
+                )
+
         # I108-1/I108-6: 安全 clamp 防止 softmax 饱和
         # 使用 LOGIT_CLAMP_BOUND (50.0) 常量
         # 数学依据: softmax(x > 50) ≈ one-hot，远小于 FP16 上界 65504
@@ -2271,12 +2283,26 @@ class AffineModulatedBias(nn.Module):
 
         # 5. 傅里叶特征编码面积相似性
         if area_sim is not None:
-            fourier_features = []
-            for k in range(self.area_encoder.fourier_levels):
-                freq = 2 ** k
-                fourier_features.append(torch.sin(freq * math.pi * area_sim))
-                fourier_features.append(torch.cos(freq * math.pi * area_sim))
-            gamma_features = torch.stack(fourier_features, dim=-1)  # [B, N, N, 2L]
+            # I145: 向量化傅里叶特征 - 预计算频率张量，使用 tensor broadcasting
+            # 原始实现 (Python循环):
+            # for k in range(self.area_encoder.fourier_levels):
+            #     freq = 2 ** k
+            #     fourier_features.append(torch.sin(freq * math.pi * area_sim))
+            #     fourier_features.append(torch.cos(freq * math.pi * area_sim))
+            fourier_levels = self.area_encoder.fourier_levels
+            # 预计算频率: [L]
+            freqs = torch.tensor([2 ** k for k in range(fourier_levels)], device=area_sim.device, dtype=area_sim.dtype)
+            freqs = freqs * math.pi  # [L]
+            # 计算所有频率的 sin 和 cos: [2L, L] -> [2L] 通过广播
+            # area_sim: [B, N, N], freqs: [L]
+            # sin_features: [L, B, N, N], cos_features: [L, B, N, N]
+            sin_features = torch.sin(freqs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * area_sim.unsqueeze(0))
+            cos_features = torch.cos(freqs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * area_sim.unsqueeze(0))
+            # 交错拼接: [B, N, N, 2L]
+            fourier_features = torch.cat([sin_features, cos_features], dim=0).permute(1, 2, 3, 0)
+            # I145: 添加溢出防护 - clamp 到合理范围
+            fourier_features = fourier_features.clamp(-1e6, 1e6)
+            gamma_features = fourier_features  # [B, N, N, 2L]
 
             # 仿射调制
             # 展平 [B, N, N, 2L] -> [B*N*N, 2L] 以便通过 Linear 层
@@ -2303,15 +2329,18 @@ class AffineModulatedBias(nn.Module):
         else:
             combined_bias = lca_bias
 
-        # I31-P2: 形状-尺度调制
+        # I31-P2: 形状-尺度调制 (FIX: 向量化计算，避免 Python 循环)
         if shape_sim is not None:
-            # 傅里叶特征编码形状相似性
-            shape_fourier_features = []
-            for k in range(4):  # 固定 4 个 Fourier 级别
-                freq = 2 ** k
-                shape_fourier_features.append(torch.sin(freq * math.pi * shape_sim))
-                shape_fourier_features.append(torch.cos(freq * math.pi * shape_sim))
-            shape_gamma_features = torch.stack(shape_fourier_features, dim=-1)  # [B, N, N, 8]
+            # 预计算固定 4 个频率: [4]
+            shape_freqs = torch.tensor([2 ** k for k in range(4)], device=shape_sim.device, dtype=shape_sim.dtype)
+            shape_freqs = shape_freqs * math.pi  # [4]
+            # 向量化计算 sin/cos: [4, B, N, N]
+            shape_sin = torch.sin(shape_freqs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * shape_sim.unsqueeze(0))
+            shape_cos = torch.cos(shape_freqs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1) * shape_sim.unsqueeze(0))
+            # 交错拼接: [B, N, N, 8]
+            shape_gamma_features = torch.cat([shape_sin, shape_cos], dim=0).permute(1, 2, 3, 0)
+            # 添加溢出防护
+            shape_gamma_features = shape_gamma_features.clamp(-1e6, 1e6)
 
             # 展平并通过偏置网络
             B, N, N, shape_fourier_dim = shape_gamma_features.shape

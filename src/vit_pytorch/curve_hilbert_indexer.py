@@ -178,7 +178,8 @@ class HilbertPathCache:
         y_tensor = torch.tensor(y_coords, dtype=torch.long)
         
         n = _next_power_of_2(max(grid_h, grid_w))
-        actual_max_depth = max(1, int(math.log2(max(n, 2))))
+        # I109-7: 使用 bit_length() 替代 int(math.log2(...)) 避免浮点精度问题
+        actual_max_depth = max(1, max(n, 2).bit_length() - 1)
         path_depth = min(max_depth, actual_max_depth)
         
         quadtree_paths = torch.zeros(num_tokens, max_depth, dtype=torch.long)

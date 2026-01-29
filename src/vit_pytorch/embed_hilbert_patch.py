@@ -420,7 +420,8 @@ class HilbertNativePatchEmbed(nn.Module):
         
         # 3. 确定统一深度
         # log2(image_size / patch_size) 对应固定网格的深度
-        depth = int(math.log2(max(grid_h, grid_w)))
+        # I109-7: 使用 bit_length() 替代 int(math.log2(...)) 避免浮点精度问题
+        depth = max(grid_h, grid_w).bit_length() - 1
         depth = min(depth, self.max_level)
         
         # 应用深度编码

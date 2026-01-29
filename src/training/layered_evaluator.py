@@ -1277,7 +1277,7 @@ class LayeredEvaluator:
             hidden_dim=splitter_hidden_dim,
             pool_size=splitter_pool_size,
             token_coverage_min=config.get('token_coverage_min', 0.01),  # I33: 使用覆盖率参数
-            token_coverage_max_hard=config.get('token_coverage_max', 0.05),
+            token_coverage_max=config.get('token_coverage_max', 0.25),  # I109-3
             image_size=(image_size, image_size) if isinstance(image_size, int) else image_size,
         )
         print(f"Created splitter with feature_dim={splitter_feature_dim}, hidden_dim={splitter_hidden_dim}, pool_size={splitter_pool_size}")

@@ -134,7 +134,7 @@ class FractalCurveViT(nn.Module):
         cls_token: Optional[nn.Parameter] = None,
         # I98-2: 内部状态标记（由工厂函数设置）
         dynamic_image_size: bool = False,
-        # 配置参数（用于向后兼容）
+        # 配置参数
         image_size: Optional[Union[int, Tuple[int, int]]] = None,
         num_classes: int = 1000,
         dim: int = 512,
@@ -147,7 +147,8 @@ class FractalCurveViT(nn.Module):
         dropout: float = 0.0,
         emb_dropout: float = 0.0,
         min_patch_size: Union[int, Tuple[int, int]] = 4,
-        max_level: Optional[int] = None,  # Hilbert 四叉树最大分割级数
+        # 注意: max_level 是变参数，完全由模型架构内部根据 image_size 和 min_patch_size 动态计算
+        # 不再作为外部参数传入，确保训练/评估模型结构完全一致
         use_hilbert_encoding: bool = True,
         use_spatial_encoding: bool = True,
         use_checkpoint: bool = False,
@@ -165,7 +166,12 @@ class FractalCurveViT(nn.Module):
         fourier_levels: int = 4,
         encoder_config: Optional[AttentionEncoderConfig] = None,
         quota_learnable: Optional[bool] = None,
+        quota_entropy_weight: float = 0.01,  # I24-2: 配额熵正则化权重
         lca_fp16: bool = False,  # I104-3: 使用 FP16 存储 LCA embedding
+        # I140: Splitter 架构参数
+        splitter_hidden_dim: Optional[int] = None,
+        splitter_feature_dim: Optional[int] = None,
+        splitter_pool_size: Optional[int] = None,
     ) -> None:
         """初始化 FractalCurveViT。
 
@@ -228,6 +234,15 @@ class FractalCurveViT(nn.Module):
         # I33: 存储覆盖率参数（用于 K 值计算）
         self.token_coverage_min = token_coverage_min
         self.token_coverage_max = token_coverage_max
+
+        # I24-2: 可学习配额参数
+        self.quota_learnable = quota_learnable
+        self.quota_entropy_weight = quota_entropy_weight
+
+        # I140: Splitter 架构参数
+        self.splitter_hidden_dim = splitter_hidden_dim
+        self.splitter_feature_dim = splitter_feature_dim
+        self.splitter_pool_size = splitter_pool_size
 
         # 温度钳制（防止梯度饱和）
         self.lca_temperature = clamp_temperature(
@@ -308,20 +323,21 @@ class FractalCurveViT(nn.Module):
             )
 
             splitter_config = SplitterConfig(
-                feature_dim=dim,
+                feature_dim=splitter_feature_dim or dim,
                 min_patch_size=effective_min_patch_size,
                 max_level_limit=max_level_limit,
-                hidden_dim=64,
-                intermediate_dim=64,
-                pool_size=4,
+                hidden_dim=splitter_hidden_dim or 64,
+                intermediate_dim=(splitter_hidden_dim or 64) // 2,
+                pool_size=splitter_pool_size or 4,
                 K_min=K_min_computed,
                 K_max=K_max_computed,
                 use_dynamic_k=True,
                 dropout=min(dropout, 0.15),
                 enable_learnable_quota=quota_learnable if quota_learnable is not None else True,
+                quota_entropy_weight=quota_entropy_weight,
                 # I33: 传递覆盖率参数（用于 ModelGene 保存）
                 token_coverage_min=token_coverage_min,
-                token_coverage_max_hard=token_coverage_max,
+                token_coverage_max=token_coverage_max,  # I109-3
             )
             self.splitter = GumbelTopKSplitter(
                 config=splitter_config,
@@ -331,29 +347,26 @@ class FractalCurveViT(nn.Module):
         # === Tokenizer ===
         if tokenizer is None:
             # 创建 StreamingFractalTokenizerV3
-            tokenizer_kwargs = dict(
+            # max_level 完全由 tokenizer 内部根据 image_size 和 min_patch_size 动态计算
+            tokenizer = StreamingFractalTokenizerV3(
                 image_size=self.image_size,
                 channels=channels,
                 d_model=dim,
                 base_patch_size=effective_min_patch_size,
                 min_patch_size=effective_min_patch_size,
             )
-            if max_level is not None:
-                tokenizer_kwargs['max_level'] = max_level
-            tokenizer = StreamingFractalTokenizerV3(**tokenizer_kwargs)
 
         self.tokenizer = tokenizer
 
         # I98-1: 设置 tokenizer 对 model 的弱引用，避免循环引用导致递归遍历失败
         tokenizer._model = weakref.ref(self)
 
-        # P11-2 修复: 从 tokenizer 动态获取 max_level 作为 max_level
-        if max_level is None:
-            if hasattr(tokenizer, 'max_level'):
-                max_level = tokenizer.max_level
-            else:
-                max_level = 8
-        self.max_level = max_level
+        # 从 tokenizer 动态获取 max_level（变参数）
+        if hasattr(tokenizer, 'max_level'):
+            computed_max_level = tokenizer.max_level
+        else:
+            computed_max_level = 8  # 默认值
+        self.max_level = computed_max_level
 
         self.token_processor = None
 
@@ -362,11 +375,12 @@ class FractalCurveViT(nn.Module):
             # I98-2: 动态创建位置编码（向后兼容）
             # I27: 传递 pos_dropout 到 Position Embedding
             # I31-3: 支持面积增强位置编码
+            # 使用 self.max_level（从 tokenizer 获取的变参数）
             if use_area_encoding:
                 from .embed_fractal_position import AreaEnhancedPositionEmbedding
                 position_embedding = AreaEnhancedPositionEmbedding(
                     dim=dim,
-                    max_level=max_level,
+                    max_level=self.max_level,
                     fourier_levels=fourier_levels,
                     use_hilbert_encoding=use_hilbert_encoding,
                     use_spatial_encoding=use_spatial_encoding,
@@ -375,7 +389,7 @@ class FractalCurveViT(nn.Module):
             else:
                 position_embedding = FractalPositionEmbedding(
                     dim=dim,
-                    max_level=max_level,
+                    max_level=self.max_level,
                     max_seq_len=10000,
                     use_hilbert_encoding=use_hilbert_encoding,
                     use_spatial_encoding=use_spatial_encoding,
@@ -404,6 +418,7 @@ class FractalCurveViT(nn.Module):
             self.transformer = transformer
         else:
             # 动态创建 Transformer（向后兼容）
+            # 使用 self.max_level（从 tokenizer 获取的变参数）
             self.transformer = FractalTransformer(
                 dim=dim,
                 depth=num_layers,
@@ -411,7 +426,7 @@ class FractalCurveViT(nn.Module):
                 dim_head=dim_head,
                 mlp_dim=mlp_dim,
                 dropout=dropout,
-                max_level=max_level,
+                max_level=self.max_level,
                 drop_path_rate=drop_path_rate,
                 ffn_type=ffn_type,
                 use_checkpoint=use_checkpoint,
@@ -915,6 +930,9 @@ class FractalCurveViT(nn.Module):
                                            dtype=torch.long, device=lengths.device)
                 valid_counts = []
 
+                # I145: 向量化深度矩阵填充 - 使用 scatter_ 向量化
+                # 注意: levels_list 是 Python list of tensors，需要逐批次处理
+                # 但可以使用 tensor 索引和 scatter 优化
                 for i, l in enumerate(levels_list):
                     if l.numel() > 0:
                         depths = l[:, 0].long()
@@ -925,12 +943,18 @@ class FractalCurveViT(nn.Module):
                     else:
                         valid_counts.append(0)  # 确保 valid_counts 长度始终等于 B
 
-                # 向量化 depth 计数 [B, D]
-                all_depth_counts = torch.zeros(B, max_level_range,
-                                               dtype=torch.float32, device=lengths.device)
-                for d in range(max_level_range):
-                    mask = (padded_depths == d)
-                    all_depth_counts[:, d] = mask.sum(dim=1, dtype=torch.float32)
+                # I145: 向量化 depth 计数 - 使用 scatter_add 替代 Python 循环
+                # 原始实现:
+                # for d in range(max_level_range):
+                #     mask = (padded_depths == d)
+                #     all_depth_counts[:, d] = mask.sum(dim=1, dtype=torch.float32)
+                # 向量化实现:
+                depths_for_count = padded_depths.clamp(min=0)  # [B, max_tokens], padding (-1) -> 0
+                # 有效位置掩码 (排除 padding)
+                valid_pos_mask = padded_depths >= 0
+                # 使用 scatter_add: counts[batch, depth] = sum over valid positions with that depth
+                all_depth_counts = torch.zeros(B, max_level_range, dtype=torch.float32, device=lengths.device)
+                all_depth_counts.scatter_add_(dim=1, index=depths_for_count, src=valid_pos_mask.float())
 
                 # 归一化分布
                 depth_sums = all_depth_counts.sum(dim=1, keepdim=True).clamp(min=1e-8)
@@ -941,16 +965,23 @@ class FractalCurveViT(nn.Module):
                 lengths_cpu = lengths.cpu() if lengths.is_cuda else lengths  # 只在需要时同步一次
                 lengths_list = lengths_cpu.tolist()  # 单次批量转换
 
-                # I144: 向量化计算 entropy - 先在 GPU 上计算所有值
+                # I144: 向量化计算 entropy - 完全在 GPU 上计算，避免 Python 循环
+                # 原始实现 (Python循环):
+                # for i in range(B):
+                #     probs_i = split_probs[i, :lengths[i]]
+                #     probs_safe = probs_i + (probs_i == 0).float() * PROB_EPSILON
+                #     entropy_i = -(probs_safe * torch.log(probs_safe)).sum()
+                #     entropies_gpu.append(entropy_i)
+                # 向量化实现:
                 if split_probs is not None:
-                    # 计算每个样本的 entropy [B]
-                    entropies_gpu = []
-                    for i in range(B):
-                        probs_i = split_probs[i, :lengths[i]]
-                        probs_safe = probs_i + (probs_i == 0).float() * PROB_EPSILON
-                        entropy_i = -(probs_safe * torch.log(probs_safe)).sum()
-                        entropies_gpu.append(entropy_i)
-                    entropies_gpu = torch.stack(entropies_gpu)  # [B]
+                    # 创建有效位置掩码 [B, max_tokens]
+                    max_len = split_probs.size(1)
+                    valid_mask = torch.arange(max_len, device=split_probs.device).unsqueeze(0) < lengths.unsqueeze(1)
+                    # 掩码概率，填充为 1.0 (log(1)=0，不影响求和)
+                    probs_masked = torch.where(valid_mask, split_probs, torch.ones_like(split_probs))
+                    probs_safe = probs_masked + (probs_masked == 0).float() * PROB_EPSILON
+                    # 计算每个样本的熵 [B]
+                    entropies_gpu = -(probs_safe * torch.log(probs_safe)).sum(dim=1)
                     # 最后一次性转换为 Python float
                     entropies_list = entropies_gpu.tolist()
 

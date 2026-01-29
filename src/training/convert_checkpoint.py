@@ -169,7 +169,7 @@ def remap_state_dict(
 def convert_checkpoint(
     checkpoint_path: str,
     output_path: str,
-    new_max_depth: int = 5,
+    new_max_level: int = 5,  # I145: max_depth -> max_level
     strict: bool = False,
     verbose: bool = True
 ):
@@ -179,7 +179,7 @@ def convert_checkpoint(
     Args:
         checkpoint_path: 输入 checkpoint 路径
         output_path: 输出 checkpoint 路径
-        new_max_depth: 目标模型的 max_depth
+        new_max_level: 目标模型的 max_level (原 max_depth)
         strict: 严格模式
         verbose: 详细输出
     """
@@ -193,35 +193,38 @@ def convert_checkpoint(
 
     # 获取配置
     config = ckpt.get('config', {})
+    # I145: 兼容旧版 max_depth 字段，统一映射到 max_level
     old_max_depth = config.get('max_depth', 9)
+    old_max_level = config.get('max_level', old_max_depth)  # I145: 优先使用新字段名
 
     if verbose:
-        print(f"  旧版 max_depth: {old_max_depth}")
-        print(f"  新版 max_depth: {new_max_depth}")
-        print(f"  深度缩放比: {new_max_depth / old_max_depth:.2f}")
+        print(f"  旧版 max_depth: {old_max_level}")
+        print(f"  新版 max_level: {new_max_level}")
+        print(f"  深度缩放比: {new_max_level / old_max_level:.2f}")
 
     # 重映射 state_dict
     if verbose:
         print("\n重映射权重...")
     new_state = remap_state_dict(
         old_state,
-        old_max_depth=old_max_depth,
-        new_max_depth=new_max_depth,
+        old_max_depth=old_max_level,  # I145: 使用 max_level
+        new_max_depth=new_max_level,  # I145: 使用 max_level
         verbose=verbose
     )
 
     # 创建新版模型
     if verbose:
-        print(f"\n创建新版模型 (max_depth={new_max_depth})...")
+        print(f"\n创建新版模型...")
+    # 注意: max_level 是变参数，完全由模型架构内部计算
     model = FractalCurveViT(
         image_size=config.get('image_size', 224),
         num_classes=config.get('num_classes', 200),
         dim=config.get('dim', 256),
-        depth=config.get('depth', 8),
+        num_layers=config.get('num_layers', config.get('depth', 8)),  # I145: depth -> num_layers
         heads=config.get('heads', 8),
         dim_head=config.get('dim_head', 32),
         mlp_dim=config.get('mlp_dim', 512),
-        max_depth=new_max_depth,
+        # max_level 不传递，由模型架构内部动态计算
     )
 
     # 尝试加载权重
@@ -259,9 +262,9 @@ def convert_checkpoint(
         'val_loss': ckpt.get('val_loss', 0.0),
         'config': {
             **config,
-            'max_depth': new_max_depth,  # 更新为新版 max_depth
+            'max_level': new_max_level,  # I145: 更新为新版 max_level
             '_converted_from': checkpoint_path,
-            '_conversion_notes': f'max_depth: {old_max_depth} -> {new_max_depth}',
+            '_conversion_notes': f'max_level: {old_max_level} -> {new_max_level}',
         },
     }
     torch.save(new_ckpt, output_path)
@@ -275,13 +278,13 @@ def convert_checkpoint(
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description='转换 checkpoint 的 max_depth')
+    parser = argparse.ArgumentParser(description='转换 checkpoint 的 max_level')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='输入 checkpoint 路径')
     parser.add_argument('--output', type=str, required=True,
                         help='输出 checkpoint 路径')
-    parser.add_argument('--max-depth', type=int, default=5,
-                        help='目标模型的 max_depth (默认: 5)')
+    parser.add_argument('--max-level', type=int, default=5,
+                        help='目标模型的 max_level (默认: 5)')
     parser.add_argument('--strict', action='store_true',
                         help='严格模式')
     parser.add_argument('--quiet', action='store_true',
@@ -292,7 +295,7 @@ def main():
     convert_checkpoint(
         args.checkpoint,
         args.output,
-        new_max_depth=args.max_depth,
+        new_max_level=args.max_level,  # I145: max-depth -> max-level
         strict=args.strict,
         verbose=not args.quiet
     )

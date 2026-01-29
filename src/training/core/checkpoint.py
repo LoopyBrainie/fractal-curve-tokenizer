@@ -146,7 +146,10 @@ def load_model(
     """
     一键加载模型（推荐方式）
 
-    封装所有加载逻辑，确保训练器和评估器使用完全一致的代码。
+    三层参数策略：
+    - 第一层（架构参数）: 从 checkpoint 读取，构建模型
+    - 第二层（动态参数）: 模型架构动态计算（max_level）
+    - 第三层（超参数）: 从 checkpoint 读取，应用到模型
 
     支持两种调用方式:
     1. 从文件加载: load_model("path/to/checkpoint.pth", device="cuda")
@@ -208,7 +211,9 @@ def load_model(
         print(f"  ModelGene: {gene}")
         print(f"  Epoch: {gene.checkpoint_epoch}, Dataset: {gene.dataset_name}")
 
-    # 构建模型
+    # ========== 构建模型 ==========
+    # 注意: max_level 是变参数，完全由模型架构内部计算，不从外部传入
+    # 构建模型（只使用第一层架构参数，max_level 由模型架构处理）
     model = gene.build_model()
 
     # 移动到设备
@@ -218,100 +223,42 @@ def load_model(
     if _state_dict:
         # 过滤掉非 Tensor 类型的键
         tensor_state = {k: v for k, v in _state_dict.items() if isinstance(v, torch.Tensor)}
-        missing, unexpected = model.load_state_dict(tensor_state, strict=strict)
+
+        # 首先清理 torch.compile 产生的 _orig_mod. 前缀
+        cleaned_state = {k.replace('_orig_mod.', ''): v for k, v in tensor_state.items()}
+
+        # 尝试加载权重，处理形状不匹配的情况
+        try:
+            missing, unexpected = model.load_state_dict(cleaned_state, strict=strict)
+        except RuntimeError:
+            # 部分加载：只加载形状匹配的权重
+            model_dict = model.state_dict()
+            loaded_keys = []
+            for name, param in cleaned_state.items():
+                if name in model_dict and model_dict[name].shape == param.shape:
+                    model_dict[name] = param
+                    loaded_keys.append(name)
+            model.load_state_dict(model_dict, strict=False)
+            missing = [k for k in cleaned_state.keys() if k not in loaded_keys]
+            unexpected = list(set(model_dict.keys()) - set(loaded_keys))
+
+            loaded_count = len(loaded_keys)
+            total_model_keys = len(model_dict)
+            load_ratio = loaded_count / total_model_keys * 100 if total_model_keys > 0 else 0
+
+            if verbose:
+                print(f"  [I145] 部分加载完成: {loaded_count}/{total_model_keys} ({load_ratio:.1f}%)")
+                if load_ratio < 80:
+                    print(f"  [WARN] 仅加载了 {load_ratio:.1f}% 的权重")
 
         if missing and verbose:
             print(f"  [WARN] Missing keys: {len(missing)}")
-            # I145: 详细诊断 - 显示关键 missing keys 示例
             if len(missing) > 0:
-                missing_examples = list(missing)[:10]
-                print(f"  [WARN] Missing key examples: {missing_examples}")
+                print(f"  [WARN] Missing key examples: {list(missing)[:5]}")
         if unexpected and verbose:
             print(f"  [WARN] Unexpected keys: {len(unexpected)}")
-            # I145: 详细诊断 - 显示关键 unexpected keys 示例
             if len(unexpected) > 0:
-                unexpected_examples = list(unexpected)[:10]
-                print(f"  [WARN] Unexpected key examples: {unexpected_examples}")
-
-        # I145: 诊断模型是否基本未加载 (50% 准确率 = 随机)
-        if len(missing) > 100 or len(unexpected) > 100:
-            print(f"  [WARN] 大量 key 不匹配 ({len(missing)} missing, {len(unexpected)} unexpected)")
-            print(f"  [WARN] 尝试从 state_dict 推断配置并重新构建模型...")
-
-            # 尝试从 state_dict 推断完整模型配置
-            inferred_config = _infer_model_config_from_state_dict(tensor_state, verbose)
-            if inferred_config:
-                if verbose:
-                    print(f"  [I145] 推断的配置: {inferred_config}")
-
-                # 更新 gene 的核心配置
-                if inferred_config.get('dim') is not None:
-                    gene.dim = inferred_config['dim']
-                if inferred_config.get('depth') is not None:
-                    gene.depth = inferred_config['depth']
-                if inferred_config.get('heads') is not None:
-                    gene.heads = inferred_config['heads']
-
-                # I145: 更新 gene 的 max_depth 配置（两个字段分离）
-                # 注意：推断函数返回 'max_depth' (用于 Transformer) 和 'tokenizer_max_depth' (用于 Splitter)
-                if inferred_config.get('tokenizer_max_depth') is not None:
-                    gene.tokenizer_max_depth = inferred_config['tokenizer_max_depth']
-                if inferred_config.get('max_depth') is not None:
-                    gene.transformer_max_depth = inferred_config['max_depth']
-
-                # 更新 gene 的 Splitter 配置
-                if inferred_config.get('hidden_dim') is not None:
-                    gene.splitter_hidden_dim = inferred_config['hidden_dim']
-                if inferred_config.get('feature_dim') is not None:
-                    gene.splitter_feature_dim = inferred_config['feature_dim']
-                if inferred_config.get('pool_size') is not None:
-                    gene.splitter_pool_size = inferred_config['pool_size']
-
-                # 重新构建模型
-                model = gene.build_model()
-                model = model.to(torch.device(device))
-
-                # 清理 _orig_mod. 前缀
-                cleaned_state = {k.replace('_orig_mod.', ''): v for k, v in tensor_state.items()}
-
-                # 尝试部分加载（跳过不匹配的层）
-                try:
-                    # 先尝试严格加载
-                    missing, unexpected = model.load_state_dict(cleaned_state, strict=False)
-                except RuntimeError as e:
-                    # 如果失败，尝试逐个加载匹配的层
-                    print(f"  [I145] 严格加载失败，尝试部分加载...")
-                    model_dict = model.state_dict()
-                    loaded_keys = []
-                    for name, param in cleaned_state.items():
-                        if name in model_dict and model_dict[name].shape == param.shape:
-                            model_dict[name] = param
-                            loaded_keys.append(name)
-                    model.load_state_dict(model_dict, strict=False)
-                    missing = [k for k in cleaned_state.keys() if k not in loaded_keys]
-                    unexpected = []
-                    if verbose:
-                        print(f"  [I145] 部分加载成功: {len(loaded_keys)} layers loaded")
-
-                # 统计加载情况
-                loaded_count = len(cleaned_state) - len(missing)
-                total_count = len(cleaned_state)
-                load_ratio = loaded_count / total_count * 100 if total_count > 0 else 0
-
-                if verbose:
-                    print(f"  [I145] 加载完成: {loaded_count}/{total_count} ({load_ratio:.1f}%)")
-
-                # 警告：架构不匹配可能导致性能下降
-                if load_ratio < 80:
-                    transformer_max_depth = inferred_config.get('max_depth', 8)
-                    tokenizer_max_depth = inferred_config.get('tokenizer_max_depth', 4)
-                    print(f"  [WARN] 警告: 仅加载了 {load_ratio:.1f}% 的权重")
-                    print(f"  [WARN] 这可能是因为:")
-                    print(f"  [WARN]   - Transformer max_depth={transformer_max_depth} 与 tokenizer max_depth={tokenizer_max_depth} 不同")
-                    print(f"  [WARN]   - 代码版本与 checkpoint 不兼容")
-                    print(f"  [WARN] 建议: 使用保存 checkpoint 时的代码版本进行评估")
-            else:
-                print(f"  [ERROR] 无法从 state_dict 推断配置，请手动指定 Splitter 参数")
+                print(f"  [WARN] Unexpected key examples: {list(unexpected)[:5]}")
 
     if verbose:
         print(f"  [OK] Model loaded successfully")
@@ -474,10 +421,16 @@ def _infer_model_config_from_state_dict(state_dict: Dict[str, Any], verbose: boo
     处理 torch.compile 产生的 _orig_mod. 前缀。
 
     关键推断逻辑:
-    - lca_embedding.weight shape = [max_depth+1, num_heads] → max_depth, heads (用于 Transformer)
-    - depth_embedding.weight shape = [max_depth+1, dim] → max_depth, dim (用于 Tokenizer)
-    - to_qkv.weight shape = [3*dim*heads, dim] → dim
+    - lca_embedding.weight shape = [max_depth+1, heads] → 直接得到 heads 和 max_depth
+    - to_qkv.weight shape = [3 * dim_head * heads, dim] → 只用于推断 dim
+    - depth_embedding.weight shape = [max_depth+1, dim] → dim（备用）
     - complexity_mlp.0.weight shape = [hidden_dim, feature_dim * pool_size^2] → hidden_dim, pool_size
+
+    注意：无法从 to_qkv.weight 唯一确定 heads，因为:
+    - to_qkv.shape = [3 * dim_head * heads, dim]
+    - dim_head = dim // heads
+    - 所以 to_qkv.shape = [3 * (dim // heads) * heads, dim]
+    - 多个 (heads, dim_head) 组合可能产生相同 shape
 
     Returns:
         dict with keys: dim, depth, heads, mlp_dim, max_depth, hidden_dim, feature_dim, pool_size
@@ -499,34 +452,50 @@ def _infer_model_config_from_state_dict(state_dict: Dict[str, Any], verbose: boo
     # 清理 _orig_mod. 前缀
     cleaned_keys = {k.replace('_orig_mod.', ''): k for k in state_dict.keys()}
 
-    # 1. 从 to_qkv 推断真实的 dim 和 heads（最先执行，因为最可靠）
-    # 注意：to_qkv.shape = [3*dim*heads, dim] → heads = shape[0] / (3 * dim)
-    # lca_embedding.shape = [max_depth+1, lca_heads] → lca_heads 不是 attention heads!
-    for key in cleaned_keys.keys():
-        if '.attention.to_qkv.weight' in key:
-            orig_key = cleaned_keys[key]
-            tensor = state_dict[orig_key]
-            if len(tensor.shape) == 2:
-                result['dim'] = tensor.shape[1]
-                result['heads'] = tensor.shape[0] // (3 * tensor.shape[1])
-                if verbose:
-                    print(f"  [I145] 发现 to_qkv: {key}, shape={tuple(tensor.shape)}")
-                    print(f"  [I145]   推断: dim={result['dim']}, heads={result['heads']}")
-                break
-
-    # 2. 从 lca_embedding 推断 Transformer 的 max_depth（lca_embedding 第二个维度是 lca_heads，不是 attention heads）
+    # 1. 首先从 lca_embedding 推断真实的 heads（最可靠的方法）
+    # lca_embedding.weight shape = [max_depth+1, heads] → 直接得到 heads
+    # 注意：lca_embedding 第二个维度是 attention heads（与 lca_heads 不同）
+    lca_heads_detected = None
     for key in cleaned_keys.keys():
         if 'lca_embedding' in key and 'weight' in key:
             orig_key = cleaned_keys[key]
             tensor = state_dict[orig_key]
             if len(tensor.shape) == 2:
-                # lca_embedding.weight shape = [max_depth+1, lca_heads]
-                # 注意：第二个维度是 lca_heads（用于 Hilbert bias），不是 attention heads
+                # lca_embedding.weight shape = [max_depth+1, heads]
+                # 第二个维度直接就是 heads 数
+                lca_heads_detected = tensor.shape[1]
                 result['max_depth'] = tensor.shape[0] - 1  # Transformer 用的 max_depth
-                lca_heads = tensor.shape[1]
+                result['heads'] = lca_heads_detected
                 if verbose:
                     print(f"  [I145] 发现 lca_embedding: {key}, shape={tuple(tensor.shape)}")
-                    print(f"  [I145]   推断: transformer_max_depth={result['max_depth']}, lca_heads={lca_heads}")
+                    print(f"  [I145]   推断: transformer_max_depth={result['max_depth']}, heads={result['heads']}")
+                break
+
+    # 2. 从 to_qkv 推断 dim（作为补充验证）
+    # to_qkv.weight shape = [3 * dim_head * heads, dim] = [3 * (dim // heads) * heads, dim]
+    # 由于无法从 to_qkv 唯一确定 heads，我们只推断 dim
+    for key in cleaned_keys.keys():
+        if '.attention.to_qkv.weight' in key:
+            orig_key = cleaned_keys[key]
+            tensor = state_dict[orig_key]
+            if len(tensor.shape) == 2:
+                # dim = to_qkv.shape[1]
+                result['dim'] = tensor.shape[1]
+                if verbose:
+                    print(f"  [I145] 发现 to_qkv: {key}, shape={tuple(tensor.shape)}")
+                    print(f"  [I145]   推断: dim={result['dim']}")
+                # 如果之前没有检测到 heads，尝试从 to_qkv 推断
+                if result['heads'] is None and lca_heads_detected is None:
+                    # 使用常见的 heads 值进行验证
+                    dim = result['dim']
+                    for heads in [1, 2, 4, 6, 8, 12, 16]:
+                        dim_head = dim // heads
+                        expected_qkv_dim = 3 * dim_head * heads
+                        if tensor.shape[0] == expected_qkv_dim:
+                            result['heads'] = heads
+                            if verbose:
+                                print(f"  [I145]   从 to_qkv 推断 heads={heads}")
+                            break
                 break
 
     # 3. 从 splitter.threshold_offsets 推断 tokenizer 的 max_depth（最可靠）

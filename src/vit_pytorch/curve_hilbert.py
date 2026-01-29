@@ -216,7 +216,8 @@ class HilbertCurve:
         device = x.device
 
         # 计算最大位数 (log2(n))
-        max_bits = int(math.log2(n))
+        # I109-7: 使用 bit_length() 替代 int(math.log2(n)) 避免浮点精度问题
+        max_bits = n.bit_length() - 1
 
         # P-OPT-8: 批量生成位掩码 [max_bits]
         bit_positions = torch.arange(max_bits, device=device, dtype=torch.long)
@@ -309,7 +310,8 @@ class HilbertCurve:
         device = d.device
 
         # 计算最大位数
-        max_bits = int(math.log2(n))
+        # I109-7: 使用 bit_length() 替代 int(math.log2(n)) 避免浮点精度问题
+        max_bits = n.bit_length() - 1
 
         # 初始化累积坐标
         x = torch.zeros(B, device=device, dtype=torch.long)
@@ -401,14 +403,23 @@ class HilbertCurve:
     def adaptive_mapping(cls, h: int, w: int) -> List[int]:
         """
         为任意尺寸的 2x2 patch 网格生成自适应 Hilbert 映射
-        
+
         Args:
-            h: 网格高度
-            w: 网格宽度
-            
+            h: 网格高度 (h >= 1)
+            w: 网格宽度 (w >= 1)
+
         Returns:
             四个象限按 Hilbert 顺序排列的索引列表
+
+        Note:
+            边缘情况处理:
+            - w=1 且 h=1: 返回 [0, 2, 3, 1] (Hilbert 曲线固有顺序)
+            - w=1 或 h=1: 归一化退化为恒等映射，保留象限间的相对顺序
         """
+        # I109-5: 1x1 退化情况：返回 Hilbert 曲线固有顺序
+        if h == 1 and w == 1:
+            return [0, 2, 3, 1]  # 左上→左下→右下→右上
+
         # 象限坐标映射: 0=左上, 1=右上, 2=左下, 3=右下
         coords = [
             (0, 1, 0),  # 左上
@@ -416,23 +427,26 @@ class HilbertCurve:
             (0, 0, 2),  # 左下
             (1, 0, 3),  # 右下
         ]
-        
-        # 计算 Hilbert 距离
+
+        # 计算 Hilbert 曲线阶数
         max_dim = max(h, w, 2)
-        # 找到最小的 2 的幂次方 >= max_dim
         n = 1
         while n < max_dim:
             n *= 2
-        
+
+        # I109-5: 统一归一化公式 (处理 w=1 或 h=1 的情况)
+        w_safe = max(w - 1, 1)  # 防止除零
+        h_safe = max(h - 1, 1)
+
         # 计算每个象限的 Hilbert 距离
         distances = []
         for x, y, idx in coords:
             # 归一化坐标
-            norm_x = (x * (n - 1)) // max(w - 1, 1) if w > 1 else x
-            norm_y = (y * (n - 1)) // max(h - 1, 1) if h > 1 else y
+            norm_x = (x * (n - 1)) // w_safe
+            norm_y = (y * (n - 1)) // h_safe
             dist = cls.xy_to_d(n, norm_x, norm_y)
             distances.append((dist, idx))
-        
+
         distances.sort()
         return [idx for _, idx in distances]
 

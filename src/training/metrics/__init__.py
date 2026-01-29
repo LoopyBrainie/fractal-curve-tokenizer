@@ -166,12 +166,21 @@ class ClassificationMetrics:
             self._top5_correct += top5_correct.sum().item()
         else:
             self._top5_correct = self._total_correct
-        
-        # Per-class 统计
-        for c in range(self.num_classes):
-            mask = targets == c
-            self._class_total[c] += mask.sum()
-            self._class_correct[c] += (correct & mask).sum()
+
+        # Per-class 统计 (FIX: 向量化使用 bincount，避免 Python 循环)
+        # _class_total[c] = count of samples with target class c
+        # _class_correct[c] = count of correctly predicted samples with target class c
+        targets_long = targets.long()
+        pred_long = pred.long()
+        # 使用 bincount 批量更新，避免循环
+        class_total_batch = torch.bincount(targets_long, minlength=self.num_classes)
+        # 修复: 只统计正确预测的类别索引，避免错误预测被计入类别 0
+        # 正确预测的类别索引
+        correct_class_indices = targets_long[correct]  # 只取正确预测对应的类别
+        class_correct_batch = torch.bincount(correct_class_indices, minlength=self.num_classes)
+        # 累积到全局统计
+        self._class_total += class_total_batch
+        self._class_correct += class_correct_batch
     
     def compute(self) -> ClassificationMetricsResult:
         """计算最终指标"""

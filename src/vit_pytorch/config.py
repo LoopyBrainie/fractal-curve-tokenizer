@@ -43,6 +43,9 @@ from .constants import (
     K_ADAPTIVE_REFERENCE_SIZE,
     K_MAX_HARD_LIMIT,
     K_MIN_HARD_LIMIT,
+    # I109-4: Elastic Budget 常量
+    ELASTIC_LAMBDA_TARGET,
+    ELASTIC_LAMBDA_BOUNDARY,
 )
 
 
@@ -92,12 +95,12 @@ class SplitterConfig:
     use_dynamic_k: bool = True
 
     # I33: 相对预算参数 (替代绝对 K_min/K_max)
-    # 基准覆盖率 (224×224 目标 5%)
+    # 基准覆盖率 (224×224 目标 ~12%)
     token_coverage_base: float = K_COVERAGE_BASE
     # 最小覆盖率 (防止欠采样)
     token_coverage_min: float = K_COVERAGE_MIN
-    # 最大覆盖率硬上限 (防止 OOM)
-    token_coverage_max_hard: float = K_COVERAGE_MAX_HARD
+    # 最大覆盖率上限 (参与自适应计算，约束 β(H,W))
+    token_coverage_max: float = K_COVERAGE_MAX_HARD
     # 自适应参考尺寸
     adaptive_reference_size: int = K_ADAPTIVE_REFERENCE_SIZE
     # 绝对下界保护
@@ -109,6 +112,10 @@ class SplitterConfig:
 
     # 正则化参数
     dropout: float = 0.1
+
+    # I109-4: Elastic Budget 目标导向损失参数
+    elastic_lambda_target: float = ELASTIC_LAMBDA_TARGET
+    elastic_lambda_boundary: float = ELASTIC_LAMBDA_BOUNDARY
 
     # I30-10: 配额参数暴露
     enable_learnable_quota: bool = LEARNABLE_QUOTA_ENABLED
@@ -495,7 +502,7 @@ def create_splitter_config(
     # I33: 相对预算参数
     token_coverage_base: Optional[float] = None,
     token_coverage_min: Optional[float] = None,
-    token_coverage_max_hard: Optional[float] = None,
+    token_coverage_max: Optional[float] = None,  # I109-3: 参与自适应计算
     adaptive_reference_size: Optional[int] = None,
     K_min_abs: Optional[int] = None,
     K_max_hard: Optional[int] = None,
@@ -535,8 +542,8 @@ def create_splitter_config(
         config.token_coverage_base = token_coverage_base
     if token_coverage_min is not None:
         config.token_coverage_min = token_coverage_min
-    if token_coverage_max_hard is not None:
-        config.token_coverage_max_hard = token_coverage_max_hard
+    if token_coverage_max is not None:
+        config.token_coverage_max = token_coverage_max  # I109-3
     if adaptive_reference_size is not None:
         config.adaptive_reference_size = adaptive_reference_size
     if K_min_abs is not None:

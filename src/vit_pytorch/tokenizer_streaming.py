@@ -352,10 +352,14 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 4. 构建输出 (P-OPT-4: 向量化输出构建，避免 Python for 循环)
         # TokenSequence 对象仍需构建，但使用预计算的张量切片
         # P-OPT: 从 count_matrix 直接在 GPU 上构建 depth_distribution，避免 .cpu()
+        # I145: 修复 GPU 同步问题 - 批量转换 tokens_per_batch 到 CPU
+        # 原始: int(tokens_per_batch[b].item()) 在循环中调用 B 次 .item()
+        # 修复: 一次性转换到 CPU，再在循环中使用 Python 值
+        tokens_per_batch_cpu = tokens_per_batch.cpu().tolist() if tokens_per_batch.is_cuda else tokens_per_batch.tolist()
         sequences = []
         for b in range(B):
-            # P-OPT: 使用 tokens_per_batch[b] 替代 Python list 索引
-            num_tokens = int(tokens_per_batch[b].item())  # 单个 scalar .item() 可接受
+            # P-OPT: 使用预转换的 CPU 值，避免 GPU 同步
+            num_tokens = tokens_per_batch_cpu[b]
             # 从 count_matrix[b] 在 GPU 上构建 depth_distribution
             row = count_matrix[b]  # [max_d]
             nonzero_mask = row > 0

@@ -55,11 +55,8 @@ class ModelGene:
     # ==================== Tokenizer 参数 ====================
     pool: str = "weighted"         # 池化类型
     min_patch_size: int = 4        # 最小 patch 尺寸
-    # I145: 分离两个 max_level（之前是同一个参数控制两个不同组件）
-    # - tokenizer_max_level: 用于 Splitter/Tokenizer（动态计算，通常基于图像尺寸）
-    # - transformer_max_level: 用于 Transformer/lca_embedding（从 args.max_level 获取）
-    tokenizer_max_level: Optional[int] = None  # Tokenizer/Splitter 用的 max_level
-    transformer_max_level: Optional[int] = None  # Transformer/lca_embedding 用的 max_level
+    # 注意: max_level 是变参数，由模型架构根据 image_size 和 min_patch_size 动态计算
+    # 不保存到 ModelGene 中，确保训练/评估模型结构完全一致
 
     # I33: 相对预算参数 (替代绝对 K_min/K_max)
     # 保存覆盖率而非绝对 K 值，确保评估时能正确复算
@@ -112,9 +109,15 @@ class ModelGene:
     # ==================== 序列化/反序列化 ====================
 
     def to_dict(self) -> Dict[str, Any]:
-        """序列化为字典 (用于保存到 checkpoint)"""
+        """序列化为字典 (用于保存到 checkpoint)
+
+        遵循三层参数策略:
+        - 第一层（架构参数）: dim, num_layers, heads, mlp_dim, image_size, channels
+        - 第二层（变参数）: max_level - 不保存，由模型架构内部计算
+        - 第三层（超参数）: token_coverage_*, dropout, ffn_type 等
+        """
         return {
-            # 核心架构参数
+            # ========== 第一层：架构参数 ==========
             'dim': self.dim,
             'num_layers': self.num_layers,
             'heads': self.heads,
@@ -123,53 +126,51 @@ class ModelGene:
             'image_size': self.image_size,
             'channels': self.channels,
 
-            # Tokenizer 参数
+            # ========== Tokenizer 参数 ==========
             'pool': self.pool,
             'min_patch_size': self.min_patch_size,
-            # I145: 分离保存两个 max_level
-            'tokenizer_max_level': self.tokenizer_max_level,
-            'transformer_max_level': self.transformer_max_level,
-            # I33: 保存覆盖率而非绝对 K 值
+            # 注意: max_level 是变参数，由模型架构动态计算，不保存
+            # I33: 保存覆盖率而非绝对 K 值（确保不同分辨率下正确复算）
             'token_coverage_min': self.token_coverage_min,
             'token_coverage_max': self.token_coverage_max,
 
-            # 正则化
+            # ========== 正则化参数 ==========
             'dropout': self.dropout,
             'emb_dropout': self.emb_dropout,
             'drop_path_rate': self.drop_path_rate,
 
-            # 编码选项
+            # ========== 编码选项 ==========
             'use_hilbert_encoding': self.use_hilbert_encoding,
             'use_spatial_encoding': self.use_spatial_encoding,
             'use_checkpoint': self.use_checkpoint,
 
-            # FFN
+            # ========== FFN 选项 ==========
             'ffn_type': self.ffn_type,
 
-            # LCA
+            # ========== LCA 参数 ==========
             'lca_temperature': self.lca_temperature,
             'learnable_temperature': self.learnable_temperature,
 
-            # I24-2
+            # ========== I24-2: 可学习配额 ==========
             'quota_learnable': self.quota_learnable,
             'quota_entropy_weight': self.quota_entropy_weight,
 
-            # I31-3
+            # ========== I31-3: 形状-尺度编码 ==========
             'use_area_encoding': self.use_area_encoding,
             'use_affine_modulation': self.use_affine_modulation,
             'fourier_levels': self.fourier_levels,
 
-            # Splitter (I140)
+            # ========== I140: Splitter 关键参数 ==========
             'splitter_hidden_dim': self.splitter_hidden_dim,
             'splitter_feature_dim': self.splitter_feature_dim,
             'splitter_pool_size': self.splitter_pool_size,
 
-            # 训练元信息
+            # ========== 训练元信息 ==========
             'dataset_name': self.dataset_name,
             'training_epochs': self.training_epochs,
             'checkpoint_epoch': self.checkpoint_epoch,
 
-            # 参数层级元数据
+            # ========== 参数层级元数据（不序列化但保留） ==========
             '_parameter_tier': self._parameter_tier,
         }
 
@@ -192,12 +193,8 @@ class ModelGene:
         if 'depth' in d and 'num_layers' not in d:
             d['num_layers'] = d['depth']
 
-        # I145: 处理向后兼容 - 旧版 checkpoint 只有 max_depth 字段
-        if 'max_depth' in d:
-            if 'tokenizer_max_level' not in d and 'transformer_max_level' not in d:
-                # 旧版格式：max_depth 同时用于 tokenizer 和 transformer
-                d['tokenizer_max_level'] = d.get('max_depth')
-                d['transformer_max_level'] = d.get('max_depth')
+        # 注意: max_level/max_depth 是变参数，由模型架构内部动态计算
+        # 不再从 checkpoint 读取或迁移
 
         # I33: 迁移支持 - 旧版 checkpoint 使用 K_min/K_max
         # 如果有旧的 K_min/K_max 字段但没有新的 token_coverage_* 字段，则进行迁移
@@ -250,78 +247,34 @@ class ModelGene:
     def build_model(self) -> nn.Module:
         """从 ModelGene 构建 FractalCurveViT 模型
 
-        关键：K 值从 coverage 复算，确保评估时与训练时的相对预算一致。
+        三层参数策略（完全信任模型架构源码）：
+        - 第一层（架构参数）: dim, num_layers, heads, mlp_dim, min_patch_size, image_size
+        - 第二层（动态参数）: max_level → 由 FractalCurveViT → StreamingFractalTokenizerV3 动态计算
+        - 第三层（超参数）: token_coverage, dropout, ffn_type 等
+
+        关键：完全信任模型架构源码，不手动创建任何子组件。
+        FractalCurveViT 会根据 image_size 和 min_patch_size 自动计算 max_level。
+
+        注意: max_level 是变参数，完全由模型架构内部计算，不从外部传入。
+              确保训练/评估模型结构完全一致。
         """
         from vit_pytorch import FractalCurveViT
-        from vit_pytorch.gumbel_topk_splitter import create_gumbel_topk_from_config
 
-        # 处理 image_size（可能是 int 或 tuple）
-        if self.image_size is None:
-            img_size_for_splitter = None
-        elif isinstance(self.image_size, tuple):
-            img_size_for_splitter = self.image_size
-        else:
-            img_size_for_splitter = (self.image_size, self.image_size)
-
-        # I145: dim_head 必须等于 dim // heads，确保 to_qkv 形状正确
-        dim_head = self.dim // self.heads
-
-        # I33: 从 coverage 复算 K 值
-        # 公式: K = coverage * max_patches = coverage * (image_size/min_patch_size)^2
-        if img_size_for_splitter is not None:
-            img_h, img_w = img_size_for_splitter
-            img_size_for_budget = min(img_h, img_w)
-            max_patches = (img_size_for_budget // self.min_patch_size) ** 2
-            K_min_computed = max(4, int(max_patches * self.token_coverage_min))
-            K_max_computed = int(max_patches * self.token_coverage_max)
-        else:
-            # 动态分辨率：使用默认 224 作为参考
-            max_patches = (224 // self.min_patch_size) ** 2
-            K_min_computed = max(4, int(max_patches * self.token_coverage_min))
-            K_max_computed = int(max_patches * self.token_coverage_max)
-
-        # I145: 使用 tokenizer_max_level 构建 Splitter
-        # 注意：只有当值不为 None 时才传递，否则使用 create_gumbel_topk_from_config 的默认值
-        splitter_kwargs = dict(
-            feature_dim=self.splitter_feature_dim if self.splitter_feature_dim else self.dim,
-            min_patch_size=self.min_patch_size,
-            K_min=K_min_computed,
-            K_max=K_max_computed,
-            image_size=img_size_for_splitter,
-            # I33: 传递覆盖率参数
-            token_coverage_min=self.token_coverage_min,
-            token_coverage_max_hard=self.token_coverage_max,
-        )
-        if self.tokenizer_max_level is not None:
-            splitter_kwargs['max_level_limit'] = self.tokenizer_max_level
-        if self.splitter_hidden_dim is not None:
-            splitter_kwargs['hidden_dim'] = self.splitter_hidden_dim
-        if self.splitter_pool_size is not None:
-            splitter_kwargs['pool_size'] = self.splitter_pool_size
-
-        splitter = create_gumbel_topk_from_config(**splitter_kwargs)
-
-        # I145: 使用 transformer_max_level 构建模型
-        # 如果有 transformer_max_level，则传入；否则设为 None（让模型从 tokenizer 获取）
-        model_max_level = self.transformer_max_level if self.transformer_max_level is not None else None
-
-        # 构建模型
-        # 注意：K_min/K_max 现在是 FractalCurveViT 的计算属性，
-        # 由 token_coverage_* 和 max_level 动态计算，不再需要显式传递
+        # 传递所有保存的参数，让模型架构创建所有组件
         model = FractalCurveViT(
             image_size=self.image_size,
             num_classes=self.num_classes,
             dim=self.dim,
             num_layers=self.num_layers,
             heads=self.heads,
-            dim_head=dim_head,  # I145: 关键修复，确保与训练一致
+            dim_head=self.dim // self.heads,  # 确保与 heads 一致
             mlp_dim=self.mlp_dim,
             pool=self.pool,
             channels=self.channels,
             dropout=self.dropout,
             emb_dropout=self.emb_dropout,
             min_patch_size=self.min_patch_size,
-            max_level=model_max_level,  # I145: 使用 transformer_max_level
+            # max_level 不传递，由模型架构内部动态计算
             use_hilbert_encoding=self.use_hilbert_encoding,
             use_spatial_encoding=self.use_spatial_encoding,
             use_checkpoint=self.use_checkpoint,
@@ -329,8 +282,8 @@ class ModelGene:
             ffn_type=self.ffn_type,
             lca_temperature=self.lca_temperature,
             learnable_temperature=self.learnable_temperature,
-            splitter=splitter,
-            # I33: 传递覆盖率参数，K 值由模型内部计算
+            # 不传递自定义 splitter，让 FractalCurveViT 自己创建
+            splitter=None,
             token_coverage_min=self.token_coverage_min,
             token_coverage_max=self.token_coverage_max,
             pos_dropout=None,
@@ -338,6 +291,11 @@ class ModelGene:
             use_affine_modulation=self.use_affine_modulation,
             fourier_levels=self.fourier_levels,
             quota_learnable=self.quota_learnable,
+            quota_entropy_weight=self.quota_entropy_weight,
+            # I140: Splitter 架构参数
+            splitter_hidden_dim=self.splitter_hidden_dim,
+            splitter_feature_dim=self.splitter_feature_dim,
+            splitter_pool_size=self.splitter_pool_size,
         )
 
         return model
@@ -353,6 +311,8 @@ class ModelGene:
         verbose: bool = False,
     ) -> "ModelGene":
         """从模型实例提取架构基因
+
+        注意：这是向后兼容方法。首选使用 from_config() 直接从配置构造。
 
         Args:
             model: FractalCurveViT 模型实例
@@ -410,12 +370,12 @@ class ModelGene:
             if hasattr(model, 'splitter') and hasattr(model.splitter, 'config') and model.splitter.config is not None:
                 config = model.splitter.config
                 gene.token_coverage_min = getattr(config, 'token_coverage_min', 0.01)
-                gene.token_coverage_max = getattr(config, 'token_coverage_max_hard', 0.05)
+                gene.token_coverage_max = getattr(config, 'token_coverage_max', 0.25)  # I109-3
             # 备选：从 tokenizer.splitter.config 提取
             elif hasattr(tokenizer, 'splitter') and hasattr(tokenizer.splitter, 'config') and tokenizer.splitter.config is not None:
                 config = tokenizer.splitter.config
                 gene.token_coverage_min = getattr(config, 'token_coverage_min', 0.01)
-                gene.token_coverage_max = getattr(config, 'token_coverage_max_hard', 0.05)
+                gene.token_coverage_max = getattr(config, 'token_coverage_max', 0.25)  # I109-3
             else:
                 raise ValueError(
                     "无法从模型提取 token_coverage_* 参数。"
@@ -423,12 +383,8 @@ class ModelGene:
                 )
 
             # I145: 分离提取两个 max_level
-            # tokenizer_max_level: 从 tokenizer 获取（动态计算的 Splitter 深度）
-            if hasattr(tokenizer, 'max_level'):
-                gene.tokenizer_max_level = tokenizer.max_level
-
-            # transformer_max_level: 从 model 获取（传入 Transformer 的深度）
-            gene.transformer_max_level = getattr(model, 'max_level', None)
+            # 注意: max_level 是变参数，由模型架构内部计算，不保存到 ModelGene
+            # 如果需要获取 max_level，应直接从 model.max_level 读取
 
         # 从 splitter 提取参数 (I140)
         if hasattr(model, 'splitter'):
@@ -448,6 +404,65 @@ class ModelGene:
             # 可学习配额
             if hasattr(splitter, 'quota_learnable'):
                 gene.quota_learnable = splitter.quota_learnable
+
+        return gene
+
+    @classmethod
+    def from_config(
+        cls,
+        config: "ModelArchitectureConfig",
+        dataset_name: str = "",
+        epoch: int = 0,
+    ) -> "ModelGene":
+        """从 ModelArchitectureConfig 构造 ModelGene（推荐方式）
+
+        这是保存 checkpoint 时构造 ModelGene 的首选方法。
+        训练器在构建模型时已经持有配置，直接从配置构造 ModelGene，
+        而不是从已创建的模型中重新提取（违反单一数据源原则）。
+
+        Args:
+            config: ModelArchitectureConfig 对象
+            dataset_name: 数据集名称
+            epoch: 当前 epoch
+
+        Returns:
+            ModelGene 对象
+        """
+        # 使用 getattr 处理可选字段（兼容不同版本的 ModelArchitectureConfig）
+        gene = cls(
+            dim=config.dim,
+            num_layers=config.num_layers,
+            heads=config.heads,
+            mlp_dim=config.mlp_dim,
+            num_classes=config.num_classes,
+            image_size=config.image_size,
+            channels=config.channels,
+            pool=config.pool,
+            min_patch_size=config.min_patch_size,
+            dropout=config.dropout,
+            emb_dropout=config.emb_dropout,
+            drop_path_rate=config.drop_path_rate,
+            # 使用 getattr 兼容可选字段
+            use_hilbert_encoding=getattr(config, 'use_hilbert_encoding', True),
+            use_spatial_encoding=getattr(config, 'use_spatial_encoding', True),
+            use_checkpoint=config.use_checkpoint,
+            ffn_type=config.ffn_type,
+            lca_temperature=config.lca_temperature if config.lca_temperature is not None else 1.5,
+            learnable_temperature=config.learnable_temperature,
+            token_coverage_min=config.token_coverage_min,
+            token_coverage_max=config.token_coverage_max,
+            use_area_encoding=config.use_area_encoding,
+            use_affine_modulation=config.use_affine_modulation,
+            fourier_levels=config.fourier_levels,
+            quota_learnable=config.quota_learnable,
+            quota_entropy_weight=getattr(config, 'quota_entropy_weight', 0.01),
+            # I140: Splitter 架构参数
+            splitter_hidden_dim=getattr(config, 'splitter_hidden_dim', None),
+            splitter_feature_dim=getattr(config, 'splitter_feature_dim', None),
+            splitter_pool_size=getattr(config, 'splitter_pool_size', None),
+            dataset_name=dataset_name,
+            checkpoint_epoch=epoch,
+        )
 
         return gene
 

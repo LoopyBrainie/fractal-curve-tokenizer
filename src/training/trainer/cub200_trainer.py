@@ -42,6 +42,7 @@ import numpy as np
 
 from ..losses.finegrained import FinegrainedLoss, FinegrainedLossConfig
 from ..config import ModelArchitectureConfig  # I36: 统一架构配置
+from ..core.checkpoint import save_checkpoint_with_gene  # ModelGene 自包含 checkpoint
 from vit_pytorch import FractalCurveViT  # I36: 模型创建
 
 logger = logging.getLogger(__name__)
@@ -973,12 +974,15 @@ class CUB200Trainer:
 
             total += labels.size(0)
 
-            # 逐类别统计
-            for c in range(self.num_classes):
-                mask = labels == c
-                if mask.sum() > 0:
-                    class_correct[c] += (preds[mask] == c).sum()
-                    class_total[c] += mask.sum()
+            # 逐类别统计 (FIX: 向量化使用 bincount，避免 Python 循环)
+            labels_long = labels.long()
+            preds_long = preds.long()
+            # _class_total[c] = count of samples with target class c
+            class_total += torch.bincount(labels_long, minlength=self.num_classes)
+            # 修复: 只统计正确预测的类别索引，避免错误预测被计入类别 0
+            correct = preds_long == labels_long
+            correct_class_indices = labels_long[correct]  # 只取正确预测对应的类别
+            class_correct += torch.bincount(correct_class_indices, minlength=self.num_classes)
 
             # 混淆矩阵
             for pred, label in zip(preds, labels):
@@ -989,22 +993,29 @@ class CUB200Trainer:
         top1_acc = 100.0 * correct_top1 / max(total, 1)
         top5_acc = 100.0 * correct_top5 / max(total, 1)
 
-        # 逐类别准确率
+        # 逐类别准确率 (I145: 向量化计算，避免 Python 循环)
+        # 原始实现:
+        # for c in range(self.num_classes):
+        #     if class_total[c] > 0:
+        #         acc = (class_correct[c] / class_total[c]).item() * 100
+        #         per_class_acc[c] = acc
+        #     else:
+        #         per_class_acc[c] = 0.0
+        # 向量化实现:
         per_class_acc = None
         mca = None
         if self.config.compute_per_class:
-            per_class_acc = {}
-            valid_classes = 0
-            acc_sum = 0.0
-            for c in range(self.num_classes):
-                if class_total[c] > 0:
-                    acc = (class_correct[c] / class_total[c]).item() * 100
-                    per_class_acc[c] = acc
-                    acc_sum += acc
-                    valid_classes += 1
-                else:
-                    per_class_acc[c] = 0.0
-            mca = acc_sum / max(valid_classes, 1)
+            # 计算所有类别的准确率 [C]
+            # clamp class_total to avoid division by zero
+            class_total_safe = class_total.clamp(min=1)
+            class_acc_tensor = (class_correct / class_total_safe) * 100  # [C]
+
+            # 转换为字典
+            per_class_acc = {c: class_acc_tensor[c].item() for c in range(self.num_classes)}
+
+            # 只对有效类别计算 MCA (class_total > 0)
+            valid_mask = class_total > 0
+            mca = class_acc_tensor[valid_mask].mean().item()
 
         # 混淆对
         confused_pairs = None
@@ -1270,70 +1281,34 @@ class CUB200Trainer:
         epoch: int,
         val_acc: float,
     ) -> None:
-        """保存检查点
+        """保存检查点 (使用 ModelGene 自包含格式)
 
-        包含完整状态:
-            - 模型权重
-            - 优化器状态
-            - AMP scaler 状态
-            - Center Loss 优化器状态
-            - 训练配置
+        使用 ModelGene.from_config() 直接从配置构造，确保：
+        1. 单一数据源 - 训练器持有配置，直接从配置构造
+        2. 避免从模型提取 - 训练器已知所有参数，无需重复查询模型
+        3. 变参数 (max_level) 不传入，由模型架构内部计算
         """
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
-            'val_acc': val_acc,
-            'best_metric': self.state.best_metric,
-            'best_epoch': self.state.best_epoch,
-            # 完整的模型架构配置（用于评估时正确重建模型）
-            'config': {
-                # 训练超参数
-                'batch_size': self.config.batch_size,
-                'num_epochs': self.config.num_epochs,
-                'learning_rate': self.config.learning_rate,
-                'accum_steps': self.config.accum_steps,
-                'center_lr_ratio': self.config.center_lr_ratio,
-                'center_lr': self.config.center_lr,
-                'label_smoothing': self.config.label_smoothing,
-                'dropout': self.config.dropout,
-                'patience': self.config.patience,
-                'use_amp': self.config.use_amp,
-                'validate_interval': self.config.validate_interval,
-                'gradient_clip_norm': self.config.gradient_clip_norm,
-                # 模型架构参数 (P1: 从 arch_config 获取)
-                'num_classes': self.config.arch_config.num_classes,
-                'dim': self.config.arch_config.dim,
-                'depth': self.config.arch_config.depth,
-                'heads': self.config.arch_config.heads,
-                'mlp_dim': self.config.arch_config.mlp_dim,
-                'dim_head': self.config.arch_config.dim // self.config.arch_config.heads,
-                'drop_path_rate': self.config.drop_path_rate,
-                # Tokenizer 参数 (P1: K_min 从 arch_config.K_min_abs 获取)
-                'min_patch_size': self.config.arch_config.min_patch_size,
-                'K_min': self.config.arch_config.K_min_abs,
-                'K_max': None,  # P1: K_max 不再硬编码，使用相对预算
-                'tokenizer_type': self.config.tokenizer_type,
-                'ffn_type': self.config.arch_config.ffn_type,
-                'use_checkpoint': self.config.use_checkpoint,
-                'use_channels_last': self.config.use_channels_last,
-                'use_compile': self.config.use_compile,
-                'compile_mode': self.config.compile_mode,
-                'channels': self.config.arch_config.channels,
-                # I31 面积编码配置 (从 arch_config 获取)
-                'use_area_encoding': self.config.arch_config.use_area_encoding,
-                'use_affine_modulation': self.config.arch_config.use_affine_modulation,
-                'fourier_levels': self.config.arch_config.fourier_levels,
-            },
-        }
+        # 直接从配置构造 ModelGene（单一数据源）
+        gene = ModelGene.from_config(
+            self.config.arch_config,
+            dataset_name='cub200',
+            epoch=epoch,
+        )
 
-        # Center Loss 优化器状态
-        if self.center_optimizer is not None:
-            checkpoint['center_optimizer_state_dict'] = self.center_optimizer.state_dict()
-            checkpoint['center_lr'] = self._center_lr
+        # 使用共享的 checkpoint 保存函数
+        save_checkpoint_with_gene(
+            path=path,
+            model=self.model,
+            gene=gene,
+            optimizer_state=optimizer.state_dict(),
+            epoch=epoch,
+            val_acc=val_acc,
+            extra={
+                # Center Loss 状态
+                'center_lr': self._center_lr if hasattr(self, '_center_lr') else None,
+            }
+        )
 
-        torch.save(checkpoint, path)
         self.logger.debug(f"检查点已保存: {path}")
 
     def load_checkpoint(
@@ -1508,7 +1483,7 @@ def create_cub200_trainer(
         arch_config = ModelArchitectureConfig(
             num_classes=200,
             dim=384,
-            depth=8,
+            num_layers=8,
             heads=6,
         )
         trainer, model = create_cub200_trainer(
@@ -1524,7 +1499,7 @@ def create_cub200_trainer(
         arch_dict = {
             'num_classes': arch_config.num_classes,
             'dim': arch_config.dim,
-            'depth': arch_config.depth,
+            'num_layers': arch_config.num_layers,  # I145: depth -> num_layers
             'heads': arch_config.heads,
             'mlp_dim': arch_config.mlp_dim,
             'image_size': arch_config.image_size,
@@ -1547,7 +1522,7 @@ def create_cub200_trainer(
     model = FractalCurveViT(
         num_classes=config.arch_config.num_classes,
         dim=config.arch_config.dim,
-        depth=config.arch_config.depth,
+        num_layers=config.arch_config.num_layers,  # I145: depth -> num_layers
         heads=config.arch_config.heads,
         mlp_dim=config.arch_config.mlp_dim,
         image_size=config.arch_config.image_size,
@@ -1598,7 +1573,7 @@ class CUB200ModularTrainer:
         from training.trainer import CUB200ModularTrainer, CUB200TrainingConfig
         from vit_pytorch import FractalCurveViT
 
-        model = FractalCurveViT(num_classes=200, dim=384, depth=8, heads=6)
+        model = FractalCurveViT(num_classes=200, dim=384, num_layers=8, heads=6)
         config = CUB200TrainingConfig(
             batch_size=16,
             learning_rate=0.0003,

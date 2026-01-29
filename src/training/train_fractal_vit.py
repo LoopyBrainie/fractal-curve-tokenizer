@@ -403,10 +403,12 @@ class FractalConfigProtocol(Protocol):
     def batch_size(self) -> int: ...
 
     # ========== 模型架构配置 (模型创建) ==========
+    # 注意: max_level/max_depth 是变参数，完全由模型架构内部计算，
+    # 不在 Protocol 中定义，确保训练/评估模型结构完全一致。
     @property
     def dim(self) -> int: ...
     @property
-    def depth(self) -> int: ...
+    def num_layers(self) -> int: ...  # 原 depth
     @property
     def heads(self) -> int: ...
     @property
@@ -417,8 +419,6 @@ class FractalConfigProtocol(Protocol):
     def ffn_type(self) -> str: ...
     @property
     def min_patch_size(self) -> int: ...
-    @property
-    def max_depth(self) -> int: ...
     @property
     def dropout(self) -> float: ...
     @property
@@ -2669,8 +2669,8 @@ def main():
     # 覆盖率 = tokens / max_patches, 与图像分辨率无关
     parser.add_argument("--token-coverage-min", type=float, default=0.01,
                        help="I33: Minimum token coverage ratio (default: 0.01, 1% of patches)")
-    parser.add_argument("--token-coverage-max", type=float, default=0.05,
-                       help="I33: Maximum token coverage ratio (default: 0.05, 5% of patches)")
+    parser.add_argument("--token-coverage-max", type=float, default=0.25,
+                       help="I33: Maximum token coverage ratio, participates in adaptive formula (default: 0.25)")
 
     # I30-10: 可学习配额参数 (Scheme E)
     # I24-2: 迁移到命令行 choices 模式
@@ -2905,7 +2905,7 @@ def main():
         token_coverage_min=args.token_coverage_min,
         token_coverage_max=args.token_coverage_max,
         K_min_abs=K_min,
-        max_level=args.max_depth if args.max_depth is not None else 8,  # I145: max_depth -> max_level
+        # 注意: max_level 是变参数，完全由模型架构内部计算，不从外部传入
         ffn_type=args.ffn_type,
         use_checkpoint=args.gradient_checkpoint,
         use_channels_last=args.channels_last,
@@ -2944,8 +2944,8 @@ def main():
             self.pool = arch_config.pool
             self.ffn_type = arch_config.ffn_type
             self.min_patch_size = arch_config.min_patch_size
-            self.max_depth = arch_config.max_level  # I145: max_depth <- max_level
-            self.max_level = arch_config.max_level  # For FractalCurveViT
+            # 注意: max_level/max_depth 是变参数，完全由模型架构内部计算
+            # 不从 arch_config 获取，确保训练/评估模型结构完全一致
             self.dropout = args.dropout
             self.emb_dropout = args.emb_dropout
             self.drop_path_rate = args.drop_path
@@ -3045,9 +3045,9 @@ def main():
         dropout=config.dropout,
         emb_dropout=config.emb_dropout,
         drop_path_rate=config.drop_path_rate,
-        # I30-17: 使用新的动态深度参数 (max_depth 自动从 min_patch_size 计算)
+        # I30-17: 动态深度参数 (max_level 由模型架构内部从 min_patch_size 计算)
         min_patch_size=config.min_patch_size,
-        max_level=config.max_level,  # FractalCurveViT 使用 max_level
+        # max_level=None  # 不传递，让模型架构内部计算（变参数）
         use_checkpoint=config.use_checkpoint,
         ffn_type=config.ffn_type,
         # 使用自定义 tokenizer (支持高级分割参数)
@@ -3951,9 +3951,9 @@ def main():
             best_val = val_acc
             patience_counter = 0
 
-            # 提取模型基因（用于自包含 checkpoint）
+            # 直接从配置构造 ModelGene（单一数据源）
             dataset_name = getattr(config, 'dataset', spec.name)
-            gene = ModelGene.from_model(model, dataset_name=dataset_name, epoch=epoch)
+            gene = ModelGene.from_config(config.arch_config, dataset_name=dataset_name, epoch=epoch)
 
             # 使用共享的 checkpoint 保存函数（与评估器使用相同的保存逻辑）
             save_checkpoint_with_gene(

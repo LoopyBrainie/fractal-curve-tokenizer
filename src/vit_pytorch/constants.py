@@ -218,9 +218,10 @@ QUOTA_STE_WEIGHT: float = 0.5
 #   3. 硬上限约束防止大分辨率下的显存溢出
 
 #: 基准覆盖率 (224×224 图像的目标覆盖率)
-#: 数学: β_0 = 0.12 表示目标采样 12% 的候选区域
-#: I36 优化: 64×64 小图像需更高覆盖率，原 0.05 → 0.12
-K_COVERAGE_BASE: float = 0.12
+#: 数学: β_0 = 0.03 表示目标采样 3% 的候选区域
+#: I109-10 修复: 原 0.12 导致 K_target > K_max (10486 > 4096)
+#: 修正后 β_0 = 0.03 使 K_target ∈ [K_min, K_max]
+K_COVERAGE_BASE: float = 0.03
 
 #: 最小覆盖率 (防止欠采样)
 #: 数学: α = 0.01 保证最小 1% 覆盖率
@@ -252,29 +253,26 @@ K_MAX_SAMPLE_RATIO: float = 0.25
 #: I36 优化: 提高以保证小图像最小 tokens
 K_MIN_SAMPLE_RATIO: float = 0.03
 
-# ==================== I33: Elastic Budget 相对预算常量 ====================
-# 设计原则: 与K参数相对预算保持一致
-# 数学分析:
-#   1. 相对覆盖率保证尺度不变性
-#   2. 与 _get_dynamic_k_bounds() 统一设计
+# ==================== I109-4: Elastic Budget 目标导向损失 ====================
+# 设计原则: 目标导向损失 + 边界安全网
+# 数学形式化:
+#   1. 主损失: L = λ_target × (K/N - β_target)²
+#   2. 安全网: 边界约束防止超出 K_bounds
+#   3. 目标覆盖率 β_target = K_COVERAGE_BASE × √(min(H,W)/224)
 
-#: Elastic Budget 相对覆盖率硬上限
-#: 数学: coverage_max = 0.25 防止过度采样 (原 0.08 → 0.25)
-#: I36 优化: 与 K_COVERAGE_MAX_HARD 保持一致
-ELASTIC_COVERAGE_MAX: float = 0.25
-
-#: Elastic Budget 相对覆盖率下界 (用于崩溃检测)
-#: 数学: coverage_min = 0.03 低于此值触发崩溃检测 (原 0.005 → 0.03)
-#: I36 优化: 与 K_MIN_SAMPLE_RATIO 保持一致
+#: 崩溃检测阈值 (低于 K_min 一半时触发)
+#: 数学: coverage_min = 0.03 低于此值触发崩溃检测
 ELASTIC_COVERAGE_MIN: float = 0.03
 
-#: Elastic Budget 损失权重 (Over)
+#: Elastic Budget 目标损失权重
 #: 数学: λ = 0.1 使损失量级与其他辅助损失匹配
-ELASTIC_LAMBDA_OVER: float = 0.1
+#: 引导 token 数量趋向最优覆盖率 (β_target = 12% @ 224×224)
+ELASTIC_LAMBDA_TARGET: float = 0.1
 
-#: Elastic Budget 损失权重 (Under)
-#: 数学: λ_under < λ_over，因为欠采样比过采样危害小
-ELASTIC_LAMBDA_UNDER: float = 0.01
+#: Elastic Budget 边界安全网权重
+#: 数学: λ = 0.1 超出 K_bounds 时额外惩罚
+#: 与目标损失权重相等，实现对称保护
+ELASTIC_LAMBDA_BOUNDARY: float = 0.1
 
 #: 崩溃检测损失权重
 #: 数学: λ_collapse = 1.0 确保崩溃时强惩罚
