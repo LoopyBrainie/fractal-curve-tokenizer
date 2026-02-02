@@ -963,16 +963,8 @@ class PseudoHilbertCurve:
         Returns:
             路径长度平方和 (避免开方，比较时使用)
         """
-        n = len(points)
-        if n < 2:
-            return 0.0
-
-        total = 0.0
-        for i in range(n - 1):
-            dx = points[i + 1][0] - points[i][0]
-            dy = points[i + 1][1] - points[i][1]
-            total += dx * dx + dy * dy
-        return total
+        # P-OPT: 统一使用向量化版本，消除 Python 循环开销
+        return cls._path_length_sq_vectorized(points)
 
     @staticmethod
     def _path_length_sq_vectorized(points: Tuple[Tuple[int, int], ...]) -> float:
@@ -1004,10 +996,8 @@ class PseudoHilbertCurve:
         if n < 2:
             return 0.0
 
-        # 转换为张量 [N, 2]
-        import numpy as np
-        points_array = np.array(points, dtype=np.float32)
-        points_tensor = torch.from_numpy(points_array)
+        # I-OPT: 直接使用 torch.tensor 替代 numpy，减少依赖
+        points_tensor = torch.tensor(points, dtype=torch.float32)
 
         # 计算差分 [N-1, 2]
         diffs = torch.diff(points_tensor, dim=0)

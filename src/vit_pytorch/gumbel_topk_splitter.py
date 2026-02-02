@@ -2672,20 +2672,20 @@ class GumbelTopKSplitter(
     def _update_temperature(self) -> float:
         """
         更新温度 (内部方法，在 forward 中调用)。
-        
+
         Returns:
             更新后的温度值
         """
-        total = self._temp_total_steps.item()
+        total = float(self._temp_total_steps)
         if total <= 0:
             return self.current_temperature
-        
-        step = self._temp_step.item()
+
+        step = float(self._temp_step)
         progress = min(1.0, step / total)
-        
-        T_s = self._temp_start.item()
-        T_e = self._temp_end.item()
-        
+
+        T_s = float(self._temp_start)
+        T_e = float(self._temp_end)
+
         if self._temp_schedule == 'exponential':
             # T(t) = T_start · (T_end / T_start)^progress
             T = T_s * ((T_e / T_s) ** progress)
@@ -2695,35 +2695,35 @@ class GumbelTopKSplitter(
             T = T_e + (T_s - T_e) * (1 + math.cos(math.pi * progress)) / 2
         else:
             T = T_s
-        
+
         self.set_temperature(T)
         self._temp_step.add_(1)
-        
+
         return T
     
     def _update_explore_bias(self) -> float:
         """
         更新探索偏置 (内部方法，在 forward 中调用)。
-        
+
         Returns:
             更新后的偏置值
         """
-        total = self._bias_total_steps.item()
+        total = float(self._bias_total_steps)
         if total <= 0:
-            return self.explore_bias.item()
-        
-        step = self._bias_step.item()
+            return float(self.explore_bias)
+
+        step = float(self._bias_step)
         progress = min(1.0, step / total)
-        
-        b_s = self._bias_start.item()
-        b_e = self._bias_end.item()
-        
+
+        b_s = float(self._bias_start)
+        b_e = float(self._bias_end)
+
         # 线性退火
         b = b_s + (b_e - b_s) * progress
-        
+
         self.set_explore_bias(b)
         self._bias_step.add_(1)
-        
+
         return b
     
     def get_diagnostics(self) -> Dict[str, Any]:
@@ -2733,11 +2733,11 @@ class GumbelTopKSplitter(
             'max_depth': self._current_max_depth,
             'K_min': self.K_min,
             'K_max': self.K_max,
-            'avg_selected': self._avg_selected.item(),
+            'avg_selected': float(self._avg_selected),
             'temperature': self.current_temperature,
-            'explore_bias': self.explore_bias.item(),
-            'depth_bias_beta': self.depth_bias_beta.item(),
-            'depth_bias_gamma': self.depth_bias_gamma.item(),
+            'explore_bias': float(self.explore_bias),
+            'depth_bias_beta': float(self.depth_bias_beta),
+            'depth_bias_gamma': float(self.depth_bias_gamma),
         }
 
     # ============================================================================

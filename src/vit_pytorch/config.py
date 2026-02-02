@@ -623,12 +623,16 @@ class SemanticSplitterConfig:
 
         公式: L_theory = floor(log2(max(H, W)))
         含义: min_patch_size=1 时的最大分裂深度
+
+        I-OPT: 使用 bit_length() 替代 math.log2，避免浮点精度问题
         """
         if self.image_size is None:
             return 8
         H, W = self.image_size
         max_dim = max(H, W)
-        return int(math.floor(math.log2(max_dim)))
+        # bit_length() 返回二进制表示的位数，对于 2^k 返回 k+1
+        # 因此 bit_length() - 1 = floor(log2(n))
+        return max_dim.bit_length() - 1
 
     def _compute_effective_max_level(self) -> int:
         """计算有效最大深度（应用上界保护）"""

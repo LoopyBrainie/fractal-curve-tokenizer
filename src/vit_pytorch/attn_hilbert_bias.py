@@ -968,7 +968,10 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         # 预分配掩码缓冲区 (I108-3 优化)
         mask_2d_buffer = torch.zeros(batch, seq_len, seq_len, dtype=torch.bool, device=x.device)
 
-        # 遍历每个深度，分别计算 Attention
+        # P-OPT: 深度循环说明
+        # max_level 通常为 2-4，循环次数少 (3-5 次)
+        # 每个深度内的 QK^T 计算是 O(N²) 向量运算，循环开销可忽略
+        # 完全向量化 (预计算所有深度的 attention) 内存开销大，不推荐
         for d in range(self.max_level + 1):
             # 深度 d 的 token 掩码 [B, N]
             depth_mask = (depths == d)

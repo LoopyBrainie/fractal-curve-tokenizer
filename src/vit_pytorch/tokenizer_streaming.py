@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections import deque
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -313,14 +314,14 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         all_depths = []  # [total_regions]
         all_batch_indices = []  # [total_regions]
 
-        # BFS 构建四叉树
-        queue = []  # (bounds, depth, batch_idx)
+        # BFS 构建四叉树 (I-OPT: 使用 deque 避免 O(N) pop(0))
+        queue = deque()  # (bounds, depth, batch_idx)
         for b in range(B):
             bounds = self._get_initial_region_bounds(B, device)
             queue.append((bounds, 0, b))
 
         while queue:
-            bounds, depth, b_idx = queue.pop(0)
+            bounds, depth, b_idx = queue.popleft()
 
             if depth >= self.max_level:
                 # 达到最大深度，添加为叶子节点

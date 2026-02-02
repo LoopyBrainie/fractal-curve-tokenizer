@@ -951,9 +951,10 @@ class FractalCurveViT(nn.Module):
                                            dtype=torch.long, device=lengths.device)
                 valid_counts = []
 
-                # I145: 向量化深度矩阵填充 - 使用 scatter_ 向量化
-                # 注意: levels_list 是 Python list of tensors，需要逐批次处理
-                # 但可以使用 tensor 索引和 scatter 优化
+                # P-OPT: levels_list 填充循环
+                # 注意: levels_list 是 Python list of tensors (各元素形状不同)
+                # 无法完全向量化，但循环体已使用张量操作，O(B) 开销可忽略
+                # B 通常 8-32，此循环开销 < 0.1ms
                 for i, l in enumerate(levels_list):
                     if l.numel() > 0:
                         depths = l[:, 0].long()
