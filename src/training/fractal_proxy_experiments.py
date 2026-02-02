@@ -959,8 +959,8 @@ class FrozenEncoderExperiment(BaseExperiment):
                 # 2. Forward pass (train splitter)
                 try:
                     if self.config.use_compile:
-                        with torch.compiler.disable():
-                            stats = self.wrapper.model(imgs)
+                        # 使用 torch._dynamo.disable 避免 graph break
+                        stats = torch._dynamo.disable(self.wrapper.model)(imgs)
                     else:
                         stats = self.wrapper.model(imgs)
                 except Exception as e:
@@ -1297,8 +1297,8 @@ class GeometricJigsawExperiment(BaseExperiment):
                 # 1. Forward pass
                 try:
                     if self.config.use_compile:
-                        with torch.compiler.disable():
-                            stats = self.wrapper.model(imgs)
+                        # 使用 torch._dynamo.disable 避免 graph break
+                        stats = torch._dynamo.disable(self.wrapper.model)(imgs)
                     else:
                         stats = self.wrapper.model(imgs)
                 except Exception as e:
