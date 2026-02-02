@@ -334,10 +334,8 @@ class CUB200TrainingConfig:
     # use_affine_modulation: bool = False  # 移至 arch_config
     # fourier_levels: int = 4  # 移至 arch_config
 
-    # P7-7: 温度退火参数
-    splitter_temp_start: float = 1.0
-    splitter_temp_end: float = 0.5
-    splitter_temp_warmup: int = 8
+    # I111-1: 温度退火参数已移至 SplitterConfig
+    # 训练器从 model.splitter.config 读取温度配置
 
     # M1: 辅助损失权重 (I36)
     splitter_sparsity_weight: float = 0.01  # 稀疏性损失权重
@@ -617,7 +615,52 @@ class CUB200Trainer:
         # I35: 混合精度 scaler - device 是关键字参数
         self.scaler: Optional[GradScaler] = GradScaler(enabled=config.use_amp, device='cuda')
 
+        # I111-6: 初始化深度分布监控器
+        self._init_depth_monitor()
+
         self.logger.info(f"CUB200Trainer 初始化完成: device={self.device}, num_classes={num_classes}")
+
+    def _init_depth_monitor(self) -> None:
+        """I111-6: 初始化深度分布监控器"""
+        from vit_pytorch.gumbel_topk_splitter import DepthMonitor
+
+        splitter = getattr(self.model, 'splitter', None)
+        if splitter is not None and hasattr(splitter, 'get_depth_distribution_tensor'):
+            self._depth_monitor: Optional[DepthMonitor] = DepthMonitor(splitter, history_max_size=0)
+            self.logger.info("[I111-6] 深度分布监控器已初始化")
+        else:
+            self._depth_monitor = None
+            self.logger.debug("[I111-6] 分割器不支持深度分布监控")
+
+    def _log_depth_monitor_to_tensorboard(
+        self,
+        writer: 'SummaryWriter',
+        epoch: int,
+    ) -> None:
+        """I111-6: 记录深度分布到 TensorBoard"""
+        if self._depth_monitor is None or writer is None:
+            return
+
+        try:
+            stats = self._depth_monitor.update(epoch)
+
+            # 深度分布 histogram
+            writer.add_histogram('Splitter/depth_distribution/pi',
+                               stats['pi'].detach().cpu().numpy(), epoch)
+
+            # 深度熵
+            writer.add_scalar('Splitter/depth_entropy', stats['entropy'], epoch)
+            writer.add_scalar('Splitter/kl_from_uniform', stats['kl_from_uniform'], epoch)
+
+            # 配额概率（如果可用）
+            quota_probs = stats.get('quota_probs')
+            if quota_probs is not None:
+                writer.add_histogram('Splitter/quota_probs',
+                                   quota_probs.detach().cpu().numpy(), epoch)
+
+            self.logger.debug(f"[I111-6] Depth monitor logged: H={stats['entropy']:.3f}, KL={stats['kl_from_uniform']:.3f}")
+        except Exception as e:
+            self.logger.warning(f"[I111-6] Depth monitor failed: {e}")
 
     def initialize_center_optimizer(self, main_optimizer: torch.optim.Optimizer) -> None:
         """初始化 Center Loss 优化器
@@ -678,24 +721,34 @@ class CUB200Trainer:
             self.logger.info("[A21] Splitter 不支持温度退火 API")
             return
 
+        # I111-1: 从 SplitterConfig 读取温度参数
+        config = getattr(splitter, 'config', None)
+        if config is None:
+            self.logger.warning("[A21] Splitter 无 config，使用默认值")
+            T_start, T_end, warmup_epochs = 1.0, 0.3, 8
+        else:
+            T_start = getattr(config, 'temperature_init', 1.0)
+            T_end = getattr(config, 'temperature_min', 0.3)
+            warmup_epochs = getattr(config, 'temperature_warmup_epochs', 8)
+
         # 计算每 epoch 的步数
         batches_per_epoch = len(train_loader) // self.config.accum_steps
 
         # warmup 后的步数用于退火
-        post_warmup_steps = max(1, (self.config.num_epochs - self.config.splitter_temp_warmup) * batches_per_epoch)
+        post_warmup_steps = max(1, (self.config.num_epochs - warmup_epochs) * batches_per_epoch)
 
         # 启用退火 (warmup 期间使用 T_start)
         splitter.enable_temperature_annealing(
             total_steps=post_warmup_steps,
-            T_start=self.config.splitter_temp_start,
-            T_end=self.config.splitter_temp_end,
+            T_start=T_start,
+            T_end=T_end,
             schedule="exponential",
         )
 
-        self.logger.info(f"[A21 OK] 温度退火已启用: {self.config.splitter_temp_start} → {self.config.splitter_temp_end}")
-        self.logger.info(f"     步数: {post_warmup_steps} (warmup: {self.config.splitter_temp_warmup} epochs)")
+        self.logger.info(f"[A21 OK] 温度退火已配置: {T_start} → {T_end}")
+        self.logger.info(f"     步数: {post_warmup_steps} (warmup: {warmup_epochs} epochs)")
 
-    # A21: Warmup 处理方法
+    # A21: Warmup 处理方法 (I111-1: 从 SplitterConfig 读取温度)
     def _handle_warmup(self, epoch: int) -> None:
         """处理 warmup 期间的温度/偏置 (A21)
 
@@ -710,25 +763,34 @@ class CUB200Trainer:
         if splitter is None:
             return
 
-        if epoch <= self.config.splitter_temp_warmup:
+        # I111-1: 从 SplitterConfig 读取温度参数
+        config = getattr(splitter, 'config', None)
+        if config is None:
+            T_start, T_end, warmup_epochs = 1.0, 0.3, 8
+        else:
+            T_start = getattr(config, 'temperature_init', 1.0)
+            T_end = getattr(config, 'temperature_min', 0.3)
+            warmup_epochs = getattr(config, 'temperature_warmup_epochs', 8)
+
+        if epoch <= warmup_epochs:
             # Warmup: 禁用退火，固定 T_start
             if hasattr(splitter, 'disable_temperature_annealing'):
                 splitter.disable_temperature_annealing()
-            splitter.set_temperature(self.config.splitter_temp_start)
-        elif epoch == self.config.splitter_temp_warmup + 1:
+            splitter.set_temperature(T_start)
+        elif epoch == warmup_epochs + 1:
             # Warmup 结束: 重新启用退火
             if hasattr(self, 'train_loader'):
                 batches_per_epoch = len(self.train_loader) // self.config.accum_steps
-                post_warmup_steps = max(1, (self.config.num_epochs - self.config.splitter_temp_warmup) * batches_per_epoch)
+                post_warmup_steps = max(1, (self.config.num_epochs - warmup_epochs) * batches_per_epoch)
 
                 if hasattr(splitter, 'enable_temperature_annealing'):
                     splitter.enable_temperature_annealing(
                         total_steps=post_warmup_steps,
-                        T_start=self.config.splitter_temp_start,
-                        T_end=self.config.splitter_temp_end,
+                        T_start=T_start,
+                        T_end=T_end,
                         schedule="exponential",
                     )
-                    self.logger.info(f"[A21] Warmup 结束，重新启用温度退火")
+                    self.logger.info(f"[A21] Warmup 结束，重新启用温度退火: {T_start} → {T_end}")
 
     def _get_warmup_lr(self, epoch: int) -> float:
         """计算学习率（包含预热）
@@ -1125,6 +1187,7 @@ class CUB200Trainer:
         optimizer: torch.optim.Optimizer,
         scheduler: Optional[Any] = None,
         exp_dir: Optional[Path] = None,
+        writer: Optional[Any] = None,  # I111-6: TensorBoard writer
     ) -> Dict[str, List[float]]:
         """完整训练流程
 
@@ -1246,6 +1309,10 @@ class CUB200Trainer:
                 msg += f" | Val: loss={val_result.loss:.4f}, acc={val_result.accuracy:.2f}%, top5={val_result.top5_accuracy:.2f}%"
 
             self.logger.info(msg)
+
+            # I111-6: 记录深度分布到 TensorBoard
+            if writer is not None:
+                self._log_depth_monitor_to_tensorboard(writer, epoch)
 
             # 早停检查
             if self.state.patience_counter >= self.config.patience:

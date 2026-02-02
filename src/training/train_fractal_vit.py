@@ -312,10 +312,11 @@ if str(EXAMPLES_PATH) not in sys.path:
 
 from vit_pytorch import FractalCurveViT
 from vit_pytorch.constants import (
-    SPLITTER_TEMP_START, 
-    SPLITTER_TEMP_END, 
+    SPLITTER_TEMP_START,
+    SPLITTER_TEMP_END,
     SPLITTER_TEMP_SCHEDULE,  # I29-4: 导入调度策略
 )
+from vit_pytorch.gumbel_topk_splitter import DepthMonitor  # I111-6: 深度分布监控
 
 # Fractal Training 模块 (I15) - 现在位于 examples/training
 from training import (
@@ -2159,7 +2160,7 @@ def train_epoch(
                     perf_stats['dominant_prob'] = depth_stats.get('dominant_prob')
             except Exception:
                 pass  # 忽略统计收集错误
-        
+
         # P10-9: 软 token 计数
         if hasattr(splitter, 'get_soft_token_count'):
             try:
@@ -2167,6 +2168,32 @@ def train_epoch(
                 perf_stats['soft_token_count'] = soft_count.item() if hasattr(soft_count, 'item') else soft_count
             except Exception:
                 pass
+
+    # I111-6: 使用 DepthMonitor 收集深度分布统计
+    # 延迟初始化，避免重复创建
+    if not hasattr(model, '_depth_monitor'):
+        splitter = getattr(model, 'splitter', None)
+        if splitter is not None and hasattr(splitter, 'get_depth_distribution_tensor'):
+            model._depth_monitor = DepthMonitor(splitter, history_max_size=0)  # 不需要历史
+        else:
+            model._depth_monitor = None
+
+    if hasattr(model, '_depth_monitor') and model._depth_monitor is not None:
+        try:
+            depth_stats = model._depth_monitor.update(global_step)
+            # 提取关键指标（转换为 Python 类型用于日志）
+            perf_stats['depth_pi'] = depth_stats['pi'].tolist()
+            perf_stats['depth_entropy'] = depth_stats['entropy']
+            perf_stats['depth_kl'] = depth_stats['kl_from_uniform']
+            perf_stats['max_entropy'] = depth_stats['max_entropy']
+            perf_stats['dominant_depth'] = depth_stats['dominant_depth']
+            perf_stats['dominant_prob'] = depth_stats['dominant_prob']
+            # 保存 GPU tensor 用于 TensorBoard（避免重复转换）
+            perf_stats['_depth_pi_tensor'] = depth_stats['pi']
+            perf_stats['_quota_probs_tensor'] = depth_stats.get('quota_probs')
+        except Exception as e:
+            # I111-6: 静默处理收集错误，避免影响训练
+            pass
     
     # P11-8: 在返回前进行一次 GPU-CPU 同步
     final_loss = (total_loss / len(loader)).item()
@@ -2513,6 +2540,44 @@ def log_splitter_health_to_tensorboard(
         if hasattr(thresholds, '__len__') and len(thresholds) > 0:
             mean_thresh = sum(thresholds) / len(thresholds)
             writer.add_scalar('Splitter/threshold_mean', mean_thresh, epoch)
+
+    # I111-6: 深度分布监控（TensorBoard）
+    # ==================================================
+
+    # 1. 深度分布 histogram
+    depth_pi_tensor = perf_stats.get('_depth_pi_tensor')
+    if depth_pi_tensor is not None:
+        # 深度分布直方图（单步分布）
+        writer.add_histogram('Splitter/depth_distribution/pi',
+                           depth_pi_tensor.detach().cpu().numpy(), epoch)
+
+        # 深度分布对数变换（观察小概率深度）
+        pi_log = torch.log1p(depth_pi_tensor)
+        writer.add_histogram('Splitter/depth_distribution/pi_log',
+                           pi_log.detach().cpu().numpy(), epoch)
+
+    # 2. 深度熵曲线
+    if perf_stats.get('depth_entropy') is not None:
+        writer.add_scalar('Splitter/depth_entropy', perf_stats['depth_entropy'], epoch)
+
+        # 熵比率（相对于最大可能熵）
+        max_entropy = perf_stats.get('max_entropy', math.log(6))
+        entropy_ratio = perf_stats['depth_entropy'] / max_entropy if max_entropy > 0 else 0
+        writer.add_scalar('Splitter/entropy_ratio_v2', entropy_ratio, epoch)
+
+    # 3. KL 散度曲线
+    if perf_stats.get('depth_kl') is not None:
+        writer.add_scalar('Splitter/kl_from_uniform', perf_stats['depth_kl'], epoch)
+
+    # 4. 主导深度指示
+    if perf_stats.get('dominant_depth') is not None:
+        writer.add_scalar('Splitter/dominant_depth', perf_stats['dominant_depth'], epoch)
+
+    # 5. 配额概率 histogram（如果可用）
+    quota_probs = perf_stats.get('_quota_probs_tensor')
+    if quota_probs is not None:
+        writer.add_histogram('Splitter/quota_probs',
+                           quota_probs.detach().cpu().numpy(), epoch)
 
 
 @torch.no_grad()
@@ -3979,6 +4044,22 @@ def main():
                 p10_parts.append(f"N_soft={perf_stats['soft_token_count']:.1f}")
             if p10_parts:
                 print(f"  P10: {', '.join(p10_parts)}")
+
+        # I111-6: 深度分布实时监控
+        if perf_stats.get('depth_pi') is not None and perf_stats.get('depth_entropy') is not None:
+            depth_pi = perf_stats['depth_pi']
+            entropy = perf_stats['depth_entropy']
+            max_entropy = perf_stats.get('max_entropy', math.log(len(depth_pi)))
+            kl = perf_stats.get('depth_kl', 0)
+
+            # 格式化深度分布字符串
+            depth_str = ", ".join([f"d{d}:{p*100:.1f}%" for d, p in enumerate(depth_pi)])
+            print(f"  Depth: {depth_str}")
+            print(f"  Entropy: {entropy:.3f}/{max_entropy:.3f} ({entropy/max_entropy*100:.1f}%)")
+
+            # KL 散度警告
+            if kl > 0.5:
+                print(f"  ⚠️  KL divergence high: {kl:.3f} (>0.5)")
         
         # P10-14: 分割器健康检查
         # 动态获取 max_entropy (从 get_depth_distribution_stats 或配置推算)

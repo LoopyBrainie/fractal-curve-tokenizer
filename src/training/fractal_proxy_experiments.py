@@ -203,6 +203,9 @@ class GJPConfig:
     # Training config (use ProxyExperimentConfig's learning_rate and weight_decay)
     epochs: int = 10  # Original num_epochs
 
+    # Quick mode
+    quick_test: bool = False  # Reduce iterations for quick validation
+
 
 # =============================================================================
 # PART 2: Basic Architecture
@@ -1285,7 +1288,7 @@ class GeometricJigsawExperiment(BaseExperiment):
         self.model.train()
 
         num_epochs = self.gjp_config.epochs  # 原 num_epochs
-        max_iter = 10 if getattr(self.ssa_config, 'quick_test', False) else None
+        max_iter = 10 if getattr(self.gjp_config, 'quick_test', False) else None
 
         for epoch in range(num_epochs):
             epoch_loss = 0.0
