@@ -18,6 +18,11 @@ import math
 import torch
 import torch.nn as nn
 
+try:
+    from vit_pytorch.config import SemanticSplitterConfig
+except ImportError:
+    SemanticSplitterConfig = None  # 类型提示用，实际使用时确保已安装
+
 
 @dataclass
 class ModelGene:
@@ -94,6 +99,11 @@ class ModelGene:
     splitter_feature_dim: Optional[int] = None  # Splitter 特征维度 (通常 = dim)
     splitter_pool_size: Optional[int] = None    # Splitter 池化大小
 
+    # ==================== I110-7: 语义分裂器参数 ====================
+    use_semantic_splitter: bool = False  # 是否使用 SemanticRedundancySplitter
+    semantic_splitter_config: Optional[Dict[str, Any]] = None  # 语义分裂器配置字典
+    semantic_loss_weight: float = 0.1  # 语义分裂器损失权重
+
     # ==================== 训练元信息 ====================
     dataset_name: str = ""          # 数据集名称
     training_epochs: int = 0        # 总训练轮数
@@ -164,6 +174,11 @@ class ModelGene:
             'splitter_hidden_dim': self.splitter_hidden_dim,
             'splitter_feature_dim': self.splitter_feature_dim,
             'splitter_pool_size': self.splitter_pool_size,
+
+            # ========== I110-7: 语义分裂器 ==========
+            'use_semantic_splitter': self.use_semantic_splitter,
+            'semantic_splitter_config': self.semantic_splitter_config,
+            'semantic_loss_weight': self.semantic_loss_weight,
 
             # ========== 训练元信息 ==========
             'dataset_name': self.dataset_name,
@@ -296,6 +311,12 @@ class ModelGene:
             splitter_hidden_dim=self.splitter_hidden_dim,
             splitter_feature_dim=self.splitter_feature_dim,
             splitter_pool_size=self.splitter_pool_size,
+            # I110-7: 语义分裂器配置
+            use_semantic_splitter=self.use_semantic_splitter,
+            semantic_splitter_config=(
+                SemanticSplitterConfig(**self.semantic_splitter_config)
+                if self.semantic_splitter_config and SemanticSplitterConfig else None
+            ),
         )
 
         return model
@@ -336,7 +357,7 @@ class ModelGene:
         # 提取基础参数
         gene = cls(
             dim=model.dim,
-            num_layers=getattr(model, 'num_layers', model.depth if hasattr(model, 'depth') else 6),
+            num_layers=getattr(model, 'num_layers', 6),  # I145: 简化 - 模型使用 num_layers
             heads=model.heads,
             mlp_dim=model.mlp_dim,
             num_classes=cls._detect_num_classes(model),
@@ -392,6 +413,18 @@ class ModelGene:
             gene.splitter_hidden_dim = cls._detect_splitter_param(splitter, 'hidden_dim')
             gene.splitter_pool_size = cls._detect_splitter_param(splitter, 'pool_size')
             gene.splitter_feature_dim = cls._detect_splitter_param(splitter, 'feature_dim')
+
+            # I110-7: 提取语义分裂器配置
+            if hasattr(model, 'use_semantic_splitter'):
+                gene.use_semantic_splitter = getattr(model, 'use_semantic_splitter', False)
+
+                # 尝试提取 semantic_splitter_config
+                if hasattr(splitter, 'config') and splitter.config is not None:
+                    config = splitter.config
+                    if hasattr(config, 'to_dict'):
+                        gene.semantic_splitter_config = config.to_dict()
+                    elif isinstance(config, dict):
+                        gene.semantic_splitter_config = config
 
         # I145: 从模型权重推断真实的架构配置（解决训练代码与权重不一致的问题）
         # 某些架构参数（如 heads）可能在权重中与模型属性不一致
@@ -460,6 +493,10 @@ class ModelGene:
             splitter_hidden_dim=getattr(config, 'splitter_hidden_dim', None),
             splitter_feature_dim=getattr(config, 'splitter_feature_dim', None),
             splitter_pool_size=getattr(config, 'splitter_pool_size', None),
+            # I110-7: 语义分裂器配置
+            use_semantic_splitter=getattr(config, 'use_semantic_splitter', False),
+            semantic_splitter_config=getattr(config, 'semantic_splitter_config', None),
+            semantic_loss_weight=getattr(config, 'semantic_loss_weight', 0.1),
             dataset_name=dataset_name,
             checkpoint_epoch=epoch,
         )

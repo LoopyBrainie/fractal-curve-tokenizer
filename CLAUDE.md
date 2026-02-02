@@ -1,4 +1,6 @@
-# Fractal Curve ViT - Claude Code Instructions
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Quick Reference
 
@@ -11,6 +13,7 @@ uv run pytest tests/                              # Full test suite
 uv run pytest tests/unit/ -v                     # Unit tests by layer
 uv run pytest tests/integration/ -v              # Integration tests
 uv run pytest -m "not slow"                      # Skip slow tests
+uv run pytest tests/unit/L2_components/splitters/test_splitter_gradient_balance.py -v  # Specific test
 
 # Training
 uv run python src/training/train_fractal_vit.py --dataset tiny-imagenet --use-amp
@@ -50,6 +53,8 @@ The `src/` directory is already in `sys.path` via `tests/conftest.py` and projec
 
 Process [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md) by priority: P0-Critical → P0 → P1 → P2 → P3
 
+Test files follow convention: `test_<issue_id>_<feature>.py` (e.g., `test_i109_6_gradient_balance.py`)
+
 ## Vectorization Testing
 
 **Two-phase verification**:
@@ -71,7 +76,7 @@ uv run pytest tests/unit/utilities/test_vectorization.py -m vectorization -v
 | **L2 Components** | Splitter, Attention, FFN | [gumbel_topk_splitter.py](src/vit_pytorch/gumbel_topk_splitter.py), [attn_hilbert_bias.py](src/vit_pytorch/attn_hilbert_bias.py), [ffn_swiglu.py](src/vit_pytorch/ffn_swiglu.py) |
 | **L1 Foundation** | Hilbert curves, config | [curve_hilbert.py](src/vit_pytorch/curve_hilbert.py), [constants.py](src/vit_pytorch/constants.py) |
 
-Test structure mirrors source: `tests/unit/L{1-4}_*/`
+Test structure mirrors source: `tests/unit/L{1-4}_*/` and `tests/integration/`
 
 ## Critical Analysis
 
@@ -85,24 +90,17 @@ Test structure mirrors source: `tests/unit/L{1-4}_*/`
 - Gradient coverage limited to K selected tokens
 - Very low temperatures (T < 0.3) may cause gradient saturation
 
-## Training Commands
+## Training
 
 ```bash
-# Basic quick validation
+# Quick test
 uv run python src/training/train_fractal_vit.py --quick-test --use-amp
 
-# Tiny-ImageNet full training
-uv run python src/training/train_fractal_vit.py \
-    --dataset tiny-imagenet --epochs 100 \
-    --dim 320 --depth 12 --heads 8 \
-    --dropout 0.2 --drop-path 0.2 --weight-decay 0.1 \
-    --use-amp --gradient-checkpoint --compile --channels-last
+# Tiny-ImageNet (RTX 4070 optimized)
+.\src\training\train_tiny_imagenet_4070_optimal.ps1
 
-# Dynamic resolution (CUB-200)
-uv run python src/training/train_fractal_vit.py \
-    --dataset cub200 --image-size None \
-    --dim 384 --depth 8 --heads 6 \
-    --use-amp --compile
+# CUB-200 (dynamic resolution)
+uv run python src/training/train_fractal_vit.py --dataset cub200 --image-size None --use-amp --compile
 ```
 
 ## Computational Efficiency
@@ -116,8 +114,8 @@ For N ≈ 32 tokens (224×224 image):
 
 - Constants: Use `from .constants import ...` in [constants.py](src/vit_pytorch/constants.py)
 - Default splitter: `GumbelTopKSplitter` (Scheme D/E)
-- Recommended: `max_depth >= 2` for optimal adaptive performance
-- Test files: `test_<issue_id>_<feature>.py` (e.g., `test_i23_1_depth_balance.py`)
+- Recommended: `max_level >= 2` for optimal adaptive performance
+- Issue tracking: Prefix code comments with `# I<issue_id>` (e.g., `# I109-6:`)
 
 ## Critical Patterns
 
@@ -138,11 +136,30 @@ loss.backward()
 model = FractalCurveViT(image_size=None, ...)  # Auto-detect from input
 ```
 
+### Lazy Diagnostics (I145)
+```python
+class LazyDiagnostics:
+    def __init__(self, model):
+        self._model = model
+        self._filled = False
+    def __getitem__(self, key):
+        if not self._filled:
+            self._model._fill_lazy_diagnostics(self)
+        return self._filled[key]
+```
+
 ## Model-Trainer Interface
 
 **Principle**: Model defines capabilities, Trainer decides usage.
 
-`forward()` returns `(logits, aux_infos)` with `num_tokens`, `levels_used`.
+### Forward Return Type
+`forward()` returns `TrainingStats` object with fields:
+- `logits`: [B, num_classes] classification outputs
+- `num_tokens`: Union[int, List[int], torch.Tensor] token count
+- `depth_used`: int maximum depth utilized
+- `depth_distribution`: Dict[int, float] depth percentage distribution
+- `features`: [B, dim] pooled features
+- `transformer_tokens`: [B, N, dim] transformer outputs
 
 **Anti-pattern**: Duplicate ModelConfig in TrainerConfig.
 
@@ -152,8 +169,16 @@ tokenizer = getattr(model, 'tokenizer', None)
 splitter = getattr(tokenizer, 'splitter', None) if tokenizer else None
 ```
 
+## Configuration Files
+
+| File | Purpose |
+|------|---------|
+| [config.py](src/vit_pytorch/config.py) | FractalConfig, SplitterConfig, AttentionConfig |
+| [constants.py](src/vit_pytorch/constants.py) | Numerical constants (GUMBEL_EPSILON, TEMPERATURE_MIN, etc.) |
+| [pyproject.toml](pyproject.toml) | pytest markers (slow, integration, e2e, unit, stability, 数学, benchmark) |
+
 ## Documentation
 
 - [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md): Issue tracker with mathematical analysis
-- [documents/](documents/): Architecture deep-dives (Chinese)
-- [examples/training/README.md](examples/training/README.md): Training system
+- [documents/](documents/): Architecture deep-dives (chapters 00-11)
+- [docs/10_testing_qa.md](docs/10_testing_qa.md): Testing guidelines

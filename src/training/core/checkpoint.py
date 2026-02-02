@@ -26,7 +26,7 @@
 ...     device="cuda",
 ...     strict=False,
 ... )
->>> print(f"Loaded {gene.dim}d-{gene.depth}l model, epoch {gene.checkpoint_epoch}")
+>>> print(f"Loaded {gene.dim}d-{gene.num_layers}l model, epoch {gene.checkpoint_epoch}")
 
 Author: Claude
 Date: 2026-01-27
@@ -720,7 +720,7 @@ def get_checkpoint_info(checkpoint_path: str) -> Dict[str, Any]:
         gene = ModelGene.from_dict(checkpoint['model_gene'])
         info.update({
             'dim': gene.dim,
-            'depth': gene.depth,
+            'num_layers': gene.num_layers,
             'heads': gene.heads,
             'num_classes': gene.num_classes,
             'dataset': gene.dataset_name,

@@ -63,7 +63,7 @@ class ModelArchitectureConfig:
     dim_head: int = 64   # dim / heads
 
     # 输入配置
-    image_size: int = 224  # None 表示动态分辨率 (I78)
+    image_size: Optional[int] = None  # None = 动态分辨率 (I78)
     patch_size: int = 8
     channels: int = 3
 
@@ -86,6 +86,10 @@ class ModelArchitectureConfig:
     use_channels_last: bool = False  # I78: channels-last 内存格式
     compile_model: bool = False      # I78: torch.compile 优化
     compile_mode: str = "default"    # torch.compile 模式
+
+    # 编码选项 (第三层超参数)
+    use_hilbert_encoding: bool = True   # 使用 Hilbert 编码
+    use_spatial_encoding: bool = True   # 使用空间编码
 
     # I31: 形状-尺度编码配置
     use_area_encoding: bool = False
@@ -114,6 +118,11 @@ class ModelArchitectureConfig:
     splitter_feature_dim: Optional[int] = None  # Splitter 特征维度 (默认等于 dim)
     splitter_pool_size: Optional[int] = None    # Splitter 池化大小 (默认 4)
 
+    # I110-7: 语义分裂器配置
+    use_semantic_splitter: bool = False  # 是否使用 SemanticRedundancySplitter
+    semantic_splitter_config: Optional[Dict[str, Any]] = None  # 语义分裂器配置字典
+    semantic_loss_weight: float = 0.1  # 语义分裂器损失权重
+
     # 训练策略参数 (从 FractalViTConfig 迁移)
     pool: str = "weighted"
     max_level: Optional[int] = None  # 变参数，完全由模型架构内部计算，外部不应传入
@@ -139,6 +148,18 @@ class ModelArchitectureConfig:
 
         # 验证 K 边界: K_min_abs > 0
         assert self.K_min_abs > 0, f"K_min_abs={self.K_min_abs} 必须 > 0"
+
+        # I145: 验证 K_min_abs 与 token_coverage_min 的一致性
+        # 基于标准 224x224 图像计算期望的 K_min
+        img_size = self.image_size if self.image_size else 224
+        max_patches = (img_size // self.min_patch_size) ** 2
+        if max_patches > 0:
+            expected_k_min = int(self.token_coverage_min * max_patches)
+            if self.K_min_abs < expected_k_min:
+                logger.warning(
+                    f"K_min_abs={self.K_min_abs} 小于基于覆盖率计算的建议值 {expected_k_min} "
+                    f"(token_coverage_min={self.token_coverage_min}, image_size={img_size})"
+                )
 
         # 注意: max_level 是变参数，完全由模型架构内部计算，不进行验证
         # assert self.max_level >= 1, f"max_level={self.max_level} 必须 >= 1"
