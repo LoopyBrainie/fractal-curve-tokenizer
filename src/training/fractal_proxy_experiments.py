@@ -1180,6 +1180,9 @@ class GeometricJigsawLoss(nn.Module):
         tokens = tokens.contiguous()
         levels_info = levels_info.contiguous()
 
+        # 确保 offset_predictor 在正确设备上
+        self.offset_predictor = self.offset_predictor.to(tokens.device)
+
         # 1. 计算 Hilbert 索引
         if original_indices is None:
             depths = levels_info[:, :, 0]  # [B, N]
