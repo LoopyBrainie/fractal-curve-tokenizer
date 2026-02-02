@@ -1313,21 +1313,27 @@ class GeometricJigsawExperiment(BaseExperiment):
                     self._handle_compile_warning(e)
                     continue
 
-                # I139: Extract from TrainingStats
-                logits = stats.logits if hasattr(stats, 'logits') else stats
-
-                # 2. Extract levels_info (I139: TrainingStats does not provide directly, needs additional adaptation)
-                # 注意: GJP 模式需要 tokenizer 的 levels_info，当前 TrainingStats 不包含此字段
-                # split_info = stats.split_info if hasattr(stats, 'split_info') else {}
-                # levels_info = split_info.get('levels_list')  # 需要转换为 LevelsInfo 格式
-                levels_info = None  # TODO: I139 需要完整适配 GJP 模式
-                if levels_info is None:
-                    logger.warning("GJP mode: levels_info unavailable, skipping batch (I139: 需要适配)")
+                # I139: Extract transformer tokens and levels_info
+                transformer_tokens = getattr(stats, 'transformer_tokens', None)
+                if transformer_tokens is None:
+                    logger.debug(f"TrainingStats 可用字段: {[k for k in dir(stats) if not k.startswith('_')]}")
+                    logger.warning("GJP mode: transformer_tokens unavailable, skipping batch")
                     continue
+
+                # Extract levels_info from split_info
+                split_info = getattr(stats, 'split_info', {})
+                levels_list = split_info.get('levels_list', None)
+                if levels_list is None or len(levels_list) == 0:
+                    logger.warning("GJP mode: levels_list unavailable, skipping batch")
+                    continue
+
+                # Stack levels_list to create levels_info [B, N, D+1]
+                # levels_list is a list of tensors, each [N, D+1] where first col is depth
+                levels_info = torch.stack(levels_list, dim=0)  # [B, N, D+1]
 
                 # 3. Compute jigsaw loss
                 loss, info = self.jigsaw_loss_fn(
-                    tokens=logits,
+                    tokens=transformer_tokens,
                     levels_info=levels_info,
                 )
 
