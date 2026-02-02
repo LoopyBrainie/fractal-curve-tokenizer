@@ -926,7 +926,7 @@ class FrozenEncoderExperiment(BaseExperiment):
         self.model.train()
 
         num_epochs = self.fer_config.epochs  # 原 frozen_encoder_epochs
-        max_iter = 10 if getattr(self.ssa_config, 'quick_test', False) else None
+        max_iter = 10 if getattr(self.fer_config, 'quick_test', False) else None
 
         for epoch in range(num_epochs):
             epoch_loss = 0.0

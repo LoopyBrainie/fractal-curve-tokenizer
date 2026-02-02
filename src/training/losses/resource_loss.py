@@ -335,7 +335,7 @@ class ResourceAwareLoss(nn.Module):
         epsilon: float = 1e-10,
     ):
         super().__init__()
-        
+
         self.flops_budget = flops_budget
         self.token_budget = token_budget
         self.alpha = depth_weight_alpha
@@ -344,7 +344,12 @@ class ResourceAwareLoss(nn.Module):
         self.lambda_entropy = lambda_entropy
         self.target_entropy_ratio = target_entropy_ratio
         self.epsilon = epsilon
-        
+
+        # I-OPT: 缓存设备避免每次 forward 检查 CUDA
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # 预注册标量张量避免重复创建
+        self._zero_tensor = torch.tensor(0.0, device=self._device, dtype=torch.float32)
+
         # 验证参数合法性
         assert flops_budget > 0, "FLOPS budget must be positive"
         assert token_budget > 0, "Token budget must be positive"
@@ -358,29 +363,31 @@ class ResourceAwareLoss(nn.Module):
     ) -> torch.Tensor:
         """
         计算资源感知损失
-        
+
         参数
         ----
         stats : ModelResourceStats
             模型资源统计信息
         return_components : bool, optional
             是否返回各损失分量 (用于调试)
-            
+
         返回
         ----
         loss : Tensor (scalar)
             总资源损失
-            
+
         或 (loss, components) : (Tensor, dict)
             如果 return_components=True
         """
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+        # I-OPT: 使用缓存的设备避免重复检查
+        device = self._device
+
         # 1. FLOPS 约束损失
         flops_ratio = stats.total_flops / self.flops_budget
+        # I-OPT: 转换为 tensor 进行计算
         flops_ratio_tensor = torch.tensor(flops_ratio, device=device, dtype=torch.float32)
         L_flops = F.relu(flops_ratio_tensor - 1.0) ** 2
-        
+
         # 2. Token 数量约束损失
         if stats.token_depth_distribution:
             depth_dist_tensor = torch.tensor(
@@ -390,42 +397,43 @@ class ResourceAwareLoss(nn.Module):
             )
             weighted_tokens = get_weighted_token_count(depth_dist_tensor, self.alpha)
         else:
-            # 如果没有深度分布，使用平均 token 数
+            # I-OPT: 如果没有深度分布，使用平均 token 数
             weighted_tokens = torch.tensor(
                 stats.avg_tokens_per_image,
                 device=device,
                 dtype=torch.float32
             )
-        
+
         L_token = F.relu(weighted_tokens - self.token_budget) ** 2
-        
+
         # 3. 深度熵正则损失
         H_actual = None  # 初始化
         if stats.token_depth_distribution and len(stats.token_depth_distribution) > 1:
+            # I-OPT: 复用已创建的 depth_dist_tensor
             depth_dist_tensor = torch.tensor(
                 stats.token_depth_distribution,
                 device=device,
                 dtype=torch.float32
             )
             H_actual = compute_depth_entropy(depth_dist_tensor, self.epsilon)
-            
+
             # 目标熵: target_ratio * log(num_depths)
             num_depths = len(stats.token_depth_distribution)
             H_target = self.target_entropy_ratio * np.log(num_depths)
             H_target_tensor = torch.tensor(H_target, device=device, dtype=torch.float32)
-            
+
             L_entropy = (H_actual - H_target_tensor) ** 2
         else:
-            # 如果深度信息不可用，跳过熵损失
-            L_entropy = torch.tensor(0.0, device=device, dtype=torch.float32)
-        
+            # I-OPT: 如果深度信息不可用，跳过熵损失，使用预注册的零张量
+            L_entropy = self._zero_tensor
+
         # 加权总损失
         total_loss = (
             self.lambda_flops * L_flops +
             self.lambda_token * L_token +
             self.lambda_entropy * L_entropy
         )
-        
+
         if return_components:
             components = {
                 "L_flops": L_flops.item(),
@@ -436,7 +444,7 @@ class ResourceAwareLoss(nn.Module):
                 "depth_entropy": H_actual.item() if isinstance(H_actual, torch.Tensor) else 0.0,
             }
             return total_loss, components
-        
+
         return total_loss
     
     def get_diagnostics(self, stats: ModelResourceStats) -> dict:

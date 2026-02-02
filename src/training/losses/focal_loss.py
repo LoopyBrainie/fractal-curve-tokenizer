@@ -42,6 +42,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vit_pytorch.constants import PROB_EPSILON
+
 
 class FocalLoss(nn.Module):
     """
@@ -166,7 +168,8 @@ class FocalLoss(nn.Module):
         # I145: 添加数值稳定性保护
         # 当 p_t → 0 且 γ 很大时，(1-p_t)^γ 可能溢出
         # clamp p_t 到 [eps, 1-eps] 范围
-        p_t_safe = p_t.clamp(min=1e-7, max=1.0 - 1e-7)
+        # P-OPT: 使用统一的 PROB_EPSILON 常量
+        p_t_safe = p_t.clamp(min=PROB_EPSILON, max=1.0 - PROB_EPSILON)
 
         # 计算 Focal权重: (1 - p_t)^γ
         focal_weight = (1 - p_t_safe).pow(self.gamma)
