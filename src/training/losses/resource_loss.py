@@ -66,21 +66,29 @@
 防止深度坍缩（所有 token 集中在单一深度）：
 
     H_actual = -Σ_d p_d · log(p_d)
-    H_target = log(D_max + 1)  # 均匀分布的熵
+
+I111-2 自适应熵目标:
+    H_target = log(D) × (1 - 1/√D)
+
+    | D  | H_target/H_max | 含义                    |
+    |----|----------------|------------------------|
+    | 2  | 29%            | 强烈偏向浅层            |
+    | 4  | 50%            | 中等深度利用            |
+    | 8  | 65%            | 允许更均匀的深度分布    |
+
     L_entropy = (H_actual - H_target)²
 
 数学性质:
-    - H ∈ [0, log(D_max+1)]
+    - H ∈ [0, log(D)]
     - H = 0: 完全坍缩（所有 token 同一深度）
-    - H = log(D_max+1): 均匀分布（最大熵）
+    - H = log(D): 均匀分布（最大熵）
 
-计算验证 (D_max=4):
+计算验证 (D=5):
     均匀分布 [0.2, 0.2, 0.2, 0.2, 0.2]:
-        H = -5 * 0.2 * log(0.2) = 1.609  (最大)
+        H = 1.609 (最大)
+    自适应目标 (D=5): H_target = 1.609 × (1 - 1/√5) = 0.89
     坍缩分布 [1.0, 0, 0, 0, 0]:
-        H = -1 * log(1) = 0  (最小)
-    实际分布 [0.4, 0.3, 0.2, 0.1, 0]:
-        H = -(0.4*log(0.4) + 0.3*log(0.3) + ...) ≈ 1.28
+        H = 0 (最小)
 
 设计原则
 ========
@@ -417,9 +425,12 @@ class ResourceAwareLoss(nn.Module):
             )
             H_actual = compute_depth_entropy(depth_dist_tensor, self.epsilon)
 
-            # 目标熵: target_ratio * log(num_depths)
+            # I111-2: 自适应熵目标
+            # H_target = log(D) × (1 - 1/√D)
+            # 深度越深，允许的分布越均匀
             num_depths = len(stats.token_depth_distribution)
-            H_target = self.target_entropy_ratio * np.log(num_depths)
+            adaptive_ratio = 1.0 - 1.0 / np.sqrt(num_depths)
+            H_target = np.log(num_depths) * adaptive_ratio
             H_target_tensor = torch.tensor(H_target, device=device, dtype=torch.float32)
 
             L_entropy = (H_actual - H_target_tensor) ** 2

@@ -968,10 +968,15 @@ class FrozenEncoderExperiment(BaseExperiment):
                     continue
 
                 # I139: Extract from TrainingStats
-                logits = stats.logits if hasattr(stats, 'logits') else stats
+                # I139: FER 需要使用 transformer_tokens 作为 reconstructed features
+                recon_features = getattr(stats, 'transformer_tokens', None)
+                if recon_features is None:
+                    recon_features = getattr(stats, 'features', None)
 
-                # 3. 获取Reconstructed features (TrainingStats 不提供此字段，使用 logits)
-                recon_features = logits  # FER 模式需要Reconstructed features，TrainingStats 暂不提供
+                if recon_features is None:
+                    logger.debug(f"TrainingStats 可用字段: {[k for k in dir(stats) if not k.startswith('_')]}")
+                    logger.warning("无法获取 reconstructed features，跳过 batch")
+                    continue
 
                 # 4. Compute reconstruction loss
                 loss, info = self.recon_loss_fn(original_features, recon_features)
