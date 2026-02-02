@@ -1,27 +1,29 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
+
 """
-Fractal Proxy Experiments - 三种实验模式
+Fractal Proxy Experiments - Three experiment modes
 
 Mode A: Sparse Subset Ablation (SSA)
-    - SubsetSampler 从 CUB-200 提取 N 个类
-    - 网格搜索 sparsity_ratio × gumbel_tau
-    - 记录平均 Token 激活数
+    - SubsetSampler extracts N classes from CUB-200
+    - Grid search over sparsity_ratio x gumbel_tau
+    - Record average token activation count
 
 Mode B: Frozen-Encoder Reconstruction (FER)
-    - 冻结 Transformer Encoder
-    - 只训练 Learnable Splitter 和 ShapeScaleEncoder
-    - FeatureReconstructionLoss: 重构 ViT 特征统计特性
+    - Freeze Transformer Encoder
+    - Train only Learnable Splitter and ShapeScaleEncoder
+    - FeatureReconstructionLoss: Reconstruct ViT feature statistics
 
 Mode C: Geometric Jigsaw Proxy (GJP)
-    - 自监督任务：随机打乱分形层级拓扑顺序
-    - 预测分形 Patch 的相对希尔伯特索引
+    - Self-supervised: Randomly shuffle fractal hierarchy order
+    - Predict relative Hilbert indices for fractal patches
 
 Usage:
-    # SSA 网格搜索
+    # SSA grid search
     uv run python src/training/fractal_proxy_experiments.py --mode ssa \
         --sparsity-ratios 0.3,0.5,0.7 --gumbel-taus 0.5,1.0,2.0
 
-    # FER (可选预训练)
+    # FER (optional pretrained)
     uv run python src/training/fractal_proxy_experiments.py --mode fer \
         --pretrained path/to/checkpoint.pt
 
@@ -30,7 +32,14 @@ Usage:
         --shuffle-group 4
 """
 
-from __future__ import annotations
+import sys
+from pathlib import Path
+
+# Add src directory to path (ensure vit_pytorch is importable)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+src_PATH = PROJECT_ROOT / "src"
+if str(src_PATH) not in sys.path:
+    sys.path.insert(0, str(src_PATH))
 
 import argparse
 import logging
@@ -49,42 +58,82 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# PART 1: 配置与常量
+# PART 1: Configuration and Constants
 # =============================================================================
 
 class ExperimentMode(Enum):
-    """三种实验模式"""
-    SSA = "sparse_subset_ablation"    # 稀疏子集消融
-    FER = "frozen_encoder_reconstruction"  # 冻结编码器重构
-    GJP = "geometric_jigsaw_proxy"    # 几何拼图代理
+    """Three experiment modes"""
+    SSA = "sparse_subset_ablation"    # Sparse subset ablation
+    FER = "frozen_encoder_reconstruction"  # Frozen encoder reconstruction
+    GJP = "geometric_jigsaw_proxy"    # Geometric jigsaw proxy
+
+    @classmethod
+    def from_string(cls, s: str) -> "ExperimentMode":
+        """Support abbreviations: ssa -> SSA, fer -> FER, gjp -> GJP"""
+        s = s.lower()
+        mapping = {
+            "ssa": cls.SSA,
+            "fer": cls.FER,
+            "gjp": cls.GJP,
+            "sparse_subset_ablation": cls.SSA,
+            "frozen_encoder_reconstruction": cls.FER,
+            "geometric_jigsaw_proxy": cls.GJP,
+        }
+        if s not in mapping:
+            raise ValueError(f"'{s}' is not a valid experiment mode. Valid options: {list(mapping.keys())}")
+        return mapping[s]
 
 
 @dataclass
 class ProxyExperimentConfig:
-    """实验统一配置"""
-    # 基础配置
+    """Experiment config - Three-layer parameter structure
+
+    L1 Data Config (Data):
+        - batch_size: Batch size
+        - num_workers: Data loader workers
+
+    L2 Model Architecture Config (Model):
+        - dim: Embedding dimension
+        - num_layers: Transformer layers (original depth)
+        - heads: Attention heads
+        - min_patch_size: Min patch size
+        - max_level: Max split depth (original max_fractal_depth)
+
+    L3 Training Config (Training):
+        - learning_rate: Learning rate
+        - weight_decay: Weight decay
+        - use_amp: Use mixed precision
+        - gradient_accumulation_steps: Gradient accumulation steps
+    """
+    # L1: Data config
     mode: ExperimentMode = ExperimentMode.SSA
     experiment_name: str = "default_experiment"
     seed: int = 42
-
-    # 显存管理
     batch_size: int = 32
-    gradient_accumulation_steps: int = 4
-    max_fractal_depth: int = 8  # 硬上限，防止死循环递归
+    num_workers: int = 4
 
-    # 日志配置
-    log_interval: int = 50
-    save_dir: Optional[Path] = None
+    # L2: Model architecture config
+    dim: int = 384
+    num_layers: int = 8  # Original depth (I145: unified naming)
+    heads: int = 6
+    min_patch_size: int = 4
+    max_level: int = 8  # Original max_fractal_depth
 
-    # 设备配置
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    # L3: Training config
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.01
     use_amp: bool = True
-    use_compile: bool = False  # 可选启用 torch.compile
+    use_compile: bool = False
+    gradient_accumulation_steps: int = 4
+    log_interval: int = 10  # Logging interval for batches
 
-    # 模型路径
+    # Runtime config (not in three-layer params)
+    device: str = "cuda"
+
+    # Model path
     pretrained_path: Optional[str] = None
 
-    # 实验特定配置
+    # Experiment-specific config
     ssa_config: Optional["SSAConfig"] = None
     fer_config: Optional["FERConfig"] = None
     gjp_config: Optional["GJPConfig"] = None
@@ -92,39 +141,42 @@ class ProxyExperimentConfig:
 
 @dataclass
 class SSAConfig:
-    """Sparse Subset Ablation 配置"""
-    num_classes_subset: int = 10  # 提取 N 个类
+    """Sparse Subset Ablation config"""
+    num_classes_subset: int = 10  # Extract N classes
     sparsity_ratios: Tuple[float, ...] = (0.3, 0.5, 0.7)
     gumbel_taus: Tuple[float, ...] = (0.5, 1.0, 2.0)
 
-    # 记录指标
+    # Record metrics
     record_per_layer_tokens: bool = True
     record_token_density: bool = True
     record_depth_variance: bool = True
 
-    # 快速模式
-    quick_test: bool = False  # 减少迭代次数用于快速验证
+    # Quick mode
+    quick_test: bool = False  # Reduce iterations for quick validation
 
 
 @dataclass
 class FERConfig:
-    """Frozen Encoder Reconstruction 配置"""
-    # 重构目标
+    """Frozen Encoder Reconstruction config
+
+    Note:
+        - learning_rate and weight_decay inherited from ProxyExperimentConfig
+        - Avoid duplication, maintain three-layer parameter consistency
+    """
+    # Reconstruction targets
     reconstruct_mean: bool = True
     reconstruct_var: bool = True
     reconstruct_channel_corr: bool = True
 
-    # 损失权重
+    # Loss weights
     mean_weight: float = 1.0
     var_weight: float = 1.0
     corr_weight: float = 0.5
 
-    # 训练配置
-    learning_rate: float = 1e-4
-    frozen_encoder_epochs: int = 10
-    weight_decay: float = 0.01
+    # Training config (use ProxyExperimentConfig's learning_rate and weight_decay)
+    epochs: int = 10  # Original frozen_encoder_epochs
 
-    # ShapeScaleEncoder 配置
+    # ShapeScaleEncoder config
     shape_encoder_names: Tuple[str, ...] = (
         'shape_scale_encoder', 'shape_encoder', 'scale_encoder'
     )
@@ -132,35 +184,38 @@ class FERConfig:
 
 @dataclass
 class GJPConfig:
-    """Geometric Jigsaw Proxy 配置"""
-    shuffle_group_size: int = 4  # 每组 shuffle 大小
+    """Geometric Jigsaw Proxy config
 
-    # Hilbert 索引相关
-    max_relative_distance: int = 8  # 最大相对距离
+    Note:
+        - learning_rate and weight_decay inherited from ProxyExperimentConfig
+        - Avoid duplication, maintain three-layer parameter consistency
+    """
+    shuffle_group_size: int = 4  # Shuffle group size
+
+    # Hilbert index related
+    max_relative_distance: int = 8  # Max relative distance
     predict_relative_offset: bool = True
 
-    # 损失权重
+    # Loss weights
     jigsaw_weight: float = 1.0
     entropy_weight: float = 0.1
 
-    # 训练配置
-    learning_rate: float = 1e-4
-    num_epochs: int = 10
-    weight_decay: float = 0.01
+    # Training config (use ProxyExperimentConfig's learning_rate and weight_decay)
+    epochs: int = 10  # Original num_epochs
 
 
 # =============================================================================
-# PART 2: 基础架构
+# PART 2: Basic Architecture
 # =============================================================================
 
 @dataclass
 class TokenMetrics:
-    """Token 指标数据结构"""
-    # 核心指标 (必须记录)
-    token_density: float  # 每层活跃 Token 比例
-    recursive_depth_variance: float  # 深度方差
+    """Token metrics data structure"""
+    # Core metrics (must record)
+    token_density: float  # Active token ratio per layer
+    recursive_depth_variance: float  # Depth variance
 
-    # 扩展指标
+    # Extended metrics
     num_tokens_per_depth: Dict[int, int] = field(default_factory=dict)
     avg_tokens_per_sample: float = 0.0
     hilbert_locality_score: float = 0.0
@@ -168,7 +223,7 @@ class TokenMetrics:
 
 
 class TokenMetricsCollector:
-    """Token 指标收集器 - 从 TrainingStats 提取"""
+    """Token metrics collector - extract from TrainingStats"""
 
     def __init__(self, max_depth: int = 8):
         self.max_depth = max_depth
@@ -179,25 +234,25 @@ class TokenMetricsCollector:
         num_total_patches: int,
         batch_size: int = 1,
     ) -> TokenMetrics:
-        """从 TrainingStats 计算指标 (I139: 适配新接口)"""
+        """Compute metrics from TrainingStats (I139: adapt new interface)"""
 
-        # I139: 支持 TrainingStats 或旧版 aux_infos 字典
-        # I141: num_tokens 可能为 int, List[int], 或 torch.Tensor
+        # I139: Support TrainingStats or legacy aux_infos dict
+        # I141: num_tokens can be int, List[int], or torch.Tensor
         if hasattr(stats, 'num_tokens'):
-            # TrainingStats 模式
+            # TrainingStats mode
             num_tokens = stats.num_tokens
             if isinstance(num_tokens, torch.Tensor):
-                # I141: GPU tensor 转换为标量
-                num_tokens = num_tokens.sum().item()  # 批次总 token 数
+                # I141: GPU tensor to scalar
+                num_tokens = num_tokens.sum().item()  # Total tokens in batch
             elif isinstance(num_tokens, list):
-                # I141: 列表类型，求和
-                num_tokens = sum(num_tokens)  # 批次总 token 数
+                # I141: List type, sum
+                num_tokens = sum(num_tokens)  # Total tokens in batch
 
-            # 从 split_info 获取 levels_used
+            # Get levels_used from split_info
             split_info = getattr(stats, 'split_info', {})
             levels_list = split_info.get('levels_list', None)
 
-            # 计算深度方差
+            # Compute depth variance
             if levels_list:
                 all_levels = []
                 for levels in levels_list:
@@ -207,14 +262,14 @@ class TokenMetricsCollector:
             else:
                 depth_variance = 0.0
 
-            # 深度分布
+            # Depth distribution
             depth_dist = getattr(stats, 'depth_distribution', {})
             if isinstance(depth_dist, dict):
                 num_tokens_per_depth = {k: int(v * num_tokens) for k, v in depth_dist.items()}
             else:
                 num_tokens_per_depth = {}
         else:
-            # 旧版 aux_infos 字典模式 (向后兼容)
+            # Legacy aux_infos dict mode (backward compatible)
             aux_infos = stats
             num_tokens = aux_infos.get("num_tokens", 0)
             if isinstance(num_tokens, torch.Tensor):
@@ -238,7 +293,7 @@ class TokenMetricsCollector:
             else:
                 num_tokens_per_depth = {}
 
-        # Token Density: 活跃 token / 总 patch
+        # Token Density: active token / total patch
         token_density = num_tokens / num_total_patches if num_total_patches > 0 else 0.0
 
         return TokenMetrics(
@@ -246,12 +301,12 @@ class TokenMetricsCollector:
             recursive_depth_variance=depth_variance,
             num_tokens_per_depth=num_tokens_per_depth,
             avg_tokens_per_sample=num_tokens / batch_size if batch_size > 0 else 0.0,
-            hilbert_locality_score=0.0,  # TrainingStats 不提供此字段
+            hilbert_locality_score=0.0,  # TrainingStats does not provide this field
             batch_size=batch_size,
         )
 
     def _compute_depth_variance(self, levels: List[int]) -> float:
-        """计算深度方差"""
+        """Compute depth variance"""
         if not levels:
             return 0.0
 
@@ -259,7 +314,7 @@ class TokenMetricsCollector:
         return levels_tensor.var().item()
 
     def aggregate_metrics(self, metrics_list: List[TokenMetrics]) -> Dict[str, float]:
-        """聚合多个 batch 的指标"""
+        """Aggregate metrics from multiple batches"""
         if not metrics_list:
             return {}
 
@@ -273,7 +328,7 @@ class TokenMetricsCollector:
 
 
 class MemoryManager:
-    """显存管理 - 满足工程约束"""
+    """Memory management - satisfy engineering constraints"""
 
     def __init__(self, config: ProxyExperimentConfig):
         self.config = config
@@ -282,18 +337,18 @@ class MemoryManager:
 
     def maybe_clear_cache(self, epoch: int, force: bool = False) -> None:
         """
-        Epoch 结束时调用 torch.cuda.empty_cache()
+        Call torch.cuda.empty_cache() at end of epoch
         Also called after Graph Break warnings
         """
         if torch.cuda.is_available():
-            # 每个 epoch 结束时清理，或强制清理
+            # Clear at end of each epoch, or force clear
             if force or epoch % 1 == 0:
                 torch.cuda.empty_cache()
 
     def check_memory_leak(self) -> Dict[str, float]:
         """
-        检查显存泄漏 - 检测未 detach 张量
-        使用 VectorizationAuditor 的模式
+        Check memory leak - detect non-detached tensors
+        Use VectorizationAuditor pattern
         """
         if not torch.cuda.is_available():
             return {}
@@ -303,10 +358,10 @@ class MemoryManager:
             "reserved_GB": torch.cuda.memory_reserved() / 1024**3,
         }
 
-        # 警告：如果 reserved 持续增长，说明有泄漏
+        # Warning: if reserved keeps growing, there's a leak
         if self._last_reserved is not None:
             growth_ratio = memory_stats["reserved_GB"] / self._last_reserved
-            if growth_ratio > 1.1:  # 增长超过 10%
+            if growth_ratio > 1.1:  # Growth exceeds 10%
                 logger.warning(
                     f"Potential memory leak: reserved increased from "
                     f"{self._last_reserved:.2f}GB to {memory_stats['reserved_GB']:.2f}GB "
@@ -317,7 +372,7 @@ class MemoryManager:
         return memory_stats
 
     def get_memory_stats(self) -> Dict[str, float]:
-        """获取当前显存状态"""
+        """Get current memory status"""
         if not torch.cuda.is_available():
             return {}
 
@@ -330,13 +385,13 @@ class MemoryManager:
 
 class ExperimentWrapper:
     """
-    实验包装器 - 解耦设计，不修改核心模型库
+    Experiment wrapper - decoupled design, no modification to core model library
 
-    通过依赖注入和属性访问封装模型，支持：
-    - 冻结/解冻模块
-    - 设置 Gumbel 温度
-    - 设置稀疏比率
-    - 自动检测 ShapeScaleEncoder
+    Encapsulate model via dependency injection and attribute access, supports:
+    - Freeze/unfreeze modules
+    - Set Gumbel temperature
+    - Set sparsity ratio
+    - Auto-detect ShapeScaleEncoder
     """
 
     def __init__(
@@ -350,20 +405,20 @@ class ExperimentWrapper:
         self.metrics_collector = metrics_collector
         self.device = torch.device(config.device)
 
-        # 提取 tokenizer 和 splitter
+        # Extract tokenizer and splitter
         self.tokenizer = getattr(model, 'tokenizer', None)
         self.splitter = getattr(self.tokenizer, 'splitter', None) if self.tokenizer else None
 
-        # 自动检测 ShapeScaleEncoder (FER 模式)
+        # Auto-detect ShapeScaleEncoder (FER mode)
         self.shape_scale_encoder: Optional[nn.Module] = None
         if config.mode == ExperimentMode.FER:
             self._detect_shape_encoder()
 
-        # 移动到设备
+        # Move to device
         self.model = self.model.to(self.device)
 
     def _detect_shape_encoder(self) -> None:
-        """自动检测 ShapeScaleEncoder (多候选名)"""
+        """Auto-detect ShapeScaleEncoder (multiple candidate names)"""
         if self.tokenizer is None:
             return
 
@@ -379,26 +434,26 @@ class ExperimentWrapper:
             logger.warning("ShapeScaleEncoder not found in tokenizer")
 
     def wrap_model_for_experiment(self) -> nn.Module:
-        """包装模型以适应实验需求"""
+        """Wrap model for experiment needs"""
         if self.config.mode == ExperimentMode.FER:
             self._freeze_encoder()
         return self.model
 
     def unwrap_model(self) -> nn.Module:
-        """恢复模型原始状态"""
+        """Restore model to original state"""
         if self.config.mode == ExperimentMode.FER:
             self._unfreeze_encoder()
         return self.model
 
     def _freeze_encoder(self) -> None:
-        """冻结 Transformer Encoder"""
+        """Freeze Transformer Encoder"""
         encoder = getattr(self.model, 'transformer', None)
         if encoder is not None:
             for param in encoder.parameters():
                 param.requires_grad = False
-            logger.info("Transformer Encoder 已冻结")
+            logger.info("Transformer Encoder frozen")
 
-            # 确保 tokenizer 和 splitter 可训练
+            # Ensure tokenizer and splitter are trainable
             if self.tokenizer:
                 for param in self.tokenizer.parameters():
                     param.requires_grad = True
@@ -410,29 +465,48 @@ class ExperimentWrapper:
                     param.requires_grad = True
 
     def _unfreeze_encoder(self) -> None:
-        """解冻 Encoder (FER 预训练后)"""
+        """Unfreeze Encoder (after FER pretraining)"""
         encoder = getattr(self.model, 'transformer', None)
         if encoder is not None:
             for param in encoder.parameters():
                 param.requires_grad = True
-            logger.info("Transformer Encoder 已解冻")
+            logger.info("Transformer Encoder unfrozen")
 
     def set_gumbel_temperature(self, tau: float) -> None:
-        """设置 Gumbel 温度 (SSA 实验)"""
+        """Set Gumbel temperature (SSA experiment)"""
         if self.splitter is not None and hasattr(self.splitter, 'log_temperature'):
             self.splitter.log_temperature.data = torch.tensor(tau).log().to(self.device)
-            logger.debug(f"Gumbel 温度设置为 {tau}")
+            logger.debug(f"Gumbel temperature set to {tau}")
 
     def set_sparsity_ratio(self, ratio: float) -> None:
-        """设置稀疏比率 (修改 K_max)"""
+        """Set sparsity ratio (modify token_coverage_max)
+
+        I33: 使用相对预算 API 替代绝对 K 值
+        公式: token_coverage_max = base_ratio * ratio
+        """
         if self.splitter is not None:
-            original_K_max = getattr(self.splitter, 'K_max', 64)
-            new_K_max = max(8, int(original_K_max * ratio))
-            self.splitter.K_max = new_K_max
-            logger.debug(f"稀疏比率 {ratio} -> K_max = {new_K_max}")
+            # I33: 从 config 获取基准覆盖率
+            base_coverage = getattr(self.splitter, '_token_coverage_max', 0.25)
+            if hasattr(self.splitter, 'config') and self.splitter.config is not None:
+                base_coverage = getattr(self.splitter.config, 'token_coverage_max', 0.25)
+
+            # 根据稀疏比率调整覆盖率
+            new_coverage = base_coverage * ratio
+            # 确保覆盖率在合理范围内 [0.01, 0.5]
+            new_coverage = max(0.01, min(0.5, new_coverage))
+
+            # 更新 config 中的 token_coverage_max
+            if hasattr(self.splitter, 'config') and self.splitter.config is not None:
+                self.splitter.config.token_coverage_max = new_coverage
+            else:
+                # 备选：直接更新内部变量
+                if hasattr(self.splitter, '_token_coverage_max'):
+                    self.splitter._token_coverage_max = new_coverage
+
+            logger.debug(f"Sparsity ratio {ratio} -> token_coverage_max = {new_coverage:.4f}")
 
     def get_trainable_params(self) -> List[torch.nn.Parameter]:
-        """获取可训练参数列表 (FER 模式)"""
+        """Get trainable parameter list (FER mode)"""
         params = []
 
         if self.splitter is not None:
@@ -441,7 +515,7 @@ class ExperimentWrapper:
         if self.shape_scale_encoder is not None:
             params.extend(p for p in self.shape_scale_encoder.parameters() if p.requires_grad)
 
-        # 如果没有指定模块，返回所有参数
+        # If no modules specified, return all parameters
         if not params:
             params = list(self.model.parameters())
 
@@ -449,7 +523,7 @@ class ExperimentWrapper:
 
 
 class BaseExperiment(ABC):
-    """实验基类"""
+    """Experiment base class"""
 
     def __init__(
         self,
@@ -464,7 +538,7 @@ class BaseExperiment(ABC):
         self.val_loader = val_loader
 
         self.metrics_collector = TokenMetricsCollector(
-            max_depth=config.max_fractal_depth
+            max_depth=config.max_level  # 原 max_fractal_depth
         )
 
         self.wrapper = ExperimentWrapper(
@@ -504,9 +578,9 @@ class BaseExperiment(ABC):
 
 class SubsetSampler(Sampler):
     """
-    从 CUB-200 提取 N 个类 - 流式采样
+    Extract N classes from CUB-200 - streaming sampling
 
-    禁止全量加载：使用生成器模式，支持大数据集
+    Prohibit full load: use generator pattern, support large datasets
     """
 
     def __init__(
@@ -577,9 +651,9 @@ class SubsetSampler(Sampler):
 
 class SparseAblationExperiment(BaseExperiment):
     """
-    Mode A: Sparse Subset Ablation 实验
+    Mode A: Sparse Subset Ablation experiment
 
-    目标：测试 sparsity_ratio 和 gumbel_tau 对 Token 激活的影响
+    Objective: test sparsity_ratio and gumbel_tau impact on token activation
     """
 
     def __init__(
@@ -598,10 +672,10 @@ class SparseAblationExperiment(BaseExperiment):
 
     def run(self) -> Dict[Tuple[float, float], Dict[str, float]]:
         """
-        网格搜索: 遍历 sparsity_ratio 和 gumbel_tau
+        Grid search: iterate over sparsity_ratio and gumbel_tau
 
         Returns:
-            Dict[(sparsity, tau)] -> Dict[metric] 平均结果
+            Dict[(sparsity, tau)] -> Dict[metric] average results
         """
         results = {}
 
@@ -610,26 +684,26 @@ class SparseAblationExperiment(BaseExperiment):
                 key = (sparsity, tau)
                 logger.info(f"Running SSA: sparsity={sparsity}, tau={tau}")
 
-                # 设置实验参数
+                # Set experiment parameters
                 self.wrapper.set_sparsity_ratio(sparsity)
                 self.wrapper.set_gumbel_temperature(tau)
 
-                # 运行单配置实验
+                # Run single config experiment
                 run_results = self._run_single_config()
                 results[key] = run_results
 
-                # 清理显存
+                # Clear memory
                 self.memory_manager.maybe_clear_cache(0, force=True)
 
                 if self.ssa_config.quick_test:
-                    break  # 快速测试模式只跑一个配置
+                    break  # Quick test mode runs only one config
             if self.ssa_config.quick_test:
                 break
 
         return results
 
     def _run_single_config(self) -> Dict[str, float]:
-        """运行单配置实验"""
+        """Run single config experiment"""
         metrics_history = []
 
         max_iter = 10 if self.ssa_config.quick_test else len(self.train_loader)
@@ -640,21 +714,19 @@ class SparseAblationExperiment(BaseExperiment):
 
             imgs = imgs.to(self.device)
 
-            # Forward
+            # Forward - disable torch.compile entirely for stability
             try:
-                if self.config.use_compile:
-                    with torch.compiler.disable():
-                        stats = self.wrapper.model(imgs)
-                else:
+                # Use inference_mode to disable gradients and compile
+                with torch.inference_mode():
                     stats = self.wrapper.model(imgs)
             except Exception as e:
                 self._handle_compile_warning(e)
                 continue
 
-            # I139: 从 TrainingStats 提取 logits
+            # I139: Extract from TrainingStats logits
             logits = stats.logits if hasattr(stats, 'logits') else stats
 
-            # 收集指标
+            # Collect metrics
             img_size = imgs.shape[2:]
             patch_size = 4  # 默认 patch size
             num_patches = (img_size[0] // patch_size) * (img_size[1] // patch_size)
@@ -705,7 +777,7 @@ class SparseAblationExperiment(BaseExperiment):
 
 class FeatureReconstructionLoss(nn.Module):
     """
-    重构 ViT 特征统计特性
+    Reconstruct ViT feature statistics
 
     数学形式化:
         L_fer = λ_mean × L_mean + λ_var × L_var + λ_corr × L_corr
@@ -727,23 +799,23 @@ class FeatureReconstructionLoss(nn.Module):
         reconstructed_features: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        计算重构损失
+        Compute reconstruction loss
 
         Args:
-            original_features: [B, N, D] 原始 ViT 特征
-            reconstructed_features: [B, N, D] 重构特征
+            original_features: [B, N, D] Original ViT features
+            reconstructed_features: [B, N, D] Reconstructed features
 
         Returns:
-            loss: 总损失
-            info: 各分量统计
+            loss: Total loss
+            info: Component statistics
         """
         info = {}
 
-        # 确保特征是连续的
+        # Ensure features are contiguous
         original_features = original_features.contiguous()
         reconstructed_features = reconstructed_features.contiguous()
 
-        # 1. 均值重构损失
+        # 1. Mean reconstruction loss
         if self.config.reconstruct_mean:
             original_mean = original_features.mean(dim=(0, 1))  # [D]
             recon_mean = reconstructed_features.mean(dim=(0, 1))
@@ -752,7 +824,7 @@ class FeatureReconstructionLoss(nn.Module):
         else:
             mean_loss = torch.tensor(0.0, device=original_features.device)
 
-        # 2. 方差重构损失
+        # 2. Variance reconstruction loss
         if self.config.reconstruct_var:
             original_var = original_features.var(dim=(0, 1))  # [D]
             recon_var = reconstructed_features.var(dim=(0, 1))
@@ -761,16 +833,16 @@ class FeatureReconstructionLoss(nn.Module):
         else:
             var_loss = torch.tensor(0.0, device=original_features.device)
 
-        # 3. 通道相关性重构损失
+        # 3. Channel correlation reconstruction loss
         if self.config.reconstruct_channel_corr:
             original_flat = original_features.flatten(0, 1)  # [B*N, D]
             recon_flat = reconstructed_features.flatten(0, 1)
 
-            # 中心化
+            # Center
             original_flat = original_flat - original_flat.mean(dim=0, keepdim=True)
             recon_flat = recon_flat - recon_flat.mean(dim=0, keepdim=True)
 
-            # 计算协方差矩阵
+            # Compute covariance matrix
             # cov = (X^T X) / (n - 1)
             n = original_flat.shape[0]
             original_cov = (original_flat.T @ original_flat) / (n - 1 + 1e-6)
@@ -781,7 +853,7 @@ class FeatureReconstructionLoss(nn.Module):
         else:
             corr_loss = torch.tensor(0.0, device=original_features.device)
 
-        # 总损失
+        # Total loss
         total_loss = (
             self.config.mean_weight * mean_loss +
             self.config.var_weight * var_loss +
@@ -795,9 +867,9 @@ class FeatureReconstructionLoss(nn.Module):
 
 class FrozenEncoderExperiment(BaseExperiment):
     """
-    Mode B: Frozen Encoder Reconstruction 实验
+    Mode B: Frozen Encoder Reconstruction experiment
 
-    目标：冻结 Encoder，只训练 Splitter + ShapeScaleEncoder
+    Objective: freeze Encoder, train only Splitter + ShapeScaleEncoder
     """
 
     def __init__(
@@ -813,7 +885,7 @@ class FrozenEncoderExperiment(BaseExperiment):
         self.fer_config = config.fer_config or FERConfig()
         self.reference_model = reference_model
 
-        # 包装模型（会冻结 encoder）
+        # Wrap model（会冻结 encoder）
         self.wrapper.wrap_model_for_experiment()
 
         # 损失函数
@@ -823,27 +895,27 @@ class FrozenEncoderExperiment(BaseExperiment):
             feat_dim=feat_dim,
         )
 
-        # 优化器 (只训练 Splitter 和 ShapeScaleEncoder)
+        # Optimizer (只训练 Splitter 和 ShapeScaleEncoder)
         self.optimizer = self._create_optimizer()
 
     def _create_optimizer(self) -> torch.optim.Optimizer:
-        """创建优化器 - 只优化 Splitter 和 ShapeScaleEncoder"""
+        """Create optimizer - optimize only Splitter and ShapeScaleEncoder"""
         params = self.wrapper.get_trainable_params()
 
         if not params:
-            logger.warning("未找到可训练参数")
+            logger.warning("No trainable parameters found")
             return torch.optim.Adam([])  # 空参数
 
         logger.info(f"FER: 找到 {len(params)} 组可训练参数")
 
         return torch.optim.AdamW(
             params,
-            lr=self.fer_config.learning_rate,
-            weight_decay=self.fer_config.weight_decay,
+            lr=self.config.learning_rate,  # 从 ProxyExperimentConfig 继承
+            weight_decay=self.config.weight_decay,
         )
 
     def run(self) -> Dict[str, Any]:
-        """运行 FER 实验"""
+        """Run FER experiment"""
         history = {
             "recon_loss": [],
             "token_density": [],
@@ -853,7 +925,7 @@ class FrozenEncoderExperiment(BaseExperiment):
 
         self.model.train()
 
-        num_epochs = self.fer_config.frozen_encoder_epochs
+        num_epochs = self.fer_config.epochs  # 原 frozen_encoder_epochs
         max_iter = 10 if getattr(self.ssa_config, 'quick_test', False) else None
 
         for epoch in range(num_epochs):
@@ -867,24 +939,24 @@ class FrozenEncoderExperiment(BaseExperiment):
 
                 imgs = imgs.to(self.device)
 
-                # 1. 获取原始 ViT 特征 (冻结的 encoder)
+                # 1. 获取Original ViT features (冻结的 encoder)
                 with torch.no_grad():
                     if self.reference_model is not None:
                         original_stats = self.reference_model(imgs)
                     else:
-                        # 使用当前模型但 encoder 冻结
+                        # Use current model but encoder frozen
                         original_stats = self.wrapper.model(imgs)
 
-                    # 提取原始特征
+                    # Extract original features
                     original_features = original_stats.transformer_tokens
                     if original_features is None:
                         original_features = original_stats.features
 
                     if original_features is None:
-                        logger.warning("无法提取原始特征，跳过 batch")
+                        logger.warning("无法Extract original features，跳过 batch")
                         continue
 
-                # 2. 前向传播 (训练 splitter)
+                # 2. Forward pass (train splitter)
                 try:
                     if self.config.use_compile:
                         with torch.compiler.disable():
@@ -895,22 +967,22 @@ class FrozenEncoderExperiment(BaseExperiment):
                     self._handle_compile_warning(e)
                     continue
 
-                # I139: 从 TrainingStats 提取
+                # I139: Extract from TrainingStats
                 logits = stats.logits if hasattr(stats, 'logits') else stats
 
-                # 3. 获取重构特征 (TrainingStats 不提供此字段，使用 logits)
-                recon_features = logits  # FER 模式需要重构特征，TrainingStats 暂不提供
+                # 3. 获取Reconstructed features (TrainingStats 不提供此字段，使用 logits)
+                recon_features = logits  # FER 模式需要Reconstructed features，TrainingStats 暂不提供
 
-                # 4. 计算重构损失
+                # 4. Compute reconstruction loss
                 loss, info = self.recon_loss_fn(original_features, recon_features)
 
-                # 5. 梯度累积
+                # 5. Gradient accumulation
                 loss = loss / self.config.gradient_accumulation_steps
 
-                # 6. 反向传播
+                # 6. Backward pass
                 loss.backward()
 
-                # 7. 梯度累积步骤
+                # 7. Gradient accumulation步骤
                 if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
                     self.optimizer.step()
                     self.optimizer.zero_grad()
@@ -918,7 +990,7 @@ class FrozenEncoderExperiment(BaseExperiment):
                 epoch_loss += info["total_loss"]
                 num_batches += 1
 
-                # 收集指标
+                # Collect metrics
                 img_size = imgs.shape[2:]
                 patch_size = 4
                 num_patches = (img_size[0] // patch_size) * (img_size[1] // patch_size)
@@ -960,7 +1032,7 @@ class FrozenEncoderExperiment(BaseExperiment):
 # =============================================================================
 
 class HilbertIndexShuffler:
-    """Hilbert 索引打乱器 - 用于几何拼图任务"""
+    """Hilbert index shuffler - for geometric jigsaw task"""
 
     def __init__(self, group_size: int = 4, max_depth: int = 8):
         self.group_size = group_size
@@ -972,19 +1044,19 @@ class HilbertIndexShuffler:
         batch_indices: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        在分形层级内打乱拓扑顺序
+        Shuffle topology order within fractal hierarchy
 
         数学形式化:
-            对每组 G 个 token，随机排列顺序
-            保持层级结构不变，只改变 Hilbert 索引排序
+            For each group of G tokens, randomly permute order
+            Keep hierarchy structure, only change Hilbert index order
 
         Args:
-            levels_info_data: [B, N, D+1] 深度+路径信息
-            batch_indices: [N] 每个 token 的 batch 索引
+            levels_info_data: [B, N, D+1] Depth + path info
+            batch_indices: [N] Batch index for each token
 
         Returns:
-            shuffled_data: 打乱后的 levels_info
-            shuffle_indices: 原始 -> 打乱后 的映射
+            shuffled_data: Shuffled levels_info
+            shuffle_indices: Original -> shuffled mapping
         """
         B, N, D = levels_info_data.shape
         device = levels_info_data.device
@@ -992,13 +1064,13 @@ class HilbertIndexShuffler:
         shuffled_data = levels_info_data.clone()
         shuffle_indices = torch.arange(N, device=device)
 
-        # 按 batch 处理
+        # Process by batch
         for b in range(B):
             batch_mask = batch_indices == b
             batch_positions = torch.where(batch_mask)[0]
 
             if len(batch_positions) >= self.group_size:
-                # 分组打乱
+                # Group shuffle
                 num_groups = len(batch_positions) // self.group_size
 
                 for g in range(num_groups):
@@ -1006,7 +1078,7 @@ class HilbertIndexShuffler:
                     end = start + self.group_size
                     group = batch_positions[start:end]
 
-                    # 随机打乱组内顺序
+                    # Randomly shuffle within group
                     perm = torch.randperm(self.group_size, device=device)
                     shuffled_data[b, group] = levels_info_data[b, group[perm]]
 
@@ -1018,14 +1090,14 @@ class HilbertIndexShuffler:
         paths: torch.Tensor,
     ) -> torch.Tensor:
         """
-        从 depths 和 paths 计算 Hilbert 索引
+        Compute Hilbert index from depths and paths
 
         Args:
-            depths: [B, N] 深度值
-            paths: [B, N, D] 四象限路径
+            depths: [B, N] Depth values
+            paths: [B, N, D] Quadrant path
 
         Returns:
-            hilbert_indices: [B, N] Hilbert 曲线索引
+            hilbert_indices: [B, N] Hilbert curve index
         """
         B, N, D = paths.shape
 
@@ -1047,7 +1119,7 @@ class HilbertIndexShuffler:
 
 class GeometricJigsawLoss(nn.Module):
     """
-    几何拼图损失 - 预测相对 Hilbert 索引
+    Geometric jigsaw loss - predict relative Hilbert index
 
     数学形式化:
         L_jigsaw = -Σ_i Σ_j 1[|h_i - h_j| < d_max] × log P(offset_ij)
@@ -1064,7 +1136,7 @@ class GeometricJigsawLoss(nn.Module):
         self.feat_dim = feat_dim
         self.max_offset = config.max_relative_distance
 
-        # 预测头：预测相对偏移类别
+        # 预测头：Predict relative offset category
         self.offset_predictor = nn.Sequential(
             nn.Linear(feat_dim * 2, feat_dim),
             nn.GELU(),
@@ -1078,12 +1150,12 @@ class GeometricJigsawLoss(nn.Module):
         original_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        计算拼图损失
+        Compute jigsaw loss
 
         Args:
-            tokens: [B, N, D] 分形 token 特征
-            levels_info: [B, N, D+1] 深度+路径信息
-            original_indices: 原始 Hilbert 索引 (用于计算相对偏移)
+            tokens: [B, N, D] Fractal token features
+            levels_info: [B, N, D+1] Depth + path info
+            original_indices: Original Hilbert index (用于Compute relative offset)
 
         Returns:
             loss: 拼图损失
@@ -1108,14 +1180,14 @@ class GeometricJigsawLoss(nn.Module):
         else:
             hilbert_indices = original_indices
 
-        # 2. 计算相对偏移 (分类任务)
+        # 2. Compute relative offset (分类任务)
         target_pairs = []
         offset_labels = []
 
         for b in range(B):
             for i in range(N):
                 for j in range(i + 1, min(i + self.max_offset * 2 + 1, N)):
-                    # 只考虑同层级的 token
+                    # Only consider tokens of same level
                     if levels_info[b, i, 0] == levels_info[b, j, 0]:
                         offset = abs(int(hilbert_indices[b, i]) - int(hilbert_indices[b, j]))
                         if offset <= self.max_offset:
@@ -1127,7 +1199,7 @@ class GeometricJigsawLoss(nn.Module):
             info["num_pairs"] = 0
             return torch.tensor(0.0, device=tokens.device), info
 
-        # 3. 构建对比特征
+        # 3. Build contrastive features
         pair_features = []
         for b, i, j in target_pairs:
             pair_feat = torch.cat([tokens[b, i], tokens[b, j]], dim=-1)
@@ -1135,10 +1207,10 @@ class GeometricJigsawLoss(nn.Module):
 
         pair_features = torch.stack(pair_features)  # [P, 2*D]
 
-        # 4. 预测偏移
+        # 4. Predict offset
         offset_logits = self.offset_predictor(pair_features)  # [P, max_offset+1]
 
-        # 5. 分类损失
+        # 5. Classification loss
         offset_labels_tensor = torch.tensor(offset_labels, device=tokens.device)
         jigsaw_loss = F.cross_entropy(offset_logits, offset_labels_tensor)
 
@@ -1146,7 +1218,7 @@ class GeometricJigsawLoss(nn.Module):
         info["num_pairs"] = len(target_pairs)
         info["accuracy"] = (offset_logits.argmax(dim=-1) == offset_labels_tensor).float().mean().item()
 
-        # 6. 熵正则化
+        # 6. Entropy regularization
         if self.config.entropy_weight > 0:
             probs = F.softmax(offset_logits, dim=-1)
             entropy = -(probs * (probs + 1e-8).log()).sum(dim=-1).mean()
@@ -1158,9 +1230,9 @@ class GeometricJigsawLoss(nn.Module):
 
 class GeometricJigsawExperiment(BaseExperiment):
     """
-    Mode C: Geometric Jigsaw Proxy 实验
+    Mode C: Geometric Jigsaw Proxy experiment
 
-    目标：自监督任务 - 预测分形 Patch 的相对 Hilbert 索引
+    Objective: self-supervised - predict relative Hilbert index for fractal patches
     """
 
     def __init__(
@@ -1174,13 +1246,13 @@ class GeometricJigsawExperiment(BaseExperiment):
 
         self.gjp_config = config.gjp_config or GJPConfig()
 
-        # 包装模型
+        # Wrap model
         self.wrapper.wrap_model_for_experiment()
 
-        # 组件
+        # Components
         self.shuffler = HilbertIndexShuffler(
             group_size=self.gjp_config.shuffle_group_size,
-            max_depth=config.max_fractal_depth,
+            max_depth=config.max_level,  # 原 max_fractal_depth
         )
 
         feat_dim = getattr(config, 'dim', 384)
@@ -1189,15 +1261,15 @@ class GeometricJigsawExperiment(BaseExperiment):
             feat_dim=feat_dim,
         )
 
-        # 优化器
+        # Optimizer
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=self.gjp_config.learning_rate,
-            weight_decay=self.gjp_config.weight_decay,
+            lr=self.config.learning_rate,  # 从 ProxyExperimentConfig 继承
+            weight_decay=self.config.weight_decay,
         )
 
     def run(self) -> Dict[str, Any]:
-        """运行 GJP 实验"""
+        """Run GJP experiment"""
         history = {
             "jigsaw_loss": [],
             "token_density": [],
@@ -1207,7 +1279,7 @@ class GeometricJigsawExperiment(BaseExperiment):
 
         self.model.train()
 
-        num_epochs = self.gjp_config.num_epochs
+        num_epochs = self.gjp_config.epochs  # 原 num_epochs
         max_iter = 10 if getattr(self.ssa_config, 'quick_test', False) else None
 
         for epoch in range(num_epochs):
@@ -1222,7 +1294,7 @@ class GeometricJigsawExperiment(BaseExperiment):
 
                 imgs = imgs.to(self.device)
 
-                # 1. 前向传播
+                # 1. Forward pass
                 try:
                     if self.config.use_compile:
                         with torch.compiler.disable():
@@ -1233,31 +1305,31 @@ class GeometricJigsawExperiment(BaseExperiment):
                     self._handle_compile_warning(e)
                     continue
 
-                # I139: 从 TrainingStats 提取
+                # I139: Extract from TrainingStats
                 logits = stats.logits if hasattr(stats, 'logits') else stats
 
-                # 2. 提取 levels_info (I139: TrainingStats 暂不直接提供，需要额外适配)
+                # 2. Extract levels_info (I139: TrainingStats does not provide directly, needs additional adaptation)
                 # 注意: GJP 模式需要 tokenizer 的 levels_info，当前 TrainingStats 不包含此字段
                 # split_info = stats.split_info if hasattr(stats, 'split_info') else {}
                 # levels_info = split_info.get('levels_list')  # 需要转换为 LevelsInfo 格式
                 levels_info = None  # TODO: I139 需要完整适配 GJP 模式
                 if levels_info is None:
-                    logger.warning("GJP 模式: levels_info 不可用，跳过 batch (I139: 需要适配)")
+                    logger.warning("GJP mode: levels_info unavailable, skipping batch (I139: 需要适配)")
                     continue
 
-                # 3. 计算拼图损失
+                # 3. Compute jigsaw loss
                 loss, info = self.jigsaw_loss_fn(
                     tokens=logits,
                     levels_info=levels_info,
                 )
 
-                # 4. 梯度累积
+                # 4. Gradient accumulation
                 loss = loss / self.config.gradient_accumulation_steps
 
-                # 5. 反向传播
+                # 5. Backward pass
                 loss.backward()
 
-                # 6. 梯度累积步骤
+                # 6. Gradient accumulation步骤
                 if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
                     self.optimizer.step()
                     self.optimizer.zero_grad()
@@ -1266,7 +1338,7 @@ class GeometricJigsawExperiment(BaseExperiment):
                 epoch_acc += info.get("accuracy", 0.0)
                 num_batches += 1
 
-                # 收集指标
+                # Collect metrics
                 img_size = imgs.shape[2:]
                 patch_size = 4
                 num_patches = (img_size[0] // patch_size) * (img_size[1] // patch_size)
@@ -1304,7 +1376,7 @@ class GeometricJigsawExperiment(BaseExperiment):
 
 
 # =============================================================================
-# PART 6: 主入口
+# PART 6: Main Entry
 # =============================================================================
 
 def create_experiment(
@@ -1315,7 +1387,7 @@ def create_experiment(
     val_loader: Optional[DataLoader] = None,
     **kwargs,
 ) -> BaseExperiment:
-    """工厂函数：创建实验实例"""
+    """Factory function: create experiment instance"""
 
     if mode == ExperimentMode.SSA:
         return SparseAblationExperiment(
@@ -1345,7 +1417,7 @@ def create_experiment(
 
 
 def setup_logging(level: int = logging.INFO) -> None:
-    """设置日志"""
+    """Setup logging"""
     logging.basicConfig(
         level=level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -1356,8 +1428,8 @@ def setup_logging(level: int = logging.INFO) -> None:
 
 
 def main():
-    """主入口"""
-    setup_logging()
+    """Main entry"""
+    setup_logging(level=logging.INFO)
 
     parser = argparse.ArgumentParser(
         description="Fractal Proxy Experiments - 三种实验模式",
@@ -1366,8 +1438,8 @@ def main():
 
     # 基础参数
     parser.add_argument("--mode", type=str,
-                        choices=["ssa", "fer", "gjp"],
-                        default="ssa", help="实验模式")
+                        default="sparse_subset_ablation",
+                        help="实验模式 (ssa/fer/gjp 或 sparse_subset_ablation/frozen_encoder_reconstruction/geometric_jigsaw_proxy)")
     parser.add_argument("--config", type=str, default=None,
                         help="配置文件路径 (可选)")
     parser.add_argument("--output-dir", type=str, default="./experiments",
@@ -1385,20 +1457,44 @@ def main():
     parser.add_argument("--quick-test", action="store_true",
                         help="快速测试模式 (减少迭代次数)")
 
+    # FER/GJP 实验配置 (L3 训练参数)
+    parser.add_argument("--epochs", type=int, default=10,
+                        help="实验训练轮数 (FER/GJP)")
+    parser.add_argument("--lr", type=float, default=1e-4,
+                        help="学习率")
+    parser.add_argument("--weight-decay", type=float, default=0.01,
+                        help="权重衰减")
+
     # FER 参数
-    parser.add_argument("--fer-lr", type=float, default=1e-4,
-                        help="FER: 学习率")
-    parser.add_argument("--fer-epochs", type=int, default=10,
-                        help="FER: 训练轮数")
+    parser.add_argument("--fer-epochs", type=int, default=None,
+                        help="FER: 训练轮数 (覆盖 --epochs)")
 
     # GJP 参数
     parser.add_argument("--shuffle-group", type=int, default=4,
                         help="GJP: 打乱组大小")
-    parser.add_argument("--gjp-epochs", type=int, default=10,
-                        help="GJP: 训练轮数")
+    parser.add_argument("--gjp-epochs", type=int, default=None,
+                        help="GJP: 训练轮数 (覆盖 --epochs)")
+
+    # L1 数据集参数
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--dataset", type=str, default="cifar10",
+                        choices=["cifar10", "cifar100", "cub200"],
+                        help="数据集选择 (默认: cifar10)")
+
+    # L2 模型架构参数
+    parser.add_argument("--dim", type=int, default=384,
+                        help="嵌入维度")
+    parser.add_argument("--num-layers", type=int, default=8,
+                        help="Transformer 层数 (原 depth)")
+    parser.add_argument("--heads", type=int, default=6,
+                        help="注意力头数")
+    parser.add_argument("--min-patch-size", type=int, default=4,
+                        help="最小 patch 大小")
+    parser.add_argument("--max-level", type=int, default=8,
+                        help="最大分割深度 (原 max_fractal_depth)")
 
     # 通用参数
-    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-amp", action="store_true",
@@ -1414,16 +1510,31 @@ def main():
         torch.cuda.manual_seed(args.seed)
 
     # 构建配置
-    mode = ExperimentMode(args.mode)
+    mode = ExperimentMode.from_string(args.mode)
+
+    # 使用命令行参数覆盖默认值
+    fer_epochs = args.fer_epochs if args.fer_epochs else args.epochs
+    gjp_epochs = args.gjp_epochs if args.gjp_epochs else args.epochs
 
     config = ProxyExperimentConfig(
         mode=mode,
+        experiment_name=f"{mode.value}_{args.seed}",
+        seed=args.seed,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        # L2 模型架构
+        dim=args.dim,
+        num_layers=args.num_layers,
+        heads=args.heads,
+        min_patch_size=args.min_patch_size,
+        max_level=args.max_level,
+        # L3 训练配置
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
         device=args.device,
         pretrained_path=args.pretrained,
         use_amp=not args.no_amp,
         use_compile=not args.no_compile,
-        experiment_name=f"{mode.value}_{args.seed}",
     )
 
     if mode == ExperimentMode.SSA:
@@ -1435,13 +1546,12 @@ def main():
         )
     elif mode == ExperimentMode.FER:
         config.fer_config = FERConfig(
-            learning_rate=args.fer_lr,
-            frozen_encoder_epochs=args.fer_epochs,
+            epochs=fer_epochs,
         )
     elif mode == ExperimentMode.GJP:
         config.gjp_config = GJPConfig(
             shuffle_group_size=args.shuffle_group,
-            num_epochs=args.gjp_epochs,
+            epochs=gjp_epochs,
         )
 
     # 加载模型
@@ -1449,9 +1559,9 @@ def main():
 
     model = FractalCurveViT(
         num_classes=200,
-        dim=384,
-        num_layers=8,  # I145: depth -> num_layers
-        heads=6,
+        dim=config.dim,
+        num_layers=config.num_layers,  # I145: depth -> num_layers
+        heads=config.heads,
     )
 
     if args.pretrained:
@@ -1460,37 +1570,66 @@ def main():
             model.load_state_dict(checkpoint['model_state_dict'])
         else:
             model.load_state_dict(checkpoint)
-        logger.info(f"加载预训练模型: {args.pretrained}")
+        logger.info(f"Load pretrained model: {args.pretrained}")
 
-    # 加载数据 (使用流式加载)
-    try:
-        from training.datasets import StreamingCUB200Dataset
+    # Load data (support CIFAR-10/100 and CUB-200)
+    from torchvision import datasets, transforms
 
-        train_dataset = StreamingCUB200Dataset(
-            root="./data/CUB-200-2011",
+    dataset_name = args.dataset
+    logger.info(f"Loading dataset: {dataset_name}")
+
+    if dataset_name.startswith("cifar"):
+        # CIFAR-10/100: 32x32 images, smaller model works well
+        num_classes = 100 if dataset_name == "cifar100" else 10
+        image_size = 32
+
+        transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomCrop(32, padding=4),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=(0.4914, 0.4822, 0.4465),
+                std=(0.2470, 0.2435, 0.2616)
+            ),
+        ])
+
+        train_dataset = getattr(datasets, dataset_name.upper())(
+            root="./data",
             train=True,
-            transform=None,
+            download=True,
+            transform=transform,
         )
-        logger.info(f"CUB-200 流式数据集加载成功: {len(train_dataset)} 样本")
-    except ImportError:
-        # 回退到标准数据集
-        from torchvision.datasets import CUB200
-        from torchvision import transforms
+        logger.info(f"CIFAR dataset loaded: {len(train_dataset)} samples, {num_classes} classes")
+
+    elif dataset_name == "cub200":
+        # CUB-200: 224x224 images, requires larger model
+        data_root = Path("./data/CUB-200-2011")
+        train_dir = data_root / "CUB_200_2011" / "train"
+
+        if not train_dir.exists():
+            raise FileNotFoundError(
+                f"CUB-200 dataset not found at {train_dir}. "
+                "Please download and extract the CUB-200-2011 dataset."
+            )
+
+        num_classes = 200
+        image_size = 224
 
         transform = transforms.Compose([
             transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
             transforms.ToTensor(),
+            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ])
 
-        train_dataset = CUB200(
-            root="./data/CUB-200-2011",
-            train=True,
-            download=False,
-            transform=transform,
-        )
-        logger.info(f"CUB-200 标准数据集加载成功: {len(train_dataset)} 样本")
+        train_dataset = datasets.ImageFolder(str(train_dir), transform=transform)
+        logger.info(f"CUB-200 dataset loaded: {len(train_dataset)} samples, {num_classes} classes")
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
 
-    # 创建数据加载器
+    # Create data loader
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -1500,7 +1639,7 @@ def main():
         drop_last=True,
     )
 
-    # 创建并运行实验
+    # Create and run experiment
     experiment = create_experiment(
         mode=mode,
         model=model,
@@ -1514,7 +1653,7 @@ def main():
     if mode == ExperimentMode.SSA:
         results = experiment.run()
 
-        # 打印结果表格
+        # Print result table
         print("\n" + "=" * 60)
         print("SSA Results - Token Activation Analysis")
         print("=" * 60)

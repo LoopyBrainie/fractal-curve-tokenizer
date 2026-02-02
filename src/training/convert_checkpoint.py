@@ -262,9 +262,11 @@ def convert_checkpoint(
         'val_loss': ckpt.get('val_loss', 0.0),
         'config': {
             **config,
-            'max_level': new_max_level,  # I145: 更新为新版 max_level
+            # I145: max_level 是第二层变参数，由模型架构动态计算，不保存到 checkpoint
+            # 保留转换说明用于参考，但不保存 max_level
             '_converted_from': checkpoint_path,
-            '_conversion_notes': f'max_level: {old_max_level} -> {new_max_level}',
+            '_conversion_notes': f'权重已从 max_level={old_max_level} 缩放到 max_level={new_max_level}',
+            # 注意: 实际 max_level 将由模型架构根据 image_size 和 min_patch_size 动态计算
         },
     }
     torch.save(new_ckpt, output_path)

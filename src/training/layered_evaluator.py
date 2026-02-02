@@ -1006,8 +1006,7 @@ class LayeredEvaluator:
 
         # 获取 tokenizer 相关配置
         # I30-17: 优先使用 checkpoint 中保存的配置
-        # 优先级：checkpoint config > state_dict 推断 > 默认值
-        max_level = config.get('max_level', None)  # P0: 使用正确的字段名 (原 max_depth)
+        # I145: max_level 是第二层变参数，由模型架构动态计算，不从外部传入
         min_patch_size = config.get('min_patch_size', 4)
         if isinstance(min_patch_size, int):
             min_patch_size = (min_patch_size, min_patch_size)
@@ -1038,23 +1037,10 @@ class LayeredEvaluator:
 
         # P11-2: 从检查点恢复所有架构参数（与训练器完全对齐）
         # 优先级：检查点 state_dict > config.json > 默认值
+        # 注意: max_level 是第二层变参数，由模型架构根据 image_size 和 min_patch_size 动态计算
 
-        # 1. 从 state_dict 推断 max_level（当 config 中没有配置时）
-        detected_min_patch_size = config.get('min_patch_size', None)
-        if detected_min_patch_size is None and max_level is not None:
-            # 从 max_level 反推 min_patch_size
-            # 公式: min_patch_size = image_size / 2^max_level
-            inferred_max_level = max_level
-            if isinstance(image_size, int):
-                effective_image_size = (image_size, image_size)
-            elif isinstance(image_size, tuple):
-                effective_image_size = image_size
-            else:
-                effective_image_size = (224, 224)
-            min_size = min(effective_image_size)
-            detected_min_patch_size = max(1, min_size // (2 ** inferred_max_level))
-            print(f"Inferred min_patch_size={detected_min_patch_size} from max_level={inferred_max_level}")
-
+        # 从 config 读取 min_patch_size，如果不存在则使用默认值 4
+        detected_min_patch_size = config.get('min_patch_size', 4)
         if detected_min_patch_size is None:
             detected_min_patch_size = 4
         if isinstance(detected_min_patch_size, int):
@@ -1270,10 +1256,11 @@ class LayeredEvaluator:
         print(f"[I140] Final: dim={ckpt_dim}, feature_dim={splitter_feature_dim}, pool_size={splitter_pool_size}, hidden_dim={splitter_hidden_dim}")
 
         # I140: 创建与检查点匹配的 splitter（避免 complexity_mlp 维度不匹配）
+        # I145: max_level_limit 使用默认值 8，不从外部 config 读取
         splitter = create_gumbel_topk_from_config(
             feature_dim=splitter_feature_dim,
             min_patch_size=min_patch_size[0] if isinstance(min_patch_size, tuple) else min_patch_size,
-            max_level_limit=config.get('max_level', 8),  # P0: 使用正确的字段名
+            max_level_limit=8,  # 第二层参数：由模型架构动态计算
             hidden_dim=splitter_hidden_dim,
             pool_size=splitter_pool_size,
             token_coverage_min=config.get('token_coverage_min', 0.01),  # I33: 使用覆盖率参数

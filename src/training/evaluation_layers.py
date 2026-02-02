@@ -134,6 +134,10 @@ class L1ClassificationMetrics:
     max_num_tokens: int = 0
     tokenizer_depth_distribution: Dict[int, float] = field(default_factory=dict)  # 聚合的深度分布
 
+    # I110-7: 语义分裂器指标 (从 TrainingStats 收集)
+    avg_semantic_loss: float = 0.0  # 平均语义冗余损失
+    avg_redundancy: float = 0.0  # 平均冗余性分数
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -185,7 +189,12 @@ class L2TokenizerMetrics:
     token_utilization_score: float = 0.0  # Token 利用效率分数 [0, 1]
     redundancy_ratio: float = 0.0  # 估计冗余 token 比例
     adaptive_ratio: float = 0.0  # 自适应调整程度 (std / mean)
-    
+
+    # I110-7: 语义分裂器指标 (从 TrainingStats 收集)
+    semantic_loss: float = 0.0  # 语义冗余损失 (来自 semantic splitter)
+    model_redundancy: float = 0.0  # 模型预测的冗余性分数 (来自 TrainingStats.redundancy)
+    child_features_used: bool = False  # 是否使用了 child_features
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -222,9 +231,11 @@ class L3AttentionMetrics:
     cls_attention_entropy: float = 0.0
     cls_effective_tokens: float = 0.0  # CLS 有效关注的 token 数
     
-    # LCA 偏置分析
-    lca_attention_correlation: float = 0.0  # LCA 深度与注意力的相关性
-    hilbert_locality_score: float = 0.0  # Hilbert 局部性保持度
+    # LCA 偏置分析 (I145: CRIT-3 移除了内部缓存，这些指标无法计算)
+    # 已废弃: lca_attention_correlation 和 hilbert_locality_score
+    # 保留字段名以保持向后兼容性，值始终为 0.0
+    lca_attention_correlation: float = 0.0  # DEPRECATED: 无法计算 (CRIT-3)
+    hilbert_locality_score: float = 0.0  # DEPRECATED: 无法计算 (CRIT-3)
     
     # 层级感知分析
     per_depth_attention_received: Dict[int, float] = field(default_factory=dict)  # 各深度收到的平均注意力
@@ -507,6 +518,8 @@ class ClassificationEvaluator:
         all_probs = []
         all_num_tokens: List[int] = []  # I35: 收集 token 数量
         all_depth_distributions: List[Dict[int, float]] = []  # I35: 收集深度分布
+        all_semantic_losses: List[float] = []  # I110-7: 收集语义损失
+        all_redundancies: List[float] = []  # I110-7: 收集冗余性分数
         total_loss = 0.0
         total_samples = 0  # 用于加权平均损失计算
         
@@ -550,6 +563,20 @@ class ClassificationEvaluator:
                 # I145: 统一非空检查模式
                 if hasattr(stats, 'depth_distribution') and stats.depth_distribution:
                     all_depth_distributions.append(stats.depth_distribution)
+
+                # I110-7: 收集语义分裂器指标
+                if hasattr(stats, 'semantic_loss') and stats.semantic_loss is not None:
+                    if isinstance(stats.semantic_loss, torch.Tensor):
+                        all_semantic_losses.append(stats.semantic_loss.mean().item())
+                    else:
+                        all_semantic_losses.append(float(stats.semantic_loss))
+
+                # I110-7: 收集冗余性分数
+                if hasattr(stats, 'redundancy') and stats.redundancy is not None:
+                    if isinstance(stats.redundancy, torch.Tensor):
+                        all_redundancies.append(stats.redundancy.mean().item())
+                    else:
+                        all_redundancies.append(float(stats.redundancy))
         
         all_preds = torch.cat(all_preds)
         all_labels = torch.cat(all_labels)
@@ -634,6 +661,13 @@ class ClassificationEvaluator:
                 metrics.tokenizer_depth_distribution = {
                     d: count / total_depth for d, count in depth_counts.items()
                 }
+
+        # I110-7: 聚合语义分裂器指标
+        if all_semantic_losses:
+            metrics.avg_semantic_loss = float(np.mean(all_semantic_losses))
+
+        if all_redundancies:
+            metrics.avg_redundancy = float(np.mean(all_redundancies))
 
         return metrics
     
@@ -1169,23 +1203,11 @@ class AttentionEvaluator:
         if hasattr(metrics, '_effective_token_counts') and metrics._effective_token_counts:
             metrics.cls_effective_tokens = float(np.mean(metrics._effective_token_counts))
             delattr(metrics, '_effective_token_counts')
-        
-        # LCA-Attention 相关性
-        if len(self._lca_attention_pairs) > 10:
-            lca_depths = np.array([p[0] for p in self._lca_attention_pairs])
-            attn_weights = np.array([p[1] for p in self._lca_attention_pairs])
-            
-            if np.std(lca_depths) > 1e-6 and np.std(attn_weights) > 1e-6:
-                correlation = np.corrcoef(lca_depths, attn_weights)[0, 1]
-                metrics.lca_attention_correlation = float(correlation)
-                
-                # 局部性分数: LCA 深度高 (更近的祖先) 的 token 对是否获得更多注意力
-                # 正相关表示模型学会了利用 Hilbert 曲线的空间局部性
-                high_lca_mask = lca_depths > np.median(lca_depths)
-                if high_lca_mask.sum() > 0:
-                    locality_score = attn_weights[high_lca_mask].mean() / (attn_weights.mean() + 1e-10)
-                    metrics.hilbert_locality_score = float(locality_score)
-        
+
+        # I145: LCA-Attention 相关性 - 已废弃 (CRIT-3 移除了内部缓存)
+        # lca_attention_correlation 和 hilbert_locality_score 保持默认值 0.0
+        # 这些指标无法在当前架构下计算，因为 _lca_depths 不再被收集
+
         # 每深度接收的注意力
         if self._depth_attention_received:
             for depth, attn_values in self._depth_attention_received.items():
@@ -1570,11 +1592,11 @@ class EfficiencyEvaluator:
                         torch.cuda.synchronize()
                     t1 = time.perf_counter()
                     latencies['tokenizer'].append((t1 - t0) * 1000)
-                    
+
                     # 2. 位置编码 + Transformer
                     # 获取 levels_info 用于位置编码
-                    # P9-5: info_dim = max_depth + 4
-                    info_dim = getattr(model, 'max_depth', 8) + 4
+                    # P9-5: info_dim = max_level + 4
+                    info_dim = getattr(model, 'max_level', 8) + 4  # I145: max_depth -> max_level
                     levels_info = tokenizer_output.get_padded_levels(info_dim)
                     
                     # 添加 CLS token

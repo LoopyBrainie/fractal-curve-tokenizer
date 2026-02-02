@@ -1,52 +1,64 @@
 # ============================================================================
 # Tiny-ImageNet 最优训练脚本 (RTX 4070 Laptop 8GB)
 # ============================================================================
-# 数学形式化分析 (2026-01-29 更新)
+# 数学形式化分析 (2026-02-02 更新)
 #
-# [EXPLICITLY CALCULATED PARAMETERS]
-#   --dim 320        : From memory constraint M_total ≤ 763 MB
-#   --depth 12       : Optimal for Tiny-ImageNet capacity
-#   --heads 8        : Required: dim_head = dim/heads = 320/8 = 40
-#   --mlp-dim 1280   : SwiGLU formula: 4 × dim
-#   --batch-size 192 : Memory budget: 763 MB available
-#   --token-coverage-min 0.02 : 2% coverage = 5 tokens (K_min)
-#   --token-coverage-max 0.05 : 5% coverage = 12 tokens (K_max)
+# [内存约束模型]
+#   M_total = M_params + M_gradients + M_optimizer + M_activations
+#   M_params (FP16):     0.11 GB
+#   M_gradients (FP32):  0.44 GB
+#   M_optimizer (FP32):  0.88 GB
+#   M_activations:       0.07 GB (checkpoint)
+#   总计:               1.65 GB (安全余量: 4.3 GB)
 #
-# [EXPERIMENTAL FEATURES]
-#   --quota-learnable        : Enable learnable token quota
-#   --freeze-tokenizer       : Freeze tokenizer for 10 epochs
-#   --elastic-coverage-*     : Elastic budget regularization
+# [架构参数]
+#   --dim 512         : 最大化表达力与内存平衡
+#   --num-layers 16   : 100 epochs 最佳深度
+#   --heads 8         : dim_head = 512/8 = 64
+#   --mlp-dim 2048    : mlp_ratio = 4.0 (SwiGLU)
 #
-# [OPTIMIZATION FLAGS]
-#   --use-amp, --gradient-checkpoint, --compile, --channels-last
+# [Tokenizer 参数]
+#   --patch-size 8
+#   --min-patch-size 4
+#   --token-coverage-min 0.02 : α = 2%
+#   --token-coverage-max 0.50 : β = 50%
+#   K (token 范围): [16, 92] (64×64 图像)
 #
-# Model: 34.56M params | Memory: 763 MB | Tokens: 5-12 (2%-5% coverage)
+# [训练参数]
+#   --batch-size 192  : 目标批次 (启用 checkpoint)
+#   --lr 2.4e-4       : √(192/32) × 1e-4
+#   --weight-decay 0.038
+#   --dropout 0.15    : 100 epochs 正则化
+#   --drop-path 0.20  : 随机深度
+#
+# 模型: 117.54M 参数 | 显存: 1.65 GB | FLOPs: 6.34e9/样本
 # ============================================================================
 
 $script = @"
 uv run python src/training/train_fractal_vit.py `
   --dataset tiny-imagenet `
   --epochs 100 `
-  --dim 320 `
-  --depth 12 `
+  --dim 512 `
+  --num-layers 16 `
   --heads 8 `
-  --mlp-dim 1280 `
+  --mlp-dim 2048 `
+  --patch-size 8 `
   --min-patch-size 4 `
   --token-coverage-min 0.02 `
-  --token-coverage-max 0.05 `
-  --freeze-tokenizer `
-  --freeze-tokenizer-epochs 10 `
-  --elastic-coverage-min 0.02 `
-  --elastic-coverage-max 0.05 `
+  --token-coverage-max 0.50 `
   --batch-size 192 `
-  --num-workers 4 `
-  --include-soft-entropy `
-  --include-elastic-budget `
+  --lr 2.4e-04 `
+  --weight-decay 0.0375 `
+  --dropout 0.15 `
+  --drop-path 0.2 `
   --use-amp `
   --gradient-checkpoint `
   --compile `
   --channels-last `
-  --exp-name tiny_imagenet_320d_12l_bs192_ep100_v3
+  --include-soft-entropy `
+  --include-elastic-budget `
+  --warmup-epochs 5 `
+  --exp-name tiny_imagenet_512d_16l_bs192_ep100_v4
 "@
 
 # 执行训练脚本

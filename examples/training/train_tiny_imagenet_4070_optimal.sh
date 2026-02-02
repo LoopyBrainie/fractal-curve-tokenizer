@@ -1,61 +1,74 @@
 #!/bin/bash
 # Tiny-ImageNet Optimal Training Script (RTX 4070 Laptop 8GB)
-# Mathematical Formalization (2026-01-29): dim=320, depth=12, batch=192
+# Mathematical Formalization (2026-02-02): dim=512, num_layers=16, batch=192
 # Optimized for 100 epochs with maximum capacity
 
 set -e
 
 # ============================================================================
-# Mathematical Verification Results (2026-01-29 Update)
+# Mathematical Verification Results (2026-02-02 Update)
 # ============================================================================
-# VRAM: 8GB RTX 4070 Laptop (6.5GB effective with 20% safety margin)
+# GPU: RTX 4070 Laptop (8GB VRAM, 6.0GB usable with 25% safety margin)
 #
-# [EXPLICITLY CALCULATED PARAMETERS]
-#   --dim 320        : From memory constraint M_total ≤ 763 MB
-#   --depth 12       : Optimal for Tiny-ImageNet capacity
-#   --heads 8        : Required: dim_head = dim/heads = 320/8 = 40
-#   --mlp-dim 1280   : SwiGLU formula: 4 × dim
-#   --batch-size 192 : Memory budget: 763 MB available
-#   --token-coverage-min 0.02 : 2% coverage = 5 tokens (K_min)
-#   --token-coverage-max 0.05 : 5% coverage = 12 tokens (K_max)
+# [MEMORY CONSTRAINT MODEL]
+#   M_total = M_params + M_gradients + M_optimizer + M_activations
+#   M_params (FP16):     0.11 GB
+#   M_gradients (FP32):  0.44 GB
+#   M_optimizer (FP32):  0.88 GB
+#   M_activations:       0.07 GB (with checkpoint)
+#   Total:               1.65 GB (safe margin: 4.3 GB)
 #
-# [EXPERIMENTAL FEATURES]
-#   --quota-learnable        : Enable learnable token quota
-#   --freeze-tokenizer       : Freeze tokenizer for 10 epochs
-#   --elastic-coverage-*     : Elastic budget regularization
+# [ARCHITECTURE PARAMETERS]
+#   --dim 512         : Balance expressivity and memory (maximized)
+#   --num-layers 16   : Optimal depth for 100 epochs
+#   --heads 8         : dim_head = 512/8 = 64 (standard)
+#   --mlp-dim 2048    : mlp_ratio = 4.0 (SwiGLU)
+#
+# [TOKENIZER PARAMETERS]
+#   --patch-size 8
+#   --min-patch-size 4
+#   --token-coverage-min 0.02 : α = 2% minimum coverage
+#   --token-coverage-max 0.50 : β = 50% maximum coverage
+#   K (token range): [16, 92] for Tiny-ImageNet 64×64
+#
+# [TRAINING PARAMETERS]
+#   --batch-size 192  : Target batch size (gradient checkpointing enabled)
+#   --lr 2.4e-4       : √(batch/32) × 1e-4 = 2.45e-4
+#   --weight-decay 0.038 : 0.05 × (384/512)
+#   --dropout 0.15    : Regularization for 100 epochs
+#   --drop-path 0.20  : Stochastic depth for deep networks
 #
 # [OPTIMIZATION FLAGS]
 #   --use-amp, --gradient-checkpoint, --compile, --channels-last
 #
-# [DEFAULT VALUES USED]
-#   --lr=5e-4, --weight-decay=0.15, --warmup-epochs=10
-#   --dropout=0.25, --drop-path=0.25, --label-smoothing=0.1
-#   --mixup-alpha=0.4, --cutmix-alpha=1.0, --mixup-prob=0.5
-#   --elastic-lambda-over=0.1, --elastic-lambda-under=0.01
-#   --soft-entropy-weight=0.1, --pool=weighted, --ffn-type=swiglu_level
+# [REGULARIZATION FEATURES]
+#   --include-soft-entropy      : Entropy maximization
+#   --include-elastic-budget    : Elastic token budget
+#   --warmup-epochs 5
 #
-# Model: 34.56M params | Memory: 763 MB | Tokens: 5-12 (2%-5% coverage)
+# Model: 117.54M params | Memory: 1.65 GB | FLOPs: 6.34e9/sample
 # ============================================================================
 
 uv run python src/training/train_fractal_vit.py \
   --dataset tiny-imagenet \
   --epochs 100 \
-  --dim 320 \
-  --depth 12 \
+  --dim 512 \
+  --num-layers 16 \
   --heads 8 \
-  --mlp-dim 1280 \
+  --mlp-dim 2048 \
+  --patch-size 8 \
   --min-patch-size 4 \
   --token-coverage-min 0.02 \
-  --token-coverage-max 0.05 \
-  --freeze-tokenizer \
-  --freeze-tokenizer-epochs 10 \
-  --elastic-coverage-min 0.02 \
-  --elastic-coverage-max 0.05 \
+  --token-coverage-max 0.50 \
   --batch-size 192 \
-  --num-workers 8 \
-  --include-soft-entropy \
-  --include-elastic-budget \
+  --lr 2.4e-04 \
+  --weight-decay 0.0375 \
+  --dropout 0.15 \
+  --drop-path 0.2 \
   --use-amp \
   --gradient-checkpoint \
   --compile \
-  --channels-last 
+  --channels-last \
+  --include-soft-entropy \
+  --include-elastic-budget \
+  --warmup-epochs 5 

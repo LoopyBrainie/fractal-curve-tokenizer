@@ -117,13 +117,13 @@ P12 内部向量化优化 (2025-12-29)
     # Tiny ImageNet 完整训练 (I30-3 优化配置 - 增强正则化缓解过拟合)
     # 正则化参数: dropout=0.25, drop_path=0.25, weight_decay=0.15
     python train_fractal_vit.py --dataset tiny-imagenet --epochs 100 --dim 320 \
-        --depth 12 --heads 8 \
+        --num-layers 12 --heads 8 \
         --use-amp --gradient-checkpoint --compile --channels-last \
         --include-soft-entropy --include-elastic-budget
 
     # 小数据集推荐配置 (I30-3: 进一步增强正则化)
     python train_fractal_vit.py --dataset tiny-imagenet --epochs 150 \
-        --dim 256 --depth 8 --heads 6 \
+        --dim 256 --num-layers 8 --heads 6 \
         --dropout 0.3 --drop-path 0.3 --weight-decay 0.2 \
         --freeze-tokenizer --use-amp
     
@@ -2037,6 +2037,18 @@ def train_epoch(
                     splitter_loss = None  # 跳过该损失
                 else:
                     loss = loss + splitter_loss_f32 / config.accum_steps
+
+            # I110-7: 语义分裂器损失集成
+            if config.use_semantic_splitter and stats is not None:
+                semantic_loss = getattr(stats, 'semantic_loss', None)
+                if semantic_loss is not None:
+                    semantic_loss_f32 = semantic_loss.float()
+                    if torch.isnan(semantic_loss_f32).any() or torch.isinf(semantic_loss_f32).any():
+                        print(f"[WARN] semantic_loss 包含 NaN/Inf，跳过此损失")
+                    else:
+                        # 使用配置的权重
+                        semantic_weight = getattr(config, 'semantic_loss_weight', 0.1)
+                        loss = loss + semantic_loss_f32.mean() * semantic_weight / config.accum_steps
         
         # 检查 loss 是否为 NaN/Inf，并输出详细诊断信息
         if torch.isnan(loss) or torch.isinf(loss):
@@ -2625,7 +2637,11 @@ def main():
     
     # 模型
     parser.add_argument("--dim", type=int, default=192)
-    parser.add_argument("--depth", type=int, default=8)
+    # I145: --num-layers 是标准参数名，--depth 是废弃的别名
+    parser.add_argument("--num-layers", type=int, default=8, dest='num_layers',
+                       help="Number of Transformer layers")
+    parser.add_argument("--depth", type=int, default=None, dest='num_layers',
+                       help="(Deprecated: use --num-layers)")
     parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--dim-head", type=int, default=32)
     # I30-17: max_depth 控制 Hilbert 四叉树递归深度
@@ -2752,6 +2768,24 @@ def main():
     parser.add_argument("--elastic-lambda-under", type=float, default=0.01,
                        help="Penalty weight for tokens below coverage_min (default: 0.01)")
 
+    # I110-7: 语义分裂器参数
+    parser.add_argument("--use-semantic-splitter", action="store_true",
+                       help="I110-7: Use SemanticRedundancySplitter instead of GumbelTopKSplitter")
+    parser.add_argument("--semantic-feature-dim", type=int, default=256,
+                       help="I110-7: Semantic splitter feature dimension")
+    parser.add_argument("--semantic-hidden-dim", type=int, default=128,
+                       help="I110-7: Semantic splitter hidden dimension")
+    parser.add_argument("--semantic-diversity-weight", type=float, default=0.1,
+                       help="I110-7: Diversity loss weight (default: 0.1)")
+    parser.add_argument("--semantic-reconstruction-weight", type=float, default=0.1,
+                       help="I110-7: Reconstruction loss weight (default: 0.1)")
+    parser.add_argument("--semantic-split-threshold", type=float, default=0.5,
+                       help="I110-7: Split decision threshold (default: 0.5)")
+    parser.add_argument("--semantic-gumbel-temp-start", type=float, default=1.0,
+                       help="I110-7: Gumbel softmax initial temperature (default: 1.0)")
+    parser.add_argument("--semantic-gumbel-temp-end", type=float, default=0.5,
+                       help="I110-7: Gumbel softmax final temperature (default: 0.5)")
+
     # 训练
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=5e-4)
@@ -2876,11 +2910,13 @@ def main():
 
     # I33: 相对预算参数 (CLI) → 绝对 K 值 (模型)
     # 转换公式: K = coverage * max_patches = coverage * (image_size/min_patch_size)^2
+    # 注意: K 值由模型架构根据覆盖率动态计算，TrainingConfig 只保存覆盖率
     # P2 修复: 使用 spec.image_size 而非 args.image_size
     image_size_for_budget = spec.image_size if spec.image_size is not None else args.min_patch_size * 64
     max_patches = (image_size_for_budget // args.min_patch_size) ** 2
-    K_min = max(4, int(max_patches * args.token_coverage_min))  # 至少 8 tokens
-    K_max = int(max_patches * args.token_coverage_max)
+    # K_min_abs 用于保护最小值，实际 K 值由模型架构计算
+    K_min_abs = max(args.K_min_abs, max(4, int(max_patches * args.token_coverage_min)))
+    K_max_abs = int(max_patches * args.token_coverage_max)
 
     # I24-2: 转换 quota_learnable 字符串到布尔值
     if args.quota_learnable == "enable":
@@ -2891,10 +2927,26 @@ def main():
         quota_learnable_value = None  # 使用全局默认值
 
     # I36: 使用 ModelArchitectureConfig 作为配置基础
+    # I110-7: 构建语义分裂器配置字典
+    if args.use_semantic_splitter:
+        semantic_config_dict = {
+            'feature_dim': args.semantic_feature_dim,
+            'hidden_dim': args.semantic_hidden_dim,
+            'diversity_weight': args.semantic_diversity_weight,
+            'reconstruction_weight': args.semantic_reconstruction_weight,
+            'split_threshold': args.semantic_split_threshold,
+            'gumbel_temp_start': args.semantic_gumbel_temp_start,
+            'gumbel_temp_end': args.semantic_gumbel_temp_end,
+            'image_size': spec.image_size if spec.image_size else (args.min_patch_size * 64, args.min_patch_size * 64),
+            'min_patch_size': args.min_patch_size,
+        }
+    else:
+        semantic_config_dict = None
+
     arch_config = ModelArchitectureConfig(
         num_classes=spec.num_classes,
         dim=args.dim,
-        num_layers=args.depth,  # I145: depth -> num_layers
+        num_layers=args.num_layers,  # I145: 已标准化
         heads=args.heads,
         dim_head=args.dim_head,
         mlp_dim=args.mlp_dim if args.mlp_dim else args.dim * 4,
@@ -2904,7 +2956,7 @@ def main():
         min_patch_size=args.min_patch_size,
         token_coverage_min=args.token_coverage_min,
         token_coverage_max=args.token_coverage_max,
-        K_min_abs=K_min,
+        K_min_abs=K_min_abs,  # 第二层参数：实际 K 值由模型架构动态计算
         # 注意: max_level 是变参数，完全由模型架构内部计算，不从外部传入
         ffn_type=args.ffn_type,
         use_checkpoint=args.gradient_checkpoint,
@@ -2921,12 +2973,15 @@ def main():
         freeze_quota=args.freeze_quota,
         freeze_tokenizer=args.freeze_tokenizer,
         freeze_tokenizer_epochs=args.freeze_tokenizer_epochs,
+        # I110-7: 语义分裂器配置
+        use_semantic_splitter=args.use_semantic_splitter,
+        semantic_splitter_config=semantic_config_dict,
     )
 
     # 创建训练配置对象 (满足 FractalConfigProtocol)
     class TrainingConfig:
         """训练配置包装器 - 满足 FractalConfigProtocol"""
-        def __init__(self, args, arch_config, K_min, K_max):
+        def __init__(self, args, arch_config):
             # 数据集配置
             self.subset_size = args.subset_size
             self.val_split = args.val_split
@@ -2936,15 +2991,14 @@ def main():
 
             # 模型架构配置 (从 arch_config 获取)
             self.dim = arch_config.dim
-            self.depth = arch_config.num_layers  # I145: depth <- num_layers
-            self.num_layers = arch_config.num_layers  # For FractalCurveViT
+            self.num_layers = arch_config.num_layers  # I145: 统一使用 num_layers
             self.heads = arch_config.heads
             self.dim_head = arch_config.dim_head
             self.mlp_dim = arch_config.mlp_dim
             self.pool = arch_config.pool
             self.ffn_type = arch_config.ffn_type
             self.min_patch_size = arch_config.min_patch_size
-            # 注意: max_level/max_depth 是变参数，完全由模型架构内部计算
+            # 注意: max_level 是变参数，完全由模型架构内部计算
             # 不从 arch_config 获取，确保训练/评估模型结构完全一致
             self.dropout = args.dropout
             self.emb_dropout = args.emb_dropout
@@ -2962,11 +3016,15 @@ def main():
             self.freeze_tokenizer_epochs = arch_config.freeze_tokenizer_epochs
             self.depth_scale_range = arch_config.depth_scale_range
 
-            # Tokenizer K 值 (I33 相对预算)
-            self.K_min = K_min
-            self.K_max = K_max
+            # I110-7: 语义分裂器配置
+            self.use_semantic_splitter = arch_config.use_semantic_splitter
+            self.semantic_splitter_config = arch_config.semantic_splitter_config
+
+            # Tokenizer 覆盖率 (I33 相对预算)
+            # 注意: K 值由模型架构动态计算，TrainingConfig 不保存绝对 K 值
             self.token_coverage_min = args.token_coverage_min
             self.token_coverage_max = args.token_coverage_max
+            self.K_min_abs = K_min_abs  # 用于保护最小值，实际 K 值动态计算
 
             # 训练配置 (use_channels_last 是 CLI 参数)
             self.use_channels_last = getattr(args, 'use_channels_last', False)
@@ -3009,7 +3067,8 @@ def main():
             self.soft_entropy_weight = args.soft_entropy_weight
             self.soft_entropy_mode = args.soft_entropy_mode
 
-    config = TrainingConfig(args, arch_config, K_min, K_max)
+    # I145: TrainingConfig 不再接收 K_min/K_max（第二层参数由模型动态计算）
+    config = TrainingConfig(args, arch_config)
     
     # 创建 Tokenizer (默认使用 GumbelTopKSplitter - Scheme D)
     from vit_pytorch.tokenizer_streaming import StreamingFractalTokenizerV3
@@ -3101,8 +3160,8 @@ def main():
     quota_info = "Scheme E" if config.quota_learnable else "Scheme D (no quota)"
     if config.quota_learnable and config.freeze_quota:
         quota_info += " (frozen)"
-    # 显示覆盖率 (用户可见) 和 K 范围 (内部值)
-    split_info = f"GumbelTopKSplitter (coverage∈[{config.token_coverage_min:.0%}, {config.token_coverage_max:.0%}], K∈[{config.K_min}, {config.K_max}], {quota_info})"
+    # I145: 只显示覆盖率范围，K 值由模型架构动态计算
+    split_info = f"GumbelTopKSplitter (coverage∈[{config.token_coverage_min:.0%}, {config.token_coverage_max:.0%}], K=dynamic, {quota_info})"
     tokenizer_name = f'StreamingFractalTokenizerV3 ({split_info})'
 
     # P6-1/P6-2 信息
