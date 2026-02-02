@@ -52,7 +52,7 @@ from .constants import (
     compute_max_level, compute_num_candidates, compute_k_bounds,
     clamp_temperature
 )
-from .config import AttentionEncoderConfig  # I98-3
+from .config import AttentionEncoderConfig, SemanticSplitterConfig  # I98-3, I110-5
 
 
 @dataclass
@@ -75,6 +75,11 @@ class TrainingStats:
     shared_features: Optional[torch.Tensor] = None  # [B, d_model, H/p, W/p]
     splitter_entropy: float = 0.0
     temperature: float = 1.0
+
+    # I110-7: 语义分裂器损失
+    semantic_loss: Optional[torch.Tensor] = None  # 语义冗余损失
+    child_features: Optional[torch.Tensor] = None  # 预测的子节点特征 [B, N, 4, D]
+    redundancy: Optional[torch.Tensor] = None  # 冗余性分数 [B, N]
 
     # === 向后兼容字段 (I112) ===
     aux_infos: Optional[List[Dict[str, Any]]] = None  # 评估层期望的 aux_infos 格式
@@ -172,6 +177,9 @@ class FractalCurveViT(nn.Module):
         splitter_hidden_dim: Optional[int] = None,
         splitter_feature_dim: Optional[int] = None,
         splitter_pool_size: Optional[int] = None,
+        # I110-7: 语义分裂器配置
+        use_semantic_splitter: bool = False,
+        semantic_splitter_config: Optional[SemanticSplitterConfig] = None,
     ) -> None:
         """初始化 FractalCurveViT。
 
@@ -355,6 +363,19 @@ class FractalCurveViT(nn.Module):
                 base_patch_size=effective_min_patch_size,
                 min_patch_size=effective_min_patch_size,
             )
+
+        # I110-7: 配置语义分裂器（必须在 tokenizer 赋值之前）
+        self._use_semantic_splitter = use_semantic_splitter
+        self._semantic_splitter_config = semantic_splitter_config
+        self._semantic_splitter: Optional[nn.Module] = None
+        self._semantic_loss_fn: Optional[nn.Module] = None
+
+        if use_semantic_splitter and semantic_splitter_config is not None:
+            # 配置 tokenizer 使用语义分裂器
+            tokenizer.use_semantic_splitter(config=semantic_splitter_config)
+            # 创建语义分裂器实例
+            self._semantic_splitter = tokenizer.get_semantic_splitter()
+            self._semantic_loss_fn = tokenizer.get_semantic_loss_fn()
 
         self.tokenizer = tokenizer
 
@@ -1221,6 +1242,48 @@ class FractalCurveViT(nn.Module):
         # I98-2: 清理 splitter 状态（如果有）
         if hasattr(self.splitter, "clear_cache"):
             self.splitter.clear_cache()
+
+        # I110-7: 清理语义分裂器状态（如果有）
+        if hasattr(self, '_semantic_splitter') and self._semantic_splitter is not None:
+            # SemanticRedundancySplitter 无缓存需要清理
+            pass
+
+    # =====================================================================
+    # I110-7: 语义分裂器接口
+    # =====================================================================
+    @property
+    def use_semantic_splitter(self) -> bool:
+        """是否使用语义分裂器"""
+        return self._use_semantic_splitter
+
+    def get_semantic_splitter(self) -> Optional[nn.Module]:
+        """获取语义分裂器实例"""
+        return self._semantic_splitter
+
+    def get_semantic_loss_fn(self) -> Optional[nn.Module]:
+        """获取语义损失函数"""
+        return self._semantic_loss_fn
+
+    def compute_semantic_loss(
+        self,
+        parent_features: torch.Tensor,
+        child_features: torch.Tensor,
+        split_decision: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """计算语义冗余损失 (I110-7)
+
+        Args:
+            parent_features: [B, N, D] 父节点特征
+            child_features: [B, N, 4, D] 子节点特征
+            split_decision: [B, N] 分裂决策
+
+        Returns:
+            包含 loss, diversity_loss, reconstruction_loss 的字典
+        """
+        if self._semantic_loss_fn is None:
+            return {'loss': torch.tensor(0.0, device=parent_features.device)}
+
+        return self._semantic_loss_fn(parent_features, child_features, split_decision)
 
     def analyze_tokenization(self, img: torch.Tensor) -> Dict[str, Any]:
         """分析 tokenization 过程，返回详细统计信息。

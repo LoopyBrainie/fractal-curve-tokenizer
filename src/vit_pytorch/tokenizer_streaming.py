@@ -54,9 +54,10 @@ import torch
 import torch.nn as nn
 
 from .base_tokenizer import BaseTokenizer, TokenizerOutput, TokenSequence
-from .config import FractalConfig  # I97-5: 合并 config_fractal.py
+from .config import FractalConfig, SemanticSplitterConfig  # I97-5: 合并 config_fractal.py, I110-5: 语义配置
 from .constants import LOG_EPSILON, PROB_EPSILON, LEARNABLE_QUOTA_ENABLED  # I12-7: 数值稳定性常量
 from .embed_fractal_path import VectorizedPathEncoder  # I12-3: 用于计算路径
+from .semantic_redundancy_splitter import SplitResult  # I110-6: 语义分裂器结果
 
 
 class StreamingFractalTokenizerV3(BaseTokenizer):
@@ -187,6 +188,16 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # I107-2: 移除调试缓存变量 (_last_features, _last_depth_count_matrix)
         # 这些仅用于调试，会导致显存泄露
 
+        # =====================================================================
+        # I110-6: 语义冗余分裂器支持
+        # =====================================================================
+        # 语义分裂器相关属性（I110-6）
+        self._use_semantic_splitter: bool = False
+        self._semantic_config: Optional[SemanticSplitterConfig] = None
+        self._semantic_loss_fn: Optional[nn.Module] = None
+        # 缓存用于语义分裂的区域边界 [N, 4] (初始全图区域)
+        self._region_bounds_cache: Optional[torch.Tensor] = None
+
     @property
     def patch_sizes(self) -> List[int]:
         """兼容性属性: 从 base_patch_size 和 max_level 计算等效的 patch 大小列表.
@@ -203,10 +214,186 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         """
         return [self.base_patch_size * (2 ** d) for d in range(self.max_level + 1)]
     
-    @property 
+    @property
     def shared_conv(self) -> nn.Module:
         """获取共享卷积层 (用于可学习分割)."""
         return self.patch_embed.shared_conv
+
+    # =====================================================================
+    # I110-6: 语义冗余分裂器配置方法
+    # =====================================================================
+    def use_semantic_splitter(
+        self,
+        config: Optional[SemanticSplitterConfig] = None,
+        loss_fn: Optional[nn.Module] = None,
+    ) -> None:
+        """配置使用语义冗余分裂器 (I110-6)
+
+        Args:
+            config: SemanticSplitterConfig 配置（默认使用参数）
+            loss_fn: 语义损失函数（默认使用配置中的权重创建）
+        """
+        from .semantic_redundancy_splitter import SemanticRedundancySplitter
+        from .semantic_losses import SemanticRedundancyLoss
+
+        self._use_semantic_splitter = True
+        self._semantic_config = config if config is not None else SemanticSplitterConfig()
+        self._semantic_config.validate()
+
+        # 创建损失函数
+        if loss_fn is not None:
+            self._semantic_loss_fn = loss_fn
+        else:
+            self._semantic_loss_fn = SemanticRedundancyLoss(
+                diversity_weight=self._semantic_config.diversity_weight,
+                reconstruction_weight=self._semantic_config.reconstruction_weight,
+            )
+
+    def get_semantic_splitter(self) -> Optional["SemanticRedundancySplitter"]:
+        """获取语义分裂器实例（用于模型前向）"""
+        if not self._use_semantic_splitter or self._semantic_config is None:
+            return None
+
+        from .semantic_redundancy_splitter import SemanticRedundancySplitter
+
+        return SemanticRedundancySplitter(
+            feature_dim=self.d_model,
+            hidden_dim=self._semantic_config.hidden_dim,
+            max_level_limit=self.max_level,
+            gumbel_temp_start=self._semantic_config.gumbel_temp_start,
+            gumbel_temp_end=self._semantic_config.gumbel_temp_end,
+            learnable_temperature=self._semantic_config.learnable_temperature,
+        )
+
+    def get_semantic_loss_fn(self) -> Optional[nn.Module]:
+        """获取语义损失函数"""
+        return self._semantic_loss_fn
+
+    def _get_initial_region_bounds(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """获取初始区域边界（全图）[B*N_initial, 4]"""
+        if self._region_bounds_cache is not None:
+            return self._region_bounds_cache
+
+        H, W = self.image_size
+        # 初始只有一个区域：整个图像
+        # 格式: [x0, y0, x1, y1]
+        initial_bounds = torch.tensor([0, 0, W, H], dtype=torch.float32, device=device)
+        self._region_bounds_cache = initial_bounds
+        return initial_bounds
+
+    # =====================================================================
+    # I110-6: SplitResult 转换方法
+    # =====================================================================
+    def convert_split_result_to_tensor(
+        self,
+        split_result: SplitResult,
+        features: torch.Tensor,
+    ) -> "TensorSplitResult":
+        """将 SplitResult 转换为 TensorSplitResult (I110-6)
+
+        语义分裂器返回的是 split_decision（二值掩码），需要转换为
+        实际的 regions/depths/batch_indices 用于 tokenization。
+
+        Args:
+            split_result: SplitResult 包含 split_decision [B, N]
+            features: [B, C, H, W] 输入图像
+
+        Returns:
+            TensorSplitResult: 兼容 TensorSplitResult 格式的分割结果
+        """
+        from .gumbel_topk_splitter import TensorSplitResult
+
+        B, C, H, W = features.shape
+        device = features.device
+        split_decision = split_result.split_decision  # [B, N]
+
+        # 递归构建四叉树区域
+        # 初始区域：整个图像
+        all_regions = []  # [total_regions, 4]
+        all_depths = []  # [total_regions]
+        all_batch_indices = []  # [total_regions]
+
+        # BFS 构建四叉树
+        queue = []  # (bounds, depth, batch_idx)
+        for b in range(B):
+            bounds = self._get_initial_region_bounds(B, device)
+            queue.append((bounds, 0, b))
+
+        while queue:
+            bounds, depth, b_idx = queue.pop(0)
+
+            if depth >= self.max_level:
+                # 达到最大深度，添加为叶子节点
+                region_idx = len(all_regions)
+                all_regions.append(bounds)
+                all_depths.append(depth)
+                all_batch_indices.append(b_idx)
+                continue
+
+            # 计算当前区域的索引
+            # 这里简化处理：假设区域按 BFS 顺序排列
+            # 实际需要更复杂的索引映射
+            region_idx_in_batch = len([r for r, d, b in queue if b == b_idx]) + \
+                                  len([r for r, d, b in queue if b != b_idx]) + \
+                                  len([1 for r, d, b in all_regions if b == b_idx])
+
+            # 检查是否应该分裂
+            if region_idx_in_batch < split_decision.shape[1]:
+                should_split = split_decision[b_idx, region_idx_in_batch] > 0.5
+            else:
+                should_split = False
+
+            if should_split:
+                # 分裂为四个子区域
+                x0, y0, x1, y1 = bounds.tolist()
+                cx = (x0 + x1) / 2
+                cy = (y0 + y1) / 2
+
+                # 添加四个子区域到队列
+                child_bounds = [
+                    torch.tensor([x0, y0, cx, cy], dtype=torch.float32, device=device),  # 左上
+                    torch.tensor([cx, y0, x1, cy], dtype=torch.float32, device=device),  # 右上
+                    torch.tensor([x0, cy, cx, y1], dtype=torch.float32, device=device),  # 左下
+                    torch.tensor([cx, cy, x1, y1], dtype=torch.float32, device=device),  # 右下
+                ]
+
+                for child_bound in child_bounds:
+                    queue.append((child_bound, depth + 1, b_idx))
+            else:
+                # 不分裂，添加为叶子节点
+                all_regions.append(bounds)
+                all_depths.append(depth)
+                all_batch_indices.append(b_idx)
+
+        # 转换为张量
+        if len(all_regions) == 0:
+            regions = torch.zeros(0, 4, dtype=torch.float32, device=device)
+            depths = torch.zeros(0, dtype=torch.long, device=device)
+            batch_indices = torch.zeros(0, dtype=torch.long, device=device)
+        else:
+            regions = torch.stack(all_regions)
+            depths = torch.tensor(all_depths, dtype=torch.long, device=device)
+            batch_indices = torch.tensor(all_batch_indices, dtype=torch.long, device=device)
+
+        # 计算 Hilbert 索引
+        from .curve_hilbert import xy_to_hilbert_distance
+        hilbert_indices = xy_to_hilbert_distance(
+            (regions[:, 0] + regions[:, 2]) / 2,  # center_x
+            (regions[:, 1] + regions[:, 3]) / 2,  # center_y
+            max_bits=16,
+        ).to(device)
+
+        # 复杂度使用冗余性分数
+        complexities = split_result.redundancy.view(-1) if split_result.redundancy.numel() > 0 else \
+                       torch.zeros(len(regions), dtype=torch.float32, device=device)
+
+        return TensorSplitResult(
+            regions=regions,
+            depths=depths,
+            batch_indices=batch_indices,
+            hilbert_indices=hilbert_indices,
+            complexities=complexities,
+        )
     
     @classmethod
     def from_config(

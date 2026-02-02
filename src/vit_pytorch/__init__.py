@@ -50,11 +50,13 @@ from .config import (
     AnnealSchedule,
     TokenizerType,
     SplitterConfig,
+    SemanticSplitterConfig,  # I110-5
+    create_semantic_splitter_config,  # I110-5
     AttentionConfig,
     TokenizerConfig,
     TransformerConfig,
     FractalViTConfig,
-)  # I97-5: 合并 config_fractal.py
+)  # I97-5: 合并 config_fractal.py, I110-5: 语义冗余配置
 from .embed_fractal_path import (
     FractalPathEmbedding,
     HierarchicalAttentionBias,

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Tuple
+import math
 
 # 导入默认常量（作为配置默认值）
 from .constants import (
@@ -561,9 +562,186 @@ def create_splitter_config(
     return config
 
 
-# ==================== I97-5: 合并 config_fractal.py 功能 ====================
+# ==================== I110-5: 语义冗余分裂器配置 ====================
 
-import math
+@dataclass
+class SemanticSplitterConfig:
+    """语义冗余分裂器配置 (I110-5)
+
+    数学设计原则
+    ============
+    理论最大深度（像素级上界）:
+        L_theory = floor(log2(max(H, W)))  # min_patch_size=1 时的最大深度
+
+    上界保护:
+        max_level_limit ≤ L_theory
+
+    示例（min_patch_size=4）:
+        - 64x64 图像: L_theory = 6, 有效范围 [2, 6]
+        - 224x224 图像: L_theory = 8, 有效范围 [2, 8]
+        - 512x512 图像: L_theory = 9, 有效范围 [2, 9]
+        - 1024x1024 图像: L_theory = 10, 有效范围 [2, 10]
+
+    损失权重 (impact=0.1):
+    - diversity_weight: 0.1 (标准)
+    - reconstruction_weight: 0.1 (标准)
+
+    决策参数 (impact=0.5):
+    - split_threshold: 0.5 (标准)
+    - use_gumbel_softmax: True
+
+    温度调度 (impact=0.8):
+    - gumbel_temp_start: 1.0
+    - gumbel_temp_end: 0.5
+    - learnable_temperature: True
+    """
+
+    # ========== 核心架构参数 ==========
+    feature_dim: int = 256
+    hidden_dim: int = 128
+
+    # 深度参数：基于图像像素数动态计算，不使用硬编码
+    image_size: Optional[Tuple[int, int]] = None  # (H, W) 用于计算理论上界
+    min_patch_size: int = 4  # 最小 patch 大小
+    max_level_limit: Optional[int] = None  # None = 自动计算到像素级上界
+
+    # ========== 损失权重 ==========
+    diversity_weight: float = 0.1
+    reconstruction_weight: float = 0.1
+
+    # ========== 决策参数 ==========
+    split_threshold: float = 0.5
+    use_gumbel_softmax: bool = True
+
+    # ========== 温度调度 ==========
+    gumbel_temp_start: float = 1.0
+    gumbel_temp_end: float = 0.5
+    learnable_temperature: bool = True
+
+    def _compute_theoretical_max_level(self) -> int:
+        """计算理论最大深度（基于图像像素数）
+
+        公式: L_theory = floor(log2(max(H, W)))
+        含义: min_patch_size=1 时的最大分裂深度
+        """
+        if self.image_size is None:
+            return 8
+        H, W = self.image_size
+        max_dim = max(H, W)
+        return int(math.floor(math.log2(max_dim)))
+
+    def _compute_effective_max_level(self) -> int:
+        """计算有效最大深度（应用上界保护）"""
+        L_theory = self._compute_theoretical_max_level()
+        if self.max_level_limit is None:
+            return L_theory
+        return min(self.max_level_limit, L_theory)
+
+    def get_max_level(self) -> int:
+        """获取有效最大深度（供外部使用）"""
+        return self._compute_effective_max_level()
+
+    def validate(self) -> None:
+        """验证配置参数的有效性"""
+        if self.feature_dim <= 0:
+            raise ValueError(f"feature_dim 必须为正数, got {self.feature_dim}")
+        if self.hidden_dim <= 0:
+            raise ValueError(f"hidden_dim 必须为正数, got {self.hidden_dim}")
+        if self.min_patch_size <= 0:
+            raise ValueError(f"min_patch_size 必须为正数, got {self.min_patch_size}")
+
+        L_theory = self._compute_theoretical_max_level()
+        if self.max_level_limit is not None:
+            if self.max_level_limit < 2:
+                raise ValueError(f"max_level_limit >= 2 是推荐配置, got {self.max_level_limit}")
+            if self.max_level_limit > L_theory:
+                raise ValueError(
+                    f"max_level_limit ({self.max_level_limit}) 超过理论最大值 ({L_theory}), "
+                    f"将自动截断"
+                )
+
+        if not 0 < self.diversity_weight <= 1:
+            raise ValueError(f"diversity_weight 必须在 (0, 1] 范围内, got {self.diversity_weight}")
+        if not 0 < self.reconstruction_weight <= 1:
+            raise ValueError(f"reconstruction_weight 必须在 (0, 1] 范围内")
+        if not 0 < self.split_threshold < 1:
+            raise ValueError(f"split_threshold 必须在 (0, 1) 范围内, got {self.split_threshold}")
+        if self.gumbel_temp_end >= self.gumbel_temp_start:
+            raise ValueError(
+                f"gumbel_temp_end ({self.gumbel_temp_end}) 必须 < gumbel_temp_start ({self.gumbel_temp_start})"
+            )
+
+    def to_dict(self) -> dict:
+        """转换为字典（用于序列化）"""
+        return {
+            'feature_dim': self.feature_dim,
+            'hidden_dim': self.hidden_dim,
+            'image_size': self.image_size,
+            'min_patch_size': self.min_patch_size,
+            'max_level_limit': self.max_level_limit,
+            'diversity_weight': self.diversity_weight,
+            'reconstruction_weight': self.reconstruction_weight,
+            'split_threshold': self.split_threshold,
+            'use_gumbel_softmax': self.use_gumbel_softmax,
+            'gumbel_temp_start': self.gumbel_temp_start,
+            'gumbel_temp_end': self.gumbel_temp_end,
+            'learnable_temperature': self.learnable_temperature,
+            '_effective_max_level': self.get_max_level(),
+        }
+
+
+def create_semantic_splitter_config(
+    feature_dim: Optional[int] = None,
+    hidden_dim: Optional[int] = None,
+    image_size: Optional[Tuple[int, int]] = None,
+    min_patch_size: Optional[int] = None,
+    max_level_limit: Optional[int] = None,
+    diversity_weight: Optional[float] = None,
+    reconstruction_weight: Optional[float] = None,
+    split_threshold: Optional[float] = None,
+    use_gumbel_softmax: Optional[bool] = None,
+    gumbel_temp_start: Optional[float] = None,
+    gumbel_temp_end: Optional[float] = None,
+    learnable_temperature: Optional[bool] = None,
+    **kwargs,
+) -> SemanticSplitterConfig:
+    """工厂函数: 创建 SemanticSplitterConfig（用于 CLI 参数解析）"""
+    config = SemanticSplitterConfig()
+
+    if feature_dim is not None:
+        config.feature_dim = feature_dim
+    if hidden_dim is not None:
+        config.hidden_dim = hidden_dim
+    if image_size is not None:
+        config.image_size = image_size
+    if min_patch_size is not None:
+        config.min_patch_size = min_patch_size
+    if max_level_limit is not None:
+        config.max_level_limit = max_level_limit
+    if diversity_weight is not None:
+        config.diversity_weight = diversity_weight
+    if reconstruction_weight is not None:
+        config.reconstruction_weight = reconstruction_weight
+    if split_threshold is not None:
+        config.split_threshold = split_threshold
+    if use_gumbel_softmax is not None:
+        config.use_gumbel_softmax = use_gumbel_softmax
+    if gumbel_temp_start is not None:
+        config.gumbel_temp_start = gumbel_temp_start
+    if gumbel_temp_end is not None:
+        config.gumbel_temp_end = gumbel_temp_end
+    if learnable_temperature is not None:
+        config.learnable_temperature = learnable_temperature
+
+    # 应用额外参数
+    for key, value in kwargs.items():
+        if hasattr(config, key):
+            setattr(config, key, value)
+
+    return config
+
+
+# ==================== I97-5: 合并 config_fractal.py 功能 ====================
 
 
 @dataclass
