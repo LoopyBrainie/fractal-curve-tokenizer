@@ -819,7 +819,7 @@ class FeatureReconstructionLoss(nn.Module):
         if self.config.reconstruct_mean:
             original_mean = original_features.mean(dim=(0, 1))  # [D]
             recon_mean = reconstructed_features.mean(dim=(0, 1))
-            mean_loss = F.mse_loss(recon_mean, original_mean)
+            mean_loss = F.mse_loss(recon_mean, original_mean, reduction='mean')
             info["mean_loss"] = mean_loss.item()
         else:
             mean_loss = torch.tensor(0.0, device=original_features.device)
@@ -828,7 +828,7 @@ class FeatureReconstructionLoss(nn.Module):
         if self.config.reconstruct_var:
             original_var = original_features.var(dim=(0, 1))  # [D]
             recon_var = reconstructed_features.var(dim=(0, 1))
-            var_loss = F.mse_loss(recon_var, original_var)
+            var_loss = F.mse_loss(recon_var, original_var, reduction='mean')
             info["var_loss"] = var_loss.item()
         else:
             var_loss = torch.tensor(0.0, device=original_features.device)
@@ -845,8 +845,8 @@ class FeatureReconstructionLoss(nn.Module):
             # Compute covariance matrix
             # cov = (X^T X) / (n - 1)
             n = original_flat.shape[0]
-            original_cov = (original_flat.T @ original_flat) / (n - 1 + 1e-6)
-            recon_cov = (recon_flat.T @ recon_flat) / (n - 1 + 1e-6)
+            original_cov = (original_flat.mT @ original_flat) / (n - 1 + 1e-6)
+            recon_cov = (recon_flat.mT @ recon_flat) / (n - 1 + 1e-6)
 
             corr_loss = F.mse_loss(recon_cov, original_cov)
             info["corr_loss"] = corr_loss.item()
