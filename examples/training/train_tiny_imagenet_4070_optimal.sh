@@ -25,8 +25,7 @@ set -e
 #   --mlp-dim 2048    : mlp_ratio = 4.0 (SwiGLU)
 #
 # [TOKENIZER PARAMETERS]
-#   --patch-size 8
-#   --min-patch-size 4
+#   --min-patch-size 4  (patch_size derived from image_size/min_patch_size)
 #   --token-coverage-min 0.02 : α = 2% minimum coverage
 #   --token-coverage-max 0.50 : β = 50% maximum coverage
 #   K (token range): [16, 92] for Tiny-ImageNet 64×64
@@ -56,7 +55,6 @@ uv run python src/training/train_fractal_vit.py \
   --num-layers 16 \
   --heads 8 \
   --mlp-dim 2048 \
-  --patch-size 8 \
   --min-patch-size 4 \
   --token-coverage-min 0.02 \
   --token-coverage-max 0.50 \

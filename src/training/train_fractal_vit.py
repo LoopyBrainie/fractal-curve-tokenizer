@@ -2687,6 +2687,11 @@ def main():
                        help="I33: Minimum token coverage ratio (default: 0.01, 1% of patches)")
     parser.add_argument("--token-coverage-max", type=float, default=0.25,
                        help="I33: Maximum token coverage ratio, participates in adaptive formula (default: 0.25)")
+    # I33: 绝对 K 值边界（用于保护最小/最大 token 数）
+    parser.add_argument("--K-min-abs", type=int, default=8,
+                       help="I33: Absolute minimum K value (default: 8)")
+    parser.add_argument("--K-max-abs", type=int, default=1024,
+                       help="I33: Absolute maximum K value (default: 1024)")
 
     # I30-10: 可学习配额参数 (Scheme E)
     # I24-2: 迁移到命令行 choices 模式

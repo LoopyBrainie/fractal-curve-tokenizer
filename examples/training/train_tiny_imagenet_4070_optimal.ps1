@@ -42,7 +42,6 @@ uv run python src/training/train_fractal_vit.py `
   --num-layers 16 `
   --heads 8 `
   --mlp-dim 2048 `
-  --patch-size 8 `
   --min-patch-size 4 `
   --token-coverage-min 0.02 `
   --token-coverage-max 0.50 `
