@@ -1329,7 +1329,10 @@ class GeometricJigsawExperiment(BaseExperiment):
 
                 # Stack levels_list to create levels_info [B, N, D+1]
                 # levels_list is a list of tensors, each [N, D+1] where first col is depth
-                levels_info = torch.stack(levels_list, dim=0)  # [B, N, D+1]
+                # Ensure tensors are on the same device as tokens
+                levels_info = torch.stack(
+                    [l.to(transformer_tokens.device) for l in levels_list], dim=0
+                )  # [B, N, D+1]
 
                 # 3. Compute jigsaw loss
                 loss, info = self.jigsaw_loss_fn(
