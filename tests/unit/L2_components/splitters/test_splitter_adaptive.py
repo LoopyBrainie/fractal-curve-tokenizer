@@ -63,7 +63,7 @@ def splitter():
         hidden_dim=128,
         pool_size=4,
         K_max=32,
-        temperature=1.0,
+        # I111-1: temperature 参数已移至 SplitterConfig
     )
 
 

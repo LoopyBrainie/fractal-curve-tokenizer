@@ -37,7 +37,7 @@ class TestDepthEntropyLoss:
             hidden_dim=128,
             pool_size=4,
             K_max=32,
-            temperature=1.0,
+            # I111-1: temperature 参数已移至 SplitterConfig
         )
 
     def test_depth_entropy_loss_computation(self, splitter):
@@ -150,7 +150,7 @@ class TestQuotaEntropyLoss:
             hidden_dim=128,
             pool_size=4,
             K_max=32,
-            temperature=1.0,
+            # I111-1: temperature 参数已移至 SplitterConfig
         )
 
     def test_quota_entropy_loss_exists(self, splitter):
@@ -214,7 +214,7 @@ class TestEntropyMode:
             hidden_dim=128,
             pool_size=4,
             K_max=32,
-            temperature=1.0,
+            # I111-1: temperature 参数已移至 SplitterConfig
         )
 
     def test_entropy_mode_parameter_exists(self, splitter):
@@ -252,7 +252,7 @@ class TestEntropyConfiguration:
             hidden_dim=128,
             pool_size=4,
             K_max=32,
-            temperature=1.0,
+            # I111-1: temperature 参数已移至 SplitterConfig
         )
 
     def test_default_entropy_weight(self, splitter):

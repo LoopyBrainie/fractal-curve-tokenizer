@@ -36,7 +36,7 @@ class TestGradientBalance:
             hidden_dim=128,
             pool_size=4,
             K_max=32,
-            temperature=1.0,
+            # I111-1: temperature 参数已移至 SplitterConfig
         )
 
     def test_gradient_flow_through_splitter(self, splitter):
@@ -162,7 +162,7 @@ class TestSTEGradientFlow:
             hidden_dim=128,
             pool_size=4,
             K_max=32,
-            temperature=1.0,
+            # I111-1: temperature 参数已移至 SplitterConfig
         )
 
     def test_ste_gradient_scaling(self, splitter):
@@ -203,7 +203,7 @@ class TestSTEImplementation:
             hidden_dim=128,
             pool_size=4,
             K_max=32,
-            temperature=1.0,
+            # I111-1: temperature 参数已移至 SplitterConfig
         )
 
     def test_hard_vs_soft_mask(self, splitter):

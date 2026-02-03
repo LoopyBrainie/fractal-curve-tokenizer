@@ -272,7 +272,6 @@ class GumbelTopKSplitter(
         hidden_dim: int = 128,
         intermediate_dim: int = 64,
         pool_size: int = 4,
-        temperature: float = 1.0,
         K_min: int = 8,
         K_max: int = 64,
         dropout: float = 0.1,
@@ -299,7 +298,7 @@ class GumbelTopKSplitter(
 
         # I30-10: 解析配置
         if config is not None:
-            # 使用 SplitterConfig
+            # 使用 SplitterConfig (I111-4: HilbertSplitterConfig)
             self.config = config
             self._use_config = True
             feature_dim = config.feature_dim
@@ -308,45 +307,67 @@ class GumbelTopKSplitter(
             hidden_dim = config.hidden_dim
             intermediate_dim = config.intermediate_dim
             pool_size = config.pool_size
-            K_min = config.K_min
-            K_max = config.K_max
+            K_min = config.K_min_abs  # I111-5: 使用相对预算下界
+            K_max = config.K_max_hard  # I111-5: 使用相对预算上界
             dropout = config.dropout
             use_dynamic_k = config.use_dynamic_k
             # 配额参数来自 config
             self._enable_learnable_quota = config.enable_learnable_quota
-            self._quota_min_per_depth = config.quota_min_per_depth
             self._quota_entropy_weight = config.quota_entropy_weight
+            self._quota_min_ratio = config.quota_min_ratio  # I111-4: 新字段
+            self._quota_min_lambda = config.quota_min_lambda  # I111-4: 新字段
+            self._quota_min_per_depth = QUOTA_MIN_PER_DEPTH  # 保留兼容性
             self._freeze_quota = config.freeze_quota
-            # I33: 自适应覆盖率参数
-            self._token_coverage_base = config.token_coverage_base
-            self._token_coverage_min = config.token_coverage_min
-            self._token_coverage_max = config.token_coverage_max  # I109-3: 参与自适应计算
-            self._adaptive_reference_size = config.adaptive_reference_size
+            # I111-5: 覆盖率参数 (用于目标计算)
+            self._coverage_base = config.coverage_base
+            self._coverage_min = config.coverage_min
+            self._coverage_max_hard = config.coverage_max_hard
             self._K_min_abs = config.K_min_abs
             self._K_max_hard = config.K_max_hard
-            self._use_adaptive_coverage = config.use_adaptive_coverage
-            # I100-7: 信息密度自适应配额
-            self._enable_info_adaptive_quota = getattr(
-                config, "enable_info_adaptive_quota", False
-            )
+            self._adaptive_reference_size = config.adaptive_reference_size
+            # I111-3: 熵模式
+            self._entropy_mode = config.entropy_mode
+            self._entropy_weight_base = config.entropy_weight_base
+            self._entropy_target = config.entropy_target
+            # I100-7: 信息密度自适应配额 (默认关闭)
+            self._enable_info_adaptive_quota = False
+            # I111-1: 温度参数从配置读取
+            self._temperature_init = config.temperature_init
+            self._temperature_min = config.temperature_min
+            self._temperature_anneal = config.temperature_anneal
+            self._temperature_warmup_steps = config.temperature_warmup_steps
+            learnable_temp = config.learnable_temperature
         else:
             # 使用传统参数（向后兼容）
             self.config = None
             self._use_config = False
             self._enable_learnable_quota = LEARNABLE_QUOTA_ENABLED
-            self._quota_min_per_depth = QUOTA_MIN_PER_DEPTH
             self._quota_entropy_weight = QUOTA_ENTROPY_WEIGHT
+            self._quota_min_ratio = QUOTA_MIN_RATIO
+            self._quota_min_lambda = QUOTA_MIN_LAMBDA
+            self._quota_min_per_depth = QUOTA_MIN_PER_DEPTH  # 保留兼容性
             self._freeze_quota = False
-            # I33: 默认自适应覆盖率参数
-            self._token_coverage_base = K_COVERAGE_BASE
-            self._token_coverage_min = K_COVERAGE_MIN
-            self._token_coverage_max = K_COVERAGE_MAX_HARD  # I109-3: 参与自适应计算
-            self._adaptive_reference_size = K_ADAPTIVE_REFERENCE_SIZE
+            # I111-5: 默认覆盖率参数
+            self._coverage_base = K_COVERAGE_BASE
+            self._coverage_min = K_COVERAGE_MIN
+            self._coverage_max_hard = K_COVERAGE_MAX_HARD
             self._K_min_abs = K_MIN_HARD_LIMIT
             self._K_max_hard = K_MAX_HARD_LIMIT
+            self._adaptive_reference_size = K_ADAPTIVE_REFERENCE_SIZE
+            # I111-3: 默认熵模式
+            self._entropy_mode = 'adaptive'
+            self._entropy_weight_base = 0.1
+            self._entropy_target = None
+            # I111-5: 保留兼容性属性 (Elastic Budget 需要)
             self._use_adaptive_coverage = True
             # I100-7: 信息密度自适应配额 (默认关闭)
             self._enable_info_adaptive_quota = False
+            # I111-1: 默认温度参数 (向后兼容)
+            self._temperature_init = 1.0
+            self._temperature_min = 0.5  # I111-4: 更新默认值
+            self._temperature_anneal = 'cosine'
+            self._temperature_warmup_steps = 1000  # I111-4: 改用 steps
+            learnable_temp = True  # 默认可学习温度
 
         # I30-17-EXT: 存储配置，不预计算
         self.feature_dim = feature_dim
@@ -405,8 +426,17 @@ class GumbelTopKSplitter(
         # I30-17-EXT: 可学习阈值使用上界维度
         self.threshold_offsets = nn.Parameter(torch.zeros(max_level_limit + 1))
 
-        # 可学习温度
-        self.log_temperature = nn.Parameter(torch.tensor(math.log(temperature)))
+        # I111-1: 可学习温度 (使用配置值)
+        if learnable_temp:
+            self.log_temperature = nn.Parameter(
+                torch.tensor(math.log(self._temperature_init))
+            )
+        else:
+            # 非可学习: 注册为缓冲区
+            self.register_buffer(
+                'log_temperature',
+                torch.tensor(math.log(self._temperature_init))
+            )
 
         # 探索偏置 (训练初期)
         self.register_buffer('explore_bias', torch.tensor(0.5))
@@ -1274,71 +1304,77 @@ class GumbelTopKSplitter(
 
         return logits, probs
 
-    # I33: 动态 K 边界方法 (自适应覆盖率)
+    # I33: 动态 K 边界方法 (I111-5: 完整相对预算公式)
     def _get_dynamic_k_bounds(
         self,
         candidate_count: int,
         image_size: Optional[Tuple[int, int]] = None,
     ) -> Tuple[int, int]:
         """
-        动态计算 K_min 和 K_max (I33 相对预算设计)。
+        动态计算 K_min 和 K_max (I111-5: 完整相对预算公式)
 
         数学形式化
         ==========
 
-        相对预算公式:
-            K_min = max(K_min_abs, α × N)
-            K_max = min(K_max_hard, β(H, W) × N)
+        完整公式 (I33):
+            N = (4^(L+1) - 1) / 3                      (候选总数)
+            γ(H,W) = √(min(H,W) / 224)                 (尺度因子)
+            K_min = max(K_min_abs, α × N)              (下界)
+            K_max = min(K_max_hard, β × γ × N)         (上界)
 
-        自适应覆盖率:
-            β(H, W) = min(β_max, max(3α, β_0 × γ))
-            γ = sqrt(min(H, W) / 224)
+        其中:
+            - α = coverage_min (默认 0.01)
+            - β = coverage_max_hard (默认 0.25)
+            - K_min_abs = 8 (硬下限)
+            - K_max_hard = 4096 (硬上限)
 
-        覆盖率分析:
-            | 图像尺寸 | min(H,W) | γ | β(H,W) | K_max覆盖率 | 评估 |
-            |----------|----------|------|--------|-------------|------|
-            | 64×64    | 64       | 0.53 | 0.03   | 3.0%        | ✅ 合理 |
-            | 128×128  | 128      | 0.76 | 0.04   | 3.8%        | ✅ 合理 |
-            | 224×224  | 224      | 1.00 | 0.05   | 5.0%        | ✅ 目标 |
-            | 512×512  | 512      | 1.51 | 0.08   | 8.0%        | ⚠️ 硬上限 |
+        覆盖率验证:
+            | 图像尺寸 | N      | γ    | K_min | K_max  |
+            |----------|--------|------|-------|--------|
+            | 64×64    | 5461   | 0.53 | 55    | 720    |
+            | 224×224  | 5461   | 1.0  | 55    | 1365   |
+            | 512×512  | 5461   | 1.51 | 55    | 2061   |
+
+        I111-5: 恢复完整公式，确保尺度不变性。
 
         Args:
             candidate_count: N 候选区域数
-            image_size: 图像尺寸 (H, W)，用于自适应覆盖率计算
+            image_size: 图像尺寸 (H, W)，用于尺度因子计算
 
         Returns:
             (K_min, K_max): 动态边界元组
         """
-        # K_min: 相对下界 + 绝对下界保护
-        K_min = max(
-            self._K_min_abs,
-            int(math.ceil(self._token_coverage_min * candidate_count))
-        )
-
-        # K_max: 自适应覆盖率 × N + 硬上限保护
-        if self._use_adaptive_coverage and image_size is not None:
+        # 计算尺度因子
+        if image_size is not None:
             H, W = image_size
             min_dim = min(H, W)
-
-            # 缩放因子 γ
-            gamma = math.sqrt(min_dim / self._adaptive_reference_size)
-
-            # 自适应覆盖率 β(H, W)
-            beta_adaptive = self._token_coverage_base * gamma
-
-            # I109-3: 应用约束: β = min(β_max, β_adaptive)
-            # 简化公式，移除经验系数 3，让 max 值真正参与自适应计算
-            beta = min(
-                self._token_coverage_max,
-                beta_adaptive
-            )
+            scale_factor = math.sqrt(min_dim / K_ADAPTIVE_REFERENCE_SIZE)
         else:
-            # 退回到基准覆盖率
-            beta = self._token_coverage_base
+            scale_factor = 1.0
 
+        # 从配置获取参数
+        if self._use_config and self.config is not None:
+            coverage_min = self.config.coverage_min
+            coverage_max_hard = self.config.coverage_max_hard
+            K_min_abs = self.config.K_min_abs
+            K_max_hard = self.config.K_max_hard
+        else:
+            # 传统参数 (向后兼容)
+            coverage_min = K_COVERAGE_MIN
+            coverage_max_hard = K_COVERAGE_MAX_HARD
+            K_min_abs = K_MIN_HARD_LIMIT
+            K_max_hard = K_MAX_HARD_LIMIT
+
+        # 计算 K_min = max(K_min_abs, α × N)
+        K_min = max(
+            K_min_abs,
+            int(math.ceil(coverage_min * candidate_count))
+        )
+
+        # 计算 K_max = min(K_max_hard, β × γ × N)
         K_max = min(
-            self._K_max_hard,
-            int(math.ceil(beta * candidate_count))
+            K_max_hard,
+            int(math.ceil(coverage_max_hard * scale_factor * candidate_count))
         )
 
         return K_min, K_max
@@ -2257,9 +2293,11 @@ class GumbelTopKSplitter(
         
         # 2. Soft Entropy Loss
         if include_soft_entropy and probs is not None:
-            entropy_loss = self.get_depth_entropy_loss(weight=entropy_weight, probs=probs)
+            # I111-3: 使用配置中的基础权重
+            effective_weight = self._entropy_weight_base if self._use_config else entropy_weight
+            entropy_loss = self.get_depth_entropy_loss(weight=effective_weight, probs=probs)
 
-            if entropy_mode == 'target' and entropy_target is not None:
+            if self._entropy_mode == 'target' and entropy_target is not None:
                 # Target mode: minimize |H - H_target|²
                 B, N = probs.shape
                 # I103-3: 使用设备端缓存
@@ -2348,48 +2386,96 @@ class GumbelTopKSplitter(
         self,
         weight: float = 0.01,
         probs: Optional[Tensor] = None,
+        hard_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """
-        计算深度熵损失 (鼓励深度多样性)。
-        
-        数学形式化:
+        计算深度熵损失 (I111-3: 修复深度分布定义)
+
+        数学形式化
+        ==========
+
+        正确深度分布 (使用硬选择计数):
+            p_d = K_d / K_total
+            K_d = Σ_i hard_mask[b,i] × 1[depth_i = d]
+
+        熵 (Shannon Entropy):
             H = -Σ_d p_d log(p_d)
-            L_entropy = -weight × H  (最大化熵)
-            
+
+        动态权重 (I111-3):
+            λ = λ_base × max(1.0, H_target / (H + ε))
+            H_target = log(D) × (1 - 1/√D)
+
+        损失:
+            L = -λ × H  (最大化熵 → 最小化负熵)
+
+        修复内容 (I111-3):
+            1. 使用硬选择计数定义深度分布 (而非软概率期望)
+            2. 修复双重归一化问题
+            3. 动态调整熵权重
+
         Args:
-            weight: 损失权重
-            probs: [B, N] 分割概率 (可选，从缓存获取)
-            
+            weight: 基础损失权重
+            probs: [B, N] 分割概率 (可选，用于后备计算)
+            hard_mask: [B, N] 硬选择掩码 (可选，如果提供则使用硬计数)
+
         Returns:
             loss: 标量损失
         """
-        if probs is None:
-            return torch.tensor(0.0, device=self.candidate_regions.device)
+        device = self.candidate_regions.device
 
-        B, N = probs.shape
-        # I103-3: 使用设备端缓存
-        depths = self._get_device_tensor(
-            self.candidate_depths, "_cached_device_depths", probs.device
-        )  # [N]
-        D = self._current_max_depth + 1
+        # I111-3: 安全获取深度数
+        D = self._current_max_depth + 1 if self._current_max_depth is not None else 4
 
-        # P-OPT-7: 向量化深度平均概率计算 (消除 for 循环)
-        # 使用 one-hot 编码计算每个深度的平均概率
-        # p_d = mean(probs[:, depths == d]) = sum(probs × mask_d) / count_d
-        depth_onehot = F.one_hot(depths, D).float()  # [N, D]
-        depth_counts = depth_onehot.sum(dim=0).clamp(min=1.0)  # [D], 每个深度的候选数量
-        prob_sums = torch.einsum('bn,nd->d', probs, depth_onehot)  # [D], batch 求和
-        depth_probs = (prob_sums / (B * depth_counts)).clamp(min=PROB_EPSILON)  # [D], 平均概率
-        depth_probs = depth_probs / depth_probs.sum()  # 归一化
-        # I23-4: 归一化后再次 clamp，防止 FP16 下溢导致 log(0)
-        depth_probs = depth_probs.clamp(min=PROB_EPSILON)
-        
-        # 熵 (使用 log_softmax 等价形式提升稳定性)
-        # H = -Σ p_i log(p_i) = -Σ p_i (log_p_i) where log_p_i = log(p_i)
+        # 如果没有硬掩码，使用软概率 (向后兼容)
+        if hard_mask is None:
+            if probs is None:
+                return torch.tensor(0.0, device=device)
+            B, _ = probs.shape  # N 不直接使用
+            depths = self._get_device_tensor(
+                self.candidate_depths, "_cached_device_depths", probs.device
+            )  # [N]
+
+            # 软概率计算 (原有逻辑，保留用于向后兼容)
+            depth_onehot = F.one_hot(depths, D).float()  # [N, D]
+            depth_counts = depth_onehot.sum(dim=0).clamp(min=1.0)  # [D]
+            prob_sums = torch.einsum('bn,nd->d', probs, depth_onehot)  # [D]
+            depth_probs = (prob_sums / (B * depth_counts)).clamp(min=PROB_EPSILON)
+            depth_probs = depth_probs / depth_probs.sum()
+            depth_probs = depth_probs.clamp(min=PROB_EPSILON)
+        else:
+            # I111-3: 硬选择计数 (正确的深度分布定义)
+            B, _ = hard_mask.shape  # N 不直接使用
+            depths = self._get_device_tensor(
+                self.candidate_depths, "_cached_device_depths", device
+            )  # [N]
+
+            # 计算每个深度的硬选择数量
+            # K_d[b] = Σ_i hard_mask[b,i] × 1[depth_i = d]
+            depth_onehot = F.one_hot(depths, D).float()  # [N, D]
+            K_per_depth = torch.einsum('bn,nd->bd', hard_mask, depth_onehot)  # [B, D]
+
+            # 计算总选择数
+            K_total = K_per_depth.sum(dim=1, keepdim=True)  # [B, 1]
+
+            # 防止除零
+            K_total = K_total.clamp(min=1.0)
+
+            # 深度分布 p_d = K_d / K_total (对 batch 取平均)
+            depth_probs = (K_per_depth / K_total).mean(dim=0)  # [D]
+            depth_probs = depth_probs.clamp(min=PROB_EPSILON)
+            depth_probs = depth_probs / depth_probs.sum()
+
+        # 计算熵
         entropy = -(depth_probs * depth_probs.log()).sum()
-        
+
+        # I111-3: 动态权重调整
+        H_target = math.log(D) * (1.0 - 1.0 / math.sqrt(D))
+
+        # 动态权重: 当实际熵远低于目标时增加权重
+        dynamic_weight = weight * max(1.0, H_target / (entropy.item() + 1e-6))
+
         # 最大化熵 → 最小化负熵
-        loss = -weight * entropy
+        loss = -dynamic_weight * entropy
         return loss
 
     def get_quota_entropy_loss(
@@ -2479,56 +2565,162 @@ class GumbelTopKSplitter(
         if self.quota_logits is not None:
             self.quota_logits.requires_grad = enabled
 
+    # ========================================================================
+    # 深度分布监控 (I111-6)
+    # ========================================================================
+
+    def get_depth_distribution_tensor(
+        self,
+        selected_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        """
+        返回 GPU Tensor 格式的深度分布（避免 CPU 同步）。
+
+        数学形式
+        =========
+
+        深度分布 π 定义为各深度层级的 token 占比：
+
+            π_d = K_d / K_total
+
+        其中 K_d 是分配到深度 d 的 token 数，K_total = Σ K_j 是总 token 数。
+
+        使用 one-hot 编码 + einsum 实现完全向量化计算：
+
+            depth_onehot[depth_i, d] = 1 if depth_i == d else 0
+            depth_counts[d] = Σ_i selected_mask[i] × depth_onehot[depth_i, d]
+            π = depth_counts / Σ depth_counts
+
+        优势
+        ====
+
+        - 完全在 GPU 上计算，避免 CPU 同步开销
+        - 返回 GPU Tensor，支持后续 GPU 操作
+        - 时间复杂度 O(B × D)，空间复杂度 O(D)
+
+        Args:
+            selected_mask: [B, N] 二值选择掩码。如果为 None，使用缓存的 _last_selected_mask。
+
+        Returns:
+            pi: [D] GPU Tensor，深度概率分布。归一化后 Σ π_d = 1。
+        """
+        if selected_mask is None:
+            selected_mask = getattr(self, '_last_selected_mask', None)
+
+        if selected_mask is None or self._current_max_depth is None:
+            # 返回零向量（无有效数据时）
+            D = self._current_max_depth + 1 if self._current_max_depth is not None else 1
+            device = getattr(self, '_cached_device_depths', None)
+            if device is not None:
+                return torch.zeros(D, device=device.device)
+            return torch.zeros(D)
+
+        B, N = selected_mask.shape
+        device = selected_mask.device
+        D = self._current_max_depth + 1
+
+        # 向量化计算（完全 GPU）
+        depths = self._get_device_tensor(
+            self.candidate_depths, "_cached_device_depths", device
+        )  # [N]
+
+        # one-hot 编码: [N] → [N, D]
+        depth_onehot = F.one_hot(depths, D).float()
+
+        # 深度计数: [D] = Σ_{b,n} mask[b,n] × onehot[n,d]
+        depth_counts = torch.einsum('bn,nd->d', selected_mask, depth_onehot)
+
+        # 归一化
+        total = depth_counts.sum().clamp(min=1.0)
+        pi = depth_counts / total
+
+        return pi  # [D] GPU Tensor
+
     def get_depth_distribution(
         self,
         selected_mask: Optional[Tensor] = None,
+        return_tensor: bool = False,
     ) -> Dict[str, Any]:
         """
-        获取当前深度分布统计信息 (用于监控)。
+        获取完整深度分布统计信息（用于监控）。
+
+        数学形式
+        =========
+
+        1. 深度分布: π_d = K_d / K_total
+        2. Shannon 熵: H(π) = -Σ π_d × log(π_d)
+        3. 最大熵: H_max = log(D)（均匀分布时）
+        4. KL 散度: KL(π||U) = H_max - H(π)
+
+        诊断阈值
+        ========
+
+        - H(π) < 0.1: 深度坍缩（自适应失效）
+        - H(π) ∈ [0.5, H_max): 正常多样性
+        - KL(π||U) > 0.5: 严重不均，需干预
+
+        Args:
+            selected_mask: [B, N] 二值选择掩码
+            return_tensor: True 返回 GPU Tensor，False 返回 CPU list
 
         Returns:
             dict: {
-                'pi': [D] 深度分布,
-                'entropy': 熵,
-                'kl_from_uniform': KL(π || U),
+                'pi': Tensor/List,  # 深度分布 [D]
+                'entropy': float,   # Shannon 熵
+                'max_entropy': float,  # 最大可能熵 log(D)
+                'kl_from_uniform': float,  # KL(π || U)
+                'dominant_depth': int,  # 主导深度 argmax(π)
+                'dominant_prob': float,  # 主导深度概率 max(π)
+                'quota_probs': Optional[Tensor],  # 配额概率 [D]
             }
         """
         if selected_mask is None:
             selected_mask = getattr(self, '_last_selected_mask', None)
 
-        if selected_mask is None:
-            return {'pi': None, 'entropy': None, 'kl_from_uniform': None}
-
-        B, N = selected_mask.shape
-        device = selected_mask.device
-        # I103-3: 使用设备端缓存
-        depths = self._get_device_tensor(
-            self.candidate_depths, "_cached_device_depths", device
-        )  # [N]
-        D = self._current_max_depth + 1
-
-        with torch.no_grad():
-            # P-OPT-6: 向量化深度分布计算 (消除 for 循环)
-            # 使用 one-hot 编码 + einsum 一次性计算
-            depth_onehot = F.one_hot(depths, D).float()  # [N, D]
-            depth_counts = torch.einsum('bn,nd->d', selected_mask, depth_onehot)  # [D]
-            total = depth_counts.sum().clamp(min=1.0)
-            pi = depth_counts / total
-
-            # 熵 - P2-1 修复: 使用加性 epsilon 替代 clamp
-            pi_safe = pi + (pi == 0).float() * PROB_EPSILON
-            entropy = -(pi_safe * pi_safe.log()).sum().item()
-
-            # KL from uniform - P2-1 修复: 使用加性 epsilon
-            uniform = torch.ones(D, device=device) / D
-            kl = (pi_safe * (pi_safe.log() - uniform.log())).sum().item()
-
+        if selected_mask is None or self._current_max_depth is None:
+            D = self._current_max_depth + 1 if self._current_max_depth is not None else 1
+            zero_pi = torch.zeros(D)
             return {
-                'pi': pi.tolist(),
-                'entropy': entropy,
+                'pi': zero_pi if return_tensor else zero_pi.tolist(),
+                'entropy': 0.0,
                 'max_entropy': math.log(D),
-                'kl_from_uniform': kl,
+                'kl_from_uniform': math.log(D),
+                'dominant_depth': 0,
+                'dominant_prob': 1.0,
+                'quota_probs': None,
             }
+
+        # 使用 GPU Tensor API
+        pi = self.get_depth_distribution_tensor(selected_mask)
+        D = pi.size(0)
+
+        # 在 GPU 上计算所有标量
+        pi_safe = pi + (pi == 0).float() * PROB_EPSILON
+        entropy = -(pi_safe * pi_safe.log()).sum().item()
+        max_entropy = math.log(D)
+        kl = max_entropy - entropy
+
+        dominant_prob, dominant_depth = pi.max(dim=0)
+        dominant_depth = dominant_depth.item()
+        dominant_prob = dominant_prob.item()
+
+        # 获取配额概率
+        quota_probs = None
+        if hasattr(self, 'get_quota_probs'):
+            try:
+                quota_probs = self.get_quota_probs()
+            except Exception:
+                pass
+
+        return {
+            'pi': pi if return_tensor else pi.tolist(),
+            'entropy': entropy,
+            'max_entropy': max_entropy,
+            'kl_from_uniform': kl,
+            'dominant_depth': dominant_depth,
+            'dominant_prob': dominant_prob,
+            'quota_probs': quota_probs,
+        }
     
     # ========================================================================
     # 退火调度接口 (与 LearnableSplitter 兼容)
@@ -2857,46 +3049,26 @@ def create_gumbel_topk_from_config(
     max_level_limit: int = 8,
     hidden_dim: int = 128,
     pool_size: int = 4,
-    temperature: float = 1.0,
     image_size: Tuple[int, int] = (64, 64),
     K_min: int = 8,
     K_max: int = 64,
-    # I33: 覆盖率参数（用于正确复算 K 值）
-    token_coverage_min: float = 0.01,
-    token_coverage_max: float = 0.25,  # I109-3: 参与自适应计算
+    target_coverage: float = 0.12,  # I111-2: 简化覆盖率参数
     **kwargs
 ) -> GumbelTopKSplitter:
     """
-    从配置创建 GumbelTopKSplitter。
-
-    I30-17-EXT 更新: 支持动态深度计算
-        - 新 API: 使用 min_patch_size + max_level_limit
-        - 旧 API: 仍支持 max_depth (自动转换)
+    从配置创建 GumbelTopKSplitter (I111-1 统一配置版)。
 
     使用方法:
         ```python
-        from vit_pytorch.gumbel_topk_splitter import create_gumbel_topk_from_config
+        from vit_pytorch.gumbel_topk_splitter import create_gumbel_topk_splitter
 
-        # 新 API (推荐)
-        splitter = create_gumbel_topk_from_config(
+        splitter = create_gumbel_topk_splitter(
+            image_size=(224, 224),
             feature_dim=256,
-            min_patch_size=4,      # 目标最小 patch 大小
-            max_level_limit=8,     # 硬上限
-            K_min=8,
-            K_max=64,
-        )
-
-        # 旧 API (仍支持)
-        splitter = create_gumbel_topk_from_config(
-            feature_dim=256,
-            max_depth=3,           # 自动转换为 min_patch_size
-            K_min=8,
-            K_max=64,
+            min_patch_size=4,
+            max_level_limit=8,
         )
         ```
-
-    转换公式:
-        min_patch_size = min(H, W) / (2^max_depth)
     """
     # I30-17-EXT: 处理新旧 API 兼容
     if max_depth is not None and min_patch_size is None:
@@ -2908,27 +3080,285 @@ def create_gumbel_topk_from_config(
     if min_patch_size is None:
         min_patch_size = 4  # 默认值
 
-    # I33: 创建 SplitterConfig 传递覆盖率参数
-    # I145: 修复 intermediate_dim 计算，保持与训练时一致
-    # 之前使用 hidden_dim // 2 会改变模型架构，导致权重不匹配
-    # 现在直接使用 hidden_dim 作为 intermediate_dim
+    # I111-2: 创建简化 SplitterConfig
     config = SplitterConfig(
         feature_dim=feature_dim,
         min_patch_size=min_patch_size,
         max_level_limit=max_level_limit,
         hidden_dim=hidden_dim,
-        intermediate_dim=hidden_dim,  # 保持与 hidden_dim 一致，避免架构变化
+        intermediate_dim=hidden_dim,
         pool_size=pool_size,
-        dropout=0.1,  # 默认 dropout
+        dropout=0.1,
         K_min=K_min,
         K_max=K_max,
+        target_coverage=target_coverage,  # I111-2: 简化覆盖率
         use_dynamic_k=True,
-        token_coverage_min=token_coverage_min,
-        token_coverage_max=token_coverage_max,  # I109-3
     )
 
     return GumbelTopKSplitter(
         config=config,
         image_size=image_size,
-        temperature=temperature,
     )
+
+
+# ========================================================================
+# I111-6: 深度分布监控器 (Lazy Monitoring Pattern)
+# ========================================================================
+
+class DepthMonitor:
+    """
+    延迟深度分布监控器 (Lazy Monitoring Pattern)
+
+    数学基础
+    =========
+
+    - 深度分布 π 反映 token 的层级分配策略
+    - 实时计算 π_d = K_d / K_total
+    - Shannon 熵 H(π) 监控分布多样性
+    - KL(π||U) = log(D) - H(π) 量化与均匀分布的偏差
+
+    优势
+    ====
+
+    - 避免 forward 关键路径的 CPU 同步
+    - 仅在需要时（如 log_interval）计算
+    - 支持批量历史的统计
+    - 与现有 LazyDiagnostics 模式一致
+
+    使用方法
+    =======
+
+    ```python
+    monitor = DepthMonitor(splitter)
+    stats = monitor.update(global_step)
+
+    # 访问统计结果
+    print(f"Depth entropy: {stats['entropy']:.3f}")
+    print(f"KL divergence: {stats['kl_from_uniform']:.3f}")
+    print(f"Depth distribution: {stats['pi']}")
+    ```
+
+    Attributes:
+        _splitter: 关联的 GumbelTopKSplitter 实例
+        _cached_stats: 缓存的统计结果（避免重复计算）
+        _last_step: 上次更新的 step（用于检测需要更新的情况）
+        _history: 历史分布的滑动窗口 [W, D]
+    """
+
+    __slots__ = ('_splitter', '_cached_stats', '_last_step', '_history', '_history_max_size')
+
+    def __init__(
+        self,
+        splitter: 'GumbelTopKSplitter',
+        history_max_size: int = 100,
+    ):
+        """
+        初始化深度分布监控器。
+
+        Args:
+            splitter: 关联的 GumbelTopKSplitter 实例
+            history_max_size: 历史记录的滑动窗口大小（默认 100 个 epoch）
+        """
+        self._splitter = splitter
+        self._cached_stats: Optional[Dict[str, Any]] = None
+        self._last_step: int = -1
+        self._history: Optional[Tensor] = None
+        self._history_max_size = history_max_size
+
+    def update(self, step: int) -> Dict[str, Any]:
+        """
+        更新并返回深度分布统计（惰性计算）。
+
+        仅在 step 变化时才重新计算统计量。
+
+        Args:
+            step: 当前训练 step/epoch
+
+        Returns:
+            dict: 包含以下键的统计字典:
+                - 'pi': GPU Tensor [D]，深度分布
+                - 'entropy': float，Shannon 熵
+                - 'max_entropy': float，最大可能熵 log(D)
+                - 'kl_from_uniform': float，KL 散度
+                - 'dominant_depth': int，主导深度
+                - 'dominant_prob': float，主导深度概率
+                - 'pi_history': GPU Tensor [W, D]，历史分布（如果 history_max_size > 0）
+        """
+        if step != self._last_step:
+            self._compute_stats()
+            self._last_step = step
+
+        # 总是返回有效字典（_compute_stats 会填充）
+        return self._cached_stats or {
+            'pi': torch.zeros(1),
+            'entropy': 0.0,
+            'max_entropy': 0.0,
+            'kl_from_uniform': 0.0,
+            'dominant_depth': 0,
+            'dominant_prob': 1.0,
+            'quota_probs': None,
+            'pi_history': None,
+        }
+
+    def _compute_stats(self) -> None:
+        """在 GPU 上计算所有统计量（私有方法）。"""
+        splitter = self._splitter
+
+        # 获取深度分布
+        pi = splitter.get_depth_distribution_tensor()
+        D = pi.size(0)
+
+        # 计算熵（使用加性 epsilon 避免 log(0)）
+        pi_safe = pi + (pi == 0).float() * PROB_EPSILON
+        entropy = -(pi_safe * pi_safe.log()).sum()
+        max_entropy = math.log(D)
+        kl = max_entropy - entropy
+
+        # 主导深度
+        dominant_prob, dominant_depth = pi.max(dim=0)
+
+        # 配额概率
+        quota_probs = None
+        if hasattr(splitter, 'get_quota_probs'):
+            try:
+                quota_probs = splitter.get_quota_probs()
+            except Exception:
+                pass
+
+        # 更新历史（滑动窗口平均）
+        pi_history = self._update_history(pi)
+
+        self._cached_stats = {
+            'pi': pi,  # GPU Tensor
+            'entropy': entropy.item(),
+            'max_entropy': max_entropy,
+            'kl_from_uniform': kl.item(),
+            'dominant_depth': dominant_depth.item(),
+            'dominant_prob': dominant_prob.item(),
+            'quota_probs': quota_probs,
+            'pi_history': pi_history,  # 可能为 None
+        }
+
+    def _update_history(self, pi: Tensor) -> Optional[Tensor]:
+        """
+        维护最近 W 个 epoch 的深度分布历史（滑动窗口）。
+
+        数学形式
+        ========
+
+        使用循环缓冲区实现滑动窗口：
+
+            history[W] = [π_{-W+1}, π_{-W+2}, ..., π_0}]
+
+        Args:
+            pi: 当前深度分布 [D]
+
+        Returns:
+            历史分布张量 [W, D]（如果 history_max_size > 0），否则 None
+        """
+        if self._history_max_size <= 0:
+            return None
+
+        if self._history is None:
+            # 初始化历史缓冲区
+            self._history = pi.unsqueeze(0)  # [1, D]
+            return self._history
+
+        # 追加新值
+        self._history = torch.cat([self._history, pi.unsqueeze(0)], dim=0)  # [W+1, D]
+
+        # 截断到最大长度
+        if self._history.size(0) > self._history_max_size:
+            self._history = self._history[-self._history_max_size:]
+
+        return self._history
+
+    def get_entropy_ratio(self) -> float:
+        """
+        获取熵比率（当前熵 / 最大可能熵）。
+
+        数学形式
+        ========
+
+            ratio = H(π) / log(D)
+
+        诊断阈值
+        ========
+
+        - ratio < 0.1: 深度坍缩（自适应失效）
+        - ratio ∈ [0.3, 0.9]: 正常范围
+        - ratio > 0.95: 过度均匀（可能需要调整正则化）
+
+        Returns:
+            float: 熵比率
+        """
+        if self._cached_stats is None:
+            self.update(0)
+
+        # 使用 assert 确保类型安全
+        assert self._cached_stats is not None
+        stats = self._cached_stats
+        return stats['entropy'] / stats['max_entropy']
+
+    def get_health_score(self) -> float:
+        """
+        获取分割器健康评分。
+
+        数学形式
+        ========
+
+        综合考虑熵比率和 KL 散度：
+
+            score = w_1 × ratio + w_2 × (1 - normalized_kl)
+
+        其中：
+            ratio = H(π) / log(D)
+            normalized_kl = KL(π||U) / log(D)
+
+        Returns:
+            float: 健康评分 [0, 1]
+        """
+        if self._cached_stats is None:
+            self.update(0)
+
+        assert self._cached_stats is not None
+        stats = self._cached_stats
+
+        entropy_ratio = self.get_entropy_ratio()
+        kl = stats['kl_from_uniform']
+        max_entropy = stats['max_entropy']
+        kl_ratio = kl / max_entropy if max_entropy > 0 else 1.0
+
+        # 综合评分（权重 0.6 给熵，0.4 给 KL）
+        score = 0.6 * max(0, entropy_ratio) + 0.4 * (1.0 - min(1.0, kl_ratio))
+
+        return min(1.0, max(0.0, score))
+
+    def is_healthy(self, entropy_threshold: float = 0.1, kl_threshold: float = 0.5) -> bool:
+        """
+        判断分割器是否健康。
+
+        Args:
+            entropy_threshold: 熵阈值（低于此值认为不健康）
+            kl_threshold: KL 散度阈值（高于此值认为不健康）
+
+        Returns:
+            bool: 是否健康
+        """
+        if self._cached_stats is None:
+            self.update(0)
+
+        assert self._cached_stats is not None
+        stats = self._cached_stats
+
+        entropy = stats['entropy']
+        max_entropy = stats['max_entropy']
+        kl = stats['kl_from_uniform']
+
+        entropy_ratio = entropy / max_entropy if max_entropy > 0 else 0
+
+        return entropy_ratio >= entropy_threshold and kl <= kl_threshold
+
+    def reset_history(self) -> None:
+        """重置历史记录缓冲区。"""
+        self._history = None

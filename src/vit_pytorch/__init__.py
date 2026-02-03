@@ -62,7 +62,7 @@ from .embed_fractal_path import (
     HierarchicalAttentionBias,
     VectorizedPathEncoder,
 )
-from .model_fractal_vit import FractalCurveViT, create_fractal_vit
+from .model_fractal_vit import FractalCurveViT
 from .curve_hilbert import (
     HilbertCurve,
     PseudoHilbertCurve,
@@ -91,7 +91,6 @@ __all__ = [
     # === 主要模型 ===
     "StreamingFractalTokenizerV3",  # Variable Depth Tokenizer
     "FractalCurveViT",
-    "create_fractal_vit",  # I98-2: 工厂函数
     # === 配置与路径编码 ===
     "FractalConfig",
     "create_fractal_config",

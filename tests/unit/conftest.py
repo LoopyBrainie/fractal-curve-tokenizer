@@ -31,7 +31,7 @@ def splitter_base():
         image_size=(32, 32),
         hidden_dim=32,
         pool_size=2,
-        temperature=1.0,
+        # I111-1: temperature 参数已移至 SplitterConfig
         K_min=4,
         K_max=16,
     )
@@ -52,7 +52,7 @@ def splitter_with_quota():
         image_size=(64, 64),
         hidden_dim=32,
         pool_size=2,
-        temperature=1.0,
+        # I111-1: temperature 参数已移至 SplitterConfig
         K_min=8,
         K_max=32,
         learnable_quota=True,
@@ -74,7 +74,7 @@ def splitter_for_ema():
         image_size=(64, 64),
         hidden_dim=128,
         pool_size=2,
-        temperature=1.0,
+        # I111-1: temperature 参数已移至 SplitterConfig
         K_min=16,
         K_max=64,
         use_depth_variance_normalization=True,

@@ -28,8 +28,14 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional, Tuple
 import math
 
-# 导入默认常量（作为配置默认值）
+# 导入 I33 相对预算常量
 from .constants import (
+    K_COVERAGE_BASE,
+    K_COVERAGE_MIN,
+    K_COVERAGE_MAX_HARD,
+    K_MIN_HARD_LIMIT,
+    K_MAX_HARD_LIMIT,
+    K_ADAPTIVE_REFERENCE_SIZE,
     LEARNABLE_QUOTA_ENABLED,
     QUOTA_INIT_LOGITS,
     QUOTA_ENTROPY_WEIGHT,
@@ -37,16 +43,6 @@ from .constants import (
     LEVEL_BIAS_SCALE,
     SPLITTER_TEMP_START,
     SPLITTER_TEMP_END,
-    # I33: 相对预算常量
-    K_COVERAGE_BASE,
-    K_COVERAGE_MIN,
-    K_COVERAGE_MAX_HARD,
-    K_ADAPTIVE_REFERENCE_SIZE,
-    K_MAX_HARD_LIMIT,
-    K_MIN_HARD_LIMIT,
-    # I109-4: Elastic Budget 常量
-    ELASTIC_LAMBDA_TARGET,
-    ELASTIC_LAMBDA_BOUNDARY,
 )
 
 
@@ -61,103 +57,241 @@ TokenizerType = Literal['streaming_v1', 'streaming_v3']
 # ==================== Splitter 配置 ====================
 
 @dataclass
-class SplitterConfig:
+class HilbertSplitterConfig:
     """
-    GumbelTopKSplitter 配置
+    GumbelTopKSplitter 配置 (I111-4: 数学最优重构)
 
-    暴露参数 (基于数学形式化分析):
-    - enable_learnable_quota: impact=1.0 (离散) → 必须暴露
-    - quota_init_logits: impact=0.01×0.1=0.001 → 建议暴露
-    - quota_min_per_depth: impact=0.1×0.05=0.005 → 可选暴露
+    数学形式化
+    ==========
 
-    I33: 相对预算设计
-    ================
-    绝对预算 K=64 的问题:
-    - 64×64: 覆盖率 = 64/256 = 25% (过高)
-    - 224×224: 覆盖率 = 64/4096 = 1.6% (不足)
-    - 512×512: 覆盖率 = 64/16384 = 0.4% (严重不足)
+    Hilbert 曲线参数:
+        N_candidates = Σ(4^d), d=0..L = (4^(L+1) - 1) / 3
+        L_max = ⌈log₂(min(H,W) / P_min)⌉
 
-    相对预算公式:
-    - K_min = max(K_min_abs, α × N)
-    - K_max = min(K_max_hard, β × N)
-    - β(H, W) = β_0 × sqrt(min(H, W) / 224) 实现尺度不变性
+    相对预算公式 (I33):
+        K_min = max(K_min_abs, α × N)
+        K_max = min(K_max_hard, β × γ(H,W) × N)
+        γ(H,W) = √(min(H,W) / 224)
+
+    熵正则化 (自适应):
+        H_target = log(D) × (1 - 1/√D)
+
+    版本历史:
+        - v2.0 (2026-02-02): 重构配置层，反映 Hilbert 曲线数学结构
+                          移除简化参数，使用相对预算公式
     """
-    # 核心架构参数
-    feature_dim: int = 256
+
+    # ==================== Hilbert 曲线参数 ====================
+    # 最小 patch 尺寸 (像素)
     min_patch_size: int = 4
+
+    # 最大分区深度 (由图像尺寸动态计算，默认 8)
     max_level_limit: int = 8
+
+    # ==================== 覆盖率约束 (相对预算) ====================
+    # 基准覆盖率 (224×224 图像的目标采样率)
+    coverage_base: float = K_COVERAGE_BASE  # 0.03
+
+    # 覆盖率范围 [α, β] (用于计算 K 边界)
+    coverage_min: float = K_COVERAGE_MIN  # 0.01
+    coverage_max_hard: float = K_COVERAGE_MAX_HARD  # 0.25
+
+    # K 绝对边界 (硬限制)
+    K_min_abs: int = K_MIN_HARD_LIMIT  # 8
+    K_max_hard: int = K_MAX_HARD_LIMIT  # 4096
+
+    # 覆盖率自适应参考尺寸
+    adaptive_reference_size: int = K_ADAPTIVE_REFERENCE_SIZE  # 224
+
+    # ==================== 架构参数 ====================
+    feature_dim: int = 256
     hidden_dim: int = 64
     intermediate_dim: int = 64
     pool_size: int = 4
-
-    # Top-K 参数 (I33: 已废弃绝对值，保留兼容)
-    K_min: int = 8  # 废弃，使用 K_min_abs
-    K_max: int = 64  # 废弃，使用相对预算
     use_dynamic_k: bool = True
 
-    # I33: 相对预算参数 (替代绝对 K_min/K_max)
-    # 基准覆盖率 (224×224 目标 ~12%)
-    token_coverage_base: float = K_COVERAGE_BASE
-    # 最小覆盖率 (防止欠采样)
-    token_coverage_min: float = K_COVERAGE_MIN
-    # 最大覆盖率上限 (参与自适应计算，约束 β(H,W))
-    token_coverage_max: float = K_COVERAGE_MAX_HARD
-    # 自适应参考尺寸
-    adaptive_reference_size: int = K_ADAPTIVE_REFERENCE_SIZE
-    # 绝对下界保护
-    K_min_abs: int = K_MIN_HARD_LIMIT
-    # 显存硬上限
-    K_max_hard: int = K_MAX_HARD_LIMIT
-    # 是否启用自适应覆盖率
-    use_adaptive_coverage: bool = True
-
-    # 正则化参数
+    # ==================== 正则化参数 ====================
     dropout: float = 0.1
 
-    # I109-4: Elastic Budget 目标导向损失参数
-    elastic_lambda_target: float = ELASTIC_LAMBDA_TARGET
-    elastic_lambda_boundary: float = ELASTIC_LAMBDA_BOUNDARY
+    # Elastic Budget 目标导向损失参数 (I109-4)
+    elastic_lambda_target: float = 0.1
+    elastic_lambda_boundary: float = 0.1
 
-    # I30-10: 配额参数暴露
-    enable_learnable_quota: bool = LEARNABLE_QUOTA_ENABLED
-    quota_init_logits: Optional[Tuple[float, ...]] = None  # None = 使用默认
-    quota_min_per_depth: int = 2  # DEPRECATED: I96-7, 使用 quota_min_ratio 替代
-    quota_entropy_weight: float = QUOTA_ENTROPY_WEIGHT
+    # ==================== 配额参数 (方案 E) ====================
+    enable_learnable_quota: bool = LEARNABLE_QUOTA_ENABLED  # True
+    quota_init_logits: Optional[Tuple[float, ...]] = None
+    quota_entropy_weight: float = QUOTA_ENTROPY_WEIGHT  # 0.1
+    quota_min_ratio: float = 0.02  # I96-7: 最小采样比例
+    quota_min_lambda: float = 0.1  # 下界软正则化权重
 
-    # I30-10: 冻结控制
+    # ==================== 熵正则化 (I111-3) ====================
+    # 'adaptive': H_target = log(D) × (1 - 1/√D) (推荐)
+    # 'target': H_target = 固定值
+    # 'disabled': 不使用熵正则化
+    entropy_mode: str = 'adaptive'
+    entropy_weight_base: float = 0.1  # 基础权重 (动态调整)
+    entropy_target: Optional[float] = None  # 固定目标 (target 模式)
+
+    # ==================== 温度调度 (I111-1) ====================
+    temperature_init: float = SPLITTER_TEMP_START  # 1.0
+    temperature_min: float = SPLITTER_TEMP_END  # 0.5
+    temperature_anneal: str = 'cosine'
+    learnable_temperature: bool = True
+    temperature_warmup_steps: int = 1000
+
+    # ==================== 冻结控制 ====================
     freeze_quota: bool = False
+
+    # ==================== 验证与工具方法 ====================
 
     def get_quota_init_tensor(self, D: int) -> Tuple[float, ...]:
         """获取适合给定深度 D 的初始化 logits"""
         if self.quota_init_logits is not None:
-            # 使用用户提供的初始化
             init = list(self.quota_init_logits)
             if len(init) < D:
-                # 扩展为均匀分布
                 init.extend([0.0] * (D - len(init)))
             elif len(init) > D:
-                # 截断
                 init = init[:D]
             return tuple(init)
         else:
-            # 使用默认常量
-            if D <= len(QUOTA_INIT_LOGITS):
-                return QUOTA_INIT_LOGITS[:D]
-            else:
-                # 扩展为均匀分布
-                base = list(QUOTA_INIT_LOGITS)
-                base.extend([0.0] * (D - len(base)))
-                return tuple(base)
+            return tuple([0.0] * D)
 
-    # I24-4: 边界条件验证
+    def compute_candidate_count(self) -> int:
+        """计算四叉树候选节点总数 (I111-4)
+
+        数学公式: N = (4^(L+1) - 1) / 3
+        """
+        L = self.max_level_limit
+        return (4 ** (L + 1) - 1) // 3
+
+    def compute_k_bounds(
+        self,
+        image_size: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[int, int]:
+        """计算 K 边界 (I111-5: 完整相对预算公式)
+
+        数学公式:
+            N = (4^(L+1) - 1) / 3
+            γ = √(min(H,W) / 224)  (尺度因子)
+            K_min = max(K_min_abs, coverage_min × N)
+            K_max = min(K_max_hard, coverage_max_hard × γ × N)
+
+        Args:
+            image_size: 图像尺寸 (H, W)，用于尺度因子计算
+
+        Returns:
+            (K_min, K_max): 动态边界元组
+        """
+        # 计算候选节点总数
+        N = self.compute_candidate_count()
+
+        # 计算尺度因子
+        if image_size is not None:
+            H, W = image_size
+            min_dim = min(H, W)
+            scale_factor = math.sqrt(min_dim / self.adaptive_reference_size)
+        else:
+            scale_factor = 1.0
+
+        # 计算 K_min
+        K_min = max(
+            self.K_min_abs,
+            int(math.ceil(self.coverage_min * N))
+        )
+
+        # 计算 K_max
+        K_max = min(
+            self.K_max_hard,
+            int(math.ceil(self.coverage_max_hard * scale_factor * N))
+        )
+
+        return K_min, K_max
+
     def validate(self) -> None:
-        """验证配置参数的有效性"""
+        """验证配置参数的有效性 (I111-4: 数学一致性验证)"""
+
+        # Hilbert 曲线参数验证
+        if self.min_patch_size <= 0:
+            raise ValueError(f"min_patch_size 必须为正数, got {self.min_patch_size}")
         if self.max_level_limit < 2:
             raise ValueError(
-                "I24-4: max_level_limit >= 2 是推荐配置。"
-                f"当前 max_level_limit={self.max_level_limit} 是边界情况，"
-                "支持但可能导致不平衡的 token 分布。"
+                f"max_level_limit >= 2 是推荐配置, got {self.max_level_limit}"
             )
+
+        # 覆盖率参数验证
+        if not 0 < self.coverage_base <= 1.0:
+            raise ValueError(f"coverage_base 必须在 (0, 1] 范围内, got {self.coverage_base}")
+        if not 0 < self.coverage_min < self.coverage_max_hard <= 1.0:
+            raise ValueError(
+                f"coverage_min ({self.coverage_min}) < coverage_max_hard ({self.coverage_max_hard}) "
+                f"且都在 (0, 1] 范围内"
+            )
+
+        # K 边界验证 (I111-4: 覆盖率参数和 K 边界独立设置，不做交叉验证)
+        # 用户可以自由配置覆盖率参数和 K 边界，它们在实际使用时通过 compute_k_bounds() 协调
+
+        # 温度参数验证
+        if not 0 < self.temperature_min <= self.temperature_init:
+            raise ValueError(
+                f"temperature_min ({self.temperature_min}) 必须 < "
+                f"temperature_init ({self.temperature_init})"
+            )
+        if self.temperature_min < 0.3:
+            raise ValueError(
+                f"temperature_min ({self.temperature_min}) 必须 >= 0.3 "
+                "以避免梯度消失问题"
+            )
+        if self.temperature_anneal not in ('linear', 'exponential', 'cosine'):
+            raise ValueError(
+                f"temperature_anneal 必须是 'linear', 'exponential', 或 'cosine', "
+                f"got {self.temperature_anneal}"
+            )
+
+        # 熵模式验证
+        if self.entropy_mode not in ('adaptive', 'target', 'disabled'):
+            raise ValueError(
+                f"entropy_mode 必须是 'adaptive', 'target', 或 'disabled', "
+                f"got {self.entropy_mode}"
+            )
+
+    def to_dict(self) -> dict:
+        """转换为字典 (用于序列化)"""
+        return {
+            'min_patch_size': self.min_patch_size,
+            'max_level_limit': self.max_level_limit,
+            'coverage_base': self.coverage_base,
+            'coverage_min': self.coverage_min,
+            'coverage_max_hard': self.coverage_max_hard,
+            'K_min_abs': self.K_min_abs,
+            'K_max_hard': self.K_max_hard,
+            'adaptive_reference_size': self.adaptive_reference_size,
+            'feature_dim': self.feature_dim,
+            'hidden_dim': self.hidden_dim,
+            'intermediate_dim': self.intermediate_dim,
+            'pool_size': self.pool_size,
+            'use_dynamic_k': self.use_dynamic_k,
+            'dropout': self.dropout,
+            'elastic_lambda_target': self.elastic_lambda_target,
+            'elastic_lambda_boundary': self.elastic_lambda_boundary,
+            'enable_learnable_quota': self.enable_learnable_quota,
+            'quota_init_logits': self.quota_init_logits,
+            'quota_entropy_weight': self.quota_entropy_weight,
+            'quota_min_ratio': self.quota_min_ratio,
+            'quota_min_lambda': self.quota_min_lambda,
+            'entropy_mode': self.entropy_mode,
+            'entropy_weight_base': self.entropy_weight_base,
+            'entropy_target': self.entropy_target,
+            'temperature_init': self.temperature_init,
+            'temperature_min': self.temperature_min,
+            'temperature_anneal': self.temperature_anneal,
+            'learnable_temperature': self.learnable_temperature,
+            'temperature_warmup_steps': self.temperature_warmup_steps,
+            'freeze_quota': self.freeze_quota,
+        }
+
+
+# 向后兼容别名 (I111-4: 过渡期使用)
+SplitterConfig = HilbertSplitterConfig
 
 
 # ==================== Attention 配置 ====================
@@ -491,68 +625,135 @@ class AttentionEncoderConfig:
         }
 
 
-# ==================== 工厂函数 ====================
+# ==================== 工厂函数 (I111-4) ====================
 
 def create_splitter_config(
-    enable_learnable_quota: Optional[bool] = None,
-    quota_init_logits: Optional[Tuple[float, ...]] = None,
-    quota_min_per_depth: Optional[int] = None,
-    K_min: Optional[int] = None,
-    K_max: Optional[int] = None,
-    freeze_quota: Optional[bool] = None,
-    # I33: 相对预算参数
-    token_coverage_base: Optional[float] = None,
-    token_coverage_min: Optional[float] = None,
-    token_coverage_max: Optional[float] = None,  # I109-3: 参与自适应计算
-    adaptive_reference_size: Optional[int] = None,
+    # 核心参数
+    min_patch_size: Optional[int] = None,
+    max_level_limit: Optional[int] = None,
+    coverage_base: Optional[float] = None,
+    coverage_min: Optional[float] = None,
+    coverage_max_hard: Optional[float] = None,
     K_min_abs: Optional[int] = None,
     K_max_hard: Optional[int] = None,
-    use_adaptive_coverage: Optional[bool] = None,
+    adaptive_reference_size: Optional[int] = None,
+    # 架构参数
+    feature_dim: Optional[int] = None,
+    hidden_dim: Optional[int] = None,
+    intermediate_dim: Optional[int] = None,
+    pool_size: Optional[int] = None,
+    use_dynamic_k: Optional[bool] = None,
+    dropout: Optional[float] = None,
+    # 正则化参数
+    elastic_lambda_target: Optional[float] = None,
+    elastic_lambda_boundary: Optional[float] = None,
+    enable_learnable_quota: Optional[bool] = None,
+    quota_init_logits: Optional[Tuple[float, ...]] = None,
+    quota_entropy_weight: Optional[float] = None,
+    quota_min_ratio: Optional[float] = None,
+    quota_min_lambda: Optional[float] = None,
+    # 熵正则化
+    entropy_mode: Optional[str] = None,
+    entropy_weight_base: Optional[float] = None,
+    entropy_target: Optional[float] = None,
+    # 温度调度
+    temperature_init: Optional[float] = None,
+    temperature_min: Optional[float] = None,
+    temperature_anneal: Optional[str] = None,
+    learnable_temperature: Optional[bool] = None,
+    temperature_warmup_steps: Optional[int] = None,
+    # 冻结控制
+    freeze_quota: Optional[bool] = None,
     **kwargs,
-) -> SplitterConfig:
+) -> HilbertSplitterConfig:
     """
-    工厂函数: 创建 SplitterConfig（用于 CLI 参数解析）
+    工厂函数: 创建 HilbertSplitterConfig（用于 CLI 参数解析）
 
-    数学保证:
-        配置参数影响度经过消融实验验证
-
-    I33: 相对预算设计
-    ================
-    相对预算公式:
+    数学保证
+    =========
+    相对预算公式 (I33):
         K_min = max(K_min_abs, α × N)
-        K_max = min(K_max_hard, β × N)
-        β(H, W) = β_0 × sqrt(min(H, W) / 224)
+        K_max = min(K_max_hard, β × γ(H,W) × N)
+        γ(H,W) = √(min(H,W) / 224)
+
+    版本历史:
+        - v2.0 (2026-02-02): 使用 HilbertSplitterConfig，重构参数命名
     """
-    config = SplitterConfig()
+    config = HilbertSplitterConfig()
 
-    if enable_learnable_quota is not None:
-        config.enable_learnable_quota = enable_learnable_quota
-    if quota_init_logits is not None:
-        config.quota_init_logits = quota_init_logits
-    if quota_min_per_depth is not None:
-        config.quota_min_per_depth = quota_min_per_depth
-    if K_min is not None:
-        config.K_min = K_min
-    if K_max is not None:
-        config.K_max = K_max
-    if freeze_quota is not None:
-        config.freeze_quota = freeze_quota
+    # Hilbert 曲线参数
+    if min_patch_size is not None:
+        config.min_patch_size = min_patch_size
+    if max_level_limit is not None:
+        config.max_level_limit = max_level_limit
 
-    # I33: 相对预算参数
-    if token_coverage_base is not None:
-        config.token_coverage_base = token_coverage_base
-    if token_coverage_min is not None:
-        config.token_coverage_min = token_coverage_min
-    if token_coverage_max is not None:
-        config.token_coverage_max = token_coverage_max  # I109-3
-    if adaptive_reference_size is not None:
-        config.adaptive_reference_size = adaptive_reference_size
+    # 覆盖率约束
+    if coverage_base is not None:
+        config.coverage_base = coverage_base
+    if coverage_min is not None:
+        config.coverage_min = coverage_min
+    if coverage_max_hard is not None:
+        config.coverage_max_hard = coverage_max_hard
     if K_min_abs is not None:
         config.K_min_abs = K_min_abs
     if K_max_hard is not None:
         config.K_max_hard = K_max_hard
-    if use_adaptive_coverage is not None:
-        config.use_adaptive_coverage = use_adaptive_coverage
+    if adaptive_reference_size is not None:
+        config.adaptive_reference_size = adaptive_reference_size
+
+    # 架构参数
+    if feature_dim is not None:
+        config.feature_dim = feature_dim
+    if hidden_dim is not None:
+        config.hidden_dim = hidden_dim
+    if intermediate_dim is not None:
+        config.intermediate_dim = intermediate_dim
+    if pool_size is not None:
+        config.pool_size = pool_size
+    if use_dynamic_k is not None:
+        config.use_dynamic_k = use_dynamic_k
+    if dropout is not None:
+        config.dropout = dropout
+
+    # 正则化参数
+    if elastic_lambda_target is not None:
+        config.elastic_lambda_target = elastic_lambda_target
+    if elastic_lambda_boundary is not None:
+        config.elastic_lambda_boundary = elastic_lambda_boundary
+    if enable_learnable_quota is not None:
+        config.enable_learnable_quota = enable_learnable_quota
+    if quota_init_logits is not None:
+        config.quota_init_logits = quota_init_logits
+    if quota_entropy_weight is not None:
+        config.quota_entropy_weight = quota_entropy_weight
+    if quota_min_ratio is not None:
+        config.quota_min_ratio = quota_min_ratio
+    if quota_min_lambda is not None:
+        config.quota_min_lambda = quota_min_lambda
+
+    # 熵正则化
+    if entropy_mode is not None:
+        config.entropy_mode = entropy_mode
+    if entropy_weight_base is not None:
+        config.entropy_weight_base = entropy_weight_base
+    if entropy_target is not None:
+        config.entropy_target = entropy_target
+
+    # 温度调度
+    if temperature_init is not None:
+        config.temperature_init = temperature_init
+    if temperature_min is not None:
+        config.temperature_min = temperature_min
+    if temperature_anneal is not None:
+        config.temperature_anneal = temperature_anneal
+    if learnable_temperature is not None:
+        config.learnable_temperature = learnable_temperature
+    if temperature_warmup_steps is not None:
+        config.temperature_warmup_steps = temperature_warmup_steps
+
+    # 冻结控制
+    if freeze_quota is not None:
+        config.freeze_quota = freeze_quota
 
     # 应用额外参数
     for key, value in kwargs.items():
