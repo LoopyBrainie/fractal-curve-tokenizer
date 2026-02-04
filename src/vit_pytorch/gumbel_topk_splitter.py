@@ -2634,8 +2634,20 @@ class GumbelTopKSplitter(
         
         # 一次性获取所有选中位置 [total_selected, 2] -> (batch_idx, candidate_idx)
         selected_positions = final_selected.nonzero(as_tuple=False)  # [total, 2]
-        batch_indices = selected_positions[:, 0]  # [total]
-        candidate_indices = selected_positions[:, 1]  # [total]
+
+        # I99-1: 防御性边界检查 - 确保 nonzero() 返回的索引在有效范围内
+        # torch.compile 优化可能暴露潜在的索引问题
+        batch_indices_raw = selected_positions[:, 0]  # [total]
+        candidate_indices_raw = selected_positions[:, 1]  # [total]
+
+        # Clamp indices to valid ranges
+        batch_indices = batch_indices_raw.clamp(min=0, max=B - 1)
+        candidate_indices = candidate_indices_raw.clamp(min=0, max=N - 1)
+
+        # I99-1: 额外验证 - 如果 nonzero 返回空张量，创建安全的默认值
+        if selected_positions.shape[0] == 0:
+            batch_indices = torch.zeros(1, dtype=torch.long, device=device)
+            candidate_indices = torch.zeros(1, dtype=torch.long, device=device)
 
         # 向量化索引所有候选属性 - I103-3: 使用缓存
         regions = self._get_device_tensor(

@@ -231,6 +231,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         防御性边界检查:
             - batch_indices ∈ [0, B-1]
             - depths ∈ [0, max_level]
+            - hilbert_indices ∈ [0, max_hilbert-1]
             - token_indices ∈ [0, num_tokens-1]
 
         Args:
@@ -244,6 +245,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         device = tensor_result.batch_indices.device
         dtype = tensor_result.batch_indices.dtype
+        num_tokens = tensor_result.num_tokens
 
         # Clamp batch_indices 到 [0, B-1]
         batch_indices_clamped = tensor_result.batch_indices.clamp(min=0, max=B - 1)
@@ -251,8 +253,17 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # Clamp depths 到 [0, max_level]
         depths_clamped = tensor_result.depths.clamp(min=0, max=self.max_level)
 
+        # I99-1: Clamp hilbert_indices 到有效范围 [0, num_tokens-1]
+        # hilbert_indices 用于 argsort 和索引，必须有效
+        if num_tokens > 0:
+            hilbert_indices = tensor_result.hilbert_indices
+            hilbert_min = hilbert_indices.min().clamp(min=0)
+            hilbert_max = hilbert_indices.max().clamp(max=num_tokens - 1)
+            hilbert_indices_clamped = hilbert_indices.clamp(min=hilbert_min, max=hilbert_max)
+        else:
+            hilbert_indices_clamped = tensor_result.hilbert_indices
+
         # Clamp token_indices 到有效范围
-        num_tokens = tensor_result.num_tokens
         token_indices = torch.arange(num_tokens, dtype=torch.long, device=device)
         token_indices_clamped = token_indices.clamp(min=0, max=max(1, num_tokens) - 1)
 
@@ -260,6 +271,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         if (
             torch.equal(batch_indices_clamped, tensor_result.batch_indices)
             and torch.equal(depths_clamped, tensor_result.depths)
+            and torch.equal(hilbert_indices_clamped, tensor_result.hilbert_indices)
         ):
             return tensor_result
 
@@ -268,9 +280,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             regions=tensor_result.regions,
             depths=depths_clamped,
             batch_indices=batch_indices_clamped,
-            hilbert_indices=tensor_result.hilbert_indices,
+            hilbert_indices=hilbert_indices_clamped,
             token_indices=token_indices_clamped,
             complexities=tensor_result.complexities,
+            tokens_per_batch=getattr(tensor_result, 'tokens_per_batch', None),
         )
 
     # =====================================================================
