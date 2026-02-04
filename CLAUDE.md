@@ -180,5 +180,5 @@ splitter = getattr(tokenizer, 'splitter', None) if tokenizer else None
 ## Documentation
 
 - [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md): Issue tracker with mathematical analysis
-- [documents/](documents/): Architecture deep-dives (chapters 00-11)
+- [docs/](docs): Architecture deep-dives (chapters 00-11)
 - [docs/10_testing_qa.md](docs/10_testing_qa.md): Testing guidelines

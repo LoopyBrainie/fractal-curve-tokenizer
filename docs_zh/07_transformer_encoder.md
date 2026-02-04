@@ -540,7 +540,7 @@ output = transformer(x, levels_info, mask, regions=regions, image_size=image_siz
 | `LAYER_NORM_EPS` | 1e-5 | LayerNorm 方差 |
 | `SPLITTER_TEMP_START` | 1.0 | 初始 Gumbel 温度 |
 | `SPLITTER_TEMP_END` | 0.5 | 最终 Gumbel 温度 |
-| `TEMPERATURE_MIN` | 0.1 | 最小温度 |
+| `TEMPERATURE_MIN` | 0.3 | 最小温度 (T < 0.3 时梯度爆炸) |
 | `DEPTH_KL_WEIGHT` | 0.5 | 深度平衡 KL 权重 |
 | `DEPTH_QUOTA_TARGET` | - | 配额目标分布 |
 | `LEARNABLE_QUOTA_ENABLED` | True | 方案 E 配额分配 |

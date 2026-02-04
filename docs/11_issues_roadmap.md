@@ -474,7 +474,7 @@ All items in I17 (End-to-End Learnable Splitter) have been subsumed by **Scheme 
 | ID | Issue | Solution |
 |:---|:------|:---------|
 | I18-1 | Soft Entropy gradient block | Use cached MLP probabilities |
-| I18-2 | Temperature unsafe lower bound | Force `TEMPERATURE_MIN = 0.1` |
+| I18-2 | Temperature unsafe lower bound | Force `TEMPERATURE_MIN = 0.1` (later updated to 0.3 in I24-7) |
 | I18-5 | Temperature learning constraint | Added clamp to learner |
 
 ---

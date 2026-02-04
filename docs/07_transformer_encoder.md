@@ -540,7 +540,7 @@ All constants are centralized in `constants.py`:
 | `LAYER_NORM_EPS` | 1e-5 | LayerNorm variance |
 | `SPLITTER_TEMP_START` | 1.0 | Initial Gumbel temperature |
 | `SPLITTER_TEMP_END` | 0.5 | Final Gumbel temperature |
-| `TEMPERATURE_MIN` | 0.1 | Minimum temperature |
+| `TEMPERATURE_MIN` | 0.3 | Minimum temperature (gradient explosion below) |
 | `DEPTH_KL_WEIGHT` | 0.5 | Depth balance KL weight |
 | `DEPTH_QUOTA_TARGET` | - | Quota target distribution |
 | `LEARNABLE_QUOTA_ENABLED` | True | Scheme E quota allocation |
