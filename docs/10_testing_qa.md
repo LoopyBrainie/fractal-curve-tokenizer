@@ -123,7 +123,39 @@ uv run pytest tests/ -n auto -v
 
 ---
 
-## 10.5 Benchmarks
+## 10.5 CUDA 调试指南
+
+### CUDA Device-Side Assert
+
+如遇 CUDA device-side assert 错误（如 `IndexKernel.cu:92 index out of bounds`），设置以下环境变量使错误同步报告：
+
+```bash
+# Windows PowerShell
+$env:CUDA_LAUNCH_BLOCKING = "1"
+$env:PYTORCH_NO_CUDA_MEMORY_CACHING = "1"
+
+# Linux/macOS Bash
+export CUDA_LAUNCH_BLOCKING=1
+export PYTORCH_NO_CUDA_MEMORY_CACHING=1
+```
+
+### 常见 CUDA 错误
+
+| 错误 | 原因 | 解决方案 |
+|:-----|:-----|:---------|
+| `index out of bounds` | batch_indices 包含越界值 | 检查 clamp 逻辑 |
+| `cublasLt` | 数值不稳定 | 检查输入 normalization |
+| `memcpy` | 内存访问违规 | 检查 tensor 形状匹配 |
+
+### 调试技巧
+
+1. **使用 `.item()` 在 CPU 端验证**：避免在 CUDA tensor 上调用 `.min()`/`.max()`
+2. **使用 `torch.where` 条件 clamp**：避免 reduction 操作触发 assert
+3. **添加诊断信息**：`torch.where(condition, valid_value, safe_default)`
+
+---
+
+## 10.6 Benchmarks
 
 ### Core Comparison (`compare_fractal_vs_standard.py`)
 

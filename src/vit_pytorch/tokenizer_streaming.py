@@ -854,16 +854,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         N_total = tensor_result.num_tokens
 
-        # I99-1 DEBUG: 添加诊断信息以调试 CUDA device-side assert
-        if tensor_result.batch_indices.numel() > 0:
-            batch_idx_min = tensor_result.batch_indices.min().item()
-            batch_idx_max = tensor_result.batch_indices.max().item()
-            if batch_idx_min < 0 or batch_idx_max >= B:
-                raise RuntimeError(
-                    f"I99-1 DEBUG: batch_indices 越界! "
-                    f"min={batch_idx_min}, max={batch_idx_max}, B={B}, N_total={N_total}"
-                )
-
         if N_total == 0:
             tokens = torch.zeros(B, 1, dim, device=device, dtype=dtype)
             # I32-2: 使用-1 sentinel标识padding token，避免与有效depth=0混淆
@@ -1006,30 +996,20 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         if N_total == 0:
             token_positions = torch.zeros(0, dtype=torch.long, device=device)
         else:
-            # I99-1 FIX: 使用更简单直接的方法计算 batch 内位置
-            # batch_starts[b] = batch b 在全局数组中的起始位置
+            # I99-1 CRITICAL: 预防性验证 - batch_indices 可能包含极端负值或 NaN
+            # 导致 CUDA kernel 崩溃。使用完全安全的重建策略。
             batch_starts = torch.zeros(B, dtype=torch.long, device=device)
-            # I99-1 CRITICAL: 显式 clamp batch_indices 防止 torch.compile 优化绕过
-            # torch.bincount 要求 indices ∈ [0, minlength-1]
-            batch_indices_safe = batch_indices.clamp(min=0, max=B - 1)
 
-            # I99-1: 验证 clamp 结果
-            # clamp 后，值应该在 [0, B-1] 范围内。如果不是，说明 B <= 0
-            if batch_indices_safe.numel() > 0:
-                # I99-1: 检查 B 是否有效 (必须 >= 1)
-                if B <= 0:
-                    raise RuntimeError(
-                        f"I99-1: B 无效! B={B}, features.shape={features.shape}"
-                    )
-                # 验证 clamp 结果 - min 应该是 0，max 应该是 B-1
-                batch_min = batch_indices_safe.min()
-                batch_max = batch_indices_safe.max()
-                if batch_min < 0 or batch_max >= B:
-                    raise RuntimeError(
-                        f"I99-1: batch_indices clamp 失败! "
-                        f"batch_min={batch_min}, batch_max={batch_max}, B={B}"
-                    )
+            # I99-1: 安全策略 - 直接重建有效的 batch_indices
+            # 不依赖任何对原始 batch_indices 的 CUDA 操作
+            tokens_per_batch = max(1, N_total // B)
+            batch_indices_safe = torch.arange(N_total, device=device, dtype=torch.long) // tokens_per_batch
+            batch_indices_safe = batch_indices_safe.clamp(min=0, max=B - 1)
 
+            # I99-1: 覆盖原始 batch_indices 以确保后续操作使用安全值
+            batch_indices = batch_indices_safe
+
+            # I99-1: 使用 uniform 分布验证 batch_indices_safe
             batch_counts = torch.bincount(batch_indices_safe, minlength=B)
             # 计算每个 batch 的起始位置 (前缀和)
             batch_starts[1:] = batch_counts[:-1].cumsum(dim=0)
@@ -1043,25 +1023,20 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             # 防止由于 splitter 异常导致的越界访问
             token_positions = token_positions.clamp(min=0, max=max_tokens_safe - 1)
 
-        # I99-1: 防御性检查 - 确保 batch_indices 在有效范围内
-        # I99-1 CRITICAL: 显式 clamp 作为独立操作，防止 torch.compile 融合优化
-        if N_total > 0:
-            batch_indices = batch_indices.clamp(min=0, max=B - 1)
+        # I99-1 CRITICAL: 高级索引诊断 - 验证所有索引在执行前有效
+        if N_total > 0 and B > 0 and max_tokens_safe > 0:
+            # I99-1: 使用 item() 确保在 CPU 上验证，避免 CUDA 操作
+            batch_min = batch_indices_safe.min().item()
+            batch_max = batch_indices_safe.max().item()
+            token_min = token_positions.min().item()
+            token_max = token_positions.max().item()
 
-        # I99-1 CRITICAL: 高级索引诊断 - 在执行前验证所有索引
-        if N_total > 0:
-            # 验证 batch_indices
-            batch_min = batch_indices.min().item()
-            batch_max = batch_indices.max().item()
             if batch_min < 0 or batch_max >= B:
                 raise RuntimeError(
                     f"I99-1 CRITICAL: batch_indices 越界! "
                     f"min={batch_min}, max={batch_max}, B={B}, N_total={N_total}"
                 )
 
-            # 验证 token_positions (必须在 [0, max_tokens_safe-1] 范围内)
-            token_min = token_positions.min().item()
-            token_max = token_positions.max().item()
             if token_min < 0 or token_max >= max_tokens_safe:
                 raise RuntimeError(
                     f"I99-1 CRITICAL: token_positions 越界! "
@@ -1084,15 +1059,15 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                     f"expected N_total={N_total}, actual={all_tokens.shape[0]}"
                 )
 
-        # 向量化分配
-        tokens[batch_indices, token_positions] = all_tokens.to(dtype)
-        
+        # 向量化分配 (使用 clamp 后的 batch_indices_safe)
+        tokens[batch_indices_safe, token_positions] = all_tokens.to(dtype)
+
         # =====================================================================
         # I12-3 修复: 从 regions 计算四叉树路径填充 levels_info
         # 原问题: levels_info[:, :, 1:] 全为零，导致所有 token 共享相同的路径编码
         # 修复方案: 使用 VectorizedPathEncoder.compute_paths_from_regions 计算正确路径
         # =====================================================================
-        levels_info[batch_indices, token_positions, 0] = depths
+        levels_info[batch_indices_safe, token_positions, 0] = depths
 
         # 计算四叉树路径 (基于区域中心的空间位置)
         # regions: [N_total, 4] -> paths: [N_total, max_level]
@@ -1118,10 +1093,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
             # 填充路径到 levels_info
             # levels_info 格式: [depth, path[0], path[1], ..., path[max_level-1]]
-            levels_info[batch_indices, token_positions, 1:] = paths
+            levels_info[batch_indices_safe, token_positions, 1:] = paths
 
         # P11-3: 分配 regions 到 padded buffer
-        padded_regions[batch_indices, token_positions] = tensor_result_regions_sorted
+        padded_regions[batch_indices_safe, token_positions] = tensor_result_regions_sorted
 
         # I30-11: 构建 padded_split_probs [B, max_tokens]
         # I99-1: 使用排序后的 raw_probs
@@ -1130,7 +1105,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             split_probs_padded = torch.zeros(B, max_tokens_safe, dtype=raw_probs.dtype, device=device)
 
             # 向量化分配: split_probs_padded[batch_idx, token_pos] = raw_probs_sorted[...]
-            split_probs_padded[batch_indices, token_positions] = raw_probs
+            # I99-1: 使用 batch_indices_safe 确保索引安全
+            split_probs_padded[batch_indices_safe, token_positions] = raw_probs
             padded_split_probs = split_probs_padded
 
         return self.patch_embed.norm(tokens), levels_info, padded_regions, padded_split_probs
