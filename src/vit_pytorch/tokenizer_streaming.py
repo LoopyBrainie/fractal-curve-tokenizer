@@ -255,11 +255,11 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         # I99-1: Clamp hilbert_indices 到有效范围 [0, num_tokens-1]
         # hilbert_indices 用于 argsort 和索引，必须有效
+        # 关键：直接 clamp 到 [0, num_tokens-1]，而不是使用 min/max
         if num_tokens > 0:
-            hilbert_indices = tensor_result.hilbert_indices
-            hilbert_min = hilbert_indices.min().clamp(min=0)
-            hilbert_max = hilbert_indices.max().clamp(max=num_tokens - 1)
-            hilbert_indices_clamped = hilbert_indices.clamp(min=hilbert_min, max=hilbert_max)
+            hilbert_indices_raw = tensor_result.hilbert_indices
+            # 直接 clamp 到有效范围，不依赖原始值的 min/max
+            hilbert_indices_clamped = hilbert_indices_raw.clamp(min=0, max=num_tokens - 1)
         else:
             hilbert_indices_clamped = tensor_result.hilbert_indices
 
@@ -586,8 +586,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
             if tensor_result.num_tokens > 0:
                 count_matrix = torch.zeros(B, max_d, dtype=torch.long, device=device)
+                # I99-1: clamp batch_indices 到 [0, B-1] 防止 scatter_add_ 越界
+                batch_indices_clamped = batch_indices.clamp(min=0, max=B - 1)
                 # I78: 添加 min clamp 防止负索引 (M3 修复)
-                flat_idx = batch_indices * max_d + depths.clamp(min=0, max=max_d - 1)
+                flat_idx = batch_indices_clamped * max_d + depths.clamp(min=0, max=max_d - 1)
                 ones = torch.ones_like(flat_idx)
                 count_matrix.view(-1).scatter_add_(0, flat_idx, ones)
             else:
