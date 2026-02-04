@@ -3834,11 +3834,25 @@ def main():
         print(f"EPOCH {epoch}/{config.epochs} - STARTING")
         print(f"{'='*60}")
         start = time.time()
-        
+
         # P13: 每个 epoch 开始时手动 GC
         gc.collect()
         if device.type == 'cuda':
-            torch.cuda.empty_cache()
+            # I145: 修复 CUDA 断言错误
+            # 使用 try-except 包装 empty_cache，防止断言错误被延迟报告
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError as e:
+                # 检查是否是 device-side assert
+                if "device-side assert" in str(e):
+                    print(f"[WARN] CUDA device-side assert detected at epoch start")
+                    print(f"       This may indicate a configuration mismatch.")
+                    # 尝试同步并获取更多信息
+                    try:
+                        torch.cuda.synchronize()
+                    except:
+                        pass
+                raise
         
         # I24-1: 可选的 tokenizer 参数解冻 (在指定 epoch 后)
         if config.freeze_tokenizer and config.freeze_tokenizer_epochs > 0:

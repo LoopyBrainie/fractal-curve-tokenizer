@@ -73,5 +73,4 @@ uv run python src/training/train_fractal_vit.py \
   --channels-last \
   --include-soft-entropy \
   --include-elastic-budget \
-  --warmup-epochs 10 \
-  --exp-name tiny_imagenet_384d_8l_bs192_ep200_v1
+  --warmup-epochs 10 

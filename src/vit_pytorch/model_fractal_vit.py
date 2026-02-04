@@ -1686,12 +1686,21 @@ class FractalCurveViT(nn.Module):
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 
             # 启用 cuDNN SDP - 使用 cuDNN 内核的 Flash Attention
-            torch.backends.cuda.enable_cudnn_sdp(True)
+            # I145: 修复 - 添加异常处理防止断言错误
+            try:
+                torch.backends.cuda.enable_cudnn_sdp(True)
+            except Exception as e:
+                import warnings
+                warnings.warn(f"无法启用 cuDNN SDP: {e}，使用默认后端")
 
         # 配置 inductor 优化
-        torch._inductor.config.max_autotune = True
-        torch._inductor.config.cudnn_sdp = True  # 启用 cuDNN attention
-        torch._inductor.config.coordinate_descent_tuning = True
+        try:
+            torch._inductor.config.max_autotune = True
+            torch._inductor.config.cudnn_sdp = True  # 启用 cuDNN attention
+            torch._inductor.config.coordinate_descent_tuning = True
+        except Exception as e:
+            import warnings
+            warnings.warn(f"Inductor 配置失败: {e}")
 
         # 编译模型
         self = torch.compile(self, mode=mode, dynamic=dynamic, fullgraph=fullgraph)

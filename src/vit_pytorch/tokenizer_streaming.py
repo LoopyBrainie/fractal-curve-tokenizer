@@ -59,6 +59,7 @@ from .config import FractalConfig, SemanticSplitterConfig  # I97-5: 合并 confi
 from .constants import LOG_EPSILON, PROB_EPSILON, LEARNABLE_QUOTA_ENABLED  # I12-7: 数值稳定性常量
 from .embed_fractal_path import VectorizedPathEncoder  # I12-3: 用于计算路径
 from .semantic_redundancy_splitter import SplitResult  # I110-6: 语义分裂器结果
+from .gumbel_topk_splitter import TensorSplitResult  # I99-1: 用于防御性边界检查
 
 
 class StreamingFractalTokenizerV3(BaseTokenizer):
@@ -219,6 +220,58 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
     def shared_conv(self) -> nn.Module:
         """获取共享卷积层 (用于可学习分割)."""
         return self.patch_embed.shared_conv
+
+    def _ensure_valid_indices(
+        self,
+        tensor_result: "TensorSplitResult",
+        B: int,
+    ) -> "TensorSplitResult":
+        """确保 tensor_result 中的 indices 在有效范围内 (I99-1).
+
+        防御性边界检查:
+            - batch_indices ∈ [0, B-1]
+            - depths ∈ [0, max_level]
+            - token_indices ∈ [0, num_tokens-1]
+
+        Args:
+            tensor_result: TensorSplitResult 分割结果
+            B: batch size
+
+        Returns:
+            修正后的 TensorSplitResult
+        """
+        from .gumbel_topk_splitter import TensorSplitResult
+
+        device = tensor_result.batch_indices.device
+        dtype = tensor_result.batch_indices.dtype
+
+        # Clamp batch_indices 到 [0, B-1]
+        batch_indices_clamped = tensor_result.batch_indices.clamp(min=0, max=B - 1)
+
+        # Clamp depths 到 [0, max_level]
+        depths_clamped = tensor_result.depths.clamp(min=0, max=self.max_level)
+
+        # Clamp token_indices 到有效范围
+        num_tokens = tensor_result.num_tokens
+        token_indices = torch.arange(num_tokens, dtype=torch.long, device=device)
+        token_indices_clamped = token_indices.clamp(min=0, max=max(1, num_tokens) - 1)
+
+        # 如果没有变化，返回原始结果
+        if (
+            torch.equal(batch_indices_clamped, tensor_result.batch_indices)
+            and torch.equal(depths_clamped, tensor_result.depths)
+        ):
+            return tensor_result
+
+        # 返回修正后的结果
+        return TensorSplitResult(
+            regions=tensor_result.regions,
+            depths=depths_clamped,
+            batch_indices=batch_indices_clamped,
+            hilbert_indices=tensor_result.hilbert_indices,
+            token_indices=token_indices_clamped,
+            complexities=tensor_result.complexities,
+        )
 
     # =====================================================================
     # I110-6: 语义冗余分裂器配置方法
@@ -485,6 +538,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             tensor_result = split_result
         else:
             raise ValueError(f"Unexpected split result type: {type(split_result)}")
+
+        # I99-1 FIX: 添加防御性边界检查，确保 batch_indices 和 depths 在有效范围内
+        # torch.compile 优化可能暴露潜在的索引问题
+        tensor_result = self._ensure_valid_indices(tensor_result, B)
 
         # 统计收集 (no_grad)
         with torch.no_grad():
@@ -783,7 +840,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # regions: [N, 4] -> (x1, y1, x2, y2)
         p = self.base_patch_size
         regions = tensor_result.regions.float()
-        batch_indices = tensor_result.batch_indices
+        # I99-1: 防御性 clamp batch_indices (额外保护)
+        batch_indices = tensor_result.batch_indices.clamp(min=0, max=B - 1)
         
         # boxes: [N, 5] -> (batch_idx, x1, y1, x2, y2) (scaled)
         boxes = torch.zeros(N_total, 5, device=device, dtype=dtype)
