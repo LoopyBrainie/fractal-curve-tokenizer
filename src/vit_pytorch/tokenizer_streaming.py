@@ -563,13 +563,13 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             # 解决: 无条件计算 bincount，然后无条件 clamp
             
             # bincount 需要至少一个元素，使用 torch.where 处理空情况
-            # 创建一个始终有效的 batch_indices (添加一个 dummy 0)
-            batch_indices_safe = tensor_result.batch_indices
-            if batch_indices_safe.numel() == 0:
+            # I99-1 CRITICAL: 必须先 clamp 再 bincount!
+            batch_indices_for_bincount = tensor_result.batch_indices.clamp(min=0, max=B - 1)
+            if batch_indices_for_bincount.numel() == 0:
                 # 极端边界情况：完全没有 token
-                batch_indices_safe = torch.zeros(1, dtype=torch.long, device=device)
-            
-            tokens_per_batch = torch.bincount(batch_indices_safe, minlength=B)
+                batch_indices_for_bincount = torch.zeros(1, dtype=torch.long, device=device)
+
+            tokens_per_batch = torch.bincount(batch_indices_for_bincount, minlength=B)
             
             # I24-14: 无条件 clamp (torch.compile 安全)
             # 不使用 .item() 或数据依赖的 if，直接 clamp
