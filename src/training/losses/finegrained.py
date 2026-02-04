@@ -215,8 +215,8 @@ class AttentionEntropyLoss(nn.Module):
         # 确保归一化
         attn = attn / (attn.sum(dim=-1, keepdim=True) + self.eps)
         
-        # 计算熵 H = -Σ p log p
-        entropy = -(attn * (attn + self.eps).log()).sum(dim=-1)  # [B]
+        # 计算熵 H = -Σ p log p (I145: 使用 clamp 保护 log 边界)
+        entropy = -(attn * torch.clamp(attn, min=self.eps).log()).sum(dim=-1)  # [B]
         mean_entropy = entropy.mean()
         
         # 计算损失

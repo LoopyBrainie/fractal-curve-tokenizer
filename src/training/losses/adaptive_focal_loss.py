@@ -51,6 +51,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .focal_loss import FocalLoss
+from vit_pytorch.constants import EPS  # I112-3: 统一数值稳定性常量
 
 
 class AdaptiveFocalLossWrapper(nn.Module):
@@ -172,9 +173,12 @@ class AdaptiveFocalLossWrapper(nn.Module):
             H = 0: 完全确定 (one-hot 预测)
             H = log(C): 完全不确定 (均匀分布)
         """
-        p = F.softmax(logits, dim=-1)
-        # 数值稳定性: log(p + eps)
-        log_p = torch.log(p + 1e-8)
+        # I145-优化：使用log_softmax直接计算，避免冗余softmax
+        # 数学形式化：
+        #   - H(p) = -Σ p_i * log(p_i) = -Σ p_i * log_softmax_i
+        #   - log_softmax更数值稳定，且只需一次前向传播
+        log_p = F.log_softmax(logits, dim=-1)
+        p = torch.exp(log_p)  # 用于后续计算
         entropy = -(p * log_p).sum(dim=-1).mean()
         return float(entropy)
 
@@ -262,13 +266,11 @@ class AdaptiveFocalLossWrapper(nn.Module):
         else:
             gamma = self.base_gamma
 
-        # 钳制到有效范围
-        gamma = float(
-            torch.clip(torch.tensor(gamma), self.gamma_min, self.gamma_max)
-        )
+        # 钳制到有效范围 (I145: 优化 - 避免重复创建 tensor)
+        gamma = float(torch.clamp(torch.tensor(gamma), self.gamma_min, self.gamma_max))
 
-        # 更新当前 γ (使用 .item() 避免 0-dim tensor 索引问题)
-        self.current_gamma = torch.tensor(gamma)
+        # 原地更新 buffer，避免重新分配
+        self.current_gamma.fill_(gamma)
 
         return gamma
 

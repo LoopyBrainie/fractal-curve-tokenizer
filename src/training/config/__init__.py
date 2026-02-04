@@ -118,6 +118,12 @@ class ModelArchitectureConfig:
     splitter_feature_dim: Optional[int] = None  # Splitter 特征维度 (默认等于 dim)
     splitter_pool_size: Optional[int] = None    # Splitter 池化大小 (默认 4)
 
+    # I136: Elastic Budget 配置 (训练时损失参数)
+    elastic_coverage_min: float = 0.03  # 最小弹性覆盖率
+    elastic_coverage_max: float = 0.25  # 最大弹性覆盖率
+    elastic_lambda_over: float = 0.1   # 超额惩罚系数
+    elastic_lambda_under: float = 0.01  # 低额惩罚系数
+
     # I110-7: 语义分裂器配置
     use_semantic_splitter: bool = False  # 是否使用 SemanticRedundancySplitter
     semantic_splitter_config: Optional[Dict[str, Any]] = None  # 语义分裂器配置字典
@@ -130,10 +136,11 @@ class ModelArchitectureConfig:
     freeze_tokenizer: bool = False  # 是否冻结 tokenizer 参数
     freeze_tokenizer_epochs: int = 0  # 前 N 个 epoch 冻结 (0=全程冻结)
 
-    # 模型 dropout 配置 (修复配置对齐问题)
-    dropout: float = 0.0  # 主 dropout 概率
-    emb_dropout: float = 0.0  # 嵌入层 dropout
-    drop_path_rate: float = 0.0  # 路径 dropout (Stochastic Depth)
+    # 模型 dropout 配置 (I145: 修复配置对齐问题)
+    # 注意: 这些默认值应该与 train_fractal_vit.py 中的 argparse 默认值一致
+    dropout: float = 0.25  # 主 dropout 概率 (与 args --dropout 一致)
+    emb_dropout: float = 0.15  # 嵌入层 dropout (与 args --emb-dropout 一致)
+    drop_path_rate: float = 0.25  # 路径 dropout (与 args --drop-path 一致)
 
     def __post_init__(self):
         """参数验证 - 数学约束"""

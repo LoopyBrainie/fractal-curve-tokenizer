@@ -312,6 +312,7 @@ if str(EXAMPLES_PATH) not in sys.path:
 
 from vit_pytorch import FractalCurveViT
 from vit_pytorch.constants import (
+    EPS,  # I112-3: 统一数值稳定性常量
     SPLITTER_TEMP_START,
     SPLITTER_TEMP_END,
     SPLITTER_TEMP_SCHEDULE,  # I29-4: 导入调度策略
@@ -665,8 +666,9 @@ def mixup_criterion(
     log_probs = F.log_softmax(outputs, dim=1)
     
     # 确保 targets 归一化且非负
+    # I112-3: 使用 EPS 统一数值稳定性
     targets = targets.clamp(min=0)
-    targets = targets / (targets.sum(dim=1, keepdim=True) + 1e-8)
+    targets = targets / (targets.sum(dim=1, keepdim=True) + EPS)
     
     loss = -(targets * log_probs).sum(dim=1).mean()
     
@@ -1907,6 +1909,11 @@ def train_epoch(
                 tokens = None
                 token_lengths = None
                 outs = stats.logits if hasattr(stats, 'logits') else stats
+
+            # I145: 验证 TrainingStats 字段类型
+            if hasattr(stats, 'validate'):
+                stats.validate()
+
             if debug_mode and i == 0 and use_mixup:
                 print(f"[DEBUG] Batch 0: forward 完成，outs.shape={outs.shape}", flush=True)
             
@@ -3043,6 +3050,11 @@ def main():
         freeze_quota=args.freeze_quota,
         freeze_tokenizer=args.freeze_tokenizer,
         freeze_tokenizer_epochs=args.freeze_tokenizer_epochs,
+        # I136: Elastic Budget 配置 (用于保存到 checkpoint)
+        elastic_coverage_min=args.elastic_coverage_min,
+        elastic_coverage_max=args.elastic_coverage_max,
+        elastic_lambda_over=args.elastic_lambda_over,
+        elastic_lambda_under=args.elastic_lambda_under,
         # I110-7: 语义分裂器配置
         use_semantic_splitter=args.use_semantic_splitter,
         semantic_splitter_config=semantic_config_dict,
@@ -3070,9 +3082,11 @@ def main():
             self.min_patch_size = arch_config.min_patch_size
             # 注意: max_level 是变参数，完全由模型架构内部计算
             # 不从 arch_config 获取，确保训练/评估模型结构完全一致
-            self.dropout = args.dropout
-            self.emb_dropout = args.emb_dropout
-            self.drop_path_rate = args.drop_path
+            # I145: 修复 dropout 来源 - 使用 arch_config 而非 args
+            # 这样 ModelGene.from_config() 保存的值与训练时使用的值一致
+            self.dropout = arch_config.dropout
+            self.emb_dropout = arch_config.emb_dropout
+            self.drop_path_rate = arch_config.drop_path_rate
             self.use_checkpoint = arch_config.use_checkpoint
             self.lca_temperature = arch_config.lca_temperature
             self.learnable_temperature = arch_config.learnable_temperature

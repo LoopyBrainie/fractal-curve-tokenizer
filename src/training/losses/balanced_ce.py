@@ -99,9 +99,13 @@ class ClassBalancedCrossEntropy(nn.Module):
         self.reduction = reduction
         self.label_smoothing = label_smoothing
         
-        # 计算有效样本数
+        # 计算有效样本数 (I145: 添加 clamp 防止下溢)
         samples_per_class = np.array(samples_per_class, dtype=np.float64)
-        effective_num = (1.0 - np.power(beta, samples_per_class)) / (1.0 - beta)
+        # 当 beta^n 下溢到 0 时，使用极限公式: (1 - 0) / (1 - beta) = 1 / (1 - beta)
+        beta_power = np.power(beta, samples_per_class)
+        # clamp 防止数值下溢: 至少保留一个小 epsilon
+        beta_power = np.clip(beta_power, a_min=1e-10, a_max=1.0)
+        effective_num = (1.0 - beta_power) / (1.0 - beta)
         
         # 类别权重: w_c = 1 / E_n
         weights = 1.0 / effective_num

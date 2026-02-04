@@ -1,72 +1,77 @@
 #!/bin/bash
 # Tiny-ImageNet Optimal Training Script (RTX 4070 Laptop 8GB)
-# Mathematical Formalization (2026-02-02): dim=512, num_layers=16, batch=192
-# Optimized for 100 epochs with maximum capacity
+# Mathematical Formalization (2026-02-04 Update)
+# Target: 200 epochs, batch=192
 
 set -e
 
 # ============================================================================
-# Mathematical Verification Results (2026-02-02 Update)
+# Mathematical Verification Results
 # ============================================================================
-# GPU: RTX 4070 Laptop (8GB VRAM, 6.0GB usable with 25% safety margin)
+# GPU: RTX 4070 Laptop (8GB VRAM, ~7GB usable with safety margin)
+#
+# [tiny-imagenet Characteristics]
+#   Image size: 64×64 (native)
+#   max_level = ceil(log2(64/4)) = 4
+#   Candidate regions = 341 (vs 21,845 for ImageNet)
+#   Conclusion: Fewer tokens than ImageNet, smaller model suffices
 #
 # [MEMORY CONSTRAINT MODEL]
 #   M_total = M_params + M_gradients + M_optimizer + M_activations
-#   M_params (FP16):     0.11 GB
-#   M_gradients (FP32):  0.44 GB
-#   M_optimizer (FP32):  0.88 GB
-#   M_activations:       0.07 GB (with checkpoint)
-#   Total:               1.65 GB (safe margin: 4.3 GB)
+#   dim=384, L=8:
+#   - Parameters (FP16):  48 MB
+#   - Gradients (FP32):  96 MB
+#   - Optimizer (FP32): 192 MB
+#   - Activations (checkpoint): ~200 MB
+#   - Total: ~540 MB << 7GB budget
 #
-# [ARCHITECTURE PARAMETERS]
-#   --dim 512         : Balance expressivity and memory (maximized)
-#   --num-layers 16   : Optimal depth for 100 epochs
-#   --heads 8         : dim_head = 512/8 = 64 (standard)
-#   --mlp-dim 2048    : mlp_ratio = 4.0 (SwiGLU)
+# [ARCHITECTURE PARAMETERS - Optimized]
+#   --dim 384         : Performance-memory balance (24M params)
+#   --num-layers 8    : Match quadtree max_level=4
+#   --heads 6          : dim_head = 384/6 = 64
+#   --mlp-dim 1536    : mlp_ratio = 4.0 (SwiGLU)
 #
 # [TOKENIZER PARAMETERS]
-#   --min-patch-size 4  (patch_size derived from image_size/min_patch_size)
-#   --token-coverage-min 0.02 : α = 2% minimum coverage
-#   --token-coverage-max 0.50 : β = 50% maximum coverage
-#   K (token range): [16, 92] for Tiny-ImageNet 64×64
+#   --patch-size 8
+#   --min-patch-size 4
+#   --token-coverage-min 0.01 : α = 1%
+#   --token-coverage-max 0.20 : β = 20%
+#   K (token range): [8, 64] for Tiny-ImageNet 64×64
 #
-# [TRAINING PARAMETERS]
-#   --batch-size 192  : Target batch size (gradient checkpointing enabled)
-#   --lr 2.4e-4       : √(batch/32) × 1e-4 = 2.45e-4
-#   --weight-decay 0.038 : 0.05 × (384/512)
-#   --dropout 0.15    : Regularization for 100 epochs
-#   --drop-path 0.20  : Stochastic depth for deep networks
+# [TRAINING PARAMETERS - 200 epochs]
+#   --batch-size 192  : Target batch size (checkpoint enabled)
+#   --lr 1e-4         : Standard learning rate
+#   --weight-decay 0.05
+#   --dropout 0.25    : Strong regularization for 200 epochs
+#   --drop-path 0.25  : Stochastic depth
+#   --warmup-epochs 10
 #
 # [OPTIMIZATION FLAGS]
 #   --use-amp, --gradient-checkpoint, --compile, --channels-last
 #
-# [REGULARIZATION FEATURES]
-#   --include-soft-entropy      : Entropy maximization
-#   --include-elastic-budget    : Elastic token budget
-#   --warmup-epochs 5
-#
-# Model: 117.54M params | Memory: 1.65 GB | FLOPs: 6.34e9/sample
+# Model: 24M params | Memory: ~4-5 GB | Expected accuracy: 55-65%
 # ============================================================================
 
 uv run python src/training/train_fractal_vit.py \
   --dataset tiny-imagenet \
-  --epochs 100 \
-  --dim 512 \
-  --num-layers 16 \
-  --heads 8 \
-  --mlp-dim 2048 \
+  --epochs 200 \
+  --dim 384 \
+  --num-layers 8 \
+  --heads 6 \
+  --mlp-dim 1536 \
   --min-patch-size 4 \
-  --token-coverage-min 0.02 \
-  --token-coverage-max 0.50 \
+  --token-coverage-min 0.01 \
+  --token-coverage-max 0.20 \
   --batch-size 192 \
-  --lr 2.4e-04 \
-  --weight-decay 0.0375 \
-  --dropout 0.15 \
-  --drop-path 0.2 \
+  --lr 1e-04 \
+  --weight-decay 0.05 \
+  --dropout 0.25 \
+  --drop-path 0.25 \
   --use-amp \
   --gradient-checkpoint \
   --compile \
   --channels-last \
   --include-soft-entropy \
   --include-elastic-budget \
-  --warmup-epochs 5 
+  --warmup-epochs 10 \
+  --exp-name tiny_imagenet_384d_8l_bs192_ep200_v1

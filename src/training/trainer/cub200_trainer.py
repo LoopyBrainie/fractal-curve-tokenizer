@@ -44,6 +44,7 @@ from ..losses.finegrained import FinegrainedLoss, FinegrainedLossConfig
 from ..config import ModelArchitectureConfig  # I36: 统一架构配置
 from ..core.checkpoint import save_checkpoint_with_gene  # ModelGene 自包含 checkpoint
 from vit_pytorch import FractalCurveViT  # I36: 模型创建
+from vit_pytorch.constants import SPLITTER_TEMP_END, TEMPERATURE_MIN  # I113-10: 温度常量
 
 logger = logging.getLogger(__name__)
 
@@ -722,13 +723,14 @@ class CUB200Trainer:
             return
 
         # I111-1: 从 SplitterConfig 读取温度参数
+        # I113-10: 使用常量确保一致性
         config = getattr(splitter, 'config', None)
         if config is None:
             self.logger.warning("[A21] Splitter 无 config，使用默认值")
-            T_start, T_end, warmup_epochs = 1.0, 0.3, 8
+            T_start, T_end, warmup_epochs = 1.0, SPLITTER_TEMP_END, 8
         else:
             T_start = getattr(config, 'temperature_init', 1.0)
-            T_end = getattr(config, 'temperature_min', 0.3)
+            T_end = getattr(config, 'temperature_min', TEMPERATURE_MIN)
             warmup_epochs = getattr(config, 'temperature_warmup_epochs', 8)
 
         # 计算每 epoch 的步数

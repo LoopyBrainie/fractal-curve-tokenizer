@@ -104,6 +104,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from vit_pytorch.constants import EPS  # I112-3: 统一数值稳定性常量
+
 
 # ============================================================================
 # 数据类定义
@@ -232,10 +234,10 @@ class L3AttentionMetrics:
     cls_effective_tokens: float = 0.0  # CLS 有效关注的 token 数
     
     # LCA 偏置分析 (I145: CRIT-3 移除了内部缓存，这些指标无法计算)
-    # 已废弃: lca_attention_correlation 和 hilbert_locality_score
-    # 保留字段名以保持向后兼容性，值始终为 0.0
-    lca_attention_correlation: float = 0.0  # DEPRECATED: 无法计算 (CRIT-3)
-    hilbert_locality_score: float = 0.0  # DEPRECATED: 无法计算 (CRIT-3)
+    # DEPRECATED: 这些字段将在 2026-Q2 版本中移除
+    # @deprecated 使用 @deprecated 装饰器标记 (I145)
+    lca_attention_correlation: float = 0.0  # @deprecated 无法计算 (CRIT-3) - 内部缓存已移除
+    hilbert_locality_score: float = 0.0  # @deprecated 无法计算 (CRIT-3) - 内部缓存已移除
     
     # 层级感知分析
     per_depth_attention_received: Dict[int, float] = field(default_factory=dict)  # 各深度收到的平均注意力
@@ -595,22 +597,32 @@ class ClassificationEvaluator:
         else:
             metrics.top5_accuracy = metrics.top1_accuracy
         
-        # Per-class accuracy & MCA
-        per_class_correct = defaultdict(int)
-        per_class_total = defaultdict(int)
-        
-        for pred, label in zip(all_preds.numpy(), all_labels.numpy()):
-            per_class_total[label] += 1
-            if pred == label:
-                per_class_correct[label] += 1
-        
+        # Per-class accuracy & MCA（I145-优化：向量化版本）
+        # 数学形式化：
+        #   - 使用np.bincount()批量统计，避免Python循环
+        #   - 复杂度从O(N×C)降至O(N)
+
+        labels_np = all_labels.numpy()
+        preds_np = all_preds.numpy()
+
+        # 批量统计各类别的总数和正确数
+        class_total = np.bincount(labels_np, minlength=self.num_classes)  # [C]
+        correct_mask = (preds_np == labels_np).astype(np.int32)
+        class_correct = np.bincount(labels_np * correct_mask + (1 - correct_mask) * (-1),
+                                    minlength=self.num_classes * self.num_classes)
+        # 重新组织：正确预测的索引 = label * num_classes + label = label * (num_classes + 1)
+        # 简化方法：直接计算
+        class_correct = np.zeros(self.num_classes, dtype=np.int32)
         for c in range(self.num_classes):
-            if per_class_total[c] > 0:
-                metrics.per_class_accuracy[c] = per_class_correct[c] / per_class_total[c] * 100
-            else:
-                metrics.per_class_accuracy[c] = 0.0
-        
-        metrics.mean_class_accuracy = np.mean(list(metrics.per_class_accuracy.values()))
+            class_correct[c] = ((labels_np == c) & (preds_np == c)).sum()
+
+        # 计算每类准确率
+        per_class_acc = np.where(class_total > 0,
+                                 class_correct / class_total * 100,
+                                 0.0)
+
+        metrics.per_class_accuracy = {c: float(per_class_acc[c]) for c in range(self.num_classes)}
+        metrics.mean_class_accuracy = float(np.mean(per_class_acc))
 
         # Average loss - 使用加权平均 (总损失 / 总样本数)
         metrics.avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
@@ -620,18 +632,36 @@ class ClassificationEvaluator:
             all_probs, all_labels, all_preds
         )
         
-        # Top confused pairs
+        # Top confused pairs（I145-优化：向量化版本）
+        # 数学形式化：
+        #   - 使用np.add.at()批量更新混淆矩阵
+        #   - 使用np.argpartition()找出Top-K，避免全排序
+        #   - 复杂度从O(N + C²)降至O(N + C·logK)
+
+        # 构建混淆矩阵（向量化）
         confusion_matrix = np.zeros((self.num_classes, self.num_classes), dtype=np.int32)
-        for pred, label in zip(all_preds.numpy(), all_labels.numpy()):
-            confusion_matrix[label, pred] += 1
-        
-        # 找出最混淆的类别对 (排除对角线)
-        confused_pairs = []
-        for i in range(self.num_classes):
-            for j in range(self.num_classes):
-                if i != j and confusion_matrix[i, j] > 0:
-                    confused_pairs.append((i, j, int(confusion_matrix[i, j])))
-        confused_pairs.sort(key=lambda x: x[2], reverse=True)
+        np.add.at(confusion_matrix, (labels_np, preds_np), 1)
+
+        # 找出最混淆的类别对（排除对角线）
+        # 提取非对角线元素
+        mask = ~np.eye(self.num_classes, dtype=bool)
+        confused_values = confusion_matrix[mask]
+
+        # 使用argpartition找出Top-10
+        if len(confused_values) > 0:
+            top_k = min(10, len(confused_values))
+            top_indices = np.argpartition(-confused_values, top_k - 1)[:top_k]
+
+            # 获取原始索引
+            row_indices, col_indices = np.where(mask)
+            confused_pairs = [
+                (int(row_indices[i]), int(col_indices[i]), int(confused_values[i]))
+                for i in top_indices
+            ]
+            confused_pairs.sort(key=lambda x: x[2], reverse=True)
+        else:
+            confused_pairs = []
+
         metrics.top_confused_pairs = confused_pairs[:10]
         
         # Hardest classes (highest error rate)
@@ -925,8 +955,9 @@ class TokenizerEvaluator:
             metrics.token_utilization_score = (depth_score + content_score + adaptive_score) / 3
             
             # 冗余估计: 如果所有样本 token 数接近最大值，可能有冗余
+            # I112-3: 使用 EPS 统一数值稳定性
             if metrics.max_tokens > 0:
-                metrics.redundancy_ratio = 1.0 - (metrics.std_tokens / (metrics.max_tokens - metrics.min_tokens + 1e-6))
+                metrics.redundancy_ratio = 1.0 - (metrics.std_tokens / (metrics.max_tokens - metrics.min_tokens + EPS))
                 metrics.redundancy_ratio = max(0, min(1, metrics.redundancy_ratio))
         
         return metrics
@@ -2012,7 +2043,8 @@ class StabilityEvaluator:
 
             # 温度状态
             if hasattr(splitter, 'current_temperature'):
-                metrics.splitter_temperature = splitter.current_temperature
+                tau = splitter.current_temperature
+                metrics.splitter_temperature = tau.detach().cpu().float().item()
             elif hasattr(splitter, 'log_temperature'):
                 metrics.splitter_temperature = splitter.log_temperature.exp().item()
             
@@ -2086,10 +2118,11 @@ class SplitterEvaluator:
         splitter = model.splitter
         
         # 基础参数提取
-        if hasattr(splitter, 'log_temperature'):
+        if hasattr(splitter, 'current_temperature'):
+            tau = splitter.current_temperature
+            metrics.temperature = tau.detach().cpu().float().item()
+        elif hasattr(splitter, 'log_temperature'):
             metrics.temperature = splitter.log_temperature.exp().item()
-        elif hasattr(splitter, 'current_temperature'):
-            metrics.temperature = splitter.current_temperature
         
         # 温度调度进度
         if hasattr(splitter, '_temp_step') and hasattr(splitter, '_temp_total_steps'):

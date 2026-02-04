@@ -223,6 +223,7 @@ from .fractal_proxy_experiments import (
     HilbertIndexShuffler,
     GeometricJigsawLoss,
     GeometricJigsawExperiment,
+    SpatialJigsawLoss,
     create_experiment,
 )
 
@@ -366,5 +367,6 @@ __all__ = [
     "HilbertIndexShuffler",
     "GeometricJigsawLoss",
     "GeometricJigsawExperiment",
+    "SpatialJigsawLoss",
     "create_experiment",
 ]

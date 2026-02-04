@@ -65,12 +65,16 @@ class ModelGene:
 
     # I33: 相对预算参数 (替代绝对 K_min/K_max)
     # 保存覆盖率而非绝对 K 值，确保评估时能正确复算
+    # I145: 修复默认值与 ModelArchitectureConfig 一致
     token_coverage_min: float = 0.01   # α = 1% 最小覆盖率
-    token_coverage_max: float = 0.05   # β = 5% 最大覆盖率
+    token_coverage_max: float = 0.25   # β = 25% 最大覆盖率
 
     # ==================== 正则化参数 ====================
-    dropout: float = 0.1           # Dropout 比率
-    emb_dropout: float = 0.1       # 嵌入 dropout
+    # I145: 修复默认值与 ModelArchitectureConfig 一致
+    # 注意: dropout=0.25, emb_dropout=0.15, drop_path_rate=0.25
+    # 这些值与 train_fractal_vit.py 中的 argparse 默认值一致
+    dropout: float = 0.25           # Dropout 比率 (与 args --dropout 一致)
+    emb_dropout: float = 0.15        # 嵌入 dropout (与 args --emb-dropout 一致)
     drop_path_rate: float = 0.15   # Drop path 比率
 
     # ==================== 编码选项 ====================
@@ -95,9 +99,17 @@ class ModelGene:
     fourier_levels: int = 4              # Fourier 级别数
 
     # ==================== Splitter 关键参数 (I140) ====================
-    splitter_hidden_dim: Optional[int] = None   # Splitter MLP 隐藏层维度
-    splitter_feature_dim: Optional[int] = None  # Splitter 特征维度 (通常 = dim)
-    splitter_pool_size: Optional[int] = None    # Splitter 池化大小
+    # 注意: 这些是模型内部的默认值，如果为 None 则使用以下值
+    splitter_hidden_dim: Optional[int] = None   # Splitter MLP 隐藏层维度 (None → 64)
+    splitter_feature_dim: Optional[int] = None  # Splitter 特征维度 (None → 使用 dim)
+    splitter_pool_size: Optional[int] = None    # Splitter 池化大小 (None → 4)
+
+    # ==================== I136: Elastic Budget 配置 ====================
+    # 这些参数控制训练时的弹性覆盖率约束，评估时需要保持一致
+    elastic_coverage_min: float = 0.03   # 最小弹性覆盖率
+    elastic_coverage_max: float = 0.25   # 最大弹性覆盖率
+    elastic_lambda_over: float = 0.1    # 超额惩罚系数
+    elastic_lambda_under: float = 0.01  # 低额惩罚系数
 
     # ==================== I110-7: 语义分裂器参数 ====================
     use_semantic_splitter: bool = False  # 是否使用 SemanticRedundancySplitter
@@ -174,6 +186,12 @@ class ModelGene:
             'splitter_hidden_dim': self.splitter_hidden_dim,
             'splitter_feature_dim': self.splitter_feature_dim,
             'splitter_pool_size': self.splitter_pool_size,
+
+            # ========== I136: Elastic Budget 配置 ==========
+            'elastic_coverage_min': self.elastic_coverage_min,
+            'elastic_coverage_max': self.elastic_coverage_max,
+            'elastic_lambda_over': self.elastic_lambda_over,
+            'elastic_lambda_under': self.elastic_lambda_under,
 
             # ========== I110-7: 语义分裂器 ==========
             'use_semantic_splitter': self.use_semantic_splitter,
@@ -390,13 +408,14 @@ class ModelGene:
             # 优先从 model.splitter.config 提取（最可靠）
             if hasattr(model, 'splitter') and hasattr(model.splitter, 'config') and model.splitter.config is not None:
                 config = model.splitter.config
-                gene.token_coverage_min = getattr(config, 'token_coverage_min', 0.01)
-                gene.token_coverage_max = getattr(config, 'token_coverage_max', 0.25)  # I109-3
+                # I145: 修复 - SplitterConfig 使用 coverage_min/max_hard 而非 token_coverage_min/max
+                gene.token_coverage_min = getattr(config, 'coverage_min', 0.01)
+                gene.token_coverage_max = getattr(config, 'coverage_max_hard', 0.25)  # I109-3
             # 备选：从 tokenizer.splitter.config 提取
             elif hasattr(tokenizer, 'splitter') and hasattr(tokenizer.splitter, 'config') and tokenizer.splitter.config is not None:
                 config = tokenizer.splitter.config
-                gene.token_coverage_min = getattr(config, 'token_coverage_min', 0.01)
-                gene.token_coverage_max = getattr(config, 'token_coverage_max', 0.25)  # I109-3
+                gene.token_coverage_min = getattr(config, 'coverage_min', 0.01)
+                gene.token_coverage_max = getattr(config, 'coverage_max_hard', 0.25)  # I109-3
             else:
                 raise ValueError(
                     "无法从模型提取 token_coverage_* 参数。"
@@ -415,16 +434,16 @@ class ModelGene:
             gene.splitter_feature_dim = cls._detect_splitter_param(splitter, 'feature_dim')
 
             # I110-7: 提取语义分裂器配置
-            if hasattr(model, 'use_semantic_splitter'):
-                gene.use_semantic_splitter = getattr(model, 'use_semantic_splitter', False)
+            # I145: 修复 - 只在 semantic_splitter 实际启用时提取配置
+            model_use_semantic = getattr(model, '_use_semantic_splitter', False)
+            gene.use_semantic_splitter = model_use_semantic
 
-                # 尝试提取 semantic_splitter_config
-                if hasattr(splitter, 'config') and splitter.config is not None:
-                    config = splitter.config
-                    if hasattr(config, 'to_dict'):
-                        gene.semantic_splitter_config = config.to_dict()
-                    elif isinstance(config, dict):
-                        gene.semantic_splitter_config = config
+            if model_use_semantic and hasattr(splitter, 'config') and splitter.config is not None:
+                config = splitter.config
+                if hasattr(config, 'to_dict'):
+                    gene.semantic_splitter_config = config.to_dict()
+                elif isinstance(config, dict):
+                    gene.semantic_splitter_config = config
 
         # I145: 从模型权重推断真实的架构配置（解决训练代码与权重不一致的问题）
         # 某些架构参数（如 heads）可能在权重中与模型属性不一致
@@ -493,6 +512,11 @@ class ModelGene:
             splitter_hidden_dim=getattr(config, 'splitter_hidden_dim', None),
             splitter_feature_dim=getattr(config, 'splitter_feature_dim', None),
             splitter_pool_size=getattr(config, 'splitter_pool_size', None),
+            # I136: Elastic Budget 配置
+            elastic_coverage_min=getattr(config, 'elastic_coverage_min', 0.03),
+            elastic_coverage_max=getattr(config, 'elastic_coverage_max', 0.25),
+            elastic_lambda_over=getattr(config, 'elastic_lambda_over', 0.1),
+            elastic_lambda_under=getattr(config, 'elastic_lambda_under', 0.01),
             # I110-7: 语义分裂器配置
             use_semantic_splitter=getattr(config, 'use_semantic_splitter', False),
             semantic_splitter_config=getattr(config, 'semantic_splitter_config', None),
