@@ -6,10 +6,17 @@
 2. Reconstruction Loss: 重构一致性损失
 3. SemanticRedundancyLoss: 总损失
 
-数学形式化：
+数学形式化（I112-1 修复版）:
 
-多样性损失:
-    L_div = ||V_c · V_c^T - I||_F^2
+多样性损失（归一化版）:
+    v̂_i = v_i / (||v_i||₂ + ε)    # L2 归一化
+    Ŝ = v̂ · v̂ᵀ                   # 余弦相似度矩阵
+    L_div = ||Ŝ - I||²_F            # Frobenius 范数平方
+
+    设计原理:
+    - 使用余弦相似度确保损失与特征范数解耦
+    - 与 CorrelationGate 保持一致性
+    - 损失范围 [0, 4]
 
 重构一致性损失:
     L_rec = ||F_p - AvgPool(V_c)||^2
@@ -21,6 +28,8 @@
 from typing import Dict, Optional
 
 import torch
+
+from .constants import EPS  # I112-3: 统一数值稳定性常量
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -28,22 +37,36 @@ import torch.nn.functional as F
 class DiversityLoss(nn.Module):
     """多样性损失：鼓励子节点特征正交（语义独立）
 
-    公式: L_div = ||V_c · V_c^T - I||_F^2
+    数学形式化（I112-1 修复版）:
+        L_div = ||Ŝ - I||_F²
+
+    其中:
+        v̂_i = v_i / (||v_i||₂ + ε)  # L2 归一化
+        Ŝ = v̂ · v̂ᵀ                   # 余弦相似度矩阵
+        L_div = ||Ŝ - I||²_F           # Frobenius 范数平方
+
+    设计原理:
+        1. 使用余弦相似度而非原始点积，确保损失与特征范数解耦
+        2. 与 CorrelationGate 的归一化策略保持一致
+        3. 损失范围 [0, 4]，4 个子节点完全平行时达到最大值
 
     效果:
-    - 当四个子节点特征正交时，V_c · V_c^T = I，损失为 0
-    - 当子节点特征相似时，损失增加
+        - 当四个子节点特征正交时，Ŝ = I，L_div = 0
+        - 当子节点特征相似时，L_div 增加（最大 4）
+        - 损失值独立于特征 L2 范数
     """
 
-    def __init__(self, reduction: str = "mean"):
+    def __init__(self, reduction: str = "mean", epsilon: float = 1e-8):
         """初始化多样性损失
 
         Args:
             reduction: 归约方式 ("mean" | "sum" | "none")
+            epsilon: 防止除零的小常数
         """
         super().__init__()
         assert reduction in ("mean", "sum", "none")
         self.reduction = reduction
+        self.epsilon = epsilon
 
     def forward(self, child_features: torch.Tensor) -> torch.Tensor:
         """计算多样性损失
@@ -52,14 +75,17 @@ class DiversityLoss(nn.Module):
             child_features: [B, N, 4, D] 子节点特征
 
         Returns:
-            loss: 多样性损失
+            loss: 多样性损失 (范围 [0, 4])
         """
         # 重塑为 [B*N, 4, D]
         B, N, num_children, D = child_features.shape
         child_flat = child_features.view(-1, num_children, D)
 
-        # 计算相似度矩阵: [B*N, 4, 4]
-        similarity = torch.bmm(child_flat, child_flat.transpose(1, 2))
+        # I112-1: L2 归一化 - 确保损失与特征范数解耦
+        normalized = F.normalize(child_flat, p=2, dim=-1, eps=self.epsilon)
+
+        # 计算余弦相似度矩阵: [B*N, 4, 4]
+        similarity = torch.bmm(normalized, normalized.transpose(1, 2))
 
         # 单位矩阵
         identity = torch.eye(num_children, device=child_features.device)
@@ -195,9 +221,10 @@ class SemanticRedundancyLoss(nn.Module):
             split_flat = split_decisions.view(-1)
 
             # 只对分裂的区域计算损失
+            # I112-3: 使用 EPS 统一数值稳定性
             num_splits = split_flat.sum()
-            diversity = (diversity_flat * split_flat).sum() / (num_splits + 1e-8)
-            reconstruction = (reconstruction_flat * split_flat).sum() / (num_splits + 1e-8)
+            diversity = (diversity_flat * split_flat).sum() / (num_splits + EPS)
+            reconstruction = (reconstruction_flat * split_flat).sum() / (num_splits + EPS)
 
         # 总损失
         total = (

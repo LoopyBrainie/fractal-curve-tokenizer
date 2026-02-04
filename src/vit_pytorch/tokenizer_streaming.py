@@ -137,7 +137,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         self.d_model = d_model
         self.base_patch_size = base_patch_size
         self.use_hilbert_order = use_hilbert_order
-        self._use_learnable_split = True  # Legacy flag, always True
+        self._use_learnable_split = True  # Legacy flag, always True (I145: 保留用于向后兼容)
 
         # I30-17: 动态深度计算
         self.min_patch_size = effective_min_patch_size  # 存储规范化后的值
@@ -270,8 +270,12 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         """获取语义损失函数"""
         return self._semantic_loss_fn
 
-    def _get_initial_region_bounds(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        """获取初始区域边界（全图）[B*N_initial, 4]"""
+    def _get_initial_region_bounds(self, device: torch.device) -> torch.Tensor:
+        """获取初始区域边界（全图）[4]
+
+        Note: 返回单个 [x0, y0, x1, y1] 边界框，batch 维度在 BFS 循环中通过 b_idx 追踪。
+              所有 batch 元素共享相同的初始边界（全图）。
+        """
         if self._region_bounds_cache is not None:
             return self._region_bounds_cache
 
@@ -316,27 +320,30 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         # BFS 构建四叉树 (I-OPT: 使用 deque 避免 O(N) pop(0))
         queue = deque()  # (bounds, depth, batch_idx)
+        initial_bounds = self._get_initial_region_bounds(device)
+
+        # I145: 使用计数器追踪每个 batch 的区域索引，避免 O(N) 列表遍历
+        batch_region_counters = {b: 0 for b in range(B)}
+        all_regions = []
+        all_depths = []
+        all_batch_indices = []
+
         for b in range(B):
-            bounds = self._get_initial_region_bounds(B, device)
-            queue.append((bounds, 0, b))
+            queue.append((initial_bounds, 0, b))
 
         while queue:
             bounds, depth, b_idx = queue.popleft()
 
+            # I145: 使用计数器获取当前 batch 的区域索引（O(1)）
+            region_idx_in_batch = batch_region_counters[b_idx]
+            batch_region_counters[b_idx] += 1
+
             if depth >= self.max_level:
                 # 达到最大深度，添加为叶子节点
-                region_idx = len(all_regions)
                 all_regions.append(bounds)
                 all_depths.append(depth)
                 all_batch_indices.append(b_idx)
                 continue
-
-            # 计算当前区域的索引
-            # 这里简化处理：假设区域按 BFS 顺序排列
-            # 实际需要更复杂的索引映射
-            region_idx_in_batch = len([r for r, d, b in queue if b == b_idx]) + \
-                                  len([r for r, d, b in queue if b != b_idx]) + \
-                                  len([1 for r, d, b in all_regions if b == b_idx])
 
             # 检查是否应该分裂
             if region_idx_in_batch < split_decision.shape[1]:
@@ -371,18 +378,25 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             regions = torch.zeros(0, 4, dtype=torch.float32, device=device)
             depths = torch.zeros(0, dtype=torch.long, device=device)
             batch_indices = torch.zeros(0, dtype=torch.long, device=device)
+            token_indices = torch.zeros(0, dtype=torch.long, device=device)
         else:
             regions = torch.stack(all_regions)
             depths = torch.tensor(all_depths, dtype=torch.long, device=device)
             batch_indices = torch.tensor(all_batch_indices, dtype=torch.long, device=device)
+            # token_indices 是顺序索引 (0, 1, 2, ..., N-1)，用于正确的概率索引
+            token_indices = torch.arange(len(all_regions), dtype=torch.long, device=device)
 
-        # 计算 Hilbert 索引
-        from .curve_hilbert import xy_to_hilbert_distance
-        hilbert_indices = xy_to_hilbert_distance(
-            (regions[:, 0] + regions[:, 2]) / 2,  # center_x
-            (regions[:, 1] + regions[:, 3]) / 2,  # center_y
-            max_bits=16,
-        ).to(device)
+        # 计算 Hilbert 索引用于排序 (I113-18: 使用 HilbertScanner)
+        from .curve_hilbert import HilbertScanner
+        hilbert_indices = HilbertScanner.region_to_hilbert_index(
+            regions[:, 0],  # x0
+            regions[:, 1],  # y0
+            regions[:, 2],  # x1
+            regions[:, 3],  # y1
+            depths,  # depth per region
+            H,
+            W
+        )
 
         # 复杂度使用冗余性分数
         complexities = split_result.redundancy.view(-1) if split_result.redundancy.numel() > 0 else \
@@ -393,6 +407,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             depths=depths,
             batch_indices=batch_indices,
             hilbert_indices=hilbert_indices,
+            token_indices=token_indices,
             complexities=complexities,
         )
     
@@ -817,8 +832,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 问题: batch_indices 可能未按 batch 分组，导致 token 位置计算错误
         # 解决: 显式排序所有相关张量
         if N_total > 0:
-            # 获取 hilbert_indices 用于排序
+            # 获取 hilbert_indices 用于排序，token_indices 用于正确的概率索引
             hilbert_idx_for_sort = tensor_result.hilbert_indices
+            token_idx_for_index = tensor_result.token_indices
 
             # I99-1 FIX: torch.lexsort 可能不可用，使用 torch.argsort 替代
             # lexsort 的语义是: 先按最后一列排序，再按倒数第二列排序...
@@ -832,10 +848,13 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             all_tokens_sorted = all_tokens[sort_indices]
             depths_sorted = depths[sort_indices]
             regions_sorted = tensor_result.regions[sort_indices]
+            # token_indices 也需要排序，用于后续的概率索引
+            token_idx_sorted = token_idx_for_index[sort_indices]
 
-            # 如果有 raw_probs 和 hilbert_indices，也要重新排列
+            # 如果有 raw_probs 和 token_indices，使用 token_indices 进行正确的概率索引
+            # I113-18 修复: 使用 token_indices 而非 hilbert_indices 索引 raw_probs
             if raw_probs is not None:
-                raw_probs_sorted = raw_probs[batch_indices, hilbert_idx_for_sort][sort_indices]
+                raw_probs_sorted = raw_probs[batch_indices_sorted, token_idx_sorted]
             else:
                 raw_probs_sorted = None
 

@@ -50,8 +50,8 @@ from .constants import (
 
 # 温度退火调度类型
 AnnealSchedule = Literal['linear', 'exponential', 'cosine']
-# Tokenizer 类型 (streaming_v2 已移除)
-TokenizerType = Literal['streaming_v1', 'streaming_v3']
+# Tokenizer 类型 (I145: 移除废弃的 streaming_v1/streaming_v2)
+TokenizerType = Literal['streaming_v3']
 
 
 # ==================== Splitter 配置 ====================
@@ -131,6 +131,14 @@ class HilbertSplitterConfig:
     entropy_mode: str = 'adaptive'
     entropy_weight_base: float = 0.1  # 基础权重 (动态调整)
     entropy_target: Optional[float] = None  # 固定目标 (target 模式)
+
+    # ==================== LookAheadHead 相关参数 (I113-2: 相关性分裂) ====================
+    # L1: 相对参数 - 归一化的控制参数
+    lookahead_dim: int = 128  # LookAheadHead 输出维度
+    target_ratio: float = 0.5  # 目标分裂率 τ_target ∈ [0, 1]
+    max_ratio: float = 0.5  # 最大分裂率上限 (替代硬编码 64) I113-2 修正
+    gamma: float = 1.0  # Lagrangian 预算约束系数
+    lambda_div: float = 0.1  # Diversity Loss 权重
 
     # ==================== 温度调度 (I111-1) ====================
     temperature_init: float = SPLITTER_TEMP_START  # 1.0
@@ -281,12 +289,76 @@ class HilbertSplitterConfig:
             'entropy_mode': self.entropy_mode,
             'entropy_weight_base': self.entropy_weight_base,
             'entropy_target': self.entropy_target,
+            # LookAheadHead 参数 (I113-2)
+            'lookahead_dim': self.lookahead_dim,
+            'target_ratio': self.target_ratio,
+            'max_ratio': self.max_ratio,  # I113-2: 最大分裂率上限
+            'gamma': self.gamma,
+            'lambda_div': self.lambda_div,
+            # 温度参数
             'temperature_init': self.temperature_init,
             'temperature_min': self.temperature_min,
             'temperature_anneal': self.temperature_anneal,
             'learnable_temperature': self.learnable_temperature,
             'temperature_warmup_steps': self.temperature_warmup_steps,
             'freeze_quota': self.freeze_quota,
+        }
+
+    # ==================== L2 绝对值计算方法 (I113-2) ====================
+
+    def compute_n_base(self) -> int:
+        """计算四叉树候选节点总数 (L2 绝对值)
+
+        数学公式: N_base = (4^(L+1) - 1) / 3
+
+        Returns:
+            N_base: 基础候选节点数 (绝对值)
+        """
+        return self.compute_candidate_count()
+
+    def compute_n_target(self, image_size: Optional[Tuple[int, int]] = None) -> int:
+        """计算目标 Token 数 (L2 绝对值)
+
+        数学公式:
+            N_base = (4^(L+1) - 1) / 3
+            N_target = N_base × τ_target
+            N_max = N_base × max_ratio  (替代硬编码 64)
+
+        Args:
+            image_size: 图像尺寸 (H, W)，可选，用于日志记录
+
+        Returns:
+            N_target: 目标 Token 数 (绝对值，范围 [8, N_base × max_ratio])
+        """
+        N_base = self.compute_n_base()
+        N_target = int(N_base * self.target_ratio)
+
+        # 边界限制: 下界=8，上界=N_base × max_ratio
+        N_max = int(N_base * self.max_ratio)
+        N_target = max(8, min(N_max, N_target))
+
+        return N_target
+
+    def compute_absolute_targets(self, image_size: Optional[Tuple[int, int]] = None) -> dict:
+        """计算所有绝对目标值 (L2)
+
+        Returns:
+            dict: 包含 N_base, N_target, N_min, N_max
+        """
+        N_base = self.compute_n_base()
+        N_target = self.compute_n_target(image_size)
+
+        # 获取动态 K 边界作为绝对边界
+        K_min, K_max = self.compute_k_bounds(image_size)
+
+        # N_max 使用相对比例 max_ratio，避免硬编码 64
+        N_max = min(int(N_base * self.max_ratio), K_max)
+
+        return {
+            'N_base': N_base,        # 绝对: 基础候选数
+            'N_target': N_target,    # 绝对: 目标Token数
+            'N_min': max(8, K_min),  # 绝对: 最小Token数
+            'N_max': N_max,          # 绝对: 最大Token数 (L1: max_ratio × N_base)
         }
 
 
@@ -449,9 +521,15 @@ class FractalViTConfig:
                 'splitter_config': {
                     'enable_learnable_quota': self.tokenizer_config.splitter_config.enable_learnable_quota,
                     'quota_init_logits': self.tokenizer_config.splitter_config.quota_init_logits,
-                    'quota_min_per_depth': self.tokenizer_config.splitter_config.quota_min_per_depth,
-                    'K_min': self.tokenizer_config.splitter_config.K_min,
-                    'K_max': self.tokenizer_config.splitter_config.K_max,
+                    'quota_min_ratio': self.tokenizer_config.splitter_config.quota_min_ratio,
+                    'quota_min_lambda': self.tokenizer_config.splitter_config.quota_min_lambda,
+                    'K_min_abs': self.tokenizer_config.splitter_config.K_min_abs,
+                    'K_max_hard': self.tokenizer_config.splitter_config.K_max_hard,
+                    'coverage_base': self.tokenizer_config.splitter_config.coverage_base,
+                    'coverage_min': self.tokenizer_config.splitter_config.coverage_min,
+                    'coverage_max_hard': self.tokenizer_config.splitter_config.coverage_max_hard,
+                    'target_ratio': self.tokenizer_config.splitter_config.target_ratio,
+                    'max_ratio': self.tokenizer_config.splitter_config.max_ratio,
                 },
             },
             'transformer_config': {
@@ -604,9 +682,11 @@ class AttentionEncoderConfig:
     level_scale_init: float = 0.5413
     # 深度缩放范围 (hierarchical_depth_scale 初始化边界)
     hierarchical_scale_bounds: tuple[float, float] = (0.5, 1.5)
-    # 偏置缩放初始化: raw = log(scale)，对应 scale=0.1 和 scale=0.05
-    hilbert_bias_init: float = -2.302585  # ln(0.1)
-    level_bias_init: float = -2.995732    # ln(0.05)
+    # I113-11: 偏置缩放初始化
+    # 修复前: raw = log(scale)，对应 scale=0.1 和 scale=0.05
+    # 修复后: 初始 scale=1.0，配合 √d_k 量纲对齐后有效 scale ≈ √d_k ≈ 5.66
+    hilbert_bias_init: float = 0.0  # ln(1.0)
+    level_bias_init: float = 0.0    # ln(1.0)
     # 可禁用能量注入（用于消融实验）
     energy_injection_enabled: bool = True
 
@@ -656,6 +736,12 @@ def create_splitter_config(
     entropy_mode: Optional[str] = None,
     entropy_weight_base: Optional[float] = None,
     entropy_target: Optional[float] = None,
+    # LookAheadHead 参数 (I113-2)
+    lookahead_dim: Optional[int] = None,
+    target_ratio: Optional[float] = None,
+    max_ratio: Optional[float] = None,  # I113-2: 最大分裂率上限
+    gamma: Optional[float] = None,
+    lambda_div: Optional[float] = None,
     # 温度调度
     temperature_init: Optional[float] = None,
     temperature_min: Optional[float] = None,
@@ -738,6 +824,18 @@ def create_splitter_config(
         config.entropy_weight_base = entropy_weight_base
     if entropy_target is not None:
         config.entropy_target = entropy_target
+
+    # LookAheadHead 参数 (I113-2)
+    if lookahead_dim is not None:
+        config.lookahead_dim = lookahead_dim
+    if target_ratio is not None:
+        config.target_ratio = target_ratio
+    if max_ratio is not None:
+        config.max_ratio = max_ratio  # I113-2: 最大分裂率上限
+    if gamma is not None:
+        config.gamma = gamma
+    if lambda_div is not None:
+        config.lambda_div = lambda_div
 
     # 温度调度
     if temperature_init is not None:
@@ -1053,11 +1151,6 @@ class FractalConfig:
         is_power_of_2 = self.grid_size > 0 and (self.grid_size & (self.grid_size - 1) == 0)
         grid_note = "" if is_power_of_2 else f" (非 2^k, 使用 {hilbert_strategy})"
 
-        if self.tokenizer_type == 'streaming_v3':
-            tokenizer_info = f"  tokenizer_type='{self.tokenizer_type}' (Variable Depth, 推荐)\n"
-        else:
-            tokenizer_info = f"  tokenizer_type='{self.tokenizer_type}' (单尺度)\n"
-
         return (
             f"FractalConfig(\n"
             f"  # Geometry\n"
@@ -1068,7 +1161,7 @@ class FractalConfig:
             f"  # Hilbert Strategy\n"
             f"  uses_pseudo_hilbert={self.uses_pseudo_hilbert}\n"
             f"  # Tokenizer\n"
-            f"{tokenizer_info}"
+            f"  tokenizer_type='streaming_v3' (Variable Depth, 推荐)\n"
             f"  # Hilbert Bias: LCA mode\n"
             f")"
         )

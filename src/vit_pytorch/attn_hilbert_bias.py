@@ -304,7 +304,7 @@ class LCAHilbertBias(HilbertBiasBase):
             # I102-1: 使用 log-space 参数化，数值稳定
             # 初始化: γ_init = log(τ_init + ε)，τ = softplus(γ)
             # 对于 τ_init >> 1e-8，有 γ_init ≈ log(τ_init)
-            init_gamma = math.log(lca_temperature + 1e-8)
+            init_gamma = math.log(lca_temperature + EPS)
             self._lca_temp_gamma = nn.Parameter(
                 torch.full((self.heads,), init_gamma)
             )
@@ -388,10 +388,12 @@ class LCAHilbertBias(HilbertBiasBase):
         # I30-5: 路径值验证 + 警告
         # 四叉树路径值必须是 0-3 (对应四个象限: 左上, 右上, 左下, 右下)
         # I102-5: 使用张量比较避免 GPU-CPU 同步
+        # I145: 延迟警告构造，避免不必要的 .item() 调用
         path_min = paths.min()
         path_max = paths.max()
-        invalid_path = (path_max > 3) | (path_min < 0)
-        if invalid_path.any():
+        path_out_of_range = (path_max > 3) | (path_min < 0)
+        if path_out_of_range.any():
+            # 只在需要时才触发 GPU-CPU 同步
             warnings.warn(
                 f"[I30-5] levels_info path values out of range: "
                 f"[{path_min.item():.2f}, {path_max.item():.2f}], expected [0, 3]. "
@@ -671,7 +673,8 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
 
         # I97-7: 可学习偏置缩放因子 (Softplus 约束)
         # 使用 softplus 确保 λ > 0，梯度稳定
-        # I98-3: 从配置读取初始化值，默认 log(0.1) 和 log(0.05)
+        # I98-3: 从配置读取初始化值
+        # I113-11: 初始化 scale=1.0，配合 √d_k 量纲对齐后有效 scale ≈ √d_k
         self._hilbert_bias_scale_raw = nn.Parameter(
             torch.tensor(self.config.hilbert_bias_init)
         )
@@ -712,22 +715,30 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
     def hilbert_bias_scale(self) -> torch.Tensor:
         """获取 Hilbert 偏置缩放因子 (可学习, Softplus + Clamp 约束).
 
+        I113-11: 量纲对齐 - 实际有效 scale = λ * √d_k
+        其中 λ = softplus(w)，w 初始化为 0 (λ ≈ 1.0)
+
         CRIT-2 修正: 添加 clamp(max=SCALE_CLAMP_BOUND) 防止数值溢出。
         I108-6 修正: 从 10.0 提升到 15.0 覆盖更多 softplus 输出范围。
 
         数学:
             λ = min(softplus(w), SCALE_CLAMP_BOUND) ∈ [0, 15.0]
+            B_hilbert_eff = B_hilbert * λ * √d_k
 
         理由:
-            - Hilbert 偏置值域 [0, 1]，scale 过大导致 attention logits 爆炸
+            - I113-11: 与 QK^T / √d_k 量纲对齐
+            - 初始 λ=1.0，配合 √d_k ≈ 5.66，有效 scale ≈ 5.66
             - softplus 无上限，训练中可能增长到数千
-            - 15.0 上界保证: max(bias * scale) ≤ 15.0 << FP32 安全边界 50
+            - 15.0 上界保证: max(bias * λ * √d_k) ≤ 15.0 * √d_k << FP32 安全边界 50
         """
         return F.softplus(self._hilbert_bias_scale_raw).clamp(max=SCALE_CLAMP_BOUND)
 
     @property
     def level_bias_scale(self) -> torch.Tensor:
         """获取层级偏置缩放因子 (可学习, Softplus + Clamp 约束).
+
+        I113-11: 量纲对齐 - 实际有效 scale = λ * √d_k
+        其中 λ = softplus(w)，w 初始化为 0 (λ ≈ 1.0)
 
         CRIT-2 修正: 添加 clamp(max=SCALE_CLAMP_BOUND) 保持与 hilbert_bias_scale 一致。
         I108-6 修正: 从 10.0 提升到 15.0。
@@ -991,8 +1002,9 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             dots = torch.matmul(q, k.transpose(-1, -2)) * scale
 
             # I103-1: 添加批量 Hilbert 偏置
+            # I113-11: 量纲对齐 - 乘以 √d_k 确保与 QK^T / √d_k 量级相当
             if hilbert_bias_batch is not None:
-                dots = dots + hilbert_bias_batch * self.hilbert_bias_scale
+                dots = dots + hilbert_bias_batch * self.hilbert_bias_scale * (self.dim_head ** 0.5)
 
             # 掩码: 只保留深度 d 的 token 之间的注意力 (I108-3: 使用预分配缓冲区)
             # mask_2d[b, i, j] = depth_mask[b, i] AND depth_mask[b, j]
@@ -1249,18 +1261,23 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                 )
                 if hilbert_bias is not None:
                     # hilbert_bias: (H, S, S) or (B, H, S, S)
+                    # I113-11: 量纲对齐 - 乘以 √d_k 确保与 QK^T / √d_k 量级相当
+                    dim_scale = self.dim_head ** 0.5
                     if hilbert_bias.dim() == 3:
-                        dots = dots + hilbert_bias.unsqueeze(0) * self.hilbert_bias_scale
+                        dots = dots + hilbert_bias.unsqueeze(0) * self.hilbert_bias_scale * dim_scale
                     else:
-                        dots = dots + hilbert_bias * self.hilbert_bias_scale
+                        dots = dots + hilbert_bias * self.hilbert_bias_scale * dim_scale
 
+            # I113-11: 量纲对齐常量 - 定义在 level_bias 分支外部
+            dim_scale = self.dim_head ** 0.5
             level_bias = self._compute_level_bias(levels_info)
             if level_bias is not None:
                 # level_bias: (H, S, S) or (B, H, S, S)
+                # I113-11: 量纲对齐 - 乘以 √d_k 确保与 QK^T / √d_k 量级相当
                 if level_bias.dim() == 3:
-                    dots = dots + level_bias.unsqueeze(0) * self.level_bias_scale
+                    dots = dots + level_bias.unsqueeze(0) * self.level_bias_scale * dim_scale
                 else:
-                    dots = dots + level_bias * self.level_bias_scale
+                    dots = dots + level_bias * self.level_bias_scale * dim_scale
 
         if attention_mask is not None:
             mask_value = -torch.finfo(dots.dtype).max
@@ -1442,7 +1459,7 @@ class ShapeScaleEncoder(nn.Module):
         #   s_log = log(s + ε) ∈ (-∞, 0]           展开到对称空间
         # 数学效果: Var(r_norm) ≈ Var(s_log)，消除异构性导致的优化偏差
         aspect_ratios_norm = torch.tanh(aspect_ratios / (1 + aspect_ratios.abs()))
-        normalized_areas_log = torch.log(normalized_areas + 1e-8)
+        normalized_areas_log = torch.log(normalized_areas + EPS)
 
         # 组合特征 [B, N, 2] - I35-1 核心改进
         combined = torch.stack([aspect_ratios_norm, normalized_areas_log], dim=-1)
@@ -1501,7 +1518,7 @@ class ShapeScaleEncoder(nn.Module):
             regions, (W, H), epsilon=1e-8
         )
         aspect_ratios_norm = torch.tanh(aspect_ratios / (1 + aspect_ratios.abs()))
-        normalized_areas_log = torch.log(normalized_areas + 1e-8)
+        normalized_areas_log = torch.log(normalized_areas + EPS)
 
         # 构建所有组合的特征 [B, N, N, 4]
         # r_i, s_i: 查询对 (query pair) 的特征
@@ -1879,7 +1896,7 @@ class AreaEncoder(nn.Module):
         heights = torch.abs(regions[..., 3] - regions[..., 1])  # [B, N]
 
         # Patch 边长的几何平均
-        L_patch = torch.sqrt(widths * heights + 1e-8)  # [B, N]
+        L_patch = torch.sqrt(widths * heights + EPS)  # [B, N]
 
         # 图像尺寸的几何平均
         L_image = math.sqrt(W * H)
@@ -1942,7 +1959,7 @@ class AreaEncoder(nn.Module):
 
         # Nyquist 频率: ω_Nyquist = π / L_norm
         # [B, N] -> [B, N, 1] 用于广播
-        omega_nyquist = (math.pi / (L_norm + 1e-8)).unsqueeze(-1)  # [B, N, 1]
+        omega_nyquist = (math.pi / (L_norm + EPS)).unsqueeze(-1)  # [B, N, 1]
 
         # 截止频率: 从配置读取，默认 80% Nyquist
         # I98-3: omega_cutoff = cutoff_ratio * omega_nyquist

@@ -23,7 +23,7 @@ Logits 裁剪:
 
 LearnableSplitter 默认参数 (P11-10/P11-11 修复后):
     T_start = 1.0        Gumbel-Softmax 起始温度
-    T_end = 0.3          Gumbel-Softmax 终止温度 (P11-11: 安全下界)
+    T_end = 0.5          Gumbel-Softmax 终止温度 (I24-7: 保持探索能力)
     τ_base = 0.0         初始基础阈值 (P11-10: 对称于 z 分布)
     γ = 0.85             阈值衰减因子 (每层)
 """
@@ -38,10 +38,15 @@ EMBEDDING_INIT_STD: float = 0.02
 # ==================== 注意力缩放常量 ====================
 
 #: Hilbert 路径偏置的缩放因子
-HILBERT_BIAS_SCALE: float = 0.1
+#: I113-11: 基础缩放值，有效值需配合 attn_hilbert_bias.py 中的 √d_k 量纲对齐
+#: 当前实现: B_hilbert_eff = B_hilbert * HILBERT_BIAS_SCALE * √d_k
+#: 初始化: HILBERT_BIAS_SCALE = 1.0 (在 config.py 中可配置)
+HILBERT_BIAS_SCALE: float = 1.0
 
 #: 层级偏置的缩放因子
-LEVEL_BIAS_SCALE: float = 0.05
+#: I113-11: 与 Hilbert 偏置保持一致的对齐策略
+#: 当前实现: B_level_eff = B_level * LEVEL_BIAS_SCALE * √d_k
+LEVEL_BIAS_SCALE: float = 1.0
 
 # ==================== Splitter 温度常量 ====================
 
@@ -61,43 +66,67 @@ SPLITTER_TEMP_END: float = 0.5
 #: 数学: T(t) = T_end + (T_start - T_end) * (1 + cos(πt)) / 2
 SPLITTER_TEMP_SCHEDULE: str = 'cosine'
 
-# ==================== 数值稳定性常量 (I12-7) ====================
+# ==================== 数值稳定性常量 (I12-7/I112-3) ====================
 # 数学分析见: workspace/numerical_constants_analysis.py
+
+# I112-3: 统一的数值稳定性常量
+# 数学依据: 1e-6 是 FP16 的安全下界
+#   - FP16 最小正规数: ~6e-8
+#   - 1e-6 提供 16× 安全余量
+#   - 相对于 FP16 精度 (~1e-3)，提供 1000× 余量
+# 使用场景: 所有需要 eps 的场景统一使用此常量
+EPS: float = 1e-6
 
 #: Gumbel 采样 uniform clamp (FP32 计算中安全边界)
 #: 数学: g = -log(-log(u)), u ∈ [ε, 1-ε]
-#: FP32 安全边界: ε >= 1e-10 (FP32 最小 ~1e-38)
-#: FP16 兼容边界: ε >= 1e-8 (FP16 最小正规数 ~6e-8)
-#: 验证: ε=1e-8 → g ∈ [-18.4, 18.4], Gumbel 分布覆盖 99.99%
-#: 注意: gumbel_topk_splitter.py 中已显式使用 FP32 计算
-GUMBEL_EPSILON: float = 1e-8  # I30-8: FP16 安全阈值
+#: I112-3: 更新为 EPS (1e-6)，与 FP16 统一
+GUMBEL_EPSILON: float = EPS
 
 #: Log 计算安全 epsilon
 #: 用途: log(p + ε) 防止 log(0)
-#: FP16 安全: ε >= 1e-8
-#: 熵误差: < 1e-8 (可忽略)
-#: I30-8: 提升到 1e-8 与 GUMBEL_EPSILON 统一
-LOG_EPSILON: float = 1e-8
+#: I112-3: 更新为 EPS (1e-6)，消除 FP16 下溢风险
+LOG_EPSILON: float = EPS
 
 #: 除法安全 epsilon
 #: 用途: x / (sum + ε) 防止除零
-DIVISION_EPSILON: float = 1e-8
+#: I112-3: 更新为 EPS (1e-6)，统一数值边界
+DIVISION_EPSILON: float = EPS
 
 #: 概率下界 (避免 0 概率参与计算)
 #: 用途: prob.clamp(min=PROB_EPSILON)
-PROB_EPSILON: float = 1e-8
+#: I112-3: 更新为 EPS (1e-6)，与 FP16 安全对齐
+PROB_EPSILON: float = EPS
 
 #: I102-4: 形状归一化 epsilon (FP16 安全下界)
 #: 用途: norm = ||f|| + ε 防止除零
-#: FP16 安全: ε >= 1e-6 (FP16 最小正规数 ~6e-8)
-#: 验证: 原 ε=1e-8 位于 FP16 边界，可能导致下溢
-SHAPE_NORM_EPSILON: float = 1e-6
+#: I112-3: 更新为 EPS，统一使用
+SHAPE_NORM_EPSILON: float = EPS
+
+#: FP16 安全 epsilon (替代原有的 1e-8)
+#: I112-3: 更新为 EPS，统一使用
+FP16_SAFE_EPSILON: float = EPS
 
 #: 温度参数下界 (Gumbel-Softmax/Top-K)
 #: 数学分析: T < 0.1 时 softmax 梯度趋近于 0
 #: I35 改进: 从 0.1 提升到 0.3，保持更健康的梯度流
 #: 验证: T=0.3 时 softmax 梯度仍有效 (∂p/∂z ≈ 1/τ)
 TEMPERATURE_MIN: float = 0.3
+
+# ==================== I113-5: STE 梯度缩放常量 ====================
+# 数学分析: STE 缩放因子 α = (N/K) × σ(log β) × min(τ/τ_ref, 1)
+
+#: STE 缩放参考温度 (用于温度保护机制)
+#: 用途: min(τ/τ_ref, 1) 防止低温度时梯度爆炸
+#: 数学: τ_ref = 1.0 作为参考点，与 Gumbel 扰动归一化一致
+STE_SCALE_TEMP_REF: float = 1.0
+
+#: STE 可学习缩放下界 (防止过度缩放)
+#: 用途: σ(log β) ∈ (0, 1)，但通过 clamp 限制有效范围
+#: 数学: 防止学习到极端值导致梯度不稳定
+STE_SCALE_MIN: float = 0.1
+
+#: STE 可学习缩放上界
+STE_SCALE_MAX: float = 2.0
 
 # ==================== I108-6: FP16 Clamp 边界常量 ====================
 # 数学分析见: workspace/fp16_clamp_analysis.md
@@ -210,6 +239,11 @@ QUOTA_ENTROPY_WEIGHT: float = 0.1
 #:       MSE 损失使 ∂L/∂φ_d = 2λ × (K_soft_d - K_hard_d) × K × ∂p_d/∂φ_d
 QUOTA_STE_WEIGHT: float = 0.5
 
+#: I113-7: 信息密度配额损失权重
+#: 数学: L_info = MSE(soft_quota, hard_quota) + λ × KL(soft || target)
+#: 用途: 为 info_density → quota 分配提供梯度，恢复端到端学习能力
+QUOTA_INFO_LAMBDA: float = 0.1
+
 # ==================== I33: 相对预算与自适应覆盖率常量 ====================
 # 数学分析: 动态深度下 K_max 与 K_min 应随图像尺寸自适应
 # 原理:
@@ -319,6 +353,10 @@ from typing import Optional, Tuple
 def compute_max_level(image_size: int, min_patch_size: int) -> int:
     """计算四叉树最大深度。
 
+    .. deprecated::
+        I145: 此函数已废弃。请使用 `depth_utils.compute_max_depth()`，
+        它支持元组形式的 image_size 和 hard_limit 参数。
+
     数学形式化:
         max_depth = ceil(log2(min(H, W) / min_patch_size))
 
@@ -343,6 +381,12 @@ def compute_max_level(image_size: int, min_patch_size: int) -> int:
     Raises:
         ValueError: 当 image_size 或 min_patch_size 非正数时
     """
+    import warnings
+    warnings.warn(
+        "constants.compute_max_level() is deprecated. Use depth_utils.compute_max_depth() instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     if image_size <= 0:
         raise ValueError(f"image_size 必须为正数, 得到 {image_size}")
     if min_patch_size <= 0:
@@ -357,6 +401,9 @@ def compute_max_level(image_size: int, min_patch_size: int) -> int:
 
 def compute_num_candidates(max_level: int) -> int:
     """计算四叉树候选节点总数。
+
+    .. deprecated::
+        I145: 此函数已废弃。请使用 `depth_utils.compute_total_candidates()`。
 
     数学形式化:
         N_candidates = Σ(4^d), d=0..max_level = (4^(max_level+1) - 1) / 3
@@ -373,6 +420,12 @@ def compute_num_candidates(max_level: int) -> int:
     Returns:
         候选节点总数
     """
+    import warnings
+    warnings.warn(
+        "constants.compute_num_candidates() is deprecated. Use depth_utils.compute_total_candidates() instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     if max_level < 0:
         raise ValueError(f"max_level 必须非负, 得到 {max_level}")
     return (4 ** (max_level + 1) - 1) // 3
@@ -381,8 +434,9 @@ def compute_num_candidates(max_level: int) -> int:
 def compute_k_bounds(
     max_level: int,
     token_coverage_min: float,
-    token_coverage_max: float,
+    token_coverage_max: Optional[float],
     image_size: Optional[int] = None,
+    target_ratio: float = 0.5,  # I113-2: L1 相对参数
 ) -> Tuple[int, int]:
     """从覆盖率参数计算 K_min 和 K_max。
 
@@ -392,20 +446,36 @@ def compute_k_bounds(
         K_min = max(K_MIN_HARD, ceil(N × coverage_min))
         K_max = min(K_MAX_HARD, ceil(N × coverage_max × scale))
 
+    I113-2 三层参数设计:
+        L1 相对: target_ratio ∈ [0, 1]
+        L2 绝对: N_base = Σ(4^d), N_target = N_base × target_ratio
+        L3 动态: 实际 K 值根据内容动态调整
+
     设计原理:
         - 覆盖率保证跨分辨率的尺度不变性
         - 硬上限约束防止显存溢出
         - scale 因子适应不同分辨率的上下文需求
+        - target_ratio 提供归一化的分裂目标
 
     Args:
         max_level: 四叉树最大深度
         token_coverage_min: 最小覆盖率 α
-        token_coverage_max: 最大覆盖率 β
+        token_coverage_max: 最大覆盖率 β (已废弃，使用 target_ratio 替代)
         image_size: 输入图像尺寸（用于 scale 计算）
+        target_ratio: L1 相对目标分裂率 [0, 1]
 
     Returns:
         (K_min, K_max) 元组
     """
+    # I113-2: 处理废弃的 token_coverage_max
+    if token_coverage_max is None:
+        # 使用 target_ratio 计算 K_max
+        N = compute_num_candidates(max_level)
+        N_target = int(N * target_ratio)
+        K_max = max(K_MIN_HARD_LIMIT, min(K_MAX_HARD_LIMIT, N_target))
+        K_min = max(K_MIN_HARD_LIMIT, int(math.ceil(N * token_coverage_min)))
+        return (K_min, K_max)
+
     # 计算候选节点总数
     N = compute_num_candidates(max_level)
 
@@ -467,7 +537,8 @@ def compute_quota_init_logits(max_level: int) -> Tuple[float, ...]:
     raw_weights = [1.0 / (d + 1) for d in range(max_level + 1)]
 
     # 转换为 log space
-    log_weights = [math.log(w + 1e-8) for w in raw_weights]
+    # I112-3: 使用 EPS 统一数值稳定性
+    log_weights = [math.log(w + EPS) for w in raw_weights]
     mean_log = sum(log_weights) / len(log_weights)
 
     # 归一化使均值为 0

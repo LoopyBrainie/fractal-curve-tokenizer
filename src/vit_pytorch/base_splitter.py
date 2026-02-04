@@ -171,12 +171,12 @@ class AnnealingSplitter(Protocol):
         """
         ...
 
-    def get_current_temperature(self) -> float:
+    def get_current_temperature(self) -> Tensor:
         """
-        获取当前 Gumbel 温度值。
+        获取当前 Gumbel 温度张量。
 
         Returns:
-            float: 当前温度 τ > 0
+            Tensor: 当前温度 τ ∈ [T_min, ∞)，GPU 张量
         """
         ...
 

@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .constants import EPS  # I112-3: 统一数值稳定性常量
+
 
 @dataclass
 class SplitResult:
@@ -122,8 +124,9 @@ class CorrelationGate(nn.Module):
             redundancy: [B, N] 冗余性分数 (0=冗余, 1=独立)
         """
         # L2 归一化
+        # I112-3: 使用 EPS 统一数值稳定性
         norms = child_features.norm(dim=-1, keepdim=True)  # [B, N, 4, 1]
-        normalized = child_features / (norms + 1e-8)  # [B, N, 4, D]
+        normalized = child_features / (norms + EPS)  # [B, N, 4, D]
 
         # 计算余弦相似度矩阵: [B, N, 4, 4]
         sim_matrix = torch.einsum('...id,...jd->...ij', normalized, normalized)
@@ -247,7 +250,8 @@ class SemanticRedundancySplitter(nn.Module):
         probs = torch.sigmoid(logits)
 
         # Gumbel-Softmax
-        gumbel_noise = -torch.log(-torch.log(torch.rand_like(probs) + 1e-8) + 1e-8)
+        # I112-3: 使用 EPS 统一数值稳定性
+        gumbel_noise = -torch.log(-torch.log(torch.rand_like(probs) + EPS) + EPS)
         softened = (probs.log() + gumbel_noise) / temperature
 
         if hard:
@@ -279,7 +283,8 @@ class SemanticRedundancySplitter(nn.Module):
             temp = self.gumbel_temp_start
 
         if hasattr(self, 'log_temp'):
-            self.log_temp.data = torch.log(torch.tensor(temp + 1e-8))
+            # I112-3: 使用 EPS 统一数值稳定性
+            self.log_temp.data = torch.log(torch.tensor(temp + EPS))
         else:
             self.fixed_temp.fill_(temp)
 

@@ -50,9 +50,49 @@ from .constants import (
     DIVISION_EPSILON, PROB_EPSILON,
     TEMPERATURE_MIN,
     compute_max_level, compute_num_candidates, compute_k_bounds,
-    clamp_temperature
+    clamp_temperature,
+    K_COVERAGE_MAX_HARD,
 )
 from .config import AttentionEncoderConfig, SemanticSplitterConfig  # I98-3, I110-5
+
+
+# I112-6: LazyDiagnostics 延迟 diagnostics 包装器
+# 避免 torch.compile 中 cudagraphs 的 CPU 同步问题
+class LazyDiagnostics:
+    """延迟计算的 diagnostics 包装器。
+
+    设计原则: 避免 forward 关键路径中的 CPU 同步操作。
+    实际计算延迟到访问时进行（训练循环不在 cudagraphs 范围内）。
+    """
+    __slots__ = ('_model', '_filled')
+
+    def __init__(self, model):
+        self._model = model
+        self._filled = False
+
+    def _ensure_filled(self):
+        if not self._filled:
+            self._model._fill_lazy_diagnostics(self)
+
+    def __repr__(self):
+        self._ensure_filled()
+        return repr(self._filled)
+
+    def __getitem__(self, key):
+        self._ensure_filled()
+        return self._filled[key]
+
+    def get(self, key, default=None):
+        self._ensure_filled()
+        return self._filled.get(key, default)
+
+    def __bool__(self):
+        self._ensure_filled()
+        return bool(self._filled)
+
+    def __contains__(self, key):
+        self._ensure_filled()
+        return key in self._filled
 
 
 @dataclass
@@ -163,8 +203,12 @@ class FractalCurveViT(nn.Module):
         learnable_temperature: bool = True,
         # I33: 覆盖率参数（用于在不同分辨率下正确复算 K 值）
         # K_min/K_max 现在作为计算属性，不再是直接参数
+        # I113-2: token_coverage_max 已废弃，使用 target_ratio 替代
         token_coverage_min: float = 0.01,
-        token_coverage_max: float = 0.05,
+        # I113-2: token_coverage_max 已废弃，保留仅用于向后兼容
+        token_coverage_max: Optional[float] = None,
+        # I113-2: target_ratio - L1 相对参数，由外部配置传递
+        target_ratio: float = 0.5,
         pos_dropout: Optional[float] = None,
         use_area_encoding: bool = False,
         use_affine_modulation: bool = True,
@@ -240,8 +284,19 @@ class FractalCurveViT(nn.Module):
         self.ffn_type = ffn_type
 
         # I33: 存储覆盖率参数（用于 K 值计算）
+        # I113-2: token_coverage_max 已废弃，保留仅用于向后兼容
         self.token_coverage_min = token_coverage_min
-        self.token_coverage_max = token_coverage_max
+        if token_coverage_max is not None:
+            import warnings
+            warnings.warn(
+                "token_coverage_max 已废弃，将在未来版本中移除。 "
+                "请使用 config.target_ratio 替代。",
+                DeprecationWarning,
+                stacklevel=2
+            )
+            self._deprecated_token_coverage_max = token_coverage_max
+        else:
+            self._deprecated_token_coverage_max = None
 
         # I24-2: 可学习配额参数
         self.quota_learnable = quota_learnable
@@ -290,6 +345,9 @@ class FractalCurveViT(nn.Module):
         self.emb_dropout = emb_dropout
         self.drop_path_rate = drop_path_rate
 
+        # I113-2: target_ratio - L1 相对参数，由外部配置传递
+        self.target_ratio = target_ratio
+
         # I78: 处理动态分辨率模式 (必须在使用 effective_min_patch_size 之后)
         if image_size is None:
             # 使用 min_patch_size 估算默认图像尺寸用于初始化
@@ -326,8 +384,9 @@ class FractalCurveViT(nn.Module):
             K_min_computed, K_max_computed = compute_k_bounds(
                 max_level=max_level_limit,
                 token_coverage_min=token_coverage_min,
-                token_coverage_max=token_coverage_max,
+                token_coverage_max=token_coverage_max,  # 已废弃，可能为 None
                 image_size=min(self.image_size) if self.image_size else None,
+                target_ratio=self.target_ratio,  # I113-2: 使用外部传递的 target_ratio
             )
 
             splitter_config = SplitterConfig(
@@ -337,15 +396,14 @@ class FractalCurveViT(nn.Module):
                 hidden_dim=splitter_hidden_dim or 64,
                 intermediate_dim=(splitter_hidden_dim or 64) // 2,
                 pool_size=splitter_pool_size or 4,
-                K_min=K_min_computed,
-                K_max=K_max_computed,
+                # I113-2: K 边界由 config 内部根据 coverage_min/coverage_max_hard 自动计算
                 use_dynamic_k=True,
                 dropout=min(dropout, 0.15),
                 enable_learnable_quota=quota_learnable if quota_learnable is not None else True,
                 quota_entropy_weight=quota_entropy_weight,
-                # I33: 传递覆盖率参数（用于 ModelGene 保存）
-                token_coverage_min=token_coverage_min,
-                token_coverage_max=token_coverage_max,  # I109-3
+                # I33: 传递覆盖率参数
+                coverage_min=token_coverage_min,
+                coverage_max_hard=token_coverage_max if token_coverage_max else K_COVERAGE_MAX_HARD,
             )
             self.splitter = GumbelTopKSplitter(
                 config=splitter_config,
@@ -459,6 +517,20 @@ class FractalCurveViT(nn.Module):
                 use_fp16=lca_fp16,  # I104-3
             )
 
+        # === 一致性检查：确保 tokenizer 和 transformer 使用相同的 max_level ===
+        # I145: 防止配置不一致导致的权重不匹配问题
+        tokenizer_max_level = getattr(self.tokenizer, 'max_level', None)
+        transformer_max_level = getattr(self.transformer, 'max_level', None)
+
+        if tokenizer_max_level is not None and transformer_max_level is not None:
+            if tokenizer_max_level != transformer_max_level:
+                raise ValueError(
+                    f"[MODEL] max_level 不一致: tokenizer={tokenizer_max_level}, "
+                    f"transformer={transformer_max_level}。\n"
+                    f"  这通常是由于外部传入的组件配置不正确导致的。\n"
+                    f"  请确保 tokenizer 和 transformer 使用相同的 max_level。"
+                )
+
         # === MLP Head ===
         if mlp_head is not None:
             self.mlp_head = mlp_head
@@ -501,11 +573,13 @@ class FractalCurveViT(nn.Module):
             最少 token 数量
         """
         max_level = self.max_level if self.max_level is not None else 8
+        # I113-2: 使用 _deprecated_token_coverage_max 兼容旧代码
         K_min, _ = compute_k_bounds(
             max_level=max_level,
             token_coverage_min=self.token_coverage_min,
-            token_coverage_max=self.token_coverage_max,
+            token_coverage_max=getattr(self, '_deprecated_token_coverage_max', None),
             image_size=min(self.image_size) if self.image_size else None,
+            target_ratio=self.target_ratio,  # I113-2: 使用外部传递的 target_ratio
         )
         return K_min
 
@@ -526,11 +600,13 @@ class FractalCurveViT(nn.Module):
             最多 token 数量
         """
         max_level = self.max_level if self.max_level is not None else 8
+        # I113-2: 使用 _deprecated_token_coverage_max 兼容旧代码
         _, K_max = compute_k_bounds(
             max_level=max_level,
             token_coverage_min=self.token_coverage_min,
-            token_coverage_max=self.token_coverage_max,
+            token_coverage_max=getattr(self, '_deprecated_token_coverage_max', None),
             image_size=min(self.image_size) if self.image_size else None,
+            target_ratio=self.target_ratio,  # I113-2: 使用外部传递的 target_ratio
         )
         return K_max
 
@@ -552,6 +628,10 @@ class FractalCurveViT(nn.Module):
 
         用于 checkpoint 序列化，确保模型可复现。
 
+        Note:
+            max_level 是变参数，由模型架构根据 image_size 和 min_patch_size 动态计算，
+            不保存到 config 中。重建模型时会自动计算。
+
         Returns:
             包含所有 Tier 3 参数的字典
         """
@@ -568,10 +648,10 @@ class FractalCurveViT(nn.Module):
             # 几何配置
             'image_size': self.image_size,
             'min_patch_size': self.min_patch_size,
-            'max_level': self.max_level,
+            # Note: max_level 是变参数，由模型架构动态计算，不保存
             # 覆盖率预算 (I33)
             'token_coverage_min': self.token_coverage_min,
-            'token_coverage_max': self.token_coverage_max,
+            'token_coverage_max': getattr(self, '_deprecated_token_coverage_max', None),
             # 编码选项
             'lca_temperature': self.lca_temperature,
             'learnable_temperature': self.learnable_temperature,
@@ -926,16 +1006,7 @@ class FractalCurveViT(nn.Module):
                     # I144: 批量转换避免循环中的 .item()
                     lengths_cpu = lengths.cpu() if lengths.is_cuda else lengths
                     lengths_list = lengths_cpu.tolist()
-                    # I145: 使用延迟 diagnostics，避免 forward 中的 CPU 同步
-                    class LazyDiagnostics:
-                        __slots__ = ('_model', '_filled')
-                        def __init__(self, model):
-                            self._model = model
-                            self._filled = False
-                        def get(self, key, default=None):
-                            if not self._filled:
-                                self._model._fill_lazy_diagnostics(self)
-                            return self._filled.get(key, default)
+                    # I145: 使用模块级 LazyDiagnostics，避免 forward 中的 CPU 同步
                     lazy_diag = LazyDiagnostics(self)
                     for i in range(B):
                         aux_infos.append({
@@ -1017,31 +1088,7 @@ class FractalCurveViT(nn.Module):
                     else:
                         levels_used_list.append([])
 
-                # I145: 延迟 splitter_diagnostics 到首次访问时计算
-                # 使用 LazyDiagnostics 包装器，避免 forward 关键路径中的 CPU 同步
-                class LazyDiagnostics:
-                    """延迟计算的 diagnostics 包装器"""
-                    __slots__ = ('_model', '_filled')
-                    def __init__(self, model):
-                        self._model = model
-                        self._filled = False
-                    def __repr__(self):
-                        if not self._filled:
-                            self._model._fill_lazy_diagnostics(self)
-                        return repr(self._filled)
-                    def __getitem__(self, key):
-                        if not self._filled:
-                            self._model._fill_lazy_diagnostics(self)
-                        return self._filled[key]
-                    def get(self, key, default=None):
-                        if not self._filled:
-                            self._model._fill_lazy_diagnostics(self)
-                        return self._filled.get(key, default)
-                    def __bool__(self):
-                        if not self._filled:
-                            self._model._fill_lazy_diagnostics(self)
-                        return bool(self._filled)
-
+                # I145: 使用模块级 LazyDiagnostics，延迟到首次访问时计算
                 lazy_diag = LazyDiagnostics(self)
 
                 for i in range(B):
@@ -1461,12 +1508,14 @@ class FractalCurveViT(nn.Module):
             # 当前温度
             if hasattr(splitter, 'get_current_temperature'):
                 current_temp = splitter.get_current_temperature()
-                diagnostics['current_temperature'] = current_temp
+                # 提取标量用于日志和比较
+                current_temp_val = current_temp.detach().cpu().float().item()
+                diagnostics['current_temperature'] = current_temp_val
 
                 # I36 Phase 3: 温度状态检查
-                if current_temp < 0.3:
+                if current_temp_val < 0.3:
                     diagnostics['temperature_status'] = 'low_risk'  # T < 0.3 可能导致梯度消失
-                elif current_temp < 0.5:
+                elif current_temp_val < 0.5:
                     diagnostics['temperature_status'] = 'healthy'  # 健康范围
                 else:
                     diagnostics['temperature_status'] = 'high_explore'  # 高温度，探索性强
