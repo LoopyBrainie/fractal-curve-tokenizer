@@ -949,21 +949,39 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             # I99-1 FIX: 使用更简单直接的方法计算 batch 内位置
             # batch_starts[b] = batch b 在全局数组中的起始位置
             batch_starts = torch.zeros(B, dtype=torch.long, device=device)
-            batch_counts = torch.bincount(batch_indices, minlength=B)
+            # I99-1 CRITICAL: 显式 clamp batch_indices 防止 torch.compile 优化绕过
+            # torch.bincount 要求 indices ∈ [0, minlength-1]
+            batch_indices_safe = batch_indices.clamp(min=0, max=B - 1)
+
+            # I99-1: 使用纯张量验证 (torch.compile 安全)
+            # 检查是否有任何索引超出范围 [0, B-1]
+            if batch_indices_safe.numel() > 0:
+                out_of_bounds = (batch_indices_safe < 0) | (batch_indices_safe >= B)
+                if out_of_bounds.any():
+                    raise RuntimeError(
+                        f"I99-1: batch_indices 包含越界值! "
+                        f"batch_indices.shape={batch_indices_safe.shape}, B={B}"
+                    )
+
+            batch_counts = torch.bincount(batch_indices_safe, minlength=B)
             # 计算每个 batch 的起始位置 (前缀和)
             batch_starts[1:] = batch_counts[:-1].cumsum(dim=0)
 
             # token_positions = 全局位置 - 该 batch 的起始位置
             global_positions = torch.arange(N_total, device=device)
-            token_positions = global_positions - batch_starts[batch_indices]
+            # I99-1: 使用 clamp 后的 batch_indices_safe
+            token_positions = global_positions - batch_starts[batch_indices_safe]
 
             # I99-1: 防御性边界检查 - 钳制 token_positions 到 [0, max_tokens_safe-1]
             # 防止由于 splitter 异常导致的越界访问
             token_positions = token_positions.clamp(min=0, max=max_tokens_safe - 1)
 
         # I99-1: 防御性检查 - 确保 batch_indices 在有效范围内
+        # I99-1 CRITICAL: 显式 clamp 作为独立操作，防止 torch.compile 融合优化
         if N_total > 0:
             batch_indices = batch_indices.clamp(min=0, max=B - 1)
+            # I99-1: 强制同步，确保 clamp 完成后再进行索引操作
+            torch._sync(batch_indices)
 
         # 向量化分配
         tokens[batch_indices, token_positions] = all_tokens.to(dtype)
