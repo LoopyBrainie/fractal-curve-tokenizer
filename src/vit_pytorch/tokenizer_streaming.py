@@ -722,12 +722,22 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         
         boxes_tensor = torch.tensor(all_boxes, device=device, dtype=dtype)
         depths_tensor = torch.tensor(all_depths, device=device, dtype=torch.long)
-        
+
+        # I99-1: 验证 boxes 不包含 NaN/Inf
+        if torch.isnan(boxes_tensor).any() or torch.isinf(boxes_tensor).any():
+            boxes_tensor = torch.where(torch.isnan(boxes_tensor), torch.zeros_like(boxes_tensor), boxes_tensor)
+            boxes_tensor = torch.where(torch.isinf(boxes_tensor), torch.zeros_like(boxes_tensor), boxes_tensor)
+
         # ROI-Align
         try:
             from torchvision.ops import roi_align
+            # I99-1: ROIAlign 需要 channels_first 格式
+            if features.dim() == 4 and features.is_contiguous(memory_format=torch.channels_last):
+                features_roi = features.to(memory_format=torch.contiguous_format)
+            else:
+                features_roi = features
             pooled = roi_align(
-                features,
+                features_roi,
                 boxes_tensor,
                 output_size=(1, 1),
                 spatial_scale=1.0,
@@ -859,6 +869,21 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # regions: [N, 4] -> (x1, y1, x2, y2)
         p = self.base_patch_size
         regions = tensor_result.regions.float()
+
+        # I99-1: 验证 regions 不包含 NaN/Inf (ROIAlign CUDA 内核对此敏感)
+        if torch.isnan(regions).any() or torch.isinf(regions).any():
+            # 替换 NaN/Inf 为安全值
+            regions = torch.where(torch.isnan(regions), torch.zeros_like(regions), regions)
+            regions = torch.where(torch.isinf(regions), torch.zeros_like(regions), regions)
+
+        # I99-1: clamp regions 到有效图像边界
+        img_size = max(self.image_size) if isinstance(self.image_size, tuple) else self.image_size
+        regions = regions.clone()
+        regions[:, 0] = regions[:, 0].clamp(min=0, max=img_size)
+        regions[:, 1] = regions[:, 1].clamp(min=0, max=img_size)
+        regions[:, 2] = regions[:, 2].clamp(min=0, max=img_size)
+        regions[:, 3] = regions[:, 3].clamp(min=0, max=img_size)
+
         # I99-1: 防御性 clamp batch_indices (额外保护)
         batch_indices = tensor_result.batch_indices.clamp(min=0, max=B - 1)
         
@@ -873,13 +898,25 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 确保最小尺寸
         boxes[:, 3] = torch.maximum(boxes[:, 1] + 0.5, boxes[:, 3])
         boxes[:, 4] = torch.maximum(boxes[:, 2] + 0.5, boxes[:, 4])
-        
+
         # ====================================================================
         # ROI-Align (批量)
         # ====================================================================
         from torchvision.ops import roi_align
+        # I99-1: ROIAlign 需要 channels_first 格式进行 CUDA 操作
+        # 如果 features 是 channels_last，转换为 channels_first 以避免 CUDA 断言错误
+        if features.dim() == 4 and features.is_contiguous(memory_format=torch.channels_last):
+            features_roi = features.to(memory_format=torch.contiguous_format)
+        else:
+            features_roi = features
+
+        # I99-1: 验证 boxes 不包含 NaN/Inf
+        if torch.isnan(boxes).any() or torch.isinf(boxes).any():
+            boxes = torch.where(torch.isnan(boxes), torch.zeros_like(boxes), boxes)
+            boxes = torch.where(torch.isinf(boxes), torch.zeros_like(boxes), boxes)
+
         pooled = roi_align(
-            features,
+            features_roi,
             boxes,
             output_size=(1, 1),
             spatial_scale=1.0,
@@ -957,14 +994,21 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             # torch.bincount 要求 indices ∈ [0, minlength-1]
             batch_indices_safe = batch_indices.clamp(min=0, max=B - 1)
 
-            # I99-1: 使用纯张量验证 (torch.compile 安全)
-            # 检查是否有任何索引超出范围 [0, B-1]
+            # I99-1: 验证 clamp 结果
+            # clamp 后，值应该在 [0, B-1] 范围内。如果不是，说明 B <= 0
             if batch_indices_safe.numel() > 0:
-                out_of_bounds = (batch_indices_safe < 0) | (batch_indices_safe >= B)
-                if out_of_bounds.any():
+                # I99-1: 检查 B 是否有效 (必须 >= 1)
+                if B <= 0:
                     raise RuntimeError(
-                        f"I99-1: batch_indices 包含越界值! "
-                        f"batch_indices.shape={batch_indices_safe.shape}, B={B}"
+                        f"I99-1: B 无效! B={B}, features.shape={features.shape}"
+                    )
+                # 验证 clamp 结果 - min 应该是 0，max 应该是 B-1
+                batch_min = batch_indices_safe.min()
+                batch_max = batch_indices_safe.max()
+                if batch_min < 0 or batch_max >= B:
+                    raise RuntimeError(
+                        f"I99-1: batch_indices clamp 失败! "
+                        f"batch_min={batch_min}, batch_max={batch_max}, B={B}"
                     )
 
             batch_counts = torch.bincount(batch_indices_safe, minlength=B)
