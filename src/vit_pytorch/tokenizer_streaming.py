@@ -947,7 +947,15 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 向量化分配到输出 buffer
         # ====================================================================
         # I99-1: 防御性检查 - 确保 max_tokens 至少为 1
-        max_tokens_safe = max(1, max_tokens)
+        # I99-1 FIX: max_tokens 是 scalar tensor，需要提取 Python int
+        # 使用 torch.maximum 保持张量计算，但后续需要 .item() 用于形状定义
+        max_tokens_tensor = torch.maximum(max_tokens, torch.tensor(1, device=device, dtype=max_tokens.dtype))
+        max_tokens_safe = max_tokens_tensor.item()  # 提取 Python int 用于 tensor 形状
+
+        # 验证 max_tokens_safe 是有效的
+        if max_tokens_safe < 1:
+            max_tokens_safe = 1
+
         tokens = torch.zeros(B, max_tokens_safe, dim, device=device, dtype=dtype)
         # I32-2: 使用-1 sentinel标识padding token，避免与有效depth=0混淆
         levels_info = torch.full((B, max_tokens_safe, self.max_level + 1), -1, dtype=torch.long, device=device)
@@ -1039,6 +1047,42 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # I99-1 CRITICAL: 显式 clamp 作为独立操作，防止 torch.compile 融合优化
         if N_total > 0:
             batch_indices = batch_indices.clamp(min=0, max=B - 1)
+
+        # I99-1 CRITICAL: 高级索引诊断 - 在执行前验证所有索引
+        if N_total > 0:
+            # 验证 batch_indices
+            batch_min = batch_indices.min().item()
+            batch_max = batch_indices.max().item()
+            if batch_min < 0 or batch_max >= B:
+                raise RuntimeError(
+                    f"I99-1 CRITICAL: batch_indices 越界! "
+                    f"min={batch_min}, max={batch_max}, B={B}, N_total={N_total}"
+                )
+
+            # 验证 token_positions (必须在 [0, max_tokens_safe-1] 范围内)
+            token_min = token_positions.min().item()
+            token_max = token_positions.max().item()
+            if token_min < 0 or token_max >= max_tokens_safe:
+                raise RuntimeError(
+                    f"I99-1 CRITICAL: token_positions 越界! "
+                    f"min={token_min}, max={token_max}, max_tokens_safe={max_tokens_safe}, "
+                    f"N_total={N_total}, B={B}"
+                )
+
+            # 验证 tokens tensor 形状
+            expected_tokens_shape = (B, max_tokens_safe, dim)
+            if tokens.shape != expected_tokens_shape:
+                raise RuntimeError(
+                    f"I99-1 CRITICAL: tokens 形状错误! "
+                    f"expected={expected_tokens_shape}, actual={tokens.shape}"
+                )
+
+            # 验证 all_tokens 形状
+            if all_tokens.shape[0] != N_total:
+                raise RuntimeError(
+                    f"I99-1 CRITICAL: all_tokens 形状错误! "
+                    f"expected N_total={N_total}, actual={all_tokens.shape[0]}"
+                )
 
         # 向量化分配
         tokens[batch_indices, token_positions] = all_tokens.to(dtype)
