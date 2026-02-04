@@ -117,7 +117,7 @@ TIER3_PARAMETERS = [
     # 几何配置
     'image_size',
     'min_patch_size',
-    'max_level',
+    # Note: max_level 是变参数，由模型架构动态计算，不保存
     # 覆盖率预算 (I33)
     'token_coverage_min',
     'token_coverage_max',
@@ -562,6 +562,7 @@ class TestCheckpointConsistency:
     def test_checkpoint_self_contained(self):
         """验证 checkpoint 是自包含的 (包含完整模型配置)."""
         # 创建包含完整配置的 ModelGene（包含所有 splitter 参数）
+        # I98-2: max_level 是计算属性，不作为直接参数
         gene = ModelGene(
             dim=64,
             num_layers=2,
@@ -572,8 +573,6 @@ class TestCheckpointConsistency:
             channels=3,
             pool='weighted',
             dropout=0.2,
-            tokenizer_max_level=4,       # Tokenizer/Splitter 的 max_level
-            transformer_max_level=4,     # Transformer 的 max_level
             token_coverage_min=0.01,     # I33: 覆盖率参数
             token_coverage_max=0.05,
             splitter_feature_dim=64,  # 必需：特征维度
@@ -864,9 +863,9 @@ class TestTier3Parameters:
         assert rebuilt_model.heads == original_model.heads
         assert rebuilt_model.num_classes == original_model.num_classes
 
-        # 验证覆盖率参数一致性
+        # 验证覆盖率参数一致性 (I113-2: 使用 _deprecated_token_coverage_max)
         assert rebuilt_model.token_coverage_min == original_model.token_coverage_min
-        assert rebuilt_model.token_coverage_max == original_model.token_coverage_max
+        assert getattr(rebuilt_model, '_deprecated_token_coverage_max', None) == getattr(original_model, '_deprecated_token_coverage_max', None)
 
         # 验证 K 值计算一致性
         assert rebuilt_model.K_min == original_model.K_min
@@ -956,12 +955,12 @@ class TestParameterFlowConsistency:
         loaded_gene = ModelGene.from_dict(gene.to_dict())
         evaluator_model = loaded_gene.build_model()
 
-        # 验证参数一致性
+        # 验证参数一致性 (I113-2: 使用 _deprecated_token_coverage_max)
         assert evaluator_model.dim == model.dim
         assert evaluator_model.num_layers == model.num_layers
         assert evaluator_model.heads == model.heads
         assert evaluator_model.token_coverage_min == model.token_coverage_min
-        assert evaluator_model.token_coverage_max == model.token_coverage_max
+        assert getattr(evaluator_model, '_deprecated_token_coverage_max', None) == getattr(model, '_deprecated_token_coverage_max', None)
         assert evaluator_model.K_min == model.K_min
         assert evaluator_model.K_max == model.K_max
 

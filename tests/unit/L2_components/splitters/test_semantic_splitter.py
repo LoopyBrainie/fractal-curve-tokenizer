@@ -284,6 +284,43 @@ class TestSemanticRedundancyLoss:
         # 经过 Gram-Schmidt 正交化后，损失应显著降低
         assert loss.abs().max() < 0.1, f"正交特征损失应较小, got {loss.abs().max():.4f}"
 
+    def test_diversity_loss_norm_invariance(self):
+        """I112-1: 测试多样性损失对特征范数的不变性
+
+        验证修复后的 DiversityLoss 使用余弦相似度，
+        无论特征范数大小，正交特征的损失应接近 0。
+        """
+        B, N, D = 1, 1, 256
+        loss_fn = DiversityLoss(reduction="none")
+
+        # 使用 QR 分解创建完美正交基
+        def create_orthogonal_features(norm_value: float) -> torch.Tensor:
+            random = torch.randn(D, 4)
+            q, _ = torch.linalg.qr(random)  # Q 的列为正交单位向量, shape [D, 4]
+            return q.T * norm_value  # 转置并缩放到指定范数, shape [4, D]
+
+        # 测试不同范数下的正交特征
+        for norm_value in [1.0, 10.0, 100.0, 1000.0]:
+            orthogonal_features = create_orthogonal_features(norm_value)
+            assert orthogonal_features.shape == (4, D), f"Expected (4, {D}), got {orthogonal_features.shape}"
+            child_features = orthogonal_features.view(B, N, 4, D)
+            loss = loss_fn(child_features)
+            # 正交特征的损失应接近 0（与范数无关）
+            assert loss.abs() < 1e-5, \
+                f"正交特征(范数={norm_value})损失应≈0, got {loss.item():.6f}"
+
+        # 验证：完全平行的大范数特征会产生显著损失
+        # 创建真正平行的特征：所有4个特征向量完全相同
+        base_vector = torch.randn(D)
+        base_vector = base_vector / base_vector.norm()  # 归一化
+        parallel_features = base_vector.unsqueeze(0).expand(4, -1)  # [4, D]
+        parallel_child = parallel_features.view(B, N, 4, D)
+        parallel_loss = loss_fn(parallel_child)
+        # 完美平行特征的损失应为 12 (4个特征完全平行)
+        # 4×3 = 12 (4行，每行有3个1)
+        assert parallel_loss.abs() > 10.0, \
+            f"平行特征损失应≈12, got {parallel_loss.item():.4f}"
+
     def test_reconstruction_loss_identity(self):
         """测试子节点均值等于父节点时重构损失为 0"""
         B, N, D = 2, 10, 256

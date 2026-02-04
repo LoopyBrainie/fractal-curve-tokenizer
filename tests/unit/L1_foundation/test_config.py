@@ -33,8 +33,9 @@ class TestAttentionEncoderConfig:
 
         assert abs(config.level_scale_init - 0.5413) < 0.0001
         assert config.hierarchical_scale_bounds == (0.5, 1.5)
-        assert abs(config.hilbert_bias_init - (-2.302585)) < 0.0001
-        assert abs(config.level_bias_init - (-2.995732)) < 0.0001
+        # I113-11: 初始化从 ln(0.1) 改为 ln(1.0)，配合 √d_k 量纲对齐
+        assert abs(config.hilbert_bias_init - 0.0) < 0.0001
+        assert abs(config.level_bias_init - 0.0) < 0.0001
         assert config.energy_injection_enabled is True
 
     def test_custom_init_values(self):
@@ -276,8 +277,9 @@ class TestConfigBackwardCompatibility:
 
         assert config.level_scale_init == 0.5413
         assert config.hierarchical_scale_bounds == (0.5, 1.5)
-        assert abs(config.hilbert_bias_init - (-2.302585)) < 0.0001
-        assert abs(config.level_bias_init - (-2.995732)) < 0.0001
+        # I113-11: 初始化从 ln(0.1) 改为 ln(1.0)
+        assert abs(config.hilbert_bias_init - 0.0) < 0.0001
+        assert abs(config.level_bias_init - 0.0) < 0.0001
 
     def test_attention_without_config_uses_defaults(self):
         """不传配置时使用默认行为."""

@@ -217,22 +217,27 @@ class TestElasticBudgetConstants:
     def test_elastic_bounds_consistent_with_k_coverage(self):
         """ELASTIC_COVERAGE bounds 与 K_COVERAGE bounds 一致."""
         from vit_pytorch.constants import (
-            ELASTIC_COVERAGE_MAX,
             ELASTIC_COVERAGE_MIN,
             K_COVERAGE_MAX_HARD,
         )
 
-        assert ELASTIC_COVERAGE_MAX == K_COVERAGE_MAX_HARD
+        # ELASTIC_COVERAGE_MIN 与 K_COVERAGE_BASE 一致
+        from vit_pytorch.constants import K_COVERAGE_BASE
+        assert ELASTIC_COVERAGE_MIN == K_COVERAGE_BASE
         assert ELASTIC_COVERAGE_MIN >= 0.01
 
     def test_elastic_lambda_weights_reasonable(self):
         """ELASTIC_LAMBDA weights 在合理范围内."""
         from vit_pytorch.constants import (
-            ELASTIC_LAMBDA_OVER,
+            ELASTIC_LAMBDA_TARGET,
+            ELASTIC_LAMBDA_BOUNDARY,
             ELASTIC_LAMBDA_COLLAPSE,
         )
 
-        assert 0.01 <= ELASTIC_LAMBDA_OVER <= 1.0
+        # 验证 λ_TARGET 和 λ_BOUNDARY 在合理范围 (0.01 ~ 1.0)
+        assert 0.01 <= ELASTIC_LAMBDA_TARGET <= 1.0
+        assert 0.01 <= ELASTIC_LAMBDA_BOUNDARY <= 1.0
+        # λ_COLLAPSE >= 1.0 用于惩罚崩溃
         assert ELASTIC_LAMBDA_COLLAPSE >= 1.0
 
 
