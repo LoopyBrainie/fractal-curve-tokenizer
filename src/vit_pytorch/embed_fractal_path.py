@@ -205,14 +205,18 @@ class VectorizedPathEncoder:
         # regions: [B, N, 4] = (x1, y1, x2, y2)
         cx = (regions[:, :, 0] + regions[:, :, 2]) // 2  # [B, N]
         cy = (regions[:, :, 1] + regions[:, :, 3]) // 2  # [B, N]
-        
+
         # 将像素坐标转换为网格坐标
         # 使用位移运算替代幂运算，避免 Triton 编译问题
         # grid_size = 2^max_level = 1 << max_level
         grid_size = 1 << max_level
+
+        # I99-1 FIX: 防御性检查 - 确保 img_size >= 1 防止除以零
+        safe_img_size = max(1, img_size)
+
         # 缩放: grid_x = cx * grid_size // img_size
-        gx = cx * grid_size // img_size  # [B, N]
-        gy = cy * grid_size // img_size  # [B, N]
+        gx = cx * grid_size // safe_img_size  # [B, N]
+        gy = cy * grid_size // safe_img_size  # [B, N]
         
         # 确保在有效范围内
         gx = gx.clamp(0, grid_size - 1)

@@ -2046,16 +2046,20 @@ class HilbertScanner:
         # 获取网格大小
         grid_size = 2 ** depth
 
+        # I99-1 FIX: 防御性检查 - 确保 W 和 H 有效
+        safe_W = max(1, W)
+        safe_H = max(1, H)
+
         # 对于标准 Hilbert 退化情况
-        if W == H and cls._is_power_of_2(W):
-            grid_x = (cx * (grid_size / W)).clamp(max=grid_size - 1).long()
-            grid_y = (cy * (grid_size / H)).clamp(max=grid_size - 1).long()
+        if safe_W == safe_H and cls._is_power_of_2(safe_W):
+            grid_x = (cx * (grid_size / safe_W)).clamp(max=grid_size - 1).long()
+            grid_y = (cy * (grid_size / safe_H)).clamp(max=grid_size - 1).long()
             return HilbertCurve.xy_to_d_batch(grid_size, grid_x, grid_y)
 
         # 对于矩形情况：使用 Pseudo-Hilbert 坐标映射
         # 坐标范围归一化到 [0, 1)
-        norm_x = cx / W
-        norm_y = cy / H
+        norm_x = cx / safe_W
+        norm_y = cy / safe_H
 
         # 映射到 Pseudo-Hilbert 索引（I145-优化：向量化版本）
         # 数学形式化：

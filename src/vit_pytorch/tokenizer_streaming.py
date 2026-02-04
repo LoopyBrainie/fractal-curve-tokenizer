@@ -846,13 +846,24 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             - padded_regions: [B, MaxN, 4] 区域边界 (P11-3 新增)
         """
         from .gumbel_topk_splitter import TensorSplitResult
-        
+
         B = features.shape[0]
         device = features.device
         dtype = features.dtype
         dim = self.d_model
-        
+
         N_total = tensor_result.num_tokens
+
+        # I99-1 DEBUG: 添加诊断信息以调试 CUDA device-side assert
+        if tensor_result.batch_indices.numel() > 0:
+            batch_idx_min = tensor_result.batch_indices.min().item()
+            batch_idx_max = tensor_result.batch_indices.max().item()
+            if batch_idx_min < 0 or batch_idx_max >= B:
+                raise RuntimeError(
+                    f"I99-1 DEBUG: batch_indices 越界! "
+                    f"min={batch_idx_min}, max={batch_idx_max}, B={B}, N_total={N_total}"
+                )
+
         if N_total == 0:
             tokens = torch.zeros(B, 1, dim, device=device, dtype=dtype)
             # I32-2: 使用-1 sentinel标识padding token，避免与有效depth=0混淆
@@ -1042,8 +1053,19 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 计算四叉树路径 (基于区域中心的空间位置)
         # regions: [N_total, 4] -> paths: [N_total, max_level]
         if N_total > 0:
-            # 获取图像尺寸 (Hilbert 曲线要求方形，使用较大边)
-            img_size = max(self.image_size) if isinstance(self.image_size, tuple) else self.image_size
+            # I99-1 FIX: 防御性处理 image_size 为 None 或 0 的情况
+            if self.image_size is None:
+                # 动态分辨率模式：从特征图获取尺寸
+                img_size = max(features.shape[-2], features.shape[-1])
+            elif isinstance(self.image_size, tuple):
+                img_size = max(self.image_size)
+            else:
+                img_size = self.image_size
+
+            # I99-1: 防御性检查 - 确保 img_size 有效 (>= 1)
+            if img_size is None or img_size <= 0:
+                img_size = 64  # 安全默认值
+
             paths = VectorizedPathEncoder.compute_paths_from_regions(
                 tensor_result_regions_sorted,  # [N_total, 4] - 使用排序后的 regions
                 img_size,
