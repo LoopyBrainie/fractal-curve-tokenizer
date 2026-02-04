@@ -589,7 +589,11 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 # I99-1: clamp batch_indices 到 [0, B-1] 防止 scatter_add_ 越界
                 batch_indices_clamped = batch_indices.clamp(min=0, max=B - 1)
                 # I78: 添加 min clamp 防止负索引 (M3 修复)
-                flat_idx = batch_indices_clamped * max_d + depths.clamp(min=0, max=max_d - 1)
+                flat_idx_base = batch_indices_clamped * max_d
+                depths_clamped = depths.clamp(min=0, max=max_d - 1)
+                flat_idx = flat_idx_base + depths_clamped
+                # I99-1: 额外的 clamp 保护 scatter_add_ index
+                flat_idx = flat_idx.clamp(min=0, max=B * max_d - 1)
                 ones = torch.ones_like(flat_idx)
                 count_matrix.view(-1).scatter_add_(0, flat_idx, ones)
             else:

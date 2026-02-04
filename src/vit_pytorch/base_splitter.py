@@ -426,8 +426,10 @@ class SplitResult:
         import torch
         if self.batch_indices.numel() == 0:
             return torch.zeros(B, dtype=torch.long, device=self.batch_indices.device)
+        # I99-1 FIX: clamp batch_indices 防止 bincount 越界
+        batch_indices_clamped = self.batch_indices.clamp(min=0, max=B - 1)
         return torch.bincount(
-            self.batch_indices,
+            batch_indices_clamped,
             minlength=B
         )
 

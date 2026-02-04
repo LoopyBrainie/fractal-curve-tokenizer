@@ -212,7 +212,9 @@ class FocalLoss(nn.Module):
             dtype=torch.float32,
             device=targets.device
         )
-        smooth_label.scatter_(1, targets.unsqueeze(1), confidence)
+        # I99-1 FIX: clamp targets 防止 scatter_ 越界
+        targets_clamped = targets.unsqueeze(1).clamp(min=0, max=num_classes - 1)
+        smooth_label.scatter_(1, targets_clamped, confidence)
         return smooth_label
     
     def extra_repr(self) -> str:
