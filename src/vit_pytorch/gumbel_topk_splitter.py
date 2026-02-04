@@ -2329,6 +2329,10 @@ class GumbelTopKSplitter(
             N_d = num_per_depth[d]
             K_d = K_d_values[d]  # 预提取的 Python int
 
+            # I99-1 FIX: torch.compile 保护 - 显式 clamp 防止优化绕过
+            # torch.topk 要求 K <= N，额外的 min() 确保安全
+            K_d = min(max(K_d, 0), N_d)
+
             if K_d <= 0 or N_d == 0:
                 continue
 
@@ -2357,7 +2361,9 @@ class GumbelTopKSplitter(
 
             # 更新 hard_mask
             topk_global = depth_indices[topk_local]  # [B, K_d]
-            hard_mask.scatter_(1, topk_global, 1.0)
+            # I99-1 FIX: torch.compile 保护 - clamp topk_global 防止 scatter_ 越界
+            topk_global_clamped = topk_global.clamp(max=N - 1)
+            hard_mask.scatter_(1, topk_global_clamped, 1.0)
             all_topk_indices.append(topk_global)
         
         # 合并所有深度的 Top-K 索引
@@ -2443,7 +2449,9 @@ class GumbelTopKSplitter(
             # 推理模式：直接 Top-K
             _, topk_indices = torch.topk(logits, K, dim=1)
             hard_mask = torch.zeros(B, N, device=device)
-            hard_mask.scatter_(1, topk_indices, 1.0)
+            # I99-1 FIX: torch.compile 保护 - clamp 防止越界
+            topk_indices_clamped = topk_indices.clamp(max=N - 1)
+            hard_mask.scatter_(1, topk_indices_clamped, 1.0)
             return hard_mask, topk_indices
         
         # 训练模式：Gumbel + STE
@@ -2465,7 +2473,9 @@ class GumbelTopKSplitter(
         
         # 构建硬掩码
         hard_mask = torch.zeros(B, N, device=device, dtype=torch.float32)
-        hard_mask.scatter_(1, topk_indices, 1.0)
+        # I99-1 FIX: torch.compile 保护 - clamp 防止越界
+        topk_indices_clamped = topk_indices.clamp(max=N - 1)
+        hard_mask.scatter_(1, topk_indices_clamped, 1.0)
 
         # ====================================================================
         # I30-2: 使用全局 Softmax (移除 Subset Softmax)

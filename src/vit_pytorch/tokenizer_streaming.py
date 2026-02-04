@@ -980,8 +980,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # I99-1 CRITICAL: 显式 clamp 作为独立操作，防止 torch.compile 融合优化
         if N_total > 0:
             batch_indices = batch_indices.clamp(min=0, max=B - 1)
-            # I99-1: 强制同步，确保 clamp 完成后再进行索引操作
-            torch._sync(batch_indices)
 
         # 向量化分配
         tokens[batch_indices, token_positions] = all_tokens.to(dtype)

@@ -1043,6 +1043,8 @@ class FractalCurveViT(nn.Module):
                 #     all_depth_counts[:, d] = mask.sum(dim=1, dtype=torch.float32)
                 # 向量化实现:
                 depths_for_count = padded_depths.clamp(min=0)  # [B, max_tokens], padding (-1) -> 0
+                # I99-1 FIX: torch.compile 保护 - clamp 到有效深度范围
+                depths_for_count = depths_for_count.clamp(max=max_level_range - 1)
                 # 有效位置掩码 (排除 padding)
                 valid_pos_mask = padded_depths >= 0
                 # 使用 scatter_add: counts[batch, depth] = sum over valid positions with that depth
