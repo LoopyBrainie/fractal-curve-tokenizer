@@ -985,14 +985,20 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         scales = self.patch_embed.depth_scale[depths]  # [N]
         embeds = self.patch_embed.depth_embed(depths)   # [N, D]
         all_tokens = pooled * scales.unsqueeze(-1) + embeds  # [N, D]
-        
+
         # ====================================================================
         # 向量化分配到输出 buffer
         # ====================================================================
-        # I99-1: 防御性检查 - 确保 max_tokens 至少为 1
+        # I99-1: 防御性检查 - 确保 max_tokens 至少为 1 且足够容纳所有 token
         # I99-1 FIX: max_tokens 是 scalar tensor，需要提取 Python int
-        # 使用 torch.maximum 保持张量计算，但后续需要 .item() 用于形状定义
-        max_tokens_tensor = torch.maximum(max_tokens, torch.tensor(1, device=device, dtype=max_tokens.dtype))
+        # 计算每个 batch 需要的最小 token 数（向上取整）
+        min_required = max(1, (N_total + B_int - 1) // B_int)  # 向上取整确保足够
+
+        # 使用 torch.maximum 确保至少为 1 且足够容纳所有 token
+        max_tokens_tensor = torch.maximum(
+            max_tokens,
+            torch.tensor(min_required, device=device, dtype=max_tokens.dtype)
+        )
         max_tokens_safe = max_tokens_tensor.item()  # 提取 Python int 用于 tensor 形状
 
         # 验证 max_tokens_safe 是有效的
@@ -1075,18 +1081,21 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             raw_probs = None
 
         # 计算每个 token 在其 batch 内的索引
+        # I99-1 CRITICAL: N_total 可能是 tensor，需要先转换为 Python int
+        # 然后统一使用 Python int 进行比较，避免 torch.compile 导致的类型问题
+        N_total_int = _safe_scalar_to_int(N_total, "N_total")
+        N_total_is_zero = (N_total_int == 0)
+
         # 排序后: batch_indices 严格按 batch 分组 [0,0,...,0, 1,1,...,1, ...]
-        if N_total == 0:
+        if N_total_is_zero:
             token_positions = torch.zeros(0, dtype=torch.long, device=device)
         else:
             # I99-1 CRITICAL: 预防性验证 - batch_indices 可能包含极端负值或 NaN
             # 导致 CUDA kernel 崩溃。使用完全安全的重建策略。
-            # I99-1 CRITICAL: 强制转换为 Python int，防止 torch.compile 导致的 CUDA tensor 类型问题
-            N_total_int = _safe_scalar_to_int(N_total, "N_total")
-
             batch_starts = torch.zeros(B_int, dtype=torch.long, device=device)
 
             # 安全计算 tokens_per_batch（确保是 Python int）
+            # I99-1 CRITICAL: 确保 tokens_per_batch_int >= 1，防止除零和无效索引
             tokens_per_batch_int = max(1, N_total_int // B_int)
             batch_indices_safe = torch.arange(N_total_int, device=device, dtype=torch.long) // tokens_per_batch_int
             batch_indices_safe = batch_indices_safe.clamp(min=0, max=B_int - 1)
@@ -1152,6 +1161,35 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 raise RuntimeError(
                     f"I99-1 CRITICAL: all_tokens 形状错误! "
                     f"expected N_total={N_total}, actual={all_tokens.shape[0]}"
+                )
+
+        # I99-1 CRITICAL: 完整索引验证 - 在所有索引操作前执行
+        # 验证 batch_indices_safe 和 token_positions 在执行索引操作前有效
+        if N_total_int > 0:
+            # 验证 batch_indices_safe
+            if batch_indices_safe.numel() > 0:
+                batch_idx_min = int(batch_indices_safe.min().item())
+                batch_idx_max = int(batch_indices_safe.max().item())
+                if batch_idx_min < 0 or batch_idx_max >= B_int:
+                    raise RuntimeError(
+                        f"I99-1 CRITICAL: batch_indices_safe 越界! "
+                        f"min={batch_idx_min}, max={batch_idx_max}, B_int={B_int}, N_total={N_total_int}"
+                    )
+
+            # 验证 token_positions
+            if token_positions.numel() > 0:
+                token_pos_min = int(token_positions.min().item())
+                token_pos_max = int(token_positions.max().item())
+                if token_pos_min < 0 or token_pos_max >= max_tokens_safe:
+                    raise RuntimeError(
+                        f"I99-1 CRITICAL: token_positions 越界! "
+                        f"min={token_pos_min}, max={token_pos_max}, max_tokens_safe={max_tokens_safe}"
+                    )
+
+            # 验证 N_total 和 max_tokens_safe 关系
+            if N_total_int > B_int * max_tokens_safe:
+                raise RuntimeError(
+                    f"I99-1 CRITICAL: N_total({N_total_int}) > B_int({B_int}) * max_tokens_safe({max_tokens_safe})!"
                 )
 
         # 向量化分配 (使用 clamp 后的 batch_indices_safe)
