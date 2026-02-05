@@ -179,12 +179,33 @@ def obj_to_dict(obj: Any) -> Dict[str, Any]:
         # dataclass
         return asdict(obj)
     elif hasattr(obj, '__dict__'):
-        # 普通对象
-        return {k: v for k, v in vars(obj).items() if not k.startswith('_')}
+        # 普通对象 - 过滤掉不可序列化的对象
+        return {
+            k: v for k, v in vars(obj).items()
+            if not k.startswith('_') and _is_json_serializable(v)
+        }
     elif isinstance(obj, dict):
         return obj
     else:
         return {'value': obj}
+
+
+def _is_json_serializable(value: Any) -> bool:
+    """检查值是否可以 JSON 序列化"""
+    # 基本类型可以直接序列化
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return True
+    # 列表和元组
+    if isinstance(value, (list, tuple)):
+        return all(_is_json_serializable(v) for v in value)
+    # 字典
+    if isinstance(value, dict):
+        return all(
+            _is_json_serializable(k) and _is_json_serializable(v)
+            for k, v in value.items()
+        )
+    # 其他复杂类型（对象、torch.Tensor 等）不能直接序列化
+    return False
 
 
 # =========================================================================
@@ -2188,15 +2209,23 @@ def train_epoch(
     if hasattr(model, '_depth_monitor') and model._depth_monitor is not None:
         try:
             depth_stats = model._depth_monitor.update(global_step)
-            # 提取关键指标（转换为 Python 类型用于日志）
-            perf_stats['depth_pi'] = depth_stats['pi'].tolist()
+            # 批量转换 GPU tensor 到 CPU（单次同步）
+            pi_tensor = depth_stats['pi']
+            if isinstance(pi_tensor, torch.Tensor) and pi_tensor.device.type == 'cuda':
+                # 一次性将 pi tensor 复制到 CPU，避免多次同步
+                pi_cpu = pi_tensor.detach().cpu()
+            else:
+                pi_cpu = pi_tensor
+
+            # 提取关键指标（depth_stats 中的标量已在 DepthMonitor._compute_stats() 中提取）
+            perf_stats['depth_pi'] = pi_cpu.tolist()
             perf_stats['depth_entropy'] = depth_stats['entropy']
             perf_stats['depth_kl'] = depth_stats['kl_from_uniform']
             perf_stats['max_entropy'] = depth_stats['max_entropy']
             perf_stats['dominant_depth'] = depth_stats['dominant_depth']
             perf_stats['dominant_prob'] = depth_stats['dominant_prob']
             # 保存 GPU tensor 用于 TensorBoard（避免重复转换）
-            perf_stats['_depth_pi_tensor'] = depth_stats['pi']
+            perf_stats['_depth_pi_tensor'] = pi_tensor
             perf_stats['_quota_probs_tensor'] = depth_stats.get('quota_probs')
         except Exception as e:
             # I111-6: 静默处理收集错误，避免影响训练

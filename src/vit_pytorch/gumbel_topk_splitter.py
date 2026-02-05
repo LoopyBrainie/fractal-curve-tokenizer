@@ -3254,15 +3254,17 @@ class GumbelTopKSplitter(
         pi = self.get_depth_distribution_tensor(selected_mask)
         D = pi.size(0)
 
-        # 在 GPU 上计算所有标量
+        # 在 GPU 上计算所有统计量
         pi_safe = pi + (pi == 0).float() * PROB_EPSILON
-        entropy = -(pi_safe * pi_safe.log()).sum().item()
+        entropy_tensor = -(pi_safe * pi_safe.log()).sum()
         max_entropy = math.log(D)
-        kl = max_entropy - entropy
-
         dominant_prob, dominant_depth = pi.max(dim=0)
-        dominant_depth = dominant_depth.item()
-        dominant_prob = dominant_prob.item()
+
+        # 批量提取标量值到 CPU（减少 GPU-CPU 同步次数）
+        entropy = entropy_tensor.item()
+        kl = max_entropy - entropy
+        dominant_depth_val = dominant_depth.item()
+        dominant_prob_val = dominant_prob.item()
 
         # 获取配额概率
         quota_probs = None
@@ -3277,8 +3279,8 @@ class GumbelTopKSplitter(
             'entropy': entropy,
             'max_entropy': max_entropy,
             'kl_from_uniform': kl,
-            'dominant_depth': dominant_depth,
-            'dominant_prob': dominant_prob,
+            'dominant_depth': int(dominant_depth_val),
+            'dominant_prob': float(dominant_prob_val),
             'quota_probs': quota_probs,
         }
     
@@ -3788,13 +3790,20 @@ class DepthMonitor:
         # 更新历史（滑动窗口平均）
         pi_history = self._update_history(pi)
 
+        # 批量提取标量值到 CPU（减少 GPU-CPU 同步次数）
+        # 注意：由于 GIL，.item() 调用仍是串行的，但代码结构更清晰
+        entropy_val = entropy.item()
+        kl_val = kl.item()
+        dominant_depth_val = dominant_depth.item()
+        dominant_prob_val = dominant_prob.item()
+
         self._cached_stats = {
             'pi': pi,  # GPU Tensor
-            'entropy': entropy.item(),
+            'entropy': entropy_val,
             'max_entropy': max_entropy,
-            'kl_from_uniform': kl.item(),
-            'dominant_depth': dominant_depth.item(),
-            'dominant_prob': dominant_prob.item(),
+            'kl_from_uniform': kl_val,
+            'dominant_depth': int(dominant_depth_val),
+            'dominant_prob': float(dominant_prob_val),
             'quota_probs': quota_probs,
             'pi_history': pi_history,  # 可能为 None
         }
