@@ -650,6 +650,8 @@ class GumbelTopKSplitter(
             self._entropy_mode = config.entropy_mode
             self._entropy_weight_base = config.entropy_weight_base
             self._entropy_target = config.entropy_target
+            # I111-5: 保留兼容性属性 (Elastic Budget 需要)
+            self._use_adaptive_coverage = getattr(config, 'use_adaptive_coverage', True)
             # I100-7: 信息密度自适应配额 (默认关闭)
             self._enable_info_adaptive_quota = False
             # I111-1: 温度参数从配置读取
