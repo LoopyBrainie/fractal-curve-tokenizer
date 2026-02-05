@@ -442,6 +442,7 @@ class LCAHilbertBias(HilbertBiasBase):
         # 调整形状: (B, H, S, S)
         return bias.permute(0, 3, 1, 2)
 
+    @torch._dynamo.disable  # I99-1: 排除 torch.compile 追踪，避免 Triton 编译错误
     def forward_from_regions(
         self,
         regions: torch.Tensor,
@@ -1645,6 +1646,7 @@ class LCAHilbertBiasWithShapeScale(nn.Module):
                 scale = 0.1 * (1 + torch.log(torch.tensor(d + 1.0)))
                 self.lca_embedding.weight[d].fill_(scale)
 
+    @torch._dynamo.disable  # I99-1: 排除 torch.compile 追踪，避免 Triton 编译错误
     def forward_from_regions(
         self,
         regions: torch.Tensor,
@@ -1667,6 +1669,7 @@ class LCAHilbertBiasWithShapeScale(nn.Module):
         # 委托给现有实现
         return self._compute_lca_bias_from_regions(regions, image_size)
 
+    @torch._dynamo.disable  # I99-1: 排除 torch.compile 追踪，避免 Triton 编译错误
     def _compute_lca_bias_from_regions(
         self,
         regions: torch.Tensor,
@@ -1696,6 +1699,7 @@ class LCAHilbertBiasWithShapeScale(nn.Module):
         # 调整形状 [B, dim, N, N]
         return bias.permute(0, 3, 1, 2)
 
+    @torch._dynamo.disable  # I99-1: 排除 torch.compile 追踪，避免 Triton 编译错误
     def forward_with_shape_scale(
         self,
         regions: torch.Tensor,
