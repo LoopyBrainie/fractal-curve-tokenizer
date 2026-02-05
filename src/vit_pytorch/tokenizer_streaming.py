@@ -62,6 +62,49 @@ from .semantic_redundancy_splitter import SplitResult  # I110-6: 语义分裂器
 from .gumbel_topk_splitter import TensorSplitResult  # I99-1: 用于防御性边界检查
 
 
+# ====================================================================
+# I99-1 CRITICAL: 防御性类型转换函数
+# 用于确保 torch.compile 场景下 tensor shape 值正确转换为 Python int
+# ====================================================================
+
+def _safe_scalar_to_int(value: Any, name: str = "value") -> int:
+    """安全地将标量值转换为 Python int。
+
+    Args:
+        value: 要转换的值（可以是 tensor、Python int/float）
+        name: 值的名称（用于错误消息）
+
+    Returns:
+        Python int
+
+    Raises:
+        RuntimeError: 如果值无法安全转换或为无效值
+    """
+    if value is None:
+        raise RuntimeError(f"I99-1 CRITICAL: {name} 不能为 None!")
+
+    # 处理 tensor 类型
+    if isinstance(value, torch.Tensor):
+        if value.dim() > 0:
+            raise RuntimeError(f"I99-1 CRITICAL: {name} 应该是标量，但得到 shape={value.shape}")
+        try:
+            result = int(value.item())
+        except (RuntimeError, ValueError) as e:
+            raise RuntimeError(f"I99-1 CRITICAL: 无法将 {name} 转换为 Python int: {e}")
+        return result
+
+    # 处理 Python 数值类型
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as e:
+        raise RuntimeError(f"I99-1 CRITICAL: 无法将 {name} 转换为 Python int: {e}")
+
+    if result <= 0:
+        raise RuntimeError(f"I99-1 CRITICAL: {name} 必须为正整数! {name}={result}")
+
+    return result
+
+
 class StreamingFractalTokenizerV3(BaseTokenizer):
     """Variable Depth Tokenizer with Learnable Quadtree Splitting.
     
@@ -221,18 +264,15 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         """获取共享卷积层 (用于可学习分割)."""
         return self.patch_embed.shared_conv
 
-    def _ensure_valid_indices(
+    def _force_clamp_tensor_result(
         self,
         tensor_result: "TensorSplitResult",
         B: int,
     ) -> "TensorSplitResult":
-        """确保 tensor_result 中的 indices 在有效范围内 (I99-1).
+        """强制 clamp tensor_result 到有效范围（CPU 安全版本）。
 
-        防御性边界检查:
-            - batch_indices ∈ [0, B-1]
-            - depths ∈ [0, max_level]
-            - hilbert_indices ∈ [0, max_hilbert-1]
-            - token_indices ∈ [0, num_tokens-1]
+        关键修复：先将 tensor 移动到 CPU 进行 clamp，避免 CUDA tensor 上的
+        任何操作触发 device-side assert。
 
         Args:
             tensor_result: TensorSplitResult 分割结果
@@ -247,43 +287,44 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         dtype = tensor_result.batch_indices.dtype
         num_tokens = tensor_result.num_tokens
 
-        # Clamp batch_indices 到 [0, B-1]
-        batch_indices_clamped = tensor_result.batch_indices.clamp(min=0, max=B - 1)
+        # I99-1: 关键修复 - CPU 中间步骤
+        # 先移动到 CPU 进行所有 clamp 操作，避免 CUDA tensor 上的任何操作
+        batch_indices_cpu = tensor_result.batch_indices.cpu()
+        depths_cpu = tensor_result.depths.cpu()
+        hilbert_indices_cpu = tensor_result.hilbert_indices.cpu()
+        regions_cpu = tensor_result.regions.cpu()
+        complexities_cpu = tensor_result.complexities.cpu() if tensor_result.complexities is not None else None
 
-        # Clamp depths 到 [0, max_level]
-        depths_clamped = tensor_result.depths.clamp(min=0, max=self.max_level)
+        # 在 CPU 上安全 clamp
+        batch_indices_clamped_cpu = batch_indices_cpu.clamp(min=0, max=B - 1)
+        depths_clamped_cpu = depths_cpu.clamp(min=0, max=self.max_level)
 
-        # I99-1: Clamp hilbert_indices 到有效范围 [0, num_tokens-1]
-        # hilbert_indices 用于 argsort 和索引，必须有效
-        # 关键：直接 clamp 到 [0, num_tokens-1]，而不是使用 min/max
         if num_tokens > 0:
-            hilbert_indices_raw = tensor_result.hilbert_indices
-            # 直接 clamp 到有效范围，不依赖原始值的 min/max
-            hilbert_indices_clamped = hilbert_indices_raw.clamp(min=0, max=num_tokens - 1)
+            hilbert_indices_clamped_cpu = hilbert_indices_cpu.clamp(min=0, max=num_tokens - 1)
         else:
-            hilbert_indices_clamped = tensor_result.hilbert_indices
+            hilbert_indices_clamped_cpu = hilbert_indices_cpu
 
-        # Clamp token_indices 到有效范围
-        token_indices = torch.arange(num_tokens, dtype=torch.long, device=device)
-        token_indices_clamped = token_indices.clamp(min=0, max=max(1, num_tokens) - 1)
+        # 安全创建 token_indices
+        token_indices_cpu = torch.arange(num_tokens, dtype=torch.long)
 
-        # 如果没有变化，返回原始结果
-        if (
-            torch.equal(batch_indices_clamped, tensor_result.batch_indices)
-            and torch.equal(depths_clamped, tensor_result.depths)
-            and torch.equal(hilbert_indices_clamped, tensor_result.hilbert_indices)
-        ):
-            return tensor_result
+        # 移动回 GPU
+        batch_indices_clamped = batch_indices_clamped_cpu.to(device=device, dtype=dtype)
+        depths_clamped = depths_clamped_cpu.to(device=device, dtype=dtype)
+        hilbert_indices_clamped = hilbert_indices_clamped_cpu.to(device=device, dtype=torch.long)
+        token_indices_clamped = token_indices_cpu.to(device=device, dtype=torch.long)
 
-        # 返回修正后的结果
+        tokens_per_batch = getattr(tensor_result, 'tokens_per_batch', None)
+        if tokens_per_batch is not None:
+            tokens_per_batch = tokens_per_batch.to(device=device)
+
         return TensorSplitResult(
-            regions=tensor_result.regions,
+            regions=regions_cpu.to(device=device, dtype=torch.long),
             depths=depths_clamped,
             batch_indices=batch_indices_clamped,
             hilbert_indices=hilbert_indices_clamped,
             token_indices=token_indices_clamped,
-            complexities=tensor_result.complexities,
-            tokens_per_batch=getattr(tensor_result, 'tokens_per_batch', None),
+            complexities=complexities_cpu.to(device=device) if complexities_cpu is not None else None,
+            tokens_per_batch=tokens_per_batch,
         )
 
     # =====================================================================
@@ -552,9 +593,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         else:
             raise ValueError(f"Unexpected split result type: {type(split_result)}")
 
-        # I99-1 FIX: 添加防御性边界检查，确保 batch_indices 和 depths 在有效范围内
-        # torch.compile 优化可能暴露潜在的索引问题
-        tensor_result = self._ensure_valid_indices(tensor_result, B)
+        # I99-1 FIX: 使用强制 clamp 版本处理 tensor_result
+        # 始终确保 batch_indices 和 depths 在有效范围内，避免 CUDA assert
+        tensor_result = self._force_clamp_tensor_result(tensor_result, B)
 
         # 统计收集 (no_grad)
         with torch.no_grad():
@@ -998,24 +1039,27 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         else:
             # I99-1 CRITICAL: 预防性验证 - batch_indices 可能包含极端负值或 NaN
             # 导致 CUDA kernel 崩溃。使用完全安全的重建策略。
-            batch_starts = torch.zeros(B, dtype=torch.long, device=device)
+            # I99-1 CRITICAL: 强制转换为 Python int，防止 torch.compile 导致的 CUDA tensor 类型问题
+            N_total_int = _safe_scalar_to_int(N_total, "N_total")
+            B_int = _safe_scalar_to_int(B, "B")
 
-            # I99-1: 安全策略 - 直接重建有效的 batch_indices
-            # 不依赖任何对原始 batch_indices 的 CUDA 操作
-            tokens_per_batch = max(1, N_total // B)
-            batch_indices_safe = torch.arange(N_total, device=device, dtype=torch.long) // tokens_per_batch
-            batch_indices_safe = batch_indices_safe.clamp(min=0, max=B - 1)
+            batch_starts = torch.zeros(B_int, dtype=torch.long, device=device)
+
+            # 安全计算 tokens_per_batch（确保是 Python int）
+            tokens_per_batch_int = max(1, N_total_int // B_int)
+            batch_indices_safe = torch.arange(N_total_int, device=device, dtype=torch.long) // tokens_per_batch_int
+            batch_indices_safe = batch_indices_safe.clamp(min=0, max=B_int - 1)
 
             # I99-1: 覆盖原始 batch_indices 以确保后续操作使用安全值
             batch_indices = batch_indices_safe
 
             # I99-1: 使用 uniform 分布验证 batch_indices_safe
-            batch_counts = torch.bincount(batch_indices_safe, minlength=B)
+            batch_counts = torch.bincount(batch_indices_safe, minlength=B_int)
             # 计算每个 batch 的起始位置 (前缀和)
             batch_starts[1:] = batch_counts[:-1].cumsum(dim=0)
 
             # token_positions = 全局位置 - 该 batch 的起始位置
-            global_positions = torch.arange(N_total, device=device)
+            global_positions = torch.arange(N_total_int, device=device)
             # I99-1: 使用 clamp 后的 batch_indices_safe
             token_positions = global_positions - batch_starts[batch_indices_safe]
 
