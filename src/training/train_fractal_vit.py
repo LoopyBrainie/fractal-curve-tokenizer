@@ -3064,6 +3064,9 @@ def main():
     class TrainingConfig:
         """训练配置包装器 - 满足 FractalConfigProtocol"""
         def __init__(self, args, arch_config):
+            # 保存原始 arch_config 供 ModelGene.from_config() 使用
+            self.arch_config = arch_config
+
             # 数据集配置
             self.subset_size = args.subset_size
             self.val_split = args.val_split
