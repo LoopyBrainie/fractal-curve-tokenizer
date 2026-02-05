@@ -1005,7 +1005,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             # I103-1: 添加批量 Hilbert 偏置
             # I113-11: 量纲对齐 - 乘以 √d_k 确保与 QK^T / √d_k 量级相当
             if hilbert_bias_batch is not None:
-                dots = dots + hilbert_bias_batch * self.hilbert_bias_scale * (self.dim_head ** 0.5)
+                dots = dots + hilbert_bias_batch * self.hilbert_bias_scale * math.sqrt(self.dim_head)
 
             # 掩码: 只保留深度 d 的 token 之间的注意力 (I108-3: 使用预分配缓冲区)
             # mask_2d[b, i, j] = depth_mask[b, i] AND depth_mask[b, j]
@@ -1049,6 +1049,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
 
         return self.to_out(output)
 
+    @torch._dynamo.disable  # I99-1: 排除 torch.compile 追踪，避免 Triton 编译错误
     def forward(
         self,
         x: torch.Tensor,
@@ -1263,14 +1264,14 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                 if hilbert_bias is not None:
                     # hilbert_bias: (H, S, S) or (B, H, S, S)
                     # I113-11: 量纲对齐 - 乘以 √d_k 确保与 QK^T / √d_k 量级相当
-                    dim_scale = self.dim_head ** 0.5
+                    dim_scale = math.sqrt(self.dim_head)
                     if hilbert_bias.dim() == 3:
                         dots = dots + hilbert_bias.unsqueeze(0) * self.hilbert_bias_scale * dim_scale
                     else:
                         dots = dots + hilbert_bias * self.hilbert_bias_scale * dim_scale
 
             # I113-11: 量纲对齐常量 - 定义在 level_bias 分支外部
-            dim_scale = self.dim_head ** 0.5
+            dim_scale = math.sqrt(self.dim_head)
             level_bias = self._compute_level_bias(levels_info)
             if level_bias is not None:
                 # level_bias: (H, S, S) or (B, H, S, S)
