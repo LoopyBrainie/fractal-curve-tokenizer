@@ -128,10 +128,15 @@ class TrainingStats:
 
     def validate(self) -> None:
         """数学约束验证"""
-        # I139: 支持列表类型的 num_tokens
-        if isinstance(self.num_tokens, list):
+        # I139: 支持列表和张量类型的 num_tokens
+        if isinstance(self.num_tokens, (list, tuple)):
             for i, n in enumerate(self.num_tokens):
                 assert 0 <= n <= 4096, f"Batch[{i}] Token 数异常: {n}"
+        elif isinstance(self.num_tokens, torch.Tensor):
+            # I99-1: 张量类型需要使用 .item() 或逐元素比较
+            n_min = self.num_tokens.min().item()
+            n_max = self.num_tokens.max().item()
+            assert 0 <= n_min and n_max <= 4096, f"Token 数异常: min={n_min}, max={n_max}, values={self.num_tokens.tolist()}"
         else:
             assert 0 <= self.num_tokens <= 4096, f"Token 数异常: {self.num_tokens}"
         assert 0 <= self.depth_used <= 50, f"深度越界: {self.depth_used}"
