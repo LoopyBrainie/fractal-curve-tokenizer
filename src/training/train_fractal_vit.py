@@ -3733,11 +3733,15 @@ def main():
     exp_dir.mkdir(parents=True, exist_ok=True)
     (exp_dir / "checkpoints").mkdir(exist_ok=True)
     (exp_dir / "logs").mkdir(exist_ok=True)
-    
+
     # 保存配置
     # P2 修复: TrainingConfig 不是 dataclass，使用 vars() 替代 asdict()
+    # I103-1 修复: 排除 arch_config（不可 JSON 序列化）
+    config_dict = {k: v for k, v in vars(config).items() if not isinstance(v, type)}
+    if 'arch_config' in config_dict:
+        del config_dict['arch_config']
     with open(exp_dir / "logs" / "config.json", 'w') as f:
-        json.dump(vars(config), f, indent=2)
+        json.dump(config_dict, f, indent=2)
     
     history = []
     
