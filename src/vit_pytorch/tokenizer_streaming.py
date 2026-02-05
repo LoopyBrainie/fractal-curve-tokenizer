@@ -889,6 +889,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         from .gumbel_topk_splitter import TensorSplitResult
 
         B = features.shape[0]
+        B_int = _safe_scalar_to_int(B, "B")
         device = features.device
         dtype = features.dtype
         dim = self.d_model
@@ -926,8 +927,19 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         regions[:, 2] = regions[:, 2].clamp(min=0, max=img_size)
         regions[:, 3] = regions[:, 3].clamp(min=0, max=img_size)
 
+        # I99-1 CRITICAL: 验证 batch_indices 值范围（在 clamp 之前）
+        batch_indices_raw = tensor_result.batch_indices
+        if batch_indices_raw.numel() > 0:
+            batch_min = int(batch_indices_raw.min().item())
+            batch_max = int(batch_indices_raw.max().item())
+            if batch_min < 0 or batch_max >= B_int:
+                raise RuntimeError(
+                    f"I99-1 CRITICAL: batch_indices 包含无效值! "
+                    f"min={batch_min}, max={batch_max}, B={B_int}, N_total={N_total}"
+                )
+
         # I99-1: 防御性 clamp batch_indices (额外保护)
-        batch_indices = tensor_result.batch_indices.clamp(min=0, max=B - 1)
+        batch_indices = tensor_result.batch_indices.clamp(min=0, max=B_int - 1)
         
         # boxes: [N, 5] -> (batch_idx, x1, y1, x2, y2) (scaled)
         boxes = torch.zeros(N_total, 5, device=device, dtype=dtype)
@@ -996,6 +1008,20 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 问题: batch_indices 可能未按 batch 分组，导致 token 位置计算错误
         # 解决: 显式排序所有相关张量
         if N_total > 0:
+            # I99-1 CRITICAL: 验证所有张量长度一致性
+            expected_len = N_total
+            tensors_to_check = [
+                ("hilbert_indices", tensor_result.hilbert_indices),
+                ("batch_indices", tensor_result.batch_indices),
+                ("depths", tensor_result.depths),
+                ("regions", tensor_result.regions),
+            ]
+            for name, tensor in tensors_to_check:
+                if tensor.shape[0] != expected_len:
+                    raise RuntimeError(
+                        f"I99-1 CRITICAL: {name}.shape[0]={tensor.shape[0]} != N_total={expected_len}"
+                    )
+
             # 获取 hilbert_indices 用于排序，token_indices 用于正确的概率索引
             hilbert_idx_for_sort = tensor_result.hilbert_indices
             token_idx_for_index = tensor_result.token_indices
@@ -1004,7 +1030,23 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             # lexsort 的语义是: 先按最后一列排序，再按倒数第二列排序...
             # 所以我们先按 hilbert_indices 排序 (稳定)，再按 batch_indices 排序 (稳定)
             hilbert_order = torch.argsort(hilbert_idx_for_sort, stable=True)
+
+            # I99-1 CRITICAL: 验证 hilbert_order 和 batch_indices 长度一致
+            if hilbert_order.shape[0] != batch_indices.shape[0]:
+                raise RuntimeError(
+                    f"I99-1 CRITICAL: hilbert_order.shape[0]={hilbert_order.shape[0]} != "
+                    f"batch_indices.shape[0]={batch_indices.shape[0]}"
+                )
+
             batch_order = torch.argsort(batch_indices[hilbert_order], stable=True)
+
+            # I99-1 CRITICAL: 验证 batch_order 和 hilbert_order 长度一致
+            if batch_order.shape[0] != hilbert_order.shape[0]:
+                raise RuntimeError(
+                    f"I99-1 CRITICAL: batch_order.shape[0]={batch_order.shape[0]} != "
+                    f"hilbert_order.shape[0]={hilbert_order.shape[0]}"
+                )
+
             sort_indices = hilbert_order[batch_order]
 
             # 重新排列所有张量
@@ -1041,7 +1083,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             # 导致 CUDA kernel 崩溃。使用完全安全的重建策略。
             # I99-1 CRITICAL: 强制转换为 Python int，防止 torch.compile 导致的 CUDA tensor 类型问题
             N_total_int = _safe_scalar_to_int(N_total, "N_total")
-            B_int = _safe_scalar_to_int(B, "B")
 
             batch_starts = torch.zeros(B_int, dtype=torch.long, device=device)
 
@@ -1049,6 +1090,16 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             tokens_per_batch_int = max(1, N_total_int // B_int)
             batch_indices_safe = torch.arange(N_total_int, device=device, dtype=torch.long) // tokens_per_batch_int
             batch_indices_safe = batch_indices_safe.clamp(min=0, max=B_int - 1)
+
+            # I99-1 CRITICAL: 验证 batch_indices_safe 钳制后仍在有效范围内
+            if batch_indices_safe.numel() > 0:
+                safe_min = int(batch_indices_safe.min().item())
+                safe_max = int(batch_indices_safe.max().item())
+                if safe_min < 0 or safe_max >= B_int:
+                    raise RuntimeError(
+                        f"I99-1 CRITICAL: batch_indices_safe 钳制后仍越界! "
+                        f"min={safe_min}, max={safe_max}, B_int={B_int}, N_total={N_total_int}"
+                    )
 
             # I99-1: 覆盖原始 batch_indices 以确保后续操作使用安全值
             batch_indices = batch_indices_safe
