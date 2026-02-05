@@ -486,7 +486,7 @@ class TensorSplitResult:
 @dataclass
 class GumbelTopKResult:
     """Gumbel-Top-K 分割器输出。
-    
+
     与 TensorSplitResult 兼容但包含更多信息。
     """
     # 核心输出 (与 TensorSplitResult 兼容)
@@ -494,12 +494,15 @@ class GumbelTopKResult:
     depths: Tensor            # [M] 区域深度
     batch_indices: Tensor     # [M] batch 索引
     hilbert_indices: Tensor   # [M] Hilbert 曲线索引
-    
+
     # Gumbel-Top-K 特有
     selected_mask: Tensor     # [B, N] 选中掩码 (STE 版本，有梯度)
     logits: Tensor            # [B, N] 原始 logits
     probs: Tensor             # [B, N] 分割概率 sigmoid(logits)
-    
+
+    # I99-1 FIX: 添加 candidate_indices 用于正确的概率索引
+    candidate_indices: Tensor  # [M] 每个选中 region 在其 batch 内的列索引
+
     # 统计信息
     num_selected_per_batch: Tensor  # [B] 每个 batch 选中的 token 数
     
@@ -511,17 +514,18 @@ class GumbelTopKResult:
 
         I20: 确保 regions 为整数类型以支持位运算
         I97-9: 使用本地 TensorSplitResult 定义
-        I113-18: 添加 token_indices 用于正确的概率索引
+        I113-18 FIX: 使用 candidate_indices 用于正确的概率索引
         """
-        # 生成顺序 token 索引 (0, 1, 2, ..., N-1)
-        token_indices = torch.arange(self.regions.shape[0], dtype=torch.long, device=self.regions.device)
+        # candidate_indices 已经在 _build_result 中正确计算
+        # 它表示每个选中 region 在其 batch 内的列索引
+        token_col_indices = self.candidate_indices
 
         return TensorSplitResult(
             regions=self.regions.long(),  # I20: 转为 long 以支持位运算
             depths=self.depths,
             batch_indices=self.batch_indices,
             hilbert_indices=self.hilbert_indices,
-            token_indices=token_indices,
+            token_indices=token_col_indices,
             complexities=torch.zeros_like(self.depths, dtype=torch.float32),
             tokens_per_batch=self.num_selected_per_batch,
         )
@@ -2624,7 +2628,14 @@ class GumbelTopKSplitter(
             使用向量化操作替换 Python for 循环，避免 B 次小张量操作。
             通过 nonzero() + scatter 一次性处理所有 batch。
         """
-        B, N = consistent_mask.shape
+        B_mask, N_mask = consistent_mask.shape
+        B_probs, N_probs = probs.shape
+        if B_mask != B_probs or N_mask != N_probs:
+            raise RuntimeError(
+                f"I99-1 SHAPE MISMATCH: consistent_mask.shape=({B_mask}, {N_mask}), "
+                f"probs.shape=({B_probs}, {N_probs})"
+            )
+        B, N = B_mask, N_mask
         device = consistent_mask.device
         
         # 使用硬阈值选择最终区域
@@ -2653,6 +2664,17 @@ class GumbelTopKSplitter(
         # Clamp indices to valid ranges
         batch_indices = batch_indices_raw.clamp(min=0, max=B - 1)
         candidate_indices = candidate_indices_raw.clamp(min=0, max=N - 1)
+        # probs.shape[1] 可能与 N 不同，需要额外检查
+        if probs.shape[1] != N:
+            raise RuntimeError(
+                f"I99-1 BUG: probs.shape[1]={probs.shape[1]} != consistent_mask.shape[1]={N}"
+            )
+        if candidate_indices.numel() > 0:
+            max_idx = int(candidate_indices.max().item())
+            if max_idx >= probs.shape[1]:
+                raise RuntimeError(
+                    f"I99-1 BUG: candidate_indices max={max_idx} >= probs.shape[1]={probs.shape[1]}"
+                )
 
         # I99-1: 额外验证 - 如果 nonzero 返回空张量，创建安全的默认值
         if selected_positions.shape[0] == 0:
@@ -2679,6 +2701,7 @@ class GumbelTopKSplitter(
             selected_mask=consistent_mask,
             logits=logits,
             probs=probs,
+            candidate_indices=candidate_indices,  # I99-1 FIX: 用于正确的概率索引
             num_selected_per_batch=num_selected_per_batch,
         )
     
