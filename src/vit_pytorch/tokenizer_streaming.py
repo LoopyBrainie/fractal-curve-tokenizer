@@ -467,24 +467,32 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 should_split = False
 
             if should_split:
-                # 分裂为四个子区域
-                x0, y0, x1, y1 = bounds.tolist()
+                # P-OPT: 优化 bounds 处理 - 避免 GPU-CPU 同步
+                # bounds 可能是 tensor 或 Python list，统一转换为 Python 值
+                if isinstance(bounds, torch.Tensor):
+                    x0, y0, x1, y1 = bounds.cpu().tolist()
+                else:
+                    x0, y0, x1, y1 = bounds
                 cx = (x0 + x1) / 2
                 cy = (y0 + y1) / 2
 
-                # 添加四个子区域到队列
+                # P-OPT: 使用 Python list 传递边界，避免创建临时 tensor
+                # 队列中保持 Python list，仅在收集时转换为 tensor
                 child_bounds = [
-                    torch.tensor([x0, y0, cx, cy], dtype=torch.float32, device=device),  # 左上
-                    torch.tensor([cx, y0, x1, cy], dtype=torch.float32, device=device),  # 右上
-                    torch.tensor([x0, cy, cx, y1], dtype=torch.float32, device=device),  # 左下
-                    torch.tensor([cx, cy, x1, y1], dtype=torch.float32, device=device),  # 右下
+                    [x0, y0, cx, cy],  # 左上
+                    [cx, y0, x1, cy],  # 右上
+                    [x0, cy, cx, y1],  # 左下
+                    [cx, cy, x1, y1],  # 右下
                 ]
 
                 for child_bound in child_bounds:
                     queue.append((child_bound, depth + 1, b_idx))
             else:
-                # 不分裂，添加为叶子节点
-                all_regions.append(bounds)
+                # P-OPT: 批量转换为 tensor，而非逐个追加
+                if isinstance(bounds, torch.Tensor):
+                    all_regions.append(bounds)
+                else:
+                    all_regions.append(torch.tensor(bounds, dtype=torch.float32, device=device))
                 all_depths.append(depth)
                 all_batch_indices.append(b_idx)
 
@@ -939,15 +947,17 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         regions[:, 3] = regions[:, 3].clamp(min=0, max=img_size)
 
         # I99-1 CRITICAL: 验证 batch_indices 值范围（在 clamp 之前）
-        batch_indices_raw = tensor_result.batch_indices
-        if batch_indices_raw.numel() > 0:
-            batch_min = int(batch_indices_raw.min().item())
-            batch_max = int(batch_indices_raw.max().item())
-            if batch_min < 0 or batch_max >= B_int:
-                raise RuntimeError(
-                    f"I99-1 CRITICAL: batch_indices 包含无效值! "
-                    f"min={batch_min}, max={batch_max}, B={B_int}, N_total={N_total}"
-                )
+        # P-OPT: 使用 no_grad 上下文避免梯度跟踪开销
+        with torch.no_grad():
+            batch_indices_raw = tensor_result.batch_indices
+            if batch_indices_raw.numel() > 0:
+                batch_min = int(batch_indices_raw.min().item())
+                batch_max = int(batch_indices_raw.max().item())
+                if batch_min < 0 or batch_max >= B_int:
+                    raise RuntimeError(
+                        f"I99-1 CRITICAL: batch_indices 包含无效值! "
+                        f"min={batch_min}, max={batch_max}, B={B_int}, N_total={N_total}"
+                    )
 
         # I99-1: 防御性 clamp batch_indices (额外保护)
         batch_indices = tensor_result.batch_indices.clamp(min=0, max=B_int - 1)
@@ -1121,46 +1131,50 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             # I99-1 CRITICAL: 验证 - 在 clamp 之前检查原始值
             # 问题: 原来的 clamp 在验证之前执行，导致验证变成"假的"
             # 解决: 先验证原始值，再 clamp 确保安全
-            if batch_indices_safe.numel() > 0:
-                batch_min = int(batch_indices_safe.min().item())
-                batch_max = int(batch_indices_safe.max().item())
-                assert batch_min >= 0 and batch_max < B_int, \
-                    f"I99-1 CRITICAL: batch_indices out of bounds! " \
-                    f"min={batch_min}, max={batch_max}, B={B_int}, N_total={N_total_int}"
+            # P-OPT: 使用 no_grad 上下文避免梯度跟踪开销
+            with torch.no_grad():
+                if batch_indices_safe.numel() > 0:
+                    batch_min = int(batch_indices_safe.min().item())
+                    batch_max = int(batch_indices_safe.max().item())
+                    assert batch_min >= 0 and batch_max < B_int, \
+                        f"I99-1 CRITICAL: batch_indices out of bounds! " \
+                        f"min={batch_min}, max={batch_max}, B={B_int}, N_total={N_total_int}"
 
-            if token_positions.numel() > 0:
-                token_min = int(token_positions.min().item())
-                token_max = int(token_positions.max().item())
-                assert token_min >= 0, \
-                    f"I99-1 CRITICAL: token_positions contains negative values! " \
-                    f"min={token_min}, max={token_max}, N_total={N_total_int}"
+                if token_positions.numel() > 0:
+                    token_min = int(token_positions.min().item())
+                    token_max = int(token_positions.max().item())
+                    assert token_min >= 0, \
+                        f"I99-1 CRITICAL: token_positions contains negative values! " \
+                        f"min={token_min}, max={token_max}, N_total={N_total_int}"
 
             # I99-1: 防御性 clamp - 确保 token_positions 在安全范围内
             # 这是一个额外的保护层，防止 splitter 异常
             token_positions = token_positions.clamp(min=0, max=max_tokens_safe - 1)
 
         # I99-1 CRITICAL: 高级索引诊断 - 验证所有索引在执行前有效
-        if N_total_int > 0 and B_int > 0 and max_tokens_safe > 0:
-            # I99-1: 使用 item() 确保在 CPU 上验证，避免 CUDA 操作
-            batch_min = batch_indices_safe.min().item()
-            batch_max = batch_indices_safe.max().item()
-            token_min = token_positions.min().item()
-            token_max = token_positions.max().item()
+        # P-OPT: 使用 no_grad 上下文避免梯度跟踪开销
+        with torch.no_grad():
+            if N_total_int > 0 and B_int > 0 and max_tokens_safe > 0:
+                # I99-1: 使用 item() 确保在 CPU 上验证，避免 CUDA 操作
+                batch_min = batch_indices_safe.min().item()
+                batch_max = batch_indices_safe.max().item()
+                token_min = token_positions.min().item()
+                token_max = token_positions.max().item()
 
-            # I99-1: 验证 clamp 后的值（额外安全层）
-            if batch_min < 0 or batch_max >= B_int:
-                raise RuntimeError(
-                    f"I99-1 CRITICAL: batch_indices 越界! "
-                    f"min={batch_min}, max={batch_max}, B_int={B_int}, N_total_int={N_total_int}"
-                )
+                # I99-1: 验证 clamp 后的值（额外安全层）
+                if batch_min < 0 or batch_max >= B_int:
+                    raise RuntimeError(
+                        f"I99-1 CRITICAL: batch_indices 越界! "
+                        f"min={batch_min}, max={batch_max}, B_int={B_int}, N_total_int={N_total_int}"
+                    )
 
-            # token_min >= 0 总是成立因为 clamp，但保留 max 检查
-            if token_max >= max_tokens_safe:
-                raise RuntimeError(
-                    f"I99-1 CRITICAL: token_positions 越界! "
-                    f"min={token_min}, max={token_max}, max_tokens_safe={max_tokens_safe}, "
-                    f"N_total_int={N_total_int}, B_int={B_int}"
-                )
+                # token_min >= 0 总是成立因为 clamp，但保留 max 检查
+                if token_max >= max_tokens_safe:
+                    raise RuntimeError(
+                        f"I99-1 CRITICAL: token_positions 越界! "
+                        f"min={token_min}, max={token_max}, max_tokens_safe={max_tokens_safe}, "
+                        f"N_total_int={N_total_int}, B_int={B_int}"
+                    )
 
             # 验证 tokens tensor 形状
             expected_tokens_shape = (B, max_tokens_safe, dim)
