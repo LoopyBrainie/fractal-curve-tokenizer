@@ -1151,8 +1151,7 @@ class LayeredEvaluator:
         lca_temperature = config.get('lca_temperature', 1.5)
         learnable_temperature = config.get('learnable_temperature', True)
 
-        # I24-2: 可学习配额
-        quota_learnable = config.get('quota_learnable', None)
+        # I24-2: 可学习配额控制（已集成到 splitter 配置中，无需单独读取）
         quota_entropy_weight = config.get('quota_entropy_weight', 0.01)
 
         # I31-3: 形状-尺度编码
@@ -1320,8 +1319,8 @@ class LayeredEvaluator:
             use_area_encoding=use_area_encoding,
             use_affine_modulation=use_affine_modulation,
             fourier_levels=fourier_levels,
-            # I24-2: 可学习配额控制
-            quota_learnable=quota_learnable,
+            # 注意: quota_learnable 不再单独传递
+            # 因为 splitter 已包含完整的 enable_learnable_quota 配置
         )
         
         # 加载权重
