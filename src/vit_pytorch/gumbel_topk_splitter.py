@@ -133,7 +133,7 @@ from .constants import (
     # Tier 2: 变参数计算函数
     compute_quota_init_logits,
 )
-from .config import SplitterConfig
+from .config import HilbertSplitterConfig, SplitterConfig
 from .base_splitter import (
     CoreSplitter,
     AnnealingSplitter,
@@ -3641,8 +3641,17 @@ def create_gumbel_topk_from_config(
     if min_patch_size is None:
         min_patch_size = 4  # 默认值
 
-    # I111-2: 创建简化 SplitterConfig
-    config = SplitterConfig(
+    # I145: 修复参数名称（使用 HilbertSplitterConfig/SplitterConfig 的正确参数）
+    # K_min_abs: 绝对最小采样数
+    # K_max_hard: 绝对最大采样数
+    K_min_abs = K_min if K_min is not None else 8
+    K_max_hard = K_max if K_max is not None else 4096
+    # target_coverage 移除，使用 coverage_min/coverage_max_hard
+    # 从 kwargs 中获取覆盖率参数
+    coverage_min = kwargs.get('token_coverage_min', 0.01)
+    coverage_max_hard = kwargs.get('token_coverage_max', 0.25)
+
+    splitter_config = SplitterConfig(
         feature_dim=feature_dim,
         min_patch_size=min_patch_size,
         max_level_limit=max_level_limit,
@@ -3650,14 +3659,15 @@ def create_gumbel_topk_from_config(
         intermediate_dim=hidden_dim,
         pool_size=pool_size,
         dropout=0.1,
-        K_min=K_min,
-        K_max=K_max,
-        target_coverage=target_coverage,  # I111-2: 简化覆盖率
+        K_min_abs=K_min_abs,
+        K_max_hard=K_max_hard,
+        coverage_min=coverage_min,
+        coverage_max_hard=coverage_max_hard,
         use_dynamic_k=True,
     )
 
     return GumbelTopKSplitter(
-        config=config,
+        config=splitter_config,
         image_size=image_size,
     )
 

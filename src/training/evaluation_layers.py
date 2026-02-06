@@ -664,8 +664,8 @@ class ClassificationEvaluator:
         # Hardest classes (highest error rate)
         error_rates = []
         for c in range(self.num_classes):
-            if per_class_total[c] > 0:
-                error_rate = 1.0 - per_class_correct[c] / per_class_total[c]
+            if class_total[c] > 0:
+                error_rate = 1.0 - class_correct[c] / class_total[c]
                 error_rates.append((c, error_rate * 100))
         error_rates.sort(key=lambda x: x[1], reverse=True)
         metrics.hardest_classes = error_rates[:10]
