@@ -1280,13 +1280,18 @@ class LayeredEvaluator:
             max_level_limit=max_level_limit,  # 动态计算，而非硬编码 8
             hidden_dim=splitter_hidden_dim,
             pool_size=splitter_pool_size,
-            token_coverage_min=config.get('token_coverage_min', 0.01),  # I33: 使用覆盖率参数
-            token_coverage_max=config.get('token_coverage_max', 0.25),  # I109-3
+            # I33: 使用覆盖率参数（从 kwargs 提取）
+            token_coverage_min=config.get('token_coverage_min', 0.01),
+            token_coverage_max=config.get('token_coverage_max', 0.25),
+            # I145: 传递 K 值参数（从 checkpoint 或默认值）
+            K_min=config.get('K_min_abs', config.get('K_min', 8)),
+            K_max=config.get('K_max_hard', config.get('K_max', 64)),
             image_size=(image_size, image_size) if isinstance(image_size, int) else image_size,
         )
         print(f"Created splitter with feature_dim={splitter_feature_dim}, hidden_dim={splitter_hidden_dim}, pool_size={splitter_pool_size}")
 
         # 创建模型（使用检测到的所有参数）
+        # I145: 注入已配置好的 splitter（splitter 包含完整配置，无需重复传递 token_coverage_*）
         model = FractalCurveViT(
             image_size=image_size,
             num_classes=num_classes,
@@ -1308,11 +1313,8 @@ class LayeredEvaluator:
             ffn_type=ffn_type,
             lca_temperature=lca_temperature,
             learnable_temperature=learnable_temperature,
-            # I140: 注入已配置好的 splitter（避免重新创建不匹配的）
+            # I140: 注入已配置好的 splitter（splitter 包含完整配置）
             splitter=splitter,
-            # I33: Token 覆盖率约束（K 值由模型内部从覆盖率计算）
-            token_coverage_min=config.get('token_coverage_min', 0.01),
-            token_coverage_max=config.get('token_coverage_max', 0.05),
             pos_dropout=pos_dropout,
             # I31-3: 形状-尺度编码配置
             use_area_encoding=use_area_encoding,

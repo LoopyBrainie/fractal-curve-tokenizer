@@ -73,4 +73,5 @@ uv run python src/training/train_fractal_vit.py \
   --channels-last \
   --include-soft-entropy \
   --include-elastic-budget \
-  --warmup-epochs 10 
+  --warmup-epochs 10 \
+  --patience 20

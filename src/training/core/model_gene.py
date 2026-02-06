@@ -69,6 +69,13 @@ class ModelGene:
     token_coverage_min: float = 0.01   # α = 1% 最小覆盖率
     token_coverage_max: float = 0.25   # β = 25% 最大覆盖率
 
+    # I145: Splitter K 值限制（从 SplitterConfig 提取）
+    K_min_abs: int = 8                 # 绝对最小采样数
+    K_max_hard: int = 64               # 绝对最大采样数
+    coverage_base: float = 0.12         # 基准覆盖率
+    splitter_temp_start: float = 1.0    # 初始温度
+    splitter_temp_end: float = 0.1      # 最终温度
+
     # ==================== 正则化参数 ====================
     # I145: 修复默认值与 ModelArchitectureConfig 一致
     # 注意: dropout=0.25, emb_dropout=0.15, drop_path_rate=0.25
@@ -411,11 +418,23 @@ class ModelGene:
                 # I145: 修复 - SplitterConfig 使用 coverage_min/max_hard 而非 token_coverage_min/max
                 gene.token_coverage_min = getattr(config, 'coverage_min', 0.01)
                 gene.token_coverage_max = getattr(config, 'coverage_max_hard', 0.25)  # I109-3
+                # I145: 提取 K 值限制参数
+                gene.K_min_abs = getattr(config, 'K_min_abs', 8)
+                gene.K_max_hard = getattr(config, 'K_max_hard', 64)
+                gene.coverage_base = getattr(config, 'coverage_base', 0.12)
+                # I145: 提取温度参数
+                gene.splitter_temp_start = getattr(config, 'temperature_init', 1.0)
+                gene.splitter_temp_end = getattr(config, 'temperature_min', 0.1)
             # 备选：从 tokenizer.splitter.config 提取
             elif hasattr(tokenizer, 'splitter') and hasattr(tokenizer.splitter, 'config') and tokenizer.splitter.config is not None:
                 config = tokenizer.splitter.config
                 gene.token_coverage_min = getattr(config, 'coverage_min', 0.01)
                 gene.token_coverage_max = getattr(config, 'coverage_max_hard', 0.25)  # I109-3
+                gene.K_min_abs = getattr(config, 'K_min_abs', 8)
+                gene.K_max_hard = getattr(config, 'K_max_hard', 64)
+                gene.coverage_base = getattr(config, 'coverage_base', 0.12)
+                gene.splitter_temp_start = getattr(config, 'temperature_init', 1.0)
+                gene.splitter_temp_end = getattr(config, 'temperature_min', 0.1)
             else:
                 raise ValueError(
                     "无法从模型提取 token_coverage_* 参数。"
@@ -453,9 +472,11 @@ class ModelGene:
             if verbose:
                 print(f"  [I145] 从模型权重检测到真实的 heads={actual_heads}")
 
-            # 可学习配额
-            if hasattr(splitter, 'quota_learnable'):
-                gene.quota_learnable = splitter.quota_learnable
+            # I145: 可学习配额（从 Splitter.config 或 GumbelTopKSplitter._enable_learnable_quota 提取）
+            if hasattr(splitter, 'config') and splitter.config is not None:
+                gene.quota_learnable = getattr(splitter.config, 'enable_learnable_quota', None)
+            elif hasattr(splitter, '_enable_learnable_quota'):
+                gene.quota_learnable = splitter._enable_learnable_quota
 
         return gene
 
