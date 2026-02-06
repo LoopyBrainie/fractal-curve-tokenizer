@@ -501,6 +501,17 @@ class ModelGene:
         Returns:
             ModelGene 对象
         """
+        # I145: 从 config 获取温度参数（支持 TrainingConfig 和 args 两种格式）
+        # TrainingConfig 使用 splitter_temp_start/end，args 使用其他命名
+        splitter_temp_start = getattr(config, 'splitter_temp_start', None)
+        if splitter_temp_start is None:
+            # 兼容旧版 config 或直接从 args 获取
+            splitter_temp_start = getattr(config, 'temperature_init', 1.0)
+
+        splitter_temp_end = getattr(config, 'splitter_temp_end', None)
+        if splitter_temp_end is None:
+            splitter_temp_end = getattr(config, 'temperature_min', 0.1)
+
         # 使用 getattr 处理可选字段（兼容不同版本的 ModelArchitectureConfig）
         gene = cls(
             dim=config.dim,
@@ -524,6 +535,9 @@ class ModelGene:
             learnable_temperature=config.learnable_temperature,
             token_coverage_min=config.token_coverage_min,
             token_coverage_max=config.token_coverage_max,
+            # Splitter 温度参数（I145: 确保从训练配置正确保存）
+            splitter_temp_start=splitter_temp_start,
+            splitter_temp_end=splitter_temp_end,
             use_area_encoding=config.use_area_encoding,
             use_affine_modulation=config.use_affine_modulation,
             fourier_levels=config.fourier_levels,

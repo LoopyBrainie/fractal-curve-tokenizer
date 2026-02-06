@@ -3138,8 +3138,9 @@ def main():
 
             # Tokenizer 覆盖率 (I33 相对预算)
             # 注意: K 值由模型架构动态计算，TrainingConfig 不保存绝对 K 值
-            self.token_coverage_min = args.token_coverage_min
-            self.token_coverage_max = args.token_coverage_max
+            # I145: 使用 arch_config 确保与 ModelGene.from_config() 一致
+            self.token_coverage_min = arch_config.token_coverage_min
+            self.token_coverage_max = arch_config.token_coverage_max
             self.K_min_abs = K_min_abs  # 用于保护最小值，实际 K 值动态计算
 
             # 训练配置 (use_channels_last 是 CLI 参数)
