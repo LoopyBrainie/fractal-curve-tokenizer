@@ -166,20 +166,19 @@ class GradientFeatureExtractor(nn.Module):
 
     def forward(self, features: Tensor) -> Tensor:
         B, C, H, W = features.shape
-        proj = self._get_input_proj(C)
-        features_proj = proj(features)
-
-        sobel_x = self._sobel_kernel[0]
-        sobel_y = self._sobel_kernel[1]
-
-        grad_x_list = []
-        grad_y_list = []
-        for c in range(self.hidden_dim):
-            feat_c = features_proj[:, c:c+1]
-            gx = F.conv2d(feat_c, sobel_x.unsqueeze(0).unsqueeze(0), padding=1)
-            gy = F.conv2d(feat_c, sobel_y.unsqueeze(0).unsqueeze(0), padding=1)
-            grad_x_list.append(gx)
-            grad_y_list.append(gy)
+        # P-OPT: Sobel 卷积向量化 - 使用 groups 参数一次处理所有通道
+        # 原始: hidden_dim 次独立卷积循环
+        # 优化: 单次深度分离卷积，groups=hidden_dim
+        # _sobel_kernel shape: [2, 1, 3, 3] -> repeat 后: [2, hidden_dim, 3, 3]
+        grad = F.conv2d(
+            features_proj,
+            self._sobel_kernel.repeat(self.hidden_dim, 1, 1, 1),
+            padding=1,
+            groups=self.hidden_dim  # 深度分离卷积：每个通道独立卷积
+        )
+        # 分离 x 和 y 梯度: [B, 2*hidden_dim, H, W] -> [B, hidden_dim, H, W] each
+        grad_x = grad[:, ::2]  # 偶数索引: 通道 0, 2, 4, ...
+        grad_y = grad[:, 1::2]  # 奇数索引: 通道 1, 3, 5, ...
 
         grad_x = torch.cat(grad_x_list, dim=1)
         grad_y = torch.cat(grad_y_list, dim=1)

@@ -605,13 +605,10 @@ class ClassificationEvaluator:
         labels_np = all_labels.numpy()
         preds_np = all_preds.numpy()
 
-        # 批量统计各类别的总数和正确数
+        # Per-class accuracy & MCA
         class_total = np.bincount(labels_np, minlength=self.num_classes)  # [C]
-        correct_mask = (preds_np == labels_np).astype(np.int32)
-        class_correct = np.bincount(labels_np * correct_mask + (1 - correct_mask) * (-1),
-                                    minlength=self.num_classes * self.num_classes)
-        # 重新组织：正确预测的索引 = label * num_classes + label = label * (num_classes + 1)
-        # 简化方法：直接计算
+
+        # 直接使用循环统计每类正确数（I145：向量化尝试产生负值问题，已修复）
         class_correct = np.zeros(self.num_classes, dtype=np.int32)
         for c in range(self.num_classes):
             class_correct[c] = ((labels_np == c) & (preds_np == c)).sum()

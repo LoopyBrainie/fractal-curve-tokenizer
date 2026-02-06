@@ -939,12 +939,12 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             regions = torch.where(torch.isinf(regions), torch.zeros_like(regions), regions)
 
         # I99-1: clamp regions 到有效图像边界
+        # P-OPT: 直接在原始张量上 clamp_()，避免不必要的 .clone() 内存分配
         img_size = max(self.image_size) if isinstance(self.image_size, tuple) else self.image_size
-        regions = regions.clone()
-        regions[:, 0] = regions[:, 0].clamp(min=0, max=img_size)
-        regions[:, 1] = regions[:, 1].clamp(min=0, max=img_size)
-        regions[:, 2] = regions[:, 2].clamp(min=0, max=img_size)
-        regions[:, 3] = regions[:, 3].clamp(min=0, max=img_size)
+        regions[:, 0] = regions[:, 0].clamp_(min=0, max=img_size)
+        regions[:, 1] = regions[:, 1].clamp_(min=0, max=img_size)
+        regions[:, 2] = regions[:, 2].clamp_(min=0, max=img_size)
+        regions[:, 3] = regions[:, 3].clamp_(min=0, max=img_size)
 
         # I99-1 CRITICAL: 验证 batch_indices 值范围（在 clamp 之前）
         # P-OPT: 使用 no_grad 上下文避免梯度跟踪开销

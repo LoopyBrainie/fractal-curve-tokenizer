@@ -387,16 +387,16 @@ class LCAHilbertBias(HilbertBiasBase):
 
         # I30-5: 路径值验证 + 警告
         # 四叉树路径值必须是 0-3 (对应四个象限: 左上, 右上, 左下, 右下)
-        # I102-5: 使用张量比较避免 GPU-CPU 同步
-        # I145: 延迟警告构造，避免不必要的 .item() 调用
-        path_min = paths.min()
-        path_max = paths.max()
-        path_out_of_range = (path_max > 3) | (path_min < 0)
-        if path_out_of_range.any():
-            # 只在需要时才触发 GPU-CPU 同步
+        # I102-5: 仅在需要时计算 .item()，避免不必要的 GPU-CPU 同步
+        # P-OPT: 先用张量比较检测异常，再在警告中提取值
+        path_out_of_range = (paths > 3).any() | (paths < 0).any()
+        if path_out_of_range:
+            # 仅在异常时触发同步
+            path_min = paths.min().item()
+            path_max = paths.max().item()
             warnings.warn(
                 f"[I30-5] levels_info path values out of range: "
-                f"[{path_min.item():.2f}, {path_max.item():.2f}], expected [0, 3]. "
+                f"[{path_min:.2f}, {path_max:.2f}], expected [0, 3]. "
                 f"Clipping will be applied. "
                 f"This may indicate a tokenizer bug.",
                 RuntimeWarning,

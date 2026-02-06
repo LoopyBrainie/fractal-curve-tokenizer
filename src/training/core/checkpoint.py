@@ -253,10 +253,13 @@ def load_model(
 
         if missing and verbose:
             print(f"  [WARN] Missing keys: {len(missing)}")
+            print("  [WARN]   (Model expects these keys but checkpoint doesn't have them)")
             if len(missing) > 0:
                 print(f"  [WARN] Missing key examples: {list(missing)[:5]}")
         if unexpected and verbose:
             print(f"  [WARN] Unexpected keys: {len(unexpected)}")
+            print("  [WARN]   (Checkpoint has these keys but current model doesn't expect them)")
+            print("  [WARN]   Possible causes: code version mismatch, different quota_learnable setting")
             if len(unexpected) > 0:
                 print(f"  [WARN] Unexpected key examples: {list(unexpected)[:5]}")
 

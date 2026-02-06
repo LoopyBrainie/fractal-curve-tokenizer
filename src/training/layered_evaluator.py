@@ -126,6 +126,7 @@ from training.core.checkpoint import (
     get_checkpoint_info,
 )
 from training.core.model_gene import ModelGene
+from vit_pytorch.depth_utils import compute_max_depth
 
 
 # ============================================================================
@@ -1255,12 +1256,28 @@ class LayeredEvaluator:
 
         print(f"[I140] Final: dim={ckpt_dim}, feature_dim={splitter_feature_dim}, pool_size={splitter_pool_size}, hidden_dim={splitter_hidden_dim}")
 
+        # I145: 从 checkpoint 的 model_gene 动态计算 max_level_limit
+        # 这确保了与训练时保存的 checkpoint 兼容
+        detected_image_size = config.get('image_size', 64)
+        detected_min_patch_size = config.get('min_patch_size', 4)
+        # 确保 image_size 是 tuple 格式
+        if isinstance(detected_image_size, int):
+            image_size_tuple = (detected_image_size, detected_image_size)
+        else:
+            image_size_tuple = tuple(detected_image_size)
+        # 确保 min_patch_size 是单个值
+        if isinstance(detected_min_patch_size, tuple):
+            min_patch_val = detected_min_patch_size[0]
+        else:
+            min_patch_val = detected_min_patch_size
+        max_level_limit = compute_max_depth(image_size_tuple, min_patch_val)
+        print(f"[I145] Using max_level_limit={max_level_limit} from checkpoint config")
+
         # I140: 创建与检查点匹配的 splitter（避免 complexity_mlp 维度不匹配）
-        # I145: max_level_limit 使用默认值 8，不从外部 config 读取
         splitter = create_gumbel_topk_from_config(
             feature_dim=splitter_feature_dim,
             min_patch_size=min_patch_size[0] if isinstance(min_patch_size, tuple) else min_patch_size,
-            max_level_limit=8,  # 第二层参数：由模型架构动态计算
+            max_level_limit=max_level_limit,  # 动态计算，而非硬编码 8
             hidden_dim=splitter_hidden_dim,
             pool_size=splitter_pool_size,
             token_coverage_min=config.get('token_coverage_min', 0.01),  # I33: 使用覆盖率参数
@@ -1348,7 +1365,7 @@ class LayeredEvaluator:
 
         if missing_keys:
             print(f"Warning: Missing {len(missing_keys)} keys in state_dict")
-            # 只打印前 5 个
+            print("  (This is normal when checkpoint was saved with different code version)")
             for k in missing_keys[:5]:
                 print(f"  - {k}")
             if len(missing_keys) > 5:
@@ -1356,6 +1373,7 @@ class LayeredEvaluator:
 
         if unexpected_keys:
             print(f"Warning: Unexpected {len(unexpected_keys)} keys in state_dict")
+            print("  (These keys from checkpoint are not used by current model code)")
             for k in unexpected_keys[:5]:
                 print(f"  - {k}")
             if len(unexpected_keys) > 5:
