@@ -1147,9 +1147,8 @@ class LayeredEvaluator:
         # FFN 类型
         ffn_type = config.get('ffn_type', 'swiglu_level')
 
-        # LCA 温度
-        lca_temperature = config.get('lca_temperature', 1.5)
-        learnable_temperature = config.get('learnable_temperature', True)
+        # I122-2: lca_temperature 已移除，由 hilbert_bias_scale 统一缩放
+        # learnable_temperature 不再是独立参数
 
         # I24-2: 可学习配额控制（已集成到 splitter 配置中，无需单独读取）
         quota_entropy_weight = config.get('quota_entropy_weight', 0.01)
@@ -1310,8 +1309,7 @@ class LayeredEvaluator:
             use_checkpoint=use_checkpoint,
             drop_path_rate=drop_path_rate,
             ffn_type=ffn_type,
-            lca_temperature=lca_temperature,
-            learnable_temperature=learnable_temperature,
+            # I122-2: lca_temperature 已移除，由 hilbert_bias_scale 统一缩放
             # I140: 注入已配置好的 splitter（splitter 包含完整配置）
             splitter=splitter,
             pos_dropout=pos_dropout,

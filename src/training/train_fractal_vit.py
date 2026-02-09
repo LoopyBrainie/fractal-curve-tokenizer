@@ -2842,14 +2842,6 @@ def main():
     parser.add_argument("--no-learnable-depth-scale", action="store_true",
                        help="Use fixed depth scale")
     
-    # P6-2: LCA 温度参数
-    parser.add_argument("--lca-temperature", type=float, default=1.5,
-                       help="LCA bias temperature τ (default: 1.5, SNR=1.5)")
-    parser.add_argument("--no-lca-temperature", action="store_true",
-                       help="Disable LCA temperature scaling")
-    parser.add_argument("--fixed-lca-temperature", action="store_true",
-                       help="Use fixed (non-learnable) LCA temperature")
-    
     # P7-7: GumbelTopKSplitter 温度退火调度参数
     # I29-1 修复: 从 constants.py 导入常量，确保一致性
     # I24-7 分析: T_end=0.5 保持探索能力，T=0.3 过低会导致梯度消失
@@ -3100,8 +3092,7 @@ def main():
         use_affine_modulation=args.use_affine_modulation,
         fourier_levels=args.fourier_levels,
         depth_scale_range=(args.depth_scale_min, args.depth_scale_max) if not args.no_learnable_depth_scale else None,
-        lca_temperature=None if args.no_lca_temperature else args.lca_temperature,
-        learnable_temperature=not args.fixed_lca_temperature,
+        # I122-2: lca_temperature 已移除，由 hilbert_bias_scale 统一缩放
         quota_learnable=quota_learnable_value,
         quota_entropy_weight=args.quota_entropy_weight,
         freeze_quota=args.freeze_quota,
@@ -3149,8 +3140,7 @@ def main():
             self.emb_dropout = arch_config.emb_dropout
             self.drop_path_rate = arch_config.drop_path_rate
             self.use_checkpoint = arch_config.use_checkpoint
-            self.lca_temperature = arch_config.lca_temperature
-            self.learnable_temperature = arch_config.learnable_temperature
+            # I122-2: lca_temperature 已移除，由 hilbert_bias_scale 统一缩放
             self.use_area_encoding = arch_config.use_area_encoding
             self.use_affine_modulation = arch_config.use_affine_modulation
             self.fourier_levels = arch_config.fourier_levels
@@ -3259,9 +3249,7 @@ def main():
         ffn_type=config.ffn_type,
         # 使用自定义 tokenizer (支持高级分割参数)
         tokenizer=tokenizer,
-        # P6-2: LCA 温度配置
-        lca_temperature=config.lca_temperature,
-        learnable_temperature=config.learnable_temperature,
+        # I122-2: lca_temperature 已移除，由 hilbert_bias_scale 统一缩放
         # I31-3: 面积编码参数
         use_area_encoding=config.use_area_encoding,
         use_affine_modulation=config.use_affine_modulation,
@@ -3314,17 +3302,15 @@ def main():
 
     # P6-1/P6-2 信息
     depth_scale_info = f"range={config.depth_scale_range}" if config.depth_scale_range else "fixed"
-    temp_info = f"τ={config.lca_temperature}" if config.lca_temperature else "disabled"
-    if config.lca_temperature and config.learnable_temperature:
-        temp_info += " (learnable)"
+    # I122-2: lca_temperature 已移除，由 hilbert_bias_scale 统一缩放
 
     print(f"\n{'='*70}")
     print(f"Model: FractalCurveViT")
     print(f"Tokenizer: {tokenizer_name}")
     print(f"FFN Type: {config.ffn_type}")
-    print(f"Hilbert Bias: LCA (only mode after P11-8 cleanup)")
+    print(f"Hilbert Bias: LCA (scaled by hilbert_bias_scale × √d_k, I122-2)")
     print(f"  - Depth Scale (P6-1): {depth_scale_info}")
-    print(f"  - LCA Temperature (P6-2): {temp_info}")
+    print(f"  - Splitter Temp (P7-7): [{config.splitter_temp_start:.1f} → {config.splitter_temp_end:.1f}]")
     print(f"Parameters: {params:,} (trainable: {trainable_params:,})")
     if config.freeze_tokenizer:
         print(f"  - Tokenizer Frozen (I24-1): {len(frozen_tokenizer_params)} params")

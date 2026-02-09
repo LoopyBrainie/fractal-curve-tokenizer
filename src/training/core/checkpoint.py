@@ -485,8 +485,7 @@ def _build_model_from_config(config: Dict[str, Any]) -> ModelType:
         use_checkpoint=config.get('use_checkpoint', False),
         drop_path_rate=config.get('drop_path_rate', 0.15),
         ffn_type=config.get('ffn_type', 'swiglu_level'),
-        lca_temperature=config.get('lca_temperature', 1.5),
-        learnable_temperature=config.get('learnable_temperature', True),
+        # I122-2: lca_temperature 已移除，由 hilbert_bias_scale 统一缩放
         splitter=splitter,
         K_min=K_min,
         K_max=K_max,
