@@ -74,9 +74,13 @@ class ModelArchitectureConfig:
     # Tokenizer 参数 (I33: 相对预算设计)
     min_patch_size: int = 4
     # I33: 相对预算参数 (替代绝对 K_min/K_max)
-    token_coverage_min: float = 0.01   # α = 1% 最小覆盖率
-    token_coverage_max: float = 0.25   # β = 25% 最大覆盖率，参与自适应计算
-    K_min_abs: int = 8                 # 绝对下界保护
+    # I145: 统一命名 - 使用与 HilbertSplitterConfig 一致的字段名
+    # I145 修复: 值应与 constants.py 中的常量定义一致
+    coverage_min: float = 0.01          # α = 1% 最小覆盖率 (与 K_COVERAGE_MIN 一致)
+    coverage_max_hard: float = 0.50     # β = 50% 最大覆盖率 (与 K_COVERAGE_MAX_HARD 一致)
+    token_coverage_min: float = 0.01   # α = 1% 最小覆盖率 (向后兼容别名)
+    token_coverage_max: float = 0.25   # β = 25% 最大覆盖率 (向后兼容别名，I145: 保持 0.25 以避免大 OOM)
+    K_min_abs: int = 4                 # 绝对下界保护 (与 K_MIN_HARD_LIMIT 一致)
 
     # FFN 类型
     ffn_type: str = "swiglu_level"  # "swiglu", "swiglu_level"
@@ -241,10 +245,12 @@ class ModelArchitectureConfig:
         # I139: 使用配置的 image_size，避免硬编码 224
         img_size = self.image_size if self.image_size else 224
         max_patches = (img_size // self.min_patch_size) ** 2
+        # I145: 使用 coverage_max_hard 替代 token_coverage_max
+        coverage_max = getattr(self, 'coverage_max_hard', None) or self.token_coverage_max
         return min(
-            int(self.token_coverage_max * max_patches),
+            int(coverage_max * max_patches),
             self.K_min_abs * 8
-        ) if max_patches > 0 else 64
+        ) if max_patches > 0 else 8192  # I145: 使用正确的默认值
 
 
 # ============================================================================
