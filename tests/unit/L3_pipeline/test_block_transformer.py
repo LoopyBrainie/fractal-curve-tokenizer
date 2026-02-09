@@ -211,18 +211,21 @@ class TestFractalTransformerBlock:
         assert out_small.shape == (2, 16, 64)
         assert out_large.shape == (2, 16, 64)
 
-    def test_lca_temperature(self):
-        """LCA 温度参数"""
+    def test_max_depth_parameter(self):
+        """max_depth 参数"""
         x = torch.randn(2, 16, 64)
 
-        block_warm = FractalTransformerBlock(dim=64, heads=4, dim_head=16, mlp_dim=256, lca_temperature=2.0)
-        block_cool = FractalTransformerBlock(dim=64, heads=4, dim_head=16, mlp_dim=256, lca_temperature=0.5)
+        block_small = FractalTransformerBlock(dim=64, heads=4, dim_head=16, mlp_dim=256, max_level=4)
+        block_large = FractalTransformerBlock(dim=64, heads=4, dim_head=16, mlp_dim=256, max_level=8)
 
-        out_warm = block_warm(x)
-        out_cool = block_cool(x)
+        out_small = block_small(x)
+        out_large = block_large(x)
 
-        # 不同温度应该产生不同输出
-        assert not torch.allclose(out_warm, out_cool, atol=1e-4)
+        assert out_small.shape == (2, 16, 64)
+        assert out_large.shape == (2, 16, 64)
+
+    # I122-2: lca_temperature 参数已移除，由 hilbert_bias_scale × √d_k 统一缩放
+    # 保留测试作为 API 变更记录
 
 
 class TestFractalTransformer:

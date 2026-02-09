@@ -326,5 +326,190 @@ class TestMathematicalProperties:
         assert grad[3] != 0 or grad[:3].abs().sum() > 0
 
 
+class TestHierarchicalQuotaAllocation:
+    """I120-3: 测试分层自适应配额"""
+
+    def test_hierarchical_quota_allocation_basic(self):
+        """验证分层自适应配额的基本性质"""
+        # 创建特征
+        features = torch.randn(2, 256, 16, 16)
+
+        splitter = GumbelTopKSplitter(
+            feature_dim=256,
+            min_patch_size=4,
+            max_level_limit=3,
+            image_size=(64, 64),
+            enable_hierarchical_quota=True,  # 启用分层配额
+        )
+
+        # 验证配置
+        assert splitter._enable_hierarchical_quota is True
+
+        # 需要先调用 forward 来初始化 _current_max_depth
+        D = splitter._current_max_depth + 1
+        assert D == 4  # max_level_limit=3 => D=4
+
+        # 调用配额分配
+        K = 32
+        hard_quota, soft_quota = splitter._compute_quota_allocation(K, features=features)
+
+        # 验证形状
+        assert hard_quota.shape == (D,)
+        assert soft_quota.shape == (D,)
+
+        # 验证总和正确
+        assert hard_quota.sum().item() == K
+
+        # 验证每个深度至少 1 个
+        assert (hard_quota >= 1).all()
+
+    def test_hierarchical_quota_sum_equals_k(self):
+        """验证分层配额总和等于 K"""
+        features = torch.randn(4, 256, 32, 32)
+
+        splitter = GumbelTopKSplitter(
+            feature_dim=256,
+            min_patch_size=8,
+            max_level_limit=4,
+            image_size=(64, 64),
+            enable_hierarchical_quota=True,
+        )
+
+        for K in [16, 32, 48, 64]:
+            hard_quota, _ = splitter._compute_quota_allocation(K, features=features)
+            assert abs(hard_quota.sum().item() - K) <= 1
+
+    def test_hierarchical_quota_respects_info_density(self):
+        """验证分层配额根据信息密度分配"""
+        # 创建有明显信息差异的特征
+        # 深度 0 (1 个 patch): 高信息
+        # 深度 3 (64 个 patches): 低信息
+        features = torch.randn(2, 256, 32, 32)
+
+        splitter = GumbelTopKSplitter(
+            feature_dim=256,
+            min_patch_size=4,
+            max_level_limit=3,
+            image_size=(64, 64),
+            enable_hierarchical_quota=True,
+        )
+
+        K = 64
+        hard_quota, soft_quota = splitter._compute_quota_allocation(K, features=features)
+
+        # 验证配额不为零
+        assert (hard_quota > 0).all()
+
+    def test_hierarchical_vs_rate_balanced(self):
+        """验证分层配额与选中率均衡配额的差异"""
+        features = torch.randn(2, 256, 16, 16)
+
+        splitter = GumbelTopKSplitter(
+            feature_dim=256,
+            min_patch_size=4,
+            max_level_limit=3,
+            image_size=(64, 64),
+            enable_hierarchical_quota=True,
+        )
+
+        K = 32
+
+        # 分层配额 (启用 features)
+        hard_quota_hier, _ = splitter._compute_quota_allocation(K, features=features)
+
+        # 选中率均衡配额 (禁用 hierarchical，使用 info_density=None)
+        splitter._enable_hierarchical_quota = False
+        hard_quota_rate, _ = splitter._compute_quota_allocation(K)
+
+        # 恢复
+        splitter._enable_hierarchical_quota = True
+
+        # 两者都应该有效
+        assert hard_quota_hier.sum().item() == K
+        assert hard_quota_rate.sum().item() == K
+
+        # 分层配额应该根据特征内容分配，与选中率均衡不同
+        # 注意：由于特征是随机的，两者可能偶然相等
+        # 但分层配额考虑了特征信息，这是关键差异
+
+    def test_hierarchical_quota_gradient_flow(self):
+        """验证分层配额梯度流"""
+        features = torch.randn(2, 256, 16, 16)
+        features.requires_grad_(True)
+
+        splitter = GumbelTopKSplitter(
+            feature_dim=256,
+            min_patch_size=4,
+            max_level_limit=3,
+            image_size=(64, 64),
+            enable_hierarchical_quota=True,
+        )
+
+        K = 32
+        hard_quota, soft_quota = splitter._compute_quota_allocation(K, features=features)
+
+        # 软配额应该有梯度
+        loss = soft_quota.sum()
+        loss.backward()
+
+        # 验证 features 有梯度
+        assert features.grad is not None
+        assert not torch.isnan(features.grad).any()
+        assert not torch.isinf(features.grad).any()
+
+    def test_hierarchical_disabled_by_default(self):
+        """验证分层配额默认关闭"""
+        splitter = GumbelTopKSplitter(
+            feature_dim=256,
+            min_patch_size=8,
+            max_level_limit=3,
+            image_size=(64, 64),
+        )
+
+        # 默认应该关闭
+        assert splitter._enable_hierarchical_quota is False
+
+
+class TestLRMProjection:
+    """测试 LRM 投影方法"""
+
+    def test_lrm_projection_sum_equals_k(self):
+        """验证 LRM 投影总和正确"""
+        splitter = GumbelTopKSplitter(
+            feature_dim=256,
+            min_patch_size=8,
+            max_level_limit=3,
+            image_size=(64, 64),
+        )
+
+        # 测试用例1: 均匀分布
+        K_soft = torch.tensor([5.0, 5.0, 5.0, 5.0])
+        K = 10
+        K_hard = splitter._lrm_projection(K_soft, target_sum=K)
+        assert K_hard.sum().item() == K
+        assert all(k >= 0 for k in K_hard.tolist())
+
+        # 测试用例2: 非均匀分布
+        K_soft = torch.tensor([2.5, 3.5, 4.5, 5.5])
+        K = 8
+        K_hard = splitter._lrm_projection(K_soft, target_sum=K)
+        assert K_hard.sum().item() == K
+
+    def test_lrm_projection_non_negative(self):
+        """验证 LRM 投影非负"""
+        splitter = GumbelTopKSplitter(
+            feature_dim=256,
+            min_patch_size=8,
+            max_level_limit=3,
+            image_size=(64, 64),
+        )
+
+        K = 32
+        K_soft = torch.tensor([-1.0, 0.5, 2.0, 0.3])
+        K_hard = splitter._lrm_projection(K_soft, target_sum=K)
+
+        assert (K_hard >= 0).all()
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

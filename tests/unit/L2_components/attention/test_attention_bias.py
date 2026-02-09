@@ -37,9 +37,14 @@ class TestLCAHilbertBiasBasic:
         assert lca_bias.lca_embedding.embedding_dim == 4
 
     def test_parameter_count(self, lca_bias):
-        """参数量测试 - 验证参数量极少"""
+        """参数量测试 - 验证参数量极少
+
+        I122-2: 移除温度参数后，参数量从 40 减少到 36
+        原: (max_level + 1) * heads + heads = 9*4 + 4 = 40 (含温度参数)
+        新: (max_level + 1) * heads = 9*4 = 36 (仅 LCA 嵌入)
+        """
         num_params = sum(p.numel() for p in lca_bias.parameters())
-        assert num_params == 40  # (max_level + 1) * heads + heads
+        assert num_params == 36  # (max_level + 1) * heads = 9 * 4 = 36
         assert num_params < 100, f"LCA params ({num_params}) should be < 100"
 
     def test_forward_2d(self, lca_bias):
@@ -223,8 +228,11 @@ class TestEdgeCases:
     """边界条件测试"""
 
     def test_single_token(self):
-        """单 token 测试"""
-        lca_bias = LCAHilbertBias(max_level=4, heads=2, lca_temperature=None)
+        """单 token 测试
+
+        I122-2: 移除 lca_temperature 参数
+        """
+        lca_bias = LCAHilbertBias(max_level=4, heads=2)
 
         levels_info = torch.randint(0, 4, (1, 5))
         levels_info[0, 0] = 4
@@ -237,8 +245,11 @@ class TestEdgeCases:
         assert torch.allclose(bias[:, 0, 0], expected_bias)
 
     def test_max_level_exceeded(self):
-        """超过最大深度测试 - I34-13: 超界时抛出异常而非静默钳位"""
-        lca_bias = LCAHilbertBias(max_level=4, heads=2, lca_temperature=None)
+        """超过最大深度测试 - I34-13: 超界时抛出异常而非静默钳位
+
+        I122-2: 移除 lca_temperature 参数
+        """
+        lca_bias = LCAHilbertBias(max_level=4, heads=2)
 
         levels_info = torch.randint(0, 4, (4, 10))
         levels_info[:, 0] = 8  # 超出 max_level=4 的范围

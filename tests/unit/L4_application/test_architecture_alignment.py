@@ -122,7 +122,9 @@ TIER3_PARAMETERS = [
     'token_coverage_min',
     'token_coverage_max',
     # 正则化
-    'dropout',
+    # I122-1: FractalCurveViT 使用分离的 dropout 参数
+    'tokenizer_dropout',
+    'transformer_dropout',
     'emb_dropout',
     'drop_path_rate',
     # 编码选项
@@ -131,8 +133,9 @@ TIER3_PARAMETERS = [
     'use_area_encoding',
     'use_affine_modulation',
     'fourier_levels',
-    'lca_temperature',
-    'learnable_temperature',
+    # I122-2: lca_temperature 已移除
+    # 'lca_temperature',
+    # 'learnable_temperature',
     'quota_learnable',
 ]
 
@@ -538,7 +541,7 @@ class TestCheckpointConsistency:
             num_layers=2,
             heads=4,
             mlp_dim=128,
-            dropout=0.1,
+            transformer_dropout=0.1,
         )
 
         gene = ModelGene.from_model(model, dataset_name='test', epoch=10)
@@ -780,7 +783,7 @@ class TestTier3Parameters:
             mlp_dim=512,
             token_coverage_min=0.01,
             token_coverage_max=0.05,
-            dropout=0.1,
+            transformer_dropout=0.1,
             use_hilbert_encoding=True,
         )
 
@@ -806,7 +809,7 @@ class TestTier3Parameters:
             mlp_dim=512,
             token_coverage_min=0.02,  # 非默认值
             token_coverage_max=0.08,  # 非默认值
-            dropout=0.15,
+            transformer_dropout=0.15,
             use_hilbert_encoding=False,
         )
 

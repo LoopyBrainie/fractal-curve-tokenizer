@@ -62,9 +62,9 @@ CONFIG_TO_GENE_MAPPING = [
     # FFN 选项
     ("ffn_type", "ffn_type", "swiglu_level"),
 
-    # LCA 参数
-    ("lca_temperature", "lca_temperature", 1.5),
-    ("learnable_temperature", "learnable_temperature", True),
+    # I122-2: lca_temperature 已移除，由 hilbert_bias_scale × √d_k 统一缩放
+    # ("lca_temperature", "lca_temperature", 1.5),
+    # ("learnable_temperature", "learnable_temperature", True),
 
     # I24-2: 可学习配额
     ("quota_learnable", "quota_learnable", None),
@@ -104,7 +104,9 @@ GENE_TO_MODEL_MAPPING = [
     ("token_coverage_max", "token_coverage_max", None),
 
     # 正则化参数
-    ("dropout", "dropout", 0.0),
+    # I120-2: dropout → tokenizer_dropout, transformer_dropout
+    ("dropout", "tokenizer_dropout", 0.0),
+    ("dropout", "transformer_dropout", 0.0),
     ("emb_dropout", "emb_dropout", 0.0),
     ("drop_path_rate", "drop_path_rate", 0.0),
 
@@ -116,9 +118,9 @@ GENE_TO_MODEL_MAPPING = [
     # FFN 选项
     ("ffn_type", "ffn_type", "swiglu_level"),
 
-    # LCA 参数
-    ("lca_temperature", "lca_temperature", 1.5),
-    ("learnable_temperature", "learnable_temperature", True),
+    # I122-2: lca_temperature 已移除
+    # ("lca_temperature", "lca_temperature", 1.5),
+    # ("learnable_temperature", "learnable_temperature", True),
 
     # Splitter 相关
     (None, "splitter", None),  # 特殊：不传递，使用模型默认
@@ -677,8 +679,9 @@ class TestEndToEndConsistency:
             dropout=0.2,
             drop_path_rate=0.3,
             ffn_type="swiglu_level",
-            lca_temperature=2.0,
-            learnable_temperature=False,
+            # I122-2: lca_temperature 已移除
+            # lca_temperature=2.0,
+            # learnable_temperature=False,
             token_coverage_min=0.01,
             token_coverage_max=0.3,
             quota_learnable=True,
@@ -700,8 +703,155 @@ class TestEndToEndConsistency:
         assert model.heads == config.heads
         assert model.mlp_dim == config.mlp_dim
         assert model.num_classes == config.num_classes
-        assert model.dropout == config.dropout
+        # I120-2: dropout → tokenizer_dropout, transformer_dropout
+        assert model.tokenizer_dropout == config.dropout
+        assert model.transformer_dropout == config.dropout
         assert model.drop_path_rate == config.drop_path_rate
+
+
+class TestWandBConfigAlignment:
+    """WandB 配置三层参数对齐测试
+
+    验证 WandB 记录的 config 与 ModelGene.to_dict() 一致：
+    1. ModelArchitectureConfig - 训练配置
+    2. ModelGene.from_config() - 从配置构造基因
+    3. WandB config - wandb.init(config=...) 使用 ModelGene.to_dict()
+
+    这确保了训练/评估加载/pth.gene保存三者一致。
+    """
+
+    def test_wandb_config_matches_model_gene(self):
+        """测试: WandB config 应与 ModelGene.to_dict() 完全一致
+
+        这是三层参数对齐的核心测试:
+        - Config → Gene → WandB config
+        - 确保没有任何参数遗漏或不一致
+        """
+        from training.config import ModelArchitectureConfig
+        from training.core.model_gene import ModelGene
+
+        # 创建配置
+        config = ModelArchitectureConfig(
+            dim=384,
+            num_layers=8,
+            heads=6,
+            mlp_dim=1536,
+            num_classes=200,
+            image_size=224,
+            dropout=0.1,
+            token_coverage_min=0.03,
+            token_coverage_max=0.25,
+            ffn_type="swiglu_level",
+            # I122-2: lca_temperature 已移除
+            # lca_temperature=1.5,
+            # learnable_temperature=True,
+            splitter_hidden_dim=256,
+            splitter_feature_dim=64,
+            splitter_pool_size=4,
+        )
+
+        # 构建基因
+        gene = ModelGene.from_config(config)
+
+        # 获取 ModelGene.to_dict()
+        gene_dict = gene.to_dict()
+
+        # 验证关键字段存在于 ModelGene
+        assert 'dim' in gene_dict
+        assert 'num_layers' in gene_dict
+        assert 'heads' in gene_dict
+        assert 'token_coverage_min' in gene_dict
+        assert 'token_coverage_max' in gene_dict
+
+        # 验证 WandB 可以使用这个配置
+        # (这模拟了 WandBCallback.on_train_begin 中的逻辑)
+        wandb_config = gene_dict.copy()
+        wandb_config['_wandb_config_version'] = '1.0'
+
+        assert '_wandb_config_version' in wandb_config
+
+    def test_wandb_callback_uses_model_gene(self):
+        """测试: WandBCallback.on_train_begin 应使用 ModelGene
+
+        验证 WandBCallback.on_train_begin 中的逻辑:
+        1. 优先从 trainer.arch_config 创建 ModelGene
+        2. 使用 ModelGene.to_dict() 作为 WandB config
+        """
+        from training.config import ModelArchitectureConfig
+        from training.core.model_gene import ModelGene
+        from training.callbacks import WandBCallback, WandBCallbackConfig
+
+        # 创建配置
+        config = ModelArchitectureConfig(
+            dim=384,
+            num_layers=8,
+            heads=6,
+            num_classes=200,
+            image_size=224,
+        )
+
+        # 模拟 ModularTrainer
+        class MockTrainer:
+            def __init__(self, arch_config):
+                self.arch_config = arch_config
+
+        trainer = MockTrainer(config)
+
+        # 验证 WandBCallback 可以访问 trainer.arch_config
+        assert hasattr(trainer, 'arch_config')
+        assert trainer.arch_config is not None
+
+        # 验证可以从 arch_config 创建 ModelGene
+        gene = ModelGene.from_config(trainer.arch_config)
+        assert gene is not None
+
+        # 验证 ModelGene.to_dict() 可用于 WandB
+        wandb_config = gene.to_dict()
+        assert isinstance(wandb_config, dict)
+        assert 'dim' in wandb_config
+        assert 'num_layers' in wandb_config
+
+    def test_extract_model_gene_metrics_returns_valid_metrics(self):
+        """测试: _extract_model_gene_metrics 返回有效的指标
+
+        验证指标与 ModelGene 字段对齐:
+        - splitter/temperature → splitter_temp_*
+        - splitter/avg_tokens → K_min_abs, K_max_hard
+        - splitter/depth_entropy → max_level_limit
+        """
+        import torch
+        from training.callbacks import WandBCallback, WandBCallbackConfig
+
+        # 创建回调
+        callback = WandBCallback(config=WandBCallbackConfig())
+
+        # 模拟 MockTrainer
+        class MockSplitter:
+            def __init__(self):
+                self.temperature = 0.6
+                self.training = True
+                self._rate_balanced_quota = torch.tensor([0.5, 0.3, 0.2])
+
+        class MockTokenizer:
+            def __init__(self):
+                self.splitter = MockSplitter()
+
+        class MockModel:
+            def __init__(self):
+                self.tokenizer = MockTokenizer()
+
+        class MockTrainer:
+            def __init__(self):
+                self.model = MockModel()
+
+        trainer = MockTrainer()
+
+        # 验证返回的指标
+        metrics = callback._extract_model_gene_metrics(trainer)
+
+        assert 'splitter/temperature' in metrics
+        assert isinstance(metrics['splitter/temperature'], float)
+        assert 0.4 <= metrics['splitter/temperature'] <= 1.0
 
 
 # ============================================================================

@@ -61,8 +61,7 @@ def test_next_gen_fractal_vit_forward_pass(device: str) -> None:
         num_layers=2,
         heads=4,
         mlp_dim=384,
-        min_patch_size=(4, 4),  # 使用 2 的幂次
-        max_level=3,
+        min_patch_size=4,
     ).to(device)
     model.eval()
 
@@ -86,8 +85,7 @@ def test_next_gen_fractal_vit_handles_varied_sizes(device: str) -> None:
             num_layers=2,
             heads=2,
             mlp_dim=256,
-            min_patch_size=(4, 4),  # 使用 2 的幂次
-            max_level=3,
+            min_patch_size=4,
         ).to(device)
         model.eval()
 
@@ -123,8 +121,10 @@ def test_streaming_v3_tokenizer_device_consistency(device: str) -> None:
         hidden_dim=32,
         intermediate_dim=32,
         pool_size=4,
-        K_min=4,
-        K_max=16,
+        # I113-2: 使用 coverage_min/coverage_max_hard 替代 K_min/K_max
+        # K 值由覆盖率 × 候选数动态计算
+        coverage_min=0.02,
+        coverage_max_hard=0.25,
     )
     splitter = GumbelTopKSplitter(
         config=splitter_config,
@@ -221,8 +221,7 @@ def test_batch_consistency(vectorization_audit_enabled) -> None:
         num_layers=2,
         heads=4,
         mlp_dim=256,
-        min_patch_size=(4, 4),
-        max_level=3,
+        min_patch_size=4,
     )
     model.eval()
 

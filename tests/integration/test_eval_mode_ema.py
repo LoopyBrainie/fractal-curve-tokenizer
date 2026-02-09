@@ -168,10 +168,12 @@ class TestBatchStability:
             logits = stats.logits if hasattr(stats, 'logits') else stats
 
         assert logits.shape == (1, 1000)
-        # I139: num_tokens 现在可能是 int 或 List[int]
+        # I139: num_tokens 现在可能是 int, List[int], 或 Tensor
         if hasattr(stats, 'num_tokens'):
-            if isinstance(stats.num_tokens, list):
+            if isinstance(stats.num_tokens, (list, tuple)):
                 assert len(stats.num_tokens) == 1  # batch size = 1
+            elif isinstance(stats.num_tokens, torch.Tensor):
+                assert stats.num_tokens.numel() == 1  # batch size = 1, scalar tensor
             else:
                 assert isinstance(stats.num_tokens, int)
 

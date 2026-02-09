@@ -17,7 +17,7 @@ def _create_pipeline():
         image_size=64,
         d_model=128,
         base_patch_size=4,
-        max_level=3,
+        # max_level 由 image_size 和 min_patch_size 动态计算
     )
 
     splitter_config = SplitterConfig(
@@ -27,8 +27,9 @@ def _create_pipeline():
         hidden_dim=64,
         intermediate_dim=64,
         pool_size=4,
-        K_min=8,
-        K_max=32,
+        # I113-2: 使用 coverage_min/coverage_max_hard 替代 K_min/K_max
+        coverage_min=0.02,
+        coverage_max_hard=0.25,
     )
     splitter = GumbelTopKSplitter(
         config=splitter_config,

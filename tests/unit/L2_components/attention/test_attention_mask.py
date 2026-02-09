@@ -31,7 +31,8 @@ class TestAttentionMaskEffectiveness:
             heads=4,
             mlp_dim=128,
             min_patch_size=(4, 4),
-            dropout=0.0,  # 禁用 dropout 确保确定性
+            tokenizer_dropout=0.0,  # 禁用 tokenizer dropout 确保确定性
+            transformer_dropout=0.0,  # 禁用 transformer dropout
         )
 
     def test_deterministic_output(self, model):

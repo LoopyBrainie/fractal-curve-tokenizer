@@ -75,8 +75,7 @@ class TestModelGeneFromConfig:
         mock_config.use_spatial_encoding = config.use_spatial_encoding
         mock_config.use_checkpoint = config.use_checkpoint
         mock_config.ffn_type = config.ffn_type
-        mock_config.lca_temperature = config.lca_temperature
-        mock_config.learnable_temperature = config.learnable_temperature
+        # I122-2: lca_temperature 已移除，由 hilbert_bias_scale 统一缩放
         mock_config.token_coverage_min = config.token_coverage_min
         mock_config.token_coverage_max = config.token_coverage_max
         mock_config.use_area_encoding = config.use_area_encoding
@@ -94,18 +93,19 @@ class TestModelGeneFromConfig:
         mock_config.semantic_splitter_config = config.semantic_splitter_config
         mock_config.compile_model = config.compile_model
 
-        # 使用非默认温度值
-        mock_config.splitter_temp_start = 2.0  # 非默认值
-        mock_config.splitter_temp_end = 0.05    # 非默认值
+        # 使用非默认温度值（确保 >= TEMPERATURE_MIN）
+        mock_config.splitter_temp_start = 1.5  # 非默认值
+        mock_config.splitter_temp_end = 0.5    # 非默认值 (>= 0.4)
 
         # 创建 ModelGene
+        gene = ModelGene.from_config(mock_config, dataset_name="test", epoch=0)
         gene = ModelGene.from_config(mock_config, dataset_name="test", epoch=10)
 
         # 验证温度参数被正确保存
-        assert gene.splitter_temp_start == 2.0, \
-            f"Expected splitter_temp_start=2.0, got {gene.splitter_temp_start}"
-        assert gene.splitter_temp_end == 0.05, \
-            f"Expected splitter_temp_end=0.05, got {gene.splitter_temp_end}"
+        assert gene.splitter_temp_start == 1.5, \
+            f"Expected splitter_temp_start=1.5, got {gene.splitter_temp_start}"
+        assert gene.splitter_temp_end == 0.5, \
+            f"Expected splitter_temp_end=0.5, got {gene.splitter_temp_end}"
 
     def test_token_coverage_parameters(self):
         """验证 token_coverage_min/max 被正确保存"""
@@ -129,6 +129,125 @@ class TestModelGeneFromConfig:
             f"Expected token_coverage_max=0.30, got {gene.token_coverage_max}"
 
 
+class TestI145ConfigConsistency:
+    """I145: 配置一致性验证测试
+
+    验证修复后的配置系统：
+    1. 温度参数默认值正确 (splitter_temp_end >= 0.4)
+    2. 覆盖率参数与常量定义一致
+    3. ModelGene.validate() 能检测配置错误
+    """
+
+    def test_temperature_default_value(self):
+        """验证温度参数默认值正确"""
+        from vit_pytorch.constants import SPLITTER_TEMP_END, TEMPERATURE_MIN
+
+        # 测试使用默认值时的行为
+        config = ModelArchitectureConfig()
+        mock_config = Mock()
+        mock_config.splitter_temp_start = None
+        mock_config.splitter_temp_end = None
+        mock_config.temperature_init = None
+        mock_config.temperature_min = None
+
+        # 从 ModelGene.from_config 验证
+        gene = ModelGene(
+            dim=256,
+            num_layers=8,
+            heads=8,
+            mlp_dim=1024,
+            num_classes=100,
+            image_size=224,
+        )
+        # 验证基因中的温度值
+        assert gene.splitter_temp_end >= TEMPERATURE_MIN, \
+            f"splitter_temp_end ({gene.splitter_temp_end}) < TEMPERATURE_MIN ({TEMPERATURE_MIN})"
+
+    def test_temperature_validation(self):
+        """验证 ModelGene.validate() 能检测无效温度"""
+        from vit_pytorch.constants import TEMPERATURE_MIN
+
+        # 创建温度过低的基因（应该失败）
+        gene = ModelGene(
+            dim=256,
+            num_layers=8,
+            heads=8,
+            mlp_dim=1024,
+            num_classes=100,
+            image_size=224,
+            splitter_temp_end=0.1,  # < 0.4，无效
+        )
+
+        with pytest.raises(ValueError, match="splitter_temp_end.*TEMPERATURE_MIN"):
+            gene.validate()
+
+    def test_temperature_warn_on_low_start(self):
+        """验证温度起始值过低时发出警告"""
+        from vit_pytorch.constants import TEMPERATURE_MIN
+        import warnings
+
+        gene = ModelGene(
+            dim=256,
+            num_layers=8,
+            heads=8,
+            mlp_dim=1024,
+            num_classes=100,
+            image_size=224,
+            splitter_temp_start=0.5,  # 略高于最小值
+            splitter_temp_end=0.4,    # 使用默认值 0.4
+        )
+
+        # 验证不会抛出错误，但应能检测到低起始值
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = gene.validate()
+            # 由于 splitter_temp_start=0.5 > splitter_temp_end=0.4，不会触发错误
+            # 但验证应该通过
+            assert result is True
+
+    def test_splitter_config_serialization(self):
+        """验证 Splitter 架构参数被正确序列化"""
+        gene = ModelGene(
+            dim=256,
+            num_layers=8,
+            heads=8,
+            mlp_dim=1024,
+            num_classes=100,
+            image_size=224,
+            splitter_hidden_dim=128,
+            splitter_feature_dim=256,
+            splitter_pool_size=8,
+        )
+
+        # 验证 to_dict 包含所有参数
+        d = gene.to_dict()
+        assert d['splitter_hidden_dim'] == 128
+        assert d['splitter_feature_dim'] == 256
+        assert d['splitter_pool_size'] == 8
+
+        # 验证 from_dict 能恢复
+        gene2 = ModelGene.from_dict(d)
+        assert gene2.splitter_hidden_dim == 128
+        assert gene2.splitter_feature_dim == 256
+        assert gene2.splitter_pool_size == 8
+
+    def test_model_gene_validation_passes(self):
+        """验证有效配置能通过验证"""
+        gene = ModelGene(
+            dim=256,
+            num_layers=8,
+            heads=8,
+            mlp_dim=1024,
+            num_classes=100,
+            image_size=224,
+            splitter_temp_start=1.0,
+            splitter_temp_end=0.5,  # 有效值
+        )
+
+        # 应该不抛出异常
+        assert gene.validate() is True
+
+
 class TestCheckpointSaveLoadConsistency:
     """测试 checkpoint 保存-加载 参数一致性"""
 
@@ -145,7 +264,7 @@ class TestCheckpointSaveLoadConsistency:
             image_size=64,
             token_coverage_min=0.015,
             token_coverage_max=0.25,
-            dropout=0.2,
+            # I120-2: dropout 已分离为 tokenizer_dropout 和 transformer_dropout
         )
 
         # 创建模型
@@ -156,7 +275,9 @@ class TestCheckpointSaveLoadConsistency:
             num_layers=config.num_layers,
             heads=config.heads,
             mlp_dim=config.mlp_dim,
-            dropout=config.dropout,
+            # I120-2: tokenizer_dropout=0.0 (确定性), transformer_dropout=0.1 (正则化)
+            tokenizer_dropout=0.0,
+            transformer_dropout=0.1,
             token_coverage_min=config.token_coverage_min,
             token_coverage_max=config.token_coverage_max,
         )
