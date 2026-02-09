@@ -127,11 +127,11 @@ class FractalTransformerBlock(nn.Module):
         max_level: Maximum hierarchical level (P11-2: should match tokenizer.max_level).
         drop_path: DropPath rate for stochastic depth.
         ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
-        lca_temperature: (P6-2) LCA bias temperature, default 1.5.
-        learnable_temperature: (P6-2) Whether temperature is learnable.
         use_affine_modulation: (向后兼容) 是否使用仿射调制偏置。
         fourier_levels: (向后兼容) 傅里叶频率级别数。
         encoder_config: (I98-3) AttentionEncoderConfig，协议驱动配置。
+
+    I122-2: 移除 lca_temperature，由 hilbert_bias_scale × √d_k 统一缩放
     """
 
     def __init__(
@@ -144,8 +144,6 @@ class FractalTransformerBlock(nn.Module):
         max_level: int = 8,  # P11-2: 默认改为 8，应由上层传入实际 max_level
         drop_path: float = 0.0,
         ffn_type: FFNType = 'swiglu_level',
-        lca_temperature: Optional[float] = 1.5,
-        learnable_temperature: bool = True,
         use_affine_modulation: bool = True,  # A17: 启用 ShapeScaleEncoder
         fourier_levels: int = 4,
         encoder_config: Optional["AttentionEncoderConfig"] = None,  # I98-3
@@ -162,8 +160,6 @@ class FractalTransformerBlock(nn.Module):
             dim_head=dim_head,
             dropout=dropout,
             max_level=max_level,
-            lca_temperature=lca_temperature,
-            learnable_temperature=learnable_temperature,
             use_affine_modulation=use_affine_modulation,
             fourier_levels=fourier_levels,
             encoder_config=encoder_config,
@@ -298,6 +294,8 @@ class FractalTransformer(nn.Module):
 
     I98-3: 新增 encoder_config 参数，支持协议驱动的编码器配置。
 
+    I122-2: 移除 lca_temperature，由 hilbert_bias_scale × √d_k 统一缩放
+
     Args:
         dim: Input/output dimension.
         num_layers: Number of transformer blocks.
@@ -309,8 +307,6 @@ class FractalTransformer(nn.Module):
         drop_path_rate: Maximum DropPath rate (linearly increased).
         ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
         use_checkpoint: Whether to use gradient checkpointing (saves memory).
-        lca_temperature: (P6-2) LCA bias temperature, default 1.5.
-        learnable_temperature: (P6-2) Whether temperature is learnable.
         use_affine_modulation: (向后兼容) 是否使用仿射调制偏置。
         fourier_levels: (向后兼容) 傅里叶频率级别数。
         encoder_config: (I98-3) AttentionEncoderConfig，协议驱动配置。
@@ -328,8 +324,6 @@ class FractalTransformer(nn.Module):
         drop_path_rate: float = 0.1,
         ffn_type: FFNType = 'swiglu_level',
         use_checkpoint: bool = False,
-        lca_temperature: Optional[float] = 1.5,
-        learnable_temperature: bool = True,
         use_affine_modulation: bool = True,  # A17: 启用 ShapeScaleEncoder
         fourier_levels: int = 4,
         encoder_config: Optional[AttentionEncoderConfig] = None,  # I98-3
@@ -343,8 +337,10 @@ class FractalTransformer(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.use_fp16 = use_fp16  # I104-3
 
-        # Stochastic depth decay rule
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        # Stochastic depth decay rule (I147: 移除 .item() 避免 GPU 同步)
+        # 使用 numpy 实现向量化，避免 torch.compile 优化路径中的 CPU 同步
+        import numpy as np
+        dpr = np.linspace(0, drop_path_rate, depth).tolist()
 
         self.layers = nn.ModuleList(
             [
@@ -357,8 +353,6 @@ class FractalTransformer(nn.Module):
                     max_level=max_level,
                     drop_path=dpr[i],
                     ffn_type=ffn_type,
-                    lca_temperature=lca_temperature,
-                    learnable_temperature=learnable_temperature,
                     use_affine_modulation=use_affine_modulation,
                     fourier_levels=fourier_levels,
                     encoder_config=encoder_config,  # I98-3

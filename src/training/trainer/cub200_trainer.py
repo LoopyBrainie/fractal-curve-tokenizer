@@ -44,7 +44,11 @@ from ..losses.finegrained import FinegrainedLoss, FinegrainedLossConfig
 from ..config import ModelArchitectureConfig  # I36: 统一架构配置
 from ..core.checkpoint import save_checkpoint_with_gene  # ModelGene 自包含 checkpoint
 from vit_pytorch import FractalCurveViT  # I36: 模型创建
-from vit_pytorch.constants import SPLITTER_TEMP_END, TEMPERATURE_MIN  # I113-10: 温度常量
+from vit_pytorch.constants import (
+    SPLITTER_TEMP_END, TEMPERATURE_MIN,  # I113-10: 温度常量
+    GRAD_CLIP_BASE_LR, GRAD_CLIP_BASE_NORM,  # I121-6: 动态梯度裁剪
+    GRAD_CLIP_MIN_NORM, GRAD_CLIP_MAX_NORM,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -285,8 +289,8 @@ class CUB200TrainingConfig:
     # 基础训练配置
     batch_size: int = 64
     num_epochs: int = 100
-    learning_rate: float = 2.7e-4
-    warmup_epochs: int = 7
+    learning_rate: float = 3e-4  # I121-6: 2.7e-4 → 3e-4 (+11% 提升收敛速度)
+    warmup_epochs: int = 5  # I121-6: 7 → 5 (-29% 缩短warmup)
     accum_steps: int = 3
     validate_interval: int = 3  # 每 N 个 epoch 验证一次
 
@@ -305,8 +309,8 @@ class CUB200TrainingConfig:
 
     # 正则化（比通用分类更强）
     label_smoothing: float = 0.13  # 0.1 × (1 + log₁₀(200/100))
-    dropout: float = 0.22
-    drop_path_rate: float = 0.16  # 统一命名: drop_path → drop_path_rate
+    dropout: float = 0.15  # I121-6: 0.22 → 0.15 (-32% 减弱正则化)
+    drop_path_rate: float = 0.10  # I121-6: 0.16 → 0.10 (-38% 减弱正则化)
     weight_decay: float = 0.15
 
     # Mixup/CutMix 数据增强
@@ -339,19 +343,28 @@ class CUB200TrainingConfig:
     # 训练器从 model.splitter.config 读取温度配置
 
     # M1: 辅助损失权重 (I36)
-    splitter_sparsity_weight: float = 0.01  # 稀疏性损失权重
-    elastic_budget_weight: float = 0.01     # 弹性预算损失权重
+    # I121-6: 权重提升以解决配置链路覆盖问题
+    # 有效权重 = config值 × splitter内部因子(0.1)
+    # 目标有效权重: sparsity=0.03, elastic=0.005
+    splitter_sparsity_weight: float = 0.3  # 0.01 → 0.30 (30x提升)
+    elastic_budget_weight: float = 0.05     # 0.01 → 0.05 (5x提升)
     depth_kl_weight: float = 0.5            # 深度KL散度损失权重
 
     # =========================================================================
     # I36: 模型架构配置 (使用 ModelArchitectureConfig)
     # =========================================================================
     # 架构参数统一通过 arch_config 指定，确保与 ModelArchitectureConfig 一致
+    # I121-7: 模型容量扩展 (16GB 显存约束下的最优配置)
+    # - dim: 384 → 448 (+17%) 增强单层表达能力
+    # - num_layers: 8 → 10 (+25%) 增强层级特征提取
+    # - heads: 6 → 7 (+17%) 增强多头注意力覆盖
+    # - 预期参数量: 24M → ~35M
+    # - 预期显存: ~12GB → ~14GB
     arch_config: ModelArchitectureConfig = field(default_factory=lambda: ModelArchitectureConfig(
         num_classes=200,
-        dim=384,
-        num_layers=8,
-        heads=6,
+        dim=448,
+        num_layers=10,
+        heads=7,
         image_size=None,  # I78: 动态分辨率
         min_patch_size=4,
     ))
@@ -360,7 +373,8 @@ class CUB200TrainingConfig:
     # I99: 训练策略参数（补充 arch_config 中未包含的字段）
     # =========================================================================
     # 注意: learning_rate 是训练超参数，不在 arch_config 中定义
-    learning_rate: float = 2.7e-4  # 主模型学习率
+    # I121-6: 2.7e-4 → 3e-4 (+11% 提升收敛速度)
+    learning_rate: float = 3e-4  # 主模型学习率
     use_checkpoint: bool = False
     use_channels_last: bool = False  # I78: channels-last 内存格式 (节省 ~20% VRAM)
     use_compile: bool = False        # I78: torch.compile 优化 (提升 ~30% 训练速度)
@@ -811,6 +825,33 @@ class CUB200Trainer:
             return self.config.learning_rate * warmup_factor
         return self.config.learning_rate
 
+    def _get_dynamic_clip_norm(self) -> float:
+        """I121-6: 动态计算梯度裁剪范数
+
+        数学公式:
+            clip_norm = GRAD_CLIP_BASE_NORM × (current_lr / GRAD_CLIP_BASE_LR)
+
+        原理:
+            - 梯度范数与学习率成正比: ||∇L|| ∝ lr
+            - 学习率增加时，梯度范数按比例增加
+            - 动态调整确保训练稳定性
+
+        Returns:
+            动态裁剪范数 (已限制在 [GRAD_CLIP_MIN_NORM, GRAD_CLIP_MAX_NORM] 范围内)
+        """
+        if not hasattr(self, 'optimizer') or self.optimizer is None:
+            return self.config.gradient_clip_norm or GRAD_CLIP_BASE_NORM
+
+        current_lr = self.optimizer.param_groups[0]['lr']
+
+        # 计算动态裁剪范数
+        clip_norm = GRAD_CLIP_BASE_NORM * (current_lr / GRAD_CLIP_BASE_LR)
+
+        # 限制在合理范围内
+        clip_norm = max(GRAD_CLIP_MIN_NORM, min(GRAD_CLIP_MAX_NORM, clip_norm))
+
+        return clip_norm
+
     def compute_loss(
         self,
         logits: torch.Tensor,
@@ -898,12 +939,13 @@ class CUB200Trainer:
 
             # 梯度累积步数检查
             if (batch_idx + 1) % accum_steps == 0:
-                # 梯度裁剪
+                # I121-6: 动态梯度裁剪
                 if self.config.gradient_clip_norm is not None:
                     self.scaler.unscale_(optimizer)
+                    dynamic_clip_norm = self._get_dynamic_clip_norm()
                     grad_norm_curr = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
-                        self.config.gradient_clip_norm
+                        dynamic_clip_norm
                     )
                     grad_norm = grad_norm_curr.item()
 

@@ -99,9 +99,10 @@ class ModelArchitectureConfig:
     # P6-1: 深度缩放参数 (从 FractalViTConfig 迁移)
     depth_scale_range: Optional[tuple] = None  # (σ_min, σ_max)，默认 (0.5, 2.0)
 
-    # P6-2: LCA 温度参数 (从 FractalViTConfig 迁移)
-    lca_temperature: Optional[float] = 1.5  # LCA 偏置温度，默认 1.5
-    learnable_temperature: bool = True  # 是否可学习温度，默认 True
+    # I122-2: lca_temperature 已移除，由 hilbert_bias_scale × √d_k 统一缩放
+    # P6-2: LCA 温度参数 (已移除)
+    # lca_temperature: Optional[float] = 1.5  # LCA 偏置温度，默认 1.5
+    # learnable_temperature: bool = True  # 是否可学习温度，默认 True
 
     # I27: 子模块 Dropout 配置
     splitter_dropout: Optional[float] = None  # None = 自动 = min(dropout, 0.15)
@@ -138,9 +139,11 @@ class ModelArchitectureConfig:
 
     # 模型 dropout 配置 (I145: 修复配置对齐问题)
     # 注意: 这些默认值应该与 train_fractal_vit.py 中的 argparse 默认值一致
-    dropout: float = 0.25  # 主 dropout 概率 (与 args --dropout 一致)
-    emb_dropout: float = 0.15  # 嵌入层 dropout (与 args --emb-dropout 一致)
-    drop_path_rate: float = 0.25  # 路径 dropout (与 args --drop-path 一致)
+    # I148: dropout 对应 transformer_dropout，emb_dropout 对应 emb-dropout
+    # 2026-02-07: 更新 emb_dropout=0.0，与 argparse --emb-dropout 默认值一致
+    dropout: float = 0.1  # 主 dropout 概率 (与 args --transformer-dropout 一致)
+    emb_dropout: float = 0.0  # 嵌入层 dropout (与 args --emb-dropout 一致)
+    drop_path_rate: float = 0.25  # 路径 dropout (与 train_fractal_vit.py --drop-path 一致)
 
     def __post_init__(self):
         """参数验证 - 数学约束"""

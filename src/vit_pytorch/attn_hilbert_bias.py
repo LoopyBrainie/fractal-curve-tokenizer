@@ -156,71 +156,58 @@ class HilbertBiasBase(ABC, nn.Module):
 
 class LCAHilbertBias(HilbertBiasBase):
     """基于最近公共祖先 (LCA) 的 Hilbert Bias 实现。
-    
+
+    I122-2 简化: 移除 τ_h 温度参数
+    ===================================
+    原设计使用 τ_h 缩放 LCA 偏置: B'[h,i,j] = τ_h · B[h,i,j]
+    问题: λ × √d_k 可学习缩放已可吸收 τ_h 的效果 → 参数冗余
+
+    简化后设计:
+        B[i,j] = LCAEmbed(LCA(i,j))
+
+    偏置强度由 hilbert_bias_scale × √d_k 统一控制 (见 attention 方法)
+
     数学原理
     ========
     利用四叉树编码的核心性质: LCA 深度直接编码空间距离。
-    
+
     定理 (LCA-距离等价性):
         对于四叉树编码的两个 token i, j:
         LCA(i, j) = ℓ  ⟹  ‖pos_i - pos_j‖_∞ ≤ N / 2^ℓ
-        
+
     其中 N 是网格边长，ℓ 是 LCA 深度。
-    
-    偏置公式:
-        B[i,j] = τ_h · LCAEmbed(LCA(i,j))
-        
-    其中 LCAEmbed: {0,1,...,D} → R^H 是可学习的嵌入表，
-    τ_h 是 per-head 可学习温度参数。
-    
+
     P11-3 修复: 从 regions 直接计算路径
     ===================================
     问题: 原始设计中 levels_info 的路径部分全为 0，导致 LCA 失效。
-    
+
     根本原因:
         - TensorSplitResult 只存储 hilbert_indices 和 regions，不存储路径
         - 代码注释声称 "path 可从 hilbert_idx 恢复" 是数学错误
         - Hilbert index XOR ≠ Quadtree LCA (验证仅 56% 一致性)
-    
+
     解决方案:
         添加 forward_from_regions() 方法，从 regions 向量化计算真实四叉树路径，
         然后计算正确的 LCA 深度矩阵。
-    
-    P6-2 改进: 可学习温度参数
-    =========================
-    问题: 原始 LCA 偏置范围 [0, 1]，相对 attention logit (σ≈1) 可能偏弱。
-    
-    解决方案: 引入 per-head 可学习温度 τ_h:
-        B'[h,i,j] = τ_h · LCAEmbed(LCA(i,j))
-    
-    数学分析:
-    - 信噪比: SNR = τ · ΔB / σ_logit = τ (当 ΔB=1, σ≈1)
-    - 默认 τ=1.5 提供 1.5σ 的空间先验，对应 e^1.5 ≈ 4.5x 注意力偏好
-    - 使用 softplus 确保 τ > 0: τ_h = softplus(γ_h)
-    - 初始化 γ_h = log(e^1.5 - 1) ≈ 1.176 使 τ_h ≈ 1.5
-    
+
     复杂度分析
     ==========
-    - 参数量: O((D+1) × H + H) ≈ 128 + 8 (vs Low-Rank ~50K)
-    - 计算量: O(N² × D) 用于 LCA 计算 (P1-6: 支持缓存避免重复计算)
+    - 参数量: O((D+1) × H) ≈ 128 (vs Low-Rank ~50K)
+    - 计算量: O(N² × D) 用于 LCA 计算
     - 显存: O(N²) 用于偏置矩阵
-    
+
     优势
     ====
     1. 显式几何意义: LCA 深度 ⟺ 空间距离
     2. 参数极少: ~100× 少于 Low-Rank
     3. 无需学习距离: 距离信息由编码结构直接提供
     4. 可解释性强: 偏置值可直接对应空间邻近程度
-    5. [P6-2] 自适应强度: 每个 head 可学习最优的空间偏好强度
-    6. [P11-3] 语义正确: 从 regions 直接计算真实四叉树 LCA
     """
-    
+
     def __init__(
         self,
         max_level: int,
         heads: int,
-        lca_temperature: Optional[float] = 1.5,
-        learnable_temperature: bool = True,
         use_fp16: bool = False,  # I104-3: FP16 存储选项
     ) -> None:
         """初始化 LCA Hilbert Bias。
@@ -228,15 +215,11 @@ class LCAHilbertBias(HilbertBiasBase):
         Args:
             max_level: 最大四叉树深度 (决定 LCA 取值范围)
             heads: 注意力头数
-            lca_temperature: LCA 偏置温度参数初始值
-                - None: 不使用温度缩放 (兼容旧版，等效 τ=1)
-                - float: 温度初始值，推荐 1.5
-            learnable_temperature: 是否使温度可学习
-                - True: per-head 可学习温度 (推荐)
-                - False: 固定温度值
             use_fp16: (I104-3) 是否使用 FP16 存储 LCA embedding
                 - True: 内存节省 50%，精度损失可忽略
                 - False: 使用 FP32 (默认)
+
+        I122-2: 移除 τ_h 温度参数，由 hilbert_bias_scale × √d_k 统一缩放
         """
         super().__init__()
         self.max_level = max_level
@@ -260,92 +243,31 @@ class LCAHilbertBias(HilbertBiasBase):
             self.lca_embedding.weight.register_hook(
                 lambda grad: grad.clamp(min=-GRAD_CLAMP_BOUND, max=GRAD_CLAMP_BOUND)
             )
-        
-        # P6-2: 可学习温度参数
-        # 数学: τ_h = softplus(γ_h), 初始化使 τ_h ≈ lca_temperature
-        self._lca_temperature_init = lca_temperature
-        self._learnable_temperature = learnable_temperature
-        self._init_temperature(lca_temperature, learnable_temperature)
 
-        # 初始化: 深度越大（越邻近）偏置越高
-        # 使用对数衰减初始化，符合 Hilbert 曲线的 √ 局部性
+        # I122-2: 移除温度参数初始化，由 hilbert_bias_scale 统一缩放
         self._init_weights()
-    
-    def _init_temperature(
-        self,
-        lca_temperature: Optional[float],
-        learnable: bool
-    ) -> None:
-        """初始化温度参数。
 
-        I102-1 改进: 使用 log-space 参数化替代 softplus 逆变换
-
-        数学分析:
-        - 原始设计: γ = softplus^{-1}(τ) = log(exp(τ) - 1)
-          问题: τ → 0 时 log(0) → -inf，数值不稳定
-        - 新设计: τ = softplus(γ)，γ ∈ ℝ 直接参数化
-          优点: 只需正向 softplus 计算，天然数值稳定
-
-        参数化原则:
-        - 直接参数化目标空间，避免逆变换
-        - log-space 参数直觉性强: γ = log(τ) 近似
-        - softplus 正向约束保证正值，无溢出风险
-
-        Args:
-            lca_temperature: 目标温度值，None 表示禁用
-            learnable: 是否可学习
-        """
-        if lca_temperature is None:
-            # 禁用模式: 无温度缩放
-            self._lca_temp_gamma: Optional[nn.Parameter] = None
-            self.register_buffer('_lca_temp_fixed', None)
-        elif learnable:
-            # 可学习模式: per-head 温度
-            # I102-1: 使用 log-space 参数化，数值稳定
-            # 初始化: γ_init = log(τ_init + ε)，τ = softplus(γ)
-            # 对于 τ_init >> 1e-8，有 γ_init ≈ log(τ_init)
-            init_gamma = math.log(lca_temperature + EPS)
-            self._lca_temp_gamma = nn.Parameter(
-                torch.full((self.heads,), init_gamma)
-            )
-            self.register_buffer('_lca_temp_fixed', None)
-        else:
-            # 固定模式
-            self._lca_temp_gamma = None
-            self.register_buffer('_lca_temp_fixed',
-                torch.full((self.heads,), lca_temperature))
-    
-    @property
-    def lca_temperature(self) -> Optional[torch.Tensor]:
-        """获取当前 LCA 温度值。
-
-        Returns:
-            (H,) 温度向量，若禁用则返回 None
-        """
-        if self._lca_temp_gamma is not None:
-            # 可学习: softplus 正向变换，数值稳定
-            return F.softplus(self._lca_temp_gamma)
-        elif self._lca_temp_fixed is not None:
-            return self._lca_temp_fixed
-        else:
-            return None
-    
     def _init_weights(self) -> None:
         """初始化 LCA 嵌入权重。
 
-        采用对数衰减初始化:
-            embed[d] ∝ log(1 + d) / log(1 + max_level)
+        采用线性初始化 (I121-8 修复):
+            embed[d] ∝ d / max_level
+
+        数学依据:
+            Hilbert 曲线性质: 相邻 index 的空间距离 ∝ |i - j| / 2^L (线性)
+            原对数初始化 log(1+d) 与 Hilbert 局部性不匹配:
+                - 深度 0→4: 线性期望 16x，log 仅 1.6x
+            线性初始化使深度差异更显著，符合 Hilbert 空间局部性保证。
 
         这样深层 (邻近) token 获得更高的初始偏置。
         """
         with torch.no_grad():
             depths = torch.arange(self.max_level + 1, dtype=torch.float32)
-            # 归一化对数深度: [0, 1]
-            log_depths = torch.log1p(depths) / torch.log1p(
-                torch.tensor(float(self.max_level))
-            )
+            # I121-8 修复: 线性归一化深度: [0, 1]
+            # Hilbert 局部性是线性的，而非对数的
+            linear_depths = depths / self.max_level
             # 广播到所有 heads，加小随机扰动
-            init_values = log_depths.unsqueeze(1).expand(-1, self.heads)
+            init_values = linear_depths.unsqueeze(1).expand(-1, self.heads)
             self.lca_embedding.weight.copy_(init_values)
             # I98-3: 添加小随机扰动以打破对称性
             # 使用常量 EMBEDDING_INIT_STD 而非硬编码 0.02
@@ -411,13 +333,14 @@ class LCAHilbertBias(HilbertBiasBase):
 
         # I34-13: LCA 钳位改为异常 - 静默钳位掩盖计算 bug
         # I102-5: 使用张量比较避免 GPU-CPU 同步
+        # I147: 修复变量遮蔽，使用 actual_max 避免遮蔽 self.max_level
         lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_level).any()
         if lca_invalid:
             min_depth = lca_depths.min().item()
-            max_level = lca_depths.max().item()
+            actual_max = lca_depths.max().item()  # 重命名避免遮蔽 self.max_level
             raise ValueError(
                 f"LCA depth out of bounds [0, {self.max_level}]: "
-                f"min={min_depth:.2f}, max={max_level:.2f}. "
+                f"min={min_depth:.2f}, max={actual_max:.2f}. "
                 "This indicates a bug in LCA computation."
             )
 
@@ -431,13 +354,7 @@ class LCAHilbertBias(HilbertBiasBase):
         padding_2d = padding_2d.unsqueeze(-1)  # [B, S, S, 1] for broadcasting with H
         bias = bias.masked_fill(padding_2d, 0.0)
 
-        # P6-2: 应用温度缩放
-        # 数学: B'[h,i,j] = τ_h · B[h,i,j]
-        temperature = self.lca_temperature
-        if temperature is not None:
-            # temperature: (H,) -> (1, 1, 1, H) for broadcasting
-            temp_scale = temperature.to(bias.device).view(1, 1, 1, -1)
-            bias = bias * temp_scale
+        # I122-2: 移除温度缩放，由 hilbert_bias_scale × √d_k 统一控制
 
         # 调整形状: (B, H, S, S)
         return bias.permute(0, 3, 1, 2)
@@ -502,13 +419,9 @@ class LCAHilbertBias(HilbertBiasBase):
         
         # 批量嵌入: (B, N, N, H)
         bias = self.lca_embedding(lca_depths)
-        
-        # P6-2: 应用温度缩放
-        temperature = self.lca_temperature
-        if temperature is not None:
-            temp_scale = temperature.to(bias.device).view(1, 1, 1, -1)
-            bias = bias * temp_scale
-        
+
+        # I122-2: 移除温度缩放，由 hilbert_bias_scale × √d_k 统一控制
+
         # 调整形状: (B, H, S, S)
         bias = bias.permute(0, 3, 1, 2)
         
@@ -550,8 +463,6 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         max_level: int = 8,  # P0 修复: 统一使用 max_level
         use_hilbert_bias: bool = True,
         use_level_scaling: bool = True,
-        lca_temperature: Optional[float] = 1.5,
-        learnable_temperature: bool = True,
         # I31-3: 仿射调制参数 (向后兼容)
         use_affine_modulation: bool = True,
         fourier_levels: int = 4,
@@ -579,6 +490,8 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         I97-10: 新增 use_hierarchical_attention 参数，实现深度内独立 Attention。
         数学形式: Attn(X) = ⊕_d softmax(Q_d K_d^T / √d_k + B_d) V_d
 
+        I122-2: 移除 lca_temperature，由 hilbert_bias_scale × √d_k 统一缩放
+
         Args:
             dim: 输入维度
             heads: 注意力头数
@@ -587,10 +500,6 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             max_level: 最大深度 (P0: 统一使用 max_level，与 tokenizer.max_level 对齐)
             use_hilbert_bias: 是否使用 Hilbert 路径偏置 (使用 LCA 模式)
             use_level_scaling: 是否使用层级缩放
-            lca_temperature: (P6-2) LCA 偏置温度参数，默认 1.5
-                - None: 不使用温度缩放 (兼容模式)
-                - float: 温度初始值
-            learnable_temperature: (P6-2) 是否使温度可学习
             use_affine_modulation: (I31-3) 是否使用仿射调制偏置，默认 True (向后兼容)
             fourier_levels: (I31-3) 傅里叶频率级别数，默认 4 (向后兼容)
             use_hierarchical_attention: (I97-10) 是否使用深度内独立 Attention，默认 False
@@ -634,8 +543,6 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             self.hilbert_bias_impl: Optional[nn.Module] = LCAHilbertBias(
                 max_level=max_level,
                 heads=heads,
-                lca_temperature=lca_temperature,
-                learnable_temperature=learnable_temperature,
                 use_fp16=use_fp16,  # I104-3
             )
         else:

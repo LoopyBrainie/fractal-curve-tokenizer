@@ -55,6 +55,8 @@ class InferenceStats:
     depth_used: int                         # 使用的深度
     depth_distribution: Dict[int, float]    # 深度分布
     features: torch.Tensor                  # [B, dim] 池化特征
+    # I147: 添加 transformer_tokens 字段，与 TrainingStats 保持一致
+    transformer_tokens: Optional[torch.Tensor] = None  # [B, N, dim] Transformer 输出
 
     # 可选字段
     splitter_entropy: float = 0.0
@@ -267,6 +269,9 @@ def wrap_stats(stats: Any, logits: torch.Tensor) -> InferenceStats:
     num_tokens = getattr(stats, 'num_tokens', len(logits))
     depth_distribution = getattr(stats, 'depth_distribution', {})
 
+    # I147: 提取 transformer_tokens 字段
+    transformer_tokens = getattr(stats, 'transformer_tokens', None)
+
     # 构造 InferenceStats
     return InferenceStats(
         logits=logits,
@@ -274,6 +279,7 @@ def wrap_stats(stats: Any, logits: torch.Tensor) -> InferenceStats:
         depth_used=getattr(stats, 'depth_used', 0),
         depth_distribution=depth_distribution if depth_distribution else {},
         features=getattr(stats, 'features', logits.new_zeros(logits.size(0), logits.size(1))),
+        transformer_tokens=transformer_tokens,  # I147: 新增字段
         splitter_entropy=getattr(stats, 'splitter_entropy', 0.0),
         temperature=getattr(stats, 'temperature', 1.0),
         aux_infos=getattr(stats, 'aux_infos', None),

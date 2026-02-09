@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import math
 import warnings
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -236,13 +237,62 @@ class WandBCallback:
             return False
     
     def on_train_begin(self, trainer: 'ModularTrainer', state: 'TrainerState') -> None:
-        """训练开始时初始化 WandB"""
+        """训练开始时初始化 WandB
+
+        三层参数对齐:
+        - Layer 1: ModelArchitectureConfig (trainer.arch_config)
+        - Layer 2: ModelGene.from_config() -> 用于 WandB config
+        - Layer 3: model.state_dict() -> 保存到 checkpoint
+        """
         if not self._init_wandb():
             return
-        
+
         import wandb
-        
-        # 监控模型梯度 (可选)
+
+        # ========== 三层参数对齐: 使用 ModelGene 作为 WandB config ==========
+        wandb_config = None
+
+        # 优先从 trainer.arch_config 创建 ModelGene
+        if hasattr(trainer, 'arch_config') and trainer.arch_config is not None:
+            try:
+                # 延迟导入避免循环依赖
+                from ..core.model_gene import ModelGene
+
+                # 创建 ModelGene（包含完整的三层参数）
+                gene = ModelGene.from_config(
+                    trainer.arch_config,
+                    dataset_name=getattr(trainer, 'dataset_name', None),
+                    epoch=0
+                )
+
+                # 使用 ModelGene.to_dict() 作为 WandB config
+                # 这确保了训练/评估加载/pth.gene保存三者一致
+                wandb_config = gene.to_dict()
+
+                # 记录 wandb_config_version 用于验证
+                wandb_config['_wandb_config_version'] = '1.0'
+                wandb_config['_model_gene_version'] = gene.version
+
+                print(f"[WandB] Using ModelGene for config (version={gene.version})")
+            except Exception as e:
+                warnings.warn(f"[WandB] Failed to create ModelGene: {e}. Using fallback config.")
+                wandb_config = None
+
+        # Fallback: 使用传入的 experiment_config
+        if wandb_config is None and self.experiment_config is not None:
+            if hasattr(self.experiment_config, '__dataclass_fields__'):
+                wandb_config = asdict(self.experiment_config)
+            elif isinstance(self.experiment_config, dict):
+                wandb_config = self.experiment_config.copy()
+
+        # 更新 WandB config
+        if wandb_config is not None and self._run is not None:
+            try:
+                wandb.config.update(wandb_config, allow_val_change=True)
+            except Exception as e:
+                warnings.warn(f"[WandB] Failed to update config: {e}")
+
+        # ========== 监控模型梯度 (可选) ==========
         if self.config.watch_model and self._run is not None:
             try:
                 wandb.watch(
@@ -395,9 +445,99 @@ class WandBCallback:
         
         except Exception:
             pass  # 静默失败，不影响训练
-        
+
         return metrics
-    
+
+    @torch.no_grad()
+    def _extract_model_gene_metrics(self, trainer: 'ModularTrainer') -> Dict[str, float]:
+        """从 Splitter 提取与 ModelGene 配置对齐的指标
+
+        三层参数对齐:
+        - 指标必须能够追溯到 ModelGene 的配置字段
+        - 用于验证训练过程中的自适应行为
+
+        返回指标 (P0 优先级):
+        ┌─────────────────────────────────────┬──────────────────────┬─────────────────────────────┐
+        │ 指标名                              │ 数学形式             │ 对应 ModelGene 字段         │
+        ├─────────────────────────────────────┼──────────────────────┼─────────────────────────────┤
+        │ splitter/temperature               │ τ ∈ [0.4, 1.0]      │ splitter_temp_start/end     │
+        │ splitter/avg_tokens                │ K̄ = (1/B) Σ K_i     │ K_min_abs, K_max_hard      │
+        │ splitter/depth_entropy             │ H_d = -Σ p_d log p_d │ max_level_limit            │
+        │ splitter/quota_entropy             │ H_q = -Σ q_d log q_d │ enable_rate_balanced_quota │
+        │ splitter/k_ratio                  │ K̄ / N ≈ 0.12-0.25   │ token_coverage_*/K_*       │
+        │ splitter/spatial_coverage         │ Σ Area / (H×W)       │ token_coverage_min/max      │
+        └─────────────────────────────────────┴──────────────────────┴─────────────────────────────┘
+        """
+        metrics: Dict[str, float] = {}
+
+        try:
+            model = trainer.model
+
+            # 获取 tokenizer
+            tokenizer = getattr(model, 'tokenizer', None)
+            if tokenizer is None and hasattr(model, 'module'):
+                tokenizer = getattr(model.module, 'tokenizer', None)
+
+            if tokenizer is None:
+                return metrics
+
+            # 获取 splitter
+            splitter = getattr(tokenizer, 'splitter', None)
+            if splitter is None:
+                return metrics
+
+            # 1. 温度监控 (对应 splitter_temp_start/end)
+            if hasattr(splitter, 'temperature') and splitter.temperature is not None:
+                metrics["splitter/temperature"] = float(splitter.temperature)
+
+            # 2. Splitter 诊断 (使用统一的 get_diagnostics() 接口)
+            if hasattr(splitter, 'get_diagnostics'):
+                diag = splitter.get_diagnostics()
+                if diag:
+                    # 2.1 Token 数 (对应 K_min_abs, K_max_hard)
+                    if 'avg_selected' in diag:
+                        metrics["splitter/avg_tokens"] = float(diag['avg_selected'])
+
+                    # 2.2 深度分布熵 (对应 max_level_limit)
+                    if 'depth_distribution' in diag:
+                        depth_dist = diag['depth_distribution']
+                        if isinstance(depth_dist, dict):
+                            probs = list(depth_dist.values())
+                            entropy = -sum(p * math.log(p + 1e-10) for p in probs if p > 0)
+                            metrics["splitter/depth_entropy"] = entropy
+
+                    # 2.3 配额熵 (对应 enable_rate_balanced_quota)
+                    if hasattr(splitter, '_rate_balanced_quota') and splitter._rate_balanced_quota is not None:
+                        quota = splitter._rate_balanced_quota
+                        quota_probs = torch.softmax(quota, dim=0).cpu().tolist()
+                        quota_entropy = -sum(p * math.log(p + 1e-10) for p in quota_probs if p > 0)
+                        metrics["splitter/quota_entropy"] = quota_entropy
+
+            # 3. 性能统计 (用于计算 k_ratio 和 spatial_coverage)
+            if hasattr(splitter, '_last_perf_stats') and splitter._last_perf_stats:
+                stats = splitter._last_perf_stats
+
+                # 3.1 Token 数
+                if 'soft_token_count' in stats:
+                    metrics["splitter/avg_tokens"] = stats['soft_token_count']
+
+                # 3.2 熵 (用于深度分布监控)
+                if 'soft_entropy' in stats:
+                    metrics["splitter/entropy"] = stats['soft_entropy']
+
+                # 3.3 熵比率 (诊断指标)
+                if 'entropy_ratio' in stats:
+                    metrics["splitter/entropy_ratio"] = stats['entropy_ratio']
+
+                # 3.4 预算达成率 (对应 Elastic Budget 配置)
+                if 'budget_ratio' in stats:
+                    metrics["splitter/budget_ratio"] = stats['budget_ratio']
+
+        except Exception:
+            pass  # 静默失败，不影响训练
+
+        return metrics
+
     def _maybe_save_model(self, trainer: 'ModularTrainer', ctx: 'CallbackContext') -> None:
         """根据指标决定是否保存模型"""
         if ctx.metrics is None:

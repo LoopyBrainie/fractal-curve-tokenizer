@@ -49,7 +49,8 @@ from .constants import (
 # ==================== 类型别名 ====================
 
 # 温度退火调度类型
-AnnealSchedule = Literal['linear', 'exponential', 'cosine']
+# I122-7: 移除 'cosine' (无理论依据)，新增 'inverse_time'
+AnnealSchedule = Literal['linear', 'exponential', 'inverse_time']
 # Tokenizer 类型 (I145: 移除废弃的 streaming_v1/streaming_v2)
 TokenizerType = Literal['streaming_v3']
 
@@ -111,7 +112,9 @@ class HilbertSplitterConfig:
     use_dynamic_k: bool = True
 
     # ==================== 正则化参数 ====================
-    dropout: float = 0.1
+    # I120-2: dropout 必须为 0.0 以确保 Tokenizer 确定性
+    # Tokenizer 是预处理器，不应引入随机性。Transformer 负责正则化。
+    dropout: float = 0.0
 
     # Elastic Budget 目标导向损失参数 (I109-4)
     elastic_lambda_target: float = 0.1
@@ -123,6 +126,15 @@ class HilbertSplitterConfig:
     quota_entropy_weight: float = QUOTA_ENTROPY_WEIGHT  # 0.1
     quota_min_ratio: float = 0.02  # I96-7: 最小采样比例
     quota_min_lambda: float = 0.1  # 下界软正则化权重
+
+    # I120-3: 选中率均衡配额 (解决深度分布单一化)
+    # 目标: 各深度选中率均衡 P(选中|d) = C，避免深度 0 选中率是深度 4 的 256 倍
+    enable_rate_balanced_quota: bool = True
+
+    # I120-3: 分层自适应配额 (推荐方案)
+    # 目标: 根据图像内容动态调整各深度配额，保留嵌套结构语义
+    # 注意: 需要 features 输入，启用后会覆盖其他配额模式
+    enable_hierarchical_quota: bool = False
 
     # ==================== 熵正则化 (I111-3) ====================
     # 'adaptive': H_target = log(D) × (1 - 1/√D) (推荐)
@@ -140,15 +152,37 @@ class HilbertSplitterConfig:
     gamma: float = 1.0  # Lagrangian 预算约束系数
     lambda_div: float = 0.1  # Diversity Loss 权重
 
-    # ==================== 温度调度 (I111-1) ====================
+    # ==================== 温度调度 (I111-1, I122-7) ====================
+    # I122-7: 默认使用 'linear' 调度 (恒定变化率，行为可预测)
     temperature_init: float = SPLITTER_TEMP_START  # 1.0
-    temperature_min: float = SPLITTER_TEMP_END  # 0.5
-    temperature_anneal: str = 'cosine'
+    temperature_min: float = SPLITTER_TEMP_END  # 0.4
+    temperature_anneal: str = 'linear'  # I122-7: 移除 'cosine'，默认 'linear'
     learnable_temperature: bool = True
     temperature_warmup_steps: int = 1000
 
     # ==================== 冻结控制 ====================
     freeze_quota: bool = False
+
+    # ==================== I120-2: DeterministicTopK 配置 ====================
+    # 启用确定性 Top-K 选择（替代 Gumbel 随机采样）
+    # 目的: 消除 train/eval 输出差异，恢复 Hilbert 曲线确定性保证
+    use_deterministic_topk: bool = False
+
+    # 确定性 Top-K 的温度参数（控制 softmax 的"锐度"）
+    # 较小的值 → 更接近硬选择 (Top-K)
+    # 较大的值 → 更软的分布 (Softmax)
+    deterministic_temperature: float = 0.5
+
+    # 确定性 Top-K 的 STE 混合系数
+    # α = 0: 完全硬选择
+    # α = 1: 完全软分布
+    deterministic_ste_alpha: float = 0.5
+
+    # ==================== I113-12: 静态 K 模式配置 ====================
+    # 启用静态 K 模式以支持 torch.compile 的 cudagraphs 优化
+    # 启用后，token 数量将 padding 到 static_k_max
+    static_k_mode: bool = False
+    static_k_max: int = 64  # Padding 目标 K 值
 
     # ==================== 验证与工具方法 ====================
 
@@ -302,6 +336,10 @@ class HilbertSplitterConfig:
             'learnable_temperature': self.learnable_temperature,
             'temperature_warmup_steps': self.temperature_warmup_steps,
             'freeze_quota': self.freeze_quota,
+            # I120-2: DeterministicTopK 配置
+            'use_deterministic_topk': self.use_deterministic_topk,
+            'deterministic_temperature': self.deterministic_temperature,
+            'deterministic_ste_alpha': self.deterministic_ste_alpha,
         }
 
     # ==================== L2 绝对值计算方法 (I113-2) ====================
@@ -373,10 +411,10 @@ class AttentionConfig:
     """
     HilbertAwareAttention 配置
 
+    I122-2 简化: 移除 lca_temperature，由 hilbert_bias_scale 统一缩放
+
     暴露参数:
-    - lca_temperature: impact>0.5 → 必须暴露
-    - learnable_temperature: impact=1.0 → 必须暴露
-    - bias_scale: impact=0.1 → 可选暴露
+    - hilbert_bias_scale: impact=0.1 → 可选暴露
     """
     # 注意力维度
     dim: int = 256
@@ -387,8 +425,6 @@ class AttentionConfig:
     lca_bias: bool = True
     max_level: int = 8
     lca_embedding_dim: int = 128
-    lca_temperature: Optional[float] = None  # None = 自动
-    learnable_temperature: bool = True
     lca_fp16: bool = False  # I104-3: 使用 FP16 存储 LCA embedding
 
     # 偏置缩放

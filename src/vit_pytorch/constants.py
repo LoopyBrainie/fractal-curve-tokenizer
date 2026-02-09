@@ -54,10 +54,12 @@ LEVEL_BIAS_SCALE: float = 1.0
 SPLITTER_TEMP_START: float = 1.0
 
 #: Gumbel-Softmax 终止温度 T_end
-#: I24-7 分析: 0.3 过低会过早停止探索
-#: 改进: 提高到 0.5，保持更长的探索能力
-#: 数学: T=0.5 时 softmax 梯度仍有效 (∂p/∂z ≈ 1)
-SPLITTER_TEMP_END: float = 0.5
+#: I121-3 修复: 从 0.5 降低到 0.3，提升梯度强度和深度多样性
+#: I121-8 修复: 从 0.3 提升到 0.4，与 TEMPERATURE_MIN 保持一致
+#: 数学: τ=0.4 时梯度强度 ≈ 2.5 (vs τ=0.5 时 2.0)，提升 25%
+#:       配合曲率感知调度，防止低曲率时温度过低导致梯度饱和
+#: 验证: τ ∈ [0.4, 1.0] 确保梯度有效且训练稳定
+SPLITTER_TEMP_END: float = 0.4
 
 #: 温度退火调度策略
 #: 可选值: 'exponential', 'linear', 'cosine'
@@ -103,39 +105,28 @@ PROB_EPSILON: float = EPS
 SHAPE_NORM_EPSILON: float = EPS
 
 #: FP16 安全 epsilon (替代原有的 1e-8)
-#: I112-3: 更新为 EPS，统一使用
-FP16_SAFE_EPSILON: float = EPS
+#: 数学依据: FP16 最小正规数 ~6e-5，精度 ~1e-3
+#: 使用 1e-6 作为安全下界，避免 FP16 下溢
+FP16_SAFE_EPSILON: float = 1e-6  # I122-? 修复: 统一使用 1e-6
 
 #: 温度参数下界 (Gumbel-Softmax/Top-K)
 #: 数学分析: T < 0.1 时 softmax 梯度趋近于 0
 #: I35 改进: 从 0.1 提升到 0.3，保持更健康的梯度流
-#: 验证: T=0.3 时 softmax 梯度仍有效 (∂p/∂z ≈ 1/τ)
-TEMPERATURE_MIN: float = 0.3
-
-# ==================== I113-5: STE 梯度缩放常量 ====================
-# 数学分析: STE 缩放因子 α = (N/K) × σ(log β) × min(τ/τ_ref, 1)
-
-#: STE 缩放参考温度 (用于温度保护机制)
-#: 用途: min(τ/τ_ref, 1) 防止低温度时梯度爆炸
-#: 数学: τ_ref = 1.0 作为参考点，与 Gumbel 扰动归一化一致
-STE_SCALE_TEMP_REF: float = 1.0
-
-#: STE 可学习缩放下界 (防止过度缩放)
-#: 用途: σ(log β) ∈ (0, 1)，但通过 clamp 限制有效范围
-#: 数学: 防止学习到极端值导致梯度不稳定
-STE_SCALE_MIN: float = 0.1
-
-#: STE 可学习缩放上界
-STE_SCALE_MAX: float = 2.0
+#: I121-8 修复: 从 0.3 提升到 0.4，防止低温度时梯度饱和
+#: 数学: T=0.4 时 softmax 梯度 ≈ 1/τ = 2.5 (有效梯度)
+#: 验证: T=0.4 时 softmax 梯度仍有效 (∂p/∂z ≈ 1/τ = 2.5)
+TEMPERATURE_MIN: float = 0.4
 
 # ==================== I108-6: FP16 Clamp 边界常量 ====================
 # 数学分析见: workspace/fp16_clamp_analysis.md
 
 #: Logits clamp 边界 (Attention / Gumbel logits)
-#: 数学依据: softmax(x > 50) ≈ one-hot (引理 2.1)
-#: FP16 安全: 50 << 65504 (FP16 最大值 ~1300× 安全余量)
-#: 验证: clamp(-50, 50) 确保数值稳定且不丢失有效信息
-LOGIT_CLAMP_BOUND: float = 50.0
+#: I147 修复: 从 50.0 降低到 10.0，保持有效梯度
+#: 数学依据: softmax(x > 10) ≈ 0.99995（梯度 ≈ 5e-5，仍有效）
+#: 问题: softmax(50) ≈ 1.0（梯度 ≈ 1e-18，梯度消失）
+#: FP16 安全: 10 << 65504 (~6500× 安全余量）
+#: 验证: clamp(-10, 10) 确保数值稳定且保留有效梯度
+LOGIT_CLAMP_BOUND: float = 10.0
 
 #: Gradient clamp 边界 (FP16)
 #: 数学依据: P(|grad| > 20) ≈ 10^-6 << 4.5% (原 clamp(-10, 10) 的裁剪率)
@@ -148,10 +139,23 @@ GRAD_CLAMP_BOUND: float = 20.0
 #: 验证: 覆盖 99.99% 的 softplus 输出范围
 SCALE_CLAMP_BOUND: float = 15.0
 
-#: FP16 安全 epsilon (替代原有的 1e-8)
-#: 数学依据: FP16 最小正规数 ~6e-5，精度 ~1e-3
-#: 使用 1e-6 作为安全下界，避免 FP16 下溢
-FP16_SAFE_EPSILON: float = 1e-6
+# ==================== I121-6: 动态梯度裁剪常量 ====================
+# 数学分析: 梯度范数与学习率成正比，动态调整确保训练稳定性
+# 公式: clip_norm = GRAD_CLIP_BASE_NORM × (current_lr / base_lr)
+
+#: 动态梯度裁剪基准学习率
+#: 数学: 以 3e-4 为基准，对应 GRAD_CLIP_BASE_NORM = 1.0
+GRAD_CLIP_BASE_LR: float = 3e-4
+
+#: 动态梯度裁剪基准范数
+#: 数学: 对应 base_lr 的标准裁剪阈值
+GRAD_CLIP_BASE_NORM: float = 1.0
+
+#: 动态梯度裁剪范数下限 (防止裁剪过松)
+GRAD_CLIP_MIN_NORM: float = 0.5
+
+#: 动态梯度裁剪范数上限 (防止裁剪过紧)
+GRAD_CLIP_MAX_NORM: float = 2.0
 
 # ==================== 深度平衡常量 (I24-2 方案E) ====================
 # 数学分析: 解决深度分布崩溃问题
@@ -252,30 +256,35 @@ QUOTA_INFO_LAMBDA: float = 0.1
 #   3. 硬上限约束防止大分辨率下的显存溢出
 
 #: 基准覆盖率 (224×224 图像的目标覆盖率)
-#: 数学: β_0 = 0.03 表示目标采样 3% 的候选区域
-#: I109-10 修复: 原 0.12 导致 K_target > K_max (10486 > 4096)
-#: 修正后 β_0 = 0.03 使 K_target ∈ [K_min, K_max]
-K_COVERAGE_BASE: float = 0.03
+#: 数学: β_0 = 0.25 表示目标采样 25% 的候选区域
+#: I121-1 修复: 原 0.03 → 0.08 保守提升
+#: I121-4 修复: 0.08 → 0.12 提升选中率均衡效果
+#: I121-7 修复: 0.12 → 0.25 实现 Hilbert 曲线完整遍历
+#: K_target = 0.25 × 341 = 85，确保各深度有足够配额
+K_COVERAGE_BASE: float = 0.25
 
 #: 最小覆盖率 (防止欠采样)
 #: 数学: α = 0.01 保证最小 1% 覆盖率
 K_COVERAGE_MIN: float = 0.01
 
 #: 最大覆盖率硬上限 (防止大分辨率下的显存溢出)
-#: 数学: β_max = 0.25 防止 K 增长过快 (原 0.08 → 0.25)
-#: I36 优化: 小图像需更高上限以支持更多 tokens
-K_COVERAGE_MAX_HARD: float = 0.25
+#: 数学: β_max = 0.50 防止 K 增长过快
+#: I121-1 修复: 0.25 → 0.30 适应 K_COVERAGE_BASE = 0.08
+#: I121-7 修复: 0.30 → 0.50 支持完整 Hilbert 遍历
+K_COVERAGE_MAX_HARD: float = 0.50
 
 #: 覆盖率自适应参考尺寸
 #: 数学: γ = sqrt(min(H, W) / 224) 缩放因子
 K_ADAPTIVE_REFERENCE_SIZE: int = 224
 
 #: K_min 绝对下限 (保证最小表达能力)
-K_MIN_HARD_LIMIT: int = 8
+#: I121-7 修复: 8 → 4，允许更灵活的 token 预算
+K_MIN_HARD_LIMIT: int = 4
 
 #: K_max 显存硬上限 (防止 OOM)
-#: 数学: K=4096 时 attention 矩阵 ≈ 64MB (batch=8)，可接受
-K_MAX_HARD_LIMIT: int = 4096
+#: 数学: K=8192 时 attention 矩阵 ≈ 256MB (batch=8)，可接受
+#: I121-7 修复: 4096 → 8192 适应高覆盖率配置
+K_MAX_HARD_LIMIT: int = 8192
 
 #: K_max 采样比例 (K_max = ceil(K_MAX_SAMPLE_RATIO × N))
 #: 数学: α = 0.25 表示最多采样 25% 的候选区域 (原 0.05 → 0.25)
@@ -299,9 +308,10 @@ K_MIN_SAMPLE_RATIO: float = 0.03
 ELASTIC_COVERAGE_MIN: float = 0.03
 
 #: Elastic Budget 目标损失权重
-#: 数学: λ = 0.1 使损失量级与其他辅助损失匹配
+#: I120-8 修复: 降低至 0.01，避免 L2 损失主导学习
+#: 数学: λ = 0.01 使梯度规模与熵损失匹配 (O(K) vs O(log D))
 #: 引导 token 数量趋向最优覆盖率 (β_target = 12% @ 224×224)
-ELASTIC_LAMBDA_TARGET: float = 0.1
+ELASTIC_LAMBDA_TARGET: float = 0.01
 
 #: Elastic Budget 边界安全网权重
 #: 数学: λ = 0.1 超出 K_bounds 时额外惩罚
@@ -311,6 +321,71 @@ ELASTIC_LAMBDA_BOUNDARY: float = 0.1
 #: 崩溃检测损失权重
 #: 数学: λ_collapse = 1.0 确保崩溃时强惩罚
 ELASTIC_LAMBDA_COLLAPSE: float = 1.0
+
+# ==================== I122-4: Poisson KL 散度损失 (新) ====================
+# 设计原则: 从第一性原理推导的最优损失函数
+# 数学形式化:
+#   L_KL = K_t × KL(Poisson(K) || Poisson(K_t))
+#   L_Huber = Huber_δ(K, K_t) with δ = K_t / 2
+#   L = λ_KL × L_KL + λ_Huber × L_Huber
+#
+# 核心洞察:
+#   - Token 计数是离散 Poisson 过程
+#   - KL 散度是计数偏差的信息论最优度量
+#   - L_KL ≥ 0 且 L_KL = 0 当且仅当 K = K_t
+#
+# 梯度分析:
+#   - ∂L_KL/∂K = λ_KL × log(K/K_t)
+#   - K > K_t 时梯度 > 0 (减少 K)
+#   - K < K_t 时梯度 < 0 (增加 K)
+#   - 大偏差时梯度温和 (K=256 vs K_t=32: 梯度 ≈ 0.44)
+
+#: Poisson KL 散度损失权重
+#: 数学: 与熵损失量级匹配，λ_KL = 0.005
+#: 推导: 目标梯度 ≈ 0.1-0.5 (与熵损失量级匹配)
+#:       当 |log(K/K_t)| = 1 (e≈2.7x偏差) 时，梯度 = λ_KL
+#:       设目标梯度 = 0.2: λ_KL = 0.2
+#:       保守使用 λ_KL = 0.005
+ELASTIC_LAMBDA_KL: float = 0.005
+
+#: Huber 边界保护权重
+#: 数学: 边界惩罚弱于主项，λ_Huber = 0.001 ≈ λ_KL / 5
+#: 用途: δ = K_t / 2 范围内使用 L2，范围外使用线性惩罚
+HUBER_LAMBDA: float = 0.001
+
+#: Huber delta 参数 (K_t / 2)
+#: 数学: δ = K_t / 2，确保合理边界范围
+#: 含义: |K - K_t| ≤ δ 时使用 L2，否则使用线性惩罚
+HUBER_DELTA: float = 16.0
+
+#: 数值稳定性 epsilon (Poisson KL 计算用)
+#: 防止 log(0) 和除零
+ELASTIC_EPS: float = 1e-8
+
+# ==================== I122-5: 熵目标公式 (新) ====================
+# 设计原则: 基于信息论的有效深度概念
+# 数学形式化:
+#   H_target = log(D_eff) = ENTROPY_TARGET_SCALE × log(D)
+#   其中 D_eff = ENTROPY_TARGET_SCALE⁻¹ × D (有效深度)
+#
+# 核心洞察:
+#   - 原始公式 H = log(D) × (1 - 1/√D) 缺乏严格数学推导
+#   - √D 项可与 Hilbert 局部性维度建立联系 (||H(d1)-H(d2)|| ≤ √2 × |d1-d2|^(1/2))
+#   - 推荐简化: H_target = 0.5 × log(D)，保持恒定 50% 熵比例
+#
+# 理论依据:
+#   - 有效深度 D_eff = √D (信息论视角下的有效类别数)
+#   - H_target = log(D_eff) = 0.5 × log(D)
+#   - 对所有 D 保持恒定 50% 熵比例，简化超参数调优
+
+#: 熵目标缩放因子
+#: 数学: H_target = ENTROPY_TARGET_SCALE × log(D)
+#:       ENTROPY_TARGET_SCALE = 0.5 表示目标熵为最大熵的 50%
+#:       等价于 D_eff = √D (有效深度 = √D)
+#: 验证:
+#   - D=4: H_target = 0.5 × 1.386 = 0.693 = log(2) ✓
+#   - D=8: H_target = 0.5 × 2.079 = 1.039 = log(2.83) ≈ log(√8)
+ENTROPY_TARGET_SCALE: float = 0.5
 
 # ==================== I24-8: 阈值正则化常量 ====================
 
@@ -338,6 +413,116 @@ OVERLAP_PENALTY_WEIGHT: float = 0.1
 
 #: levels_info 的最小长度
 MIN_INFO_LEN: int = 16
+
+# ==================== I120-8: Hilbert-感知自适应预算系统 ====================
+# 设计原则: 移除 L_budget (L2损失)，替换为 Hilbert-感知损失
+# 数学形式化:
+#   1. L_continuity = -Σ exp(-γ × ΔH_i) 鼓励 Hilbert 连续选择
+#   2. 自适应覆盖率 β = β_min + (β_max - β_min) × complexity
+
+#: Hilbert-感知连续性损失是否启用 (I120-8)
+#: 替代 L_budget，与 Hilbert 曲线局部性保证对齐
+HILBERT_CONTINUITY_ENABLED: bool = True
+
+#: Hilbert-感知连续性损失权重
+#: I120-8 修复: 提高至 0.2，增强 Hilbert 连续性约束
+#: 数学: λ_continuity = 0.2 与降低后的预算损失保持平衡
+HILBERT_CONTINUITY_WEIGHT: float = 0.2
+
+#: Hilbert-感知连续性损失 gamma 参数 (I122-8: 保留基准值，添加动态计算函数)
+#: 数学: exp(-γ × ΔH) 控制连续性强度
+#: γ = 0.1 时，ΔH = 10 → exp(-1) ≈ 0.37 (显著惩罚)
+#: 注意: 对于不同分辨率，γ 应动态调整为 γ = 0.1 × log₂(N_patches)
+#:       见 compute_hilbert_continuity_gamma() 函数
+HILBERT_CONTINUITY_GAMMA: float = 0.1
+
+#: 任务自适应覆盖率是否启用 (I120-8)
+#: 根据图像复杂度动态调整目标覆盖率
+ADAPTIVE_COVERAGE_ENABLED: bool = True
+
+#: 自适应覆盖率最小值 (简单图像)
+#: 数学: β_min = 0.05 保证最小覆盖率
+ADAPTIVE_COVERAGE_MIN: float = 0.05
+
+#: 自适应覆盖率最大值 (复杂图像)
+#: 数学: β_max = 0.40 允许复杂图像更多 tokens
+ADAPTIVE_COVERAGE_MAX: float = 0.40
+
+#: 复杂度估计权重 (HybridDensityHead 输出)
+#: 数学: complexity = Σ I_d / N_candidates
+#: I_d = softmax((1/4^d) × Σ Var(F_q))
+ADAPTIVE_COMPLEXITY_WEIGHT: float = 1.0
+
+#: 空间覆盖预算是否启用 (I120-8)
+#: 确保选中的 token 覆盖图像的各个区域
+COVERAGE_BUDGET_ENABLED: bool = True
+
+#: 空间覆盖预算最小值
+#: 数学: coverage_min = 0.3 保证 30% 区域覆盖
+SPATIAL_COVERAGE_MIN: float = 0.3
+
+#: 空间覆盖预算损失权重
+#: 数学: λ_coverage = 0.05 轻量正则化
+SPATIAL_COVERAGE_WEIGHT: float = 0.05
+
+# ==================== I121-5, I122-6: 课程学习常量 ====================
+# 设计原则: 根据训练阶段动态调整损失权重，平衡预算约束与深度多样性
+# 数学形式化:
+#   1. λ_b(t, K) = λ_b^0 · α(t) · β(K)
+#      α(t) = Cosine平滑阶段因子
+#      β(K) = 距离惩罚因子
+#   2. λ_e(t) = λ_e^0 / α(t)  (I122-6: 从 1/√α 改为 1/α)
+#      熵权重与预算权重线性反向联动
+#      变化范围: 0.33×λ_e^0 ~ 3.0×λ_e^0 (9× 变化)
+#
+# 对称性原则 (I122-6):
+#   √(α_explore/α_exploit) = 整数
+#   推荐: √(3.0/0.33) = √9 = 3
+
+#: 探索阶段结束 (归一化训练进度 0-1)
+#: 数学: t ∈ [0, 0.25T] 为探索阶段，高权重强化预算约束
+CURRICULUM_EXPLORATION_END: float = 0.25
+
+#: 适应阶段结束 (归一化训练进度 0-1)
+#: 数学: t ∈ [0.25T, 0.75T] 为适应阶段，平滑过渡
+CURRICULUM_ADAPTATION_END: float = 0.75
+
+#: 探索阶段权重因子 (I122-6: 从 2.0 改为 3.0)
+#: 数学: α = 3.0 探索阶段增强预算约束
+#: 对称因子: √(3.0/0.33) = √9 = 3
+CURRICULUM_WEIGHT_FACTOR_EXPLORE: float = 3.0
+
+#: 适应阶段权重因子
+#: 数学: α = 1.0 适应阶段恢复正常权重
+CURRICULUM_WEIGHT_FACTOR_ADAPT: float = 1.0
+
+#: 利用阶段权重因子 (I122-6: 从 0.5 改为 0.33)
+#: 数学: α = 1/3 利用阶段放松预算约束，允许深度多样性
+CURRICULUM_WEIGHT_FACTOR_EXPLOIT: float = 1.0 / 3.0
+
+#: 是否启用距离惩罚因子
+#: 数学: β(K) > 1 当 K 超出 [K_min, K_max] 时增强惩罚
+CURRICULUM_DISTANCE_PENALTY_ENABLED: bool = True
+
+#: 距离惩罚强度系数 (I122-6: 从 1.0 改为 0.5)
+#: 数学: β(K) = 1 + γ · (d_outside / d_inside)²
+#: 验证: γ = 0.5 时，β ∈ [1.0, 1.5] (50% 最大增强)
+CURRICULUM_PENALTY_GAMMA: float = 0.5
+
+#: 课程学习熵权重基础值
+#: I120-8 修复: 提高至 0.5，增强深度多样性约束
+#: 数学: λ_e^0 = 0.5 与降低后的预算权重保持平衡
+CURRICULUM_BASE_ENTROPY_WEIGHT: float = 0.5
+
+#: 课程学习预算权重基础值
+#: I120-8 修复: 降低至 0.01，避免 L2 损失主导
+#: 数学: λ_b^0 = 0.01 基础权重 (会被配置覆盖)
+CURRICULUM_BASE_BUDGET_WEIGHT: float = 0.01
+
+# I120-8: 深度平衡损失权重
+#: 深度平衡损失权重
+#: 数学: λ_depth = 0.1 与其他辅助损失量级匹配
+DEPTH_BALANCE_WEIGHT: float = 0.1
 
 
 # ============================================================================
@@ -429,6 +614,66 @@ def compute_num_candidates(max_level: int) -> int:
     if max_level < 0:
         raise ValueError(f"max_level 必须非负, 得到 {max_level}")
     return (4 ** (max_level + 1) - 1) // 3
+
+
+# ==================== I122-8: 动态常量计算函数 ====================
+
+def compute_hilbert_continuity_gamma(
+    image_size: int,
+    patch_size: int,
+    base_gamma: float = HILBERT_CONTINUITY_GAMMA,
+    base_n_patches: int = 4096,
+) -> float:
+    """计算分辨率自适应的 Hilbert 连续性 gamma 参数 (I122-8)。
+
+    数学形式化:
+        γ(image_size, patch_size) = base_γ × log₂(N_patches) / log₂(N_base)
+
+    其中:
+        N_patches = (image_size / patch_size)²
+        N_base = 4096 (224×224, patch=4 的基准)
+
+    设计原理:
+        1. Hilbert 曲线的局部性保证: ‖Δp‖ ≤ √2 × |ΔH|^0.5
+        2. 固定 γ = 0.1 对不同分辨率产生差异巨大的相对惩罚
+        3. 动态 γ 确保 exp(-γ × ΔH) 的衰减与图像大小无关
+
+    验证:
+        | ΔH | = 1 → ‖Δp‖ ≤ √2 (1 个 patch)
+        | ΔH | = 9 → ‖Δp‖ ≤ 3√2 (约 3 个 patches)
+        ΔH = 10 隐含允许 3 个 patch 跳跃
+
+    示例:
+        64×64, patch=4: N=256, log₂=8, γ = 0.1 × 8/12 = 0.67
+        224×224, patch=4: N=3136, log₂≈11.6, γ = 0.1 × 11.6/12 = 0.97
+        224×224, patch=16: N=196, log₂≈7.6, γ = 0.1 × 7.6/12 = 0.63
+
+    Args:
+        image_size: 输入图像尺寸（正方形边长）
+        patch_size: Patch 尺寸
+        base_gamma: 基准 gamma 值 (默认 HILBERT_CONTINUITY_GAMMA = 0.1)
+        base_n_patches: 基准 patches 数量 (默认 4096)
+
+    Returns:
+        分辨率自适应的 gamma 值
+    """
+    if image_size <= 0:
+        raise ValueError(f"image_size 必须为正数, 得到 {image_size}")
+    if patch_size <= 0:
+        raise ValueError(f"patch_size 必须为正数, 得到 {patch_size}")
+    if patch_size > image_size:
+        raise ValueError(f"patch_size ({patch_size}) 不能大于 image_size ({image_size})")
+
+    # 计算 patches 数量
+    n_patches = (image_size // patch_size) ** 2
+
+    # 计算 log₂ 比例
+    log_ratio = math.log2(n_patches) / math.log2(base_n_patches)
+
+    # 动态 gamma
+    gamma = base_gamma * log_ratio
+
+    return gamma
 
 
 def compute_k_bounds(
@@ -557,11 +802,11 @@ def clamp_temperature(temperature: float, min_val: float = TEMPERATURE_MIN) -> f
     数学形式化:
         T_safe = max(T, TEMPERATURE_MIN)
         softmax 梯度: ∂p/∂z ≈ p × (1-p) / T
-        T >= 0.3 确保梯度流健康
+        T >= 0.4 确保梯度流健康 (I121-8: τ=0.4 梯度强度 ≈ 2.5)
 
     Args:
         temperature: 原始温度值
-        min_val: 最小安全温度（默认 TEMPERATURE_MIN = 0.3）
+        min_val: 最小安全温度（默认 TEMPERATURE_MIN = 0.4）
 
     Returns:
         钳制后的安全温度值

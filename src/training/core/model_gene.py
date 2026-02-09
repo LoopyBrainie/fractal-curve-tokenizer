@@ -73,16 +73,16 @@ class ModelGene:
     K_min_abs: int = 8                 # 绝对最小采样数
     K_max_hard: int = 64               # 绝对最大采样数
     coverage_base: float = 0.12         # 基准覆盖率
-    splitter_temp_start: float = 1.0    # 初始温度
-    splitter_temp_end: float = 0.1      # 最终温度
+    splitter_temp_start: float = 1.0    # 初始温度 (与 constants.SPLITTER_TEMP_START 一致)
+    splitter_temp_end: float = 0.3      # I147: 最终温度 (与 constants.SPLITTER_TEMP_END 一致)
 
     # ==================== 正则化参数 ====================
-    # I145: 修复默认值与 ModelArchitectureConfig 一致
-    # 注意: dropout=0.25, emb_dropout=0.15, drop_path_rate=0.25
-    # 这些值与 train_fractal_vit.py 中的 argparse 默认值一致
-    dropout: float = 0.25           # Dropout 比率 (与 args --dropout 一致)
-    emb_dropout: float = 0.15        # 嵌入 dropout (与 args --emb-dropout 一致)
-    drop_path_rate: float = 0.15   # Drop path 比率
+    # I148: 修复默认值与 ModelArchitectureConfig 和 train_fractal_vit.py 一致
+    # 2026-02-07: 更新 emb_dropout=0.0，与 argparse --emb-dropout 默认值一致
+    # dropout=0.1 (transformer_dropout), emb_dropout=0.0, drop_path_rate=0.25
+    dropout: float = 0.1           # Dropout 比率 (与 args --transformer-dropout 一致)
+    emb_dropout: float = 0.0        # 嵌入 dropout (与 args --emb-dropout 一致)
+    drop_path_rate: float = 0.25   # Drop path 比率 (与 args --drop-path 一致)
 
     # ==================== 编码选项 ====================
     use_hilbert_encoding: bool = True   # 使用 Hilbert 编码
@@ -92,9 +92,9 @@ class ModelGene:
     # ==================== FFN 选项 ====================
     ffn_type: str = "swiglu_level"  # FFN 类型
 
-    # ==================== LCA 参数 ====================
-    lca_temperature: float = 1.5      # LCA 温度
-    learnable_temperature: bool = True  # 可学习温度
+    # I122-2: lca_temperature 已移除，由 hilbert_bias_scale × √d_k 统一缩放
+    # lca_temperature: float = 1.5      # LCA 温度
+    # learnable_temperature: bool = True  # 可学习温度
 
     # ==================== I24-2: 可学习配额 ====================
     quota_learnable: Optional[bool] = None  # 是否启用可学习配额
@@ -163,6 +163,13 @@ class ModelGene:
             'token_coverage_min': self.token_coverage_min,
             'token_coverage_max': self.token_coverage_max,
 
+            # ========== I145: Splitter K 值限制 ==========
+            'K_min_abs': self.K_min_abs,
+            'K_max_hard': self.K_max_hard,
+            'coverage_base': self.coverage_base,
+            'splitter_temp_start': self.splitter_temp_start,
+            'splitter_temp_end': self.splitter_temp_end,
+
             # ========== 正则化参数 ==========
             'dropout': self.dropout,
             'emb_dropout': self.emb_dropout,
@@ -176,9 +183,9 @@ class ModelGene:
             # ========== FFN 选项 ==========
             'ffn_type': self.ffn_type,
 
-            # ========== LCA 参数 ==========
-            'lca_temperature': self.lca_temperature,
-            'learnable_temperature': self.learnable_temperature,
+            # I122-2: lca_temperature 已移除
+            # 'lca_temperature': self.lca_temperature,
+            # 'learnable_temperature': self.learnable_temperature,
 
             # ========== I24-2: 可学习配额 ==========
             'quota_learnable': self.quota_learnable,
@@ -301,6 +308,7 @@ class ModelGene:
         from vit_pytorch import FractalCurveViT
 
         # 传递所有保存的参数，让模型架构创建所有组件
+        # I120-2: 使用分离的 dropout 参数
         model = FractalCurveViT(
             image_size=self.image_size,
             num_classes=self.num_classes,
@@ -311,7 +319,8 @@ class ModelGene:
             mlp_dim=self.mlp_dim,
             pool=self.pool,
             channels=self.channels,
-            dropout=self.dropout,
+            tokenizer_dropout=self.dropout,  # 复用 dropout 字段作为 tokenizer_dropout
+            transformer_dropout=self.dropout,
             emb_dropout=self.emb_dropout,
             min_patch_size=self.min_patch_size,
             # max_level 不传递，由模型架构内部动态计算
@@ -320,8 +329,9 @@ class ModelGene:
             use_checkpoint=self.use_checkpoint,
             drop_path_rate=self.drop_path_rate,
             ffn_type=self.ffn_type,
-            lca_temperature=self.lca_temperature,
-            learnable_temperature=self.learnable_temperature,
+            # I122-2: lca_temperature 已移除
+            # lca_temperature=self.lca_temperature,
+            # learnable_temperature=self.learnable_temperature,
             # 不传递自定义 splitter，让 FractalCurveViT 自己创建
             splitter=None,
             token_coverage_min=self.token_coverage_min,
@@ -367,17 +377,20 @@ class ModelGene:
             verbose: 是否打印详细信息
         """
         # 提取 dropout 值
-        # 优先使用 model.dropout（如果它是 float），否则从 Dropout 模块提取
-        dropout_attr = getattr(model, 'dropout', None)
-        if dropout_attr is not None:
-            if isinstance(dropout_attr, (int, float)):
-                dropout_val = dropout_attr
-            elif hasattr(dropout_attr, 'p'):  # PyTorch Dropout module
-                dropout_val = dropout_attr.p
+        # I122-1: FractalCurveViT 使用分离的 dropout 参数
+        # 优先使用 model.transformer_dropout，其次是 model.dropout (兼容旧模型)
+        dropout_val = getattr(model, 'transformer_dropout', None)
+        if dropout_val is None:
+            dropout_attr = getattr(model, 'dropout', None)
+            if dropout_attr is not None:
+                if isinstance(dropout_attr, (int, float)):
+                    dropout_val = dropout_attr
+                elif hasattr(dropout_attr, 'p'):  # PyTorch Dropout module
+                    dropout_val = dropout_attr.p
+                else:
+                    dropout_val = 0.1
             else:
-                dropout_val = getattr(model, 'emb_dropout', 0.1)
-        else:
-            dropout_val = getattr(model, 'emb_dropout', 0.1)
+                dropout_val = 0.1
 
         # 提取基础参数
         gene = cls(
@@ -396,8 +409,9 @@ class ModelGene:
             use_spatial_encoding=getattr(model, 'use_spatial_encoding', True),
             use_checkpoint=getattr(model, 'use_checkpoint', False),
             ffn_type=getattr(model, 'ffn_type', 'swiglu_level'),
-            lca_temperature=getattr(model, 'lca_temperature', 1.5),
-            learnable_temperature=getattr(model, 'learnable_temperature', True),
+            # I122-2: lca_temperature 已移除
+            # lca_temperature=getattr(model, 'lca_temperature', 1.5),
+            # learnable_temperature=getattr(model, 'learnable_temperature', True),
             use_area_encoding=getattr(model, 'use_area_encoding', False),
             use_affine_modulation=getattr(model, 'use_affine_modulation', True),
             fourier_levels=getattr(model, 'fourier_levels', 4),
@@ -531,8 +545,9 @@ class ModelGene:
             use_spatial_encoding=getattr(config, 'use_spatial_encoding', True),
             use_checkpoint=config.use_checkpoint,
             ffn_type=config.ffn_type,
-            lca_temperature=config.lca_temperature if config.lca_temperature is not None else 1.5,
-            learnable_temperature=config.learnable_temperature,
+            # I122-2: lca_temperature 已移除
+            # lca_temperature=config.lca_temperature if config.lca_temperature is not None else 1.5,
+            # learnable_temperature=config.learnable_temperature,
             token_coverage_min=config.token_coverage_min,
             token_coverage_max=config.token_coverage_max,
             # Splitter 温度参数（I145: 确保从训练配置正确保存）

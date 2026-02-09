@@ -48,9 +48,7 @@ from .block_transformer import FractalTransformer, FFNType
 from .utils import pair
 from .constants import (
     DIVISION_EPSILON, PROB_EPSILON,
-    TEMPERATURE_MIN,
     compute_max_level, compute_num_candidates, compute_k_bounds,
-    clamp_temperature,
     K_COVERAGE_MAX_HARD,
 )
 from .config import AttentionEncoderConfig, SemanticSplitterConfig  # I98-3, I110-5
@@ -194,7 +192,11 @@ class FractalCurveViT(nn.Module):
         pool: str = "weighted",
         channels: int = 3,
         dim_head: int = 64,
-        dropout: float = 0.0,
+        # I120-2: 分离 dropout 配置
+        # tokenizer_dropout: Tokenizer/Splitter dropout，必须为 0.0 (确定性)
+        # transformer_dropout: Transformer dropout，默认为 0.1 (正则化)
+        tokenizer_dropout: float = 0.0,
+        transformer_dropout: float = 0.1,
         emb_dropout: float = 0.0,
         min_patch_size: Union[int, Tuple[int, int]] = 4,
         # 注意: max_level 是变参数，完全由模型架构内部根据 image_size 和 min_patch_size 动态计算
@@ -204,8 +206,7 @@ class FractalCurveViT(nn.Module):
         use_checkpoint: bool = False,
         drop_path_rate: float = 0.0,
         ffn_type: FFNType = 'swiglu_level',
-        lca_temperature: Optional[float] = 1.5,
-        learnable_temperature: bool = True,
+        # I122-2: 移除 lca_temperature，由 hilbert_bias_scale 统一缩放
         # I33: 覆盖率参数（用于在不同分辨率下正确复算 K 值）
         # K_min/K_max 现在作为计算属性，不再是直接参数
         # I113-2: token_coverage_max 已废弃，使用 target_ratio 替代
@@ -253,15 +254,15 @@ class FractalCurveViT(nn.Module):
             pool: 池化策略 ('weighted' 或 'mean')
             channels: 输入图像通道数
             dim_head: 每个注意力头的维度
-            dropout: Dropout 比率
+            tokenizer_dropout: Tokenizer/Splitter dropout 比率，必须为 0.0 (确定性)
+            transformer_dropout: Transformer dropout 比率，默认为 0.1 (正则化)
             emb_dropout: 嵌入层 Dropout 比率
             min_patch_size: 目标最小 patch 大小，用于动态计算 max_level
             max_level: 最大递归深度 (P0: 统一使用 max_level)
             use_hilbert_encoding: 是否使用 Hilbert 编码
             use_spatial_encoding: 是否使用空间编码
             ffn_type: FFN 变体 ('gelu', 'swiglu', 'swiglu_level')
-            lca_temperature: LCA 温度
-            learnable_temperature: 是否可学习温度
+            I122-2: 移除 lca_temperature，由 hilbert_bias_scale 统一缩放
             K_min: 最少 token 数
             K_max: 最多 token 数
             pos_dropout: 位置编码 dropout
@@ -312,25 +313,21 @@ class FractalCurveViT(nn.Module):
         self.splitter_feature_dim = splitter_feature_dim
         self.splitter_pool_size = splitter_pool_size
 
-        # 温度钳制（防止梯度饱和）
-        self.lca_temperature = clamp_temperature(
-            lca_temperature if lca_temperature is not None else 1.5,
-            TEMPERATURE_MIN
-        )
-        self.learnable_temperature = learnable_temperature
+        # I122-2: 移除 lca_temperature，由 hilbert_bias_scale 统一缩放
         self.lca_fp16 = lca_fp16  # I104-3
 
         # ====================================================================
-        # I27: 子模块 Dropout 配置 (避免硬编码)
+        # I120-2: 子模块 Dropout 配置 (确定性 + 正则化分离)
         # ====================================================================
         # 数学依据:
-        #   - Splitter MLP 敏感: 过高 dropout 导致分割决策不稳定
-        #   - Position Embedding 是信息瓶颈: 需保守正则化
+        #   - Splitter MLP: dropout=0.0 (确定性，无随机性)
+        #   - Position Embedding: dropout=0.0 (确定性)
+        #   - Transformer: dropout=0.1 (正则化)
         #
         # 推导公式:
-        #   pos_dropout = dropout * 0.5            # half of main dropout
+        #   pos_dropout = transformer_dropout * 0.5  # half of transformer dropout
         # ====================================================================
-        effective_pos_dropout = pos_dropout if pos_dropout is not None else (dropout * 0.5)
+        effective_pos_dropout = pos_dropout if pos_dropout is not None else (transformer_dropout * 0.5)
 
         # I30-17: 处理 min_patch_size 的向后兼容
         # 支持旧 API: min_patch_size=(4, 4)
@@ -346,7 +343,9 @@ class FractalCurveViT(nn.Module):
         self.use_area_encoding = use_area_encoding
         self.use_affine_modulation = use_affine_modulation
         self.fourier_levels = fourier_levels
-        self.dropout = dropout
+        # I120-2: 分离 dropout 配置
+        self.tokenizer_dropout = tokenizer_dropout
+        self.transformer_dropout = transformer_dropout
         self.emb_dropout = emb_dropout
         self.drop_path_rate = drop_path_rate
 
@@ -403,12 +402,15 @@ class FractalCurveViT(nn.Module):
                 pool_size=splitter_pool_size or 4,
                 # I113-2: K 边界由 config 内部根据 coverage_min/coverage_max_hard 自动计算
                 use_dynamic_k=True,
-                dropout=min(dropout, 0.15),
+                # I120-2: dropout 始终为 0.0 (Tokenizer 确定性)
+                dropout=0.0,
                 enable_learnable_quota=quota_learnable if quota_learnable is not None else True,
                 quota_entropy_weight=quota_entropy_weight,
                 # I33: 传递覆盖率参数
                 coverage_min=token_coverage_min,
                 coverage_max_hard=token_coverage_max if token_coverage_max else K_COVERAGE_MAX_HARD,
+                # I120-3: 选中率均衡配额 (解决深度分布单一化)
+                enable_rate_balanced_quota=True,
             )
             self.splitter = GumbelTopKSplitter(
                 config=splitter_config,
@@ -489,7 +491,7 @@ class FractalCurveViT(nn.Module):
         else:
             self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
 
-        # I145: 使用单独的变量名避免覆盖 self.dropout（保存了 dropout float 值）
+        # I120-2: emb_dropout 始终为 0.0 (确定性位置编码)
         self.emb_dropout_module = nn.Dropout(emb_dropout)
 
         # I30-11: 已删除 Mixed Pooling
@@ -503,19 +505,18 @@ class FractalCurveViT(nn.Module):
         else:
             # 动态创建 Transformer（向后兼容）
             # 使用 self.max_level（从 tokenizer 获取的变参数）
+            # I120-2: 使用 transformer_dropout 而非 dropout
             self.transformer = FractalTransformer(
                 dim=dim,
                 depth=num_layers,
                 heads=heads,
                 dim_head=dim_head,
                 mlp_dim=mlp_dim,
-                dropout=dropout,
+                dropout=transformer_dropout,
                 max_level=self.max_level,
                 drop_path_rate=drop_path_rate,
                 ffn_type=ffn_type,
                 use_checkpoint=use_checkpoint,
-                lca_temperature=lca_temperature,
-                learnable_temperature=learnable_temperature,
                 use_affine_modulation=use_affine_modulation,
                 fourier_levels=fourier_levels,
                 encoder_config=encoder_config,
@@ -541,11 +542,12 @@ class FractalCurveViT(nn.Module):
             self.mlp_head = mlp_head
         else:
             # 动态创建 MLP Head
+            # I120-2: 使用 transformer_dropout 而非 dropout
             self.mlp_head = nn.Sequential(
                 nn.LayerNorm(dim),
                 nn.Linear(dim, mlp_dim // 2),
                 nn.GELU(),
-                nn.Dropout(dropout),
+                nn.Dropout(transformer_dropout),
                 nn.Linear(mlp_dim // 2, num_classes),
             )
             self.num_classes = num_classes
@@ -658,15 +660,15 @@ class FractalCurveViT(nn.Module):
             'token_coverage_min': self.token_coverage_min,
             'token_coverage_max': getattr(self, '_deprecated_token_coverage_max', None),
             # 编码选项
-            'lca_temperature': self.lca_temperature,
-            'learnable_temperature': self.learnable_temperature,
+            # I122-2: 移除 lca_temperature，由 hilbert_bias_scale 统一缩放
             'use_hilbert_encoding': self.use_hilbert_encoding,
             'use_spatial_encoding': self.use_spatial_encoding,
             'use_area_encoding': self.use_area_encoding,
             'use_affine_modulation': self.use_affine_modulation,
             'fourier_levels': self.fourier_levels,
-            # 正则化
-            'dropout': self.dropout,
+            # I120-2: 分离 dropout 配置
+            'tokenizer_dropout': self.tokenizer_dropout,
+            'transformer_dropout': self.transformer_dropout,
             'emb_dropout': self.emb_dropout,
             'drop_path_rate': self.drop_path_rate,
             # FFN
@@ -1463,11 +1465,17 @@ class FractalCurveViT(nn.Module):
                     schedule=config.get('schedule', 'exponential'),
                 )
 
-        # 辅助损失权重配置
-        if 'aux_loss_weights' in config:
+        # I121-2: 辅助损失权重配置 (修复配置链路断裂)
+        if 'aux_loss_weights' in config and splitter is not None:
             weights = config['aux_loss_weights']
-            # 可以在此处更新内部辅助损失权重
-            # 目前使用默认值，留作扩展接口
+
+            # 应用稀疏性权重 (熵损失)
+            if 'sparsity' in weights and hasattr(splitter, '_entropy_weight_base'):
+                splitter._entropy_weight_base = weights['sparsity']
+
+            # 应用弹性预算权重 (外部因子)
+            if 'elastic' in weights and hasattr(splitter, '_elastic_budget_factor'):
+                splitter._elastic_budget_factor = weights['elastic']
 
     def get_splitter_diagnostics(self) -> Dict[str, Any]:
         """获取分割器诊断信息 (I36-3: FractalModelProtocol 实现, I99-对齐修复)

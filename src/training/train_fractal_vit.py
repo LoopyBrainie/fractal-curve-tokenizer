@@ -115,7 +115,7 @@ P12 内部向量化优化 (2025-12-29)
     python train_fractal_vit.py --quick-test --use-amp
 
     # Tiny ImageNet 完整训练 (I30-3 优化配置 - 增强正则化缓解过拟合)
-    # 正则化参数: dropout=0.25, drop_path=0.25, weight_decay=0.15
+    # I120-2: 正则化参数: tokenizer_dropout=0.0, transformer_dropout=0.1, drop_path=0.25, weight_decay=0.15
     python train_fractal_vit.py --dataset tiny-imagenet --epochs 100 --dim 320 \
         --num-layers 12 --heads 8 \
         --use-amp --gradient-checkpoint --compile --channels-last \
@@ -124,7 +124,7 @@ P12 内部向量化优化 (2025-12-29)
     # 小数据集推荐配置 (I30-3: 进一步增强正则化)
     python train_fractal_vit.py --dataset tiny-imagenet --epochs 150 \
         --dim 256 --num-layers 8 --heads 6 \
-        --dropout 0.3 --drop-path 0.3 --weight-decay 0.2 \
+        --transformer-dropout 0.3 --drop-path 0.3 --weight-decay 0.2 \
         --freeze-tokenizer --use-amp
     
     # 自定义 P10 参数
@@ -443,7 +443,9 @@ class FractalConfigProtocol(Protocol):
     @property
     def min_patch_size(self) -> int: ...
     @property
-    def dropout(self) -> float: ...
+    def tokenizer_dropout(self) -> float: ...
+    @property
+    def transformer_dropout(self) -> float: ...
     @property
     def emb_dropout(self) -> float: ...
     @property
@@ -2897,10 +2899,13 @@ def main():
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=0.15,
                        help="Weight decay for L2 regularization (default: 0.15, I30-3 tuned for overfitting)")
-    parser.add_argument("--dropout", type=float, default=0.25,
-                       help="Dropout rate (default: 0.25, I30-3 tuned for overfitting)")
-    parser.add_argument("--emb-dropout", type=float, default=0.15,
-                       help="Embedding dropout rate (default: 0.15)")
+    # I120-2: 分离 dropout 配置
+    parser.add_argument("--tokenizer-dropout", type=float, default=0.0,
+                       help="Tokenizer/Splitter dropout rate (default: 0.0, 确定性)")
+    parser.add_argument("--transformer-dropout", type=float, default=0.1,
+                       help="Transformer dropout rate (default: 0.1, 正则化)")
+    parser.add_argument("--emb-dropout", type=float, default=0.0,
+                       help="Embedding dropout rate (default: 0.0, 确定性)")
     parser.add_argument("--drop-path", type=float, default=0.25,
                        help="Drop path (stochastic depth) rate (default: 0.25, I30-3 tuned for overfitting)")
     parser.add_argument("--label-smoothing", type=float, default=0.1,
@@ -3114,9 +3119,10 @@ def main():
             self.min_patch_size = arch_config.min_patch_size
             # 注意: max_level 是变参数，完全由模型架构内部计算
             # 不从 arch_config 获取，确保训练/评估模型结构完全一致
-            # I145: 修复 dropout 来源 - 使用 arch_config 而非 args
+            # I120-2: 修复 dropout 来源 - 使用 arch_config 而非 args
             # 这样 ModelGene.from_config() 保存的值与训练时使用的值一致
-            self.dropout = arch_config.dropout
+            self.tokenizer_dropout = arch_config.tokenizer_dropout
+            self.transformer_dropout = arch_config.transformer_dropout
             self.emb_dropout = arch_config.emb_dropout
             self.drop_path_rate = arch_config.drop_path_rate
             self.use_checkpoint = arch_config.use_checkpoint
@@ -3218,7 +3224,9 @@ def main():
         pool=config.pool,
         channels=spec.channels,
         dim_head=config.dim_head,
-        dropout=config.dropout,
+        # I120-2: 分离 dropout 配置
+        tokenizer_dropout=config.tokenizer_dropout,
+        transformer_dropout=config.transformer_dropout,
         emb_dropout=config.emb_dropout,
         drop_path_rate=config.drop_path_rate,
         # I30-17: 动态深度参数 (max_level 由模型架构内部从 min_patch_size 计算)
@@ -3776,7 +3784,9 @@ def main():
     history = []
     
     print(f"[INFO] Early stopping: patience={config.patience}, min_delta={config.min_delta}")
-    print(f"[INFO] Regularization: dropout={config.dropout}, weight_decay={config.weight_decay}")
+    # I120-2: 分离 dropout 配置
+    print(f"[INFO] Regularization: tokenizer_dropout={config.tokenizer_dropout}, "
+          f"transformer_dropout={config.transformer_dropout}, weight_decay={config.weight_decay}")
     print(f"[INFO] Label smoothing: {config.label_smoothing}")
     print(f"[INFO] Mixup/CutMix: alpha={config.mixup_alpha}/{config.cutmix_alpha}, prob={config.mixup_prob}")
     if use_mixup and config.warmup_epochs > 0:
