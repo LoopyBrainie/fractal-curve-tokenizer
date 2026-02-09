@@ -66,15 +66,18 @@ class ModelGene:
     # I33: 相对预算参数 (替代绝对 K_min/K_max)
     # 保存覆盖率而非绝对 K 值，确保评估时能正确复算
     # I145: 修复默认值与 ModelArchitectureConfig 一致
-    token_coverage_min: float = 0.01   # α = 1% 最小覆盖率
-    token_coverage_max: float = 0.25   # β = 25% 最大覆盖率
+    token_coverage_min: float = 0.01   # α = 1% 最小覆盖率 (向后兼容)
+    token_coverage_max: float = 0.25   # β = 25% 最大覆盖率 (向后兼容)
+    # I145: 统一命名覆盖率字段
+    coverage_min: float = 0.01          # α = 1% 最小覆盖率 (与 HilbertSplitterConfig 一致)
+    coverage_max_hard: float = 0.25     # β = 25% 最大覆盖率 (与 HilbertSplitterConfig 一致)
 
     # I145: Splitter K 值限制（从 SplitterConfig 提取）
     K_min_abs: int = 8                 # 绝对最小采样数
-    K_max_hard: int = 64               # 绝对最大采样数
+    K_max_hard: int = 8192             # 绝对最大采样数 (与 K_MAX_HARD_LIMIT 一致)
     coverage_base: float = 0.12         # 基准覆盖率
     splitter_temp_start: float = 1.0    # 初始温度 (与 constants.SPLITTER_TEMP_START 一致)
-    splitter_temp_end: float = 0.3      # I147: 最终温度 (与 constants.SPLITTER_TEMP_END 一致)
+    splitter_temp_end: float = 0.4      # I145: 最终温度 (与 constants.SPLITTER_TEMP_END 一致)
 
     # ==================== 正则化参数 ====================
     # I148: 修复默认值与 ModelArchitectureConfig 和 train_fractal_vit.py 一致
@@ -162,6 +165,9 @@ class ModelGene:
             # I33: 保存覆盖率而非绝对 K 值（确保不同分辨率下正确复算）
             'token_coverage_min': self.token_coverage_min,
             'token_coverage_max': self.token_coverage_max,
+            # I145: 统一命名覆盖率字段
+            'coverage_min': self.coverage_min,
+            'coverage_max_hard': self.coverage_max_hard,
 
             # ========== I145: Splitter K 值限制 ==========
             'K_min_abs': self.K_min_abs,
@@ -346,6 +352,9 @@ class ModelGene:
             splitter_hidden_dim=self.splitter_hidden_dim,
             splitter_feature_dim=self.splitter_feature_dim,
             splitter_pool_size=self.splitter_pool_size,
+            # I145: Splitter 温度参数
+            splitter_temp_start=self.splitter_temp_start,
+            splitter_temp_end=self.splitter_temp_end,
             # I110-7: 语义分裂器配置
             use_semantic_splitter=self.use_semantic_splitter,
             semantic_splitter_config=(
@@ -434,7 +443,7 @@ class ModelGene:
                 gene.token_coverage_max = getattr(config, 'coverage_max_hard', 0.25)  # I109-3
                 # I145: 提取 K 值限制参数
                 gene.K_min_abs = getattr(config, 'K_min_abs', 8)
-                gene.K_max_hard = getattr(config, 'K_max_hard', 64)
+                gene.K_max_hard = getattr(config, 'K_max_hard', 8192)
                 gene.coverage_base = getattr(config, 'coverage_base', 0.12)
                 # I145: 提取温度参数
                 gene.splitter_temp_start = getattr(config, 'temperature_init', 1.0)
@@ -445,7 +454,7 @@ class ModelGene:
                 gene.token_coverage_min = getattr(config, 'coverage_min', 0.01)
                 gene.token_coverage_max = getattr(config, 'coverage_max_hard', 0.25)  # I109-3
                 gene.K_min_abs = getattr(config, 'K_min_abs', 8)
-                gene.K_max_hard = getattr(config, 'K_max_hard', 64)
+                gene.K_max_hard = getattr(config, 'K_max_hard', 8192)
                 gene.coverage_base = getattr(config, 'coverage_base', 0.12)
                 gene.splitter_temp_start = getattr(config, 'temperature_init', 1.0)
                 gene.splitter_temp_end = getattr(config, 'temperature_min', 0.1)
@@ -524,7 +533,9 @@ class ModelGene:
 
         splitter_temp_end = getattr(config, 'splitter_temp_end', None)
         if splitter_temp_end is None:
-            splitter_temp_end = getattr(config, 'temperature_min', 0.1)
+            # I145 修复: 使用 constants.SPLITTER_TEMP_END (0.4) 而非错误的 0.1
+            from vit_pytorch.constants import SPLITTER_TEMP_END
+            splitter_temp_end = getattr(config, 'temperature_min', SPLITTER_TEMP_END)
 
         # 使用 getattr 处理可选字段（兼容不同版本的 ModelArchitectureConfig）
         gene = cls(
@@ -550,6 +561,9 @@ class ModelGene:
             # learnable_temperature=config.learnable_temperature,
             token_coverage_min=config.token_coverage_min,
             token_coverage_max=config.token_coverage_max,
+            # I145: 统一覆盖率字段
+            coverage_min=getattr(config, 'coverage_min', config.token_coverage_min),
+            coverage_max_hard=getattr(config, 'coverage_max_hard', config.token_coverage_max),
             # Splitter 温度参数（I145: 确保从训练配置正确保存）
             splitter_temp_start=splitter_temp_start,
             splitter_temp_end=splitter_temp_end,
@@ -672,8 +686,12 @@ class ModelGene:
     # ==================== 验证 ====================
 
     def validate(self) -> bool:
-        """验证 ModelGene 的有效性"""
+        """验证 ModelGene 的有效性
+
+        I145: 添加配置一致性验证，确保与常量定义对齐。
+        """
         errors = []
+        warnings = []
 
         # 必填参数检查
         if self.dim <= 0:
@@ -697,8 +715,53 @@ class ModelGene:
                 f"覆盖率约束违反: 0 < {self.token_coverage_min} < {self.token_coverage_max} < 1"
             )
 
+        # I145: 温度参数验证
+        from vit_pytorch.constants import SPLITTER_TEMP_START, SPLITTER_TEMP_END, TEMPERATURE_MIN
+        if self.splitter_temp_start < TEMPERATURE_MIN:
+            warnings.append(
+                f"splitter_temp_start ({self.splitter_temp_start}) < TEMPERATURE_MIN ({TEMPERATURE_MIN}), "
+                f"可能导致梯度消失问题"
+            )
+        if self.splitter_temp_end < TEMPERATURE_MIN:
+            errors.append(
+                f"splitter_temp_end ({self.splitter_temp_end}) < TEMPERATURE_MIN ({TEMPERATURE_MIN}), "
+                f"这会导致梯度消失"
+            )
+        if self.splitter_temp_start < self.splitter_temp_end:
+            errors.append(
+                f"splitter_temp_start ({self.splitter_temp_start}) < splitter_temp_end ({self.splitter_temp_end}), "
+                f"温度应该从高到低退火"
+            )
+
+        # I145: K 边界验证
+        from vit_pytorch.constants import K_MIN_HARD_LIMIT, K_MAX_HARD_LIMIT
+        if self.K_min_abs < K_MIN_HARD_LIMIT:
+            warnings.append(
+                f"K_min_abs ({self.K_min_abs}) < K_MIN_HARD_LIMIT ({K_MIN_HARD_LIMIT}), "
+                f"将被自动调整"
+            )
+        if self.K_max_hard > K_MAX_HARD_LIMIT:
+            warnings.append(
+                f"K_max_hard ({self.K_max_hard}) > K_MAX_HARD_LIMIT ({K_MAX_HARD_LIMIT}), "
+                f"将被自动调整"
+            )
+
+        # I145: Splitter 架构参数验证
+        if self.splitter_hidden_dim is not None and self.splitter_hidden_dim <= 0:
+            errors.append(f"splitter_hidden_dim must be positive, got {self.splitter_hidden_dim}")
+        if self.splitter_feature_dim is not None and self.splitter_feature_dim <= 0:
+            errors.append(f"splitter_feature_dim must be positive, got {self.splitter_feature_dim}")
+        if self.splitter_pool_size is not None and self.splitter_pool_size <= 0:
+            errors.append(f"splitter_pool_size must be positive, got {self.splitter_pool_size}")
+
         if errors:
-            raise ValueError(f"Invalid ModelGene: {errors}")
+            raise ValueError(f"Invalid ModelGene: {'; '.join(errors)}")
+
+        if warnings:
+            import warnings as _warnings
+            for w in warnings:
+                _warnings.warn(f"[ModelGene Validation] {w}")
+
         return True
 
     # ==================== 字符串表示 ====================

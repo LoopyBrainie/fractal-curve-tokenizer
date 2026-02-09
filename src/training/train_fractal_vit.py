@@ -451,11 +451,13 @@ class FractalConfigProtocol(Protocol):
     @property
     def drop_path_rate(self) -> float: ...
     @property
-    def use_checkpoint(self) -> bool: ...  # I139: 统一命名 (原 use_checkpoint)
+    def use_checkpoint(self) -> bool: ...
+
+    # I122-2: lca_temperature 已移除，由 hilbert_bias_scale 统一缩放
+    # 保留 learnable_temperature 以支持 HilbertSplitterConfig
     @property
-    def lca_temperature(self) -> Optional[float]: ...
-    @property
-    def learnable_temperature(self) -> bool: ...
+    def learnable_temperature(self) -> bool: ...  # I145: 保留支持旧版配置
+
     @property
     def use_area_encoding(self) -> bool: ...
     @property
@@ -474,14 +476,17 @@ class FractalConfigProtocol(Protocol):
     def depth_scale_range(self) -> Optional[Tuple[float, float]]: ...
 
     # ========== Tokenizer K 值 (I33 相对预算) ==========
+    # I145: 修复 K_min/K_max 属性，应使用 K_min_abs 和计算值
     @property
-    def K_min(self) -> int: ...
-    @property
-    def K_max(self) -> int: ...
+    def K_min_abs(self) -> int: ...  # 绝对下界保护 (替代废弃的 K_min)
     @property
     def token_coverage_min(self) -> float: ...
     @property
     def token_coverage_max(self) -> float: ...
+    @property
+    def coverage_min(self) -> float: ...  # I145: 新增覆盖率参数
+    @property
+    def coverage_max_hard(self) -> float: ...  # I145: 新增覆盖率参数
 
     # ========== 训练配置 (训练循环) ==========
     @property
@@ -546,6 +551,24 @@ class FractalConfigProtocol(Protocol):
     def soft_entropy_weight(self) -> float: ...
     @property
     def soft_entropy_mode(self) -> str: ...
+
+    # ========== I140: 分裂器架构参数 ==========
+    @property
+    def splitter_hidden_dim(self) -> Optional[int]: ...
+    @property
+    def splitter_feature_dim(self) -> Optional[int]: ...
+    @property
+    def splitter_pool_size(self) -> Optional[int]: ...
+    @property
+    def splitter_dropout(self) -> Optional[float]: ...
+
+    # ========== I110-7: 语义分裂器配置 ==========
+    @property
+    def use_semantic_splitter(self) -> bool: ...
+    @property
+    def semantic_splitter_config(self) -> Optional[Dict[str, Any]]: ...
+    @property
+    def semantic_loss_weight(self) -> float: ...
 
 
 # ============================================================================

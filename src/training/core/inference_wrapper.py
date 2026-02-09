@@ -58,6 +58,12 @@ class InferenceStats:
     # I147: 添加 transformer_tokens 字段，与 TrainingStats 保持一致
     transformer_tokens: Optional[torch.Tensor] = None  # [B, N, dim] Transformer 输出
 
+    # I145: 添加 shared_features 字段，与 TrainingStats 保持一致
+    shared_features: Optional[torch.Tensor] = None  # [B, d_model, H/p, W/p]
+
+    # I99-1: 添加 ema_stats 字段，与 TrainingStats 保持一致
+    ema_stats: Optional[torch.Tensor] = None
+
     # 可选字段
     splitter_entropy: float = 0.0
     temperature: float = 1.0
@@ -272,6 +278,12 @@ def wrap_stats(stats: Any, logits: torch.Tensor) -> InferenceStats:
     # I147: 提取 transformer_tokens 字段
     transformer_tokens = getattr(stats, 'transformer_tokens', None)
 
+    # I145: 提取 shared_features 字段
+    shared_features = getattr(stats, 'shared_features', None)
+
+    # I99-1: 提取 ema_stats 字段
+    ema_stats = getattr(stats, 'ema_stats', None)
+
     # 构造 InferenceStats
     return InferenceStats(
         logits=logits,
@@ -280,6 +292,8 @@ def wrap_stats(stats: Any, logits: torch.Tensor) -> InferenceStats:
         depth_distribution=depth_distribution if depth_distribution else {},
         features=getattr(stats, 'features', logits.new_zeros(logits.size(0), logits.size(1))),
         transformer_tokens=transformer_tokens,  # I147: 新增字段
+        shared_features=shared_features,  # I145: 新增字段
+        ema_stats=ema_stats,  # I99-1: 新增字段
         splitter_entropy=getattr(stats, 'splitter_entropy', 0.0),
         temperature=getattr(stats, 'temperature', 1.0),
         aux_infos=getattr(stats, 'aux_infos', None),

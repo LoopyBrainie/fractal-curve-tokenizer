@@ -329,9 +329,17 @@ def load_model_legacy(
         }
 
     # 构建模型
+    # I145: 确保 num_layers 优先使用已推断的值，支持旧版 depth 迁移
+    inferred_num_layers = inferred.get('num_layers', inferred.get('depth', 8))
+
+    # I145: 添加默认的分裂器配置
+    inferred_splitter_hidden = inferred.get('splitter_hidden_dim')
+    inferred_splitter_feature = inferred.get('splitter_feature_dim')
+    inferred_splitter_pool = inferred.get('splitter_pool_size')
+
     gene = ModelGene(
         dim=inferred.get('dim', 256),
-        num_layers=inferred.get('num_layers', inferred.get('depth', 8)),
+        num_layers=inferred_num_layers,
         heads=inferred.get('heads', 8),
         mlp_dim=inferred.get('mlp_dim', inferred.get('dim', 256) * 4),
         num_classes=inferred.get('num_classes', 10),
@@ -339,6 +347,10 @@ def load_model_legacy(
         channels=inferred.get('channels', 3),
         dataset_name='legacy',
         checkpoint_epoch=checkpoint.get('epoch', 0),
+        # I145: 添加 splitter 架构参数（从 state_dict 推断）
+        splitter_hidden_dim=inferred.get('splitter_hidden_dim'),
+        splitter_feature_dim=inferred.get('splitter_feature_dim'),
+        splitter_pool_size=inferred.get('splitter_pool_size'),
     )
 
     model = gene.build_model()
@@ -419,7 +431,8 @@ def _build_model_from_config(config: Dict[str, Any]) -> ModelType:
 
     # 提取配置值，设置合理的默认值
     dim = config.get('dim', 256)
-    depth = config.get('depth', 8)
+    # I145: 统一使用 num_layers，支持从旧版 depth 迁移
+    num_layers = config.get('num_layers', config.get('depth', 8))
     heads = config.get('heads', 8)
     mlp_dim = config.get('mlp_dim', 512)
     num_classes = config.get('num_classes', 10)
@@ -458,7 +471,7 @@ def _build_model_from_config(config: Dict[str, Any]) -> ModelType:
         image_size=image_size,
         num_classes=num_classes,
         dim=dim,
-        depth=depth,
+        num_layers=num_layers,
         heads=heads,
         mlp_dim=mlp_dim,
         pool=pool,
@@ -634,6 +647,13 @@ def _infer_model_config_from_state_dict(state_dict: Dict[str, Any], verbose: boo
             mlp_count += 1
     if mlp_count > 0 and result.get('hidden_dim') is not None:
         result['mlp_dim'] = result['hidden_dim']
+
+    # 8. 推断 splitter 架构参数
+    splitter_config = _infer_splitter_config_from_state_dict(state_dict, verbose)
+    if splitter_config:
+        result['splitter_hidden_dim'] = splitter_config.get('hidden_dim')
+        result['splitter_feature_dim'] = splitter_config.get('feature_dim')
+        result['splitter_pool_size'] = splitter_config.get('pool_size')
 
     return result if any(v is not None for v in result.values()) else None
 

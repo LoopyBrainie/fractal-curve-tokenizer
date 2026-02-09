@@ -91,11 +91,13 @@ class HilbertSplitterConfig:
 
     # ==================== 覆盖率约束 (相对预算) ====================
     # 基准覆盖率 (224×224 图像的目标采样率)
-    coverage_base: float = K_COVERAGE_BASE  # 0.03
+    # I145 修复: 注释更新以反映实际常量值 K_COVERAGE_BASE = 0.25
+    coverage_base: float = K_COVERAGE_BASE
 
     # 覆盖率范围 [α, β] (用于计算 K 边界)
-    coverage_min: float = K_COVERAGE_MIN  # 0.01
-    coverage_max_hard: float = K_COVERAGE_MAX_HARD  # 0.25
+    coverage_min: float = K_COVERAGE_MIN
+    # I145 修复: K_COVERAGE_MAX_HARD = 0.50，注释应为 0.50
+    coverage_max_hard: float = K_COVERAGE_MAX_HARD
 
     # K 绝对边界 (硬限制)
     K_min_abs: int = K_MIN_HARD_LIMIT  # 8
@@ -283,9 +285,9 @@ class HilbertSplitterConfig:
                 f"temperature_min ({self.temperature_min}) 必须 >= 0.3 "
                 "以避免梯度消失问题"
             )
-        if self.temperature_anneal not in ('linear', 'exponential', 'cosine'):
+        if self.temperature_anneal not in ('linear', 'exponential'):
             raise ValueError(
-                f"temperature_anneal 必须是 'linear', 'exponential', 或 'cosine', "
+                f"temperature_anneal 必须是 'linear' 或 'exponential', "
                 f"got {self.temperature_anneal}"
             )
 

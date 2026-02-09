@@ -62,11 +62,11 @@ SPLITTER_TEMP_START: float = 1.0
 SPLITTER_TEMP_END: float = 0.4
 
 #: 温度退火调度策略
-#: 可选值: 'exponential', 'linear', 'cosine'
-#: I24-7 改进: 使用 cosine 退火
-#: 优势: 开始慢降(保持探索) → 中期快降(高效收敛) → 末期平稳(稳定决策)
-#: 数学: T(t) = T_end + (T_start - T_end) * (1 + cos(πt)) / 2
-SPLITTER_TEMP_SCHEDULE: str = 'cosine'
+#: 可选值: 'exponential', 'linear'
+#: I122-7 修复: 统一使用 'linear' (cosine 已移除，缺乏理论依据)
+#: I122-7 理由: linear 调度具有恒定变化率，行为可预测
+#: 数学: T(t) = T_end + (T_start - T_end) × (1 - t/T)
+SPLITTER_TEMP_SCHEDULE: str = 'linear'
 
 # ==================== 数值稳定性常量 (I12-7/I112-3) ====================
 # 数学分析见: workspace/numerical_constants_analysis.py

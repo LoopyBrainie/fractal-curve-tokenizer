@@ -4250,7 +4250,13 @@ class GumbelTopKSplitter(
         # 新公式:   H_target = ENTROPY_TARGET_SCALE × log(D) = 0.5 × log(D)
         # 理论依据: 有效深度 D_eff = √D (信息论视角下的有效类别数)
         # 优势:     对所有 D 保持恒定 50% 熵比例，简化超参数调优
-        H_target = ENTROPY_TARGET_SCALE * math.log(D)
+        #
+        # I145: 添加边界检查
+        # 当 D <= 1 时，log(D) = 0，熵目标自然为 0，无需特殊处理
+        if D <= 1:
+            H_target = 0.0
+        else:
+            H_target = ENTROPY_TARGET_SCALE * math.log(D)
 
         # I121-5: 课程学习熵权重联动
         # 基础权重: λ_base = weight × (1 + softplus(H_target/H - 1))

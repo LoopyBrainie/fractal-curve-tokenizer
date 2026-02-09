@@ -663,12 +663,16 @@ class ModularTrainer:
 
             # 验证禁用 AMP 以确保指标精度 (I78: 使用 detach().item() 支持 torch.compile)
             with torch.amp.autocast('cuda', enabled=False):
-                model_output = self.model(inputs)
-                # P0-Critical: 模型可能返回元组，提取 logits
-                if isinstance(model_output, tuple):
-                    outputs = model_output[0]
+                stats = self.model(inputs)
+                # 统一 TrainingStats 提取逻辑 (I145)
+                if TrainingStats is not None and isinstance(stats, TrainingStats):
+                    outputs = stats.logits
+                elif hasattr(stats, 'logits'):
+                    outputs = stats.logits
+                elif isinstance(stats, tuple):
+                    outputs = stats[0]
                 else:
-                    outputs = model_output
+                    outputs = stats
                 loss = self.loss_fn(outputs, targets)
 
             # CRIT-4: 累积到 GPU 张量 (不同步)

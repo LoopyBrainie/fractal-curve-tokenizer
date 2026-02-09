@@ -50,6 +50,7 @@ from .constants import (
     DIVISION_EPSILON, PROB_EPSILON,
     compute_max_level, compute_num_candidates, compute_k_bounds,
     K_COVERAGE_MAX_HARD,
+    SPLITTER_TEMP_START, SPLITTER_TEMP_END,
 )
 from .config import AttentionEncoderConfig, SemanticSplitterConfig  # I98-3, I110-5
 
@@ -227,6 +228,9 @@ class FractalCurveViT(nn.Module):
         splitter_hidden_dim: Optional[int] = None,
         splitter_feature_dim: Optional[int] = None,
         splitter_pool_size: Optional[int] = None,
+        # I145: Splitter 温度参数 (用于温度退火)
+        splitter_temp_start: Optional[float] = None,
+        splitter_temp_end: Optional[float] = None,
         # I110-7: 语义分裂器配置
         use_semantic_splitter: bool = False,
         semantic_splitter_config: Optional[SemanticSplitterConfig] = None,
@@ -411,6 +415,9 @@ class FractalCurveViT(nn.Module):
                 coverage_max_hard=token_coverage_max if token_coverage_max else K_COVERAGE_MAX_HARD,
                 # I120-3: 选中率均衡配额 (解决深度分布单一化)
                 enable_rate_balanced_quota=True,
+                # I145: 传递温度参数
+                temperature_init=splitter_temp_start if splitter_temp_start is not None else SPLITTER_TEMP_START,
+                temperature_min=splitter_temp_end if splitter_temp_end is not None else SPLITTER_TEMP_END,
             )
             self.splitter = GumbelTopKSplitter(
                 config=splitter_config,
@@ -1229,6 +1236,8 @@ class FractalCurveViT(nn.Module):
         # P-OPT: 避免在 forward 中使用 .cpu()，使用 GPU 计算 max_level
         # 从 levels_list 推断主要使用的深度
         # I142: 使用向量化操作替代 for 循环中的 int() 转换，避免 CPU 同步
+        # I145: 已知限制 - int() 转换仍会导致 CPU 同步，影响 torch.compile cudagraphs
+        # TODO: 修改 TrainingStats.depth_used 类型为 Union[int, Tensor]，完全消除 CPU 同步
         if levels_list and len(levels_list) > 0:
             # 向量化计算所有 depths 的最大值
             all_max_levels = []
@@ -1239,7 +1248,7 @@ class FractalCurveViT(nn.Module):
             if all_max_levels:
                 # 使用 torch.stack 和 max，避免 CPU 同步
                 max_level_tensor = torch.stack(all_max_levels).max()
-                depth_used = int(max_level_tensor)  # 只有一次 CPU 同步
+                depth_used = int(max_level_tensor)  # 已知限制: CPU 同步点
             else:
                 depth_used = 0
         else:
