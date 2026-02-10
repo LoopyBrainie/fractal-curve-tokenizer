@@ -2163,8 +2163,10 @@ def train_epoch(
         
         batch_times.append(time.time() - batch_start)
 
-        if device.type == 'cuda':
-            cuda_mem_peak = max(cuda_mem_peak, torch.cuda.max_memory_allocated() / 1024**3)
+        # P-OPT: 移除 per-batch 内存统计，避免 GPU 同步
+        # torch.cuda.max_memory_allocated() 需要 CUDA 同步，严重影响吞吐
+        # 仅在 epoch 结束时统计一次内存使用
+        cuda_mem_peak = 0.0
 
         # P-OPT: 减少 .item() 调用频率，每 20 个 batch 同步一次
         # 使用 torch.no_grad() 避免影响梯度计算
@@ -2193,7 +2195,8 @@ def train_epoch(
         'avg_data_time': np.mean(data_times) if data_times else 0,
         'avg_forward_time': np.mean(forward_times) if forward_times else 0,
         'throughput': total / sum(batch_times) if batch_times else 0,
-        'cuda_mem_peak_gb': cuda_mem_peak,
+        # P-OPT: 仅在 epoch 结束时获取内存统计，避免 per-batch 同步
+        'cuda_mem_peak_gb': torch.cuda.max_memory_allocated() / 1024**3 if device.type == 'cuda' else 0.0,
         # P1-5: 添加熵统计
         'avg_entropy_loss': np.mean(entropy_losses) if entropy_losses else None,
     }

@@ -453,32 +453,24 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 should_split = False
 
             if should_split:
-                # P-OPT: 优化 bounds 处理 - 避免 GPU-CPU 同步
-                # bounds 可能是 tensor 或 Python list，统一转换为 Python 值
-                if isinstance(bounds, torch.Tensor):
-                    x0, y0, x1, y1 = bounds.cpu().tolist()
-                else:
-                    x0, y0, x1, y1 = bounds
+                # P-OPT: 使用张量运算直接在 GPU 上计算子边界，避免 .cpu().tolist() 同步
+                # bounds: [x0, y0, x1, y1] (tensor on device)
+                x0, y0, x1, y1 = bounds.unbind()  # 解绑为 4 个标量张量
                 cx = (x0 + x1) / 2
                 cy = (y0 + y1) / 2
 
-                # P-OPT: 使用 Python list 传递边界，避免创建临时 tensor
-                # 队列中保持 Python list，仅在收集时转换为 tensor
-                child_bounds = [
-                    [x0, y0, cx, cy],  # 左上
-                    [cx, y0, x1, cy],  # 右上
-                    [x0, cy, cx, y1],  # 左下
-                    [cx, cy, x1, y1],  # 右下
+                # 直接在 GPU 上创建子边界张量，避免创建 Python 列表
+                child_bounds_list = [
+                    torch.stack([x0, y0, cx, cy]),  # 左上
+                    torch.stack([cx, y0, x1, cy]),  # 右上
+                    torch.stack([x0, cy, cx, y1]),  # 左下
+                    torch.stack([cx, cy, x1, y1]),  # 右下
                 ]
-
-                for child_bound in child_bounds:
+                for child_bound in child_bounds_list:
                     queue.append((child_bound, depth + 1, b_idx))
             else:
-                # P-OPT: 批量转换为 tensor，而非逐个追加
-                if isinstance(bounds, torch.Tensor):
-                    all_regions.append(bounds)
-                else:
-                    all_regions.append(torch.tensor(bounds, dtype=torch.float32, device=device))
+                # P-OPT: 保持 tensor 格式直接追加，避免重复转换
+                all_regions.append(bounds)
                 all_depths.append(depth)
                 all_batch_indices.append(b_idx)
 

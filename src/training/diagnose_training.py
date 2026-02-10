@@ -66,8 +66,8 @@ def diagnose_model_collapse(
             if i >= max_batches:
                 break
             
-            imgs = imgs.to(device)
-            labels = labels.to(device)
+            imgs = imgs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             # 单一接口: forward() 返回 TrainingStats 或 Tensor
             stats = model(imgs)
@@ -624,7 +624,7 @@ def main():
         mlp_dim=192 * 4,
         channels=spec['channels'],
         tokenizer=tokenizer,
-    ).to(device)
+    ).to(device, non_blocking=True)
     
     if args.checkpoint:
         print(f"\n加载检查点: {args.checkpoint}")
@@ -650,8 +650,8 @@ def main():
     
     # 4. Tokenizer 诊断
     sample_batch = next(iter(test_loader))
-    sample_input = sample_batch[0][:4].to(device)
-    sample_label = sample_batch[1][:4].to(device)
+    sample_input = sample_batch[0][:4].to(device, non_blocking=True)
+    sample_label = sample_batch[1][:4].to(device, non_blocking=True)
     
     tokenizer_result = diagnose_tokenizer(model, sample_input)
     diagnostics.update(tokenizer_result)

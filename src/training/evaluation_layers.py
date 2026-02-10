@@ -527,8 +527,9 @@ class ClassificationEvaluator:
         
         with torch.no_grad():
             for imgs, labels in tqdm(data_loader, desc="L1: Classification"):
-                imgs = imgs.to(device)
-                labels = labels.to(device)
+                # P-OPT: 使用 non_blocking 异步传输
+                imgs = imgs.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
 
                 # 单一接口: forward() 返回 TrainingStats 或 Tensor
                 stats = model(imgs)
@@ -773,7 +774,7 @@ class TokenizerEvaluator:
                 if batch_idx >= max_batches:
                     break
                 
-                imgs = imgs.to(device)
+                imgs = imgs.to(device, non_blocking=True)
                 B, C, H, W = imgs.shape
 
                 # I139: 获取 split_result（新版 tokenizer 需要）
@@ -1027,7 +1028,7 @@ class AttentionEvaluator:
                     if batch_idx >= max_batches:
                         break
                     
-                    imgs = imgs.to(device)
+                    imgs = imgs.to(device, non_blocking=True)
 
                     # I139: 先获取 tokenizer 输出以获取深度信息
                     if hasattr(model, 'tokenizer'):
@@ -1303,7 +1304,7 @@ class RepresentationEvaluator:
                     if collected >= max_samples:
                         break
                     
-                    imgs = imgs.to(device)
+                    imgs = imgs.to(device, non_blocking=True)
                     _ = model(imgs)
                     
                     if pooled_features:
@@ -2203,8 +2204,8 @@ class GradientFlowEvaluator:
         model.train()  # 需要训练模式
         metrics = L8GradientFlowMetrics()
         
-        sample_input = sample_input.to(device)
-        sample_labels = sample_labels.to(device)
+        sample_input = sample_input.to(device, non_blocking=True)
+        sample_labels = sample_labels.to(device, non_blocking=True)
         
         # 清空梯度
         model.zero_grad()

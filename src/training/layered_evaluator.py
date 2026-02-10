@@ -377,8 +377,8 @@ class FinegrainedClassificationEvaluator:
             # 单一接口: forward() 返回 TrainingStats 或 Tensor
             with torch.no_grad():
                 for inputs, labels in test_loader:
-                    inputs = inputs.to(device)
-                    labels = labels.to(device)
+                    inputs = inputs.to(device, non_blocking=True)
+                    labels = labels.to(device, non_blocking=True)
 
                     stats = trainer.model(inputs)
                     outputs = stats.logits if hasattr(stats, 'logits') else stats
