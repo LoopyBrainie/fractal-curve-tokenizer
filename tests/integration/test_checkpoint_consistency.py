@@ -458,7 +458,7 @@ class TestThreeTierParameterPrinciple:
             mlp_dim=1024,
             num_classes=100,
             image_size=224,
-            dropout=0.3,
+            transformer_dropout=0.3,
             token_coverage_min=0.02,
             token_coverage_max=0.35,
         )
@@ -470,6 +470,140 @@ class TestThreeTierParameterPrinciple:
         assert gene_dict['dropout'] == 0.3
         assert gene_dict['token_coverage_min'] == 0.02
         assert gene_dict['token_coverage_max'] == 0.35
+
+
+class TestI145Fixes:
+    """I145: 修复后的配置一致性测试
+
+    验证以下修复：
+    1. coverage_max_hard 统一为 0.25
+    2. K_min_abs 统一为 8
+    3. 温度参数使用正确的默认值 0.4
+    """
+
+    def test_coverage_max_hard_consistency(self):
+        """验证 coverage_max_hard 在 Config 和 ModelGene 中一致"""
+        from vit_pytorch.constants import K_COVERAGE_MAX_HARD
+
+        # Config 中的值
+        config = ModelArchitectureConfig()
+        assert config.coverage_max_hard == 0.25, \
+            f"Config coverage_max_hard should be 0.25, got {config.coverage_max_hard}"
+
+        # ModelGene 中的值
+        gene = ModelGene(
+            dim=256, num_layers=8, heads=8, mlp_dim=1024,
+            num_classes=100, image_size=224
+        )
+        assert gene.coverage_max_hard == 0.25, \
+            f"ModelGene coverage_max_hard should be 0.25, got {gene.coverage_max_hard}"
+
+    def test_k_min_abs_consistency(self):
+        """验证 K_min_abs 在 Constants、Config 和 ModelGene 中一致"""
+        from vit_pytorch.constants import K_MIN_HARD_LIMIT
+
+        # 常量中的值
+        assert K_MIN_HARD_LIMIT == 8, \
+            f"K_MIN_HARD_LIMIT should be 8, got {K_MIN_HARD_LIMIT}"
+
+        # Config 中的值
+        config = ModelArchitectureConfig()
+        assert config.K_min_abs == 8, \
+            f"Config K_min_abs should be 8, got {config.K_min_abs}"
+
+        # ModelGene 中的值
+        gene = ModelGene(
+            dim=256, num_layers=8, heads=8, mlp_dim=1024,
+            num_classes=100, image_size=224
+        )
+        assert gene.K_min_abs == 8, \
+            f"ModelGene K_min_abs should be 8, got {gene.K_min_abs}"
+
+    def test_temperature_default_consistency(self):
+        """验证温度参数默认值与常量一致"""
+        from vit_pytorch.constants import SPLITTER_TEMP_END, TEMPERATURE_MIN
+
+        # ModelGene 默认值应该与常量一致
+        gene = ModelGene(
+            dim=256, num_layers=8, heads=8, mlp_dim=1024,
+            num_classes=100, image_size=224
+        )
+        assert gene.splitter_temp_end == SPLITTER_TEMP_END, \
+            f"splitter_temp_end ({gene.splitter_temp_end}) != SPLITTER_TEMP_END ({SPLITTER_TEMP_END})"
+        assert gene.splitter_temp_end >= TEMPERATURE_MIN, \
+            f"splitter_temp_end ({gene.splitter_temp_end}) < TEMPERATURE_MIN ({TEMPERATURE_MIN})"
+
+
+class TestLegacyCheckpointMigration:
+    """旧版 Checkpoint 迁移测试
+
+    验证从旧版 checkpoint 格式（使用 K_min/K_max 绝对值）
+    迁移到新版（使用 token_coverage_* 相对值）的正确性。
+    """
+
+    def test_migration_from_k_values(self):
+        """测试从旧版 K_min/K_max 格式迁移"""
+        # 模拟旧版 checkpoint 格式
+        old_checkpoint_dict = {
+            'dim': 256,
+            'depth': 8,  # 旧版使用 depth
+            'heads': 8,
+            'mlp_dim': 1024,
+            'num_classes': 100,
+            'image_size': 224,
+            'K_min': 8,
+            'K_max': 56,  # 约 25% 覆盖率
+            'tokenizer_max_level': 5,
+        }
+
+        # 迁移应该成功
+        gene = ModelGene.from_dict(old_checkpoint_dict)
+
+        # 验证迁移后的覆盖率计算正确
+        assert gene.token_coverage_min > 0
+        assert gene.token_coverage_max > gene.token_coverage_min
+        assert gene.token_coverage_max < 1  # 覆盖率应该在 0-1 之间
+
+    def test_migration_depth_to_num_layers(self):
+        """测试 depth → num_layers 迁移"""
+        old_checkpoint_dict = {
+            'dim': 256,
+            'depth': 6,  # 旧版使用 depth
+            'heads': 8,
+            'mlp_dim': 1024,
+            'num_classes': 100,
+            'image_size': 224,
+            'token_coverage_min': 0.01,
+            'token_coverage_max': 0.25,
+        }
+
+        gene = ModelGene.from_dict(old_checkpoint_dict)
+
+        # 验证 depth 被正确迁移到 num_layers
+        assert gene.num_layers == 6, \
+            f"num_layers should be 6 (migrated from depth), got {gene.num_layers}"
+
+    def test_migration_math_constraints(self):
+        """测试迁移后的数学约束 (0 < α < β < 1)"""
+        # 旧版配置
+        old_checkpoint_dict = {
+            'dim': 256,
+            'depth': 8,
+            'heads': 8,
+            'mlp_dim': 1024,
+            'num_classes': 100,
+            'image_size': 224,
+            'K_min': 4,
+            'K_max': 1000,  # 过高会导致覆盖率 > 1
+            'tokenizer_max_level': 5,
+        }
+
+        # 迁移应该钳制不合理的值
+        gene = ModelGene.from_dict(old_checkpoint_dict)
+
+        # 验证覆盖率约束
+        assert 0 < gene.token_coverage_min < gene.token_coverage_max < 1, \
+            f"Coverage constraint violated: {gene.token_coverage_min} < {gene.token_coverage_max} < 1"
 
 
 if __name__ == "__main__":

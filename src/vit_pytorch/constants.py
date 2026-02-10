@@ -278,8 +278,9 @@ K_COVERAGE_MAX_HARD: float = 0.50
 K_ADAPTIVE_REFERENCE_SIZE: int = 224
 
 #: K_min 绝对下限 (保证最小表达能力)
-#: I121-7 修复: 8 → 4，允许更灵活的 token 预算
-K_MIN_HARD_LIMIT: int = 4
+#: I145-修复: 从 4 提升到 8，与 ModelGene 和训练脚本默认值一致
+#: 数学依据: K=8 确保足够的 token 数量以维持 Hilbert 曲线局部性
+K_MIN_HARD_LIMIT: int = 8
 
 #: K_max 显存硬上限 (防止 OOM)
 #: 数学: K=8192 时 attention 矩阵 ≈ 256MB (batch=8)，可接受

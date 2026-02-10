@@ -52,7 +52,9 @@ CONFIG_TO_GENE_MAPPING = [
     ("token_coverage_max", "token_coverage_max", None),
 
     # 正则化参数
-    ("dropout", "dropout", 0.0),
+    # I148: 使用 transformer_dropout 作为主 dropout 源
+    ("transformer_dropout", "dropout", 0.1),
+    ("tokenizer_dropout", "tokenizer_dropout", 0.0),
     ("emb_dropout", "emb_dropout", 0.0),
     ("drop_path_rate", "drop_path_rate", 0.0),
 
@@ -104,9 +106,9 @@ GENE_TO_MODEL_MAPPING = [
     ("token_coverage_max", "token_coverage_max", None),
 
     # 正则化参数
-    # I120-2: dropout → tokenizer_dropout, transformer_dropout
-    ("dropout", "tokenizer_dropout", 0.0),
-    ("dropout", "transformer_dropout", 0.0),
+    # I148: tokenizer_dropout → tokenizer_dropout, transformer_dropout → dropout
+    ("tokenizer_dropout", "tokenizer_dropout", 0.0),
+    ("dropout", "transformer_dropout", 0.1),
     ("emb_dropout", "emb_dropout", 0.0),
     ("drop_path_rate", "drop_path_rate", 0.0),
 
@@ -319,7 +321,8 @@ def extract_getattr_patterns(code: str) -> Dict[str, Tuple[str, Any]]:
     call_content = method_body[call_start:i-1]
 
     # 匹配: gene.field = getattr(config, 'field', default) 或 getattr(config, "field", default)
-    pattern = r'gene\.(\w+)\s*=\s*getattr\s*\(\s*config\s*,\s*[\'"]([^\'"]+)[\'"]\s*,\s*([^\)]+)\)'
+    # I148: 修复正则表达式以匹配格式: dropout=getattr(config, 'field', value),
+    pattern = r'(\w+)=getattr\(config,\s*[\'"]([^\'"]+)[\'"],\s*([^),]+)\),?'
 
     matches = re.findall(pattern, call_content)
 
@@ -535,7 +538,7 @@ class TestModelGeneConfigConsistency:
             num_classes=100,
             image_size=224,
             channels=3,
-            dropout=0.1,
+            transformer_dropout=0.1,
             token_coverage_min=0.02,
             token_coverage_max=0.15,
             quota_learnable=True,
@@ -676,7 +679,7 @@ class TestEndToEndConsistency:
             mlp_dim=2048,
             num_classes=1000,
             image_size=384,
-            dropout=0.2,
+            transformer_dropout=0.2,
             drop_path_rate=0.3,
             ffn_type="swiglu_level",
             # I122-2: lca_temperature 已移除
@@ -703,9 +706,9 @@ class TestEndToEndConsistency:
         assert model.heads == config.heads
         assert model.mlp_dim == config.mlp_dim
         assert model.num_classes == config.num_classes
-        # I120-2: dropout → tokenizer_dropout, transformer_dropout
-        assert model.tokenizer_dropout == config.dropout
-        assert model.transformer_dropout == config.dropout
+        # I148: tokenizer_dropout → tokenizer_dropout, transformer_dropout → dropout
+        assert model.tokenizer_dropout == config.tokenizer_dropout
+        assert model.transformer_dropout == config.transformer_dropout
         assert model.drop_path_rate == config.drop_path_rate
 
 
@@ -738,7 +741,7 @@ class TestWandBConfigAlignment:
             mlp_dim=1536,
             num_classes=200,
             image_size=224,
-            dropout=0.1,
+            transformer_dropout=0.1,
             token_coverage_min=0.03,
             token_coverage_max=0.25,
             ffn_type="swiglu_level",

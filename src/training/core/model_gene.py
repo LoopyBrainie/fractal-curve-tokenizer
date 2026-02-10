@@ -72,8 +72,8 @@ class ModelGene:
     coverage_min: float = 0.01          # α = 1% 最小覆盖率 (与 HilbertSplitterConfig 一致)
     coverage_max_hard: float = 0.25     # β = 25% 最大覆盖率 (与 HilbertSplitterConfig 一致)
 
-    # I145: Splitter K 值限制（从 SplitterConfig 提取）
-    K_min_abs: int = 8                 # 绝对最小采样数
+    # I145: Splitter K 值限制（从 SplitterConfig 提取，与 constants.K_MIN_HARD_LIMIT 一致）
+    K_min_abs: int = 8                 # 绝对最小采样数 (与 K_MIN_HARD_LIMIT=8 一致)
     K_max_hard: int = 8192             # 绝对最大采样数 (与 K_MAX_HARD_LIMIT 一致)
     coverage_base: float = 0.12         # 基准覆盖率
     splitter_temp_start: float = 1.0    # 初始温度 (与 constants.SPLITTER_TEMP_START 一致)
@@ -82,8 +82,10 @@ class ModelGene:
     # ==================== 正则化参数 ====================
     # I148: 修复默认值与 ModelArchitectureConfig 和 train_fractal_vit.py 一致
     # 2026-02-07: 更新 emb_dropout=0.0，与 argparse --emb-dropout 默认值一致
-    # dropout=0.1 (transformer_dropout), emb_dropout=0.0, drop_path_rate=0.25
-    dropout: float = 0.1           # Dropout 比率 (与 args --transformer-dropout 一致)
+    # I145-修复: 统一使用 transformer_dropout 语义，dropout 字段保留用于历史兼容
+    # 注意: dropout 字段实际存储 transformer_dropout 值，build_model() 时传递给 FractalCurveViT
+    tokenizer_dropout: float = 0.0  # Tokenizer/Splitter dropout，必须为 0.0 (确定性)
+    dropout: float = 0.1           # Dropout 比率 (实际为 transformer_dropout，build_model() 时传递)
     emb_dropout: float = 0.0        # 嵌入 dropout (与 args --emb-dropout 一致)
     drop_path_rate: float = 0.25   # Drop path 比率 (与 args --drop-path 一致)
 
@@ -177,6 +179,8 @@ class ModelGene:
             'splitter_temp_end': self.splitter_temp_end,
 
             # ========== 正则化参数 ==========
+            # I148: 添加 tokenizer_dropout
+            'tokenizer_dropout': self.tokenizer_dropout,
             'dropout': self.dropout,
             'emb_dropout': self.emb_dropout,
             'drop_path_rate': self.drop_path_rate,
@@ -315,6 +319,7 @@ class ModelGene:
 
         # 传递所有保存的参数，让模型架构创建所有组件
         # I120-2: 使用分离的 dropout 参数
+        # I148: 使用分离的 tokenizer_dropout 和 transformer_dropout
         model = FractalCurveViT(
             image_size=self.image_size,
             num_classes=self.num_classes,
@@ -325,7 +330,7 @@ class ModelGene:
             mlp_dim=self.mlp_dim,
             pool=self.pool,
             channels=self.channels,
-            tokenizer_dropout=self.dropout,  # 复用 dropout 字段作为 tokenizer_dropout
+            tokenizer_dropout=self.tokenizer_dropout,
             transformer_dropout=self.dropout,
             emb_dropout=self.emb_dropout,
             min_patch_size=self.min_patch_size,
@@ -411,6 +416,8 @@ class ModelGene:
             image_size=getattr(model, 'image_size', None),
             channels=getattr(model, 'channels', 3),
             pool=getattr(model, 'pool', 'weighted'),
+            # I148: 提取 tokenizer_dropout 和 transformer_dropout
+            tokenizer_dropout=getattr(model, 'tokenizer_dropout', 0.0),
             dropout=dropout_val,
             emb_dropout=getattr(model, 'emb_dropout', 0.1),
             drop_path_rate=getattr(model, 'drop_path_rate', 0.15),
@@ -447,7 +454,9 @@ class ModelGene:
                 gene.coverage_base = getattr(config, 'coverage_base', 0.12)
                 # I145: 提取温度参数
                 gene.splitter_temp_start = getattr(config, 'temperature_init', 1.0)
-                gene.splitter_temp_end = getattr(config, 'temperature_min', 0.1)
+                # I145-修复: 使用 SPLITTER_TEMP_END 常量 (0.4) 而非错误的 0.1
+                from vit_pytorch.constants import SPLITTER_TEMP_END
+                gene.splitter_temp_end = getattr(config, 'temperature_min', SPLITTER_TEMP_END)
             # 备选：从 tokenizer.splitter.config 提取
             elif hasattr(tokenizer, 'splitter') and hasattr(tokenizer.splitter, 'config') and tokenizer.splitter.config is not None:
                 config = tokenizer.splitter.config
@@ -457,7 +466,8 @@ class ModelGene:
                 gene.K_max_hard = getattr(config, 'K_max_hard', 8192)
                 gene.coverage_base = getattr(config, 'coverage_base', 0.12)
                 gene.splitter_temp_start = getattr(config, 'temperature_init', 1.0)
-                gene.splitter_temp_end = getattr(config, 'temperature_min', 0.1)
+                # I145-修复: 使用 SPLITTER_TEMP_END 常量 (0.4) 而非错误的 0.1
+                gene.splitter_temp_end = getattr(config, 'temperature_min', SPLITTER_TEMP_END)
             else:
                 raise ValueError(
                     "无法从模型提取 token_coverage_* 参数。"
@@ -548,7 +558,10 @@ class ModelGene:
             channels=config.channels,
             pool=config.pool,
             min_patch_size=config.min_patch_size,
-            dropout=config.dropout,
+            # I148: 使用 tokenizer_dropout 和 transformer_dropout
+            # 注意: ModelGene 使用 dropout 字段名，但通过 from_config 映射 transformer_dropout
+            tokenizer_dropout=getattr(config, 'tokenizer_dropout', 0.0),
+            dropout=getattr(config, 'transformer_dropout', 0.1),  # config.transformer_dropout → ModelGene.dropout
             emb_dropout=config.emb_dropout,
             drop_path_rate=config.drop_path_rate,
             # 使用 getattr 兼容可选字段

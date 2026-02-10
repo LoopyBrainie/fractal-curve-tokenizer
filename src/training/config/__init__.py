@@ -77,10 +77,10 @@ class ModelArchitectureConfig:
     # I145: 统一命名 - 使用与 HilbertSplitterConfig 一致的字段名
     # I145 修复: 值应与 constants.py 中的常量定义一致
     coverage_min: float = 0.01          # α = 1% 最小覆盖率 (与 K_COVERAGE_MIN 一致)
-    coverage_max_hard: float = 0.50     # β = 50% 最大覆盖率 (与 K_COVERAGE_MAX_HARD 一致)
+    coverage_max_hard: float = 0.25     # β = 25% 最大覆盖率 (与 ModelGene 和实际训练配置一致，I145-修复)
     token_coverage_min: float = 0.01   # α = 1% 最小覆盖率 (向后兼容别名)
     token_coverage_max: float = 0.25   # β = 25% 最大覆盖率 (向后兼容别名，I145: 保持 0.25 以避免大 OOM)
-    K_min_abs: int = 4                 # 绝对下界保护 (与 K_MIN_HARD_LIMIT 一致)
+    K_min_abs: int = 8                 # 绝对下界保护 (与 K_MIN_HARD_LIMIT 一致，I145-修复)
 
     # FFN 类型
     ffn_type: str = "swiglu_level"  # "swiglu", "swiglu_level"
@@ -142,10 +142,12 @@ class ModelArchitectureConfig:
     freeze_tokenizer_epochs: int = 0  # 前 N 个 epoch 冻结 (0=全程冻结)
 
     # 模型 dropout 配置 (I145: 修复配置对齐问题)
-    # 注意: 这些默认值应该与 train_fractal_vit.py 中的 argparse 默认值一致
     # I148: dropout 对应 transformer_dropout，emb_dropout 对应 emb-dropout
     # 2026-02-07: 更新 emb_dropout=0.0，与 argparse --emb-dropout 默认值一致
-    dropout: float = 0.1  # 主 dropout 概率 (与 args --transformer-dropout 一致)
+    # I148: 添加 tokenizer_dropout (必须为 0.0 确定性) 和 transformer_dropout
+    tokenizer_dropout: float = 0.0  # Tokenizer/Splitter dropout，必须为 0.0 (确定性)
+    transformer_dropout: float = 0.1  # Transformer dropout (与 args --transformer-dropout 一致)
+    dropout: float = 0.1  # 主 dropout 概率 (保留用于向后兼容，实际使用 transformer_dropout)
     emb_dropout: float = 0.0  # 嵌入层 dropout (与 args --emb-dropout 一致)
     drop_path_rate: float = 0.25  # 路径 dropout (与 train_fractal_vit.py --drop-path 一致)
 
