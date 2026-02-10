@@ -1458,31 +1458,35 @@ def create_dataloaders(
         train_tf = transforms.Compose([
             transforms.RandomHorizontalFlip(),
             transforms.RandomCrop(64, padding=8),  # 原始图像 64x64
-            transforms.RandAugment(num_ops=2, magnitude=9),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            # I150-优化: 降低增强强度以提升训练吞吐量
+            # num_ops=1, magnitude=5: 减少 CPU 计算量，保持基础正则化效果
+            transforms.RandAugment(num_ops=1, magnitude=5),
+            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15),
             transforms.ToTensor(),
             transforms.Normalize(spec.mean, spec.std),
-            transforms.RandomErasing(p=0.25),
+            transforms.RandomErasing(p=0.1),
         ])
     elif spec.name == "CUB200":
         # CUB-200-2011 细粒度分类 - 保持原始分辨率
+        # I150-优化: 降低增强强度以提升训练吞吐量
         train_tf = transforms.Compose([
             transforms.RandomHorizontalFlip(),
-            transforms.RandomRotation(15),
-            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
-            transforms.RandAugment(num_ops=2, magnitude=9),
+            transforms.RandomRotation(10),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+            transforms.RandAugment(num_ops=1, magnitude=5),
             transforms.ToTensor(),
             transforms.Normalize(spec.mean, spec.std),
-            transforms.RandomErasing(p=0.25),
+            transforms.RandomErasing(p=0.1),
         ])
     else:
+        # I150-优化: 降低增强强度以提升训练吞吐量
         train_tf = transforms.Compose([
             transforms.RandomHorizontalFlip(),
             transforms.RandomCrop(spec.image_size, padding=4) if spec.image_size else transforms.RandomHorizontalFlip(),
-            transforms.RandAugment(num_ops=2, magnitude=9),
+            transforms.RandAugment(num_ops=1, magnitude=5),
             transforms.ToTensor(),
             transforms.Normalize(spec.mean, spec.std),
-            transforms.RandomErasing(p=0.25),
+            transforms.RandomErasing(p=0.1),
         ])
 
     test_tf = transforms.Compose([
