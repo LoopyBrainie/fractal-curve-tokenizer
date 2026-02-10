@@ -132,11 +132,15 @@ class TrainingStats:
             for i, n in enumerate(self.num_tokens):
                 assert 0 <= n <= 4096, f"Batch[{i}] Token 数异常: {n}"
         elif isinstance(self.num_tokens, torch.Tensor):
-            # I99-1 OPT: 使用张量比较避免 .item() 同步
-            # assert (self.num_tokens >= 0).all() and (self.num_tokens <= 4096).all()
-            # 注意: 完整值检查保留 tolist() 但仅在 assert 失败时触发
+            # P-OPT: 使用张量比较避免 .item()/.tolist() 同步
+            # 仅在异常时提取违规值，使用 .detach() 避免梯度追踪
             tokens_valid = (self.num_tokens >= 0) & (self.num_tokens <= 4096)
-            assert tokens_valid.all(), f"Token 数异常: values={self.num_tokens.tolist()}"
+            assert tokens_valid.all(), (
+                f"Token 数异常: "
+                f"min={float(self.num_tokens.min()):.0f}, "
+                f"max={float(self.num_tokens.max()):.0f}, "
+                f"out_of_range={(~tokens_valid).sum()} 个"
+            )
         else:
             assert 0 <= self.num_tokens <= 4096, f"Token 数异常: {self.num_tokens}"
         assert 0 <= self.depth_used <= 50, f"深度越界: {self.depth_used}"

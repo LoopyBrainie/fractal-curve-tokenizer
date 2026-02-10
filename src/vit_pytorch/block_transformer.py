@@ -337,10 +337,9 @@ class FractalTransformer(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.use_fp16 = use_fp16  # I104-3
 
-        # Stochastic depth decay rule (I147: 移除 .item() 避免 GPU 同步)
-        # 使用 numpy 实现向量化，避免 torch.compile 优化路径中的 CPU 同步
-        import numpy as np
-        dpr = np.linspace(0, drop_path_rate, depth).tolist()
+        # P-OPT: Stochastic depth decay rule
+        # 使用 torch.linspace 预计算，避免 numpy 依赖和 .tolist() 转换
+        self.register_buffer('_drop_path_rates', torch.linspace(0, drop_path_rate, depth))
 
         self.layers = nn.ModuleList(
             [
@@ -351,7 +350,7 @@ class FractalTransformer(nn.Module):
                     mlp_dim=mlp_dim,
                     dropout=dropout,
                     max_level=max_level,
-                    drop_path=dpr[i],
+                    drop_path=self._drop_path_rates[i].item(),
                     ffn_type=ffn_type,
                     use_affine_modulation=use_affine_modulation,
                     fourier_levels=fourier_levels,

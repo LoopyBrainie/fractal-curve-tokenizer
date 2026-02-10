@@ -1,5 +1,10 @@
 #!/usr/bin/env python
-"""调试训练循环问题的脚本"""
+"""调试训练循环问题的脚本
+
+性能优化说明:
+- num_workers: 多进程并行加载数据，避免 GPU 等待 CPU
+- pin_memory: 启用后数据从 CPU 到 GPU 使用 DMA 传输，减少拷贝开销
+"""
 import sys
 import os
 
@@ -27,8 +32,12 @@ from train_fractal_vit import create_dataloaders
 class QuickConfig:
     def __init__(self):
         self.batch_size = 32
-        self.num_workers = 0
-        self.pin_memory = False
+        # P-OPT: 启用 num_workers 提高数据加载吞吐量
+        # GPU 计算速度远快于 CPU 数据加载，需要多进程并行化
+        import multiprocessing as mp
+        self.num_workers = min(8, mp.cpu_count())
+        # P-OPT: 启用 pin_memory 使用 DMA 传输，异步 GPU 加载
+        self.pin_memory = True
         self.subset_size = 256
         self.val_split = 0.1
         self.seed = 42

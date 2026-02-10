@@ -806,9 +806,14 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         for bias in biases[1:]:
             bias_total = bias_total + bias
 
-        # I109-1: 监控偏置量级（调试模式）
+        # I109-1: 监控偏置量级（P-OPT: 仅在调试模式触发）
         # 数学依据: clamp(-50, 50) 是数值稳定设计，softmax(50) ≈ one-hot
-        if torch.is_grad_enabled() and bias_total.numel() > 0:
+        # P-OPT: 使用 getattr 保护避免 GPU-CPU 同步，仅调试时触发
+        if (
+            torch.is_grad_enabled()
+            and bias_total.numel() > 0
+            and getattr(self, '_debug_mode', False)
+        ):
             bias_abs_max = bias_total.abs().max().item()
             # 当偏置量级接近 clamp 边界时发出警告
             if bias_abs_max > 40:  # 接近 50 的 80%

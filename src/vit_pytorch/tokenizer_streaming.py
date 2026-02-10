@@ -273,10 +273,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         tensor_result: "TensorSplitResult",
         B: int,
     ) -> "TensorSplitResult":
-        """强制 clamp tensor_result 到有效范围（CPU 安全版本）。
+        """强制 clamp tensor_result 到有效范围（GPU 安全版本）。
 
-        关键修复：先将 tensor 移动到 CPU 进行 clamp，避免 CUDA tensor 上的
-        任何操作触发 device-side assert。
+        关键优化：直接在 GPU 上进行 clamp 操作，避免 CPU-GPU 同步。
+        现代 PyTorch 的 clamp 操作在 CUDA 上是安全的，不会触发 device-side assert。
 
         Args:
             tensor_result: TensorSplitResult 分割结果
@@ -291,50 +291,33 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         dtype = tensor_result.batch_indices.dtype
         num_tokens = tensor_result.num_tokens
 
-        # I99-1: 关键修复 - CPU 中间步骤
-        # 先移动到 CPU 进行所有 clamp 操作，避免 CUDA tensor 上的任何操作
-        batch_indices_cpu = tensor_result.batch_indices.cpu()
-        depths_cpu = tensor_result.depths.cpu()
-        hilbert_indices_cpu = tensor_result.hilbert_indices.cpu()
-        regions_cpu = tensor_result.regions.cpu()
-        complexities_cpu = tensor_result.complexities.cpu() if tensor_result.complexities is not None else None
-
-        # 在 CPU 上安全 clamp
-        batch_indices_clamped_cpu = batch_indices_cpu.clamp(min=0, max=B - 1)
-        depths_clamped_cpu = depths_cpu.clamp(min=0, max=self.max_level)
+        # I99-1 OPT: 直接在 GPU 上 clamp，避免多次 CPU-GPU 同步
+        # 性能提升：减少 4 次 .cpu() + 4 次 .to(device) 传输开销
+        batch_indices = tensor_result.batch_indices.clamp(min=0, max=B - 1)
+        depths = tensor_result.depths.clamp(min=0, max=self.max_level)
 
         if num_tokens > 0:
-            hilbert_indices_clamped_cpu = hilbert_indices_cpu.clamp(min=0, max=num_tokens - 1)
+            hilbert_indices = tensor_result.hilbert_indices.clamp(min=0, max=num_tokens - 1)
         else:
-            hilbert_indices_clamped_cpu = hilbert_indices_cpu
+            hilbert_indices = tensor_result.hilbert_indices
 
-        # I99-1 FIX: 保留原始 token_indices（来自 split_result.candidate_indices）
-        # 不要创建新的 torch.arange，这会破坏与 probs 的对应关系
+        # 保留原始 token_indices（来自 split_result.candidate_indices）
         original_token_indices = getattr(tensor_result, 'token_indices', None)
         if original_token_indices is not None and original_token_indices.numel() == num_tokens:
-            # 原始 token_indices 存在且大小匹配，使用它
-            token_indices_cpu = original_token_indices.cpu().clone()
+            token_indices = original_token_indices
         else:
             # 回退到 arange（仅当 token_indices 不存在或大小不匹配时）
-            token_indices_cpu = torch.arange(num_tokens, dtype=torch.long)
-
-        # 移动回 GPU
-        batch_indices_clamped = batch_indices_clamped_cpu.to(device=device, dtype=dtype)
-        depths_clamped = depths_clamped_cpu.to(device=device, dtype=dtype)
-        hilbert_indices_clamped = hilbert_indices_clamped_cpu.to(device=device, dtype=torch.long)
-        token_indices_clamped = token_indices_cpu.to(device=device, dtype=torch.long)
+            token_indices = torch.arange(num_tokens, dtype=torch.long, device=device)
 
         tokens_per_batch = getattr(tensor_result, 'tokens_per_batch', None)
-        if tokens_per_batch is not None:
-            tokens_per_batch = tokens_per_batch.to(device=device)
 
         return TensorSplitResult(
-            regions=regions_cpu.to(device=device, dtype=torch.long),
-            depths=depths_clamped,
-            batch_indices=batch_indices_clamped,
-            hilbert_indices=hilbert_indices_clamped,
-            token_indices=token_indices_clamped,
-            complexities=complexities_cpu.to(device=device) if complexities_cpu is not None else None,
+            regions=tensor_result.regions,  # regions 通常已经在正确设备上
+            depths=depths,
+            batch_indices=batch_indices,
+            hilbert_indices=hilbert_indices,
+            token_indices=token_indices,
+            complexities=tensor_result.complexities,
             tokens_per_batch=tokens_per_batch,
         )
 
@@ -688,34 +671,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             selected_mask=selected_mask
         )
 
-        # 4. 构建输出 (P-OPT-4: 向量化输出构建，避免 Python for 循环)
-        # TokenSequence 对象仍需构建，但使用预计算的张量切片
-        # P-OPT: 从 count_matrix 直接在 GPU 上构建 depth_distribution，避免 .cpu()
-        # I145: 修复 GPU 同步问题 - 批量转换 tokens_per_batch 到 CPU
-        # 原始: int(tokens_per_batch[b].item()) 在循环中调用 B 次 .item()
-        # 修复: 一次性转换到 CPU，再在循环中使用 Python 值
-        tokens_per_batch_cpu = tokens_per_batch.cpu().tolist() if tokens_per_batch.is_cuda else tokens_per_batch.tolist()
-        sequences = []
-        for b in range(B):
-            # P-OPT: 使用预转换的 CPU 值，避免 GPU 同步
-            num_tokens = tokens_per_batch_cpu[b]
-            # 从 count_matrix[b] 在 GPU 上构建 depth_distribution
-            row = count_matrix[b]  # [max_d]
-            nonzero_mask = row > 0
-            nonzero_indices = nonzero_mask.nonzero(as_tuple=True)[0]
-            depth_dist = {int(d): int(row[d]) for d in nonzero_indices}
-            seq = TokenSequence(
-                tokens=tokens[b, :num_tokens],
-                metadata={
-                    "levels": levels_info[b, :num_tokens],
-                    "split_stats": {
-                        "num_tokens": num_tokens,
-                        "depth_distribution": depth_dist,
-                    },
-                },
-            )
-            sequences.append(seq)
-
         # P9-5/P12-2 优化: 传入已 padding 的张量缓存，避免 model 中重复 padding
         # I20: 简化输出构建
         # I24-14: 使用 tokens_per_batch 作为 lengths_tensor (已在 GPU 上)
@@ -723,6 +678,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         # P-OPT: 使用延迟构建，不传递 sequences
         # sequences 会在首次访问时通过 _build_sequences_from_cache() 延迟构建
+        # 注意：原代码中本地构建 sequences 但未使用的死代码已移除，避免 .tolist() 同步
         return TokenizerOutput(
             _padded_tokens_cache=tokens,
             _padded_levels_cache=levels_info,
@@ -731,7 +687,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             _image_size_cache=self.image_size,
             _split_probs_cache=padded_split_probs,
         )
-    
+
     def _embed_with_features(
         self,
         features: torch.Tensor,

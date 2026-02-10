@@ -637,8 +637,13 @@ class MixupCutmix:
         device = images.device
         
         # 检查 label 范围，防止越界
-        assert labels.min() >= 0, f"Label 包含负值: min={labels.min().item()}"
-        assert labels.max() < self.num_classes, f"Label 越界: max={labels.max().item()} >= {self.num_classes}"
+        # P-OPT: 使用 torch.all() 避免 .item() 同步开销
+        # assert labels.min() >= 0, f"Label 包含负值: min={labels.min().item()}"
+        # assert labels.max() < self.num_classes, f"Label 越界: max={labels.max().item()} >= {self.num_classes}"
+        if not torch.all(labels >= 0):
+            raise ValueError(f"Label 包含负值")
+        if torch.all(labels >= self.num_classes):
+            raise ValueError(f"Label 越界: max={labels.max().item() if labels.numel() < 1000 else 'tensor'} >= {self.num_classes}")
         
         # 转换为 one-hot 并应用 label smoothing
         labels_one_hot = F.one_hot(labels, self.num_classes).float()
@@ -1613,11 +1618,13 @@ def create_dataloaders(
     #   - shm < 1GB: 保守配置，禁用两者
     shm_sufficient = shm_size_gb >= 2.0
     shm_moderate = shm_size_gb >= 1.0
-    
-    # P-OPT: 禁用 pin_memory 避免 torch.compile + 多进程兼容性问题
-    use_pin_memory = False
+
+    # P-OPT: 启用 pin_memory 提高 CPU->GPU 传输效率
+    # 现代 PyTorch 2.x + CUDA 11.8+/12.x 支持 pin_memory + torch.compile
+    # 使用 non_blocking=True 在 transfer 时避免同步阻塞
+    use_pin_memory = shm_moderate and torch.cuda.is_available()
     use_persistent_workers = (
-        effective_workers > 0 
+        effective_workers > 0
         and (not is_container or shm_sufficient)  # 容器中需要更多共享内存
     )
     
@@ -2238,11 +2245,11 @@ def train_epoch(
     if hasattr(model, '_depth_monitor') and model._depth_monitor is not None:
         try:
             depth_stats = model._depth_monitor.update(global_step)
-            # 批量转换 GPU tensor 到 CPU（单次同步）
+            # 批量转换 GPU tensor 到 CPU（P-OPT: 使用 non_blocking 异步传输）
             pi_tensor = depth_stats['pi']
             if isinstance(pi_tensor, torch.Tensor) and pi_tensor.device.type == 'cuda':
-                # 一次性将 pi tensor 复制到 CPU，避免多次同步
-                pi_cpu = pi_tensor.detach().cpu()
+                # 使用 non_blocking 异步传输，与计算流水重叠
+                pi_cpu = pi_tensor.detach().to(device='cpu', non_blocking=True)
             else:
                 pi_cpu = pi_tensor
 

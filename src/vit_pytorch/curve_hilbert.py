@@ -1257,6 +1257,56 @@ class RectHilbertIndex:
         # 批量计算 Hilbert 距离
         return HilbertCurve.xy_to_d_batch(grid_size, grid_x, grid_y)
 
+    # P-OPT: Hilbert 顺序查找表缓存（向量化查询优化）
+    @classmethod
+    @_dynamo_safe_lru_cache(maxsize=256)
+    def _hilbert_order_table_cached(cls, H: int, W: int) -> torch.Tensor:
+        """
+        缓存 Hilbert 顺序查找表（2D 张量形式）。
+
+        内部使用，返回形状为 [H, W] 的 torch.Tensor，
+        其中 table[y, x] = Hilbert 索引。
+
+        Args:
+            H: 矩形高度
+            W: 矩形宽度
+
+        Returns:
+            形状为 [H, W] 的 long Tensor
+        """
+        # 获取扫描点（使用 HilbertScanner）
+        scan_points = HilbertScanner.scan(H, W)
+
+        # 构建 2D 查找表
+        table = torch.zeros(H, W, dtype=torch.long)
+        for idx, (x, y) in enumerate(scan_points):
+            if 0 <= y < H and 0 <= x < W:
+                table[y, x] = idx
+
+        return table
+
+    @classmethod
+    def hilbert_order_table(cls, H: int, W: int, device: torch.device) -> torch.Tensor:
+        """
+        获取 Hilbert 顺序查找表，支持任意设备。
+
+        返回形状为 [H, W] 的 torch.Tensor，其中 table[y, x] = Hilbert 索引。
+        内部使用缓存，返回张量会根据请求的设备移动。
+
+        Args:
+            H: 矩形高度
+            W: 矩形宽度
+            device: 目标设备
+
+        Returns:
+            形状为 [H, W] 的 long Tensor（位于指定设备上）
+        """
+        # 获取缓存的查找表（CPU 上）
+        table = cls._hilbert_order_table_cached(H, W)
+
+        # 移动到目标设备
+        return table.to(device, non_blocking=True)
+
 
 # I25-12: Pseudo-Hilbert 局部性量化工具类
 class HilbertLocalityMetrics:
@@ -2048,6 +2098,7 @@ class HilbertScanner:
 
         # I99-1 FIX: 防御性检查 - 确保 W 和 H 有效
         safe_W = max(1, W)
+        safe_W = max(1, W)
         safe_H = max(1, H)
 
         # 对于标准 Hilbert 退化情况
@@ -2186,30 +2237,23 @@ class HilbertScanner:
         # 坐标范围归一化到 [0, 1)
         norm_x = _cx / W
         norm_y = _cy / H
-
-        # 映射到 Pseudo-Hilbert 索引（I145-优化：向量化版本）
         num_points = _cx.shape[0]
-        pseudo_d = torch.zeros(num_points, device=_cx.device, dtype=torch.long)
 
-        # 预构建坐标到索引的映射
-        scan_points = cls.scan(H, W)
-        if len(scan_points) > 0 and num_points > 0:
-            coord_to_idx = {pt: i for i, pt in enumerate(scan_points)}
-
+        # P-OPT: 使用缓存的 Hilbert 顺序查找表进行向量化查询
+        # 避免 Python dict 和 .tolist() 同步开销
+        if num_points > 0:
             # 将中心坐标转换为整数坐标
             cx_int = (norm_x * (W - 1)).long().clamp(max=W - 1)
             cy_int = (norm_y * (H - 1)).long().clamp(max=H - 1)
 
-            # I145-优化：一次性转换为Python列表，避免循环中的.item()调用
-            cx_list = cx_int.tolist()
-            cy_list = cy_int.tolist()
+            # 使用 RectHilbertIndex 的缓存 2D 查找表进行向量化索引
+            # table[y, x] = hilbert_idx
+            order_table = RectHilbertIndex.hilbert_order_table(H, W, _cx.device)
 
-            # 使用列表推导批量查询
-            pseudo_d_list = [
-                coord_to_idx.get((cx_list[i], cy_list[i]), 0)
-                for i in range(num_points)
-            ]
-            pseudo_d = torch.tensor(pseudo_d_list, device=_cx.device, dtype=torch.long)
+            # 直接使用张量索引，无 Python 循环
+            pseudo_d = order_table[cy_int, cx_int]
+        else:
+            pseudo_d = torch.zeros(0, device=_cx.device, dtype=torch.long)
 
         # 注意：from_center 不添加深度偏移
         return pseudo_d
