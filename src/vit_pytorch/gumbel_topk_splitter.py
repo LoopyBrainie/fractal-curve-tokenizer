@@ -4684,6 +4684,11 @@ class GumbelTopKSplitter(
         # 区域面积
         region_areas = (regions[:, 2] - regions[:, 0]) * (regions[:, 3] - regions[:, 1])
 
+        # I145-修复: 确保 region_areas 在正确的设备上 (selected_mask 可能在 GPU)
+        target_device = selected_mask.device
+        if region_areas.device != target_device:
+            region_areas = region_areas.to(target_device)
+
         # 计算选中区域的覆盖面积
         B = selected_mask.shape[0]
         coverage_losses = []
