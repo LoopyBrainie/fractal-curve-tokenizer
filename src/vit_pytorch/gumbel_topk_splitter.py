@@ -4210,7 +4210,13 @@ class GumbelTopKSplitter(
         Returns:
             loss: 标量损失
         """
-        device = self.candidate_regions.device
+        # 根据输入确定设备：hard_mask > probs > candidate_regions
+        if hard_mask is not None:
+            device = hard_mask.device
+        elif probs is not None:
+            device = probs.device
+        else:
+            device = self.candidate_regions.device
 
         # I111-3: 安全获取深度数
         D = self._current_max_depth + 1 if self._current_max_depth is not None else 4
@@ -4619,7 +4625,7 @@ class GumbelTopKSplitter(
         D = self._current_max_depth + 1 if self._current_max_depth is not None else 5
 
         # 计算 one-hot 深度编码
-        depth_onehot = F.one_hot(depths, D).float()  # [N, D]
+        depth_onehot = F.one_hot(depths, D).float().to(hard_mask.device)  # [N, D]
 
         # 计算每个深度的选择数量: K_d[b] = Σ_i hard_mask[b,i] × 1[depth_i = d]
         K_per_depth = torch.einsum('bn,nd->bd', hard_mask, depth_onehot)  # [B, D]
