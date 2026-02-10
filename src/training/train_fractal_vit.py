@@ -2253,16 +2253,16 @@ def train_epoch(
             else:
                 pi_cpu = pi_tensor
 
-            # 提取关键指标（depth_stats 中的标量已在 DepthMonitor._compute_stats() 中提取）
-            perf_stats['depth_pi'] = pi_cpu.tolist()
+            # P-OPT: 延迟 .tolist() 到实际需要时，避免每次 batch 同步
+            # 保持 GPU tensor 引用用于 TensorBoard，仅存储 CPU 副本用于列表打印
+            perf_stats['depth_pi'] = pi_cpu  # 保持张量形式，延迟转换
             perf_stats['depth_entropy'] = depth_stats['entropy']
             perf_stats['depth_kl'] = depth_stats['kl_from_uniform']
             perf_stats['max_entropy'] = depth_stats['max_entropy']
-            perf_stats['dominant_depth'] = depth_stats['dominant_depth']
-            perf_stats['dominant_prob'] = depth_stats['dominant_prob']
-            # 保存 GPU tensor 用于 TensorBoard（避免重复转换）
-            perf_stats['_depth_pi_tensor'] = pi_tensor
-            perf_stats['_quota_probs_tensor'] = depth_stats.get('quota_probs')
+            perf_stats['depth_pi_tensor'] = pi_tensor  # 保留 GPU tensor 用于 TensorBoard
+            # 保存 quota_probs（如果存在）
+            if 'quota_probs' in depth_stats:
+                perf_stats['quota_probs'] = depth_stats['quota_probs']
         except Exception as e:
             # I111-6: 静默处理收集错误，避免影响训练
             pass
@@ -2617,7 +2617,7 @@ def log_splitter_health_to_tensorboard(
     # ==================================================
 
     # 1. 深度分布 histogram
-    depth_pi_tensor = perf_stats.get('_depth_pi_tensor')
+    depth_pi_tensor = perf_stats.get('depth_pi_tensor')
     if depth_pi_tensor is not None:
         # 深度分布直方图（单步分布）
         writer.add_histogram('Splitter/depth_distribution/pi',
@@ -2646,7 +2646,7 @@ def log_splitter_health_to_tensorboard(
         writer.add_scalar('Splitter/dominant_depth', perf_stats['dominant_depth'], epoch)
 
     # 5. 配额概率 histogram（如果可用）
-    quota_probs = perf_stats.get('_quota_probs_tensor')
+    quota_probs = perf_stats.get('quota_probs')
     if quota_probs is not None:
         writer.add_histogram('Splitter/quota_probs',
                            quota_probs.detach().cpu().numpy(), epoch)
@@ -4141,14 +4141,20 @@ def main():
                 print(f"  P10: {', '.join(p10_parts)}")
 
         # I111-6: 深度分布实时监控
-        if perf_stats.get('depth_pi') is not None and perf_stats.get('depth_entropy') is not None:
-            depth_pi = perf_stats['depth_pi']
+        # P-OPT: 延迟 .tolist() 到实际打印时，避免每个 batch 同步
+        depth_pi = perf_stats.get('depth_pi')
+        if depth_pi is not None and perf_stats.get('depth_entropy') is not None:
+            # 仅在需要打印时转换为列表（epoch 末尾）
+            if isinstance(depth_pi, torch.Tensor):
+                depth_pi_list = depth_pi.tolist()  # 延迟到此时才同步
+            else:
+                depth_pi_list = depth_pi
             entropy = perf_stats['depth_entropy']
-            max_entropy = perf_stats.get('max_entropy', math.log(len(depth_pi)))
+            max_entropy = perf_stats.get('max_entropy', math.log(len(depth_pi_list)))
             kl = perf_stats.get('depth_kl', 0)
 
             # 格式化深度分布字符串
-            depth_str = ", ".join([f"d{d}:{p*100:.1f}%" for d, p in enumerate(depth_pi)])
+            depth_str = ", ".join([f"d{d}:{p*100:.1f}%" for d, p in enumerate(depth_pi_list)])
             print(f"  Depth: {depth_str}")
             print(f"  Entropy: {entropy:.3f}/{max_entropy:.3f} ({entropy/max_entropy*100:.1f}%)")
 
