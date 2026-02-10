@@ -1838,7 +1838,9 @@ def train_epoch(
     optimizer.zero_grad(set_to_none=True)
 
     batch_times, data_times, forward_times = [], [], []
-    entropy_losses = []  # P1-5: 收集熵损失用于统计
+    # P-OPT: 使用 GPU 张量累加 entropy loss，避免每 batch 的 .item() 同步
+    entropy_loss_sum = torch.tensor(0.0, device=device)
+    entropy_loss_count = 0
     cuda_mem_peak = 0.0
     use_mixup = mixup_fn is not None
     nan_count = 0  # NaN 计数器
@@ -1907,16 +1909,23 @@ def train_epoch(
                 if config.use_channels_last:
                     imgs = imgs.to(memory_format=torch.use_channels_last)
         
-        # 检查 label 范围
-        if labels.min() < 0 or labels.max() >= num_classes:
-            print(f"\n[WARN] Label 范围异常: min={labels.min().item()}, max={labels.max().item()}, num_classes={num_classes}")
+        # P-OPT: 使用张量比较避免 GPU-CPU 同步
+        # 原代码: labels.min() < 0 or labels.max() >= num_classes
+        # 问题: .min()/.max() 触发 CUDA 同步
+        labels_invalid = (labels < 0).any() | (labels >= num_classes).any()
+        if labels_invalid:
+            # 仅在异常时获取具体值（此时同步不可避免）
+            print(f"\n[WARN] Label 范围异常: min={int(labels.min())}, max={int(labels.max())}, num_classes={num_classes}")
             continue
-        
+
         # I23-4-FIX: 检查输入图像是否包含 NaN/Inf
-        # 这可能由数据加载/增强导致，跳过有问题的 batch 避免 splitter_loss 变成 NaN
-        if torch.isnan(imgs).any() or torch.isinf(imgs).any():
-            nan_count_input = torch.isnan(imgs).sum().item()
-            inf_count_input = torch.isinf(imgs).sum().item()
+        # 使用 any() 而非 sum().item() 避免同步
+        imgs_has_nan = torch.isnan(imgs).any()
+        imgs_has_inf = torch.isinf(imgs).any()
+        if imgs_has_nan or imgs_has_inf:
+            # 仅在异常时同步获取数量
+            nan_count_input = int(torch.isnan(imgs).sum()) if imgs_has_nan else 0
+            inf_count_input = int(torch.isinf(imgs).sum()) if imgs_has_inf else 0
             print(f"\n[WARN] Batch {i}: 输入图像包含 NaN={nan_count_input}, Inf={inf_count_input}，跳过此 batch")
             continue
 
@@ -2094,7 +2103,9 @@ def train_epoch(
                     entropy_loss = None  # 跳过该损失
                 else:
                     loss = loss + entropy_loss_f32 / config.accum_steps
-                    entropy_losses.append(entropy_loss_f32.item())  # P1-5: 记录熵损失
+                    # P-OPT: 使用 GPU 张量累加，避免 .item() 同步
+                    entropy_loss_sum = entropy_loss_sum + entropy_loss_f32.detach()
+                    entropy_loss_count += 1
             if splitter_loss is not None:
                 splitter_loss_f32 = splitter_loss.float()
                 if torch.isnan(splitter_loss_f32) or torch.isinf(splitter_loss_f32):
@@ -2197,8 +2208,8 @@ def train_epoch(
         'throughput': total / sum(batch_times) if batch_times else 0,
         # P-OPT: 仅在 epoch 结束时获取内存统计，避免 per-batch 同步
         'cuda_mem_peak_gb': torch.cuda.max_memory_allocated() / 1024**3 if device.type == 'cuda' else 0.0,
-        # P1-5: 添加熵统计
-        'avg_entropy_loss': np.mean(entropy_losses) if entropy_losses else None,
+        # P1-5: 使用 GPU 张量计算平均熵损失，避免 per-batch .item() 同步
+        'avg_entropy_loss': (entropy_loss_sum / entropy_loss_count).item() if entropy_loss_count > 0 else None,
     }
     
     # P1-5: 获取当前尺度熵值用于监控
@@ -2247,7 +2258,8 @@ def train_epoch(
 
     if hasattr(model, '_depth_monitor') and model._depth_monitor is not None:
         try:
-            depth_stats = model._depth_monitor.update(global_step)
+            # P-FIX: 使用 epoch 替代未定义的 global_step
+            depth_stats = model._depth_monitor.update(epoch)
             # 批量转换 GPU tensor 到 CPU（P-OPT: 使用 non_blocking 异步传输）
             pi_tensor = depth_stats['pi']
             if isinstance(pi_tensor, torch.Tensor) and pi_tensor.device.type == 'cuda':

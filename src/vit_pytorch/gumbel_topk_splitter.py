@@ -2110,8 +2110,14 @@ class GumbelTopKSplitter(
 
         # 缓存 probs 和 selected_mask 用于辅助损失计算
         # I102-4: 使用 detach() 防止显存泄露
+        # I145-FIX: 同时保留非 detached 版本用于辅助损失的梯度计算
         self._last_probs = probs.detach()
-        self._last_selected_mask = consistent_mask.detach()  # I21: 用于 Depth KL Loss
+        self._last_probs_for_loss = probs  # 保留梯度用于辅助损失
+        self._last_selected_mask = consistent_mask.detach()  # 用于日志/统计
+        self._last_selected_mask_for_loss = consistent_mask  # 保留梯度用于辅助损失
+
+        # I145-FIX: 缓存当前 batch 的 token 数量用于弹性预算损失（有梯度）
+        self._last_num_selected_for_loss = result.num_selected_per_batch.float().mean()
 
         # 更新统计
         with torch.no_grad():
@@ -3706,13 +3712,13 @@ class GumbelTopKSplitter(
             )
         B, N = B_mask, N_mask
         device = consistent_mask.device
-        
-        # 使用硬阈值选择最终区域
+
+        # I145-FIX: 使用软掩码计算 token 数量，保持梯度
+        # 这用于辅助损失计算，不影响实际的 token 选择逻辑
+        num_selected_per_batch = consistent_mask.sum(dim=1)  # [B]
+
+        # 使用硬阈值选择最终区域 (用于实际 token 选择和索引)
         final_selected = (consistent_mask > 0.5)  # [B, N]
-        
-        # P-OPT-1: 向量化收集选中区域
-        # 计算每个 batch 的选中数量
-        num_selected_per_batch = final_selected.sum(dim=1)  # [B]
         
         # 确保每个 batch 至少有一个 token (根节点)
         empty_batches = (num_selected_per_batch == 0)
@@ -3831,17 +3837,21 @@ class GumbelTopKSplitter(
         device = self.candidate_regions.device
         losses = {}
 
-        # 获取 cached probs 和 selected_mask
-        probs = self._last_probs if hasattr(self, '_last_probs') else None
-        selected_mask = self._last_selected_mask if hasattr(self, '_last_selected_mask') else None
+        # I145-FIX: 获取带梯度的版本用于辅助损失计算
+        # 使用 _last_probs_for_loss / _last_selected_mask_for_loss 而不是 detached 版本
+        probs = self._last_probs_for_loss if hasattr(self, '_last_probs_for_loss') else None
+        selected_mask = self._last_selected_mask_for_loss if hasattr(self, '_last_selected_mask_for_loss') else None
 
-        # I23-4-FIX: NaN 检测与防护
+        # 同时保留 detached 版本用于 NaN 检测
+        probs_detached = self._last_probs if hasattr(self, '_last_probs') else None
+        selected_mask_detached = self._last_selected_mask if hasattr(self, '_last_selected_mask') else None
+
+        # I23-4-FIX: NaN 检测与防护 (使用 detached 版本检测)
         # 如果缓存的 probs 或 selected_mask 包含 NaN，返回零损失
-        # 这可能由上游输入包含 NaN 导致，应在训练脚本中处理根因
         has_nan = False
-        if probs is not None and torch.isnan(probs).any():
+        if probs_detached is not None and torch.isnan(probs_detached).any():
             has_nan = True
-        if selected_mask is not None and torch.isnan(selected_mask).any():
+        if selected_mask_detached is not None and torch.isnan(selected_mask_detached).any():
             has_nan = True
         
         if has_nan:
@@ -3867,7 +3877,8 @@ class GumbelTopKSplitter(
         #   L_bound = λ_boundary × [max(0, K_min - K)² + max(0, K - K_max)²]
         #
         if include_elastic_budget:
-            avg_tokens = self._avg_selected
+            # I145-FIX: 使用当前 batch 的实际 token 数（有梯度）而不是 EMA 值
+            avg_tokens = self._last_num_selected_for_loss if hasattr(self, '_last_num_selected_for_loss') else self._avg_selected
             candidate_count = self.num_candidates
 
             # === 动态目标覆盖率 ===
@@ -3904,7 +3915,10 @@ class GumbelTopKSplitter(
             # Poisson KL 散度损失
             # 数值稳定性: K ≥ 1, ratio ≥ ELASTIC_EPS
             K = avg_tokens.clamp(min=1.0)
-            K_t = max(target_K, 1.0)
+            # I145-FIX: 使用 torch.max 而不是 Python max，保持梯度
+            # target_K 是 float，需要先转换为张量
+            target_K_tensor = torch.tensor(target_K, device=K.device, dtype=K.dtype)
+            K_t = torch.max(target_K_tensor, torch.tensor(1.0, device=K.device))
             ratio = K / K_t
             ratio_clamped = ratio.clamp(min=ELASTIC_EPS)
 
@@ -3921,17 +3935,21 @@ class GumbelTopKSplitter(
             delta = K_t / 2.0
             diff = (K - K_t).abs()
 
+            # I145-FIX: 使用 torch.where 而不是 Python if，保持梯度
             # Huber 损失: L = { 0.5×Δ² if |Δ| ≤ δ; δ×|Δ| - 0.5×δ² otherwise }
+            # 构建条件张量
+            cond = diff <= delta
             huber_loss = torch.where(
-                diff <= delta,
+                cond,
                 0.5 * diff.pow(2),
                 delta * diff - 0.5 * (delta ** 2)
             )
 
             # === 组合损失 ===
             # L = factor × (λ_KL × L_KL + λ_Huber × L_Huber)
-            lambda_kl = ELASTIC_LAMBDA_KL      # 0.005
-            lambda_huber = HUBER_LAMBDA        # 0.001
+            # I145-FIX: 使用张量权重保持梯度
+            lambda_kl = torch.tensor(ELASTIC_LAMBDA_KL, device=K.device)  # 0.005
+            lambda_huber = torch.tensor(HUBER_LAMBDA, device=K.device)  # 0.001
             loss = self._elastic_budget_factor * (
                 lambda_kl * kl_loss + lambda_huber * huber_loss
             )
@@ -4416,8 +4434,9 @@ class GumbelTopKSplitter(
             hilbert_indices = hilbert_indices.to(device=device)
 
         # 获取选中掩码
+        # I145-FIX: 使用带梯度的版本用于损失计算
         if selected_mask is None:
-            selected_mask = self._last_selected_mask if hasattr(self, '_last_selected_mask') else None
+            selected_mask = self._last_selected_mask_for_loss if hasattr(self, '_last_selected_mask_for_loss') else None
 
         # I145-修复: 确保 selected_mask 在正确的设备上
         if selected_mask is not None and selected_mask.device != device:
@@ -4586,8 +4605,9 @@ class GumbelTopKSplitter(
         import torch.nn.functional as F
 
         # 获取硬选择掩码
+        # I145-FIX: 使用带梯度的版本
         if hard_mask is None:
-            hard_mask = self._last_hard_mask if hasattr(self, '_last_hard_mask') else None
+            hard_mask = self._last_selected_mask_for_loss if hasattr(self, '_last_selected_mask_for_loss') else None
 
         if hard_mask is None:
             return torch.tensor(0.0, device=self.candidate_regions.device)
@@ -4651,7 +4671,8 @@ class GumbelTopKSplitter(
         device = self.candidate_regions.device
 
         if selected_mask is None:
-            selected_mask = self._last_selected_mask if hasattr(self, '_last_selected_mask') else None
+            # I145-FIX: 使用带梯度的版本用于损失计算
+            selected_mask = self._last_selected_mask_for_loss if hasattr(self, '_last_selected_mask_for_loss') else None
 
         if selected_mask is None:
             return torch.tensor(0.0, device=device)
