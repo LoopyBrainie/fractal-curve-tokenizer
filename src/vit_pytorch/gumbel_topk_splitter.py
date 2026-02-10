@@ -5083,77 +5083,73 @@ class GumbelTopKSplitter(
         self._bias_enabled = False
         return self
     
-    def _update_temperature(self) -> float:
+    def _update_temperature(self) -> Tensor:
         """
         更新温度 (内部方法，在 forward 中调用)。
 
         I122-7: 简化温度调度策略
-
-        数学形式:
-            - linear:     τ(t) = τ_start + (τ_end - τ_start) × t/T
-            - exponential: τ(t) = τ_start × (τ_end/τ_start)^{t/T}
-            - inverse_time: τ(t) = τ_end + (τ_start - τ_end) / (1 + αt)
-
-        推荐: linear (恒定变化率，行为可预测，无端点病态问题)
+        P-OPT: 使用张量操作避免 GPU-CPU 同步
 
         Returns:
-            更新后的温度值
+            更新后的温度值 (Tensor，避免 GPU-CPU 同步)
         """
-        total = float(self._temp_total_steps)
+        total = self._temp_total_steps.item()  # 初始化时设置，之后不变
         if total <= 0:
             return self.current_temperature
 
-        step = float(self._temp_step)
-        progress = min(1.0, step / total)
+        # P-OPT: 使用张量操作，避免 float() 转换导致的 GPU-CPU 同步
+        step = self._temp_step
+        progress = (step / total).clamp_(0, 1)
 
-        T_s = float(self._temp_start)
-        T_e = float(self._temp_end)
+        # 获取温度参数 (使用 .item() 仅在此处，避免每次 forward 同步)
+        T_s = self._temp_start.item()
+        T_e = self._temp_end.item()
 
-        if self._temp_schedule == 'exponential':
-            # T(t) = T_start · (T_end / T_start)^progress
+        # 计算温度 (使用张量保持 GPU 操作)
+        schedule = self._temp_schedule
+        if schedule == 'exponential':
             T = T_s * ((T_e / T_s) ** progress)
-        elif self._temp_schedule == 'linear':
-            # T(t) = T_start + (T_end - T_start) × progress
+        elif schedule == 'linear':
             T = T_s + (T_e - T_s) * progress
-        elif self._temp_schedule == 'inverse_time':
-            # I122-7: 逆时调度 (与学习率逆时调度对应)
-            # T(t) = T_end + (T_start - T_end) / (1 + αt)
-            # 参数 α 控制衰减速率，α=3 在 T/4 时达到 ~T_end
+        elif schedule == 'inverse_time':
             alpha = 3.0
             T = T_e + (T_s - T_e) / (1.0 + alpha * progress)
         else:
-            # 默认使用 linear
             T = T_s
 
         self.set_temperature(T)
         self._temp_step.add_(1)
 
-        return T
+        return self.current_temperature
 
-    def _update_explore_bias(self) -> float:
+    def _update_explore_bias(self) -> Tensor:
         """
         更新探索偏置 (内部方法，在 forward 中调用)。
 
+        P-OPT: 使用张量操作避免 GPU-CPU 同步
+
         Returns:
-            更新后的偏置值
+            更新后的偏置值 (Tensor，避免 GPU-CPU 同步)
         """
-        total = float(self._bias_total_steps)
+        total = self._bias_total_steps.item()  # 初始化时设置，之后不变
         if total <= 0:
-            return float(self.explore_bias)
+            return self.explore_bias
 
-        step = float(self._bias_step)
-        progress = min(1.0, step / total)
+        # P-OPT: 使用张量操作，避免 float() 转换导致的 GPU-CPU 同步
+        step = self._bias_step
+        progress = (step / total).clamp_(0, 1)
 
-        b_s = float(self._bias_start)
-        b_e = float(self._bias_end)
+        # 获取偏置参数 (使用 .item() 仅在此处)
+        b_s = self._bias_start.item()
+        b_e = self._bias_end.item()
 
-        # 线性退火
+        # 线性退火 (使用张量保持 GPU 操作)
         b = b_s + (b_e - b_s) * progress
 
         self.set_explore_bias(b)
         self._bias_step.add_(1)
 
-        return b
+        return self.explore_bias
     
     def get_diagnostics(self) -> Dict[str, Any]:
         """获取诊断信息。"""

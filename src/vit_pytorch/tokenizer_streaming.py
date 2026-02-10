@@ -967,21 +967,17 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 计算每个 batch 需要的最小 token 数（向上取整）
         min_required = max(1, (N_total + B_int - 1) // B_int)  # 向上取整确保足够
 
-        # 使用 torch.maximum 确保至少为 1 且足够容纳所有 token
-        max_tokens_tensor = torch.maximum(
-            max_tokens,
-            torch.tensor(min_required, device=device, dtype=max_tokens.dtype)
-        )
-        max_tokens_safe = max_tokens_tensor.item()  # 提取 Python int 用于 tensor 形状
+        # P-OPT: max_tokens 转换 (必须使用 Python int 用于 tensor 形状)
+        # 仅在 tensor 类型时调用 .item()，减少不必要的 GPU-CPU 同步
+        if isinstance(max_tokens, torch.Tensor):
+            max_tokens_int = max_tokens.item() if max_tokens.numel() == 1 else int(max.max(max_tokens))
+        else:
+            max_tokens_int = max(1, int(max_tokens))
 
-        # 验证 max_tokens_safe 是有效的
-        if max_tokens_safe < 1:
-            max_tokens_safe = 1
-
-        tokens = torch.zeros(B, max_tokens_safe, dim, device=device, dtype=dtype)
+        tokens = torch.zeros(B, max_tokens_int, dim, device=device, dtype=dtype)
         # I32-2: 使用-1 sentinel标识padding token，避免与有效depth=0混淆
-        levels_info = torch.full((B, max_tokens_safe, self.max_level + 1), -1, dtype=torch.long, device=device)
-        padded_regions = torch.zeros(B, max_tokens_safe, 4, dtype=torch.long, device=device)  # P11-3
+        levels_info = torch.full((B, max_tokens_int, self.max_level + 1), -1, dtype=torch.long, device=device)
+        padded_regions = torch.zeros(B, max_tokens_int, 4, dtype=torch.long, device=device)  # P11-3
 
         # I99-1: 修复 batch 独立性 - 确保按 (batch_idx, hilbert_idx) 排序
         # 问题: batch_indices 可能未按 batch 分组，导致 token 位置计算错误
