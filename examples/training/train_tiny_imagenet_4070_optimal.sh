@@ -67,4 +67,5 @@ uv run python src/training/train_fractal_vit.py \
   --gradient-checkpoint \
   --compile \
   --channels-last \
-  --patience 25 
+  --patience 25 \
+  --num-workers 8
