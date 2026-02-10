@@ -5093,7 +5093,11 @@ class GumbelTopKSplitter(
         Returns:
             更新后的温度值 (Tensor，避免 GPU-CPU 同步)
         """
-        total = self._temp_total_steps.item()  # 初始化时设置，之后不变
+        # P-OPT: 延迟 .item() 到真正需要时，使用 Python 变量缓存
+        if not hasattr(self, '_cached_temp_total'):
+            self._cached_temp_total = self._temp_total_steps.item() if self._temp_total_steps.numel() > 0 else 0
+        total = self._cached_temp_total
+
         if total <= 0:
             return self.current_temperature
 
@@ -5101,12 +5105,18 @@ class GumbelTopKSplitter(
         step = self._temp_step
         progress = (step / total).clamp_(0, 1)
 
-        # 获取温度参数 (使用 .item() 仅在此处，避免每次 forward 同步)
-        T_s = self._temp_start.item()
-        T_e = self._temp_end.item()
+        # 使用缓存的温度参数 (初始化时设置，之后不变)
+        schedule = self._temp_schedule
+
+        # 缓存温度参数 (惰性初始化)
+        if not hasattr(self, '_cached_temp_start'):
+            self._cached_temp_start = self._temp_start.item()
+        if not hasattr(self, '_cached_temp_end'):
+            self._cached_temp_end = self._temp_end.item()
+        T_s = self._cached_temp_start
+        T_e = self._cached_temp_end
 
         # 计算温度 (使用张量保持 GPU 操作)
-        schedule = self._temp_schedule
         if schedule == 'exponential':
             T = T_s * ((T_e / T_s) ** progress)
         elif schedule == 'linear':
@@ -5131,7 +5141,11 @@ class GumbelTopKSplitter(
         Returns:
             更新后的偏置值 (Tensor，避免 GPU-CPU 同步)
         """
-        total = self._bias_total_steps.item()  # 初始化时设置，之后不变
+        # P-OPT: 延迟 .item() 到真正需要时，使用 Python 变量缓存
+        if not hasattr(self, '_cached_bias_total'):
+            self._cached_bias_total = self._bias_total_steps.item() if self._bias_total_steps.numel() > 0 else 0
+        total = self._cached_bias_total
+
         if total <= 0:
             return self.explore_bias
 
@@ -5139,9 +5153,13 @@ class GumbelTopKSplitter(
         step = self._bias_step
         progress = (step / total).clamp_(0, 1)
 
-        # 获取偏置参数 (使用 .item() 仅在此处)
-        b_s = self._bias_start.item()
-        b_e = self._bias_end.item()
+        # 缓存偏置参数 (惰性初始化)
+        if not hasattr(self, '_cached_bias_start'):
+            self._cached_bias_start = self._bias_start.item()
+        if not hasattr(self, '_cached_bias_end'):
+            self._cached_bias_end = self._bias_end.item()
+        b_s = self._cached_bias_start
+        b_e = self._cached_bias_end
 
         # 线性退火 (使用张量保持 GPU 操作)
         b = b_s + (b_e - b_s) * progress
