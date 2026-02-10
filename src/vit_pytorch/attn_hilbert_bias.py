@@ -907,7 +907,8 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             depth_count = depth_mask.sum(dim=1)  # [B]
 
             # 检查是否有深度 d 的 token（跨所有 batch）
-            if depth_count.sum() == 0:
+            # P-OPT: 使用 torch.any() 代替 sum() == 0，避免 GPU-CPU 同步
+            if not depth_count.any():
                 continue
 
             # 深度缩放 (广播到 [1, H, 1, 1])

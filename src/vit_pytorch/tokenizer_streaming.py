@@ -898,17 +898,18 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         regions[:, 3] = regions[:, 3].clamp_(min=0, max=img_size)
 
         # I99-1 CRITICAL: 验证 batch_indices 值范围（在 clamp 之前）
-        # P-OPT: 使用 no_grad 上下文避免梯度跟踪开销
-        with torch.no_grad():
-            batch_indices_raw = tensor_result.batch_indices
-            if batch_indices_raw.numel() > 0:
-                batch_min = int(batch_indices_raw.min().item())
-                batch_max = int(batch_indices_raw.max().item())
-                if batch_min < 0 or batch_max >= B_int:
-                    raise RuntimeError(
-                        f"I99-1 CRITICAL: batch_indices 包含无效值! "
-                        f"min={batch_min}, max={batch_max}, B={B_int}, N_total={N_total}"
-                    )
+        # P-OPT: 使用向量化布尔运算，避免 GPU-CPU 同步
+        # torch.all/any 保持张量在 GPU 上，不触发 .item() 同步
+        batch_indices_raw = tensor_result.batch_indices
+        if batch_indices_raw.numel() > 0:
+            # 向量化检查：batch_min >= 0 且 batch_max < B_int
+            valid_min = (batch_indices_raw >= 0).all()
+            valid_max = (batch_indices_raw < B_int).all()
+            # 使用 assert 而不是 if-raise，避免 Python 控制流
+            assert valid_min and valid_max, (
+                f"I99-1 CRITICAL: batch_indices 包含无效值! "
+                f"范围=[{batch_indices_raw.min()}, {batch_indices_raw.max()}], B={B_int}, N_total={N_total}"
+            )
 
         # I99-1: 防御性 clamp batch_indices (额外保护)
         batch_indices = tensor_result.batch_indices.clamp(min=0, max=B_int - 1)

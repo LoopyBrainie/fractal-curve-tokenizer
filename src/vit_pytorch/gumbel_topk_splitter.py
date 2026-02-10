@@ -527,8 +527,8 @@ class ContinuousQuotaAllocator(nn.Module):
             # 初始使用更高温度以获得更平滑的梯度
             warmup_ratio = self._current_step / self.tau_warmup_steps
             tau_current = self.tau + (self.tau * 2 - self.tau) * warmup_ratio
-            return torch.tensor(tau_current)
-        return torch.tensor(self.tau)
+            return torch.tensor(tau_current, device=self.quota_logits.device)
+        return torch.tensor(self.tau, device=self.quota_logits.device)
 
     def forward(self, K: Union[int, Tensor]) -> Tuple[Tensor, Tensor]:
         """
@@ -2515,9 +2515,9 @@ class GumbelTopKSplitter(
             # 使用连续松弛分配器
             K_hard, K_soft = self.quota_allocator.forward(K)
 
-            # 确保维度正确
-            K_hard = K_hard[:D].to(device)
-            K_soft = K_soft[:D].to(device)
+            # 确保维度正确 (P-OPT: 移除多余的 .to(device)，quota_logits 已随模型正确迁移)
+            K_hard = K_hard[:D]
+            K_soft = K_soft[:D]
 
             # 更新warmup进度
             self.quota_allocator.step()
@@ -2970,11 +2970,10 @@ class GumbelTopKSplitter(
         K_soft_remaining = K_soft_remaining.clamp(min=0)
 
         # 按相对分数比例分配剩余配额
-        if K_soft_remaining.sum() > 0:
-            ratio = K_soft_remaining / K_soft_remaining.sum()
-            K_extra = (ratio * K_remaining).floor().long()
-        else:
-            K_extra = torch.zeros(D, device=device, dtype=torch.long)
+        # P-OPT: 使用 torch.where() 向量化处理，避免 GPU-CPU 同步
+        total = K_soft_remaining.sum()
+        ratio = torch.where(total > 0, K_soft_remaining / total, torch.zeros_like(K_soft_remaining))
+        K_extra = (ratio * K_remaining).floor().long()
 
         # 确保 K_extra 不超过剩余配额
         K_extra = K_extra.clamp(max=K_remaining)
@@ -3366,23 +3365,14 @@ class GumbelTopKSplitter(
             num_per_depth.append(len(depth_indices))
 
         # I97-4 优化: 批量提取 K_d（减少 CPU/GPU 同步）
-        # I102-6: 使用 tolist() 一次性转换，避免 D 次 .item() 调用
+        # P-OPT: 延迟转换 - 只在每个循环内转换需要的元素，避免一次性转换整个张量
         quota_clamped = quota.detach().clamp(min=0).long()  # [D] 张量
-        K_d_values_raw = quota_clamped.tolist()  # 一次性转换为 Python 列表
 
-        # 批量边界检查（避免 Python 循环内的 .item() 调用）
-        K_d_values = [min(max(k_d, 0), n) for k_d, n in zip(K_d_values_raw, num_per_depth)]
-        # K_d_values 是 Python int 列表，用于后续的 topk k 参数
-
-        # 分层选择
+        # 分层选择 - 延迟到每个深度再转换 K_d
         for d in range(D):
             depth_indices = depth_indices_list[d]  # [N_d]
             N_d = num_per_depth[d]
-            K_d = K_d_values[d]  # 预提取的 Python int
-
-            # I99-1 FIX: torch.compile 保护 - 显式 clamp 防止优化绕过
-            # torch.topk 要求 K <= N，额外的 min() 确保安全
-            K_d = min(max(K_d, 0), N_d)
+            K_d = int(quota_clamped[d].clamp(min=0, max=N_d))  # P-OPT: 单元素转换，开销极小
 
             if K_d <= 0 or N_d == 0:
                 continue

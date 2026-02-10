@@ -426,9 +426,9 @@ class FractalPathEmbedding(nn.Module):
         
         # 2. 路径编码
         # 获取预计算的路径并扩展到 batch
+        # P-OPT: base_paths 已通过 register_buffer 注册，会随模型自动迁移，无需 .to(device)
         paths = self.base_paths[:N].unsqueeze(0).expand(B, -1, -1)  # [B, N, max_level]
-        paths = paths.to(device)
-        
+
         # 计算每个 token 的有效深度
         # scale_idx=0 (最细) → depth=max_level
         # scale_idx=num_scales-1 (最粗) → depth=1
