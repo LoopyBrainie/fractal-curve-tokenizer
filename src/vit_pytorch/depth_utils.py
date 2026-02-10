@@ -258,7 +258,7 @@ compute_max_level = compute_max_depth
 def compute_region_shape_scale(
     regions: torch.Tensor,
     image_size: Tuple[int, int],
-    epsilon: float = 1e-8,
+    epsilon: float = SHAPE_NORM_EPSILON,  # I99-1 OPT: 使用常量替代 1e-8
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     计算区域的形状和尺度特征。
@@ -410,7 +410,7 @@ def compute_shape_scale_similarity(
 def compute_normalized_area(
     regions: torch.Tensor,
     image_size: Tuple[int, int],
-    epsilon: float = 1e-8,
+    epsilon: float = SHAPE_NORM_EPSILON,  # I99-1 OPT: 使用常量替代 1e-8
 ) -> torch.Tensor:
     """
     计算归一化面积分数 (I31-3)

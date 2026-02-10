@@ -809,7 +809,8 @@ class CurriculumWeightScheduler(nn.Module):
         T = self._total_epochs
         t_norm = current_epoch / T
 
-        alpha = self._get_phase_factor(torch.tensor(t_norm))
+        # I145-修复: 使用 torch.as_tensor 避免从已有张量复制数据的警告
+        alpha = self._get_phase_factor(torch.as_tensor(t_norm, dtype=torch.float32))
         # I122-6: 使用线性反比 (1/α) 而非平方根反比 (1/√α)
         return self._base_entropy_weight / alpha
 
@@ -818,7 +819,7 @@ class CurriculumWeightScheduler(nn.Module):
         T = float(self._total_epochs.item())
         t = current_epoch
 
-        alpha = self._get_phase_factor(torch.tensor(t / T)).item()
+        alpha = self._get_phase_factor(torch.as_tensor(t / T, dtype=torch.float32)).item()
         budget_weight = self._base_budget_weight * alpha
         # I122-6: 使用线性反比 (1/α) 而非平方根反比 (1/√α)
         entropy_weight = self._base_entropy_weight / alpha
@@ -1907,45 +1908,38 @@ class GumbelTopKSplitter(
             # I107-1: 确保 EMA 缓冲区足够大
             self._ensure_ema_buffers(B, device)
 
-            for b in range(B):
-                mu_b = mu_per_batch[b]  # [D]
-                var_b = variance_per_batch[b]  # [D]
+            if not self._ema_buffer_initialized:
+                # I100-5: 首次初始化 - 逐样本处理（需要 B 相关的条件逻辑）
+                for b in range(B):
+                    mu_b = mu_per_batch[b]  # [D]
+                    var_b = variance_per_batch[b]  # [D]
 
-                if not self._ema_buffer_initialized:
-                    # I100-5: 首次初始化 - 分层保守初始化
                     # 根据 batch size 的统计可靠性分级处理
                     safe_var = var_b.detach().clamp(min=DEPTH_VARIANCE_NORM_EPS)
                     if B == 1:
                         # B=1: 样本方差无定义，使用先验 σ²=0.25
                         safe_var = safe_var.clamp(min=DEPTH_VARIANCE_INIT_EPS_B1)
-                        logger.debug(
-                            f"[I112-5] Depth variance tiered init: B={B}, "
-                            f"using B{B} tiered init (eps={DEPTH_VARIANCE_INIT_EPS_B1})"
-                        )
                     elif B == 2:
                         # B=2: 置信区间 5124:1，需要 4× 缓冲
                         safe_var = safe_var.clamp(min=DEPTH_VARIANCE_INIT_EPS_B2)
-                        logger.debug(
-                            f"[I112-5] Depth variance tiered init: B={B}, "
-                            f"using B{B} tiered init (eps={DEPTH_VARIANCE_INIT_EPS_B2})"
-                        )
                     elif B == 4:
                         # B=4: 置信区间 130:1，需要 1.5× 缓冲
                         safe_var = safe_var.clamp(min=DEPTH_VARIANCE_INIT_EPS_B4)
                     # B≥4: 使用 DEPTH_VARIANCE_NORM_EPS (1e-6)
                     self._depth_ema_mean[b, :D] = mu_b.detach()
                     self._depth_ema_var[b, :D] = safe_var
-                else:
-                    # I99-1: Per-sample EMA 更新
-                    # μ_new = α × μ_batch + (1-α) × μ_old (对每个样本独立)
-                    self._depth_ema_mean[b, :D] = (
-                        DEPTH_EMA_ALPHA * mu_b.detach() +
-                        (1 - DEPTH_EMA_ALPHA) * self._depth_ema_mean[b, :D]
-                    )
-                    self._depth_ema_var[b, :D] = (
-                        DEPTH_EMA_ALPHA * var_b.detach() +
-                        (1 - DEPTH_EMA_ALPHA) * self._depth_ema_var[b, :D]
-                    ).clamp(min=DEPTH_VARIANCE_NORM_EPS)
+            else:
+                # I99-1 OPT: 已初始化后向量化 EMA 更新
+                # μ_new = α × μ_batch + (1-α) × μ_old (批量处理)
+                alpha = DEPTH_EMA_ALPHA
+                self._depth_ema_mean[:B, :D] = (
+                    alpha * mu_per_batch.detach() +
+                    (1 - alpha) * self._depth_ema_mean[:B, :D]
+                )
+                self._depth_ema_var[:B, :D] = (
+                    alpha * variance_per_batch.detach() +
+                    (1 - alpha) * self._depth_ema_var[:B, :D]
+                ).clamp(min=DEPTH_VARIANCE_NORM_EPS)
 
             self._ema_buffer_initialized = True
 

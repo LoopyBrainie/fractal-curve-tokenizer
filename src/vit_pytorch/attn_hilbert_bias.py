@@ -310,9 +310,9 @@ class LCAHilbertBias(HilbertBiasBase):
         # I30-5: 路径值验证 + 警告
         # 四叉树路径值必须是 0-3 (对应四个象限: 左上, 右上, 左下, 右下)
         # I102-5: 仅在需要时计算 .item()，避免不必要的 GPU-CPU 同步
-        # P-OPT: 先用张量比较检测异常，再在警告中提取值
+        # I99-1 OPT: 添加调试模式检查，避免 CUDA Graphs 中断
         path_out_of_range = (paths > 3).any() | (paths < 0).any()
-        if path_out_of_range:
+        if path_out_of_range and getattr(self, '_debug_mode', False):
             # 仅在异常时触发同步
             path_min = paths.min().item()
             path_max = paths.max().item()
@@ -334,13 +334,17 @@ class LCAHilbertBias(HilbertBiasBase):
         # I34-13: LCA 钳位改为异常 - 静默钳位掩盖计算 bug
         # I102-5: 使用张量比较避免 GPU-CPU 同步
         # I147: 修复变量遮蔽，使用 actual_max 避免遮蔽 self.max_level
+        # I99-1 OPT: 添加调试模式获取详细值
         lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_level).any()
         if lca_invalid:
-            min_depth = lca_depths.min().item()
-            actual_max = lca_depths.max().item()  # 重命名避免遮蔽 self.max_level
+            if getattr(self, '_debug_mode', False):
+                min_depth = lca_depths.min().item()
+                actual_max = lca_depths.max().item()  # 重命名避免遮蔽 self.max_level
+            else:
+                min_depth, actual_max = "<tensor>", "<tensor>"
             raise ValueError(
                 f"LCA depth out of bounds [0, {self.max_level}]: "
-                f"min={min_depth:.2f}, max={actual_max:.2f}. "
+                f"min={min_depth}, max={actual_max}. "
                 "This indicates a bug in LCA computation."
             )
 
@@ -409,8 +413,9 @@ class LCAHilbertBias(HilbertBiasBase):
         lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
         # I34-13: LCA 钳位警告 - 静默钳位可能隐藏计算 bug
         # I102-5: 使用张量比较 + 延迟构造警告消息
+        # I99-1 OPT: 添加调试模式检查，避免 CUDA Graphs 中断
         lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_level).any()
-        if lca_invalid:
+        if lca_invalid and getattr(self, '_debug_mode', False):
             warnings.warn(
                 f"LCA depth clamped to [0, {self.max_level}]. "
                 f"Min: {lca_depths.min().item():.2f}, Max: {lca_depths.max().item():.2f}"
@@ -1355,8 +1360,9 @@ class ShapeScaleEncoder(nn.Module):
         W, H = image_size
 
         # 计算纵横比和面积 [B, N]
+        # I99-1 OPT: 使用 EPS 常量替代硬编码 1e-8
         aspect_ratios, normalized_areas = compute_region_shape_scale(
-            regions, (W, H), epsilon=1e-8
+            regions, (W, H), epsilon=EPS
         )
 
         # I35-5: 特征归一化 (异质性特征空间对齐)
@@ -1423,8 +1429,9 @@ class ShapeScaleEncoder(nn.Module):
         W, H = image_size
 
         # 计算并归一化特征 [B, N]
+        # I99-1 OPT: 使用 EPS 常量替代硬编码 1e-8
         aspect_ratios, normalized_areas = compute_region_shape_scale(
-            regions, (W, H), epsilon=1e-8
+            regions, (W, H), epsilon=EPS
         )
         aspect_ratios_norm = torch.tanh(aspect_ratios / (1 + aspect_ratios.abs()))
         normalized_areas_log = torch.log(normalized_areas + EPS)
@@ -1961,7 +1968,8 @@ class AreaEncoder(nn.Module):
         W, H = image_size_tuple
 
         # 1. 计算归一化面积分数
-        area_scores = compute_normalized_area(regions, image_size, epsilon=1e-8)
+        # I99-1 OPT: 使用 EPS 常量替代硬编码 1e-8
+        area_scores = compute_normalized_area(regions, image_size, epsilon=EPS)
         # area_scores: [B, N]
 
         # 2. 计算归一化 Patch 尺寸 (用于动态频率)

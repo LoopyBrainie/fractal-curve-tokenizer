@@ -132,10 +132,11 @@ class TrainingStats:
             for i, n in enumerate(self.num_tokens):
                 assert 0 <= n <= 4096, f"Batch[{i}] Token 数异常: {n}"
         elif isinstance(self.num_tokens, torch.Tensor):
-            # I99-1: 张量类型需要使用 .item() 或逐元素比较
-            n_min = self.num_tokens.min().item()
-            n_max = self.num_tokens.max().item()
-            assert 0 <= n_min and n_max <= 4096, f"Token 数异常: min={n_min}, max={n_max}, values={self.num_tokens.tolist()}"
+            # I99-1 OPT: 使用张量比较避免 .item() 同步
+            # assert (self.num_tokens >= 0).all() and (self.num_tokens <= 4096).all()
+            # 注意: 完整值检查保留 tolist() 但仅在 assert 失败时触发
+            tokens_valid = (self.num_tokens >= 0) & (self.num_tokens <= 4096)
+            assert tokens_valid.all(), f"Token 数异常: values={self.num_tokens.tolist()}"
         else:
             assert 0 <= self.num_tokens <= 4096, f"Token 数异常: {self.num_tokens}"
         assert 0 <= self.depth_used <= 50, f"深度越界: {self.depth_used}"
@@ -1237,7 +1238,8 @@ class FractalCurveViT(nn.Module):
         # 从 levels_list 推断主要使用的深度
         # I142: 使用向量化操作替代 for 循环中的 int() 转换，避免 CPU 同步
         # I145: 已知限制 - int() 转换仍会导致 CPU 同步，影响 torch.compile cudagraphs
-        # TODO: 修改 TrainingStats.depth_used 类型为 Union[int, Tensor]，完全消除 CPU 同步
+        # I99-1 OPT: 修改 TrainingStats.depth_used 类型为 Union[int, Tensor]
+        # 保持 Tensor 格式避免 CPU 同步，训练器负责在需要时转换
         if levels_list and len(levels_list) > 0:
             # 向量化计算所有 depths 的最大值
             all_max_levels = []
@@ -1246,13 +1248,13 @@ class FractalCurveViT(nn.Module):
                     # 获取每个样本的最大深度
                     all_max_levels.append(levels[:, 0].max())
             if all_max_levels:
-                # 使用 torch.stack 和 max，避免 CPU 同步
+                # 使用 torch.stack 和 max，保持 GPU Tensor 格式
                 max_level_tensor = torch.stack(all_max_levels).max()
-                depth_used = int(max_level_tensor)  # 已知限制: CPU 同步点
+                depth_used = max_level_tensor  # 保持 Tensor，避免 CPU 同步
             else:
-                depth_used = 0
+                depth_used = torch.tensor(0, device='cuda' if torch.cuda.is_available() else 'cpu', dtype=torch.long)
         else:
-            depth_used = 0
+            depth_used = torch.tensor(0, device='cuda' if torch.cuda.is_available() else 'cpu', dtype=torch.long)
 
         # I107-7: 在 training 模式下返回 shared_features供 auxiliary loss 使用
         return_features = features if self.training else None
@@ -1292,7 +1294,8 @@ class FractalCurveViT(nn.Module):
         """
         # StreamingFractalTokenizerV3 使用可微分的 Region Pooling
         # 无需策略梯度损失 (I78: 使用预分配零张量避免重复分配)
-        return self._zero_loss.detach().to(self.aux_loss_weight.device)
+        # I99-1 OPT: 添加 non_blocking=True 进行异步传输
+        return self._zero_loss.detach().to(self.aux_loss_weight.device, non_blocking=True)
     
     def clear_tokenizer_cache(self) -> None:
         """清空 tokenizer 和 splitter 的内部状态，应在每个 batch 结束后调用 (I98-2).

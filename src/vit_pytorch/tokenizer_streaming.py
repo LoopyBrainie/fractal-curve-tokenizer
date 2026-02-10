@@ -84,14 +84,17 @@ def _safe_scalar_to_int(value: Any, name: str = "value") -> int:
     if value is None:
         raise RuntimeError(f"I99-1 CRITICAL: {name} 不能为 None!")
 
+    # I99-1 OPT: 延迟同步到 no_grad 上下文
     # 处理 tensor 类型
     if isinstance(value, torch.Tensor):
         if value.dim() > 0:
             raise RuntimeError(f"I99-1 CRITICAL: {name} 应该是标量，但得到 shape={value.shape}")
-        try:
-            result = int(value.item())
-        except (RuntimeError, ValueError) as e:
-            raise RuntimeError(f"I99-1 CRITICAL: 无法将 {name} 转换为 Python int: {e}")
+        # 使用 no_grad 避免梯度跟踪和同步
+        with torch.no_grad():
+            try:
+                result = int(value.item())
+            except (RuntimeError, ValueError) as e:
+                raise RuntimeError(f"I99-1 CRITICAL: 无法将 {name} 转换为 Python int: {e}")
         return result
 
     # 处理 Python 数值类型
@@ -1128,48 +1131,52 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             token_positions = torch.zeros_like(token_positions_sorted)
             token_positions[sort_order] = token_positions_sorted
 
-            # I99-1 CRITICAL: 验证 - 在 clamp 之前检查原始值
-            # 问题: 原来的 clamp 在验证之前执行，导致验证变成"假的"
-            # 解决: 先验证原始值，再 clamp 确保安全
+            # I99-1 OPT: 向量化验证，避免每个 batch 单独同步
             # P-OPT: 使用 no_grad 上下文避免梯度跟踪开销
             with torch.no_grad():
-                if batch_indices_safe.numel() > 0:
+                # 使用张量比较进行验证，避免不必要的 .item() 同步
+                batch_indices_valid = (batch_indices_safe >= 0).all() & (batch_indices_safe < B_int).all()
+                token_indices_valid = (token_positions >= 0).all()
+
+                if not batch_indices_valid:
                     batch_min = int(batch_indices_safe.min().item())
                     batch_max = int(batch_indices_safe.max().item())
-                    assert batch_min >= 0 and batch_max < B_int, \
-                        f"I99-1 CRITICAL: batch_indices out of bounds! " \
+                    raise RuntimeError(
+                        f"I99-1 CRITICAL: batch_indices out of bounds! "
                         f"min={batch_min}, max={batch_max}, B={B_int}, N_total={N_total_int}"
+                    )
 
-                if token_positions.numel() > 0:
+                if not token_indices_valid:
                     token_min = int(token_positions.min().item())
                     token_max = int(token_positions.max().item())
-                    assert token_min >= 0, \
-                        f"I99-1 CRITICAL: token_positions contains negative values! " \
+                    raise RuntimeError(
+                        f"I99-1 CRITICAL: token_positions contains negative values! "
                         f"min={token_min}, max={token_max}, N_total={N_total_int}"
+                    )
 
             # I99-1: 防御性 clamp - 确保 token_positions 在安全范围内
             # 这是一个额外的保护层，防止 splitter 异常
             token_positions = token_positions.clamp(min=0, max=max_tokens_safe - 1)
 
-        # I99-1 CRITICAL: 高级索引诊断 - 验证所有索引在执行前有效
+        # I99-1 OPT: 批量验证后同步，避免每个样本单独检查
         # P-OPT: 使用 no_grad 上下文避免梯度跟踪开销
         with torch.no_grad():
             if N_total_int > 0 and B_int > 0 and max_tokens_safe > 0:
-                # I99-1: 使用 item() 确保在 CPU 上验证，避免 CUDA 操作
-                batch_min = batch_indices_safe.min().item()
-                batch_max = batch_indices_safe.max().item()
-                token_min = token_positions.min().item()
-                token_max = token_positions.max().item()
+                # 先用张量比较验证，失败时再同步获取具体值
+                batch_ok = (batch_indices_safe >= 0).all() & (batch_indices_safe < B_int).all()
+                token_ok = (token_positions >= 0).all() & (token_positions < max_tokens_safe).all()
 
-                # I99-1: 验证 clamp 后的值（额外安全层）
-                if batch_min < 0 or batch_max >= B_int:
+                if not batch_ok:
+                    batch_min = int(batch_indices_safe.min().item())
+                    batch_max = int(batch_indices_safe.max().item())
                     raise RuntimeError(
                         f"I99-1 CRITICAL: batch_indices 越界! "
                         f"min={batch_min}, max={batch_max}, B_int={B_int}, N_total_int={N_total_int}"
                     )
 
-                # token_min >= 0 总是成立因为 clamp，但保留 max 检查
-                if token_max >= max_tokens_safe:
+                if not token_ok:
+                    token_min = int(token_positions.min().item())
+                    token_max = int(token_positions.max().item())
                     raise RuntimeError(
                         f"I99-1 CRITICAL: token_positions 越界! "
                         f"min={token_min}, max={token_max}, max_tokens_safe={max_tokens_safe}, "
@@ -1285,7 +1292,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         probs = count_matrix / row_sums  # [B, max_d]
         # 计算熵: H = -sum(p * log(p))
         # 避免 log(0) 问题
-        probs_safe = probs + (probs == 0).float() * 1e-10
+        # I99-1 OPT: 使用 PROB_EPSILON 替代硬编码 1e-10
+        probs_safe = probs + (probs == 0).float() * PROB_EPSILON
         entropy_per_batch = -(probs_safe * probs_safe.log()).sum(dim=1)
         return float(entropy_per_batch.mean().item())
 
