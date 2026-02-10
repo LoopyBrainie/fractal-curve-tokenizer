@@ -1057,8 +1057,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         # I99-1 CRITICAL: 防御性断言 - 验证 N_total_int 在合理范围内
         # 这可以在最早的阶段捕获异常值
-        assert 0 <= N_total_int <= B_int * max_tokens_safe * 10, \
-            f"N_total_int out of reasonable range: {N_total_int}, B={B_int}, max_tokens={max_tokens_safe}"
+        assert 0 <= N_total_int <= B_int * max_tokens_int * 10, \
+            f"N_total_int out of reasonable range: {N_total_int}, B={B_int}, max_tokens={max_tokens_int}"
 
         # 排序后: batch_indices 严格按 batch 分组 [0,0,...,0, 1,1,...,1, ...]
         if N_total_is_zero:
@@ -1101,15 +1101,15 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
             # I99-1: 防御性 clamp - 确保 token_positions 在安全范围内
             # 这是一个额外的保护层，防止 splitter 异常
-            token_positions = token_positions.clamp(min=0, max=max_tokens_safe - 1)
+            token_positions = token_positions.clamp(min=0, max=max_tokens_int - 1)
 
         # I99-1 OPT: 批量验证后同步，避免每个样本单独检查
         # P-OPT: 使用 no_grad 上下文避免梯度跟踪开销
         with torch.no_grad():
-            if N_total_int > 0 and B_int > 0 and max_tokens_safe > 0:
+            if N_total_int > 0 and B_int > 0 and max_tokens_int > 0:
                 # 先用张量比较验证，失败时再同步获取具体值
                 batch_ok = (batch_indices_safe >= 0).all() & (batch_indices_safe < B_int).all()
-                token_ok = (token_positions >= 0).all() & (token_positions < max_tokens_safe).all()
+                token_ok = (token_positions >= 0).all() & (token_positions < max_tokens_int).all()
 
                 if not batch_ok:
                     batch_min = int(batch_indices_safe.min().item())
@@ -1124,12 +1124,12 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                     token_max = int(token_positions.max().item())
                     raise RuntimeError(
                         f"I99-1 CRITICAL: token_positions 越界! "
-                        f"min={token_min}, max={token_max}, max_tokens_safe={max_tokens_safe}, "
+                        f"min={token_min}, max={token_max}, max_tokens_int={max_tokens_int}, "
                         f"N_total_int={N_total_int}, B_int={B_int}"
                     )
 
             # 验证 tokens tensor 形状
-            expected_tokens_shape = (B, max_tokens_safe, dim)
+            expected_tokens_shape = (B, max_tokens_int, dim)
             if tokens.shape != expected_tokens_shape:
                 raise RuntimeError(
                     f"I99-1 CRITICAL: tokens 形状错误! "
@@ -1145,9 +1145,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         # I99-1 CRITICAL: 最终安全检查 - 验证 N_total 是否超过容量
         # 这是最后一道防线
-        if N_total_int > B_int * max_tokens_safe:
+        if N_total_int > B_int * max_tokens_int:
             raise RuntimeError(
-                f"I99-1 CRITICAL: N_total({N_total_int}) > B_int({B_int}) * max_tokens_safe({max_tokens_safe})!"
+                f"I99-1 CRITICAL: N_total({N_total_int}) > B_int({B_int}) * max_tokens_int({max_tokens_int})!"
             )
 
         # 向量化分配 (使用 clamp 后的 batch_indices_safe)
@@ -1192,8 +1192,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # I30-11: 构建 padded_split_probs [B, max_tokens]
         # I99-1: 使用排序后的 raw_probs
         padded_split_probs = None
-        if raw_probs is not None and N_total > 0 and max_tokens_safe > 0:
-            split_probs_padded = torch.zeros(B, max_tokens_safe, dtype=raw_probs.dtype, device=device)
+        if raw_probs is not None and N_total > 0 and max_tokens_int > 0:
+            split_probs_padded = torch.zeros(B, max_tokens_int, dtype=raw_probs.dtype, device=device)
 
             # 向量化分配: split_probs_padded[batch_idx, token_pos] = raw_probs_sorted[...]
             # I99-1: 使用 batch_indices_safe 确保索引安全
