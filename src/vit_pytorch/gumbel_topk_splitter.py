@@ -4416,9 +4416,18 @@ class GumbelTopKSplitter(
                 return torch.tensor(0.0, device=device)
             hilbert_indices = self.hilbert_indices
 
+        # I145-修复: 确保 hilbert_indices 在正确的设备上
+        # 候选区域初始化时可能使用 CPU，但训练时 selected_mask 在 GPU 上
+        if hilbert_indices.device != device:
+            hilbert_indices = hilbert_indices.to(device=device)
+
         # 获取选中掩码
         if selected_mask is None:
             selected_mask = self._last_selected_mask if hasattr(self, '_last_selected_mask') else None
+
+        # I145-修复: 确保 selected_mask 在正确的设备上
+        if selected_mask is not None and selected_mask.device != device:
+            selected_mask = selected_mask.to(device)
 
         if selected_mask is None or hilbert_indices is None:
             return torch.tensor(0.0, device=device)
