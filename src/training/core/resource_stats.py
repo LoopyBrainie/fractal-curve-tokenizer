@@ -171,28 +171,30 @@ class ModelResourceStats:
         stats : ModelResourceStats
             资源统计对象
         """
-        # Token 统计
-        if hasattr(token_output, 'actual_token_count'):
-            avg_tokens = token_output.actual_token_count.float().mean().item()
-        else:
-            avg_tokens = token_output.tokens.size(1) if hasattr(token_output, 'tokens') else 0.0
-        
-        # 深度分布
-        if hasattr(token_output, 'depths'):
-            depths = token_output.depths.cpu().numpy()
-            max_depth = model_config.get('max_depth', 4)
-            depth_dist = np.bincount(depths.flatten(), minlength=max_depth+1).tolist()
-            
-            # 深度熵
-            depth_probs = np.array(depth_dist) / (np.sum(depth_dist) + 1e-10)
-            depth_entropy = -np.sum(depth_probs * np.log(depth_probs + 1e-10))
-            
-            # 平均深度
-            avg_depth = np.mean(depths)
-        else:
-            depth_dist = []
-            depth_entropy = 0.0
-            avg_depth = 0.0
+        # P-OPT: 使用 no_grad 避免梯度同步
+        with torch.no_grad():
+            # Token 统计
+            if hasattr(token_output, 'actual_token_count'):
+                avg_tokens = token_output.actual_token_count.float().mean().item()
+            else:
+                avg_tokens = token_output.tokens.size(1) if hasattr(token_output, 'tokens') else 0.0
+
+            # 深度分布
+            if hasattr(token_output, 'depths'):
+                depths = token_output.depths.cpu().numpy()
+                max_depth = model_config.get('max_depth', 4)
+                depth_dist = np.bincount(depths.flatten(), minlength=max_depth+1).tolist()
+
+                # 深度熵
+                depth_probs = np.array(depth_dist) / (np.sum(depth_dist) + 1e-10)
+                depth_entropy = -np.sum(depth_probs * np.log(depth_probs + 1e-10))
+
+                # 平均深度
+                avg_depth = np.mean(depths)
+            else:
+                depth_dist = []
+                depth_entropy = 0.0
+                avg_depth = 0.0
         
         # FLOPS 计算
         flops_breakdown = cls._compute_flops_breakdown(

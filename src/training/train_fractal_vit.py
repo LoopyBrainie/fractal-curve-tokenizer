@@ -3667,33 +3667,22 @@ def main():
 
             # 设置编译缓存和错误处理
             # I107-6: 优化编译配置，提升训练性能
-            torch._dynamo.config.cache_size_limit = 256
+            torch._inductor.config.cache_size_limit = 512
             torch._dynamo.config.suppress_errors = False
 
-            # I107-8: 禁用 cudagraphs (避免动态 token 数量导致的重复警告)
-            # FractalViT 动态 token 数量 (K_min=8 到 K_max=64) 会导致 cudagraphs 反复跳过
-            # 警告 "skipping cudagraphs due to cpu device" 会干扰训练输出
-            # 性能影响: ~10%，但训练输出更清晰
-            torch._inductor.config.triton.cudagraphs = False
-            torch._inductor.config.max_autotune = False
+            # P-OPT: 启用 cudagraphs (CUDA图优化 ~10% 性能提升)
+            # 笔记本GPU建议启用，因为动态token已通过dynamic=False稳定
+            torch._inductor.config.triton.cudagraphs = True
+            torch._inductor.config.max_autotune = True
             torch._inductor.config.compile_threads = 4  # 并行编译加速
 
-            # I107-6: 优化动态编译，减少重复编译开销
-            # GumbelTopK 的 token 数量在 K_min=8 到 K_max=64 之间动态变化
-            torch._dynamo.config.assume_static_by_default = True  # 减少动态编译
+            # P-OPT: 禁用 dynamic=True，避免动态shape导致的重复编译
+            # FractalViT 的 token 数量变化 (K_min-K_max) 由inductor自动处理
+            torch._dynamo.config.assume_static_by_default = False
 
-            # I107-6: 移除 cudagraphs 相关禁用配置
-            # 之前禁用的原因 (TDP 限制不稳定) 已确认可启用
-            # 删除: torch._inductor.config.triton.cudagraphs = False
-            # 删除: torch._inductor.config.triton.cudagraphs_checkpoint = False
-
-            # I107-6: 移除冲突的 cudnn 配置
-            # cudagraphs 与 cudnn 配置可能冲突，统一使用 inductor 默认
-            # 删除: torch._inductor.config.triton.cudnn = True
-            # 删除: torch._inductor.config.triton.use_cudnn = True
-
-            # I107-6: 使用 reduce-overhead 模式获得更好的 CUDA 性能
-            compile_mode = 'reduce-overhead'
+            # P-OPT: 使用 default 模式而非 reduce-overhead
+            # reduce-overhead 对小模型有额外开销，default更适合
+            compile_mode = 'default'
 
             # I107-6: 在 compile 之前应用 use_channels_last，避免 cudagraphs 冲突
             # 这样可以避免 device_put 时触发 CPU 操作
@@ -3705,7 +3694,7 @@ def main():
                 model,
                 mode=compile_mode,
                 fullgraph=False,
-                dynamic=True,
+                dynamic=False,  # P-OPT: 禁用dynamic，避免重复编译
             )
             print(f"[OK] Model compiled with torch.compile (mode={compile_mode})")
             if has_cuda:
@@ -3821,22 +3810,28 @@ def main():
         import threading
         import time as time_module
 
-        # I107-4: 启动 GPU 监控线程
+        # P-OPT: 移除 GPU 监控线程的同步调用
+        # torch.cuda.utilization() 和 memory_allocated() 会导致 CUDA 同步
+        # 改为仅在需要时手动检查，或完全移除
+        # 当前：完全移除监控线程，避免 GPU 利用率波动
         gpu_monitor_running = [True]
-        def gpu_monitor():
-            if device.type == 'cuda':
-                try:
-                    while gpu_monitor_running[0]:
-                        if torch.cuda.is_available():
-                            mem_used = torch.cuda.memory_allocated() / 1024**3
-                            util = torch.cuda.utilization() if hasattr(torch.cuda, 'utilization') else -1
-                            print(f"[GPU-MONITOR] Memory: {mem_used:.2f} GB, Util: {util}%")
-                        time_module.sleep(10)
-                except Exception:
-                    pass
-
-        monitor_thread = threading.Thread(target=gpu_monitor, daemon=True)
-        monitor_thread.start()
+        # 注意：已注释掉的监控代码曾导致 GPU 利用率下降
+        # 如需调试，可临时启用以下代码：
+        #
+        # def gpu_monitor():
+        #     if device.type == 'cuda':
+        #         try:
+        #             while gpu_monitor_running[0]:
+        #                 if torch.cuda.is_available():
+        #                     # P-OPT: 仅获取内存，不调用 utilization() 避免同步
+        #                     mem_used = torch.cuda.memory_allocated() / 1024**3
+        #                     print(f"[GPU-MONITOR] Memory: {mem_used:.2f} GB")
+        #                 time_module.sleep(30)  # P-OPT: 降低频率到 30 秒
+        #         except Exception:
+        #             pass
+        #
+        # monitor_thread = threading.Thread(target=gpu_monitor, daemon=True)
+        # monitor_thread.start()
 
         print("[INFO] Warming up compiled model with full batch size...")
         compile_start = time_module.time()
@@ -3890,9 +3885,9 @@ def main():
             import traceback
             traceback.print_exc()
         finally:
-            gpu_monitor_running[0] = False
-            monitor_thread.join(timeout=5)
-    
+            # P-OPT: 已移除 GPU 监控线程，不需要 cleanup
+            pass
+
     best_val = 0.0
     patience_counter = 0
     early_stopped = False

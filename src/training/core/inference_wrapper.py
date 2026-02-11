@@ -172,10 +172,12 @@ def evaluate(
     """
     model.eval()
 
+    # P-OPT: 保持 GPU tensor 累积，最后统一同步
     all_preds: List[torch.Tensor] = []
     all_labels: List[torch.Tensor] = []
     all_probs: List[torch.Tensor] = []
-    total_loss = 0.0
+    # P-OPT: 使用 GPU tensor 累积损失，避免每个 batch .item() 同步
+    total_loss = torch.tensor(0.0, device=device)
     total_samples = 0
 
     for batch in tqdm(loader, desc="Evaluating"):
@@ -185,17 +187,20 @@ def evaluate(
         probs = F.softmax(logits, dim=1)
         preds = logits.argmax(dim=1)
 
-        all_preds.append(preds.cpu())
-        all_labels.append(batch_labels.cpu())
-        all_probs.append(probs.cpu())
+        # P-OPT: 保持 GPU tensor，不立即同步
+        all_preds.append(preds)
+        all_labels.append(batch_labels)
+        all_probs.append(probs)
 
-        total_loss += loss.item() * len(batch_labels)
+        # P-OPT: GPU tensor 累积，最后统一 .item()
+        total_loss += loss * len(batch_labels)
         total_samples += len(batch_labels)
 
-    # 汇总结果
-    all_preds = torch.cat(all_preds)
-    all_labels = torch.cat(all_labels)
-    all_probs = torch.cat(all_probs)
+    # P-OPT: 最后统一同步到 CPU
+    all_preds = torch.cat(all_preds).cpu()
+    all_labels = torch.cat(all_labels).cpu()
+    all_probs = torch.cat(all_probs).cpu()
+    final_loss = total_loss.item() / total_samples  # P-OPT: 只同步一次
 
     # 计算 Top-1 准确率
     correct = (all_preds == all_labels).sum().item()
@@ -203,7 +208,7 @@ def evaluate(
 
     result = EvalResult(
         accuracy=accuracy,
-        avg_loss=total_loss / total_samples,
+        avg_loss=final_loss,
         num_samples=total_samples,
     )
 
