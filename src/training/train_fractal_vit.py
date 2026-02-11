@@ -2177,6 +2177,7 @@ def train_epoch(
 
             # P-OPT: 首层梯度监控与动态裁剪
             # 获取首层参数（通常是 tokenizer.shared_conv 的第一个卷积层）
+            # 减少 .item() 调用：仅在检测到大梯度时同步获取精确值
             first_param = None
             for param in model.parameters():
                 if param.requires_grad and param.grad is not None:
@@ -2184,13 +2185,19 @@ def train_epoch(
                     break
 
             if first_param is not None:
-                first_grad_norm = first_param.grad.norm().item()
-                # 动态调整裁剪阈值
-                if first_grad_norm > 100:
-                    effective_clip = min(config.gradient_clip * 2, 5.0)
-                    if i % 100 == 0:  # 每100个accum步打印一次警告
-                        print(f"[WARN] Batch {i}: 首层梯度={first_grad_norm:.2f}, 裁剪阈值={effective_clip:.2f}")
+                # P-OPT: 使用向量化的梯度范数检查，避免每个参数都 .item()
+                # 仅在大梯度时才需要精确的 .item() 值
+                grad_sq = (first_param.grad * first_param.grad).sum()
+                # 不需要 .item()，直接比较平方值
+                if grad_sq > 10000.0:  # 100^2 = 10000
+                    # 大梯度：获取精确值用于日志和裁剪阈值调整
+                    first_grad_norm = grad_sq.sqrt().item()
+                    if first_grad_norm > 100:
+                        effective_clip = min(config.gradient_clip * 2, 5.0)
+                        if i % 100 == 0:  # 每100个accum步打印一次警告
+                            print(f"[WARN] Batch {i}: 首层梯度={first_grad_norm:.2f}, 裁剪阈值={effective_clip:.2f}")
                 else:
+                    # 小梯度：使用默认值，跳过 .item() 同步
                     effective_clip = config.gradient_clip
             else:
                 effective_clip = config.gradient_clip

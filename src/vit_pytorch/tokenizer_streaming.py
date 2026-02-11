@@ -905,12 +905,15 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             # 向量化检查：batch_min >= 0 且 batch_max < B_int
             valid_min = (batch_indices_raw >= 0).all()
             valid_max = (batch_indices_raw < B_int).all()
-            # P-OPT: 使用向量化 assert 避免 .item() 同步
-            # 错误信息使用张量格式，延迟求值
-            assert valid_min and valid_max, (
-                f"I99-1 CRITICAL: batch_indices 包含无效值! "
-                f"范围=[{batch_indices_raw.min():.0f}, {batch_indices_raw.max():.0f}], B={B_int}, N_total={N_total}"
-            )
+            # P-OPT: 使用向量化检查，失败时获取详细错误值
+            # 改回 if-raise 模式，确保不会被 Python -O 标志跳过
+            if not (valid_min and valid_max):
+                batch_min = int(batch_indices_raw.min().item()) if batch_indices_raw.numel() > 0 else "N/A"
+                batch_max = int(batch_indices_raw.max().item()) if batch_indices_raw.numel() > 0 else "N/A"
+                raise RuntimeError(
+                    f"I99-1 CRITICAL: batch_indices 包含无效值! "
+                    f"范围=[{batch_min}, {batch_max}], B={B_int}, N_total={N_total}"
+                )
 
         # I99-1: 防御性 clamp batch_indices (额外保护)
         batch_indices = tensor_result.batch_indices.clamp(min=0, max=B_int - 1)
@@ -1059,8 +1062,11 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         # I99-1 CRITICAL: 防御性断言 - 验证 N_total_int 在合理范围内
         # 这可以在最早的阶段捕获异常值
-        assert 0 <= N_total_int <= B_int * max_tokens_int * 10, \
-            f"N_total_int out of reasonable range: {N_total_int}, B={B_int}, max_tokens={max_tokens_int}"
+        # 改回 if-raise 模式，确保不会被 Python -O 标志跳过
+        if not (0 <= N_total_int <= B_int * max_tokens_int * 10):
+            raise RuntimeError(
+                f"N_total_int out of reasonable range: {N_total_int}, B={B_int}, max_tokens={max_tokens_int}"
+            )
 
         # 排序后: batch_indices 严格按 batch 分组 [0,0,...,0, 1,1,...,1, ...]
         if N_total_is_zero:
@@ -1079,42 +1085,54 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             token_positions[sort_order] = token_positions_sorted
 
             # I99-1 OPT: 向量化验证，避免每个 batch 单独同步
-            # P-OPT: 完全移除 .item() 同步，使用 assert 替代 if-raise
+            # 改回 if-raise 模式，确保不会被 Python -O 标志跳过
             batch_indices_valid = (batch_indices_safe >= 0).all() & (batch_indices_safe < B_int).all()
             token_indices_valid = (token_positions >= 0).all()
-            assert batch_indices_valid and token_indices_valid, (
-                f"I99-1 CRITICAL: batch_indices 或 token_positions 无效! "
-                f"batch_valid={batch_indices_valid}, token_valid={token_indices_valid}, "
-                f"B={B_int}, N_total={N_total_int}"
-            )
+            if not (batch_indices_valid and token_indices_valid):
+                batch_min = int(batch_indices_safe.min().item()) if batch_indices_valid else "N/A"
+                batch_max = int(batch_indices_safe.max().item()) if batch_indices_valid else "N/A"
+                token_min = int(token_positions.min().item()) if token_indices_valid else "N/A"
+                token_max = int(token_positions.max().item()) if token_indices_valid else "N/A"
+                raise RuntimeError(
+                    f"I99-1 CRITICAL: batch_indices 或 token_positions 无效! "
+                    f"batch范围=[{batch_min}, {batch_max}], token范围=[{token_min}, {token_max}], "
+                    f"B={B_int}, N_total={N_total_int}"
+                )
 
             # I99-1: 防御性 clamp - 确保 token_positions 在安全范围内
             # 这是一个额外的保护层，防止 splitter 异常
             token_positions = token_positions.clamp(min=0, max=max_tokens_int - 1)
 
         # I99-1 OPT: 批量验证，避免每个样本单独检查
-        # P-OPT: 完全移除 .item() 同步，使用 assert 替代 if-raise
+        # 改回 if-raise 模式，确保不会被 Python -O 标志跳过
         if N_total_int > 0 and B_int > 0 and max_tokens_int > 0:
             batch_ok = (batch_indices_safe >= 0).all() & (batch_indices_safe < B_int).all()
             token_ok = (token_positions >= 0).all() & (token_positions < max_tokens_int).all()
-            assert batch_ok and token_ok, (
-                f"I99-1 CRITICAL: batch_indices 或 token_positions 越界! "
-                f"batch_ok={batch_ok}, token_ok={token_ok}, "
-                f"B_int={B_int}, max_tokens_int={max_tokens_int}, N_total_int={N_total_int}"
-            )
+            if not (batch_ok and token_ok):
+                batch_min = int(batch_indices_safe.min().item()) if batch_ok else "N/A"
+                batch_max = int(batch_indices_safe.max().item()) if batch_ok else "N/A"
+                token_min = int(token_positions.min().item()) if token_ok else "N/A"
+                token_max = int(token_positions.max().item()) if token_ok else "N/A"
+                raise RuntimeError(
+                    f"I99-1 CRITICAL: batch_indices 或 token_positions 越界! "
+                    f"batch范围=[{batch_min}, {batch_max}], token范围=[{token_min}, {token_max}], "
+                    f"B_int={B_int}, max_tokens_int={max_tokens_int}, N_total_int={N_total_int}"
+                )
 
         # 验证 tokens tensor 形状
         expected_tokens_shape = (B, max_tokens_int, dim)
-        assert tokens.shape == expected_tokens_shape, (
-            f"I99-1 CRITICAL: tokens 形状错误! "
-            f"expected={expected_tokens_shape}, actual={tokens.shape}"
-        )
+        if tokens.shape != expected_tokens_shape:
+            raise RuntimeError(
+                f"I99-1 CRITICAL: tokens 形状错误! "
+                f"expected={expected_tokens_shape}, actual={tokens.shape}"
+            )
 
         # 验证 all_tokens 形状
-        assert all_tokens.shape[0] == N_total_int, (
-            f"I99-1 CRITICAL: all_tokens 形状错误! "
-            f"expected N_total_int={N_total_int}, actual={all_tokens.shape[0]}"
-        )
+        if all_tokens.shape[0] != N_total_int:
+            raise RuntimeError(
+                f"I99-1 CRITICAL: all_tokens 形状错误! "
+                f"expected N_total_int={N_total_int}, actual={all_tokens.shape[0]}"
+            )
 
         # I99-1 CRITICAL: 最终安全检查 - 验证 N_total 是否超过容量
         # 这是最后一道防线
