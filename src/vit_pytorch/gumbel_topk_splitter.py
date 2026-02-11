@@ -615,14 +615,16 @@ class ContinuousQuotaAllocator(nn.Module):
         计算配额正则化损失
 
         数学形式:
-            L_quota = MSE(K_soft, K_hard.detach())
+            L_quota = MSE(K_soft, K_hard)
 
         作用:
             - 鼓励软配额接近硬配额
             - 提供梯度信号使配额分布稳定
         """
         _, K_soft = self.forward(K=self._get_K_estimate())
-        K_hard = self._lrm_projection(K_soft.detach())
+        # P0-FIX: 移除 detach()，恢复梯度流动
+        # 之前错误地使用 K_soft.detach()，导致 quota_logits 无法学习
+        K_hard = self._lrm_projection(K_soft)
 
         # MSE损失：软配额接近硬配额
         # I113-17 FIX: 确保K_hard是float类型

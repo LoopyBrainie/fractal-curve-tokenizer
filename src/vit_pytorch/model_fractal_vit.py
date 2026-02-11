@@ -1227,15 +1227,13 @@ class FractalCurveViT(nn.Module):
         }
 
         aux_infos, _ = self._prepare_auxiliary_output(
-            batch_size, lengths, levels_list, pooled, return_aux_info=True, return_features=False,
+            batch_size, lengths, levels_list, pooled, return_aux_info=False, return_features=False,
             split_probs=split_probs
         )
 
-        # 从 aux_infos 提取信息构建 TrainingStats
-        first_aux = aux_infos[0] if aux_infos else {}
-
-        # 计算深度分布
-        depth_dist = first_aux.get('depth_distribution', {})
+        # P0-FIX: 移除 aux_infos 依赖，避免 forward 中的 GPU-CPU 同步
+        # depth_distribution 延迟到 callbacks 中计算（使用 TrainingStats 中的 tensor）
+        depth_dist = {}
 
         # I135: 辅助函数 - 递归展平嵌套结构，提取所有整数值
         # P-OPT: 避免在 forward 中使用 .cpu()，使用 GPU 计算 max_level

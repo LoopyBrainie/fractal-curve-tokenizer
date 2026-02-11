@@ -651,7 +651,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # I99-1 FIX: 使用每个 batch 的最大 token 数，而非总 token 数
         # N_total 是实际选择的 token 总数，但 max_tokens 应该是每个 batch 的最大 token 数
         N_total = tensor_result.num_tokens
-        max_tokens = max_tokens_per_batch  # 每个 batch 的最大 token 数
+        max_tokens_int = _safe_scalar_to_int(max_tokens_per_batch, "max_tokens_per_batch")  # P0-FIX: 提前转换
 
         # 3. 纯张量嵌入
         # I30-11: 传递 raw_probs 用于构建 padded_split_probs
@@ -659,7 +659,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         raw_probs = split_result.probs if isinstance(split_result, GumbelTopKResult) else None
         selected_mask = split_result.selected_mask if isinstance(split_result, GumbelTopKResult) else None
         tokens, levels_info, padded_regions, padded_split_probs = self._embed_with_tensor_result(
-            features, tensor_result, raw_probs, max_tokens=max_tokens,
+            features, tensor_result, raw_probs, max_tokens=max_tokens_int,  # P0-FIX: 传入 Python int
             selected_mask=selected_mask
         )
 
@@ -820,7 +820,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         features: torch.Tensor,
         tensor_result: "TensorSplitResult",
         raw_probs: Optional[torch.Tensor] = None,
-        max_tokens: int = 1,
+        max_tokens: int = 1,  # P0-FIX: 现在确保传入 Python int
         selected_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """使用 TensorSplitResult 进行嵌入 (P9-1 完全向量化版本).
@@ -943,6 +943,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             boxes = torch.where(torch.isnan(boxes), torch.zeros_like(boxes), boxes)
             boxes = torch.where(torch.isinf(boxes), torch.zeros_like(boxes), boxes)
 
+        # P1-FIX: 确保 boxes 和 features_roi 在同一设备上
+        if boxes.device != features_roi.device:
+            boxes = boxes.to(features_roi.device, non_blocking=True)
+
         pooled = roi_align(
             features_roi,
             boxes,
@@ -968,12 +972,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 计算每个 batch 需要的最小 token 数（向上取整）
         min_required = max(1, (N_total + B_int - 1) // B_int)  # 向上取整确保足够
 
-        # P-OPT: max_tokens 转换 (必须使用 Python int 用于 tensor 形状)
-        # 仅在 tensor 类型时调用 .item()，减少不必要的 GPU-CPU 同步
-        if isinstance(max_tokens, torch.Tensor):
-            max_tokens_int = max_tokens.item() if max_tokens.numel() == 1 else int(max.max(max_tokens))
-        else:
-            max_tokens_int = max(1, int(max_tokens))
+        # P0-FIX: max_tokens 已经是 Python int，无需类型检查
+        # 移除 isinstance 检查以支持 torch.compile + CUDA Graphs
+        max_tokens_int = max(1, int(max_tokens))
 
         tokens = torch.zeros(B, max_tokens_int, dim, device=device, dtype=dtype)
         # I32-2: 使用-1 sentinel标识padding token，避免与有效depth=0混淆
