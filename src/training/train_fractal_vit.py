@@ -2303,7 +2303,9 @@ def train_epoch(
         # P-OPT: 仅在 epoch 结束时获取内存统计，避免 per-batch 同步
         'cuda_mem_peak_gb': torch.cuda.max_memory_allocated() / 1024**3 if device.type == 'cuda' else 0.0,
         # P-OPT: GPU 利用率诊断（仅在 epoch 结束时获取，避免同步）
-        'cuda_utilization': torch.cuda.utilization() if device.type == 'cuda' and hasattr(torch.cuda, 'utilization') else None,
+        # Note: pynvml 不一定安装，torch.cuda.utilization() 会抛出 ModuleNotFoundError
+        # 暂时设为 None，避免依赖 pynvml
+        'cuda_utilization': None,
         # P1-5: 使用 GPU 张量计算平均熵损失，避免 per-batch .item() 同步
         'avg_entropy_loss': (entropy_loss_sum / entropy_loss_count).item() if entropy_loss_count > 0 else None,
     }

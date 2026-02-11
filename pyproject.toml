@@ -11,6 +11,7 @@ dependencies = [
     "manimgl>=1.7.2",
     "mypy>=1.19.0",
     "opencv-python>=4.11.0.86",
+    "pynvml>=13.0.1",
     "pytest>=8.4.1",
     "pytest-runner>=6.0.1",
     "scikit-learn>=1.8.0",
