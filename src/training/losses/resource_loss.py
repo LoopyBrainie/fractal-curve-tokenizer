@@ -147,11 +147,12 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from training.core.resource_stats import ModelResourceStats
+from vit_pytorch.constants import EPS  # I112-3: 统一数值稳定性常量
 
 
 def compute_depth_entropy(
     depth_distribution: torch.Tensor,
-    epsilon: float = 1e-10,
+    epsilon: float = EPS,  # I112-3: 使用统一 EPS (1e-6)
 ) -> torch.Tensor:
     """
     计算深度分布的 Shannon 熵
@@ -340,7 +341,7 @@ class ResourceAwareLoss(nn.Module):
         lambda_token: float = 0.01,
         lambda_entropy: float = 0.05,
         target_entropy_ratio: float = 0.8,
-        epsilon: float = 1e-10,
+        epsilon: float = EPS,  # I112-3: 使用统一 EPS (1e-6)
     ):
         super().__init__()
 
@@ -391,10 +392,12 @@ class ResourceAwareLoss(nn.Module):
         device = self._device
 
         # 1. FLOPS 约束损失
+        # P-OPT: 使用温和的 L¹ 惩罚避免 L² 平方放大效应
+        # 原始 L²: ratio=2.0 → L=1.0 (放大 100%)
+        # 新 L¹: ratio=2.0 → L=1.0 (线性，梯度稳定)
         flops_ratio = stats.total_flops / self.flops_budget
-        # I-OPT: 转换为 tensor 进行计算
         flops_ratio_tensor = torch.tensor(flops_ratio, device=device, dtype=torch.float32)
-        L_flops = F.relu(flops_ratio_tensor - 1.0) ** 2
+        L_flops = F.relu(flops_ratio_tensor - 1.0)  # 线性惩罚
 
         # 2. Token 数量约束损失
         if stats.token_depth_distribution:
@@ -412,7 +415,7 @@ class ResourceAwareLoss(nn.Module):
                 dtype=torch.float32
             )
 
-        L_token = F.relu(weighted_tokens - self.token_budget) ** 2
+        L_token = F.relu(weighted_tokens - self.token_budget)  # 线性惩罚
 
         # 3. 深度熵正则损失
         H_actual = None  # 初始化

@@ -256,7 +256,7 @@ class DeterministicTopK(nn.Module):
     def __init__(
         self,
         temperature: float = 0.5,
-        eps: float = 1e-8,
+        eps: float = EPS,  # I112-3: 使用统一 EPS (1e-6) 替代 1e-8
     ):
         """
         Args:
@@ -513,7 +513,10 @@ class ContinuousQuotaAllocator(nn.Module):
         self.enable_warmup = enable_warmup
 
         # 可学习logits (I113-17: 替换原有的quota_logits)
-        self.quota_logits = nn.Parameter(torch.randn(D))
+        # 修复: 使用 Xavier 初始化 + 小初始缩放，防止初始 softmax 过于极端
+        self.quota_logits = nn.Parameter(torch.zeros(D))
+        nn.init.xavier_uniform_(self.quota_logits.unsqueeze(0))
+        self.quota_logits.data.mul_(0.01)  # 初始缩放较小，确保梯度正常流动
 
         # 温度缓存
         self._current_step = 0

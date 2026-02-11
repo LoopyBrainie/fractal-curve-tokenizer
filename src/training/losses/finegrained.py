@@ -25,6 +25,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vit_pytorch.constants import EPS  # I112-3: 统一数值稳定性常量
+
 
 @dataclass
 class FinegrainedLossConfig:
@@ -170,10 +172,10 @@ class AttentionEntropyLoss(nn.Module):
     """
     
     def __init__(
-        self, 
+        self,
         mode: str = 'minimize',  # 'minimize' or 'target'
         target_entropy: Optional[float] = None,
-        eps: float = 1e-8,
+        eps: float = EPS,  # I112-3: 使用统一 EPS (1e-6)
     ):
         """
         Args:

@@ -56,7 +56,7 @@ class DiversityLoss(nn.Module):
         - 损失值独立于特征 L2 范数
     """
 
-    def __init__(self, reduction: str = "mean", epsilon: float = 1e-8):
+    def __init__(self, reduction: str = "mean", epsilon: float = EPS):  # I112-3: EPS = 1e-6
         """初始化多样性损失
 
         Args:
@@ -82,7 +82,8 @@ class DiversityLoss(nn.Module):
         child_flat = child_features.view(-1, num_children, D)
 
         # I112-1: L2 归一化 - 确保损失与特征范数解耦
-        normalized = F.normalize(child_flat, p=2, dim=-1, eps=self.epsilon)
+        # I112-3: 使用 EPS 统一数值稳定性 (F.normalize 的 eps 参数)
+        normalized = F.normalize(child_flat, p=2, dim=-1, eps=EPS)
 
         # 计算余弦相似度矩阵: [B*N, 4, 4]
         similarity = torch.bmm(normalized, normalized.transpose(1, 2))

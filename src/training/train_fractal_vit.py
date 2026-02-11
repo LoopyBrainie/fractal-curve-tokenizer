@@ -142,6 +142,7 @@ import os
 import sys
 import platform
 import time
+import math
 import json
 import multiprocessing as _mp
 import argparse
@@ -2173,7 +2174,28 @@ def train_epoch(
 
         if (i + 1) % config.accum_steps == 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+
+            # P-OPT: 首层梯度监控与动态裁剪
+            # 获取首层参数（通常是 tokenizer.shared_conv 的第一个卷积层）
+            first_param = None
+            for param in model.parameters():
+                if param.requires_grad and param.grad is not None:
+                    first_param = param
+                    break
+
+            if first_param is not None:
+                first_grad_norm = first_param.grad.norm().item()
+                # 动态调整裁剪阈值
+                if first_grad_norm > 100:
+                    effective_clip = min(config.gradient_clip * 2, 5.0)
+                    if i % 100 == 0:  # 每100个accum步打印一次警告
+                        print(f"[WARN] Batch {i}: 首层梯度={first_grad_norm:.2f}, 裁剪阈值={effective_clip:.2f}")
+                else:
+                    effective_clip = config.gradient_clip
+            else:
+                effective_clip = config.gradient_clip
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), effective_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
@@ -4200,7 +4222,6 @@ def main():
             # I98-2: 新架构使用 model.splitter (依赖注入模式)
             splitter = model.splitter
             if hasattr(splitter, 'max_depth'):
-                import math
                 max_entropy_value = math.log(splitter.max_depth + 1)
         
         if perf_stats.get('soft_token_count') is not None or perf_stats.get('soft_entropy') is not None:

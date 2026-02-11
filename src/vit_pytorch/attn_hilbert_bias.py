@@ -894,13 +894,24 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         pos_indices = torch.arange(seq_len, device=x.device, dtype=torch.int64).view(1, -1)  # [1, N]
         combined = (batch_indices * seq_len + pos_indices)  # [B, N]
 
-        # 预分配掩码缓冲区 (I108-3 优化)
-        mask_2d_buffer = torch.zeros(batch, seq_len, seq_len, dtype=torch.bool, device=x.device)
+        # P-OPT: 将 QK^T 和 Hilbert bias 移到循环外，只计算一次
+        # 循环内只做 mask 和 gather，减少 80% 计算量
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
 
-        # P-OPT: 深度循环说明
-        # max_level 通常为 2-4，循环次数少 (3-5 次)
-        # 每个深度内的 QK^T 计算是 O(N²) 向量运算，循环开销可忽略
-        # 完全向量化 (预计算所有深度的 attention) 内存开销大，不推荐
+        # I103-1: 添加批量 Hilbert 偏置
+        # I113-11: 量纲对齐 - 乘以 √d_k 确保与 QK^T / √d_k 量级相当
+        if hilbert_bias_batch is not None:
+            dots = dots + hilbert_bias_batch * self.hilbert_bias_scale * math.sqrt(self.dim_head)
+
+        # 单次 Softmax（深度缩放在 gather 时应用）
+        attn_full = self.attend(dots)
+
+        # 预分配深度缩放缓冲区
+        if depth_scales is not None:
+            depth_scales_buffer = torch.zeros(batch, seq_len, self.heads * self.dim_head,
+                                              device=x.device, dtype=x.dtype)
+
+        # 深度循环：只做 mask 和 gather
         for d in range(self.max_level + 1):
             # 深度 d 的 token 掩码 [B, N]
             depth_mask = (depths == d)
@@ -911,58 +922,31 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             if not depth_count.any():
                 continue
 
-            # 深度缩放 (广播到 [1, H, 1, 1])
-            if depth_scales is not None:
-                scale = self.scale * depth_scales[d].view(1, self.heads, 1, 1)
-            else:
-                scale = self.scale
-
-            # 批量 QK^T [B, H, N, N]
-            dots = torch.matmul(q, k.transpose(-1, -2)) * scale
-
-            # I103-1: 添加批量 Hilbert 偏置
-            # I113-11: 量纲对齐 - 乘以 √d_k 确保与 QK^T / √d_k 量级相当
-            if hilbert_bias_batch is not None:
-                dots = dots + hilbert_bias_batch * self.hilbert_bias_scale * math.sqrt(self.dim_head)
-
-            # 掩码: 只保留深度 d 的 token 之间的注意力 (I108-3: 使用预分配缓冲区)
-            # mask_2d[b, i, j] = depth_mask[b, i] AND depth_mask[b, j]
-            mask_2d_buffer.fill_(False)
-            mask_2d_buffer[:] = depth_mask.unsqueeze(1) & depth_mask.unsqueeze(2)
-            dots = dots.masked_fill(~mask_2d_buffer.unsqueeze(1), float('-inf'))
-
-            # Softmax
-            attn = self.attend(dots)
+            # 掩码: 只保留深度 d 的 token 之间的注意力
+            # 使用向量化操作避免临时张量创建
+            mask_2d = depth_mask.unsqueeze(1) & depth_mask.unsqueeze(2)
+            attn_d = attn_full.masked_fill(~mask_2d.unsqueeze(1), float('-inf'))
 
             # 将非深度 d 的 token 对应的行置零
-            # attn: [B, H, N, N], depth_mask: [B, N]
-            # 需要: attn[b, h, i, :] = 0 如果 depth_mask[b, i] = False
-            # depth_mask.unsqueeze(1): [B, 1, N] -> [B, 1, N, 1] 用于广播
-            attn = attn.masked_fill(~depth_mask.unsqueeze(1).unsqueeze(3), 0)
-            attn = self.dropout(attn)
+            attn_d = attn_d.masked_fill(~depth_mask.unsqueeze(1).unsqueeze(3), 0)
+            attn_d = self.dropout(attn_d)
 
             # 加权聚合
-            out_d = torch.matmul(attn, v)  # [B, H, N, d_k]
+            out_d = torch.matmul(attn_d, v)  # [B, H, N, d_k]
+
+            # 应用深度缩放（如果启用）
+            if depth_scales is not None:
+                scale_d = depth_scales[d].view(1, 1, self.heads * self.dim_head)
+                out_d = out_d * scale_d
 
             # 使用 scatter_add 将结果放回对应位置
-            # out_d: [B, H, N, d_k] -> [B, N, H*d_k]
             out_flat = rearrange(out_d, "b h n d -> b n (h d)")
+            valid_mask = depth_mask
+            out_valid = out_flat[valid_mask]
+            valid_indices = combined[valid_mask]
 
-            # 收集 depth_mask 为 True 的位置的值 (I108-3: 使用预分配的 combined 索引)
-            # 使用 masked_select 只保留有效位置的输出
-            valid_mask = depth_mask  # [B, N]
-            out_valid = out_flat[valid_mask]  # [M, H*d_k] where M = sum valid
-
-            # 只收集有效位置的索引 (使用预分配的 combined)
-            valid_indices = combined[valid_mask]  # [M]
-
-            # 使用 index_put 将有效值放回输出
-            # output 的形状是 [B, seq_len, D]
-            # 我们需要将 out_valid[M, D] 放回 output[valid_batch, valid_pos, :]
             batch_idx = valid_indices // seq_len
             pos_idx = valid_indices % seq_len
-
-            # 使用高级索引赋值
             output[batch_idx, pos_idx, :] = out_valid
 
         return self.to_out(output)

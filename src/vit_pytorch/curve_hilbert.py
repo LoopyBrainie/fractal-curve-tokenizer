@@ -2112,32 +2112,24 @@ class HilbertScanner:
         norm_x = cx / safe_W
         norm_y = cy / safe_H
 
-        # 映射到 Pseudo-Hilbert 索引（I145-优化：向量化版本）
-        # 数学形式化：
-        #   - 使用torch.stack代替Python循环，避免.item() GPU同步
-        #   - 利用字典批量查询替代逐元素检查
+        # 映射到 Pseudo-Hilbert 索引（优化：使用预计算的 hilbert_order_table）
+        # 修复: 使用 hilbert_order_table 直接索引，替代 Python 循环构建 idx_map
 
         num_points = cx.shape[0]
 
-        # 对于每个中心点，找到其在 Pseudo-Hilbert 序列中的位置
-        scan_points = cls.scan(H, W)
-        if len(scan_points) > 0 and num_points > 0:
-            # P-OPT: 向量化坐标查询 - 使用 2D tensor 索引替代字典查询
-            # 创建坐标到索引的 2D 映射
-            idx_map = torch.full((H, W), -1, dtype=torch.long, device=cx.device)
-            for i, (x, y) in enumerate(scan_points):
-                if 0 <= x < W and 0 <= y < H:
-                    idx_map[y, x] = i
+        if num_points > 0:
+            # 优化: 使用预计算的 Hilbert 顺序表进行向量化查询
+            # hilbert_order_table 返回 [H, W] 张量，table[y, x] = Hilbert 索引
+            order_table = RectHilbertIndex.hilbert_order_table(H, W, cx.device)
 
             # 将中心坐标转换为整数坐标
             cx_int = (norm_x * (W - 1)).long().clamp(max=W - 1)
             cy_int = (norm_y * (H - 1)).long().clamp(max=H - 1)
 
-            # 向量化的 2D 张量索引查询
-            pseudo_d = idx_map[cy_int, cx_int]
-            # 处理未找到的坐标（使用 clamp 保证了所有坐标都在范围内）
+            # 向量化的 2D 张量索引查询：order_table[cy_int, cx_int]
+            pseudo_d = order_table[cy_int, cx_int]
         else:
-            pseudo_d = torch.zeros(num_points, device=cx.device, dtype=torch.long)
+            pseudo_d = torch.zeros(0, device=cx.device, dtype=torch.long)
 
         # 添加深度偏移（使用移位运算优化）
         # sum(4^d for d in range(depth)) = (4^depth - 1) / 3
