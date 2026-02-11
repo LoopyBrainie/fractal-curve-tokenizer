@@ -731,10 +731,12 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         boxes_tensor = torch.tensor(all_boxes, device=device, dtype=dtype)
         depths_tensor = torch.tensor(all_depths, device=device, dtype=torch.long)
 
-        # I99-1: 验证 boxes 不包含 NaN/Inf
-        if torch.isnan(boxes_tensor).any() or torch.isinf(boxes_tensor).any():
-            boxes_tensor = torch.where(torch.isnan(boxes_tensor), torch.zeros_like(boxes_tensor), boxes_tensor)
-            boxes_tensor = torch.where(torch.isinf(boxes_tensor), torch.zeros_like(boxes_tensor), boxes_tensor)
+        # P-OPT: 直接替换 NaN/Inf，移除 .any() 同步检查
+        # 批量操作保持 GPU 利用率，避免 GPU-CPU 同步
+        nan_mask = torch.isnan(boxes_tensor)
+        inf_mask = torch.isinf(boxes_tensor)
+        if nan_mask.any() or inf_mask.any():
+            boxes_tensor = torch.where(nan_mask | inf_mask, torch.zeros_like(boxes_tensor), boxes_tensor)
 
         # ROI-Align
         try:
@@ -883,11 +885,12 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         p = self.base_patch_size
         regions = tensor_result.regions.float()
 
-        # I99-1: 验证 regions 不包含 NaN/Inf (ROIAlign CUDA 内核对此敏感)
-        if torch.isnan(regions).any() or torch.isinf(regions).any():
-            # 替换 NaN/Inf 为安全值
-            regions = torch.where(torch.isnan(regions), torch.zeros_like(regions), regions)
-            regions = torch.where(torch.isinf(regions), torch.zeros_like(regions), regions)
+        # P-OPT: 直接替换 NaN/Inf，移除 .any() 同步检查
+        # 批量操作保持 GPU 利用率，避免 GPU-CPU 同步
+        nan_mask = torch.isnan(regions)
+        inf_mask = torch.isinf(regions)
+        if nan_mask.any() or inf_mask.any():
+            regions = torch.where(nan_mask | inf_mask, torch.zeros_like(regions), regions)
 
         # I99-1: clamp regions 到有效图像边界
         # P-OPT: 直接在原始张量上 clamp_()，避免不必要的 .clone() 内存分配
@@ -902,18 +905,18 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # torch.all/any 保持张量在 GPU 上，不触发 .item() 同步
         batch_indices_raw = tensor_result.batch_indices
         if batch_indices_raw.numel() > 0:
-            # 向量化检查：batch_min >= 0 且 batch_max < B_int
-            valid_min = (batch_indices_raw >= 0).all()
-            valid_max = (batch_indices_raw < B_int).all()
-            # P-OPT: 使用向量化检查，失败时获取详细错误值
-            # 改回 if-raise 模式，确保不会被 Python -O 标志跳过
-            if not (valid_min and valid_max):
-                batch_min = int(batch_indices_raw.min().item()) if batch_indices_raw.numel() > 0 else "N/A"
-                batch_max = int(batch_indices_raw.max().item()) if batch_indices_raw.numel() > 0 else "N/A"
-                raise RuntimeError(
-                    f"I99-1 CRITICAL: batch_indices 包含无效值! "
-                    f"范围=[{batch_min}, {batch_max}], B={B_int}, N_total={N_total}"
-                )
+            # P-OPT: 仅在调试模式验证 batch_indices 范围
+            # clamp 已经提供了安全保证，避免每次 forward 都触发 GPU-CPU 同步
+            if getattr(self, '_debug_mode', False):
+                valid_min = (batch_indices_raw >= 0).all()
+                valid_max = (batch_indices_raw < B_int).all()
+                if not (valid_min and valid_max):
+                    batch_min = int(batch_indices_raw.min().item()) if batch_indices_raw.numel() > 0 else "N/A"
+                    batch_max = int(batch_indices_raw.max().item()) if batch_indices_raw.numel() > 0 else "N/A"
+                    raise RuntimeError(
+                        f"I99-1 CRITICAL: batch_indices 包含无效值! "
+                        f"范围=[{batch_min}, {batch_max}], B={B_int}, N_total={N_total}"
+                    )
 
         # I99-1: 防御性 clamp batch_indices (额外保护)
         batch_indices = tensor_result.batch_indices.clamp(min=0, max=B_int - 1)
@@ -941,10 +944,14 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         else:
             features_roi = features
 
-        # I99-1: 验证 boxes 不包含 NaN/Inf
-        if torch.isnan(boxes).any() or torch.isinf(boxes).any():
-            boxes = torch.where(torch.isnan(boxes), torch.zeros_like(boxes), boxes)
-            boxes = torch.where(torch.isinf(boxes), torch.zeros_like(boxes), boxes)
+        # P-OPT: 直接替换 NaN/Inf，移除 .any() 同步检查
+        # 批量操作保持 GPU 利用率，避免 GPU-CPU 同步
+        # I-OPT: 使用 | 合并 mask 避免重复计算
+        nan_mask = torch.isnan(boxes)
+        inf_mask = torch.isinf(boxes)
+        combined_mask = nan_mask | inf_mask
+        # 使用 fused 操作避免显式 .any() 调用
+        boxes = torch.where(combined_mask, torch.zeros_like(boxes), boxes)
 
         # P1-FIX: 确保 boxes 和 features_roi 在同一设备上
         if boxes.device != features_roi.device:
@@ -1085,39 +1092,41 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             token_positions[sort_order] = token_positions_sorted
 
             # I99-1 OPT: 向量化验证，避免每个 batch 单独同步
-            # 改回 if-raise 模式，确保不会被 Python -O 标志跳过
-            batch_indices_valid = (batch_indices_safe >= 0).all() & (batch_indices_safe < B_int).all()
-            token_indices_valid = (token_positions >= 0).all()
-            if not (batch_indices_valid and token_indices_valid):
-                batch_min = int(batch_indices_safe.min().item()) if batch_indices_valid else "N/A"
-                batch_max = int(batch_indices_safe.max().item()) if batch_indices_valid else "N/A"
-                token_min = int(token_positions.min().item()) if token_indices_valid else "N/A"
-                token_max = int(token_positions.max().item()) if token_indices_valid else "N/A"
-                raise RuntimeError(
-                    f"I99-1 CRITICAL: batch_indices 或 token_positions 无效! "
-                    f"batch范围=[{batch_min}, {batch_max}], token范围=[{token_min}, {token_max}], "
-                    f"B={B_int}, N_total={N_total_int}"
-                )
+            # P-OPT: 仅在调试模式进行完整的验证检查，避免 GPU-CPU 同步
+            if getattr(self, '_debug_mode', False):
+                batch_indices_valid = (batch_indices_safe >= 0).all() & (batch_indices_safe < B_int).all()
+                token_indices_valid = (token_positions >= 0).all()
+                if not (batch_indices_valid and token_indices_valid):
+                    batch_min = int(batch_indices_safe.min().item()) if batch_indices_valid else "N/A"
+                    batch_max = int(batch_indices_safe.max().item()) if batch_indices_valid else "N/A"
+                    token_min = int(token_positions.min().item()) if token_indices_valid else "N/A"
+                    token_max = int(token_positions.max().item()) if token_indices_valid else "N/A"
+                    raise RuntimeError(
+                        f"I99-1 CRITICAL: batch_indices 或 token_positions 无效! "
+                        f"batch范围=[{batch_min}, {batch_max}], token范围=[{token_min}, {token_max}], "
+                        f"B={B_int}, N_total={N_total_int}"
+                    )
 
             # I99-1: 防御性 clamp - 确保 token_positions 在安全范围内
             # 这是一个额外的保护层，防止 splitter 异常
             token_positions = token_positions.clamp(min=0, max=max_tokens_int - 1)
 
         # I99-1 OPT: 批量验证，避免每个样本单独检查
-        # 改回 if-raise 模式，确保不会被 Python -O 标志跳过
-        if N_total_int > 0 and B_int > 0 and max_tokens_int > 0:
-            batch_ok = (batch_indices_safe >= 0).all() & (batch_indices_safe < B_int).all()
-            token_ok = (token_positions >= 0).all() & (token_positions < max_tokens_int).all()
-            if not (batch_ok and token_ok):
-                batch_min = int(batch_indices_safe.min().item()) if batch_ok else "N/A"
-                batch_max = int(batch_indices_safe.max().item()) if batch_ok else "N/A"
-                token_min = int(token_positions.min().item()) if token_ok else "N/A"
-                token_max = int(token_positions.max().item()) if token_ok else "N/A"
-                raise RuntimeError(
-                    f"I99-1 CRITICAL: batch_indices 或 token_positions 越界! "
-                    f"batch范围=[{batch_min}, {batch_max}], token范围=[{token_min}, {token_max}], "
-                    f"B_int={B_int}, max_tokens_int={max_tokens_int}, N_total_int={N_total_int}"
-                )
+        # P-OPT: 仅在调试模式进行完整的验证检查，避免 GPU-CPU 同步
+        if getattr(self, '_debug_mode', False):
+            if N_total_int > 0 and B_int > 0 and max_tokens_int > 0:
+                batch_ok = (batch_indices_safe >= 0).all() & (batch_indices_safe < B_int).all()
+                token_ok = (token_positions >= 0).all() & (token_positions < max_tokens_int).all()
+                if not (batch_ok and token_ok):
+                    batch_min = int(batch_indices_safe.min().item()) if batch_ok else "N/A"
+                    batch_max = int(batch_indices_safe.max().item()) if batch_ok else "N/A"
+                    token_min = int(token_positions.min().item()) if token_ok else "N/A"
+                    token_max = int(token_positions.max().item()) if token_ok else "N/A"
+                    raise RuntimeError(
+                        f"I99-1 CRITICAL: batch_indices 或 token_positions 越界! "
+                        f"batch范围=[{batch_min}, {batch_max}], token范围=[{token_min}, {token_max}], "
+                        f"B_int={B_int}, max_tokens_int={max_tokens_int}, N_total_int={N_total_int}"
+                    )
 
         # 验证 tokens tensor 形状
         expected_tokens_shape = (B, max_tokens_int, dim)

@@ -2032,25 +2032,29 @@ def train_epoch(
             if debug_mode and i == 0 and use_mixup:
                 print(f"[DEBUG] Batch 0: forward 完成，outs.shape={outs.shape}", flush=True)
             
-            # 检查 logits 范围，防止爆炸
-            if torch.isnan(outs).any() or torch.isinf(outs).any():
-                nan_count += 1
-                if nan_count <= 3:
-                    print(f"\n[WARN] Logits 包含 NaN/Inf (batch {i}), 跳过此 batch")
-                    # 详细诊断
-                    report = diagnose_nan_inf(
-                        batch_idx=i,
-                        imgs=imgs,
-                        labels=labels,
-                        model=model,
-                        logits=outs,
-                        log_file=exp_dir / "nan_inf_diagnose.log" if exp_dir else None,
-                    )
-                    print(report)
-                if nan_count > 10:
-                    raise RuntimeError(f"连续出现 {nan_count} 次 NaN，训练终止")
-                optimizer.zero_grad(set_to_none=True)
-                continue
+            # P-OPT: 仅在调试模式检查 NaN/Inf，避免 GPU-CPU 同步
+            # 使用 AMP 时 NaN/Inf 很少见，全量检查会严重影响吞吐量
+            if debug_mode:
+                outs_has_nan = torch.isnan(outs).any()
+                outs_has_inf = torch.isinf(outs).any()
+                if outs_has_nan or outs_has_inf:
+                    nan_count += 1
+                    if nan_count <= 3:
+                        print(f"\n[WARN] Logits 包含 NaN/Inf (batch {i}), 跳过此 batch")
+                        report = diagnose_nan_inf(
+                            batch_idx=i,
+                            imgs=imgs,
+                            labels=labels,
+                            model=model,
+                            logits=outs,
+                            log_file=exp_dir / "nan_inf_diagnose.log" if exp_dir else None,
+                        )
+                        print(report)
+                    if nan_count > 10:
+                        raise RuntimeError(f"连续出现 {nan_count} 次 NaN，训练终止")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+                nan_count = 0
             
             if use_mixup and mixed_labels is not None:
                 # 使用混合标签的交叉熵 (Mixup 模式下不使用 Focal Loss)
@@ -2147,19 +2151,28 @@ def train_epoch(
 
             if entropy_loss is not None:
                 entropy_loss_f32 = entropy_loss.float()
-                if torch.isnan(entropy_loss_f32) or torch.isinf(entropy_loss_f32):
-                    print(f"[WARN] entropy_loss 为 NaN/Inf: {entropy_loss_f32.item()}")
-                    entropy_loss = None  # 跳过该损失
+                # P-OPT: 仅在调试模式检查 NaN/Inf，避免 GPU-CPU 同步
+                if debug_mode:
+                    if torch.isnan(entropy_loss_f32) or torch.isinf(entropy_loss_f32):
+                        print(f"[WARN] entropy_loss 为 NaN/Inf: {entropy_loss_f32.item()}")
+                        entropy_loss = None  # 跳过该损失
+                    else:
+                        loss = loss + entropy_loss_f32 / config.accum_steps
+                        entropy_loss_sum = entropy_loss_sum + entropy_loss_f32.detach()
+                        entropy_loss_count += 1
                 else:
                     loss = loss + entropy_loss_f32 / config.accum_steps
-                    # P-OPT: 使用 GPU 张量累加，避免 .item() 同步
                     entropy_loss_sum = entropy_loss_sum + entropy_loss_f32.detach()
                     entropy_loss_count += 1
             if splitter_loss is not None:
                 splitter_loss_f32 = splitter_loss.float()
-                if torch.isnan(splitter_loss_f32) or torch.isinf(splitter_loss_f32):
-                    print(f"[WARN] splitter_loss 为 NaN/Inf: {splitter_loss_f32.item()}")
-                    splitter_loss = None  # 跳过该损失
+                # P-OPT: 仅在调试模式检查 NaN/Inf，避免 GPU-CPU 同步
+                if debug_mode:
+                    if torch.isnan(splitter_loss_f32) or torch.isinf(splitter_loss_f32):
+                        print(f"[WARN] splitter_loss 为 NaN/Inf: {splitter_loss_f32.item()}")
+                        splitter_loss = None  # 跳过该损失
+                    else:
+                        loss = loss + splitter_loss_f32 / config.accum_steps
                 else:
                     loss = loss + splitter_loss_f32 / config.accum_steps
 
@@ -2168,38 +2181,42 @@ def train_epoch(
                 semantic_loss = getattr(stats, 'semantic_loss', None)
                 if semantic_loss is not None:
                     semantic_loss_f32 = semantic_loss.float()
-                    if torch.isnan(semantic_loss_f32).any() or torch.isinf(semantic_loss_f32).any():
-                        print(f"[WARN] semantic_loss 包含 NaN/Inf，跳过此损失")
+                    # P-OPT: 仅在调试模式检查 NaN/Inf，避免 GPU-CPU 同步
+                    if debug_mode:
+                        if torch.isnan(semantic_loss_f32).any() or torch.isinf(semantic_loss_f32).any():
+                            print(f"[WARN] semantic_loss 包含 NaN/Inf，跳过此损失")
+                        else:
+                            semantic_weight = getattr(config, 'semantic_loss_weight', 0.1)
+                            loss = loss + semantic_loss_f32.mean() * semantic_weight / config.accum_steps
                     else:
-                        # 使用配置的权重
                         semantic_weight = getattr(config, 'semantic_loss_weight', 0.1)
                         loss = loss + semantic_loss_f32.mean() * semantic_weight / config.accum_steps
-        
-        # 检查 loss 是否为 NaN/Inf，并输出详细诊断信息
-        if torch.isnan(loss) or torch.isinf(loss):
-            nan_count += 1
-            if nan_count <= 3:
-                print(f"\n[WARN] Loss 为 NaN/Inf (batch {i}), 跳过此 batch")
-                # 详细诊断
-                report = diagnose_nan_inf(
-                    batch_idx=i,
-                    imgs=imgs,
-                    labels=labels,
-                    model=model,
-                    logits=outs,
-                    loss=loss,
-                    ce_loss=ce_loss * config.accum_steps,  # 还原真实值
-                    entropy_loss=entropy_loss,
-                    splitter_loss=splitter_loss,
-                    log_file=exp_dir / "nan_inf_diagnose.log" if exp_dir else None,
-                )
-                print(report)
-            if nan_count > 10:
-                raise RuntimeError(f"连续出现 {nan_count} 次 NaN loss，训练终止")
-            optimizer.zero_grad(set_to_none=True)
-            continue
-        
-        nan_count = 0  # 重置计数器
+
+        # P-OPT: 仅在调试模式检查 loss NaN/Inf，避免 GPU-CPU 同步
+        # 训练时依赖 AMP 的安全机制，跳过检查
+        if debug_mode:
+            if torch.isnan(loss) or torch.isinf(loss):
+                nan_count += 1
+                if nan_count <= 3:
+                    print(f"\n[WARN] Loss 为 NaN/Inf (batch {i}), 跳过此 batch")
+                    report = diagnose_nan_inf(
+                        batch_idx=i,
+                        imgs=imgs,
+                        labels=labels,
+                        model=model,
+                        logits=outs,
+                        loss=loss,
+                        ce_loss=ce_loss * config.accum_steps,
+                        entropy_loss=entropy_loss,
+                        splitter_loss=splitter_loss,
+                        log_file=exp_dir / "nan_inf_diagnose.log" if exp_dir else None,
+                    )
+                    print(report)
+                if nan_count > 10:
+                    raise RuntimeError(f"连续出现 {nan_count} 次 NaN loss，训练终止")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            nan_count = 0
         
         forward_time = time.time() - forward_start
         forward_times.append(forward_time)

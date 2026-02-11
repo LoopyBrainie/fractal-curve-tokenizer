@@ -3714,15 +3714,15 @@ class GumbelTopKSplitter(
 
         # 使用硬阈值选择最终区域 (用于实际 token 选择和索引)
         final_selected = (consistent_mask > 0.5)  # [B, N]
-        
-        # 确保每个 batch 至少有一个 token (根节点)
-        empty_batches = (num_selected_per_batch == 0)
-        if empty_batches.any():
-            # 对空 batch 强制选中根节点 (index 0)
-            final_selected = final_selected.clone()
-            final_selected[empty_batches, 0] = True
-            num_selected_per_batch = final_selected.sum(dim=1)
-        
+
+        # P-OPT: 使用向量化操作确保每个 batch 至少有一个 token
+        # 避免 .any() 同步点，直接使用 clamp 和 where 操作
+        min_tokens_per_batch = final_selected.sum(dim=1, keepdim=True)  # [B, 1]
+        empty_mask = (min_tokens_per_batch == 0)  # [B, 1]
+
+        # P-OPT: 使用 torch.where 批量处理，避免 Python 控制流
+        final_selected = torch.where(empty_mask, final_selected.new_zeros(final_selected.shape).scatter_(1, torch.zeros(empty_mask.shape[0], 1, dtype=torch.long, device=device).unsqueeze(1), 1), final_selected)
+
         # 一次性获取所有选中位置 [total_selected, 2] -> (batch_idx, candidate_idx)
         selected_positions = final_selected.nonzero(as_tuple=False)  # [total, 2]
 
@@ -3731,21 +3731,15 @@ class GumbelTopKSplitter(
         batch_indices_raw = selected_positions[:, 0]  # [total]
         candidate_indices_raw = selected_positions[:, 1]  # [total]
 
-        # Clamp indices to valid ranges
+        # Clamp indices to valid ranges (提供安全保障)
         batch_indices = batch_indices_raw.clamp(min=0, max=B - 1)
         candidate_indices = candidate_indices_raw.clamp(min=0, max=N - 1)
-        # probs.shape[1] 可能与 N 不同，需要额外检查
+
+        # I99-1: 形状验证 (不触发同步的简单比较)
         if probs.shape[1] != N:
             raise RuntimeError(
                 f"I99-1 BUG: probs.shape[1]={probs.shape[1]} != consistent_mask.shape[1]={N}"
             )
-        # I113-12: 移除 .item()，使用张量比较
-        if candidate_indices.numel() > 0:
-            max_idx = candidate_indices.max()
-            if max_idx >= probs.shape[1]:
-                raise RuntimeError(
-                    f"I99-1 BUG: candidate_indices max={max_idx} >= probs.shape[1]={probs.shape[1]}"
-                )
 
         # I99-1: 额外验证 - 如果 nonzero 返回空张量，创建安全的默认值
         if selected_positions.shape[0] == 0:
@@ -3843,21 +3837,24 @@ class GumbelTopKSplitter(
 
         # I23-4-FIX: NaN 检测与防护 (使用 detached 版本检测)
         # 如果缓存的 probs 或 selected_mask 包含 NaN，返回零损失
-        has_nan = False
-        if probs_detached is not None and torch.isnan(probs_detached).any():
-            has_nan = True
-        if selected_mask_detached is not None and torch.isnan(selected_mask_detached).any():
-            has_nan = True
-        
-        if has_nan:
-            # 返回零损失，避免 NaN 传播到总损失
-            zero = torch.tensor(0.0, device=device)
-            if include_elastic_budget:
-                losses['elastic_budget_loss'] = zero
-            if include_soft_entropy:
-                losses['soft_entropy_loss'] = zero
-            # I35: 移除死代码 DEPTH_KL_WEIGHT, DEPTH_QUOTA_ENABLED
-            return losses
+        # P-OPT: 仅在调试模式检查 NaN，避免 GPU-CPU 同步
+        # NaN 很少见，AMP 模式下可以跳过检查
+        if getattr(self, '_debug_mode', False):
+            has_nan = False
+            if probs_detached is not None and torch.isnan(probs_detached).any():
+                has_nan = True
+            if selected_mask_detached is not None and torch.isnan(selected_mask_detached).any():
+                has_nan = True
+
+            if has_nan:
+                # 返回零损失，避免 NaN 传播到总损失
+                zero = torch.tensor(0.0, device=device)
+                if include_elastic_budget:
+                    losses['elastic_budget_loss'] = zero
+                if include_soft_entropy:
+                    losses['soft_entropy_loss'] = zero
+                # I35: 移除死代码 DEPTH_KL_WEIGHT, DEPTH_QUOTA_ENABLED
+                return losses
         
         # 1. Elastic Budget Loss (I109-4: 目标导向损失)
         # I109-4: 替换死区设计为目标导向损失

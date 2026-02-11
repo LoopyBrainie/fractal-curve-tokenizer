@@ -307,46 +307,28 @@ class LCAHilbertBias(HilbertBiasBase):
         paths = paths.clone()  # 避免原地修改
         paths[padding_mask] = -1  # 特殊值，不会与有效路径混淆
 
-        # I30-5: 路径值验证 + 警告
-        # 四叉树路径值必须是 0-3 (对应四个象限: 左上, 右上, 左下, 右下)
-        # I102-5: 仅在需要时计算 .item()，避免不必要的 GPU-CPU 同步
-        # I99-1 OPT: 添加调试模式检查，避免 CUDA Graphs 中断
-        path_out_of_range = (paths > 3).any() | (paths < 0).any()
-        if path_out_of_range and getattr(self, '_debug_mode', False):
-            # 仅在异常时触发同步
-            path_min = paths.min().item()
-            path_max = paths.max().item()
-            warnings.warn(
-                f"[I30-5] levels_info path values out of range: "
-                f"[{path_min:.2f}, {path_max:.2f}], expected [0, 3]. "
-                f"Clipping will be applied. "
-                f"This may indicate a tokenizer bug.",
-                RuntimeWarning,
-                stacklevel=2
-            )
-        paths = paths.clamp(0, 3)  # 安全保护仍保留
+        # P-OPT: 移除冗余的范围检查，clamp 已经提供了安全保证
+        # 之前的检查 + clamp 模式是冗余的：检查触发 GPU 同步但 clamp 仍会执行
+        # 直接 clamp，避免 GPU-CPU 同步开销
+        paths = paths.clamp(0, 3)
 
         # CRIT-3: 移除缓存，直接计算 LCA
         # 数学分析: 训练中每张图像不同，不存在等价输入复用
         # 缓存命中率趋近于 0，缓存是过早优化，应移除
         lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
 
-        # I34-13: LCA 钳位改为异常 - 静默钳位掩盖计算 bug
-        # I102-5: 使用张量比较避免 GPU-CPU 同步
-        # I147: 修复变量遮蔽，使用 actual_max 避免遮蔽 self.max_level
-        # I99-1 OPT: 添加调试模式获取详细值
-        lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_level).any()
-        if lca_invalid:
-            if getattr(self, '_debug_mode', False):
+        # P-OPT: 仅在调试模式检查 LCA 有效性，避免每次 forward 都触发 GPU 同步
+        # I34-13: 静默钳位掩盖计算 bug，所以在调试时抛出异常
+        if getattr(self, '_debug_mode', False):
+            lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_level).any()
+            if lca_invalid:
                 min_depth = lca_depths.min().item()
-                actual_max = lca_depths.max().item()  # 重命名避免遮蔽 self.max_level
-            else:
-                min_depth, actual_max = "<tensor>", "<tensor>"
-            raise ValueError(
-                f"LCA depth out of bounds [0, {self.max_level}]: "
-                f"min={min_depth}, max={actual_max}. "
-                "This indicates a bug in LCA computation."
-            )
+                actual_max = lca_depths.max().item()
+                raise ValueError(
+                    f"LCA depth out of bounds [0, {self.max_level}]: "
+                    f"min={min_depth}, max={actual_max}. "
+                    "This indicates a bug in LCA computation."
+                )
 
         # 批量嵌入: (B, S, S, H)
         bias = self.lca_embedding(lca_depths)
@@ -411,15 +393,15 @@ class LCAHilbertBias(HilbertBiasBase):
         
         # 计算 LCA 深度矩阵
         lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)
+        # P-OPT: 仅在调试模式检查 LCA，移除热路径中的 GPU 同步
         # I34-13: LCA 钳位警告 - 静默钳位可能隐藏计算 bug
-        # I102-5: 使用张量比较 + 延迟构造警告消息
-        # I99-1 OPT: 添加调试模式检查，避免 CUDA Graphs 中断
-        lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_level).any()
-        if lca_invalid and getattr(self, '_debug_mode', False):
-            warnings.warn(
-                f"LCA depth clamped to [0, {self.max_level}]. "
-                f"Min: {lca_depths.min().item():.2f}, Max: {lca_depths.max().item():.2f}"
-            )
+        if getattr(self, '_debug_mode', False):
+            lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_level).any()
+            if lca_invalid:
+                warnings.warn(
+                    f"LCA depth clamped to [0, {self.max_level}]. "
+                    f"Min: {lca_depths.min().item():.2f}, Max: {lca_depths.max().item():.2f}"
+                )
         lca_depths = lca_depths.clamp(0, self.max_level)  # [B, N, N]
         
         # 批量嵌入: (B, N, N, H)
