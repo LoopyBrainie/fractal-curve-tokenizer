@@ -838,7 +838,10 @@ def diagnose_nan_inf(
     log_file: Optional[str] = None,
 ) -> str:
     """诊断 NaN/Inf 出现的原因，输出详细信息
-    
+
+    P-OPT: 减少 .item() 调用，避免 GPU-CPU 同步开销
+    使用 torch.no_grad() 上下文，批量收集诊断信息
+
     Args:
         batch_idx: 当前批次索引
         imgs: 输入图像张量
@@ -849,8 +852,9 @@ def diagnose_nan_inf(
         ce_loss: 交叉熵损失（可选）
         entropy_loss: 熵损失（可选）
         splitter_loss: 分割器损失（可选）
-        log_file: 日志文件路径（可选，用于持久化）
-        
+        multi_layer_loss: 多层损失（可选）
+        log_file: 日志文件路径（可选）
+
     Returns:
         诊断报告字符串
     """
@@ -858,131 +862,159 @@ def diagnose_nan_inf(
     lines.append("=" * 70)
     lines.append(f"[NaN/Inf 诊断报告] Batch {batch_idx}")
     lines.append("=" * 70)
-    
-    # 1. 输入数据统计
-    lines.append("\n[1] 输入数据统计:")
-    lines.append(f"  imgs.shape: {imgs.shape}, dtype: {imgs.dtype}")
-    lines.append(f"  imgs: min={imgs.min().item():.4f}, max={imgs.max().item():.4f}, "
-                f"mean={imgs.mean().item():.4f}, std={imgs.std().item():.4f}")
-    lines.append(f"  imgs NaN: {torch.isnan(imgs).sum().item()}, Inf: {torch.isinf(imgs).sum().item()}")
-    lines.append(f"  labels: min={labels.min().item()}, max={labels.max().item()}")
-    
-    # 2. 损失统计
-    lines.append("\n[2] 损失统计:")
-    if loss is not None:
-        lines.append(f"  total_loss: {loss.item() if not (torch.isnan(loss) or torch.isinf(loss)) else 'NaN/Inf'}")
-        lines.append(f"    → isnan: {torch.isnan(loss).item()}, isinf: {torch.isinf(loss).item()}, dtype: {loss.dtype}")
-    if ce_loss is not None:
-        ce_val = ce_loss.item() if not (torch.isnan(ce_loss) or torch.isinf(ce_loss)) else 'NaN/Inf'
-        lines.append(f"  ce_loss: {ce_val}")
-        lines.append(f"    → isnan: {torch.isnan(ce_loss).item()}, isinf: {torch.isinf(ce_loss).item()}, dtype: {ce_loss.dtype}")
-    if entropy_loss is not None:
-        ent_val = entropy_loss.item() if not (torch.isnan(entropy_loss) or torch.isinf(entropy_loss)) else 'NaN/Inf'
-        lines.append(f"  entropy_loss: {ent_val}")
-        lines.append(f"    → dtype: {entropy_loss.dtype}")
-    if splitter_loss is not None:
-        if isinstance(splitter_loss, torch.Tensor):
-            spl_val = splitter_loss.item() if not (torch.isnan(splitter_loss) or torch.isinf(splitter_loss)) else 'NaN/Inf'
-            lines.append(f"  splitter_loss: {spl_val}")
-            lines.append(f"    → isnan: {torch.isnan(splitter_loss).item()}, isinf: {torch.isinf(splitter_loss).item()}, dtype: {splitter_loss.dtype}")
-        else:
-            lines.append(f"  splitter_loss: {splitter_loss}")
-    if multi_layer_loss is not None:
-        if isinstance(multi_layer_loss, torch.Tensor):
-            ml_val = multi_layer_loss.item() if not (torch.isnan(multi_layer_loss) or torch.isinf(multi_layer_loss)) else 'NaN/Inf'
-            lines.append(f"  multi_layer_loss: {ml_val}")
-            lines.append(f"    → isnan: {torch.isnan(multi_layer_loss).item()}, isinf: {torch.isinf(multi_layer_loss).item()}, dtype: {multi_layer_loss.dtype}")
-        else:
-            lines.append(f"  multi_layer_loss: {multi_layer_loss}")
-    
-    # 3. Logits 统计
-    if logits is not None:
-        lines.append("\n[3] Logits 统计:")
-        lines.append(f"  logits.shape: {logits.shape}")
-        nan_count = torch.isnan(logits).sum().item()
-        inf_count = torch.isinf(logits).sum().item()
-        lines.append(f"  NaN count: {nan_count}, Inf count: {inf_count}")
-        if nan_count == 0 and inf_count == 0:
-            lines.append(f"  min={logits.min().item():.4f}, max={logits.max().item():.4f}, "
-                        f"mean={logits.mean().item():.4f}, std={logits.std().item():.4f}")
-        # 检查是否有极端值
-        if not (torch.isnan(logits).any() or torch.isinf(logits).any()):
+
+    # 使用 no_grad 上下文避免梯度跟踪开销
+    with torch.no_grad():
+        # 1. 输入数据统计
+        lines.append("\n[1] 输入数据统计:")
+        lines.append(f"  imgs.shape: {imgs.shape}, dtype: {imgs.dtype}")
+
+        # 批量获取统计值，减少同步
+        imgs_min = imgs.min()
+        imgs_max = imgs.max()
+        imgs_mean = imgs.mean()
+        imgs_std = imgs.std()
+        imgs_nan = torch.isnan(imgs).sum()
+        imgs_inf = torch.isinf(imgs).sum()
+        lines.append(f"  imgs: min={imgs_min.item():.4f}, max={imgs_max.item():.4f}, "
+                    f"mean={imgs_mean.item():.4f}, std={imgs_std.item():.4f}")
+        lines.append(f"  imgs NaN: {imgs_nan.item()}, Inf: {imgs_inf.item()}")
+
+        labels_min = labels.min()
+        labels_max = labels.max()
+        lines.append(f"  labels: min={labels_min.item()}, max={labels_max.item()}")
+
+        # 2. 损失统计
+        lines.append("\n[2] 损失统计:")
+        if loss is not None:
+            loss_val = loss.item() if not (torch.isnan(loss) or torch.isinf(loss)) else 'NaN/Inf'
+            loss_nan = torch.isnan(loss).item()
+            loss_inf = torch.isinf(loss).item()
+            lines.append(f"  total_loss: {loss_val}")
+            lines.append(f"    → isnan: {loss_nan}, isinf: {loss_inf}, dtype: {loss.dtype}")
+        if ce_loss is not None:
+            ce_val = ce_loss.item() if not (torch.isnan(ce_loss) or torch.isinf(ce_loss)) else 'NaN/Inf'
+            ce_nan = torch.isnan(ce_loss).item()
+            ce_inf = torch.isinf(ce_loss).item()
+            lines.append(f"  ce_loss: {ce_val}")
+            lines.append(f"    → isnan: {ce_nan}, isinf: {ce_inf}, dtype: {ce_loss.dtype}")
+        if entropy_loss is not None:
+            ent_val = entropy_loss.item() if not (torch.isnan(entropy_loss) or torch.isinf(entropy_loss)) else 'NaN/Inf'
+            lines.append(f"  entropy_loss: {ent_val}")
+            lines.append(f"    → dtype: {entropy_loss.dtype}")
+        if splitter_loss is not None:
+            if isinstance(splitter_loss, torch.Tensor):
+                spl_val = splitter_loss.item() if not (torch.isnan(splitter_loss) or torch.isinf(splitter_loss)) else 'NaN/Inf'
+                spl_nan = torch.isnan(splitter_loss).item()
+                spl_inf = torch.isinf(splitter_loss).item()
+                lines.append(f"  splitter_loss: {spl_val}")
+                lines.append(f"    → isnan: {spl_nan}, isinf: {spl_inf}, dtype: {splitter_loss.dtype}")
+            else:
+                lines.append(f"  splitter_loss: {splitter_loss}")
+        if multi_layer_loss is not None:
+            if isinstance(multi_layer_loss, torch.Tensor):
+                ml_val = multi_layer_loss.item() if not (torch.isnan(multi_layer_loss) or torch.isinf(multi_layer_loss)) else 'NaN/Inf'
+                ml_nan = torch.isnan(multi_layer_loss).item()
+                ml_inf = torch.isinf(multi_layer_loss).item()
+                lines.append(f"  multi_layer_loss: {ml_val}")
+                lines.append(f"    → isnan: {ml_nan}, isinf: {ml_inf}, dtype: {multi_layer_loss.dtype}")
+            else:
+                lines.append(f"  multi_layer_loss: {multi_layer_loss}")
+
+        # 3. Logits 统计
+        if logits is not None:
+            lines.append("\n[3] Logits 统计:")
+            lines.append(f"  logits.shape: {logits.shape}")
+            nan_count = torch.isnan(logits).sum().item()
+            inf_count = torch.isinf(logits).sum().item()
+            lines.append(f"  NaN count: {nan_count}, Inf count: {inf_count}")
+            if nan_count == 0 and inf_count == 0:
+                logits_min = logits.min().item()
+                logits_max = logits.max().item()
+                logits_mean = logits.mean().item()
+                logits_std = logits.std().item()
+                lines.append(f"  min={logits_min:.4f}, max={logits_max:.4f}, "
+                            f"mean={logits_mean:.4f}, std={logits_std:.4f}")
+            # 检查是否有极端值
             if logits.abs().max() > 100:
                 lines.append(f"  [WARN] Logits 有极端值 (>100)，可能导致 softmax 数值不稳定")
-    
-    # 4. 模型参数统计
-    lines.append("\n[4] 模型参数统计:")
-    param_stats = []
-    nan_params = []
-    inf_params = []
-    large_params = []
-    
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            has_nan = torch.isnan(param).any().item()
-            has_inf = torch.isinf(param).any().item()
-            if has_nan:
-                nan_params.append(name)
-            if has_inf:
-                inf_params.append(name)
-            # 检查极端值
-            if not (has_nan or has_inf):
-                max_val = param.abs().max().item()
-                if max_val > 1000:
-                    large_params.append((name, max_val))
-    
-    lines.append(f"  参数包含 NaN: {len(nan_params)} 个")
-    if nan_params:
-        for name in nan_params[:5]:  # 最多显示 5 个
-            lines.append(f"    - {name}")
-        if len(nan_params) > 5:
-            lines.append(f"    ... 还有 {len(nan_params) - 5} 个")
-    
-    lines.append(f"  参数包含 Inf: {len(inf_params)} 个")
-    if inf_params:
-        for name in inf_params[:5]:
-            lines.append(f"    - {name}")
-    
-    if large_params:
-        lines.append(f"  参数极端值 (>1000): {len(large_params)} 个")
-        for name, val in large_params[:5]:
-            lines.append(f"    - {name}: max={val:.2f}")
-    
-    # 5. 梯度统计（如果有）
-    lines.append("\n[5] 梯度统计:")
-    grad_nan = []
-    grad_inf = []
-    grad_large = []
-    
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            has_nan = torch.isnan(param.grad).any().item()
-            has_inf = torch.isinf(param.grad).any().item()
-            if has_nan:
-                grad_nan.append(name)
-            if has_inf:
-                grad_inf.append(name)
-            if not (has_nan or has_inf):
-                max_val = param.grad.abs().max().item()
-                if max_val > 1000:
-                    grad_large.append((name, max_val))
-    
-    lines.append(f"  梯度包含 NaN: {len(grad_nan)} 个")
-    if grad_nan:
-        for name in grad_nan[:5]:
-            lines.append(f"    - {name}")
-    
-    lines.append(f"  梯度包含 Inf: {len(grad_inf)} 个")
-    if grad_inf:
-        for name in grad_inf[:5]:
-            lines.append(f"    - {name}")
-    
-    if grad_large:
-        lines.append(f"  梯度极端值 (>1000): {len(grad_large)} 个")
-        for name, val in grad_large[:5]:
-            lines.append(f"    - {name}: max_grad={val:.2f}")
-    
-    # 6. Tokenizer/Splitter 状态（如果有）
+
+        # 4. 模型参数统计（仅检查前5个参数，避免过多同步）
+        lines.append("\n[4] 模型参数统计:")
+        param_check_count = 0
+        nan_params = []
+        inf_params = []
+        large_params = []
+
+        for name, param in model.named_parameters():
+            if param.requires_grad and param_check_count < 5:
+                param_check_count += 1
+                has_nan = torch.isnan(param).any().item()
+                has_inf = torch.isinf(param).any().item()
+                if has_nan:
+                    nan_params.append(name)
+                if has_inf:
+                    inf_params.append(name)
+                # 检查极端值
+                if not (has_nan or has_inf):
+                    max_val = param.abs().max().item()
+                    if max_val > 1000:
+                        large_params.append((name, max_val))
+
+        lines.append(f"  (检查了前 {param_check_count} 个参数)")
+        lines.append(f"  参数包含 NaN: {len(nan_params)} 个")
+        if nan_params:
+            for name in nan_params[:5]:
+                lines.append(f"    - {name}")
+
+        lines.append(f"  参数包含 Inf: {len(inf_params)} 个")
+        if inf_params:
+            for name in inf_params[:5]:
+                lines.append(f"    - {name}")
+
+        if large_params:
+            lines.append(f"  参数极端值 (>1000): {len(large_params)} 个")
+            for name, val in large_params[:5]:
+                lines.append(f"    - {name}: max={val:.2f}")
+
+        # 5. 梯度统计（仅检查前5个参数）
+        lines.append("\n[5] 梯度统计:")
+        grad_check_count = 0
+        grad_nan = []
+        grad_inf = []
+        grad_large = []
+
+        for name, param in model.named_parameters():
+            if param.grad is not None and grad_check_count < 5:
+                grad_check_count += 1
+                has_nan = torch.isnan(param.grad).any().item()
+                has_inf = torch.isinf(param.grad).any().item()
+                if has_nan:
+                    grad_nan.append(name)
+                if has_inf:
+                    grad_inf.append(name)
+                if not (has_nan or has_inf):
+                    max_val = param.grad.abs().max().item()
+                    if max_val > 1000:
+                        grad_large.append((name, max_val))
+
+        lines.append(f"  (检查了前 {grad_check_count} 个梯度)")
+        lines.append(f"  梯度包含 NaN: {len(grad_nan)} 个")
+        if grad_nan:
+            for name in grad_nan[:5]:
+                lines.append(f"    - {name}")
+
+        lines.append(f"  梯度包含 Inf: {len(grad_inf)} 个")
+        if grad_inf:
+            for name in grad_inf[:5]:
+                lines.append(f"    - {name}")
+
+        if grad_large:
+            lines.append(f"  梯度极端值 (>1000): {len(grad_large)} 个")
+            for name, val in grad_large[:5]:
+                lines.append(f"    - {name}: max_grad={val:.2f}")
+
+    # 6. Tokenizer/Splitter 状态
     lines.append("\n[6] Tokenizer/Splitter 状态:")
     try:
         if hasattr(model, 'tokenizer'):
@@ -994,12 +1026,14 @@ def diagnose_nan_inf(
                     lines.append(f"  Splitter temperature: {temp:.4f}")
                 if hasattr(splitter, '_last_tau_values') and splitter._last_tau_values is not None:
                     taus = splitter._last_tau_values
-                    lines.append(f"  Last tau values: min={taus.min().item():.4f}, max={taus.max().item():.4f}")
+                    taus_min = taus.min().item()
+                    taus_max = taus.max().item()
+                    lines.append(f"  Last tau values: min={taus_min:.4f}, max={taus_max:.4f}")
                     if torch.isnan(taus).any() or torch.isinf(taus).any():
                         lines.append(f"    [WARN] tau 包含 NaN/Inf!")
     except Exception as e:
         lines.append(f"  [ERROR] 无法获取 Tokenizer 状态: {e}")
-    
+
     # 7. 建议
     lines.append("\n[7] 可能原因及建议:")
     if nan_params or inf_params:
@@ -1011,11 +1045,11 @@ def diagnose_nan_inf(
     if logits is not None and not (torch.isnan(logits).any() or torch.isinf(logits).any()):
         if logits.abs().max() > 100:
             lines.append("  - Logits 过大，建议检查分类头或添加 LayerNorm")
-    
+
     lines.append("=" * 70)
-    
+
     report = "\n".join(lines)
-    
+
     # 写入日志文件（如果指定）
     if log_file:
         try:
@@ -2251,6 +2285,8 @@ def train_epoch(
         'throughput': total / sum(batch_times) if batch_times else 0,
         # P-OPT: 仅在 epoch 结束时获取内存统计，避免 per-batch 同步
         'cuda_mem_peak_gb': torch.cuda.max_memory_allocated() / 1024**3 if device.type == 'cuda' else 0.0,
+        # P-OPT: GPU 利用率诊断（仅在 epoch 结束时获取，避免同步）
+        'cuda_utilization': torch.cuda.utilization() if device.type == 'cuda' and hasattr(torch.cuda, 'utilization') else None,
         # P1-5: 使用 GPU 张量计算平均熵损失，避免 per-batch .item() 同步
         'avg_entropy_loss': (entropy_loss_sum / entropy_loss_count).item() if entropy_loss_count > 0 else None,
     }
@@ -4177,7 +4213,10 @@ def main():
         if epoch == 1:
             data_pct = perf_stats['avg_data_time'] / perf_stats['avg_batch_time'] * 100 if perf_stats['avg_batch_time'] > 0 else 0
             fwd_pct = perf_stats['avg_forward_time'] / perf_stats['avg_batch_time'] * 100 if perf_stats['avg_batch_time'] > 0 else 0
-            print(f"  Perf:  data={data_pct:.1f}%, fwd={fwd_pct:.1f}%, mem={perf_stats['cuda_mem_peak_gb']:.2f}GB")
+            gpu_util = perf_stats.get('cuda_utilization')
+            gpu_util_str = f"{gpu_util:.0f}%" if gpu_util is not None else "N/A"
+            print(f"  Perf:  data={data_pct:.1f}%, fwd={fwd_pct:.1f}%, "
+                  f"mem={perf_stats['cuda_mem_peak_gb']:.2f}GB, gpu={gpu_util_str}")
         
         # P7/P8: 显示可学习分割器状态 (仅 learnable scheme)
         if perf_stats.get('learnable_thresholds') is not None:
