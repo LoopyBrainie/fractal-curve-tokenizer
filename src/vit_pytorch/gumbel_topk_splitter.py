@@ -3721,7 +3721,11 @@ class GumbelTopKSplitter(
         empty_mask = (min_tokens_per_batch == 0)  # [B, 1]
 
         # P-OPT: 使用 torch.where 批量处理，避免 Python 控制流
-        final_selected = torch.where(empty_mask, final_selected.new_zeros(final_selected.shape).scatter_(1, torch.zeros(empty_mask.shape[0], 1, dtype=torch.long, device=device).unsqueeze(1), 1), final_selected)
+        # 无论是否为空 batch，都执行 where 操作（空 batch 会得到填充值，非空保持原值）
+        # fill_values: [B, N]，所有位置初始化为 0，然后在每个 batch 的位置 0 设置为 1
+        fill_values = torch.zeros(B, N, dtype=torch.bool, device=device)
+        fill_values.scatter_(1, torch.zeros(B, 1, dtype=torch.long, device=device), True)
+        final_selected = torch.where(empty_mask, fill_values, final_selected)
 
         # 一次性获取所有选中位置 [total_selected, 2] -> (batch_idx, candidate_idx)
         selected_positions = final_selected.nonzero(as_tuple=False)  # [total, 2]
