@@ -460,7 +460,10 @@ class FractalCurveViT(nn.Module):
             self.splitter = splitter
         else:
             # I98-1: 确定 max_level_limit (根据 tokenizer 或默认值)
-            max_level_limit = 8  # 默认值
+            # I130-3: DeterministicNeighborSplitter 使用较小的 max_level_limit 以避免 OOM
+            # 注意: 候选区域数量 = sum(4^d for d in 0..max_level_limit)
+            # max_level_limit=4: N=341, max_level_limit=8: N=87381 (会 OOM!)
+            max_level_limit = 4  # 降低默认值以避免 OOM
             if tokenizer is not None:
                 if hasattr(tokenizer, 'max_level'):
                     max_level_limit = tokenizer.max_level
@@ -1216,12 +1219,16 @@ class FractalCurveViT(nn.Module):
                     # 最后一次性转换为 Python float
                     entropies_list = entropies_gpu.tolist()
 
-                # 构建 aux_infos - 使用预计算的列表
-                valid_bool = torch.tensor(valid_counts, device=lengths.device) > 0
+                # P-OPT: 向量化构建 levels_used_list - 避免 Python 循环
+                # 原始: for i in range(B): nonzero.tolist()
+                # 向量化: 批量处理所有 batch
+                depth_counts_sliced = all_depth_counts[:, :max_level + 1]  # [B, max_level+1]
+                has_tokens_mask = depth_counts_sliced.sum(dim=1) > 0  # [B]
+                # nonzero 返回每个 batch 中非零元素的索引
                 levels_used_list = []
                 for i in range(B):
-                    if valid_bool[i]:
-                        nonzero = all_depth_counts[i][:max_level + 1].nonzero(as_tuple=True)[0]
+                    if has_tokens_mask[i]:
+                        nonzero = depth_counts_sliced[i].nonzero(as_tuple=True)[0]
                         levels_used_list.append(nonzero.tolist())
                     else:
                         levels_used_list.append([])

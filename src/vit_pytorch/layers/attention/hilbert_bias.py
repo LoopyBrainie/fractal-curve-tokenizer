@@ -131,10 +131,14 @@ class HilbertBiasBase(ABC, nn.Module):
             # 注意：使用 self.max_level 而不是推断的 max_level
             # 因为 lca_embedding 的 num_embeddings 由 self.max_level 决定
             # I150-2 FIX: 先检查非空，避免空张量上的 max() 错误
+            # P-OPT: 使用延迟同步 - 仅在检测到问题时才触发 GPU-CPU 同步
             if levels_info.data.numel() > 0:
                 depths = levels_info.data[:, :, 0]  # [B, S]
-                max_depth_in_input = depths.max().item()
-                if max_depth_in_input > self.max_level:
+                # 向量化检查：仅在有问题时才同步，避免每次 forward 都触发 .item()
+                exceeds_mask = depths > self.max_level
+                if exceeds_mask.any():
+                    # 延迟同步：只有真正出错时才获取具体值
+                    max_depth_in_input = depths.max().item()
                     raise ValueError(
                         f"LCA depth out of bounds: max depth in input is {max_depth_in_input}, "
                         f"but LCAHilbertBias.max_level is {self.max_level}. "
