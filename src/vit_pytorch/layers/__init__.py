@@ -11,6 +11,7 @@ from .splitters import (
     GumbelTopKSplitter,
     TensorSplitResult,
     GumbelTopKResult,
+    DepthMonitor,  # I111-6: 深度分布监控
     NeighborAwareSplitter,
     NeighborAwareSplitterConfig,
     LocalityConsistencyLoss,
@@ -41,6 +42,7 @@ __all__ = [
     "GumbelTopKSplitter",
     "TensorSplitResult",
     "GumbelTopKResult",
+    "DepthMonitor",  # I111-6: 深度分布监控
     "NeighborAwareSplitter",
     "NeighborAwareSplitterConfig",
     "LocalityConsistencyLoss",

@@ -7,6 +7,7 @@ from .gumbel_topk import (
     TensorSplitResult,
     GumbelTopKResult,
     create_gumbel_topk_from_config,
+    DepthMonitor,  # I111-6: 深度分布监控
 )
 from .deterministic_neighbor import (
     DeterministicNeighborSplitter,
@@ -26,6 +27,7 @@ __all__ = [
     "TensorSplitResult",
     "GumbelTopKResult",
     "create_gumbel_topk_from_config",
+    "DepthMonitor",  # I111-6: 深度分布监控
     "DeterministicNeighborSplitter",
     "DeterministicNeighborSplitterConfig",
     "HilbertNeighborMatrix",
