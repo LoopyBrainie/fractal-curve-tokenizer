@@ -460,8 +460,8 @@ class FractalCurveViT(nn.Module):
             self.splitter = splitter
         else:
             # I98-1: 确定 max_level_limit (根据 tokenizer 或默认值)
-            # I164-1: 现在使用分块处理，不再有 OOM 问题
-            max_level_limit = 8  # I164-1: 支持完整的 Hilbert 层级
+            # I164-1: 使用 max_level_limit=8 (已通过分块处理优化)
+            max_level_limit = 8
             if tokenizer is not None:
                 if hasattr(tokenizer, 'max_level'):
                     max_level_limit = tokenizer.max_level
