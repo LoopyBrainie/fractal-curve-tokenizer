@@ -13,7 +13,7 @@ ffn_swiglu.py 单元测试
 import pytest
 import torch
 import torch.nn as nn
-from vit_pytorch.ffn_swiglu import SwiGLUFFN, AdaptiveFractalFeedForward
+from vit_pytorch.layers.ffn.swiglu import SwiGLUFFN, AdaptiveFractalFeedForward
 
 
 class TestSwiGLUFFN:

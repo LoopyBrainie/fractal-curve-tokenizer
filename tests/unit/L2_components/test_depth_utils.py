@@ -14,7 +14,7 @@ depth_utils.py 单元测试
 import pytest
 import torch
 import math
-from vit_pytorch.depth_utils import (
+from vit_pytorch.core.depth_utils import (
     compute_max_depth,
     compute_actual_min_patch,
     compute_patch_sizes,

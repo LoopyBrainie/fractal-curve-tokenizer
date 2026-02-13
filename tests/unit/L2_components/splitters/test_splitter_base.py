@@ -14,7 +14,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
 
 
 def greedy_optimal_quota(p: list, K: int, k_min: int = 2) -> torch.Tensor:

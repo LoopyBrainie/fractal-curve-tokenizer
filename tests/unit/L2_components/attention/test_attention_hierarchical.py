@@ -21,7 +21,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vit_pytorch.attn_hilbert_bias import HilbertAwareMultiScaleAttention
+from vit_pytorch.layers.attention.hilbert_bias import HilbertAwareMultiScaleAttention
 
 
 class TestHierarchicalAttention:
@@ -282,7 +282,7 @@ class TestHierarchicalAttention:
     def test_gradient_flow_through_depth_scales(
         self, dim, heads, dim_head, max_level, device
     ):
-        """测试9: 深度缩放因子有梯度。"""
+        """测试9: 深度缩放因子有梯度 (I150-1: 简化相对缩放)。"""
         attn = HilbertAwareMultiScaleAttention(
             dim=dim,
             heads=heads,
@@ -306,11 +306,15 @@ class TestHierarchicalAttention:
         loss = output.sum()
         loss.backward()
 
-        # 检查深度缩放因子有梯度
-        assert attn._hierarchical_depth_scale.grad is not None, \
-            "深度缩放因子应有梯度"
-        assert attn._hierarchical_depth_scale.grad.abs().sum() > 0, \
-            "深度缩放因子梯度不应全为0"
+        # I150-1: 检查 Base 和 Delta 参数有梯度
+        assert attn._depth_scale_base.grad is not None, \
+            "Base 缩放因子应有梯度"
+        assert attn._depth_scale_base.grad.abs().sum() > 0, \
+            "Base 缩放因子梯度不应全为0"
+        assert attn._depth_scale_delta.grad is not None, \
+            "Delta 残差偏移应有梯度"
+        assert attn._depth_scale_delta.grad.abs().sum() > 0, \
+            "Delta 残差偏移梯度不应全为0"
 
 
 class TestHierarchicalAttentionIntegration:

@@ -140,7 +140,7 @@ class TestI145ConfigConsistency:
 
     def test_temperature_default_value(self):
         """验证温度参数默认值正确"""
-        from vit_pytorch.constants import SPLITTER_TEMP_END, TEMPERATURE_MIN
+        from vit_pytorch.core.constants import SPLITTER_TEMP_END, TEMPERATURE_MIN
 
         # 测试使用默认值时的行为
         config = ModelArchitectureConfig()
@@ -165,7 +165,7 @@ class TestI145ConfigConsistency:
 
     def test_temperature_validation(self):
         """验证 ModelGene.validate() 能检测无效温度"""
-        from vit_pytorch.constants import TEMPERATURE_MIN
+        from vit_pytorch.core.constants import TEMPERATURE_MIN
 
         # 创建温度过低的基因（应该失败）
         gene = ModelGene(
@@ -183,7 +183,7 @@ class TestI145ConfigConsistency:
 
     def test_temperature_warn_on_low_start(self):
         """验证温度起始值过低时发出警告"""
-        from vit_pytorch.constants import TEMPERATURE_MIN
+        from vit_pytorch.core.constants import TEMPERATURE_MIN
         import warnings
 
         gene = ModelGene(
@@ -483,7 +483,7 @@ class TestI145Fixes:
 
     def test_coverage_max_hard_consistency(self):
         """验证 coverage_max_hard 在 Config 和 ModelGene 中一致"""
-        from vit_pytorch.constants import K_COVERAGE_MAX_HARD
+        from vit_pytorch.core.constants import K_COVERAGE_MAX_HARD
 
         # Config 中的值
         config = ModelArchitectureConfig()
@@ -500,7 +500,7 @@ class TestI145Fixes:
 
     def test_k_min_abs_consistency(self):
         """验证 K_min_abs 在 Constants、Config 和 ModelGene 中一致"""
-        from vit_pytorch.constants import K_MIN_HARD_LIMIT
+        from vit_pytorch.core.constants import K_MIN_HARD_LIMIT
 
         # 常量中的值
         assert K_MIN_HARD_LIMIT == 8, \
@@ -521,7 +521,7 @@ class TestI145Fixes:
 
     def test_temperature_default_consistency(self):
         """验证温度参数默认值与常量一致"""
-        from vit_pytorch.constants import SPLITTER_TEMP_END, TEMPERATURE_MIN
+        from vit_pytorch.core.constants import SPLITTER_TEMP_END, TEMPERATURE_MIN
 
         # ModelGene 默认值应该与常量一致
         gene = ModelGene(

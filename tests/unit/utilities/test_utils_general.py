@@ -20,7 +20,7 @@ if str(_tests_dir) not in sys.path:
 
 # features.py 已移入 utilities 目录
 from tests.unit.utilities.features import compute_token_features
-from vit_pytorch.utils import create_attention_mask
+from vit_pytorch.core.utils import create_attention_mask
 
 
 def test_compute_token_features_shapes() -> None:

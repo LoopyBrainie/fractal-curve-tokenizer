@@ -24,7 +24,7 @@ class TestNumericalSafetyConstants:
 
     def test_all_epsilon_positive(self):
         """所有 epsilon > 0."""
-        from vit_pytorch.constants import (
+        from vit_pytorch.core.constants import (
             GUMBEL_EPSILON,
             LOG_EPSILON,
             DIVISION_EPSILON,
@@ -44,7 +44,7 @@ class TestNumericalSafetyConstants:
 
     def test_epsilon_not_too_large(self):
         """epsilon 不应过大以免影响计算精度."""
-        from vit_pytorch.constants import (
+        from vit_pytorch.core.constants import (
             GUMBEL_EPSILON,
             LOG_EPSILON,
             DIVISION_EPSILON,
@@ -62,13 +62,13 @@ class TestNumericalSafetyConstants:
 
     def test_temperature_min_above_gradient_collapse(self):
         """TEMPERATURE_MIN > 0.1 防止梯度消失."""
-        from vit_pytorch.constants import TEMPERATURE_MIN
+        from vit_pytorch.core.constants import TEMPERATURE_MIN
 
         assert TEMPERATURE_MIN >= 0.1, f"TEMPERATURE_MIN = {TEMPERATURE_MIN} may cause gradient collapse"
 
     def test_gumbel_epsilon_safe_for_sampling(self):
         """GUMBEL_EPSILON 安全边距验证."""
-        from vit_pytorch.constants import GUMBEL_EPSILON
+        from vit_pytorch.core.constants import GUMBEL_EPSILON
 
         import math
 
@@ -85,7 +85,7 @@ class TestTemperatureSchedule:
 
     def test_temperature_order(self):
         """SPLITTER_TEMP_START > SPLITTER_TEMP_END >= TEMPERATURE_MIN > 0."""
-        from vit_pytorch.constants import (
+        from vit_pytorch.core.constants import (
             SPLITTER_TEMP_START,
             SPLITTER_TEMP_END,
             TEMPERATURE_MIN,
@@ -97,13 +97,13 @@ class TestTemperatureSchedule:
 
     def test_temperature_in_exploration_range(self):
         """起始温度在有效探索范围内."""
-        from vit_pytorch.constants import SPLITTER_TEMP_START
+        from vit_pytorch.core.constants import SPLITTER_TEMP_START
 
         assert 0.5 <= SPLITTER_TEMP_START <= 2.0
 
     def test_temperature_convergence_bound(self):
         """终止温度保证收敛."""
-        from vit_pytorch.constants import SPLITTER_TEMP_END
+        from vit_pytorch.core.constants import SPLITTER_TEMP_END
 
         assert 0.1 <= SPLITTER_TEMP_END <= 1.0
 
@@ -113,7 +113,7 @@ class TestQuotaInitialization:
 
     def test_quota_logits_softmax_sum(self):
         """QUOTA_INIT_LOGITS softmax 后求和为 1."""
-        from vit_pytorch.constants import QUOTA_INIT_LOGITS
+        from vit_pytorch.core.constants import QUOTA_INIT_LOGITS
 
         logits = torch.tensor(QUOTA_INIT_LOGITS)
         probs = F.softmax(logits, dim=-1)
@@ -123,7 +123,7 @@ class TestQuotaInitialization:
 
     def test_quota_distribution_increases_with_depth(self):
         """配额分布随深度递增 (深度优先策略)."""
-        from vit_pytorch.constants import QUOTA_INIT_LOGITS
+        from vit_pytorch.core.constants import QUOTA_INIT_LOGITS
 
         logits = torch.tensor(QUOTA_INIT_LOGITS)
         probs = F.softmax(logits, dim=-1)
@@ -133,14 +133,14 @@ class TestQuotaInitialization:
 
     def test_quota_min_ratio_positive(self):
         """QUOTA_MIN_RATIO > 0."""
-        from vit_pytorch.constants import QUOTA_MIN_RATIO
+        from vit_pytorch.core.constants import QUOTA_MIN_RATIO
 
         assert QUOTA_MIN_RATIO > 0
         assert QUOTA_MIN_RATIO < 1.0
 
     def test_quota_entropy_weight_reasonable(self):
         """QUOTA_ENTROPY_WEIGHT 在合理范围内."""
-        from vit_pytorch.constants import QUOTA_ENTROPY_WEIGHT
+        from vit_pytorch.core.constants import QUOTA_ENTROPY_WEIGHT
 
         assert 0 <= QUOTA_ENTROPY_WEIGHT <= 1.0
 
@@ -150,7 +150,7 @@ class TestCoverageConstants:
 
     def test_coverage_bounds_order(self):
         """0 < K_COVERAGE_MIN < K_COVERAGE_BASE < K_COVERAGE_MAX_HARD <= 1."""
-        from vit_pytorch.constants import (
+        from vit_pytorch.core.constants import (
             K_COVERAGE_MIN,
             K_COVERAGE_BASE,
             K_COVERAGE_MAX_HARD,
@@ -163,14 +163,14 @@ class TestCoverageConstants:
 
     def test_coverage_reference_size_valid(self):
         """K_ADAPTIVE_REFERENCE_SIZE 为正整数."""
-        from vit_pytorch.constants import K_ADAPTIVE_REFERENCE_SIZE
+        from vit_pytorch.core.constants import K_ADAPTIVE_REFERENCE_SIZE
 
         assert K_ADAPTIVE_REFERENCE_SIZE > 0
         assert isinstance(K_ADAPTIVE_REFERENCE_SIZE, int)
 
     def test_k_hard_limits_order(self):
         """K_MIN_HARD_LIMIT < K_MAX_HARD_LIMIT."""
-        from vit_pytorch.constants import (
+        from vit_pytorch.core.constants import (
             K_MIN_HARD_LIMIT,
             K_MAX_HARD_LIMIT,
         )
@@ -181,7 +181,7 @@ class TestCoverageConstants:
 
     def test_sample_ratios_order(self):
         """K_MIN_SAMPLE_RATIO < K_MAX_SAMPLE_RATIO."""
-        from vit_pytorch.constants import (
+        from vit_pytorch.core.constants import (
             K_MIN_SAMPLE_RATIO,
             K_MAX_SAMPLE_RATIO,
         )
@@ -190,7 +190,7 @@ class TestCoverageConstants:
 
     def test_coverage_adaptive_formula_works(self):
         """覆盖率自适应公式数学正确性."""
-        from vit_pytorch.constants import (
+        from vit_pytorch.core.constants import (
             K_COVERAGE_BASE,
             K_ADAPTIVE_REFERENCE_SIZE,
         )
@@ -216,7 +216,7 @@ class TestElasticBudgetConstants:
 
     def test_elastic_bounds_consistent_with_k_coverage(self):
         """ELASTIC_COVERAGE bounds 与 K_COVERAGE bounds 一致."""
-        from vit_pytorch.constants import (
+        from vit_pytorch.core.constants import (
             ELASTIC_COVERAGE_MIN,
             K_COVERAGE_MAX_HARD,
             K_COVERAGE_MIN,
@@ -230,7 +230,7 @@ class TestElasticBudgetConstants:
 
     def test_elastic_lambda_weights_reasonable(self):
         """ELASTIC_LAMBDA weights 在合理范围内."""
-        from vit_pytorch.constants import (
+        from vit_pytorch.core.constants import (
             ELASTIC_LAMBDA_TARGET,
             ELASTIC_LAMBDA_BOUNDARY,
             ELASTIC_LAMBDA_COLLAPSE,
@@ -248,7 +248,7 @@ class TestThresholdRegularization:
 
     def test_threshold_var_reg_weight_reasonable(self):
         """THRESHOLD_VAR_REG_WEIGHT 在 [0, 1] 范围内."""
-        from vit_pytorch.constants import THRESHOLD_VAR_REG_WEIGHT
+        from vit_pytorch.core.constants import THRESHOLD_VAR_REG_WEIGHT
 
         assert 0 <= THRESHOLD_VAR_REG_WEIGHT <= 1.0
 
@@ -258,13 +258,13 @@ class TestDepthVarianceNormalization:
 
     def test_ema_alpha_reasonable(self):
         """DEPTH_EMA_ALPHA 在有效范围内."""
-        from vit_pytorch.constants import DEPTH_EMA_ALPHA
+        from vit_pytorch.core.constants import DEPTH_EMA_ALPHA
 
         assert 0.01 <= DEPTH_EMA_ALPHA <= 0.5
 
     def test_depth_variance_init_eps_reasonable(self):
         """DEPTH_VARIANCE_INIT_EPS 为保守初始化下界."""
-        from vit_pytorch.constants import DEPTH_VARIANCE_INIT_EPS
+        from vit_pytorch.core.constants import DEPTH_VARIANCE_INIT_EPS
 
         assert 0.01 <= DEPTH_VARIANCE_INIT_EPS <= 1.0
 
@@ -274,13 +274,13 @@ class TestAttentionBiasScales:
 
     def test_hilbert_bias_scale_reasonable(self):
         """HILBERT_BIAS_SCALE 在 [0.01, 1.0] 范围内."""
-        from vit_pytorch.constants import HILBERT_BIAS_SCALE
+        from vit_pytorch.core.constants import HILBERT_BIAS_SCALE
 
         assert 0.01 <= HILBERT_BIAS_SCALE <= 1.0
 
     def test_level_bias_scale_reasonable(self):
         """LEVEL_BIAS_SCALE 在 [0.01, 1.0] 范围内."""
-        from vit_pytorch.constants import (
+        from vit_pytorch.core.constants import (
             LEVEL_BIAS_SCALE,
             HILBERT_BIAS_SCALE,
         )
@@ -294,7 +294,7 @@ class TestOverlapPenalty:
 
     def test_overlap_penalty_weight_reasonable(self):
         """OVERLAP_PENALTY_WEIGHT 在 [0, 1] 范围内."""
-        from vit_pytorch.constants import OVERLAP_PENALTY_WEIGHT
+        from vit_pytorch.core.constants import OVERLAP_PENALTY_WEIGHT
 
         assert 0 <= OVERLAP_PENALTY_WEIGHT <= 1.0
 
@@ -304,7 +304,7 @@ class TestSoftExclusionMargin:
 
     def test_soft_exclusion_margin_reasonable(self):
         """SOFT_EXCLUSION_MARGIN 在 (0, 1) 范围内."""
-        from vit_pytorch.constants import SOFT_EXCLUSION_MARGIN
+        from vit_pytorch.core.constants import SOFT_EXCLUSION_MARGIN
 
         assert 0 < SOFT_EXCLUSION_MARGIN < 1
         assert SOFT_EXCLUSION_MARGIN <= 0.5
@@ -327,31 +327,31 @@ class TestFP16ClampConstants:
         vs 50.0: softmax(50) ≈ 1.0, 梯度 ≈ 1e-22 (消失)
         I122-3 修复: 从 50.0 改为 10.0
         """
-        from vit_pytorch.constants import LOGIT_CLAMP_BOUND
+        from vit_pytorch.core.constants import LOGIT_CLAMP_BOUND
 
         assert LOGIT_CLAMP_BOUND == 10.0
 
     def test_grad_clamp_bound_value(self):
         """GRAD_CLAMP_BOUND = 20.0."""
-        from vit_pytorch.constants import GRAD_CLAMP_BOUND
+        from vit_pytorch.core.constants import GRAD_CLAMP_BOUND
 
         assert GRAD_CLAMP_BOUND == 20.0
 
     def test_scale_clamp_bound_value(self):
         """SCALE_CLAMP_BOUND = 15.0."""
-        from vit_pytorch.constants import SCALE_CLAMP_BOUND
+        from vit_pytorch.core.constants import SCALE_CLAMP_BOUND
 
         assert SCALE_CLAMP_BOUND == 15.0
 
     def test_fp16_safe_epsilon_value(self):
         """FP16_SAFE_EPSILON = 1e-6."""
-        from vit_pytorch.constants import FP16_SAFE_EPSILON
+        from vit_pytorch.core.constants import FP16_SAFE_EPSILON
 
         assert FP16_SAFE_EPSILON == 1e-6
 
     def test_logit_clamp_fp16_safe(self):
         """LOGIT_CLAMP_BOUND << FP16 最大值 (65504)."""
-        from vit_pytorch.constants import LOGIT_CLAMP_BOUND
+        from vit_pytorch.core.constants import LOGIT_CLAMP_BOUND
 
         fp16_max = 65504.0
         safety_factor = fp16_max / LOGIT_CLAMP_BOUND
@@ -361,7 +361,7 @@ class TestFP16ClampConstants:
 
     def test_grad_clamp_fp16_safe(self):
         """GRAD_CLAMP_BOUND << FP16 最大值."""
-        from vit_pytorch.constants import GRAD_CLAMP_BOUND
+        from vit_pytorch.core.constants import GRAD_CLAMP_BOUND
 
         fp16_max = 65504.0
         safety_factor = fp16_max / GRAD_CLAMP_BOUND
@@ -370,7 +370,7 @@ class TestFP16ClampConstants:
 
     def test_scale_clamp_fp16_safe(self):
         """SCALE_CLAMP_BOUND << FP16 最大值."""
-        from vit_pytorch.constants import SCALE_CLAMP_BOUND
+        from vit_pytorch.core.constants import SCALE_CLAMP_BOUND
 
         fp16_max = 65504.0
         safety_factor = fp16_max / SCALE_CLAMP_BOUND
@@ -383,7 +383,7 @@ class TestFP16ClampConstants:
         数学: softmax(10) ≈ 0.99995, 梯度 ≈ 5e-5 (有效)
         vs 50.0: softmax(50) ≈ 1.0, 梯度 ≈ 1e-22 (消失)
         """
-        from vit_pytorch.constants import LOGIT_CLAMP_BOUND
+        from vit_pytorch.core.constants import LOGIT_CLAMP_BOUND
 
         x = torch.tensor([LOGIT_CLAMP_BOUND, 0.0])
         softmax = torch.softmax(x, dim=0)
@@ -393,7 +393,7 @@ class TestFP16ClampConstants:
 
     def test_grad_clip_rate_below_threshold(self):
         """验证新边界下梯度裁剪率极低 (< 0.001%)."""
-        from vit_pytorch.constants import GRAD_CLAMP_BOUND
+        from vit_pytorch.core.constants import GRAD_CLAMP_BOUND
         import numpy as np
 
         # 模拟梯度分布 (正态分布, σ = 5)
@@ -406,7 +406,7 @@ class TestFP16ClampConstants:
 
     def test_grad_clamp_improvement_over_old(self):
         """验证新边界比旧边界 (10.0) 显著改善梯度裁剪率."""
-        from vit_pytorch.constants import GRAD_CLAMP_BOUND
+        from vit_pytorch.core.constants import GRAD_CLAMP_BOUND
         import numpy as np
 
         np.random.seed(42)
@@ -422,7 +422,7 @@ class TestFP16ClampConstants:
 
     def test_softplus_output_covered_by_scale_bound(self):
         """验证 softplus 输出大部分在 SCALE_CLAMP_BOUND 范围内."""
-        from vit_pytorch.constants import SCALE_CLAMP_BOUND
+        from vit_pytorch.core.constants import SCALE_CLAMP_BOUND
         import numpy as np
 
         # 测试典型输入范围内的 softplus 输出
@@ -435,7 +435,7 @@ class TestFP16ClampConstants:
 
     def test_fp16_safe_epsilon_above_fp16_min(self):
         """FP16_SAFE_EPSILON > FP16 最小正规数."""
-        from vit_pytorch.constants import FP16_SAFE_EPSILON
+        from vit_pytorch.core.constants import FP16_SAFE_EPSILON
 
         # FP16 最小正规数 ≈ 6.1e-5
         fp16_min_normal = 2**-14  # ≈ 6.1e-5
@@ -456,7 +456,7 @@ class TestFP16ClampConstants:
 
         I122-3 修复: 更新顺序测试以匹配数学分析
         """
-        from vit_pytorch.constants import (
+        from vit_pytorch.core.constants import (
             LOGIT_CLAMP_BOUND,
             GRAD_CLAMP_BOUND,
             SCALE_CLAMP_BOUND,

@@ -30,7 +30,7 @@ from typing import Dict, List
 import sys
 sys.path.insert(0, 'src')
 
-from vit_pytorch.gumbel_topk_splitter import (
+from vit_pytorch.layers.splitters.gumbel_topk import (
     GumbelTopKSplitter,
     GumbelTopKResult,
     TensorSplitResult,

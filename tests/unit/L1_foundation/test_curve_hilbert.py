@@ -12,7 +12,7 @@ L1 Foundation: Hilbert Curve Tests
 """
 
 import pytest
-from vit_pytorch.curve_hilbert import (
+from vit_pytorch.core.curve_hilbert import (
     HilbertCurve,
     get_quadrant_order,
     hilbert_distance_to_xy,
@@ -206,3 +206,117 @@ class TestHilbertLocality:
                 manhattan_dist = abs(x2 - x1) + abs(y2 - y1)
                 # Hilbert 曲线中相邻步骤应该是相邻格子
                 assert manhattan_dist <= 2, f"level={level}, 步骤{i}: {q1}->){q2} 距离过大"
+
+
+# =============================================================================
+# HilbertScanner 测试 (从 L3_critique/test_hilbert_locality.py 迁移)
+# =============================================================================
+
+import math
+import torch
+import numpy as np
+from dataclasses import dataclass
+
+
+@dataclass
+class LocalityMetrics:
+    """局部性指标结构体"""
+    L_max: float      # 最大跳跃距离
+    L_avg: float      # 平均跳跃距离
+    L_median: float   # 中位数跳跃距离
+    R_local: float    # 局部性保持率 (跳跃 ≤ √2 的比例)
+
+
+def compute_locality_metrics(points: torch.Tensor, H: int, W: int) -> LocalityMetrics:
+    """计算 Hilbert 序列的局部性指标"""
+    diffs = points[1:] - points[:-1]
+    distances = torch.sqrt((diffs ** 2).sum(dim=1))
+    dist_list = distances.cpu().numpy()
+
+    L_max = float(dist_list.max())
+    L_avg = float(dist_list.mean())
+    L_median = float(np.median(dist_list))
+    R_local = float((dist_list <= np.sqrt(2)).sum() / len(dist_list))
+
+    return LocalityMetrics(L_max=L_max, L_avg=L_avg, L_median=L_median, R_local=R_local)
+
+
+class TestHilbertScanner:
+    """HilbertScanner 测试 (I113-18)"""
+
+    def test_hilbert_scanner_locality(self):
+        """I113-18: 验证 HilbertScanner 局部性"""
+        from vit_pytorch.core.curve_hilbert import HilbertScanner
+
+        aspect_ratios = [
+            (32, 32),    # 1:1 正方形
+            (32, 64),    # 1:2
+            (32, 128),   # 1:4
+            (64, 32),    # 2:1
+            (64, 128),   # 1:2 (偶数)
+            (128, 32),   # 4:1
+        ]
+
+        for H, W in aspect_ratios:
+            rho = max(H, W) / min(H, W)
+            points_np = HilbertScanner.scan(H, W)
+            points = torch.from_numpy(np.array(points_np)).float()
+            metrics = compute_locality_metrics(points, H, W)
+
+            # R_local > 0.9 (关键指标)
+            assert metrics.R_local > 0.9, f"R_local {metrics.R_local:.3f} < 0.9 for {H}x{W}"
+
+    def test_standard_hilbert_degeneration(self):
+        """验证标准 Hilbert 退化（2^k × 2^k 正方形）"""
+        from vit_pytorch.core.curve_hilbert import HilbertScanner
+
+        for size in [8, 16, 32, 64]:
+            H = W = size
+            points_np = HilbertScanner.scan(H, W)
+            points = torch.from_numpy(np.array(points_np)).float()
+            metrics = compute_locality_metrics(points, H, W)
+
+            # 标准 Hilbert 的 L_max 理论值是 √2
+            assert metrics.L_max <= math.sqrt(2) + 0.1, \
+                f"L_max {metrics.L_max:.2f} > √2={math.sqrt(2):.2f}"
+
+    def test_pseudo_hilbert_for_rectangle(self):
+        """验证 Pseudo-Hilbert 在矩形上的表现"""
+        from vit_pytorch.core.curve_hilbert import HilbertScanner
+
+        test_cases = [
+            (32, 64),   # 1:2
+            (32, 128),  # 1:4
+            (64, 32),   # 2:1
+            (128, 32),  # 4:1
+        ]
+
+        for H, W in test_cases:
+            rho = max(H, W) / min(H, W)
+            points_np = HilbertScanner.scan(H, W)
+            points = torch.from_numpy(np.array(points_np)).float()
+            metrics = compute_locality_metrics(points, H, W)
+
+            theoretical_max = math.sqrt(2 * rho)
+            assert metrics.L_max <= theoretical_max + 0.1, \
+                f"L_max {metrics.L_max:.2f} > √(2ρ)={theoretical_max:.2f}"
+
+    def test_hilbert_scanner_api(self):
+        """验证 HilbertScanner API 正确性"""
+        from vit_pytorch.core.curve_hilbert import HilbertScanner
+
+        # 测试标准 Hilbert 退化
+        H = W = 64
+        points = HilbertScanner.scan(H, W)
+        assert len(points) == H * W, f"长度错误: {len(points)} vs {H*W}"
+
+        # 验证 xy_to_d 和 d_to_xy 互逆
+        for d in [0, 100, 1000, 4095]:
+            x, y = HilbertScanner.d_to_xy(H, W, d)
+            d_back = HilbertScanner.xy_to_d(H, W, x, y)
+            assert d == d_back, f"xy_to_d/d_to_xy invert failed: {d} vs {d_back}"
+
+        # 测试 Pseudo-Hilbert
+        H, W = 32, 128
+        points = HilbertScanner.scan(H, W)
+        assert len(points) == H * W, f"Pseudo-Hilbert length error"

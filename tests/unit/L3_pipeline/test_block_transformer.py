@@ -13,12 +13,12 @@ block_transformer.py 单元测试
 import pytest
 import torch
 import torch.nn as nn
-from vit_pytorch.block_transformer import (
+from vit_pytorch.modules.transformer_block import (
     DropPath,
     FractalTransformerBlock,
     FractalTransformer,
 )
-from vit_pytorch.levels_info import LevelsInfo
+from vit_pytorch.core.levels_info import LevelsInfo
 
 
 class TestDropPath:

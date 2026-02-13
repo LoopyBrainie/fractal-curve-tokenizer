@@ -57,8 +57,8 @@ from pathlib import Path
 from typing import Dict, Any
 
 from vit_pytorch import FractalCurveViT
-from vit_pytorch.model_fractal_vit import TrainingStats
-from vit_pytorch.constants import (
+from vit_pytorch.models.fractal_vit import TrainingStats
+from vit_pytorch.core.constants import (
     compute_max_level,
     compute_num_candidates,
     compute_k_bounds,

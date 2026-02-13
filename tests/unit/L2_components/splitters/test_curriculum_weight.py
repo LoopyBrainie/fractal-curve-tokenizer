@@ -14,8 +14,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from vit_pytorch.gumbel_topk_splitter import CurriculumWeightScheduler
-from vit_pytorch.constants import (
+from vit_pytorch.layers.splitters.gumbel_topk import CurriculumWeightScheduler
+from vit_pytorch.core.constants import (
     CURRICULUM_EXPLORATION_END,
     CURRICULUM_ADAPTATION_END,
     CURRICULUM_WEIGHT_FACTOR_EXPLORE,

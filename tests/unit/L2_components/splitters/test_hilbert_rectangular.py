@@ -7,7 +7,7 @@ I113-8 测试: 矩形区域的 Hilbert 局部性保证
 import pytest
 import torch
 
-from vit_pytorch.curve_hilbert import (
+from vit_pytorch.core.curve_hilbert import (
     HilbertCurve,
     RectHilbertIndex,
     HilbertLocalityMetrics,

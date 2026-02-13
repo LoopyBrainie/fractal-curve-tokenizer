@@ -12,11 +12,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vit_pytorch.attn_hilbert_bias import (
+from vit_pytorch.layers.attention.hilbert_bias import (
     HilbertAwareMultiScaleAttention,
     FLASH_ATTN_AVAILABLE,
 )
-from vit_pytorch.levels_info import LevelsInfo
+from vit_pytorch.core.levels_info import LevelsInfo
 
 
 class TestFlashAttention2Integration:
@@ -164,7 +164,7 @@ class TestFlashAttention2BiasFusion:
 
     def test_bias_fusion_mathematical_properties(self):
         """验证偏置融合的数学性质."""
-        from vit_pytorch.attn_hilbert_bias import HilbertAwareMultiScaleAttention
+        from vit_pytorch.layers.attention.hilbert_bias import HilbertAwareMultiScaleAttention
 
         attn = HilbertAwareMultiScaleAttention(
             dim=64,

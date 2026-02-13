@@ -23,7 +23,7 @@ from vit_pytorch import (
     MultiScalePatchEncoder,
     TokenizerOutput,
 )
-from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
 
 
 # I98-1: Pipeline API 辅助函数

@@ -16,8 +16,8 @@ import torch
 import torch.nn.functional as F
 
 from vit_pytorch import GumbelTopKSplitter
-from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
-from vit_pytorch.constants import (
+from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
+from vit_pytorch.core.constants import (
     HILBERT_CONTINUITY_ENABLED,
     HILBERT_CONTINUITY_WEIGHT,
     HILBERT_CONTINUITY_GAMMA,

@@ -15,8 +15,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
-from vit_pytorch.constants import (
+from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
+from vit_pytorch.core.constants import (
     LEARNABLE_QUOTA_ENABLED,
     QUOTA_MIN_RATIO,
     QUOTA_ENTROPY_WEIGHT,

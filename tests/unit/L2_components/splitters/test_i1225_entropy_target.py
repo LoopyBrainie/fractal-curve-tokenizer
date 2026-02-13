@@ -23,7 +23,7 @@ class TestEntropyTargetFormula:
 
     def test_new_formula_values(self):
         """验证新公式计算值"""
-        from vit_pytorch.constants import ENTROPY_TARGET_SCALE
+        from vit_pytorch.core.constants import ENTROPY_TARGET_SCALE
 
         # 理论值: H_target = 0.5 × log(D)
         expected = {
@@ -41,13 +41,13 @@ class TestEntropyTargetFormula:
 
     def test_constant_scale_factor(self):
         """验证缩放因子为 0.5"""
-        from vit_pytorch.constants import ENTROPY_TARGET_SCALE
+        from vit_pytorch.core.constants import ENTROPY_TARGET_SCALE
 
         assert abs(ENTROPY_TARGET_SCALE - 0.5) < 1e-6
 
     def test_h_target_half_of_max_entropy(self):
         """验证 H_target 始终是最大熵的 50%"""
-        from vit_pytorch.constants import ENTROPY_TARGET_SCALE
+        from vit_pytorch.core.constants import ENTROPY_TARGET_SCALE
 
         for D in [2, 3, 4, 5, 6, 8, 16]:
             H_max = math.log(D)
@@ -57,7 +57,7 @@ class TestEntropyTargetFormula:
 
     def test_new_vs_original_formula(self):
         """对比新公式与原始公式"""
-        from vit_pytorch.constants import ENTROPY_TARGET_SCALE
+        from vit_pytorch.core.constants import ENTROPY_TARGET_SCALE
 
         original = lambda D: math.log(D) * (1.0 - 1.0 / math.sqrt(D))
         new = lambda D: ENTROPY_TARGET_SCALE * math.log(D)
@@ -84,7 +84,7 @@ class TestEntropyTargetScaling:
 
     def test_scaling_consistency(self):
         """验证缩放一致性"""
-        from vit_pytorch.constants import ENTROPY_TARGET_SCALE
+        from vit_pytorch.core.constants import ENTROPY_TARGET_SCALE
 
         # 新公式的缩放行为
         def H_target_new(D):
@@ -101,7 +101,7 @@ class TestEntropyTargetScaling:
 
     def test_effective_depth_concept(self):
         """验证有效深度概念 (D_eff = √D)"""
-        from vit_pytorch.constants import ENTROPY_TARGET_SCALE
+        from vit_pytorch.core.constants import ENTROPY_TARGET_SCALE
 
         print("\n有效深度验证:")
         print("D\tH_target\tD_eff=exp(H)\t√D\t差异")
@@ -196,7 +196,7 @@ class TestEntropyTargetEdgeCases:
 
     def test_minimal_depth(self):
         """测试最小深度 D=2"""
-        from vit_pytorch.constants import ENTROPY_TARGET_SCALE
+        from vit_pytorch.core.constants import ENTROPY_TARGET_SCALE
 
         D = 2
         H_target = ENTROPY_TARGET_SCALE * math.log(D)
@@ -208,7 +208,7 @@ class TestEntropyTargetEdgeCases:
 
     def test_large_depth(self):
         """测试较大深度 D=16"""
-        from vit_pytorch.constants import ENTROPY_TARGET_SCALE
+        from vit_pytorch.core.constants import ENTROPY_TARGET_SCALE
 
         D = 16
         H_target = ENTROPY_TARGET_SCALE * math.log(D)
@@ -221,7 +221,7 @@ class TestEntropyTargetEdgeCases:
 
     def test_extreme_case(self):
         """测试极端情况"""
-        from vit_pytorch.constants import ENTROPY_TARGET_SCALE
+        from vit_pytorch.core.constants import ENTROPY_TARGET_SCALE
 
         # D=1 (只有一层)
         D = 1
@@ -235,7 +235,7 @@ class TestEntropyTargetIntegration:
     def test_in_splitter_context(self):
         """在 Splitter 上下文中验证"""
         from vit_pytorch import GumbelTopKSplitter
-        from vit_pytorch.config import SplitterConfig
+        from vit_pytorch.core.config import SplitterConfig
         import torch
 
         config = SplitterConfig(max_level_limit=4)

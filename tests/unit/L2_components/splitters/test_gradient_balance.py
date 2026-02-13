@@ -30,7 +30,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
 
 
 def compute_gradient_balance_ratio(gradients, selected_mask):

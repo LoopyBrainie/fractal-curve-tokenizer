@@ -3,8 +3,8 @@ import torch.nn as nn
 from torch.optim import AdamW
 import pytest
 
-from vit_pytorch.model_fractal_vit import FractalCurveViT
-from vit_pytorch.base_tokenizer import BaseTokenProcessor, BaseTokenizer, TokenSequence, TokenizerOutput
+from vit_pytorch.models.fractal_vit import FractalCurveViT
+from vit_pytorch.modules.base_tokenizer import BaseTokenProcessor, BaseTokenizer, TokenSequence, TokenizerOutput
 
 
 class DummyTokenizer(BaseTokenizer):

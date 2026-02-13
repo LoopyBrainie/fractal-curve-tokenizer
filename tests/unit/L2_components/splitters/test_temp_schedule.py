@@ -12,8 +12,8 @@ I122-7: 温度调度策略单元测试
 import pytest
 import math
 from vit_pytorch import GumbelTopKSplitter
-from vit_pytorch.config import HilbertSplitterConfig
-from vit_pytorch.constants import (
+from vit_pytorch.core.config import HilbertSplitterConfig
+from vit_pytorch.core.constants import (
     SPLITTER_TEMP_START,
     SPLITTER_TEMP_END,
     TEMPERATURE_MIN,
@@ -226,7 +226,7 @@ class TestConstantsUpdated:
     def test_curvature_constants_removed(self):
         """验证曲率相关常量已被移除"""
         try:
-            from vit_pytorch.constants import (
+            from vit_pytorch.core.constants import (
                 CURVATURE_TEMP_BASE,
                 CURVATURE_SENSITIVITY,
                 CURVATURE_EMA_ALPHA,

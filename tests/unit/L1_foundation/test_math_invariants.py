@@ -31,8 +31,8 @@ Hilbert Curve:
 
 import pytest
 import torch
-from vit_pytorch.levels_info import LevelsInfo
-from vit_pytorch.curve_hilbert import HilbertCurve
+from vit_pytorch.core.levels_info import LevelsInfo
+from vit_pytorch.core.curve_hilbert import HilbertCurve
 
 
 class TestLevelsInfoInvariants:

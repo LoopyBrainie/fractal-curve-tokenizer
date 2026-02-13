@@ -218,7 +218,7 @@ class TestPoissonKLLossImplementation:
     def splitter(self):
         """创建测试用的 GumbelTopKSplitter"""
         from vit_pytorch import GumbelTopKSplitter
-        from vit_pytorch.config import SplitterConfig
+        from vit_pytorch.core.config import SplitterConfig
 
         config = SplitterConfig(
             max_level_limit=4,
@@ -472,7 +472,7 @@ class TestConstantsValue:
         """
         验证: ELASTIC_LAMBDA_KL = 0.005
         """
-        from vit_pytorch.constants import ELASTIC_LAMBDA_KL
+        from vit_pytorch.core.constants import ELASTIC_LAMBDA_KL
         assert ELASTIC_LAMBDA_KL == 0.005, \
             f"ELASTIC_LAMBDA_KL should be 0.005: got {ELASTIC_LAMBDA_KL}"
 
@@ -480,7 +480,7 @@ class TestConstantsValue:
         """
         验证: HUBER_LAMBDA = 0.001
         """
-        from vit_pytorch.constants import HUBER_LAMBDA
+        from vit_pytorch.core.constants import HUBER_LAMBDA
         assert HUBER_LAMBDA == 0.001, \
             f"HUBER_LAMBDA should be 0.001: got {HUBER_LAMBDA}"
 
@@ -490,7 +490,7 @@ class TestConstantsValue:
 
         数学: δ = K_t / 2 = 32 / 2 = 16
         """
-        from vit_pytorch.constants import HUBER_DELTA
+        from vit_pytorch.core.constants import HUBER_DELTA
         assert HUBER_DELTA == 16.0, \
             f"HUBER_DELTA should be 16.0: got {HUBER_DELTA}"
 
@@ -498,7 +498,7 @@ class TestConstantsValue:
         """
         验证: ELASTIC_EPS = 1e-8
         """
-        from vit_pytorch.constants import ELASTIC_EPS
+        from vit_pytorch.core.constants import ELASTIC_EPS
         assert ELASTIC_EPS == 1e-8, \
             f"ELASTIC_EPS should be 1e-8: got {ELASTIC_EPS}"
 

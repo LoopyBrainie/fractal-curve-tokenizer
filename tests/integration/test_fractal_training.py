@@ -491,6 +491,7 @@ from training.config import (
     ExperimentConfig,
     DataConfig,
     LossConfig,
+    ModelArchitectureConfig,
     ConfigLoader,
 )
 
@@ -577,14 +578,16 @@ class TestExperimentConfig:
     
     def test_nested_config_modification(self):
         """嵌套配置修改"""
+        # I147: focal_gamma 已移到 ModelArchitectureConfig
         config = ExperimentConfig(
             name="test_experiment",
             data=DataConfig(batch_size=64, sampler_type="class_balanced"),
-            loss=LossConfig(type="focal", focal_gamma=3.0),
+            model=ModelArchitectureConfig(use_focal_loss=True, focal_gamma=3.0),
         )
         assert config.data.batch_size == 64
         assert config.data.sampler_type == "class_balanced"
-        assert config.loss.focal_gamma == 3.0
+        assert config.model.use_focal_loss == True
+        assert config.model.focal_gamma == 3.0
 
 
 class TestConfigLoader:
@@ -593,16 +596,17 @@ class TestConfigLoader:
     def test_from_dict(self):
         """从字典加载配置"""
         loader = ConfigLoader()
+        # I147: focal_gamma 在 model 配置中，不在 loss 配置中
         config = loader.from_dict({
             "name": "test",
             "data": {"batch_size": 256},
-            "loss": {"type": "focal", "focal_gamma": 2.5},
+            "model": {"use_focal_loss": True, "focal_gamma": 2.5},
         })
-        
+
         assert config.name == "test"
         assert config.data.batch_size == 256
-        assert config.loss.type == "focal"
-        assert config.loss.focal_gamma == 2.5
+        assert config.model.use_focal_loss == True
+        assert config.model.focal_gamma == 2.5
 
 
 class TestModularTrainer:

@@ -132,7 +132,7 @@ class TestTokenizerDynamicResolution:
     def test_tokenizer_dynamic_size(self):
         """Verify tokenizer handles dynamic input sizes."""
         from vit_pytorch import StreamingFractalTokenizerV3
-        from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+        from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
 
         # Note: tokenizer requires image_size at init, but supports variable input
         tokenizer = StreamingFractalTokenizerV3(

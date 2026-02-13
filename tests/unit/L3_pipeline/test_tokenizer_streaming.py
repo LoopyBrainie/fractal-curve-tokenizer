@@ -28,8 +28,8 @@ from vit_pytorch import (
     MultiScalePatchEncoder,
     TokenizerOutput,
 )
-from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
-from vit_pytorch.config import SplitterConfig
+from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
+from vit_pytorch.core.config import SplitterConfig
 
 
 class TestHilbertPathCache:
@@ -315,6 +315,70 @@ class TestStreamingFractalTokenizerV3Full:
         assert 'split_stats' in metadata
         assert 'num_tokens' in metadata['split_stats']
         assert metadata['split_stats']['num_tokens'] == output.sequences[0].tokens.shape[0]
+
+
+class TestTokenizerTemperatureControl:
+    """测试 V3 Tokenizer 温度控制 (从 test_v3_refactored.py 迁移)"""
+
+    @pytest.fixture
+    def tokenizer_with_splitter(self):
+        """创建 tokenizer 和 splitter 用于温度测试"""
+        tokenizer = StreamingFractalTokenizerV3(
+            image_size=64,
+            channels=3,
+            d_model=128,
+            base_patch_size=4,
+        )
+
+        splitter_config = SplitterConfig(
+            feature_dim=128,
+            min_patch_size=4,
+            max_level_limit=3,
+            hidden_dim=64,
+            intermediate_dim=64,
+            pool_size=4,
+            coverage_min=0.02,
+            coverage_max_hard=0.25,
+        )
+        splitter = GumbelTopKSplitter(
+            config=splitter_config,
+            image_size=(64, 64),
+        )
+        return tokenizer, splitter
+
+    def test_splitter_temperature_control(self, tokenizer_with_splitter):
+        """测试 Splitter 温度控制"""
+        tokenizer, splitter = tokenizer_with_splitter
+
+        # 测试不同温度值
+        for temp in [0.1, 0.5, 1.0, 2.0]:
+            splitter.set_temperature(temp)
+            current_temp = splitter.temperature.item() if hasattr(splitter, 'temperature') else None
+            # 温度设置应该生效
+            assert current_temp is None or current_temp > 0
+
+    def test_output_stability_with_temperature(self, tokenizer_with_splitter):
+        """测试输出随温度变化的稳定性"""
+        tokenizer, splitter = tokenizer_with_splitter
+        images = torch.randn(2, 3, 64, 64)
+
+        # 在 eval 模式下使用硬决策
+        tokenizer.eval()
+        splitter.eval()
+
+        features = tokenizer.shared_conv(images)
+        split_result = splitter(
+            features,
+            image_size=(64, 64),
+            hard=True,
+        )
+        output = tokenizer.tokenize(images, split_result)
+
+        # 验证输出结构
+        assert isinstance(output, TokenizerOutput)
+        assert len(output) == 2
+        for seq in output.sequences:
+            assert seq.tokens.dim() == 2
 
 
 if __name__ == "__main__":

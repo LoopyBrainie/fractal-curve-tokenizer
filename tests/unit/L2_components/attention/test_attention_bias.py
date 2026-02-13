@@ -14,11 +14,11 @@ L2 Components: Attention Bias Tests
 import pytest
 import torch
 
-from vit_pytorch.attn_hilbert_bias import (
+from vit_pytorch.layers.attention.hilbert_bias import (
     LCAHilbertBias,
     HilbertAwareMultiScaleAttention,
 )
-from vit_pytorch.embed_fractal_path import VectorizedPathEncoder
+from vit_pytorch.layers.embeddings.fractal_path import VectorizedPathEncoder
 
 
 class TestLCAHilbertBiasBasic:
@@ -296,3 +296,102 @@ class TestPerformance:
 
         avg_time = elapsed / 10 * 1000
         assert avg_time < 50, f"Too slow: {avg_time:.2f}ms per forward"
+
+
+# I163-1: 分层自适应边界测试
+class TestCompactBound:
+    """I163-1: 分层自适应边界测试
+
+    验证优化后的边界比保守界 N/2^l 更紧
+    """
+
+    @pytest.fixture
+    def lca_bias(self):
+        """创建 LCA Bias 实例"""
+        return LCAHilbertBias(max_level=8, heads=4)
+
+    def test_compact_bound_values(self, lca_bias):
+        """验证分层边界值
+
+        I163-1 优化界:
+            ℓ=0: N/3
+            ℓ=1: N/4
+            ℓ≥2: N/2^l
+        """
+        N = 224  # 图像尺寸
+
+        # ℓ=0 应该是 N/3
+        bound_0 = lca_bias.get_compact_bound(0, N)
+        assert bound_0 == pytest.approx(N / 3.0, rel=1e-5)
+
+        # ℓ=1 应该是 N/4
+        bound_1 = lca_bias.get_compact_bound(1, N)
+        assert bound_1 == pytest.approx(N / 4.0, rel=1e-5)
+
+        # ℓ=2 应该是 N/4 (与保守界相同)
+        bound_2 = lca_bias.get_compact_bound(2, N)
+        assert bound_2 == pytest.approx(N / 4.0, rel=1e-5)
+
+        # ℓ=3 应该是 N/8 (与保守界相同)
+        bound_3 = lca_bias.get_compact_bound(3, N)
+        assert bound_3 == pytest.approx(N / 8.0, rel=1e-5)
+
+    def test_compact_bound_improvement(self, lca_bias):
+        """验证边界收紧效果
+
+        对比保守界和优化界:
+            保守界: N/2^l
+            优化界: N/3 (ℓ=0), N/4 (ℓ=1)
+
+        改进比例:
+            ℓ=0: 3x 收紧
+            ℓ=1: 2x 收紧
+        """
+        N = 224
+
+        # ℓ=0: 保守界 N vs 优化界 N/3 → 3x 收紧
+        conservative_0 = N / (2 ** 0)  # N
+        compact_0 = lca_bias.get_compact_bound(0, N)
+        assert conservative_0 / compact_0 == pytest.approx(3.0, rel=1e-3)
+
+        # ℓ=1: 保守界 N/2 vs 优化界 N/4 → 2x 收紧
+        conservative_1 = N / (2 ** 1)  # N/2
+        compact_1 = lca_bias.get_compact_bound(1, N)
+        assert conservative_1 / compact_1 == pytest.approx(2.0, rel=1e-3)
+
+    def test_compact_bound_batch(self, lca_bias):
+        """测试批量边界计算"""
+        N = 64
+        batch_size = 2
+        seq_len = 16
+
+        # 创建 LCA 深度矩阵
+        lca_depths = torch.randint(0, 5, (batch_size, seq_len, seq_len))
+
+        # 批量计算边界
+        bounds = lca_bias.get_compact_bound_batch(lca_depths, N)
+
+        assert bounds.shape == lca_depths.shape
+        assert bounds.dtype == torch.float32
+
+        # 验证边界值
+        for b in range(batch_size):
+            for i in range(seq_len):
+                for j in range(seq_len):
+                    lca = lca_depths[b, i, j].item()
+                    expected = lca_bias.get_compact_bound(lca, N)
+                    assert bounds[b, i, j] == pytest.approx(expected, rel=1e-3)
+
+    def test_compact_bound_with_different_N(self, lca_bias):
+        """测试不同图像尺寸"""
+        # 224x224
+        assert lca_bias.get_compact_bound(0, 224) == pytest.approx(224 / 3)
+        assert lca_bias.get_compact_bound(1, 224) == pytest.approx(224 / 4)
+
+        # 64x64
+        assert lca_bias.get_compact_bound(0, 64) == pytest.approx(64 / 3)
+        assert lca_bias.get_compact_bound(1, 64) == pytest.approx(64 / 4)
+
+        # 512x512
+        assert lca_bias.get_compact_bound(0, 512) == pytest.approx(512 / 3)
+        assert lca_bias.get_compact_bound(1, 512) == pytest.approx(512 / 4)

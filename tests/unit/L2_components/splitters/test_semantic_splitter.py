@@ -13,13 +13,13 @@ import pytest
 import torch
 import torch.nn as nn
 
-from vit_pytorch.semantic_redundancy_splitter import (
+from vit_pytorch.layers.splitters.semantic_redundancy import (
     LookAheadHead,
     CorrelationGate,
     SemanticRedundancySplitter,
     SplitResult,
 )
-from vit_pytorch.semantic_losses import (
+from vit_pytorch.modules.semantic_losses import (
     DiversityLoss,
     ReconstructionLoss,
     SemanticRedundancyLoss,

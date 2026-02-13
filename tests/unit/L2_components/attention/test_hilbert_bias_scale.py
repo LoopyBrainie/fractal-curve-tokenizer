@@ -37,11 +37,11 @@ import pytest
 import torch
 import math
 
-from vit_pytorch.attn_hilbert_bias import (
+from vit_pytorch.layers.attention.hilbert_bias import (
     HilbertAwareMultiScaleAttention,
 )
-from vit_pytorch.embed_fractal_path import VectorizedPathEncoder
-from vit_pytorch.levels_info import LevelsInfo
+from vit_pytorch.layers.embeddings.fractal_path import VectorizedPathEncoder
+from vit_pytorch.core.levels_info import LevelsInfo
 
 
 class TestHilbertBiasScaleDimensionAlignment:

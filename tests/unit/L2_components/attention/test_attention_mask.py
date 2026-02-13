@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from vit_pytorch import FractalCurveViT
-from vit_pytorch.utils import create_attention_mask
+from vit_pytorch.core.utils import create_attention_mask
 
 
 class TestAttentionMaskEffectiveness:
@@ -165,7 +165,7 @@ class TestGlobalAttentionMask:
 
     def test_transformer_uses_mask(self):
         """验证 transformer 正确使用 attention mask"""
-        from vit_pytorch.block_transformer import FractalTransformer
+        from vit_pytorch.modules.transformer_block import FractalTransformer
 
         transformer = FractalTransformer(
             dim=64,

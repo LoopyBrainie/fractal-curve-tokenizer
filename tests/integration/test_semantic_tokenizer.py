@@ -17,8 +17,8 @@ from vit_pytorch import (
     StreamingFractalTokenizerV3,
     SemanticSplitterConfig,
 )
-from vit_pytorch.semantic_redundancy_splitter import SemanticRedundancySplitter
-from vit_pytorch.semantic_losses import SemanticRedundancyLoss
+from vit_pytorch.layers.splitters.semantic_redundancy import SemanticRedundancySplitter
+from vit_pytorch.modules.semantic_losses import SemanticRedundancyLoss
 
 
 class TestSemanticTokenizerIntegration:

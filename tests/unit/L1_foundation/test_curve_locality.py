@@ -15,7 +15,7 @@ from typing import Tuple
 
 import pytest
 
-from vit_pytorch.curve_hilbert import (
+from vit_pytorch.core.curve_hilbert import (
     HilbertCurve,
     PseudoHilbertCurve,
     HilbertLocalityMetrics,

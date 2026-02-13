@@ -31,8 +31,8 @@ Test Categories:
 
 import pytest
 import torch
-from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
-from vit_pytorch.config import SplitterConfig
+from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
+from vit_pytorch.core.config import SplitterConfig
 
 
 class TestMaxDepthBoundary:

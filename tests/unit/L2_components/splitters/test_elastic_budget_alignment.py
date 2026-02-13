@@ -35,7 +35,7 @@ def compute_k_bounds(max_level: int, token_coverage_min: float, token_coverage_m
                      image_size: int = 224) -> tuple:
     """从覆盖率参数计算 K_min 和 K_max"""
     # I121-7: 从常量模块导入，确保测试与实现同步
-    from vit_pytorch.constants import K_MIN_HARD_LIMIT, K_MAX_HARD_LIMIT, K_ADAPTIVE_REFERENCE_SIZE
+    from vit_pytorch.core.constants import K_MIN_HARD_LIMIT, K_MAX_HARD_LIMIT, K_ADAPTIVE_REFERENCE_SIZE
 
     N = compute_num_candidates(max_level)
     scale = math.sqrt(image_size / K_ADAPTIVE_REFERENCE_SIZE)
@@ -63,7 +63,7 @@ class TestElasticBudgetAlignment:
              这是预期行为，高分辨率图像才会遇到
         """
         # 导入常量
-        from vit_pytorch.constants import K_COVERAGE_BASE, K_COVERAGE_MAX_HARD
+        from vit_pytorch.core.constants import K_COVERAGE_BASE, K_COVERAGE_MAX_HARD
 
         N = compute_num_candidates(max_level)
         K_min, K_max = compute_k_bounds(
@@ -93,7 +93,7 @@ class TestElasticBudgetAlignment:
         注意: I121-7 使用 K_COVERAGE_BASE=0.25, K_MAX_HARD_LIMIT=8192
              所有 max_level 都应该在 K_bounds 范围内
         """
-        from vit_pytorch.constants import K_COVERAGE_BASE, K_COVERAGE_MAX_HARD, K_ADAPTIVE_REFERENCE_SIZE
+        from vit_pytorch.core.constants import K_COVERAGE_BASE, K_COVERAGE_MAX_HARD, K_ADAPTIVE_REFERENCE_SIZE
 
         max_level = 7  # max_level=8 会导致 K_target > K_max (预期行为)
         N = compute_num_candidates(max_level)
@@ -128,7 +128,7 @@ class TestElasticBudgetAlignment:
         注意: max_level=8 时 K_target 可能超过 K_MAX_HARD_LIMIT=4096
              这是预期行为，模型会受到边界惩罚
         """
-        from vit_pytorch.constants import K_COVERAGE_BASE, K_COVERAGE_MAX_HARD
+        from vit_pytorch.core.constants import K_COVERAGE_BASE, K_COVERAGE_MAX_HARD
 
         print("\n覆盖率范围分析 (max_level=4, image_size=224):")
         print("=" * 60)
@@ -166,7 +166,7 @@ class TestElasticBudgetAlignment:
             - 最大 image_size (1024)
             - 极端覆盖率参数
         """
-        from vit_pytorch.constants import K_COVERAGE_BASE, K_COVERAGE_MAX_HARD
+        from vit_pytorch.core.constants import K_COVERAGE_BASE, K_COVERAGE_MAX_HARD
 
         print("\n边界情况测试:")
         print("=" * 60)
@@ -202,7 +202,7 @@ class TestKBoundsComputation:
             K_min = max(K_MIN_HARD, ceil(N * coverage_min))
             K_max = min(K_MAX_HARD, ceil(N * coverage_max * scale))
         """
-        from vit_pytorch.constants import K_MIN_HARD_LIMIT, K_MAX_HARD_LIMIT
+        from vit_pytorch.core.constants import K_MIN_HARD_LIMIT, K_MAX_HARD_LIMIT
 
         test_cases = [
             (6, 224, 0.01, 0.05),  # 标准配置

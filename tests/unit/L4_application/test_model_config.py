@@ -8,10 +8,12 @@ L4 Application Tests: FractalConfig
 - FractalConfig 参数推导
 - Hilbert 策略选择
 - 尺度深度转换
+- LogitsClamp (从 test_i147_refactoring.py 迁移)
 """
 
 import math
 import pytest
+import torch
 
 from vit_pytorch import (
     FractalConfig,
@@ -139,6 +141,180 @@ class TestRepr:
         assert "# Hilbert Bias" in repr_str or "LCA" in repr_str  # P11-8 simplified
         assert "# Tokenizer" in repr_str
         assert "image_size=64" in repr_str
+
+
+# =============================================================================
+# 迁移自 test_i147_refactoring.py (I147 重构测试)
+# =============================================================================
+
+class TestLogitsClamp:
+    """LogitsClamp 钳制层的验证 (I147)"""
+
+    def test_clamp_boundaries(self):
+        """验证钳制边界"""
+        from vit_pytorch.models.fractal_vit import LogitsClamp
+        from vit_pytorch.core.constants import LOGIT_CLAMP_BOUND
+
+        clamp = LogitsClamp()
+        assert clamp.bound == LOGIT_CLAMP_BOUND
+
+        # 测试边界钳制
+        x = torch.tensor([-100.0, -10.0, 0.0, 10.0, 100.0])
+        y = clamp(x)
+
+        assert y[0].item() == -LOGIT_CLAMP_BOUND
+        assert y[1].item() == -10.0
+        assert y[2].item() == 0.0
+        assert y[3].item() == 10.0
+        assert y[4].item() == LOGIT_CLAMP_BOUND
+
+    def test_gradient_flow(self):
+        """验证梯度流动"""
+        from vit_pytorch.models.fractal_vit import LogitsClamp
+
+        clamp = LogitsClamp()
+        x = torch.tensor([-5.0, 0.0, 5.0], requires_grad=True)
+        y = clamp(x)
+        loss = y.sum()
+        loss.backward()
+
+        # 梯度应该能流动
+        assert x.grad is not None
+        assert not torch.isnan(x.grad).any()
+        assert not torch.isinf(x.grad).any()
+
+    def test_no_gradient_modification(self):
+        """验证钳制不修改有效梯度"""
+        from vit_pytorch.models.fractal_vit import LogitsClamp
+
+        clamp = LogitsClamp(bound=10.0)
+
+        # 在边界内的值，梯度应该不变
+        x = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+        y = clamp(x)
+        loss = y.sum()
+        loss.backward()
+
+        assert torch.allclose(x.grad, torch.ones(3))
+
+    def test_clamp_extreme_values(self):
+        """验证极端值的钳制"""
+        from vit_pytorch.models.fractal_vit import LogitsClamp
+        from vit_pytorch.core.constants import LOGIT_CLAMP_BOUND
+
+        clamp = LogitsClamp()
+
+        # 极端正值
+        x_pos = torch.tensor([1e10, 1e5, 1000.0])
+        y_pos = clamp(x_pos)
+        assert torch.all(y_pos <= LOGIT_CLAMP_BOUND)
+
+        # 极端负值
+        x_neg = torch.tensor([-1e10, -1e5, -1000.0])
+        y_neg = clamp(x_neg)
+        assert torch.all(y_neg >= -LOGIT_CLAMP_BOUND)
+
+    def test_extra_repr(self):
+        """验证字符串表示"""
+        from vit_pytorch.models.fractal_vit import LogitsClamp
+
+        clamp = LogitsClamp(bound=10.0)
+        repr_str = repr(clamp)
+        assert "bound=10.0" in repr_str
+
+
+class TestLogitsClampIntegration:
+    """LogitsClamp 与模型的集成测试 (I147)"""
+
+    def test_model_output_clamped(self):
+        """验证模型输出被钳制"""
+        from vit_pytorch import FractalCurveViT
+        from vit_pytorch.core.constants import LOGIT_CLAMP_BOUND
+
+        model = FractalCurveViT(
+            image_size=64,
+            num_classes=10,
+            dim=64,
+            num_layers=2,
+            heads=4,
+        )
+        model.eval()
+
+        x = torch.randn(2, 3, 64, 64)
+        with torch.no_grad():
+            out = model(x)
+
+        # 输出 logits 应该被钳制
+        logits = out.logits
+        max_val = logits.abs().max().item()
+
+        # 考虑数值精度，允许微小误差
+        assert max_val <= LOGIT_CLAMP_BOUND + 1e-5, \
+            f"Logits should be clamped: max={max_val}"
+
+    def test_gradients_exist(self):
+        """验证模型参数有梯度"""
+        from vit_pytorch import FractalCurveViT
+
+        model = FractalCurveViT(
+            image_size=64,
+            num_classes=10,
+            dim=64,
+            num_layers=2,
+            heads=4,
+        )
+        model.train()
+
+        x = torch.randn(2, 3, 64, 64)
+        y = model(x)
+
+        # 计算损失并反向传播
+        loss = y.logits.sum()
+        loss.backward()
+
+        # 关键参数应该有梯度（MLP Head, Transformer Layers）
+        key_params_have_grad = False
+        for name, param in model.named_parameters():
+            # 跳过 splitter.quota_logits（可能默认冻结）
+            if 'quota_logits' in name:
+                continue
+            if param.requires_grad:
+                if param.grad is not None:
+                    key_params_have_grad = True
+                # 验证没有 NaN/Inf 梯度
+                if param.grad is not None:
+                    assert not torch.isnan(param.grad).any(), f"{name} has NaN grad"
+                    assert not torch.isinf(param.grad).any(), f"{name} has Inf grad"
+
+        assert key_params_have_grad, "Key model parameters should have gradients"
+
+
+class TestConfigChangesI147:
+    """配置变更验证 (I147: 遵循三层参数原则)"""
+
+    def test_focal_loss_disabled_in_arch_config(self):
+        """验证 focal_gamma = 0 (禁用 Focal Loss, 从 arch_config 读取)"""
+        from training.config import ModelArchitectureConfig
+
+        config = ModelArchitectureConfig()
+        # focal_gamma = 0 时退化为标准 CE
+        assert config.focal_gamma == 0.0
+        assert config.use_focal_loss == False
+
+    def test_learning_rate_updated(self):
+        """验证学习率已更新"""
+        from training.config import OptimizerConfig
+
+        config = OptimizerConfig()
+        # 从 1e-4 提升到 5e-4
+        assert config.lr == 5e-4
+
+    def test_loss_type_cross_entropy(self):
+        """验证默认损失类型为 cross_entropy"""
+        from training.config import LossConfig
+
+        config = LossConfig()
+        assert config.type == "cross_entropy"
 
 
 if __name__ == "__main__":

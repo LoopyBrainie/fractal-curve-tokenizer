@@ -13,12 +13,12 @@ L1 Foundation: Config Tests
 import pytest
 import torch
 
-from vit_pytorch.config import (
+from vit_pytorch.core.config import (
     AttentionEncoderConfig,
     AreaEncoderConfig,
     ShapeScaleEncoderConfig,
 )
-from vit_pytorch.attn_hilbert_bias import (
+from vit_pytorch.layers.attention.hilbert_bias import (
     HilbertAwareMultiScaleAttention,
     AreaEncoder,
 )
@@ -32,7 +32,6 @@ class TestAttentionEncoderConfig:
         config = AttentionEncoderConfig()
 
         assert abs(config.level_scale_init - 0.5413) < 0.0001
-        assert config.hierarchical_scale_bounds == (0.5, 1.5)
         # I113-11: 初始化从 ln(0.1) 改为 ln(1.0)，配合 √d_k 量纲对齐
         assert abs(config.hilbert_bias_init - 0.0) < 0.0001
         assert abs(config.level_bias_init - 0.0) < 0.0001
@@ -42,14 +41,12 @@ class TestAttentionEncoderConfig:
         """自定义初始化值正确应用."""
         config = AttentionEncoderConfig(
             level_scale_init=0.7,
-            hierarchical_scale_bounds=(0.3, 1.2),
             hilbert_bias_init=-1.5,
             level_bias_init=-2.0,
             energy_injection_enabled=False,
         )
 
         assert config.level_scale_init == 0.7
-        assert config.hierarchical_scale_bounds == (0.3, 1.2)
         assert config.hilbert_bias_init == -1.5
         assert config.level_bias_init == -2.0
         assert config.energy_injection_enabled is False
@@ -60,7 +57,6 @@ class TestAttentionEncoderConfig:
         config_dict = config.to_dict()
 
         assert 'level_scale_init' in config_dict
-        assert 'hierarchical_scale_bounds' in config_dict
         assert 'hilbert_bias_init' in config_dict
         assert 'level_bias_init' in config_dict
         assert 'energy_injection_enabled' in config_dict
@@ -137,9 +133,8 @@ class TestHilbertAwareMultiScaleAttentionConfig:
         assert abs(init_value - custom_init) < 1e-6
 
     def test_hierarchical_scale_bounds_from_config(self, dim, heads, max_level):  # max_level fixture defined above
-        """hierarchical_depth_scale 从配置初始化."""
-        low, high = 0.3, 1.2
-        config = AttentionEncoderConfig(hierarchical_scale_bounds=(low, high))
+        """I150-1: 简化相对缩放从配置初始化."""
+        config = AttentionEncoderConfig()
 
         attn = HilbertAwareMultiScaleAttention(
             dim=dim,
@@ -149,9 +144,13 @@ class TestHilbertAwareMultiScaleAttentionConfig:
             encoder_config=config,
         )
 
-        scale_values = attn._hierarchical_depth_scale.data
-        assert scale_values.min() >= low - 1e-6
-        assert scale_values.max() <= high + 1e-6
+        # I150-1: 检查 Base 和 Delta 参数存在且初始化正确
+        assert attn._depth_scale_base is not None
+        assert attn._depth_scale_delta is not None
+
+        # 初始化为 0（对应 sigmoid(0) = 0.5）
+        assert torch.allclose(attn._depth_scale_base, torch.zeros(heads, attn.dim_head))
+        assert torch.allclose(attn._depth_scale_delta, torch.zeros(heads, attn.dim_head))
 
     def test_bias_init_from_config(self, dim, heads, max_level):
         """偏置缩放从配置初始化."""
@@ -184,7 +183,6 @@ class TestHilbertAwareMultiScaleAttentionConfig:
 
         default_config = AttentionEncoderConfig()
         assert attn.config.level_scale_init == default_config.level_scale_init
-        assert attn.config.hierarchical_scale_bounds == default_config.hierarchical_scale_bounds
         assert attn.config.hilbert_bias_init == default_config.hilbert_bias_init
         assert attn.config.level_bias_init == default_config.level_bias_init
 
@@ -246,7 +244,6 @@ class TestConfigIntegration:
 
         enc_config = AttentionEncoderConfig(
             level_scale_init=0.65,
-            hierarchical_scale_bounds=(0.4, 1.3),
             hilbert_bias_init=-2.0,
             level_bias_init=-2.5,
             energy_injection_enabled=True,
@@ -276,7 +273,6 @@ class TestConfigBackwardCompatibility:
         config = AttentionEncoderConfig()
 
         assert config.level_scale_init == 0.5413
-        assert config.hierarchical_scale_bounds == (0.5, 1.5)
         # I113-11: 初始化从 ln(0.1) 改为 ln(1.0)
         assert abs(config.hilbert_bias_init - 0.0) < 0.0001
         assert abs(config.level_bias_init - 0.0) < 0.0001
@@ -294,7 +290,6 @@ class TestConfigBackwardCompatibility:
         default_config = AttentionEncoderConfig()
 
         assert attn.config.level_scale_init == default_config.level_scale_init
-        assert attn.config.hierarchical_scale_bounds == default_config.hierarchical_scale_bounds
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ def splitter_base():
 
     用于测试 splitter 的基础功能.
     """
-    from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+    from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
 
     return GumbelTopKSplitter(
         feature_dim=64,
@@ -43,7 +43,7 @@ def splitter_with_quota():
 
     用于测试 Scheme E 可学习配额机制.
     """
-    from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+    from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
 
     return GumbelTopKSplitter(
         feature_dim=64,
@@ -65,7 +65,7 @@ def splitter_for_ema():
 
     具有完整 EMA 配置的 splitter.
     """
-    from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+    from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
 
     return GumbelTopKSplitter(
         feature_dim=256,

@@ -490,7 +490,7 @@ class TestIntegrationVectorization:
         测试 Splitter 特征处理的向量化。
         """
         try:
-            from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
+            from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
 
             N, D, dim = 64, 6, 128
             features = torch.randn(N, dim)

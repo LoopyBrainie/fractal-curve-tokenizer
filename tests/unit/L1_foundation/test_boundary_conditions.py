@@ -15,13 +15,13 @@
 import pytest
 import torch
 import math
-from vit_pytorch.curve_hilbert import (
+from vit_pytorch.core.curve_hilbert import (
     HilbertCurve,
     xy_to_hilbert_distance,
     hilbert_distance_to_xy,
     PseudoHilbertCurve,
 )
-from vit_pytorch.levels_info import LevelsInfo
+from vit_pytorch.core.levels_info import LevelsInfo
 
 
 class TestHilbertCurveBoundary:

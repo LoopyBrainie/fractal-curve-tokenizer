@@ -23,8 +23,8 @@ import torch.nn.functional as F
 import sys
 sys.path.insert(0, 'src')
 
-from vit_pytorch.gumbel_topk_splitter import GumbelTopKSplitter
-from vit_pytorch.config import SplitterConfig
+from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
+from vit_pytorch.core.config import SplitterConfig
 
 
 class TestGradientCoverageMath:

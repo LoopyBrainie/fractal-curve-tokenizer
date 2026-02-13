@@ -185,7 +185,7 @@ class TestHilbertToXY:
 
     def test_hilbert_xy_to_index_roundtrip(self):
         """验证 xy -> Hilbert 索引的往返转换。"""
-        from vit_pytorch.curve_hilbert import HilbertCurve
+        from vit_pytorch.core.curve_hilbert import HilbertCurve
 
         config = GJPConfig(max_relative_distance=8)
         loss_fn = SpatialJigsawLoss(config=config, feat_dim=64)
