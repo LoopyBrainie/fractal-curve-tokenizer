@@ -310,56 +310,66 @@ class LevelsInfo:
             )
         return _hilbert_weights_cache[d].to(device, non_blocking=True)
 
-    # ========== Hilbert Curve 工具方法 ==========
+    # ========== 深度根归一化 (I161-1 修复) ==========
 
-    def _path_to_hilbert_index(self, path: list[int], depth: int) -> int:
-        """将四叉树路径转换为 Hilbert 曲线索引。
+    @staticmethod
+    def normalize_hilbert_index(hilbert_dist: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
+        """深度根归一化 (I161-1 修复：保持跨尺度一致性)
 
-        使用 Hilbert 曲线的递归来计算索引。
+        数学:
+            H_norm = (H / 4^d)^(1/d)
+
+        性质:
+            - H_norm ∈ [0, 1] 对于任意深度 d
+            - 深度 d 的子点 H_norm ≈ 深度 d-1 的父点 H_norm
+            - 自然保持 Hilbert 曲线的自相似性
 
         Args:
-            path: 四象限路径列表
-            depth: 路径深度
+            hilbert_dist: Hilbert距离 [B, N] 或 [N]
+            depth: 对应深度 [B, N] 或 [N]
 
         Returns:
-            Hilbert 曲线索引
+            归一化Hilbert索引，范围 [0, 1]
         """
-        if depth == 0:
-            return 0
+        # 深度为0时返回0
+        depth_safe = depth.clamp(min=1)
 
-        # 使用 curve_hilbert 的函数
-        from .curve_hilbert import xy_to_hilbert_distance
+        # 计算 4^depth [B, N] 或 [N]
+        four_pow_depth = 4 ** depth_safe
 
-        # 计算子网格大小
-        grid_size = 1 << depth  # 2^depth
+        # 深度根归一化: (H / 4^d)^(1/d)
+        normalized = (hilbert_dist.float() / four_pow_depth.float()) ** (1.0 / depth_safe.float())
 
-        # 从路径计算 x, y 坐标
-        x, y = 0, 0
-        for level, quadrant in enumerate(path):
-            # 在每个深度级别，根据象限更新坐标
-            half = 1 << (depth - level - 1)
-            if quadrant == 0:  # 左上
-                # 无变化
-                pass
-            elif quadrant == 1:  # 右上
-                x += half
-            elif quadrant == 2:  # 左下
-                y += half
-            elif quadrant == 3:  # 右下
-                x += half
-                y += half
+        # 处理深度为0的情况
+        if depth.dim() == 1:
+            normalized = torch.where(depth == 0, torch.zeros_like(normalized), normalized)
+        else:
+            normalized = torch.where(
+                depth == 0,
+                torch.zeros_like(normalized),
+                normalized
+            )
 
-        return xy_to_hilbert_distance(grid_size, x, y)
+        return normalized
 
-    def get_hilbert_indices(self) -> torch.Tensor:
+    def get_hilbert_indices(self, normalize: bool = False) -> torch.Tensor:
         """计算 Hilbert 曲线索引 (用于排序)。
 
         I102-8 修复: 使用查找表实现正确的向量化
         I103-2 优化: 使用类级权重缓存避免重复创建张量
-        数学等价于 _path_to_hilbert_index，但运行时 O(B×N)
+        I161-1 修复: 添加归一化选项保持跨尺度一致性
+
+        数学:
+            H_raw = Σ q_k × 4^{d-k}  (原始Hilbert距离)
+            H_norm = (H_raw / 4^d)^(1/d)  (深度根归一化)
+
+        Args:
+            normalize: 是否使用深度根归一化 (默认 False 保持向后兼容)
 
         Returns:
             hilbert_indices: [B, N] 每个 token 的 Hilbert 序
+            - normalize=False: 原始Hilbert距离，范围 [0, 4^d - 1]
+            - normalize=True: 归一化Hilbert索引，范围 [0, 1]
         """
         B, N, D_plus_1 = self.data.shape
         D = D_plus_1 - 1
@@ -392,6 +402,11 @@ class LevelsInfo:
                 dtype=torch.long,
                 device=self.data.device
             )
+
+        # I161-1 修复: 深度根归一化
+        if normalize:
+            depths = self.data[:, :, 0]  # [B, N]
+            return self.normalize_hilbert_index(results, depths)
 
         return results
 

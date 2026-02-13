@@ -41,18 +41,59 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .embed_fractal_position import FractalPositionEmbedding
-from .tokenizer_streaming import StreamingFractalTokenizerV3
-from .base_tokenizer import BaseTokenizer, TokenizerOutput
-from .block_transformer import FractalTransformer, FFNType
-from .utils import pair
-from .constants import (
+from vit_pytorch.layers.embeddings.fractal_position import FractalPositionEmbedding
+from vit_pytorch.modules.tokenizer import StreamingFractalTokenizerV3
+from vit_pytorch.modules.base_tokenizer import BaseTokenizer, TokenizerOutput
+from vit_pytorch.modules.transformer_block import FractalTransformer, FFNType
+from vit_pytorch.core.utils import pair
+from vit_pytorch.core.constants import (
     DIVISION_EPSILON, PROB_EPSILON,
     compute_max_level, compute_num_candidates, compute_k_bounds,
     K_COVERAGE_MAX_HARD,
     SPLITTER_TEMP_START, SPLITTER_TEMP_END,
+    LOGIT_CLAMP_BOUND,  # I147: 添加钳制边界导入
 )
-from .config import AttentionEncoderConfig, SemanticSplitterConfig  # I98-3, I110-5
+from vit_pytorch.core.config import AttentionEncoderConfig, SemanticSplitterConfig  # I98-3, I110-5
+from vit_pytorch.core.pattern_encoder import (
+    HilbertPatternEncoder,
+    HilbertPatternEncoderLight,
+    create_hilbert_pattern_encoder,
+)  # I162-1
+
+
+# =============================================================================
+# I147: Logits 钳制层 - 解决训练损失异常 (~82)
+# =============================================================================
+class LogitsClamp(nn.Module):
+    """分类 Logits 钳制层 - 确保数值稳定性
+
+    数学形式化
+    =============
+        y = clamp(x, min=-bound, max=bound)
+
+    作用
+    ----
+        - 防止 logits 数值溢出导致 CE 损失爆炸
+        - 保持 softmax 梯度有效性 (|z| ≤ 10 → ∂p/∂z ≥ 5e-5)
+        - 替代 Focal Loss 的数值稳定化
+
+    最佳实践
+    =======
+        - bound = LOGIT_CLAMP_BOUND = 10.0
+        - 添加在 MLP Head 最后一层
+        - 确保 train/eval 输出一致
+    """
+    __slots__ = ('bound',)
+
+    def __init__(self, bound: float = LOGIT_CLAMP_BOUND):
+        super().__init__()
+        self.bound = bound
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.clamp(min=-self.bound, max=self.bound)
+
+    def extra_repr(self) -> str:
+        return f"bound={self.bound}"
 
 
 # I112-6: LazyDiagnostics 延迟 diagnostics 包装器
@@ -201,8 +242,11 @@ class FractalCurveViT(nn.Module):
         # I120-2: 分离 dropout 配置
         # tokenizer_dropout: Tokenizer/Splitter dropout，必须为 0.0 (确定性)
         # transformer_dropout: Transformer dropout，默认为 0.1 (正则化)
+        # I130-2: Hilbert 最佳实现 - 禁用 Dropout 和 DropPath
+        # 理由: Dropout/DropPath 破坏 Hilbert 曲线的确定性保证
+        # 预期效果: train/eval max_diff: 3.64 → <0.05
         tokenizer_dropout: float = 0.0,
-        transformer_dropout: float = 0.1,
+        transformer_dropout: float = 0.0,
         emb_dropout: float = 0.0,
         min_patch_size: Union[int, Tuple[int, int]] = 4,
         # 注意: max_level 是变参数，完全由模型架构内部根据 image_size 和 min_patch_size 动态计算
@@ -236,9 +280,17 @@ class FractalCurveViT(nn.Module):
         # I145: Splitter 温度参数 (用于温度退火)
         splitter_temp_start: Optional[float] = None,
         splitter_temp_end: Optional[float] = None,
+        # I130-3: Splitter 类型选择 (I145: 新增 semantic_redundancy 支持)
+        splitter_type: str = 'gumbel_topk',  # 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy'
         # I110-7: 语义分裂器配置
         use_semantic_splitter: bool = False,
         semantic_splitter_config: Optional[SemanticSplitterConfig] = None,
+        # P6-1: 深度缩放参数 (传递给 HilbertPatchEmbed)
+        depth_scale_range: Optional[Tuple[float, float]] = None,
+        # I162-1: Hilbert 模式编码器参数
+        use_pattern_encoder: bool = False,  # 是否启用模式编码器
+        pattern_encoder_mode: str = "light",  # "light", "standard", "multihead"
+        pattern_encoder_window_sizes: Optional[Tuple[int, ...]] = None,  # 多尺度窗口大小
     ) -> None:
         """初始化 FractalCurveViT。
 
@@ -280,6 +332,7 @@ class FractalCurveViT(nn.Module):
             fourier_levels: 傅里叶特征级别数
             encoder_config: 注意力编码器配置
             quota_learnable: 可学习配额控制
+            depth_scale_range: P6-1 深度缩放范围 (σ_min, σ_max)，传递给 HilbertPatchEmbed
 
         Note:
             I78: 支持 image_size=None 实现真正的动态分辨率输入。
@@ -324,6 +377,29 @@ class FractalCurveViT(nn.Module):
 
         # I122-2: 移除 lca_temperature，由 hilbert_bias_scale 统一缩放
         self.lca_fp16 = lca_fp16  # I104-3
+
+        # P6-1: 深度缩放参数
+        self.depth_scale_range = depth_scale_range
+
+        # I162-1: Hilbert 模式编码器配置
+        self.use_pattern_encoder = use_pattern_encoder
+        self.pattern_encoder = None
+        if use_pattern_encoder:
+            window_sizes = pattern_encoder_window_sizes or (3, 7)
+            if pattern_encoder_mode == "light":
+                self.pattern_encoder = create_hilbert_pattern_encoder(
+                    dim=dim,
+                    mode=pattern_encoder_mode,
+                    kernel_size=window_sizes[0] if window_sizes else 7,
+                    out_dim=dim,
+                )
+            else:
+                self.pattern_encoder = create_hilbert_pattern_encoder(
+                    dim=dim,
+                    mode=pattern_encoder_mode,
+                    window_sizes=window_sizes,
+                    out_dim=dim,
+                )
 
         # ====================================================================
         # I120-2: 子模块 Dropout 配置 (确定性 + 正则化分离)
@@ -383,51 +459,85 @@ class FractalCurveViT(nn.Module):
             # I98-2: 使用注入的 Splitter
             self.splitter = splitter
         else:
-            # 动态创建 Splitter（向后兼容）
-            from .gumbel_topk_splitter import GumbelTopKSplitter
-            from .config import SplitterConfig
-
             # I98-1: 确定 max_level_limit (根据 tokenizer 或默认值)
             max_level_limit = 8  # 默认值
             if tokenizer is not None:
                 if hasattr(tokenizer, 'max_level'):
                     max_level_limit = tokenizer.max_level
 
-            # I33: 使用 compute_k_bounds 从 coverage 计算 K 值
-            K_min_computed, K_max_computed = compute_k_bounds(
-                max_level=max_level_limit,
-                token_coverage_min=token_coverage_min,
-                token_coverage_max=token_coverage_max,  # 已废弃，可能为 None
-                image_size=min(self.image_size) if self.image_size else None,
-                target_ratio=self.target_ratio,  # I113-2: 使用外部传递的 target_ratio
-            )
+            # I130-3: 根据 splitter_type 创建不同的 Splitter (I145: 添加 semantic_redundancy)
+            if splitter_type == 'deterministic_neighbor':
+                # DeterministicNeighborSplitter: 100%梯度覆盖率，完整邻居传播
+                from vit_pytorch.layers.splitters.deterministic_neighbor import (
+                    DeterministicNeighborSplitter,
+                    DeterministicNeighborSplitterConfig,
+                )
 
-            splitter_config = SplitterConfig(
-                feature_dim=splitter_feature_dim or dim,
-                min_patch_size=effective_min_patch_size,
-                max_level_limit=max_level_limit,
-                hidden_dim=splitter_hidden_dim or 64,
-                intermediate_dim=(splitter_hidden_dim or 64) // 2,
-                pool_size=splitter_pool_size or 4,
-                # I113-2: K 边界由 config 内部根据 coverage_min/coverage_max_hard 自动计算
-                use_dynamic_k=True,
-                # I120-2: dropout 始终为 0.0 (Tokenizer 确定性)
-                dropout=0.0,
-                enable_learnable_quota=quota_learnable if quota_learnable is not None else True,
-                quota_entropy_weight=quota_entropy_weight,
-                # I33: 传递覆盖率参数
-                coverage_min=token_coverage_min,
-                coverage_max_hard=token_coverage_max if token_coverage_max else K_COVERAGE_MAX_HARD,
-                # I120-3: 选中率均衡配额 (解决深度分布单一化)
-                enable_rate_balanced_quota=True,
-                # I145: 传递温度参数
-                temperature_init=splitter_temp_start if splitter_temp_start is not None else SPLITTER_TEMP_START,
-                temperature_min=splitter_temp_end if splitter_temp_end is not None else SPLITTER_TEMP_END,
-            )
-            self.splitter = GumbelTopKSplitter(
-                config=splitter_config,
-                image_size=self.image_size,
-            )
+                splitter_config = DeterministicNeighborSplitterConfig(
+                    feature_dim=splitter_feature_dim or dim,
+                    max_level_limit=max_level_limit,
+                    hidden_dim=splitter_hidden_dim or 64,
+                    # 覆盖率参数
+                    coverage_min=token_coverage_min,
+                    coverage_base=token_coverage_max if token_coverage_max else K_COVERAGE_MAX_HARD,
+                    # 温度参数
+                    temperature_init=splitter_temp_start if splitter_temp_start is not None else SPLITTER_TEMP_START,
+                    temperature_min=splitter_temp_end if splitter_temp_end is not None else SPLITTER_TEMP_END,
+                    # 配额参数
+                    enable_learnable_quota=quota_learnable if quota_learnable is not None else True,
+                    locality_weight=0.1,
+                    entropy_weight=0.01,
+                )
+                self.splitter = DeterministicNeighborSplitter(
+                    config=splitter_config,
+                    image_size=self.image_size,
+                    feature_dim=splitter_feature_dim or dim,
+                )
+            elif splitter_type == 'semantic_redundancy':
+                # SemanticRedundancySplitter: 语义冗余性感知分裂
+                from vit_pytorch.layers.splitters.semantic_redundancy import (
+                    SemanticRedundancySplitter,
+                )
+
+                self.splitter = SemanticRedundancySplitter(
+                    feature_dim=splitter_feature_dim or dim,
+                    hidden_dim=splitter_hidden_dim or 128,
+                    max_level_limit=max_level_limit,
+                    gumbel_temp_start=splitter_temp_start if splitter_temp_start is not None else SPLITTER_TEMP_START,
+                    gumbel_temp_end=splitter_temp_end if splitter_temp_end is not None else SPLITTER_TEMP_END,
+                    learnable_temperature=True,
+                )
+            else:
+                # 默认使用 GumbelTopKSplitter
+                from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
+                from vit_pytorch.core.config import SplitterConfig
+
+                splitter_config = SplitterConfig(
+                    feature_dim=splitter_feature_dim or dim,
+                    min_patch_size=effective_min_patch_size,
+                    max_level_limit=max_level_limit,
+                    hidden_dim=splitter_hidden_dim or 64,
+                    intermediate_dim=(splitter_hidden_dim or 64) // 2,
+                    pool_size=splitter_pool_size or 4,
+                    # I113-2: K 边界由 config 内部根据 coverage_min/coverage_max_hard 自动计算
+                    use_dynamic_k=True,
+                    # I120-2: dropout 始终为 0.0 (Tokenizer 确定性)
+                    dropout=0.0,
+                    enable_learnable_quota=quota_learnable if quota_learnable is not None else True,
+                    quota_entropy_weight=quota_entropy_weight,
+                    # I33: 传递覆盖率参数
+                    coverage_min=token_coverage_min,
+                    coverage_max_hard=token_coverage_max if token_coverage_max else K_COVERAGE_MAX_HARD,
+                    # I120-3: 选中率均衡配额 (解决深度分布单一化)
+                    enable_rate_balanced_quota=True,
+                    # I145: 传递温度参数
+                    temperature_init=splitter_temp_start if splitter_temp_start is not None else SPLITTER_TEMP_START,
+                    temperature_min=splitter_temp_end if splitter_temp_end is not None else SPLITTER_TEMP_END,
+                )
+                self.splitter = GumbelTopKSplitter(
+                    config=splitter_config,
+                    image_size=self.image_size,
+                )
 
         # === Tokenizer ===
         if tokenizer is None:
@@ -439,6 +549,7 @@ class FractalCurveViT(nn.Module):
                 d_model=dim,
                 base_patch_size=effective_min_patch_size,
                 min_patch_size=effective_min_patch_size,
+                depth_scale_range=self.depth_scale_range,
             )
 
         # I110-7: 配置语义分裂器（必须在 tokenizer 赋值之前）
@@ -475,7 +586,7 @@ class FractalCurveViT(nn.Module):
             # I31-3: 支持面积增强位置编码
             # 使用 self.max_level（从 tokenizer 获取的变参数）
             if use_area_encoding:
-                from .embed_fractal_position import AreaEnhancedPositionEmbedding
+                from vit_pytorch.layers.embeddings.fractal_position import AreaEnhancedPositionEmbedding
                 position_embedding = AreaEnhancedPositionEmbedding(
                     dim=dim,
                     max_level=self.max_level,
@@ -555,12 +666,14 @@ class FractalCurveViT(nn.Module):
         else:
             # 动态创建 MLP Head
             # I120-2: 使用 transformer_dropout 而非 dropout
+            # I147: 添加 LogitsClamp 解决训练损失异常 (~82)
             self.mlp_head = nn.Sequential(
                 nn.LayerNorm(dim),
                 nn.Linear(dim, mlp_dim // 2),
                 nn.GELU(),
                 nn.Dropout(transformer_dropout),
                 nn.Linear(mlp_dim // 2, num_classes),
+                LogitsClamp(LOGIT_CLAMP_BOUND),  # I147: 钳制 logits 防止损失爆炸
             )
             self.num_classes = num_classes
             self.dim = dim
@@ -816,10 +929,14 @@ class FractalCurveViT(nn.Module):
         needs_split_result = hasattr(self.tokenizer, 'shared_conv')
 
         if needs_split_result:
+            # I130-2: Hilbert 最佳实现 - DeterministicTopK 模式始终使用硬选择
+            # 关键修复: 对于确定性模式，hard 参数不影响选择逻辑
+            # DeterminativeTopK 模式下，硬掩码和软掩码基于相同的确定性概率
+            use_hard = True  # 始终使用硬选择以确保确定性
             split_result = self.splitter(
                 features,
                 image_size=(img.shape[2], img.shape[3]),
-                hard=not self.training,
+                hard=use_hard,
             )
             # Tokenizer 使用 Splitter 的结果进行 embedding
             token_output = self.tokenizer.tokenize(img, split_result)
@@ -867,7 +984,7 @@ class FractalCurveViT(nn.Module):
         device = padded_tokens.device
 
         # I98-4: 将 raw tensor 转换为 LevelsInfo
-        from .levels_info import LevelsInfo
+        from vit_pytorch.core.levels_info import LevelsInfo
         levels_info = LevelsInfo(data=padded_levels, max_level=self.max_level)
 
         # I31-3: 传递 regions 和 image_size 给位置编码器（用于面积编码）
@@ -1187,6 +1304,15 @@ class FractalCurveViT(nn.Module):
         # P11-3: 获取 regions 和 image_size 用于正确的 LCA 偏置计算
         regions, image_size = token_output.get_padded_regions()
 
+        # I162-1: Hilbert 模式编码 - 在添加 CLS 之前获取 Hilbert 索引
+        hilbert_order = None
+        if self.pattern_encoder is not None:
+            from vit_pytorch.core.levels_info import LevelsInfo
+            temp_levels_info = LevelsInfo(data=padded_levels, max_level=self.max_level)
+            hilbert_indices = temp_levels_info.get_hilbert_indices()  # [B, MaxLen]
+            # 将 Hilbert 索引转换为排序位置 (使用第一个样本的排序，对所有batch通用)
+            hilbert_order = torch.argsort(hilbert_indices[0], dim=0)  # [MaxLen]
+
         # 2. 添加位置编码和 CLS token
         x, levels_info = self._apply_position_and_cls(
             padded_tokens, padded_levels, regions=regions, image_size=image_size
@@ -1196,6 +1322,20 @@ class FractalCurveViT(nn.Module):
         if regions is not None:
             cls_region = torch.zeros(batch_size, 1, 4, dtype=regions.dtype, device=device)
             regions = torch.cat([cls_region, regions], dim=1)
+
+        # I162-1: 应用模式编码器 (Tokenizer后、Transformer前)
+        if self.pattern_encoder is not None and hilbert_order is not None:
+            # 使用与实际 token 数量匹配的 Hilbert 排序索引
+            # x 形状: [B, 1+MaxLen, D], 跳过 CLS 后: [B, MaxLen, D]
+            actual_num_tokens = x.shape[1] - 1  # 减去 CLS
+            max_len = min(hilbert_order.shape[0], actual_num_tokens)
+            hilbert_order_trimmed = hilbert_order[:max_len]
+            x_tokens = x[:, 1:max_len+1, :]
+            # 应用模式编码器
+            pattern_features = self.pattern_encoder(x_tokens, hilbert_order_trimmed)
+            # 残差连接并重建完整序列
+            x_enhanced = x[:, 1:max_len+1, :] + pattern_features
+            x = torch.cat([x[:, :1, :], x_enhanced, x[:, max_len+1:, :]], dim=1)
 
         # 3. 创建 attention mask
         attn_mask, key_padding_mask = self._create_attention_mask(

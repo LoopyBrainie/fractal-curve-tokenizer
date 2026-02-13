@@ -87,7 +87,7 @@ from torch import Tensor
 # I30-10: 导入 SplitterConfig
 # I35: 移除死代码 DEPTH_KL_*, DEPTH_QUOTA_* 常量
 # I112-3: 导入统一数值稳定性常量
-from .constants import (
+from vit_pytorch.core.constants import (
     EPS,  # I112-3: 统一数值稳定性常量
     LOGIT_CLAMP_BOUND,
     TEMPERATURE_MIN,
@@ -158,8 +158,8 @@ from .constants import (
     # I120-8: 深度平衡损失权重
     DEPTH_BALANCE_WEIGHT,
 )
-from .config import HilbertSplitterConfig, SplitterConfig
-from .base_splitter import (
+from vit_pytorch.core.config import HilbertSplitterConfig, SplitterConfig
+from vit_pytorch.modules.base_splitter import (
     CoreSplitter,
     AnnealingSplitter,
     MetricsSplitter,
@@ -1184,9 +1184,11 @@ class GumbelTopKSplitter(
         # 探索偏置 (训练初期)
         self.register_buffer('explore_bias', torch.tensor(0.5))
 
-        # 深度偏置系数 (可选)
-        self.register_buffer('depth_bias_beta', torch.tensor(0.5))
-        self.register_buffer('depth_bias_gamma', torch.tensor(0.7))
+        # I131-1: 固定深度偏置已移除
+        # 原因: 与 Scheme E 可学习配额机制冲突
+        # 深度选择完全由 quota_logits 控制
+        # self.register_buffer('depth_bias_beta', torch.tensor(0.5))
+        # self.register_buffer('depth_bias_gamma', torch.tensor(0.7))
 
         # ====================================================================
         # I113-5: 可学习 STE 梯度缩放因子
@@ -1226,10 +1228,17 @@ class GumbelTopKSplitter(
         #   1. 需要确定性的推理结果
         #   2. train/eval 输出一致性要求
         #   3. Hilbert 局部性保持
-        # ====================================================================
-        self._use_deterministic_topk = False  # 默认使用 Gumbel-TopK
-        self._deterministic_temperature = 0.5  # 初始温度
-        self._deterministic_ste_alpha = 0.5  # STE 混合系数
+        #
+        # I130-2: Hilbert 最佳实现 - 从 config 读取 DeterministicTopK 设置
+        # 修复: 使用 config 中的值替代硬编码默认值
+        if self.config is not None:
+            self._use_deterministic_topk = getattr(self.config, 'use_deterministic_topk', False)
+            self._deterministic_temperature = getattr(self.config, 'deterministic_temperature', 0.5)
+            self._deterministic_ste_alpha = getattr(self.config, 'deterministic_ste_alpha', 0.5)
+        else:
+            self._use_deterministic_topk = False  # 默认使用 Gumbel-TopK
+            self._deterministic_temperature = 0.5  # 初始温度
+            self._deterministic_ste_alpha = 0.5  # STE 混合系数
 
         # 延迟初始化 DeterministicTopK（仅在 use_deterministic_topk=True 时创建）
         self._deterministic_topk: Optional[DeterministicTopK] = None
@@ -1558,7 +1567,7 @@ class GumbelTopKSplitter(
         Args:
             image_size: (H, W) 输入图像尺寸
         """
-        from .depth_utils import compute_max_depth
+        from vit_pytorch.core.depth_utils import compute_max_depth
 
         H_img, W_img = image_size
 
@@ -1647,7 +1656,7 @@ class GumbelTopKSplitter(
             image_size: (H, W) 图像尺寸
             max_depth: 最大深度
         """
-        from .curve_hilbert import HilbertScanner
+        from vit_pytorch.core.curve_hilbert import HilbertScanner
 
         H_img, W_img = image_size
 
@@ -1907,8 +1916,17 @@ class GumbelTopKSplitter(
         #   2. EMA 仅用于初始化时的保守回退 (避免未训练时的数值异常)
         #   3. Per-sample EMA 跟踪每个样本的统计量变化
         # ====================================================================
-        if self.training:
+        # I130-2: Hilbert 最佳实现 - DeterministicTopK 模式统一使用实时统计量
+        # 关键修复: 对于确定性模式，始终使用当前 batch 的实时统计量
+        # 这样 train/eval 模式使用相同的归一化逻辑，保证输出一致
+        use_realtime_stats = (
+            self.training or
+            self._use_deterministic_topk  # DeterministicTopK 始终使用实时统计量
+        )
+
+        if self.training and not self._use_deterministic_topk:
             # I107-1: 训练模式: Per-sample EMA 更新
+            # 仅在非确定性模式下更新 EMA
             # 对每个样本独立更新 EMA，不跨 batch 平均
             # I107-1: 确保 EMA 缓冲区足够大
             self._ensure_ema_buffers(B, device)
@@ -1952,9 +1970,14 @@ class GumbelTopKSplitter(
             # 这样确保不同 batch size 下的归一化行为一致
             mu_normalize = mu_per_batch  # [B, D]
             sigma_normalize = (variance_per_batch + DEPTH_VARIANCE_NORM_EPS).sqrt()  # [B, D]
+        elif self._use_deterministic_topk:
+            # I130-2: DeterministicTopK 模式始终使用实时统计量
+            # 并且不更新 EMA 缓冲区，保持状态一致
+            mu_normalize = mu_per_batch
+            sigma_normalize = (variance_per_batch + DEPTH_VARIANCE_NORM_EPS).sqrt()
         else:
             # ====================================================================
-            # 评估模式
+            # 评估模式 (非 DeterministicTopK)
             # ====================================================================
             if not self._ema_buffer_initialized:
                 import warnings
@@ -2208,8 +2231,9 @@ class GumbelTopKSplitter(
         depth_embed = self.depth_embedding(depths)  # [N, 16]
         depth_bias_learned = self.depth_proj(depth_embed).squeeze(-1)  # [N]
 
-        # 固定深度偏置 (可选，用于平滑过渡)
-        depth_bias_fixed = self.depth_bias_beta * (self.depth_bias_gamma ** depths.float())
+        # I131-1: 固定深度偏置已移除
+        # 深度选择由 Scheme E 可学习配额机制主导
+        # depth_bias_fixed = self.depth_bias_beta * (self.depth_bias_gamma ** depths.float())
 
         # I30-4: 已移除 Log-Compensation (被方案E完全替代)
 
@@ -2220,10 +2244,10 @@ class GumbelTopKSplitter(
         taus = thresholds[depths]  # [N]
         
         # 总 logits
-        # logits = z + depth_bias + explore_bias - tau
-        logits = (complexity_logits 
+        # logits = z + depth_bias_learned + explore_bias - tau
+        # I131-1: 移除了 depth_bias_fixed，由 Scheme E 可学习配额主导
+        logits = (complexity_logits
                   + depth_bias_learned.unsqueeze(0)
-                  + depth_bias_fixed.unsqueeze(0)
                   + self.explore_bias
                   - taus.unsqueeze(0))
         
@@ -3385,18 +3409,21 @@ class GumbelTopKSplitter(
             # 提取该深度的 logits
             logits_d = logits_fp32[:, depth_indices]  # [B, N_d]
 
-            if hard or not self.training:
-                # 推理模式：直接 Top-K
-                _, topk_local = torch.topk(logits_d, K_d, dim=1)  # [B, K_d]
-            elif self._use_deterministic_topk and self._deterministic_topk is not None:
+            # I130-2: Hilbert 最佳实现 - DeterministicTopK 统一使用确定性 softmax
+            # 关键修复: 当 use_deterministic_topk=True 时，始终使用确定性 softmax
+            # 这样 train/eval 模式使用相同的底层概率分布，保证输出一致
+            if self._use_deterministic_topk and self._deterministic_topk is not None:
                 # I120-2: 确定性 Top-K 模式（替代 Gumbel 采样）
-                # 使用温度退火的 softmax 替代 Gumbel 随机采样
+                # 无论 hard 模式如何，都使用确定性 softmax
                 # 数学: P(i ∈ Top-K) = softmax(z_i / τ)[i] × K
                 det_probs = F.softmax(logits_d / self._deterministic_temperature, dim=1)  # [B, N_d]
                 _, topk_local = torch.topk(det_probs, K_d, dim=1)  # [B, K_d]
 
                 # 更新 soft_mask（使用确定性 softmax）
                 soft_mask[:, depth_indices] = det_probs  # [B, N_d]
+            elif hard or not self.training:
+                # 推理模式：直接 Top-K（仅在非确定性模式下使用）
+                _, topk_local = torch.topk(logits_d, K_d, dim=1)  # [B, K_d]
             else:
                 # 训练模式：Gumbel + Top-K
                 uniform = torch.rand(B, N_d, device=device, dtype=torch.float32)
@@ -3431,17 +3458,26 @@ class GumbelTopKSplitter(
             soft_mask[:, 0] = 1.0
 
         # I122-1: 移除 STE 混合，直接使用软概率
+        # I130-2: Hilbert 最佳实现 - DeterministicTopK 使用确定性硬掩码
+        #
         # 数学: st_mask = soft_mask (无偏梯度)
         #
         # 原 STE 公式 (I113-5):
         #   st_mask = (1 - α) × hard + α × soft
         #   其中 α = σ(log β) ∈ (0, 1) 是启发式参数
         #
-        # 最佳实现: 直接使用 soft_mask
-        #   1. 无偏梯度: ∂P/∂z 有闭式解
-        #   2. 无需启发式 α 参数
-        #   3. 温度 τ 自动控制硬度
-        if self.training and not hard:
+        # 最佳实现:
+        #   1. DeterministicTopK: 使用确定性 softmax 概率构建硬掩码
+        #   2. 训练模式: 使用软概率 (soft_mask) 保证梯度流动
+        #   3. 推理模式: 使用硬掩码 (hard_mask) 保证确定性
+        #
+        # 关键: DeterministicTopK 模式下，硬掩码基于确定性概率构建
+        #      所以 train/eval 使用相同的底层选择逻辑
+        if self._use_deterministic_topk and self._deterministic_topk is not None:
+            # I130-2: DeterministicTopK 始终使用软掩码（用于训练和推理）
+            # 硬掩码已基于确定性概率构建，st_mask 选择不影响最终行为
+            st_mask = soft_mask
+        elif self.training and not hard:
             st_mask = soft_mask
         else:
             st_mask = hard_mask
@@ -3709,11 +3745,14 @@ class GumbelTopKSplitter(
         device = consistent_mask.device
 
         # I145-FIX: 使用软掩码计算 token 数量，保持梯度
-        # 这用于辅助损失计算，不影响实际的 token 选择逻辑
-        num_selected_per_batch = consistent_mask.sum(dim=1)  # [B]
+        # 这用于辅助损失计算
+        num_selected_per_batch_float = consistent_mask.sum(dim=1)  # [B]
 
         # 使用硬阈值选择最终区域 (用于实际 token 选择和索引)
         final_selected = (consistent_mask > 0.5)  # [B, N]
+
+        # I150-2 FIX: 使用硬掩码计算实际的 token 数量，与 hilbert_indices 数量一致
+        num_selected_per_batch = final_selected.sum(dim=1).long()  # [B]
 
         # P-OPT: 使用向量化操作确保每个 batch 至少有一个 token
         # 避免 .any() 同步点，直接使用 clamp 和 where 操作
@@ -3890,65 +3929,48 @@ class GumbelTopKSplitter(
 
             target_tokens = target_coverage * candidate_count
 
-            # === I122-4: Poisson KL 散度损失 (新实现) ===
-            # 从第一性原理推导的最优损失函数
+            # === I147: 简化的预算损失 (替代 Poisson KL) ===
+            # 从第一性原理推导的稳定损失函数
             #
             # 数学形式化:
-            #   L_KL = K_t × KL(Poisson(K) || Poisson(K_t))
-            #   L_KL = K_t × (K/K_t × log(K/K_t) + 1 - K/K_t)
+            #   L_budget = λ × Huber(|K - K_t| / N, δ / N)
             #
             # 核心洞察:
-            #   - Token 计数是离散 Poisson 过程
-            #   - KL 散度是计数偏差的信息论最优度量
-            #   - 梯度 = λ × log(K/K_t) (大偏差时温和)
+            #   - 相对误差: |K - K_t| / N 确保尺度不变性
+            #   - Huber 边界: 大偏差时梯度有界，防止数值爆炸
+            #   - 比 Poisson KL 更稳定，数学假设更少
             #
-            # 对比 L2 损失:
-            #   L2: ∂L/∂K = 2λ(K-K_t) (大偏差梯度爆炸)
-            #   KL:  ∂L/∂K = λ × log(K/K_t) (大偏差梯度温和)
+            # 对比 Poisson KL:
+            #   Poisson KL: 需要假设 token 计数服从 Poisson 分布
+            #   简化的: 无分布假设，更鲁棒
             #
             target_K = target_tokens
 
-            # Poisson KL 散度损失
-            # 数值稳定性: K ≥ 1, ratio ≥ ELASTIC_EPS
+            # 相对误差损失
+            # K ≥ 1 数值稳定性
             K = avg_tokens.clamp(min=1.0)
-            # I145-FIX: 使用 torch.max 而不是 Python max，保持梯度
-            # target_K 是 float，需要先转换为张量
-            target_K_tensor = torch.tensor(target_K, device=K.device, dtype=K.dtype)
+            # I147-FIX: 使用张量运算保持梯度
+            target_K_tensor = torch.tensor(float(target_K), device=K.device, dtype=K.dtype)
             K_t = torch.max(target_K_tensor, torch.tensor(1.0, device=K.device))
-            ratio = K / K_t
-            ratio_clamped = ratio.clamp(min=ELASTIC_EPS)
 
-            # KL(Poisson(K) || Poisson(K_t))
-            # = K_t × (K/K_t × log(K/K_t) + 1 - K/K_t)
-            # = K_t × (ratio × log(ratio) + 1 - ratio)
-            kl_loss = K_t * (ratio_clamped * torch.log(ratio_clamped) + 1.0 - ratio_clamped)
+            # 相对误差: diff / N
+            diff = (K - K_t).abs() / float(candidate_count)
+            diff = diff.clamp(min=0.0, max=1.0)  # 钳制到 [0, 1]
 
-            # 归一化
-            kl_loss = kl_loss / candidate_count
-
-            # === Huber 边界保护 ===
-            # δ = K_t / 2 (动态计算)
-            delta = K_t / 2.0
-            diff = (K - K_t).abs()
-
-            # I145-FIX: 使用 torch.where 而不是 Python if，保持梯度
-            # Huber 损失: L = { 0.5×Δ² if |Δ| ≤ δ; δ×|Δ| - 0.5×δ² otherwise }
-            # 构建条件张量
-            cond = diff <= delta
+            # Huber 边界损失
+            # δ = 0.5 (标准 Huber δ=1 在归一化后)
+            delta = 0.5
             huber_loss = torch.where(
-                cond,
+                diff <= delta,
                 0.5 * diff.pow(2),
-                delta * diff - 0.5 * (delta ** 2)
+                delta * diff - 0.5 * delta ** 2
             )
 
-            # === 组合损失 ===
-            # L = factor × (λ_KL × L_KL + λ_Huber × L_Huber)
-            # I145-FIX: 使用张量权重保持梯度
-            lambda_kl = torch.tensor(ELASTIC_LAMBDA_KL, device=K.device)  # 0.005
-            lambda_huber = torch.tensor(HUBER_LAMBDA, device=K.device)  # 0.001
-            loss = self._elastic_budget_factor * (
-                lambda_kl * kl_loss + lambda_huber * huber_loss
-            )
+            # === I147: 简化的损失权重 ===
+            # λ_budget = 0.1 (确保与 CE 损失量纲一致)
+            # 无需复杂的 λ_KL + λ_Huber 组合
+            lambda_budget = torch.tensor(0.1, device=K.device)
+            loss = self._elastic_budget_factor * lambda_budget * huber_loss
 
             # === 边界约束 (简化，依赖 Huber 保护) ===
             K_min, K_max = self._get_dynamic_k_bounds(candidate_count)
@@ -4457,7 +4479,7 @@ class GumbelTopKSplitter(
             if patch_size is None:
                 patch_size = getattr(self, '_last_patch_size', 4)
             # 使用动态 gamma 计算
-            from .constants import compute_hilbert_continuity_gamma
+            from vit_pytorch.core.constants import compute_hilbert_continuity_gamma
             gamma = compute_hilbert_continuity_gamma(
                 image_size=image_size,
                 patch_size=patch_size,
@@ -5177,6 +5199,7 @@ class GumbelTopKSplitter(
     
     def get_diagnostics(self) -> Dict[str, Any]:
         """获取诊断信息。"""
+        # I131-1: depth_bias_beta/gamma 已移除，由 quota_logits 替代
         return {
             'num_candidates': self.num_candidates,
             'max_depth': self._current_max_depth,
@@ -5185,8 +5208,8 @@ class GumbelTopKSplitter(
             'avg_selected': float(self._avg_selected),
             'temperature': self.current_temperature,
             'explore_bias': float(self.explore_bias),
-            'depth_bias_beta': float(self.depth_bias_beta),
-            'depth_bias_gamma': float(self.depth_bias_gamma),
+            # I131-1: 返回配额信息替代深度偏置
+            'quota_probs': self.get_quota_probs().detach().cpu().tolist() if self.get_quota_probs() is not None else None,
         }
 
     # ============================================================================
@@ -5318,9 +5341,9 @@ def create_gumbel_topk_from_config(
 
     使用方法:
         ```python
-        from vit_pytorch.gumbel_topk_splitter import create_gumbel_topk_splitter
+        from vit_pytorch.layers.splitters import create_gumbel_topk_from_config
 
-        splitter = create_gumbel_topk_splitter(
+        splitter = create_gumbel_topk_from_config(
             image_size=(224, 224),
             feature_dim=256,
             min_patch_size=4,

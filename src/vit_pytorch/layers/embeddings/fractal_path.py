@@ -35,8 +35,8 @@ import torch
 import torch._dynamo
 import torch.nn as nn
 
-from .config import FractalConfig  # I97-5: 合并 config_fractal.py
-from .curve_hilbert import HilbertCurve
+from vit_pytorch.core.config import FractalConfig  # I97-5: 合并 config_fractal.py
+from vit_pytorch.core.curve_hilbert import HilbertCurve
 
 
 # 创建兼容 torch.compile 的缓存装饰器

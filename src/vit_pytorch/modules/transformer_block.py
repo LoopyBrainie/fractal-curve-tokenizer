@@ -71,10 +71,10 @@ from torch.utils.checkpoint import checkpoint
 
 logger = logging.getLogger(__name__)
 
-from .attn_hilbert_bias import HilbertAwareMultiScaleAttention
-from .ffn_swiglu import AdaptiveFractalFeedForward, FFNType
-from .config import AttentionEncoderConfig  # I98-3
-from .levels_info import LevelsInfo  # I98-4
+from vit_pytorch.layers.attention.hilbert_bias import HilbertAwareMultiScaleAttention
+from vit_pytorch.layers.ffn.swiglu import AdaptiveFractalFeedForward, FFNType
+from vit_pytorch.core.config import AttentionEncoderConfig  # I98-3
+from vit_pytorch.core.levels_info import LevelsInfo  # I98-4
 
 
 class DropPath(nn.Module):

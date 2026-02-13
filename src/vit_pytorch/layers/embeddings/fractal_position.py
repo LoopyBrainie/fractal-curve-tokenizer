@@ -50,10 +50,10 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from .constants import EMBEDDING_INIT_STD, HILBERT_BIAS_SCALE
-from .attn_hilbert_bias import AreaEncoder
-from .config import AreaEncoderConfig  # I98-3: 协议驱动配置
-from .levels_info import LevelsInfo  # I98-4
+from vit_pytorch.core.constants import EMBEDDING_INIT_STD, HILBERT_BIAS_SCALE
+# AreaEncoder is imported lazily in the __init__ method to avoid circular imports
+from vit_pytorch.core.config import AreaEncoderConfig  # I98-3: 协议驱动配置
+from vit_pytorch.core.levels_info import LevelsInfo  # I98-4
 
 
 class FractalPositionEmbedding(nn.Module):
@@ -203,7 +203,7 @@ class FractalPositionEmbedding(nn.Module):
         
         return self.fusion_network(combined_emb)
 
-from .constants import EMBEDDING_INIT_STD, HILBERT_BIAS_SCALE
+from vit_pytorch.core.constants import EMBEDDING_INIT_STD, HILBERT_BIAS_SCALE
 
 
 class AreaEnhancedPositionEmbedding(nn.Module):
@@ -282,7 +282,7 @@ class AreaEnhancedPositionEmbedding(nn.Module):
         )
 
         # 面积编码器 (I31-3, I98-3: 使用配置类)
-        from .attn_hilbert_bias import AreaEncoder
+        from vit_pytorch.layers.attention.hilbert_bias import AreaEncoder
         self.area_encoder = AreaEncoder(
             dim=dim,
             config=area_config

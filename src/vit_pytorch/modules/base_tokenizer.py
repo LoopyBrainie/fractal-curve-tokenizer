@@ -32,6 +32,7 @@ levels_info 格式:
 """
 from __future__ import annotations
 
+from abc import abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -271,7 +272,7 @@ class TokenizerOutput:
         Returns:
             LevelsInfo 实例或 None（当序列为空时）
         """
-        from .levels_info import LevelsInfo
+        from vit_pytorch.core.levels_info import LevelsInfo
 
         if len(self) == 0:
             return None
@@ -439,7 +440,7 @@ class TokenizerOutput:
             return info
 
         # I98-5: levels_info 为 None 时创建默认 LevelsInfo
-        from .levels_info import LevelsInfo
+        from vit_pytorch.core.levels_info import LevelsInfo
         B = self.batch_size
         N = 1
         all_levels = torch.zeros(B, N, max_level + 1, dtype=torch.long)
@@ -459,19 +460,75 @@ class LegacyTokenizerOutput:
 
 
 class BaseTokenizer(nn.Module):
-    """Abstract base class for tokenizers."""
+    """Abstract base class for tokenizers.
 
-    def tokenize(self, images: torch.Tensor) -> TokenizerOutput:
+    Mathematical Contract
+    ====================
+    T: R^{B × C × H × W} → TokenizerOutput
+
+    All concrete tokenizers must implement:
+    - get_tokens_from_regions(): Support non-streaming tokenization
+    - forward(): Alias for tokenize() following nn.Module convention
+    """
+
+    @abstractmethod
+    def get_tokens_from_regions(
+        self,
+        images: torch.Tensor,
+        regions: torch.Tensor
+    ) -> TokenizerOutput:
+        """Generate tokens directly from region boundaries.
+
+        Enables non-streaming tokenizer implementations.
+
+        Args:
+            images: Input images [B, C, H, W]
+            regions: Region boundaries [B, N, 4] in (x1, y1, x2, y2) format
+
+        Returns:
+            TokenizerOutput with tokens and metadata
+        """
         raise NotImplementedError
 
-    def forward(self, images: torch.Tensor) -> Any:  # type: ignore[override]
+    @abstractmethod
+    def tokenize(self, images: torch.Tensor) -> TokenizerOutput:
+        """Main tokenization entry point (streaming or batch).
+
+        Args:
+            images: Input images [B, C, H, W]
+
+        Returns:
+            TokenizerOutput with tokens and metadata
+        """
+        raise NotImplementedError
+
+    def forward(self, images: torch.Tensor) -> TokenizerOutput:  # type: ignore[override]
         return self.tokenize(images)
 
 
 class BaseTokenProcessor(nn.Module):
-    """Base class for modules that post-process tokenizer outputs."""
+    """Base class for modules that post-process tokenizer outputs.
 
+    Mathematical Contract
+    ====================
+    P: TokenizerOutput → TokenizerOutput
+
+    Post-processors can:
+    - Filter/merge tokens
+    - Compute attention masks
+    - Aggregate metadata
+    """
+
+    @abstractmethod
     def process(self, batch: TokenizerOutput) -> TokenizerOutput:
+        """Process tokenizer output.
+
+        Args:
+            batch: TokenizerOutput from tokenizer
+
+        Returns:
+            Processed TokenizerOutput
+        """
         raise NotImplementedError
 
     def forward(self, batch: TokenizerOutput) -> TokenizerOutput:  # type: ignore[override]

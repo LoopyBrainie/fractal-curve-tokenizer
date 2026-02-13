@@ -1,5 +1,5 @@
 """
-Splitter 接口协议定义（功能分组版本）
+Splitter 接口协议定义（功能分组版本）- L1 Foundation
 
 数学形式化
 ==========
@@ -16,13 +16,7 @@ Hilbert Curve ViT 的 Splitter 组件负责决策哪些区域需要进一步细�
     2. 渐进式实现: 可选择实现子集
     3. 类型安全: 完整的类型注解 + 运行时验证
 
-与 Tokenizer 的关系:
-    - Splitter 输出作为 Tokenizer 的输入
-    - 两者通过 SplitResult 数据结构解耦
-
-作者: Claude Code
-日期: 2026-01-25
-版本: 功能分组 Protocol v1.0 (基于数学形式化分析)
+版本: Protocol v2.0 (移动到 L1 Foundation)
 """
 
 from __future__ import annotations

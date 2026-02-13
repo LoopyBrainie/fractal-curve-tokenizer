@@ -2,131 +2,220 @@
 """
 Fractal Curve ViT - 分形曲线视觉 Transformer
 
-项目目标: 验证 Hilbert 曲线分形 tokenization 对 ViT 的可行性
-
-数学形式化
-============
-
-核心流程:
-    I → T(I) → E_pos → Transformer → Pool → MLP → ŷ
-    
-其中:
-    I ∈ R^{B × C × H × W}     输入图像
-    T: I → (T, L)             Tokenization
-    T ∈ R^{B × N × D}         Token 嵌入
-    L ∈ Z^{B × N}             层级信息
-
-模块层级
+模块层级 (重构后)
 ---------
 Layer 4 (应用层):
-    model_fractal_vit.py    FractalCurveViT
+    models/         FractalCurveViT
 
 Layer 3 (管道层):
-    streaming_tokenizer.py  StreamingFractalTokenizerV3
-    transformer.py          FractalTransformer
+    modules/        StreamingFractalTokenizer, FractalTransformer
 
 Layer 2 (组件层):
-    attention.py            HilbertAwareMultiScaleAttention
-    feedforward.py          SwiGLUFFN, AdaptiveFractalFeedForward
-    positional.py           FractalPositionEmbedding
+    layers/attention/       HilbertAwareMultiScaleAttention
+    layers/splitters/       GumbelTopKSplitter, NeighborAwareSplitter
+    layers/ffn/             SwiGLUFFN
+    layers/embeddings/      FractalPositionEmbedding, FractalPathEmbedding
 
 Layer 1 (基础层):
-    hilbert.py              HilbertCurve, PseudoHilbertCurve
-    tokenization.py         BaseTokenizer, TokenizerOutput
-    constants.py            超参数默认值
-    utils.py                工具函数
+    core/          HilbertCurve, LevelsInfo, Constants, Utils
 """
 
-# === 推荐组件 ===
-from .attn_hilbert_bias import (
+# === L4: Models ===
+from .models import (
+    FractalCurveViT,
+    TrainingStats,
+    # V2 models (I162-1)
+    DualPathFractalViT,
+    FractalCurveViTV2,
+    TrainingStatsV2,
+)
+
+# === L3: Modules ===
+from .modules import (
+    StreamingFractalTokenizer,
+    StreamingFractalTokenizerV3,  # 向后兼容
+    BaseTokenizer,
+    BaseTokenProcessor,
+    TokenSequence,
+    TokenizerOutput,
+    FractalTransformer,
+    FractalTransformerBlock,
+)
+
+# === L2: Layers ===
+from .layers import (
     HilbertAwareMultiScaleAttention,
     HilbertBiasBase,
     LCAHilbertBias,
+    GumbelTopKSplitter,
+    TensorSplitResult,
+    GumbelTopKResult,
+    NeighborAwareSplitter,
+    NeighborAwareSplitterConfig,
+    LocalityConsistencyLoss,
+    SemanticRedundancySplitter,
+    SwiGLUFFN,
+    AdaptiveFractalFeedForward,
+    FFNType,
+    FractalPathEmbedding,
+    HierarchicalAttentionBias,
+    VectorizedPathEncoder,
+    FractalPositionEmbedding,
+    MultiScalePatchEncoder,
+    HilbertNativePatchEmbed,
 )
-from .ffn_swiglu import AdaptiveFractalFeedForward, FFNType, SwiGLUFFN
-from .config import (
+
+# === L2/L3 additional imports (from modules) ===
+from .modules import (
+    CoreSplitter,
+    AnnealingSplitter,
+    MetricsSplitter,
+    SplitResult,
+    SemanticRedundancyLoss,
+)
+
+# === L1: Core ===
+from .core import (
+    HilbertCurve,
+    PseudoHilbertCurve,
+    HilbertIndexer,
+    HilbertPathCache,
+    HilbertScanner,
+    get_quadrant_order,
+    hilbert_distance_to_xy,
+    xy_to_hilbert_distance,
+    # I162-1: Pattern Encoder
+    HilbertPatternEncoder,
+    HilbertPatternEncoderLight,
+    create_hilbert_pattern_encoder,
     FractalConfig,
+    SplitterConfig,
     create_fractal_config,
     AnnealSchedule,
     TokenizerType,
-    SplitterConfig,
-    SemanticSplitterConfig,  # I110-5
-    create_semantic_splitter_config,  # I110-5
+    SemanticSplitterConfig,
+    create_semantic_splitter_config,
     AttentionConfig,
     TokenizerConfig,
     TransformerConfig,
     FractalViTConfig,
-)  # I97-5: 合并 config_fractal.py, I110-5: 语义冗余配置
-from .embed_fractal_path import (
-    FractalPathEmbedding,
-    HierarchicalAttentionBias,
-    VectorizedPathEncoder,
-)
-from .model_fractal_vit import FractalCurveViT
-from .curve_hilbert import (
-    HilbertCurve,
-    PseudoHilbertCurve,
-    get_quadrant_order,
-    hilbert_distance_to_xy,
-    xy_to_hilbert_distance,
-)
-from .embed_fractal_position import FractalPositionEmbedding
-from .tokenizer_streaming import StreamingFractalTokenizerV3
-from .curve_hilbert_indexer import (
-    HilbertIndexer,
-    HilbertPathCache,
-)
-from .embed_multiscale_patch import MultiScalePatchEncoder
-from .base_tokenizer import BaseTokenizer, BaseTokenProcessor, TokenSequence, TokenizerOutput
-from .levels_info import LevelsInfo  # I98-4
-from .block_transformer import FractalTransformer, FractalTransformerBlock
-from .gumbel_topk_splitter import (
-    GumbelTopKSplitter,
-    TensorSplitResult,
-    GumbelTopKResult,
+    NeighborAwareSplitterConfig,
+    EPS,
+    TEMPERATURE_MIN,
+    LevelsInfo,
+    pair,
+    exists,
+    default,
+    sanitize_tensor,
+    create_attention_mask,
+    compute_max_depth,
+    compute_actual_min_patch,
+    compute_patch_sizes,
+    compute_depth_distribution,
+    compute_total_candidates,
+    compute_region_shape_scale,
+    compute_shape_scale_similarity,
+    compute_normalized_area,
+    compute_area_similarity,
+    # Splitter Protocol (L1 - Protocol interfaces)
+    CoreSplitter,
+    AnnealingSplitter,
+    MetricsSplitter,
+    SplitResult,
+    validate_splitter,
 )
 
+# === 向后兼容别名 ===
+StreamingFractalTokenizerV3 = StreamingFractalTokenizer
 
 __all__ = [
-    # === 主要模型 ===
-    "StreamingFractalTokenizerV3",  # Variable Depth Tokenizer
+    # === L4: Models ===
     "FractalCurveViT",
-    # === 配置与路径编码 ===
-    "FractalConfig",
-    "create_fractal_config",
-    "AnnealSchedule",
-    "TokenizerType",
+    "TrainingStats",
+    # V2 models (I162-1)
+    "DualPathFractalViT",
+    "FractalCurveViTV2",
+    "TrainingStatsV2",
+    # === L3: Modules ===
+    "StreamingFractalTokenizer",
+    "StreamingFractalTokenizerV3",  # 向后兼容
+    "BaseTokenizer",
+    "BaseTokenProcessor",
+    "TokenSequence",
+    "TokenizerOutput",
+    "FractalTransformer",
+    "FractalTransformerBlock",
+    # === L2: Layers ===
+    "HilbertAwareMultiScaleAttention",
+    "HilbertBiasBase",
+    "LCAHilbertBias",
+    "GumbelTopKSplitter",
+    "TensorSplitResult",
+    "GumbelTopKResult",
+    "NeighborAwareSplitter",
+    "NeighborAwareSplitterConfig",
+    "LocalityConsistencyLoss",
+    "SemanticRedundancySplitter",
+    "SemanticRedundancyLoss",
+    "SwiGLUFFN",
+    "AdaptiveFractalFeedForward",
+    "FFNType",
     "FractalPathEmbedding",
     "HierarchicalAttentionBias",
     "VectorizedPathEncoder",
-    # === 核心组件 ===
-    "BaseTokenProcessor",
-    "BaseTokenizer",
-    "TokenSequence",
-    "TokenizerOutput",
-    "LevelsInfo",  # I98-4
+    "FractalPositionEmbedding",
+    "MultiScalePatchEncoder",
+    "HilbertNativePatchEmbed",
+    "CoreSplitter",
+    "AnnealingSplitter",
+    "MetricsSplitter",
+    "SplitResult",
+    # === L1: Core ===
     "HilbertCurve",
     "PseudoHilbertCurve",
     "HilbertIndexer",
     "HilbertPathCache",
-    "MultiScalePatchEncoder",
-    # === Transformer 组件 ===
-    "FractalTransformer",
-    "FractalTransformerBlock",
-    "HilbertAwareMultiScaleAttention",
-    "HilbertBiasBase",
-    "LCAHilbertBias",
-    "AdaptiveFractalFeedForward",
-    "SwiGLUFFN",
-    "FFNType",
-    # === 位置编码 ===
-    "FractalPositionEmbedding",
-    # === 工具函数 ===
+    "HilbertScanner",
     "get_quadrant_order",
     "hilbert_distance_to_xy",
     "xy_to_hilbert_distance",
-    # === 分割器 (Scheme D/E - GumbelTopKSplitter) ===
-    "GumbelTopKSplitter",
-    "GumbelTopKResult",
-    "TensorSplitResult",  # P9-1: 完全向量化分割结果
+    # I162-1: Pattern Encoder
+    "HilbertPatternEncoder",
+    "HilbertPatternEncoderLight",
+    "create_hilbert_pattern_encoder",
+    "FractalConfig",
+    "SplitterConfig",
+    "create_fractal_config",
+    "AnnealSchedule",
+    "TokenizerType",
+    "SemanticSplitterConfig",
+    "create_semantic_splitter_config",
+    "AttentionConfig",
+    "TokenizerConfig",
+    "TransformerConfig",
+    "FractalViTConfig",
+    "NeighborAwareSplitterConfig",
+    "EPS",
+    "TEMPERATURE_MIN",
+    "LevelsInfo",
+    "pair",
+    "exists",
+    "default",
+    "sanitize_tensor",
+    "create_attention_mask",
+    "compute_max_depth",
+    "compute_actual_min_patch",
+    "compute_patch_sizes",
+    "compute_depth_distribution",
+    "compute_total_candidates",
+    "compute_region_shape_scale",
+    "compute_shape_scale_similarity",
+    "compute_normalized_area",
+    "compute_area_similarity",
+    # Splitter Protocol (L1 - Protocol interfaces)
+    "CoreSplitter",
+    "AnnealingSplitter",
+    "MetricsSplitter",
+    "SplitResult",
+    "validate_splitter",
 ]

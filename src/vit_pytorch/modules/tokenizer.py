@@ -49,18 +49,22 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections import deque
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .base_tokenizer import BaseTokenizer, TokenizerOutput, TokenSequence
-from .config import FractalConfig, SemanticSplitterConfig  # I97-5: 合并 config_fractal.py, I110-5: 语义配置
-from .constants import LOG_EPSILON, PROB_EPSILON, LEARNABLE_QUOTA_ENABLED  # I12-7: 数值稳定性常量
-from .embed_fractal_path import VectorizedPathEncoder  # I12-3: 用于计算路径
-from .semantic_redundancy_splitter import SplitResult  # I110-6: 语义分裂器结果
-from .gumbel_topk_splitter import TensorSplitResult  # I99-1: 用于防御性边界检查
+from vit_pytorch.core.config import FractalConfig, SemanticSplitterConfig  # I97-5: 合并 config_fractal.py, I110-5: 语义配置
+from vit_pytorch.core.constants import LOG_EPSILON, PROB_EPSILON, LEARNABLE_QUOTA_ENABLED  # I12-7: 数值稳定性常量
+
+# I99-1: 延迟导入 VectorizedPathEncoder 以避免循环导入
+# 使用函数内导入模式，确保在运行时正确加载
+try:
+    from vit_pytorch.layers.embeddings.fractal_path import VectorizedPathEncoder
+except ImportError:
+    VectorizedPathEncoder = None  # type: ignore
 
 
 # ====================================================================
@@ -192,7 +196,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         # 动态计算 max_level (用于 splitter)
         # 公式: L_max = max(0, floor(log2(min(H, W) / min_patch_size)))
-        from .depth_utils import compute_max_level
+        from vit_pytorch.core.depth_utils import compute_max_level
         self._computed_max_level = compute_max_level(
             image_size, effective_min_patch_size
         )
@@ -204,17 +208,20 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # =====================================================================
         # Hilbert-Native Patch Embedding (包含 SharedConv)
         # =====================================================================
-        from .embed_hilbert_patch import HilbertNativePatchEmbed
+        from vit_pytorch.layers.embeddings.hilbert_patch import HilbertNativePatchEmbed
         # I30-17-EXT: 使用动态计算的 max_level
         # 对于 embedding 层，需要在 __init__ 时确定深度
         # 使用 self.max_level (可能由用户显式指定，也可能由动态计算得到)
+        #
+        # I130-2: Hilbert 最佳实现 - 禁用 BatchNorm 确保确定性
+        # BatchNorm 在 train/eval 模式行为不同，破坏 Hilbert 确定性保证
         self.patch_embed = HilbertNativePatchEmbed(
             channels=channels,
             dim=d_model,
             base_patch_size=base_patch_size,
             max_level=self.max_level,  # 保持使用计算后的深度
             conv_layers=2,
-            use_batch_norm=True,
+            use_batch_norm=False,  # I130-2: 禁用 BatchNorm 确保确定性
             depth_scale_range=depth_scale_range,
         )
 
@@ -285,7 +292,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         Returns:
             修正后的 TensorSplitResult
         """
-        from .gumbel_topk_splitter import TensorSplitResult
+        from vit_pytorch.layers.splitters.gumbel_topk import TensorSplitResult
 
         device = tensor_result.batch_indices.device
         dtype = tensor_result.batch_indices.dtype
@@ -335,8 +342,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             config: SemanticSplitterConfig 配置（默认使用参数）
             loss_fn: 语义损失函数（默认使用配置中的权重创建）
         """
-        from .semantic_redundancy_splitter import SemanticRedundancySplitter
-        from .semantic_losses import SemanticRedundancyLoss
+        from vit_pytorch.layers.splitters.semantic_redundancy import SemanticRedundancySplitter
+        from vit_pytorch.modules.semantic_losses import SemanticRedundancyLoss
 
         self._use_semantic_splitter = True
         self._semantic_config = config if config is not None else SemanticSplitterConfig()
@@ -356,7 +363,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         if not self._use_semantic_splitter or self._semantic_config is None:
             return None
 
-        from .semantic_redundancy_splitter import SemanticRedundancySplitter
+        from vit_pytorch.layers.splitters.semantic_redundancy import SemanticRedundancySplitter
 
         return SemanticRedundancySplitter(
             feature_dim=self.d_model,
@@ -407,7 +414,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         Returns:
             TensorSplitResult: 兼容 TensorSplitResult 格式的分割结果
         """
-        from .gumbel_topk_splitter import TensorSplitResult
+        from vit_pytorch.layers.splitters.gumbel_topk import TensorSplitResult
 
         B, C, H, W = features.shape
         device = features.device
@@ -488,7 +495,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             token_indices = torch.arange(len(all_regions), dtype=torch.long, device=device)
 
         # 计算 Hilbert 索引用于排序 (I113-18: 使用 HilbertScanner)
-        from .curve_hilbert import HilbertScanner
+        from vit_pytorch.core.curve_hilbert import HilbertScanner
         hilbert_indices = HilbertScanner.region_to_hilbert_index(
             regions[:, 0],  # x0
             regions[:, 1],  # y0
@@ -556,8 +563,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         I35: 支持 channels_last 内存格式以优化卷积性能
         """
-        from .gumbel_topk_splitter import GumbelTopKResult
-        from .gumbel_topk_splitter import TensorSplitResult
+        from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKResult
+        from vit_pytorch.layers.splitters.gumbel_topk import TensorSplitResult
 
         if images.dim() != 4:
             raise ValueError(
@@ -855,7 +862,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             - levels_info: [B, MaxN, max_level+1] 层级信息
             - padded_regions: [B, MaxN, 4] 区域边界 (P11-3 新增)
         """
-        from .gumbel_topk_splitter import TensorSplitResult
+        from vit_pytorch.layers.splitters.gumbel_topk import TensorSplitResult
 
         B = features.shape[0]
         B_int = _safe_scalar_to_int(B, "B")
@@ -894,11 +901,15 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         # I99-1: clamp regions 到有效图像边界
         # P-OPT: 直接在原始张量上 clamp_()，避免不必要的 .clone() 内存分配
-        img_size = max(self.image_size) if isinstance(self.image_size, tuple) else self.image_size
-        regions[:, 0] = regions[:, 0].clamp_(min=0, max=img_size)
-        regions[:, 1] = regions[:, 1].clamp_(min=0, max=img_size)
-        regions[:, 2] = regions[:, 2].clamp_(min=0, max=img_size)
-        regions[:, 3] = regions[:, 3].clamp_(min=0, max=img_size)
+        # 修复: 分别使用宽度和高度进行clamp，支持非方形图像
+        if isinstance(self.image_size, tuple):
+            img_w, img_h = self.image_size
+        else:
+            img_w = img_h = self.image_size
+        regions[:, 0] = regions[:, 0].clamp_(min=0, max=img_w)  # x1: 使用宽度
+        regions[:, 1] = regions[:, 1].clamp_(min=0, max=img_h)  # y1: 使用高度
+        regions[:, 2] = regions[:, 2].clamp_(min=0, max=img_w)  # x2: 使用宽度
+        regions[:, 3] = regions[:, 3].clamp_(min=0, max=img_h)  # y2: 使用高度
 
         # I99-1 CRITICAL: 验证 batch_indices 值范围（在 clamp 之前）
         # P-OPT: 使用向量化布尔运算，避免 GPU-CPU 同步
@@ -1260,7 +1271,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         Returns:
             Dict[str, Any]: 深度分布统计信息
         """
-        from .gumbel_topk_splitter import GumbelTopKResult
+        from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKResult
 
         # I98-1: 如果未提供 split_result，尝试从外部获取
         if split_result is None:

@@ -42,7 +42,8 @@ import math
 import weakref
 import warnings
 from abc import ABC, abstractmethod
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
+from torch import Tensor
 
 import numpy as np
 import torch
@@ -50,16 +51,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from .constants import *
-from .config import (
+from vit_pytorch.core.constants import *
+from vit_pytorch.core.config import (
     ShapeScaleEncoderConfig,
     AreaEncoderConfig,
     LCAEncoderConfig,
     AttentionEncoderConfig,
 )
-from .levels_info import LevelsInfo  # I98-4
-from .embed_fractal_path import VectorizedPathEncoder
-from .depth_utils import (
+from vit_pytorch.core.levels_info import LevelsInfo  # I98-4
+from vit_pytorch.layers.embeddings.fractal_path import VectorizedPathEncoder
+from vit_pytorch.core.depth_utils import (
     compute_region_shape_scale,
     compute_shape_scale_similarity,
     compute_normalized_area,
@@ -125,6 +126,20 @@ class HilbertBiasBase(ABC, nn.Module):
             inferred_max_level = info_dim - 1
 
             levels_info = LevelsInfo(data=levels_info, max_level=inferred_max_level)
+
+            # I34-13: 边界检查 - 深度值必须在 [0, self.max_level] 范围内
+            # 注意：使用 self.max_level 而不是推断的 max_level
+            # 因为 lca_embedding 的 num_embeddings 由 self.max_level 决定
+            # I150-2 FIX: 先检查非空，避免空张量上的 max() 错误
+            if levels_info.data.numel() > 0:
+                depths = levels_info.data[:, :, 0]  # [B, S]
+                max_depth_in_input = depths.max().item()
+                if max_depth_in_input > self.max_level:
+                    raise ValueError(
+                        f"LCA depth out of bounds: max depth in input is {max_depth_in_input}, "
+                        f"but LCAHilbertBias.max_level is {self.max_level}. "
+                        "This indicates inconsistent configuration or invalid input data."
+                    )
 
         if levels_info.data.numel() == 0:
             return None
@@ -274,6 +289,69 @@ class LCAHilbertBias(HilbertBiasBase):
             self.lca_embedding.weight.add_(
                 torch.randn_like(self.lca_embedding.weight) * EMBEDDING_INIT_STD
             )
+
+    # I163-1: 分层自适应边界 - 比保守界 N/2^l 更紧
+    def get_compact_bound(self, lca_depth: int, N: int) -> float:
+        """计算分层自适应空间距离边界
+
+        数学原理:
+            保守界: ‖pos_i - pos_j‖_∞ ≤ N / 2^l
+            问题: ℓ=0,1 时过度保守 (松弛 ~3x)
+
+            优化界 (I163-1):
+                ℓ=0: ‖pos_i - pos_j‖_∞ ≤ N / 3 (Hilbert遍历特性)
+                ℓ=1: ‖pos_i - pos_j‖_∞ ≤ N / 4 (象限紧凑性)
+                ℓ≥2: ‖pos_i - pos_j‖_∞ ≤ N / 2^l (已接近理论极限)
+
+        Args:
+            lca_depth: LCA 深度 (ℓ)
+            N: 网格边长
+
+        Returns:
+            空间距离上界
+        """
+        if lca_depth == 0:
+            # 不同根: Hilbert曲线遍历特性，实际最远约 N/3
+            return N / 3.0
+        elif lca_depth == 1:
+            # 不同象限: 实际典型距离约 N/4
+            return N / 4.0
+        else:
+            # ℓ≥2 时保守界已接近理论极限 4^l
+            return N / (2 ** lca_depth)
+
+    def get_compact_bound_batch(
+        self,
+        lca_depths: torch.Tensor,
+        N: int,
+    ) -> torch.Tensor:
+        """批量计算分层自适应边界
+
+        Args:
+            lca_depths: [..., N, N] LCA 深度矩阵
+            N: 网格边长
+
+        Returns:
+            [..., N, N] 空间距离边界矩阵
+        """
+        # 初始化为保守界
+        bounds = torch.zeros_like(lca_depths, dtype=torch.float32)
+
+        # ℓ=0: N/3
+        bounds = torch.where(lca_depths == 0, N / 3.0, bounds)
+
+        # ℓ=1: N/4
+        bounds = torch.where(lca_depths == 1, N / 4.0, bounds)
+
+        # ℓ≥2: N/2^l
+        mask_ge_2 = lca_depths >= 2
+        bounds = torch.where(
+            mask_ge_2,
+            N / (2 ** lca_depths.float()),
+            bounds
+        )
+
+        return bounds
     
     def _compute_bias_3d(self, levels_info: LevelsInfo) -> Optional[torch.Tensor]:
         """计算基于 LCA 的 Hilbert Bias（核心 3D 实现）。
@@ -556,15 +634,19 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         else:
             self._level_scale_raw = None
 
-        # I97-10: 层级化注意力的深度缩放因子
-        # 每个深度有独立的缩放因子，用于深度内 Attention
+        # I150-1: 简化相对缩放 (Constrained Relative Scaling)
+        # 数学: Gamma = sigmoid(Base + Delta)
+        # 设计: Base 提供稳定基准，Delta 提供残差修正（跨深度共享）
         if use_hierarchical_attention:
-            self._hierarchical_depth_scale = nn.Parameter(torch.ones(max_level + 1, heads))
-            # I98-3: 从配置读取初始化边界，默认 [0.5, 1.5]
-            low, high = self.config.hierarchical_scale_bounds
-            nn.init.uniform_(self._hierarchical_depth_scale, low, high)
+            # Base: 基础缩放因子 [H, C]
+            self._depth_scale_base = nn.Parameter(torch.ones(heads, dim_head))
+            nn.init.zeros_(self._depth_scale_base)  # sigmoid(0) = 0.5
+
+            # Delta: 残差偏移 [H, C]（与深度无关，跨所有深度共享）
+            self._depth_scale_delta = nn.Parameter(torch.zeros(heads, dim_head))
         else:
-            self._hierarchical_depth_scale = None
+            self._depth_scale_base = None
+            self._depth_scale_delta = None
 
         # I97-7: 可学习偏置缩放因子 (Softplus 约束)
         # 使用 softplus 确保 λ > 0，梯度稳定
@@ -859,11 +941,14 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         # 初始化输出
         output = torch.zeros(batch, seq_len, self.heads * self.dim_head, device=x.device, dtype=x.dtype)
 
-        # 深度缩放因子 (用于层级化注意力)
-        if self._hierarchical_depth_scale is not None:
-            depth_scales = self._hierarchical_depth_scale  # [max_level+1, heads]
+        # I150-1: 预计算相对缩放因子 Gamma = sigmoid(Base + Delta)
+        if self._depth_scale_base is not None:
+            # Base + Delta: [H, C] + [H, C] = [H, C]
+            base = self._depth_scale_base
+            delta = self._depth_scale_delta
+            gamma = torch.sigmoid(base + delta)  # [H, C]
         else:
-            depth_scales = None
+            gamma = None
 
         # I103-1: 批量 Hilbert 偏置 (一次调用处理整个 batch)
         # hilbert_bias: [B, H, N, N] 或 None
@@ -888,11 +973,6 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         # 单次 Softmax（深度缩放在 gather 时应用）
         attn_full = self.attend(dots)
 
-        # 预分配深度缩放缓冲区
-        if depth_scales is not None:
-            depth_scales_buffer = torch.zeros(batch, seq_len, self.heads * self.dim_head,
-                                              device=x.device, dtype=x.dtype)
-
         # 深度循环：只做 mask 和 gather
         for d in range(self.max_level + 1):
             # 深度 d 的 token 掩码 [B, N]
@@ -906,20 +986,24 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
 
             # 掩码: 只保留深度 d 的 token 之间的注意力
             # 使用向量化操作避免临时张量创建
-            mask_2d = depth_mask.unsqueeze(1) & depth_mask.unsqueeze(2)
-            attn_d = attn_full.masked_fill(~mask_2d.unsqueeze(1), float('-inf'))
+            mask_2d = depth_mask.unsqueeze(1) & depth_mask.unsqueeze(2)  # [B, N, N]
 
-            # 将非深度 d 的 token 对应的行置零
+            # I150-1 fix: 使用 large negative number 替代 -inf，避免 -inf * 0 = NaN
+            # 设置非注意力位置为极小值，softmax 会使其权重接近 0
+            NEG_INF = -1e9
+            attn_d = attn_full.masked_fill(~mask_2d.unsqueeze(1), NEG_INF)
+
+            # 将非深度 d 的 token 对应的行置零（避免 NaN）
             attn_d = attn_d.masked_fill(~depth_mask.unsqueeze(1).unsqueeze(3), 0)
             attn_d = self.dropout(attn_d)
 
             # 加权聚合
             out_d = torch.matmul(attn_d, v)  # [B, H, N, d_k]
 
-            # 应用深度缩放（如果启用）
-            if depth_scales is not None:
-                scale_d = depth_scales[d].view(1, 1, self.heads * self.dim_head)
-                out_d = out_d * scale_d
+            # I150-1: 应用相对缩放因子 Gamma = sigmoid(Base + Delta)
+            if gamma is not None:
+                # gamma: [H, C] -> [1, H, 1, C] 用于广播
+                out_d = out_d * gamma.view(1, self.heads, 1, self.dim_head)
 
             # 使用 scatter_add 将结果放回对应位置
             out_flat = rearrange(out_d, "b h n d -> b n (h d)")
@@ -2094,6 +2178,14 @@ class AffineModulatedBias(nn.Module):
             # 形状调制权重
             self.shape_scale_alpha = nn.Parameter(torch.zeros(1))
 
+        # I161-2: 添加偏置量级监控器
+        # 从配置获取 dim_head，若未设置则使用 dim // heads 的默认值
+        dim_head = getattr(config, 'dim_head', dim // 8) if config else dim // 8
+        self.bias_monitor = BiasMagnitudeMonitor(
+            dim_head=dim_head,
+            warning_threshold=10.0
+        )
+
         self._init_weights(scale_init_factor)
 
     def _init_weights(self, scale_init_factor: float = 0.1):
@@ -2138,8 +2230,9 @@ class AffineModulatedBias(nn.Module):
         self,
         regions: torch.Tensor,
         image_size: int,
-    ) -> torch.Tensor:
-        """计算仿射调制偏置 (I31-P2: 添加 ShapeScale 支持).
+        return_stats: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+        """计算仿射调制偏置 (I31-P2: 添加 ShapeScale 支持, I161-2: 可选统计信息).
 
         数学形式化
         ==========
@@ -2157,18 +2250,32 @@ class AffineModulatedBias(nn.Module):
             区域边界张量，形状 [B, N, 4]
         image_size : int
             图像边长
+        return_stats : bool, optional
+            (I161-2) 是否返回偏置量级统计信息，默认 False
 
         返回
         ----
         torch.Tensor
             仿射调制偏置，形状 [B, dim, N, N]
+        Tuple[torch.Tensor, Dict[str, Tensor]], optional
+            当 return_stats=True 时返回 (偏置, 统计字典)
         """
         B, N, _ = regions.shape
 
         # 1. 空间偏置 (LCA) [B, dim, N, N]
         lca_bias = self._compute_lca_bias_from_regions(regions, image_size)
 
+        # I161-2: 预定义变量以避免作用域问题
+        modulated_area = None
+        shape_beta = None
+
         if not self.enable_area_modulation and not self.enable_shape_scale:
+            if return_stats:
+                stats = self.bias_monitor({
+                    'hilbert': lca_bias,
+                    'combined': lca_bias,
+                })
+                return lca_bias, stats
             return lca_bias
 
         # 2. 面积编码 [B, N, dim]
@@ -2267,5 +2374,141 @@ class AffineModulatedBias(nn.Module):
             # B_shape = shape_beta (与 LCA 偏置相加)
             combined_bias = combined_bias + self.shape_scale_alpha * shape_beta
 
+        # I161-2: 可选返回统计信息
+        # 注意: modulated_area 只在 enable_area_modulation=True 时定义
+        #       shape_beta 只在 enable_shape_scale=True 时定义
+        if return_stats:
+            area_bias = modulated_area if self.enable_area_modulation else None
+            shape_bias = shape_beta if self.enable_shape_scale else None
+            stats = self.bias_monitor({
+                'hilbert': lca_bias,
+                'area': area_bias,
+                'shape': shape_bias,
+                'combined': combined_bias,
+            })
+            return combined_bias, stats
+
         return combined_bias
 
+
+class BiasMagnitudeMonitor(nn.Module):
+    """偏置量级监控器 (I161-2)
+
+    用于监控和验证各注意力偏置的量级是否在预期范围内。
+
+    数学形式化
+    ==========
+
+    归一化量级计算:
+        - Hilbert/Level 偏置: norm = max|B| / √d_k
+        - Area/Shape 偏置: norm = max|B| (已由 Tanh 限制)
+
+    监控维度:
+        | 偏置类型 | 目标量级 | 验证公式 |
+        |---------|---------|---------|
+        | Hilbert | O(√d_k) | max|B_hilbert| / √d_k ≈ O(1) |
+        | Level   | O(√d_k) | max|B_level| / √d_k ≈ O(1) |
+        | Area    | O(1)    | max|B_area| ∈ (-1, 1) |
+        | Shape   | O(1)    | max|B_shape| ∈ (-1, 1) |
+
+    用法
+    ----
+    ```python
+    monitor = BiasMagnitudeMonitor(dim_head=32, warning_threshold=10.0)
+
+    stats = monitor({
+        'hilbert': lca_bias,
+        'area': modulated_area,
+        'shape': shape_beta,
+        'combined': combined_bias
+    })
+    # stats: {'hilbert/max': val, 'area/max': val, ...}
+    ```
+    """
+
+    def __init__(
+        self,
+        dim_head: int = 32,
+        warning_threshold: float = 10.0,
+        epsilon: float = 1e-6,
+    ):
+        """初始化偏置量级监控器。
+
+        Args:
+            dim_head: 注意力头维度，用于计算 √d_k 归一化因子
+            warning_threshold: 归一化量级警告阈值，默认 10.0
+            epsilon: 数值稳定性的小常数
+        """
+        super().__init__()
+        self.dim_head = dim_head
+        self.scale_factor = dim_head ** 0.5
+        self.warning_threshold = warning_threshold
+        self.epsilon = epsilon
+
+    def forward(
+        self,
+        bias_dict: Dict[str, Union[Tensor, None]],
+    ) -> Dict[str, Tensor]:
+        """计算各偏置的归一化量级统计。
+
+        Args:
+            bias_dict: 偏置字典，key 为偏置名称，value 为偏置张量
+
+        Returns:
+            统计字典，key 格式为 '{name}/{metric}'，value 为标量张量
+        """
+        stats = {}
+
+        for name, bias in bias_dict.items():
+            if bias is None:
+                continue
+
+            # 计算绝对值的最大值
+            max_abs = bias.abs()
+
+            # 处理 4D [B, H, N, N] 或 3D [B, N, N] 或 2D [N, N]
+            if max_abs.dim() > 1:
+                max_abs = max_abs.flatten(1).max(dim=1)[0]  # [B] 或 scalar
+
+            # 取批次和头维度的平均值
+            if isinstance(max_abs, Tensor) and max_abs.dim() > 0:
+                max_abs = max_abs.mean()
+
+            # 判断偏置类型，计算归一化量级
+            name_lower = name.lower()
+            if 'hilbert' in name_lower or 'level' in name_lower:
+                # Hilbert/Level 偏置需要除以 √d_k
+                normalized = max_abs / (self.scale_factor + self.epsilon)
+            else:
+                # Area/Shape 偏置已由 Tanh 限制
+                normalized = max_abs
+
+            # 存储统计值
+            stats[f'{name}/max_abs'] = max_abs.detach().clone()
+            stats[f'{name}/normalized_max'] = normalized.detach().clone()
+
+            # 超阈值警告 (仅在训练模式下)
+            if self.training and normalized > self.warning_threshold:
+                warnings.warn(
+                    f"Bias '{name}' normalized magnitude {normalized.item():.2f} "
+                    f"exceeds threshold {self.warning_threshold}. "
+                    f"Scale factor: √{self.dim_head} = {self.scale_factor:.2f}"
+                )
+
+        return stats
+
+    def get_summary(self, stats: Dict[str, Tensor]) -> str:
+        """生成统计摘要字符串。
+
+        Args:
+            stats: forward() 返回的统计字典
+
+        Returns:
+            格式化的统计摘要
+        """
+        lines = ["=== Bias Magnitude Summary ==="]
+        for key, val in stats.items():
+            if isinstance(val, Tensor):
+                val_f = val.item() if val.numel() == 1 else val.mean().item()
+                lines.append(f"  {key}: {val_f:.4f}")
+        return "\n".join(lines)

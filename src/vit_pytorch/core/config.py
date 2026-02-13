@@ -166,9 +166,10 @@ class HilbertSplitterConfig:
     freeze_quota: bool = False
 
     # ==================== I120-2: DeterministicTopK 配置 ====================
-    # 启用确定性 Top-K 选择（替代 Gumbel 随机采样）
-    # 目的: 消除 train/eval 输出差异，恢复 Hilbert 曲线确定性保证
-    use_deterministic_topk: bool = False
+    # I130-2: Hilbert 最佳实现 - 默认启用确定性 Top-K 选择
+    # 理由: 消除 train/eval 输出差异，恢复 Hilbert 曲线确定性保证
+    # 预期效果: train/eval max_diff: 4.48 → <0.05 (89× 改善)
+    use_deterministic_topk: bool = True
 
     # 确定性 Top-K 的温度参数（控制 softmax 的"锐度"）
     # 较小的值 → 更接近硬选择 (Top-K)
@@ -285,9 +286,9 @@ class HilbertSplitterConfig:
                 f"temperature_min ({self.temperature_min}) 必须 >= 0.3 "
                 "以避免梯度消失问题"
             )
-        if self.temperature_anneal not in ('linear', 'exponential'):
+        if self.temperature_anneal not in ('linear', 'exponential', 'inverse_time'):
             raise ValueError(
-                f"temperature_anneal 必须是 'linear' 或 'exponential', "
+                f"temperature_anneal 必须是 'linear', 'exponential' 或 'inverse_time', "
                 f"got {self.temperature_anneal}"
             )
 
@@ -406,7 +407,143 @@ class HilbertSplitterConfig:
 SplitterConfig = HilbertSplitterConfig
 
 
-# ==================== Attention 配置 ====================
+# ==================== I130-3/I160-1: Neighbor-Aware Splitter 配置 ====================
+
+# I130-3: NeighborAwareSplitter 的配置类
+# I160-1: 重命名为 DeterministicNeighborSplitter，使用确定性选择
+# 注意：原配置类已合并到 deterministic_neighbor.py，此处保留完整实现以避免循环导入
+
+@dataclass
+class NeighborAwareSplitterConfig:
+    """
+    NeighborAwareSplitter 配置 (I130-3: 解决收敛极慢问题)
+
+    数学形式化
+    ==========
+
+    核心创新:
+    1. 梯度覆盖率 100%: 使用软 softmax 配额，无需 floor() 操作
+    2. 邻居感知评分: s_i' = s_i + α × Σ_{j∈N(i)} sim(f_i, f_j) × s_j
+    3. 可微 ROI Align: 使用 grid_sample 替代整数索引
+
+    与 GumbelTopKSplitter 对比:
+
+    | 方面                | GumbelTopKSplitter    | NeighborAwareSplitter |
+    |---------------------|----------------------|---------------------|
+    | 梯度覆盖率          | 0% (floor)           | 100% (softmax)      |
+    | 邻居关系            | 无                   | 显式建模 (LCA)     |
+    | 局部一致性          | 不保证               | LocalityConsistencyLoss |
+    | ROI Align          | 整数索引             | grid_sample 可微    |
+
+    版本历史:
+    - v1.0 (2026-02-12): 初始实现，借鉴 NAP 论文 (Li & Xu 2025)
+    - v2.0 (2026-02-12): I160-1 重命名，使用 DeterministicNeighborSplitter
+    """
+
+    # ==================== Hilbert 曲线参数 ====================
+    min_patch_size: int = 4
+    max_level_limit: int = 8
+
+    # ==================== 覆盖率约束 ====================
+    coverage_base: float = K_COVERAGE_BASE
+    coverage_min: float = K_COVERAGE_MIN
+    coverage_max_hard: float = K_COVERAGE_MAX_HARD
+    K_min_abs: int = K_MIN_HARD_LIMIT
+    K_max_hard: int = K_MAX_HARD_LIMIT
+    adaptive_reference_size: int = K_ADAPTIVE_REFERENCE_SIZE
+
+    # ==================== 架构参数 ====================
+    feature_dim: int = 256
+    hidden_dim: int = 64
+    pool_size: int = 4
+
+    # ==================== 邻居感知参数 ====================
+    neighbor_threshold: int = 2
+    alpha_init: float = 0.5
+    learnable_alpha: bool = True
+
+    # ==================== 温度参数 ====================
+    temperature_init: float = SPLITTER_TEMP_START
+    temperature_min: float = SPLITTER_TEMP_END
+    learnable_temperature: bool = True
+
+    # ==================== 配额参数 ====================
+    enable_learnable_quota: bool = LEARNABLE_QUOTA_ENABLED
+    quota_init_logits: Optional[Tuple[float, ...]] = None
+    quota_entropy_weight: float = QUOTA_ENTROPY_WEIGHT
+
+    # ==================== 局部一致性损失 ====================
+    locality_weight: float = 0.1
+
+    def compute_candidate_count(self) -> int:
+        """计算四叉树候选节点总数"""
+        L = self.max_level_limit
+        return (4 ** (L + 1) - 1) // 3
+
+    def compute_k_bounds(
+        self,
+        image_size: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[int, int]:
+        """计算 K 边界"""
+        N = self.compute_candidate_count()
+
+        if image_size is not None:
+            H, W = image_size
+            min_dim = min(H, W)
+            scale_factor = math.sqrt(min_dim / self.adaptive_reference_size)
+        else:
+            scale_factor = 1.0
+
+        K_min = max(
+            self.K_min_abs,
+            int(math.ceil(self.coverage_min * N))
+        )
+
+        K_max = min(
+            self.K_max_hard,
+            int(math.ceil(self.coverage_max_hard * scale_factor * N))
+        )
+
+        return K_min, K_max
+
+    def validate(self) -> None:
+        """验证配置参数的有效性"""
+        if self.min_patch_size <= 0:
+            raise ValueError(f"min_patch_size 必须为正数, got {self.min_patch_size}")
+        if self.max_level_limit < 2:
+            raise ValueError(f"max_level_limit >= 2 是推荐配置, got {self.max_level_limit}")
+        if not 0 < self.coverage_base <= 1.0:
+            raise ValueError(f"coverage_base 必须在 (0, 1] 范围内, got {self.coverage_base}")
+        if not 0 < self.coverage_min < self.coverage_max_hard <= 1.0:
+            raise ValueError(f"coverage_min ({self.coverage_min}) < coverage_max_hard")
+        if not 0 < self.temperature_min <= self.temperature_init:
+            raise ValueError(f"temperature_min ({self.temperature_min}) 必须 < temperature_init")
+
+    def to_dict(self) -> dict:
+        """转换为字典"""
+        return {
+            'min_patch_size': self.min_patch_size,
+            'max_level_limit': self.max_level_limit,
+            'coverage_base': self.coverage_base,
+            'coverage_min': self.coverage_min,
+            'coverage_max_hard': self.coverage_max_hard,
+            'K_min_abs': self.K_min_abs,
+            'K_max_hard': self.K_max_hard,
+            'adaptive_reference_size': self.adaptive_reference_size,
+            'feature_dim': self.feature_dim,
+            'hidden_dim': self.hidden_dim,
+            'pool_size': self.pool_size,
+            'neighbor_threshold': self.neighbor_threshold,
+            'alpha_init': self.alpha_init,
+            'learnable_alpha': self.learnable_alpha,
+            'temperature_init': self.temperature_init,
+            'temperature_min': self.temperature_min,
+            'learnable_temperature': self.learnable_temperature,
+            'enable_learnable_quota': self.enable_learnable_quota,
+            'quota_init_logits': self.quota_init_logits,
+            'quota_entropy_weight': self.quota_entropy_weight,
+            'locality_weight': self.locality_weight,
+        }# ==================== Attention 配置 ====================
 
 @dataclass
 class AttentionConfig:
@@ -718,8 +855,6 @@ class AttentionEncoderConfig:
     # I98-3: 初始化参数配置 (用于 HilbertAwareMultiScaleAttention)
     # 能量基准初始化: raw* = softplus^{-1}(1.0) ≈ 0.5413
     level_scale_init: float = 0.5413
-    # 深度缩放范围 (hierarchical_depth_scale 初始化边界)
-    hierarchical_scale_bounds: tuple[float, float] = (0.5, 1.5)
     # I113-11: 偏置缩放初始化
     # 修复前: raw = log(scale)，对应 scale=0.1 和 scale=0.05
     # 修复后: 初始 scale=1.0，配合 √d_k 量纲对齐后有效 scale ≈ √d_k ≈ 5.66
@@ -736,7 +871,6 @@ class AttentionEncoderConfig:
             'hilbert_bias_scale': self.hilbert_bias_scale,
             'level_bias_scale': self.level_bias_scale,
             'level_scale_init': self.level_scale_init,
-            'hierarchical_scale_bounds': self.hierarchical_scale_bounds,
             'hilbert_bias_init': self.hilbert_bias_init,
             'level_bias_init': self.level_bias_init,
             'energy_injection_enabled': self.energy_injection_enabled,

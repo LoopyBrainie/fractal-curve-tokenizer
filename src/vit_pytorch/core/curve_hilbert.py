@@ -1653,6 +1653,180 @@ class HilbertLocalityMetrics:
 
         return results
 
+    # =============================================================================
+    # I162-2: 区域覆盖率与边界效应验证
+    # =============================================================================
+
+    @classmethod
+    def region_coverage_score(
+        cls,
+        points: Tuple[Tuple[int, int], ...],
+        H: int,
+        W: int,
+        num_regions: int = 4
+    ) -> Dict[str, Any]:
+        """计算区域覆盖率 (I162-2)
+
+        数学定义：将图像划分为 num_regions × num_regions 区域
+        每个区域的 Token 密度: C_r = N_r / A_r
+
+        预期：Hilbert 的四叉树结构保证 CV < 0.1
+
+        Args:
+            points: Hilbert扫描点序列
+            H, W: 图像尺寸
+            num_regions: 区域划分数量 (默认4 = 4×4 = 16区域)
+
+        Returns:
+            包含覆盖率指标的字典:
+            - coverage_cv: 变异系数 (目标 < 0.3)
+            - min_coverage: 最小覆盖率
+            - max_coverage: 最大覆盖率
+            - is_balanced: 是否均衡 (CV < 0.3)
+            - region_counts: 每个区域的token数量
+        """
+        if len(points) == 0:
+            return {
+                'coverage_cv': 0.0,
+                'min_coverage': 0.0,
+                'max_coverage': 0.0,
+                'is_balanced': True,
+                'region_counts': []
+            }
+
+        # 计算每个区域的高度和宽度
+        region_h = H / num_regions
+        region_w = W / num_regions
+
+        # 统计每个区域的 token 数量
+        region_counts = [0] * (num_regions * num_regions)
+
+        for point in points:
+            y, x = point
+            # 计算点所属的区域索引
+            region_y = min(int(y / region_h), num_regions - 1)
+            region_x = min(int(x / region_w), num_regions - 1)
+            region_idx = region_y * num_regions + region_x
+            region_counts[region_idx] += 1
+
+        # 计算每个区域的覆盖率（相对于平均值的比例）
+        total_tokens = len(points)
+        expected_per_region = total_tokens / (num_regions * num_regions)
+
+        if expected_per_region == 0:
+            return {
+                'coverage_cv': 0.0,
+                'min_coverage': 0.0,
+                'max_coverage': 0.0,
+                'is_balanced': True,
+                'region_counts': region_counts
+            }
+
+        # 计算实际覆盖率（相对于预期值）
+        coverages = [count / expected_per_region for count in region_counts]
+
+        # 计算变异系数 CV = std / mean
+        mean_coverage = sum(coverages) / len(coverages)
+        variance = sum((c - mean_coverage) ** 2 for c in coverages) / len(coverages)
+        std_coverage = variance ** 0.5
+        cv = std_coverage / mean_coverage if mean_coverage > 0 else 0.0
+
+        return {
+            'coverage_cv': round(cv, 4),
+            'min_coverage': round(min(coverages), 4),
+            'max_coverage': round(max(coverages), 4),
+            'is_balanced': cv < 0.3,
+            'region_counts': region_counts
+        }
+
+    @classmethod
+    def boundary_effect_score(
+        cls,
+        points: Tuple[Tuple[int, int], ...],
+        boundary_ratio: float = 0.05
+    ) -> Dict[str, Any]:
+        """计算边界效应 (I162-2)
+
+        数学定义：
+        - 边界区域：序列的前后 boundary_ratio
+        - 边界效应：E = D_boundary / D_center - 1
+
+        预期：
+        - 标准 Hilbert：E ≈ 0（封闭曲线）
+        - Pseudo-Hilbert：E < 0.15
+
+        Args:
+            points: Hilbert扫描点序列
+            boundary_ratio: 边界比例 (默认5%)
+
+        Returns:
+            包含边界效应的字典:
+            - boundary_effect: 边界效应指标 (目标 < 0.2)
+            - boundary_locality: 边界区域局部性
+            - center_locality: 中心区域局部性
+            - boundary_l_max: 边界区域最大跳跃
+            - center_l_max: 中心区域最大跳跃
+        """
+        if len(points) < 10:
+            return {
+                'boundary_effect': 0.0,
+                'boundary_locality': 1.0,
+                'center_locality': 1.0,
+                'boundary_l_max': 0.0,
+                'center_l_max': 0.0
+            }
+
+        n = len(points)
+        boundary_size = max(1, int(n * boundary_ratio))
+
+        # 分离边界和中心区域
+        boundary_points = points[:boundary_size] + points[-boundary_size:]
+        center_points = points[boundary_size:n-boundary_size]
+
+        # 计算边界区域的局部性
+        def compute_locality(pts: Tuple[Tuple[int, int], ...]) -> Dict[str, float]:
+            if len(pts) < 2:
+                return {'locality': 1.0, 'l_max': 0.0}
+
+            total_dist = 0.0
+            max_dist = 0.0
+            local_count = 0
+
+            for i in range(len(pts) - 1):
+                p1, p2 = pts[i], pts[i + 1]
+                dist = ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
+                total_dist += dist
+                max_dist = max(max_dist, dist)
+                if dist <= 1.5:  # √2 ≈ 1.41
+                    local_count += 1
+
+            avg_dist = total_dist / (len(pts) - 1)
+            locality = local_count / (len(pts) - 1)
+
+            return {'locality': locality, 'l_max': max_dist, 'avg_dist': avg_dist}
+
+        boundary_stats = compute_locality(boundary_points)
+        center_stats = compute_locality(center_points)
+
+        # 计算边界效应
+        # E = (D_boundary / D_center) - 1
+        # D 是平均局部距离
+        boundary_avg = boundary_stats['avg_dist']
+        center_avg = center_stats['avg_dist']
+
+        if center_avg > 0:
+            boundary_effect = (boundary_avg / center_avg) - 1
+        else:
+            boundary_effect = 0.0
+
+        return {
+            'boundary_effect': round(boundary_effect, 4),
+            'boundary_locality': round(boundary_stats['locality'], 4),
+            'center_locality': round(center_stats['locality'], 4),
+            'boundary_l_max': round(boundary_stats['l_max'], 4),
+            'center_l_max': round(center_stats['l_max'], 4)
+        }
+
 
 # =============================================================================
 # I108-5: Hilbert 局部性概率量化工具类
@@ -2097,7 +2271,6 @@ class HilbertScanner:
         grid_size = 2 ** depth
 
         # I99-1 FIX: 防御性检查 - 确保 W 和 H 有效
-        safe_W = max(1, W)
         safe_W = max(1, W)
         safe_H = max(1, H)
 

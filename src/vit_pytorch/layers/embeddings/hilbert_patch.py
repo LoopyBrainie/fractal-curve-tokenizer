@@ -156,7 +156,7 @@ class HilbertNativePatchEmbed(nn.Module):
             self.max_level = max_level
         elif min_patch_size is not None and image_size is not None:
             # 新 API: 从 min_patch_size 计算 max_level
-            from .depth_utils import compute_max_level
+            from vit_pytorch.core.depth_utils import compute_max_level
             H, W = image_size
             self.max_level = compute_max_level(
                 (H, W), min_patch_size, max_level_limit
@@ -441,7 +441,7 @@ class HilbertNativePatchEmbed(nn.Module):
         levels_info[:, :, 0] = depth
         
         # 填充四叉树路径 (从 HilbertPathCache 获取)
-        from .curve_hilbert_indexer import HilbertPathCache
+        from vit_pytorch.core.hilbert_indexer import HilbertPathCache
         _, quadtree_paths = HilbertPathCache.get_or_compute(
             grid_h=fh, grid_w=fw, max_level=self.max_level, device=device
         )

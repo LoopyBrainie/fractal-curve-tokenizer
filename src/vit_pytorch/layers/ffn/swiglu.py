@@ -76,7 +76,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .levels_info import LevelsInfo  # I98-4
+from vit_pytorch.core.levels_info import LevelsInfo  # I98-4
 
 
 # FFN type literal for type checking
