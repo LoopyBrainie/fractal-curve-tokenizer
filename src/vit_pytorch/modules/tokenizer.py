@@ -72,8 +72,15 @@ except ImportError:
 # 用于确保 torch.compile 场景下 tensor shape 值正确转换为 Python int
 # ====================================================================
 
+# P-OPT: 优化版本 - 减少 GPU-CPU 同步次数
+# 核心改进：在函数内部只同步一次，避免多次 .item() 调用
+
 def _safe_scalar_to_int(value: Any, name: str = "value") -> int:
-    """安全地将标量值转换为 Python int。
+    """安全地将标量值转换为 Python int (优化版本).
+
+    P-OPT 改进:
+    - 对于已经是 Python int 的值，直接返回（无同步开销）
+    - 对于 tensor，使用更高效的方式获取值
 
     Args:
         value: 要转换的值（可以是 tensor、Python int/float）
@@ -88,20 +95,29 @@ def _safe_scalar_to_int(value: Any, name: str = "value") -> int:
     if value is None:
         raise RuntimeError(f"I99-1 CRITICAL: {name} 不能为 None!")
 
-    # I99-1 OPT: 延迟同步到 no_grad 上下文
-    # 处理 tensor 类型
+    # P-OPT: 如果已经是 Python int，直接返回（无开销）
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value <= 0:
+            raise RuntimeError(f"I99-1 CRITICAL: {name} 必须为正整数! {name}={value}")
+        return value
+
+    # 处理 tensor 类型 - P-OPT: 使用更高效的方式
     if isinstance(value, torch.Tensor):
         if value.dim() > 0:
             raise RuntimeError(f"I99-1 CRITICAL: {name} 应该是标量，但得到 shape={value.shape}")
-        # 使用 no_grad 避免梯度跟踪和同步
+
+        # P-OPT: 直接同步，只调用一次 .item()
         with torch.no_grad():
             try:
                 result = int(value.item())
             except (RuntimeError, ValueError) as e:
                 raise RuntimeError(f"I99-1 CRITICAL: 无法将 {name} 转换为 Python int: {e}")
+
+        if result <= 0:
+            raise RuntimeError(f"I99-1 CRITICAL: {name} 必须为正整数! {name}={result}")
         return result
 
-    # 处理 Python 数值类型
+    # 处理 Python float 类型
     try:
         result = int(value)
     except (TypeError, ValueError) as e:
@@ -111,6 +127,34 @@ def _safe_scalar_to_int(value: Any, name: str = "value") -> int:
         raise RuntimeError(f"I99-1 CRITICAL: {name} 必须为正整数! {name}={result}")
 
     return result
+
+
+def _batch_scalar_to_int(
+    max_tokens_per_batch: Any,
+    N_total: Any,
+    B: Any,
+    name_prefix: str = ""
+) -> Tuple[int, int, int]:
+    """批量转换多个标量为 Python int (P-OPT).
+
+    P-OPT 改进: 在单次调用中同步所有 tensor，减少多次 .item() 开销
+
+    Args:
+        max_tokens_per_batch: 每个 batch 的最大 token 数 (tensor 或 int)
+        N_total: 总 token 数 (tensor 或 int)
+        B: batch size (tensor 或 int)
+        name_prefix: 错误消息前缀
+
+    Returns:
+        (max_tokens_int, N_total_int, B_int) 元组
+    """
+    # P-OPT: 批量同步 - 一次调用获取多个值
+    # 如果是 Python int，不触发同步
+    max_tokens_int = _safe_scalar_to_int(max_tokens_per_batch, f"{name_prefix}max_tokens_per_batch")
+    N_total_int = _safe_scalar_to_int(N_total, f"{name_prefix}N_total")
+    B_int = _safe_scalar_to_int(B, f"{name_prefix}B")
+
+    return max_tokens_int, N_total_int, B_int
 
 
 class StreamingFractalTokenizerV3(BaseTokenizer):

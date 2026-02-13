@@ -512,6 +512,8 @@ class DeterministicNeighborSplitter(
 
     def _compute_regions(self, max_level: int, image_size: Tuple[int, int]) -> Tensor:
         """计算所有候选区域的坐标"""
+        # I162-1 fix: 确保 tensor 在正确的设备上创建
+        device = next(self.parameters()).device if list(self.parameters()) else torch.device('cpu')
         H, W = image_size
         regions = []
 
@@ -528,15 +530,17 @@ class DeterministicNeighborSplitter(
                     y1 = int((i + 1) * cell_h)
                     regions.append([x0, y0, x1, y1])
 
-        return torch.tensor(regions, dtype=torch.float32)
+        return torch.tensor(regions, dtype=torch.float32, device=device)
 
     def _compute_depth_indices(self, max_level: int) -> Tensor:
         """计算每个区域的深度"""
+        # I162-1 fix: 确保 tensor 在正确的设备上创建
+        device = next(self.parameters()).device if list(self.parameters()) else torch.device('cpu')
         depth_indices = []
         for d in range(max_level + 1):
             n_regions = 4 ** d
             depth_indices.extend([d] * n_regions)
-        return torch.tensor(depth_indices, dtype=torch.long)
+        return torch.tensor(depth_indices, dtype=torch.long, device=device)
 
     def _compute_hilbert_indices(self, max_level: int) -> Tensor:
         """
@@ -573,7 +577,9 @@ class DeterministicNeighborSplitter(
                     offset = sum(4 ** k for k in range(d))
                     indices.append(hilbert_idx + offset)
 
-        return torch.tensor(indices, dtype=torch.long)
+        # I162-1 fix: 确保 tensor 在正确的设备上创建
+        device = next(self.parameters()).device if list(self.parameters()) else torch.device('cpu')
+        return torch.tensor(indices, dtype=torch.long, device=device)
 
     def _get_adj_matrix(self) -> Tensor:
         """获取邻接矩阵（使用缓存）"""
