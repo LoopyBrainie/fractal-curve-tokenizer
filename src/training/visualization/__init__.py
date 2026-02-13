@@ -47,6 +47,7 @@ from training.visualization import (
     plot_confusion_matrix,
     plot_token_distribution,
     plot_depth_distribution,
+    plot_complexity_depth_correlation,
     plot_resource_curves,
     VisualizationConfig,
     ExperimentVisualizer,
@@ -75,6 +76,7 @@ from .class_metrics import (
 from .splitter_analysis import (
     plot_token_distribution,
     plot_depth_distribution,
+    plot_complexity_depth_correlation,
     plot_splitter_health_timeline,
     plot_token_depth_heatmap,
 )
@@ -123,6 +125,7 @@ __all__ = [
     # Splitter analysis
     "plot_token_distribution",
     "plot_depth_distribution",
+    "plot_complexity_depth_correlation",
     "plot_splitter_health_timeline",
     "plot_token_depth_heatmap",
     # Resource curves

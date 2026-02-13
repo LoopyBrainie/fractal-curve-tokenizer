@@ -421,5 +421,87 @@ def plot_token_depth_heatmap(
     # 添加颜色条
     cbar = fig.colorbar(im, ax=ax)
     cbar.set_label('Token Count', fontsize=10)
-    
+
+    return fig
+
+
+def plot_complexity_depth_correlation(
+    complexity_depth_pairs: List[Dict[str, float]],
+    figsize: tuple = (14, 5),
+    config: Optional['VisualizationConfig'] = None,
+) -> Figure:
+    r"""绘制 I133-2 验证实验结果：图像复杂度与深度分布的相关性
+
+    数学形式化:
+        假设 H1: 简单图像 → 深层 Token 占主导 (d 较小)
+        假设 H2: 复杂图像 → 浅层 Token 更活跃 (d 较大)
+
+        相关性分析:
+        - corr(complexity, avg_depth): 复杂度与平均深度的皮尔逊相关系数
+        - corr(complexity, shallow_ratio): 复杂度与浅层比例的相关性
+        - corr(complexity, deep_ratio): 复杂度与深层比例的相关性
+
+    Args:
+        complexity_depth_pairs: [{'complexity': ..., 'avg_depth': ..., 'shallow_ratio': ..., 'deep_ratio': ...}, ...]
+        figsize: 图像尺寸
+        config: 可视化配置
+
+    Returns:
+        matplotlib Figure 对象
+    """
+    sns = _ensure_seaborn()
+
+    # 提取数据
+    complexities = np.array([p['complexity'] for p in complexity_depth_pairs])
+    avg_depths = np.array([p['avg_depth'] for p in complexity_depth_pairs])
+    shallow_ratios = np.array([p['shallow_ratio'] for p in complexity_depth_pairs])
+    deep_ratios = np.array([p['deep_ratio'] for p in complexity_depth_pairs])
+
+    # 计算相关性
+    corr_depth = np.corrcoef(complexities, avg_depths)[0, 1] if np.std(complexities) > 1e-6 and np.std(avg_depths) > 1e-6 else 0.0
+    corr_shallow = np.corrcoef(complexities, shallow_ratios)[0, 1] if np.std(complexities) > 1e-6 and np.std(shallow_ratios) > 1e-6 else 0.0
+    corr_deep = np.corrcoef(complexities, deep_ratios)[0, 1] if np.std(complexities) > 1e-6 and np.std(deep_ratios) > 1e-6 else 0.0
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+
+    # 子图1: 复杂度 vs 平均深度
+    ax1 = axes[0]
+    ax1.scatter(complexities, avg_depths, alpha=0.3, s=10)
+    z = np.polyfit(complexities, avg_depths, 1)
+    p = np.poly1d(z)
+    x_line = np.linspace(complexities.min(), complexities.max(), 100)
+    ax1.plot(x_line, p(x_line), 'r-', linewidth=2, label=f'r = {corr_depth:.3f}')
+    ax1.set_xlabel('Image Complexity (Edge Density)', fontsize=11)
+    ax1.set_ylabel('Average Depth', fontsize=11)
+    ax1.set_title('Complexity vs Avg Depth', fontsize=12, fontweight='bold')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # 子图2: 复杂度 vs 浅层比例
+    ax2 = axes[1]
+    ax2.scatter(complexities, shallow_ratios, alpha=0.3, s=10)
+    z = np.polyfit(complexities, shallow_ratios, 1)
+    p = np.poly1d(z)
+    ax2.plot(x_line, p(x_line), 'r-', linewidth=2, label=f'r = {corr_shallow:.3f}')
+    ax2.set_xlabel('Image Complexity (Edge Density)', fontsize=11)
+    ax2.set_ylabel('Shallow Token Ratio (d≤1)', fontsize=11)
+    ax2.set_title('Complexity vs Shallow Ratio', fontsize=12, fontweight='bold')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    # 子图3: 复杂度 vs 深层比例
+    ax3 = axes[2]
+    ax3.scatter(complexities, deep_ratios, alpha=0.3, s=10)
+    z = np.polyfit(complexities, deep_ratios, 1)
+    p = np.poly1d(z)
+    ax3.plot(x_line, p(x_line), 'r-', linewidth=2, label=f'r = {corr_deep:.3f}')
+    ax3.set_xlabel('Image Complexity (Edge Density)', fontsize=11)
+    ax3.set_ylabel('Deep Token Ratio (d≥3)', fontsize=11)
+    ax3.set_title('Complexity vs Deep Ratio', fontsize=12, fontweight='bold')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+
+    plt.suptitle('I133-2: Complexity-Depth Correlation Analysis', fontsize=14, fontweight='bold', y=1.02)
+    plt.tight_layout()
+
     return fig

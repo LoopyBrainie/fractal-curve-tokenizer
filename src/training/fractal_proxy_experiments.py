@@ -55,7 +55,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler, random_split
 
-from vit_pytorch.constants import EPS  # I112-3: 统一数值稳定性常量
+from vit_pytorch.core.constants import EPS  # I112-3: 统一数值稳定性常量
 
 logger = logging.getLogger(__name__)
 
@@ -1313,7 +1313,7 @@ class SpatialJigsawLoss(nn.Module):
             x: [B, N] x 坐标
             y: [B, N] y 坐标
         """
-        from vit_pytorch.curve_hilbert import HilbertCurve
+        from vit_pytorch.core.curve_hilbert import HilbertCurve
 
         B, N = hilbert_indices.shape
         # 展平以使用 d_to_xy_batch
@@ -1342,7 +1342,7 @@ class SpatialJigsawLoss(nn.Module):
         归一化:
             L_normalized = L / ΣN_k (token 级别)
         """
-        from vit_pytorch.curve_hilbert import HilbertCurve
+        from vit_pytorch.core.curve_hilbert import HilbertCurve
 
         info = {}
         total_valid_pairs = 0

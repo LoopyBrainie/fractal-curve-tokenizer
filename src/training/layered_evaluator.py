@@ -126,7 +126,7 @@ from training.core.checkpoint import (
     get_checkpoint_info,
 )
 from training.core.model_gene import ModelGene
-from vit_pytorch.depth_utils import compute_max_depth
+from vit_pytorch.core.depth_utils import compute_max_depth
 
 
 # ============================================================================
@@ -1647,7 +1647,7 @@ class LayeredEvaluator:
             print(f"  - Top-5 Accuracy: {report.L1_classification.top5_accuracy:.2f}%")
             print(f"  - Mean Class Accuracy: {report.L1_classification.mean_class_accuracy:.2f}%")
             print(f"  - ECE: {report.L1_classification.ece:.2f}%")
-        
+
         # L2: Tokenizer 行为评估
         if 'L2' not in skip_layers:
             print("\n[L2] Tokenizer Evaluation...")
@@ -1659,6 +1659,11 @@ class LayeredEvaluator:
             print(f"  - Token range: [{report.L2_tokenizer.min_tokens}, {report.L2_tokenizer.max_tokens}]")
             print(f"  - Depth entropy: {report.L2_tokenizer.depth_entropy:.3f}")
             print(f"  - Spatial coverage: {report.L2_tokenizer.spatial_coverage_ratio:.2%}")
+            # I133-2: 打印复杂度-深度相关性
+            if hasattr(report.L2_tokenizer, 'complexity_depth_correlation') and report.L2_tokenizer.complexity_depth_correlation != 0:
+                print(f"  - Complexity-Depth correlation: {report.L2_tokenizer.complexity_depth_correlation:.3f}")
+            if hasattr(report.L2_tokenizer, 'complexity_shallow_ratio_correlation') and report.L2_tokenizer.complexity_shallow_ratio_correlation != 0:
+                print(f"  - Complexity-Shallow ratio correlation: {report.L2_tokenizer.complexity_shallow_ratio_correlation:.3f}")
         
         # L3: 注意力机制评估
         if 'L3' not in skip_layers:

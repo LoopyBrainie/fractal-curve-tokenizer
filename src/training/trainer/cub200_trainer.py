@@ -44,7 +44,7 @@ from ..losses.finegrained import FinegrainedLoss, FinegrainedLossConfig
 from ..config import ModelArchitectureConfig  # I36: 统一架构配置
 from ..core.checkpoint import save_checkpoint_with_gene  # ModelGene 自包含 checkpoint
 from vit_pytorch import FractalCurveViT  # I36: 模型创建
-from vit_pytorch.constants import (
+from vit_pytorch.core.constants import (
     SPLITTER_TEMP_END, TEMPERATURE_MIN,  # I113-10: 温度常量
     GRAD_CLIP_BASE_LR, GRAD_CLIP_BASE_NORM,  # I121-6: 动态梯度裁剪
     GRAD_CLIP_MIN_NORM, GRAD_CLIP_MAX_NORM,
@@ -425,9 +425,9 @@ class CUB200TrainingConfig:
         # 通过便捷属性从 arch_config 获取参数
         arch = self.arch_config
 
-        # 检查 dim_head 兼容性 (通过便捷属性访问)
-        if self.dim % self.heads != 0:
-            issues.append(f"dim={self.dim} 不能被 heads={self.heads} 整除")
+        # 检查 dim_head 兼容性 (通过 arch 配置访问)
+        if arch.dim % arch.heads != 0:
+            issues.append(f"dim={arch.dim} 不能被 heads={arch.heads} 整除")
 
         # 检查 min_patch_size 合理性 (通过便捷属性访问)
         if self.min_patch_size < 1:
@@ -444,6 +444,43 @@ class CUB200TrainingConfig:
                 f"CUB200TrainingConfig 与 ModelArchitectureConfig 不一致:\n  - " +
                 "\n  - ".join(issues)
             )
+
+    def _validate_gene_consistency(self, loaded_gene: "ModelGene") -> None:
+        """验证加载的 ModelGene 与当前训练配置的一致性
+
+        Args:
+            loaded_gene: 从 checkpoint 加载的 ModelGene
+
+        Raises:
+            ValueError: 当配置不一致时
+        """
+        from ..core.model_gene import ModelGene
+
+        # 当前配置构造的 ModelGene
+        current_gene = ModelGene.from_config(
+            self.config.arch_config,
+            dataset_name='cub200',
+        )
+
+        # 关键架构参数一致性检查
+        key_params = ['dim', 'num_layers', 'heads', 'mlp_dim', 'image_size',
+                      'min_patch_size', 'token_coverage_min', 'token_coverage_max']
+
+        mismatches = []
+        for param in key_params:
+            current_val = getattr(current_gene, param, None)
+            loaded_val = getattr(loaded_gene, param, None)
+            if current_val != loaded_val:
+                mismatches.append(f"{param}: checkpoint={loaded_val}, current={current_val}")
+
+        if mismatches:
+            raise ValueError(
+                f"Checkpoint 配置与当前训练配置不一致:\n  - " +
+                "\n  - ".join(mismatches) +
+                "\n\n请使用与训练时相同配置加载 checkpoint。"
+            )
+
+        self.logger.info(f"ModelGene 验证通过: {loaded_gene}")
 
     # =========================================================================
     # I36: 便捷属性（从 arch_config 获取，保持向后兼容）
@@ -852,6 +889,78 @@ class CUB200Trainer:
 
         return clip_norm
 
+    def _compute_splitter_loss(
+        self,
+        images: torch.Tensor,
+        stats: Any,
+    ) -> Optional[torch.Tensor]:
+        """I142-1: 计算 splitter 辅助损失（与 train_fractal_vit.py 对齐）
+
+        数学公式:
+            L_total = L_ce + λ_sparsity × L_entropy + λ_elastic × L_elastic + λ_depth × L_depth
+
+        其中:
+            - L_entropy: 稀疏性正则化（鼓励使用更少 tokens）
+            - L_elastic: 弹性预算损失（约束总 token 数在预算范围内）
+            - L_depth: 深度分布 KL 散度损失
+
+        Args:
+            images: 输入图像 [B, C, H, W]
+            stats: 模型返回的 TrainingStats
+
+        Returns:
+            splitter_loss: 辅助损失张量（如果 splitter 存在），否则返回 None
+        """
+        # 统一 Splitter 访问路径 (I99-对齐修复)
+        splitter = None
+        if hasattr(self.model, 'splitter'):
+            splitter = self.model.splitter
+        elif hasattr(self.model, 'tokenizer') and hasattr(self.model.tokenizer, 'splitter'):
+            splitter = self.model.tokenizer.splitter
+
+        if splitter is None:
+            return None
+
+        # 检查是否支持辅助损失计算
+        if not hasattr(splitter, 'get_auxiliary_losses'):
+            return None
+
+        # I107-7: 从 stats.shared_features 获取已计算的 features
+        # 避免重复调用 model.tokenizer.shared_conv(imgs)
+        if stats is not None and hasattr(stats, 'shared_features') and stats.shared_features is not None:
+            splitter_features = stats.shared_features
+        else:
+            # Fallback: 仍需计算时的回退方案
+            splitter_features = self.model.tokenizer.shared_conv(images)
+
+        # 计算辅助损失
+        try:
+            aux_losses = splitter.get_auxiliary_losses(
+                features=splitter_features,
+                image_size=(images.shape[2], images.shape[3]),
+                include_elastic_budget=True,
+                include_soft_entropy=True,
+                batch_size=images.shape[0],
+                entropy_target=0.5,  # 默认目标熵
+                entropy_weight=self.config.splitter_sparsity_weight,
+                entropy_mode='minimize',
+            )
+
+            if aux_losses:
+                # 累加所有辅助损失
+                splitter_loss = sum(aux_losses.values())
+
+                # 确保是 float32 类型（AMP 兼容性）
+                if splitter_loss.dtype != torch.float32:
+                    splitter_loss = splitter_loss.float()
+
+                return splitter_loss
+        except Exception as e:
+            # 忽略辅助损失计算错误
+            self.logger.debug(f"Splitter loss computation failed: {e}")
+
+        return None
+
     def compute_loss(
         self,
         logits: torch.Tensor,
@@ -927,9 +1036,15 @@ class CUB200Trainer:
 
                 if self.config.use_center_loss:
                     features = stats.features
-                    loss, stats = self.compute_loss(logits, labels, features=features)
+                    loss, loss_stats = self.compute_loss(logits, labels, features=features)
                 else:
-                    loss, stats = self.compute_loss(logits, labels)
+                    loss, loss_stats = self.compute_loss(logits, labels)
+
+                # I142-1: 添加 splitter 辅助损失（与 train_fractal_vit.py 对齐）
+                # 计算分割器辅助损失（弹性预算、软熵等）
+                splitter_loss = self._compute_splitter_loss(imgs, stats)
+                if splitter_loss is not None:
+                    loss = loss + splitter_loss
 
                 # 累积归一化
                 loss = loss * scale_factor
@@ -1437,7 +1552,23 @@ class CUB200Trainer:
             epoch: 恢复的 epoch
             best_metric: 最佳准确率
         """
-        checkpoint = torch.load(path, map_location=self.device)
+        # 使用共享的 checkpoint 加载函数（与 eval.py 一致）
+        from ..core.checkpoint import load_checkpoint as load_checkpoint_func
+        from ..core.model_gene import ModelGene
+
+        checkpoint = load_checkpoint_func(path, device=str(self.device))
+
+        # 验证 model_gene 存在（与 eval.py 一致）
+        if 'model_gene' not in checkpoint:
+            raise ValueError(
+                f"Checkpoint does not contain 'model_gene' key.\n"
+                f"This checkpoint was saved with an older version.\n"
+                f"Please retrain with the updated training script."
+            )
+
+        # 验证配置一致性
+        loaded_gene = ModelGene.from_dict(checkpoint['model_gene'])
+        self._validate_gene_consistency(loaded_gene)
 
         # 恢复模型
         self.model.load_state_dict(checkpoint['model_state_dict'])

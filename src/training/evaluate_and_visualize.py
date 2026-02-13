@@ -862,6 +862,24 @@ def main():
             splitter_pool_size=args.splitter_pool_size,
             splitter_hidden_dim=args.splitter_hidden_dim,
         )
+
+        # 深度分布与任务难度关系分析 - 集成在评估流程中
+        print("\n" + "=" * 60)
+        print("Running Depth-Difficulty Analysis")
+        print("=" * 60)
+
+        # 导入分析函数
+        from examples.analysis.depth_difficulty_analysis import run_evaluation as run_depth_diff_analysis
+
+        # 运行分析，结果保存到与评估报告相同的目录
+        run_depth_diff_analysis(
+            checkpoint_path=str(checkpoint_path),
+            dataset_name=dataset_name,
+            batch_size=batch_size,
+            max_samples=1000,
+            output_dir=str(output_dir),
+        )
+
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user")
         sys.exit(1)

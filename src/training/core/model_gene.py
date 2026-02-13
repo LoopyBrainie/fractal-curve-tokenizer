@@ -12,14 +12,14 @@ Date: 2026-01-27
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import math
 import torch
 import torch.nn as nn
 
 try:
-    from vit_pytorch.config import SemanticSplitterConfig
+    from vit_pytorch.core.config import SemanticSplitterConfig
 except ImportError:
     SemanticSplitterConfig = None  # 类型提示用，实际使用时确保已安装
 
@@ -75,7 +75,8 @@ class ModelGene:
     # I145: Splitter K 值限制（从 SplitterConfig 提取，与 constants.K_MIN_HARD_LIMIT 一致）
     K_min_abs: int = 8                 # 绝对最小采样数 (与 K_MIN_HARD_LIMIT=8 一致)
     K_max_hard: int = 8192             # 绝对最大采样数 (与 K_MAX_HARD_LIMIT 一致)
-    coverage_base: float = 0.12         # 基准覆盖率
+    # I145-修复: coverage_base 默认值从 0.12 改为 0.25，与 constants.K_COVERAGE_BASE 一致
+    coverage_base: float = 0.25         # 基准覆盖率 (与 constants.K_COVERAGE_BASE=0.25 一致)
     splitter_temp_start: float = 1.0    # 初始温度 (与 constants.SPLITTER_TEMP_START 一致)
     splitter_temp_end: float = 0.4      # I145: 最终温度 (与 constants.SPLITTER_TEMP_END 一致)
 
@@ -85,7 +86,8 @@ class ModelGene:
     # I145-修复: 统一使用 transformer_dropout 语义，dropout 字段保留用于历史兼容
     # 注意: dropout 字段实际存储 transformer_dropout 值，build_model() 时传递给 FractalCurveViT
     tokenizer_dropout: float = 0.0  # Tokenizer/Splitter dropout，必须为 0.0 (确定性)
-    dropout: float = 0.1           # Dropout 比率 (实际为 transformer_dropout，build_model() 时传递)
+    # I145-修复: dropout 默认值从 0.1 改为 0.0，与 ModelArchitectureConfig.transformer_dropout 一致
+    dropout: float = 0.0           # Dropout 比率 (实际为 transformer_dropout，build_model() 时传递)
     emb_dropout: float = 0.0        # 嵌入 dropout (与 args --emb-dropout 一致)
     drop_path_rate: float = 0.25   # Drop path 比率 (与 args --drop-path 一致)
 
@@ -110,23 +112,38 @@ class ModelGene:
     use_affine_modulation: bool = True   # 使用仿射调制
     fourier_levels: int = 4              # Fourier 级别数
 
-    # ==================== Splitter 关键参数 (I140) ====================
+    # ==================== I113-2: target_ratio 参数 ====================
+    target_ratio: float = 0.5  # 目标覆盖率 (0.5 = 50%)
+
+    # ==================== I104-3: LCA FP16 存储 ====================
+    lca_fp16: bool = False  # 使用 FP16 存储 LCA embedding
+
+    # ==================== I162-1: Hilbert 模式编码器 ====================
+    use_pattern_encoder: bool = False  # 是否启用模式编码器
+    pattern_encoder_mode: str = "light"  # "light", "standard", "multihead"
+    pattern_encoder_window_sizes: Optional[Tuple[int, ...]] = None  # 多尺度窗口大小
+
+    # ==================== Splitter 关键参数 (I140, I145) ====================
     # 注意: 这些是模型内部的默认值，如果为 None 则使用以下值
+    # I145: 新增 splitter_type 参数选择 Splitter 类型（第三层：超参数）
+    splitter_type: str = 'gumbel_topk'  # 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy'
     splitter_hidden_dim: Optional[int] = None   # Splitter MLP 隐藏层维度 (None → 64)
     splitter_feature_dim: Optional[int] = None  # Splitter 特征维度 (None → 使用 dim)
     splitter_pool_size: Optional[int] = None    # Splitter 池化大小 (None → 4)
 
-    # ==================== I136: Elastic Budget 配置 ====================
-    # 这些参数控制训练时的弹性覆盖率约束，评估时需要保持一致
-    elastic_coverage_min: float = 0.03   # 最小弹性覆盖率
-    elastic_coverage_max: float = 0.25   # 最大弹性覆盖率
-    elastic_lambda_over: float = 0.1    # 超额惩罚系数
-    elastic_lambda_under: float = 0.01  # 低额惩罚系数
+    # 注意: I136: Elastic Budget 配置 (elastic_coverage_min/max, elastic_lambda_over/under)
+    # 是训练损失超参数，不是模型架构参数，不保存到 ModelGene 中
+    # 这些参数仅在训练时使用，影响损失函数但不改变模型结构
 
     # ==================== I110-7: 语义分裂器参数 ====================
     use_semantic_splitter: bool = False  # 是否使用 SemanticRedundancySplitter
     semantic_splitter_config: Optional[Dict[str, Any]] = None  # 语义分裂器配置字典
     semantic_loss_weight: float = 0.1  # 语义分裂器损失权重
+
+    # ==================== P6-1: 深度缩放参数 ====================
+    # 控制注意力偏置的深度缩放，影响模型的层次化注意力
+    # I155: 添加 depth_scale_range 以确保训练/评估时模型行为一致
+    depth_scale_range: Optional[tuple] = None  # (σ_min, σ_max)，默认 (0.5, 2.0)
 
     # ==================== 训练元信息 ====================
     dataset_name: str = ""          # 数据集名称
@@ -206,21 +223,32 @@ class ModelGene:
             'use_affine_modulation': self.use_affine_modulation,
             'fourier_levels': self.fourier_levels,
 
-            # ========== I140: Splitter 关键参数 ==========
+            # ========== I113-2: target_ratio 参数 ==========
+            'target_ratio': self.target_ratio,
+
+            # ========== I104-3: LCA FP16 存储 ==========
+            'lca_fp16': self.lca_fp16,
+
+            # ========== I162-1: Hilbert 模式编码器 ==========
+            'use_pattern_encoder': self.use_pattern_encoder,
+            'pattern_encoder_mode': self.pattern_encoder_mode,
+            'pattern_encoder_window_sizes': self.pattern_encoder_window_sizes,
+
+            # ========== I140: Splitter 关键参数 (I145: 添加 splitter_type) ==========
+            'splitter_type': self.splitter_type,
             'splitter_hidden_dim': self.splitter_hidden_dim,
             'splitter_feature_dim': self.splitter_feature_dim,
             'splitter_pool_size': self.splitter_pool_size,
 
-            # ========== I136: Elastic Budget 配置 ==========
-            'elastic_coverage_min': self.elastic_coverage_min,
-            'elastic_coverage_max': self.elastic_coverage_max,
-            'elastic_lambda_over': self.elastic_lambda_over,
-            'elastic_lambda_under': self.elastic_lambda_under,
+            # 注意: I136: Elastic Budget 配置已移除（训练损失超参数，不属于模型架构）
 
             # ========== I110-7: 语义分裂器 ==========
             'use_semantic_splitter': self.use_semantic_splitter,
             'semantic_splitter_config': self.semantic_splitter_config,
             'semantic_loss_weight': self.semantic_loss_weight,
+
+            # ========== P6-1: 深度缩放参数 ==========
+            'depth_scale_range': self.depth_scale_range,
 
             # ========== 训练元信息 ==========
             'dataset_name': self.dataset_name,
@@ -351,9 +379,18 @@ class ModelGene:
             use_area_encoding=self.use_area_encoding,
             use_affine_modulation=self.use_affine_modulation,
             fourier_levels=self.fourier_levels,
+            # I113-2: target_ratio 参数
+            target_ratio=self.target_ratio,
+            # I104-3: LCA FP16 存储
+            lca_fp16=self.lca_fp16,
+            # I162-1: Hilbert 模式编码器
+            use_pattern_encoder=self.use_pattern_encoder,
+            pattern_encoder_mode=self.pattern_encoder_mode,
+            pattern_encoder_window_sizes=self.pattern_encoder_window_sizes,
             quota_learnable=self.quota_learnable,
             quota_entropy_weight=self.quota_entropy_weight,
-            # I140: Splitter 架构参数
+            # I140: Splitter 架构参数 (I145: 添加 splitter_type)
+            splitter_type=self.splitter_type,
             splitter_hidden_dim=self.splitter_hidden_dim,
             splitter_feature_dim=self.splitter_feature_dim,
             splitter_pool_size=self.splitter_pool_size,
@@ -366,6 +403,8 @@ class ModelGene:
                 SemanticSplitterConfig(**self.semantic_splitter_config)
                 if self.semantic_splitter_config and SemanticSplitterConfig else None
             ),
+            # P6-1: 深度缩放参数
+            depth_scale_range=self.depth_scale_range,
         )
 
         return model
@@ -431,6 +470,14 @@ class ModelGene:
             use_area_encoding=getattr(model, 'use_area_encoding', False),
             use_affine_modulation=getattr(model, 'use_affine_modulation', True),
             fourier_levels=getattr(model, 'fourier_levels', 4),
+            # I113-2: target_ratio 参数
+            target_ratio=getattr(model, 'target_ratio', 0.5),
+            # I104-3: LCA FP16 存储
+            lca_fp16=getattr(model, 'lca_fp16', False),
+            # I162-1: Hilbert 模式编码器
+            use_pattern_encoder=getattr(model, 'use_pattern_encoder', False),
+            pattern_encoder_mode=getattr(model, 'pattern_encoder_mode', 'light'),
+            pattern_encoder_window_sizes=getattr(model, 'pattern_encoder_window_sizes', None),
             dataset_name=dataset_name,
             checkpoint_epoch=epoch,
         )
@@ -455,7 +502,7 @@ class ModelGene:
                 # I145: 提取温度参数
                 gene.splitter_temp_start = getattr(config, 'temperature_init', 1.0)
                 # I145-修复: 使用 SPLITTER_TEMP_END 常量 (0.4) 而非错误的 0.1
-                from vit_pytorch.constants import SPLITTER_TEMP_END
+                from vit_pytorch.core.constants import SPLITTER_TEMP_END
                 gene.splitter_temp_end = getattr(config, 'temperature_min', SPLITTER_TEMP_END)
             # 备选：从 tokenizer.splitter.config 提取
             elif hasattr(tokenizer, 'splitter') and hasattr(tokenizer.splitter, 'config') and tokenizer.splitter.config is not None:
@@ -544,7 +591,7 @@ class ModelGene:
         splitter_temp_end = getattr(config, 'splitter_temp_end', None)
         if splitter_temp_end is None:
             # I145 修复: 使用 constants.SPLITTER_TEMP_END (0.4) 而非错误的 0.1
-            from vit_pytorch.constants import SPLITTER_TEMP_END
+            from vit_pytorch.core.constants import SPLITTER_TEMP_END
             splitter_temp_end = getattr(config, 'temperature_min', SPLITTER_TEMP_END)
 
         # 使用 getattr 处理可选字段（兼容不同版本的 ModelArchitectureConfig）
@@ -583,21 +630,29 @@ class ModelGene:
             use_area_encoding=config.use_area_encoding,
             use_affine_modulation=config.use_affine_modulation,
             fourier_levels=config.fourier_levels,
+            # I113-2: target_ratio 参数
+            target_ratio=getattr(config, 'target_ratio', 0.5),
+            # I104-3: LCA FP16 存储
+            lca_fp16=getattr(config, 'lca_fp16', False),
+            # I162-1: Hilbert 模式编码器
+            use_pattern_encoder=getattr(config, 'use_pattern_encoder', False),
+            pattern_encoder_mode=getattr(config, 'pattern_encoder_mode', 'light'),
+            pattern_encoder_window_sizes=getattr(config, 'pattern_encoder_window_sizes', None),
             quota_learnable=config.quota_learnable,
             quota_entropy_weight=getattr(config, 'quota_entropy_weight', 0.01),
-            # I140: Splitter 架构参数
+            # I140: Splitter 架构参数 (I145: 添加 splitter_type)
+            splitter_type=getattr(config, 'splitter_type', 'gumbel_topk'),
             splitter_hidden_dim=getattr(config, 'splitter_hidden_dim', None),
             splitter_feature_dim=getattr(config, 'splitter_feature_dim', None),
             splitter_pool_size=getattr(config, 'splitter_pool_size', None),
-            # I136: Elastic Budget 配置
-            elastic_coverage_min=getattr(config, 'elastic_coverage_min', 0.03),
-            elastic_coverage_max=getattr(config, 'elastic_coverage_max', 0.25),
-            elastic_lambda_over=getattr(config, 'elastic_lambda_over', 0.1),
-            elastic_lambda_under=getattr(config, 'elastic_lambda_under', 0.01),
+            # 注意: I136: Elastic Budget 配置已移除（训练损失超参数，不属于模型架构）
+
             # I110-7: 语义分裂器配置
             use_semantic_splitter=getattr(config, 'use_semantic_splitter', False),
             semantic_splitter_config=getattr(config, 'semantic_splitter_config', None),
             semantic_loss_weight=getattr(config, 'semantic_loss_weight', 0.1),
+            # P6-1: 深度缩放参数
+            depth_scale_range=getattr(config, 'depth_scale_range', None),
             dataset_name=dataset_name,
             checkpoint_epoch=epoch,
         )
@@ -729,7 +784,7 @@ class ModelGene:
             )
 
         # I145: 温度参数验证
-        from vit_pytorch.constants import SPLITTER_TEMP_START, SPLITTER_TEMP_END, TEMPERATURE_MIN
+        from vit_pytorch.core.constants import SPLITTER_TEMP_START, SPLITTER_TEMP_END, TEMPERATURE_MIN
         if self.splitter_temp_start < TEMPERATURE_MIN:
             warnings.append(
                 f"splitter_temp_start ({self.splitter_temp_start}) < TEMPERATURE_MIN ({TEMPERATURE_MIN}), "
@@ -747,7 +802,7 @@ class ModelGene:
             )
 
         # I145: K 边界验证
-        from vit_pytorch.constants import K_MIN_HARD_LIMIT, K_MAX_HARD_LIMIT
+        from vit_pytorch.core.constants import K_MIN_HARD_LIMIT, K_MAX_HARD_LIMIT
         if self.K_min_abs < K_MIN_HARD_LIMIT:
             warnings.append(
                 f"K_min_abs ({self.K_min_abs}) < K_MIN_HARD_LIMIT ({K_MIN_HARD_LIMIT}), "

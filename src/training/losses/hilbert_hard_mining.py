@@ -56,7 +56,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from vit_pytorch.constants import EPS  # I112-3: 统一数值稳定性常量
+from vit_pytorch.core.constants import EPS  # I112-3: 统一数值稳定性常量
 
 
 class HilbertAwareHardMining(nn.Module):

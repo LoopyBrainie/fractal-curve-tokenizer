@@ -51,7 +51,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .focal_loss import FocalLoss
-from vit_pytorch.constants import EPS  # I112-3: 统一数值稳定性常量
+from vit_pytorch.core.constants import EPS  # I112-3: 统一数值稳定性常量
 
 
 class AdaptiveFocalLossWrapper(nn.Module):

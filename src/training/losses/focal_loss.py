@@ -42,7 +42,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vit_pytorch.constants import PROB_EPSILON
+from vit_pytorch.core.constants import PROB_EPSILON
 
 
 class FocalLoss(nn.Module):

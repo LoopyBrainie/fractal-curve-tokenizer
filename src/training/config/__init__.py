@@ -47,7 +47,7 @@ class ModelArchitectureConfig:
         - depth: Transformer 层数
         - heads: 注意力头数
         - mlp_dim: FFN 维度 = dim × mlp_ratio
-        - dim_head: 每头维度 = dim / heads
+        - dim_head: 由 dim // heads 自动计算
 
     Tokenizer 参数:
         - min_patch_size: 最小 patch 大小
@@ -60,7 +60,6 @@ class ModelArchitectureConfig:
     num_layers: int = 8  # Transformer 层数 (原 depth)
     heads: int = 6
     mlp_dim: int = 1536  # dim * mlp_ratio (default 4.0)
-    dim_head: int = 64   # dim / heads
 
     # 输入配置
     image_size: Optional[int] = None  # None = 动态分辨率 (I78)
@@ -100,6 +99,17 @@ class ModelArchitectureConfig:
     use_affine_modulation: bool = True  # A17: 默认为 True
     fourier_levels: int = 4             # 傅里叶特征级别数
 
+    # I113-2: target_ratio - L1 相对参数 (替代已废弃的 token_coverage_max)
+    target_ratio: float = 0.5  # 目标覆盖率 (0.5 = 50%)
+
+    # I104-3: LCA FP16 存储 (显存优化)
+    lca_fp16: bool = False  # 使用 FP16 存储 LCA embedding
+
+    # I162-1: Hilbert 模式编码器 (高级位置编码)
+    use_pattern_encoder: bool = False  # 是否启用模式编码器
+    pattern_encoder_mode: str = "light"  # "light", "standard", "multihead"
+    pattern_encoder_window_sizes: Optional[Tuple[int, ...]] = None  # 多尺度窗口大小
+
     # P6-1: 深度缩放参数 (从 FractalViTConfig 迁移)
     depth_scale_range: Optional[tuple] = None  # (σ_min, σ_max)，默认 (0.5, 2.0)
 
@@ -119,6 +129,9 @@ class ModelArchitectureConfig:
 
     # I140: Splitter 架构参数
     # 这些参数控制 Splitter 内部 MLP 的维度配置
+    # I145: 新增 splitter_type 选择器，遵循三层参数原则
+    # splitter_type 是超参数（第三层），决定使用哪种 Splitter
+    splitter_type: str = 'gumbel_topk'  # 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy'
     splitter_hidden_dim: Optional[int] = None  # Splitter MLP 隐藏层维度 (默认 64)
     splitter_feature_dim: Optional[int] = None  # Splitter 特征维度 (默认等于 dim)
     splitter_pool_size: Optional[int] = None    # Splitter 池化大小 (默认 4)
@@ -145,11 +158,19 @@ class ModelArchitectureConfig:
     # I148: dropout 对应 transformer_dropout，emb_dropout 对应 emb-dropout
     # 2026-02-07: 更新 emb_dropout=0.0，与 argparse --emb-dropout 默认值一致
     # I148: 添加 tokenizer_dropout (必须为 0.0 确定性) 和 transformer_dropout
+    # I130-2: Hilbert 最佳实现 - 禁用 Dropout 和 DropPath
+    # 理由: Dropout/DropPath 破坏 Hilbert 曲线的确定性保证
+    # 预期效果: train/eval max_diff: 3.64 → <0.05
     tokenizer_dropout: float = 0.0  # Tokenizer/Splitter dropout，必须为 0.0 (确定性)
-    transformer_dropout: float = 0.1  # Transformer dropout (与 args --transformer-dropout 一致)
-    dropout: float = 0.1  # 主 dropout 概率 (保留用于向后兼容，实际使用 transformer_dropout)
-    emb_dropout: float = 0.0  # 嵌入层 dropout (与 args --emb-dropout 一致)
-    drop_path_rate: float = 0.25  # 路径 dropout (与 train_fractal_vit.py --drop-path 一致)
+    transformer_dropout: float = 0.0  # Transformer dropout (禁用以确保确定性)
+    dropout: float = 0.0  # 主 dropout 概率 (禁用)
+    emb_dropout: float = 0.0  # 嵌入层 dropout (禁用)
+    drop_path_rate: float = 0.0  # 路径 dropout (禁用)
+
+    # I147: 损失函数超参数 (固定不变，应保存在模型架构中)
+    # 遵循三层参数原则: 超参数应当固定不变，直接保存在模型架构配置中
+    use_focal_loss: bool = False  # 是否使用 Focal Loss (默认禁用，I147修复)
+    focal_gamma: float = 0.0     # Focal Loss gamma (0=标准CE，I147修复)
 
     def __post_init__(self):
         """参数验证 - 数学约束"""
@@ -180,18 +201,15 @@ class ModelArchitectureConfig:
         # 注意: max_level 是变参数，完全由模型架构内部计算，不进行验证
         # assert self.max_level >= 1, f"max_level={self.max_level} 必须 >= 1"
 
-        # 验证 dim_head 一致性
-        expected_dim_head = self.dim // self.heads
-        if self.dim_head != expected_dim_head:
-            logger.warning(
-                f"dim_head={self.dim_head} != dim/heads={expected_dim_head}, "
-                f"将使用 dim_head={expected_dim_head}"
-            )
-            self.dim_head = expected_dim_head
+        # dim_head 由 dim // heads 自动计算，不再作为参数验证
 
         # 验证 mlp_ratio
         expected_mlp_dim = int(self.dim * (self.mlp_dim / self.dim)) if self.mlp_dim != self.dim else int(self.dim * 4.0)
         # mlp_dim 已经是绝对值，不需要重新计算
+
+        # I147: 验证 focal_gamma 数学约束
+        assert self.focal_gamma >= 0, f"focal_gamma={self.focal_gamma} 必须 >= 0"
+        assert self.focal_gamma <= 5, f"focal_gamma={self.focal_gamma} 应 <= 5 (极端聚焦)"
 
     @property
     def mlp_ratio(self) -> float:
@@ -286,83 +304,23 @@ class DataConfig:
 @dataclass
 class LossConfig:
     """损失函数配置
-    
+
+    I147: Focal Loss 超参数已移至 arch_config (遵循三层参数原则)
+    - use_focal_loss 和 focal_gamma 现在是模型架构超参数
+    - LossConfig 只保留损失类型和 Class-Balanced 参数
+
     支持的损失类型:
     - "cross_entropy": 标准 CE
-    - "focal": Focal Loss (Lin et al., 2017)
     - "class_balanced": Class-Balanced CE (Cui et al., 2019)
-    - "focal_cb": Focal + Class-Balanced 组合
-    
-    I25-1 Focal Loss 数学指南
-    =========================
-    
-    标准 Cross-Entropy:
-        L_CE = -log(p_t)
-        
-    Focal Loss:
-        L_FL = -α_t (1 - p_t)^γ log(p_t)
-        
-    梯度对比 (γ=2):
-        | p_t | CE梯度 | FL梯度 | 比例 |
-        |-----|--------|--------|------|
-        | 0.9 | 0.11   | 0.0011 | 100x |
-        | 0.5 | 1.0    | 0.25   | 4x   |
-        | 0.1 | 10.0   | 8.1    | 1.2x |
-        
-    效果: 易分类样本梯度降低 100x，难分类样本梯度基本保持
-    
-    推荐配置:
-        - 类别不均衡严重 (accuracy std > 15%): 启用 Focal Loss
-        - γ = 2.0: 平衡配置
-        - γ = 2.5: 推荐值 (I28-1 优化，难/易比 243x)
-        - γ = 3.0-5.0: 极端不均衡时使用
-        - 同时启用 class_balanced 以获得 α_t 权重
-        
-    I28-1 γ 参数优化形式化分析
-    ==========================
-    
-    问题数据 (实验 20260114):
-        - Worst class 准确率: 8-10% (p_t ≈ 0.10)
-        - Best class 准确率: 82-92% (p_t ≈ 0.90)
-        - accuracy_std: 17.81%
-        
-    梯度权重公式:
-        w(p_t) = (1 - p_t)^γ
-        
-    难/易梯度比:
-        R(γ) = w(0.10) / w(0.90) = 0.90^γ / 0.10^γ = 9^γ
-        
-        | γ   | 难/易比 |
-        |-----|---------|
-        | 2.0 | 81x     |
-        | 2.5 | 243x    | ← 推荐
-        | 3.0 | 729x    |
-        
-    稳定性约束:
-        中等样本梯度保留率 = 0.5^γ
-        γ = 2.5 时保留 71%，γ = 3.0 时仅保留 50%
-        
-    最优解推导:
-        max R(γ) s.t. 0.5^γ ≥ 0.15
-        → γ ≤ ln(0.15)/ln(0.5) = 2.74
-        → 推荐 γ = 2.5
     """
-    type: str = "cross_entropy"
-    
-    # Focal Loss 参数
-    # γ (gamma): 聚焦参数，控制对易分类样本的抑制强度
-    # γ = 0: 退化为标准 CE
-    # γ = 2.5: 推荐值 (I28-1 优化，243x 抑制易分类样本梯度)
-    # γ = 5: 极端聚焦 (仅对非常难的样本有梯度)
-    focal_gamma: float = 2.5  # I28-1: 从 2.0 提升到 2.5
-    focal_alpha: Optional[List[float]] = None  # None = 自动计算
+    type: str = "cross_entropy"  # I147: 默认为标准 CE
 
     # Class-Balanced 参数
     # β (beta): 有效样本数衰减因子
     # β → 1: 权重更平滑
     # β → 0: 权重差异更大
     cb_beta: float = 0.9999
-    
+
     # Label Smoothing
     # ε: 平滑因子，y'_c = (1-ε)y_c + ε/C
     # 推荐: 0.1 (轻微正则化), 0.2 (强正则化)
@@ -403,9 +361,11 @@ class BudgetConfig:
 class OptimizerConfig:
     """优化器配置"""
     type: str = "adamw"  # "sgd", "adam", "adamw"
-    
+
     # 基本参数
-    lr: float = 1e-4
+    # I147: 从 1e-4 提升到 5e-4，解决训练损失异常 (~82)
+    # 数学依据: dim=384 时，推荐 lr ≈ 5e-4 (ViT 论文建议 dim=768 时 lr=3e-4)
+    lr: float = 5e-4
     weight_decay: float = 0.05
     
     # SGD 特定

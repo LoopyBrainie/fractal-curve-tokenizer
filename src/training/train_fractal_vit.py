@@ -333,7 +333,7 @@ if str(EXAMPLES_PATH) not in sys.path:
     sys.path.insert(0, str(EXAMPLES_PATH))
 
 from vit_pytorch import FractalCurveViT
-from vit_pytorch.constants import (
+from vit_pytorch.core.constants import (
     EPS,  # I112-3: 统一数值稳定性常量
     SPLITTER_TEMP_START,
     SPLITTER_TEMP_END,
@@ -435,8 +435,7 @@ class FractalConfigProtocol(Protocol):
     def num_layers(self) -> int: ...  # 原 depth
     @property
     def heads(self) -> int: ...
-    @property
-    def dim_head(self) -> int: ...
+    # dim_head 由 dim // heads 自动计算
     @property
     def pool(self) -> str: ...
     @property
@@ -2530,10 +2529,10 @@ def analyze_class_balance(
                 worst_str = ", ".join([f"{c}:{a:.1f}%" for c, a in zip(worst_5, worst_acc)])
                 print(f"    - Worst classes (ID:acc): {worst_str}")
 
-            # I30-4: Focal Loss 和 Class Balanced 现在默认启用 (gamma=3.0)
-            # 建议仅在严重不平衡时考虑调整参数
+            # I147: Focal Loss 默认禁用 (gamma=0.0)
+            # 建议仅在严重不平衡时启用 Focal Loss
             if imbalance_score > 50 and epoch > 20:
-                print("    [建议] 考虑增加 --focal-gamma (当前: 3.0)")
+                print("    [建议] 考虑启用 Focal Loss: --no-focal-loss=False --focal-gamma=2.0")
     
     return report
 
@@ -2870,6 +2869,27 @@ def verify_train_eval_consistency(
 
 
 # ============================================================================
+# 辅助函数
+# ============================================================================
+
+def _parse_window_sizes(sizes_str: Optional[str]) -> Optional[Tuple[int, ...]]:
+    """解析 window sizes 字符串为元组
+
+    Args:
+        sizes_str: 逗号分隔的整数字符串，如 "3,7"
+
+    Returns:
+        元组形式的窗口大小，或 None
+    """
+    if not sizes_str:
+        return None
+    try:
+        return tuple(int(x.strip()) for x in sizes_str.split(','))
+    except ValueError:
+        raise ValueError(f"Invalid window sizes format: {sizes_str}. Expected comma-separated integers like '3,7'")
+
+
+# ============================================================================
 # 主函数
 # ============================================================================
 
@@ -2893,7 +2913,7 @@ def main():
     parser.add_argument("--depth", type=int, default=None, dest='num_layers',
                        help="(Deprecated: use --num-layers)")
     parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--dim-head", type=int, default=32)
+    # dim_head 由 dim // heads 自动计算，不再作为 CLI 参数
     # I30-17: max_depth 控制 Hilbert 四叉树递归深度
     parser.add_argument("--max-depth", type=int, default=None,
                        help="I30-17: Maximum quadtree depth (auto-computed from min_patch_size if None)")
@@ -2930,6 +2950,23 @@ def main():
                        help="I31-3: Enable affine-modulated attention bias")
     parser.add_argument("--fourier-levels", type=int, default=4,
                        help="I31-3: Number of Fourier frequency levels for area encoding (default: 4)")
+
+    # I113-2: target_ratio - L1 相对参数
+    parser.add_argument("--target-ratio", type=float, default=0.5,
+                       help="I113-2: Target token coverage ratio (default: 0.5)")
+
+    # I104-3: LCA FP16 存储
+    parser.add_argument("--lca-fp16", action="store_true",
+                       help="I104-3: Use FP16 storage for LCA embedding (reduces memory)")
+
+    # I162-1: Hilbert 模式编码器
+    parser.add_argument("--use-pattern-encoder", action="store_true",
+                       help="I162-1: Enable Hilbert pattern encoder (advanced position encoding)")
+    parser.add_argument("--pattern-encoder-mode", type=str, default="light",
+                       choices=["light", "standard", "multihead"],
+                       help="I162-1: Pattern encoder mode (default: light)")
+    parser.add_argument("--pattern-encoder-window-sizes", type=str, default=None,
+                       help="I162-1: Pattern encoder window sizes as comma-separated (e.g., '3,7')")
 
     # I33: 相对预算参数 (替代绝对 K_min/K_max)
     # 覆盖率 = tokens / max_patches, 与图像分辨率无关
@@ -2969,6 +3006,10 @@ def main():
     # P7-7: GumbelTopKSplitter 温度退火调度参数
     # I29-1 修复: 从 constants.py 导入常量，确保一致性
     # I24-7 分析: T_end=0.5 保持探索能力，T=0.3 过低会导致梯度消失
+    # I145: 新增 splitter_type 参数
+    parser.add_argument("--splitter-type", type=str, default='gumbel_topk',
+                       choices=['gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy'],
+                       help="Splitter type: 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy' (default: gumbel_topk)")
     parser.add_argument("--splitter-temp-start", type=float, default=SPLITTER_TEMP_START,
                        help=f"Learnable splitter initial temperature (default: {SPLITTER_TEMP_START})")
     parser.add_argument("--splitter-temp-end", type=float, default=SPLITTER_TEMP_END,
@@ -3068,11 +3109,9 @@ def main():
     parser.add_argument("--mixup-prob", type=float, default=0.5,
                        help="Probability of applying Mixup/CutMix (default: 0.5)")
 
-    # P14/I30-4: 长尾效应优化 - 默认启用
-    parser.add_argument("--no-focal-loss", action="store_true",
-                       help="Disable Focal Loss (enabled by default)")
-    parser.add_argument("--focal-gamma", type=float, default=3.0,
-                       help="Focal Loss gamma parameter (default: 3.0, I30-4 tuned)")
+    # I147: Focal Loss 超参数已移至 arch_config (遵循三层参数原则)
+    # - use_focal_loss 和 focal_gamma 现在是模型架构超参数
+    # - 训练时从 arch_config 读取，不通过命令行暴露
     parser.add_argument("--no-class-balanced", action="store_true",
                        help="Disable class-balanced loss weights (enabled by default)")
     parser.add_argument("--class-balance-beta", type=float, default=0.9999,
@@ -3198,7 +3237,7 @@ def main():
         dim=args.dim,
         num_layers=args.num_layers,  # I145: 已标准化
         heads=args.heads,
-        dim_head=args.dim_head,
+        # dim_head 由 dim // heads 自动计算
         mlp_dim=args.mlp_dim if args.mlp_dim else args.dim * 4,
         pool=args.pool,
         image_size=spec.image_size,
@@ -3216,6 +3255,14 @@ def main():
         use_affine_modulation=args.use_affine_modulation,
         fourier_levels=args.fourier_levels,
         depth_scale_range=(args.depth_scale_min, args.depth_scale_max) if not args.no_learnable_depth_scale else None,
+        # I113-2: target_ratio - L1 相对参数
+        target_ratio=args.target_ratio,
+        # I104-3: LCA FP16 存储
+        lca_fp16=getattr(args, 'lca_fp16', False),
+        # I162-1: Hilbert 模式编码器
+        use_pattern_encoder=getattr(args, 'use_pattern_encoder', False),
+        pattern_encoder_mode=getattr(args, 'pattern_encoder_mode', 'light'),
+        pattern_encoder_window_sizes=_parse_window_sizes(getattr(args, 'pattern_encoder_window_sizes', None)),
         # I122-2: lca_temperature 已移除，由 hilbert_bias_scale 统一缩放
         quota_learnable=quota_learnable_value,
         quota_entropy_weight=args.quota_entropy_weight,
@@ -3227,9 +3274,11 @@ def main():
         elastic_coverage_max=args.elastic_coverage_max,
         elastic_lambda_over=args.elastic_lambda_over,
         elastic_lambda_under=args.elastic_lambda_under,
-        # I110-7: 语义分裂器配置
+        # I110-7: 语义分裂器配置 (I145: 添加 splitter_type)
         use_semantic_splitter=args.use_semantic_splitter,
         semantic_splitter_config=semantic_config_dict,
+        # I145: Splitter 类型选择
+        splitter_type=args.splitter_type,
     )
 
     # 创建训练配置对象 (满足 FractalConfigProtocol)
@@ -3250,7 +3299,7 @@ def main():
             self.dim = arch_config.dim
             self.num_layers = arch_config.num_layers  # I145: 统一使用 num_layers
             self.heads = arch_config.heads
-            self.dim_head = arch_config.dim_head
+            # dim_head 由 dim // heads 自动计算
             self.mlp_dim = arch_config.mlp_dim
             self.pool = arch_config.pool
             self.ffn_type = arch_config.ffn_type
@@ -3264,16 +3313,33 @@ def main():
             self.emb_dropout = arch_config.emb_dropout
             self.drop_path_rate = arch_config.drop_path_rate
             self.use_checkpoint = arch_config.use_checkpoint
+            # 编码超参数
+            self.use_hilbert_encoding = arch_config.use_hilbert_encoding
+            self.use_spatial_encoding = arch_config.use_spatial_encoding
             # I122-2: lca_temperature 已移除，由 hilbert_bias_scale 统一缩放
             self.use_area_encoding = arch_config.use_area_encoding
             self.use_affine_modulation = arch_config.use_affine_modulation
             self.fourier_levels = arch_config.fourier_levels
+            # I113-2: target_ratio - L1 相对参数
+            self.target_ratio = arch_config.target_ratio
+            # I104-3: LCA FP16 存储
+            self.lca_fp16 = arch_config.lca_fp16
+            # I162-1: Hilbert 模式编码器
+            self.use_pattern_encoder = arch_config.use_pattern_encoder
+            self.pattern_encoder_mode = arch_config.pattern_encoder_mode
+            self.pattern_encoder_window_sizes = arch_config.pattern_encoder_window_sizes
             self.quota_learnable = arch_config.quota_learnable
             self.quota_entropy_weight = arch_config.quota_entropy_weight
             self.freeze_quota = arch_config.freeze_quota
             self.freeze_tokenizer = arch_config.freeze_tokenizer
             self.freeze_tokenizer_epochs = arch_config.freeze_tokenizer_epochs
             self.depth_scale_range = arch_config.depth_scale_range
+            # I140: Splitter 架构参数
+            # I145: 新增 splitter_type 参数选择 Splitter 类型
+            self.splitter_type = arch_config.splitter_type
+            self.splitter_hidden_dim = arch_config.splitter_hidden_dim
+            self.splitter_feature_dim = arch_config.splitter_feature_dim
+            self.splitter_pool_size = arch_config.splitter_pool_size
 
             # I110-7: 语义分裂器配置
             self.use_semantic_splitter = arch_config.use_semantic_splitter
@@ -3299,8 +3365,9 @@ def main():
             self.mixup_alpha = args.mixup_alpha
             self.cutmix_alpha = args.cutmix_alpha
             self.mixup_prob = args.mixup_prob
-            self.use_focal_loss = not args.no_focal_loss
-            self.focal_gamma = args.focal_gamma
+            # I147: 从 arch_config 读取损失函数超参数 (遵循三层参数原则)
+            self.use_focal_loss = arch_config.use_focal_loss
+            self.focal_gamma = arch_config.focal_gamma
             self.use_class_balanced = not args.no_class_balanced
             self.class_balance_beta = args.class_balance_beta
             self.progressive_aug = args.progressive_aug
@@ -3331,7 +3398,7 @@ def main():
     config = TrainingConfig(args, arch_config)
     
     # 创建 Tokenizer (默认使用 GumbelTopKSplitter - Scheme D)
-    from vit_pytorch.tokenizer_streaming import StreamingFractalTokenizerV3
+    from vit_pytorch.modules.tokenizer import StreamingFractalTokenizerV3
 
     # I30-17: 使用动态深度计算
     # Note: Splitter 由模型内部创建 GumbelTopKSplitter 时自动处理，
@@ -3351,6 +3418,7 @@ def main():
     )
 
     # 创建模型 (V3 Variable Depth Tokens)
+    # 三层参数：参数(模型固定) + 变参数(动态计算) + 超参数(架构配置)
     model_kwargs = dict(
         image_size=spec.image_size,
         num_classes=spec.num_classes,
@@ -3360,7 +3428,7 @@ def main():
         mlp_dim=config.mlp_dim,
         pool=config.pool,
         channels=spec.channels,
-        dim_head=config.dim_head,
+        dim_head=config.dim // config.heads,  # 自动计算
         # I120-2: 分离 dropout 配置
         tokenizer_dropout=config.tokenizer_dropout,
         transformer_dropout=config.transformer_dropout,
@@ -3374,12 +3442,37 @@ def main():
         # 使用自定义 tokenizer (支持高级分割参数)
         tokenizer=tokenizer,
         # I122-2: lca_temperature 已移除，由 hilbert_bias_scale 统一缩放
+        # 编码超参数
+        use_hilbert_encoding=config.use_hilbert_encoding,
+        use_spatial_encoding=config.use_spatial_encoding,
         # I31-3: 面积编码参数
         use_area_encoding=config.use_area_encoding,
         use_affine_modulation=config.use_affine_modulation,
         fourier_levels=config.fourier_levels,
+        # I113-2: target_ratio - L1 相对参数
+        target_ratio=config.target_ratio,
+        # I104-3: LCA FP16 存储
+        lca_fp16=config.lca_fp16,
+        # I162-1: Hilbert 模式编码器
+        use_pattern_encoder=config.use_pattern_encoder,
+        pattern_encoder_mode=config.pattern_encoder_mode,
+        pattern_encoder_window_sizes=config.pattern_encoder_window_sizes,
         # I24-2: 可学习配额控制 (Scheme E)
         quota_learnable=config.quota_learnable,
+        quota_entropy_weight=config.quota_entropy_weight,
+        # I140: Splitter 架构参数 (I145: 添加 splitter_type)
+        splitter_type=config.splitter_type,
+        splitter_hidden_dim=config.splitter_hidden_dim,
+        splitter_feature_dim=config.splitter_feature_dim,
+        splitter_pool_size=config.splitter_pool_size,
+        # I145: Splitter 温度参数
+        splitter_temp_start=config.splitter_temp_start,
+        splitter_temp_end=config.splitter_temp_end,
+        # I110-7: 语义分裂器配置
+        use_semantic_splitter=config.use_semantic_splitter,
+        semantic_splitter_config=config.semantic_splitter_config,
+        # P6-1: 深度缩放参数 (已在 tokenizer 中传递，此处也传递以防不使用自定义 tokenizer)
+        depth_scale_range=config.depth_scale_range,
     )
 
     model = FractalCurveViT(**model_kwargs).to(device)
@@ -3420,8 +3513,14 @@ def main():
     quota_info = "Scheme E" if config.quota_learnable else "Scheme D (no quota)"
     if config.quota_learnable and config.freeze_quota:
         quota_info += " (frozen)"
-    # I145: 只显示覆盖率范围，K 值由模型架构动态计算
-    split_info = f"GumbelTopKSplitter (coverage∈[{config.token_coverage_min:.0%}, {config.token_coverage_max:.0%}], K=dynamic, {quota_info})"
+    # I145: 根据 splitter_type 显示正确的 Splitter 类型
+    splitter_names = {
+        'gumbel_topk': 'GumbelTopKSplitter',
+        'deterministic_neighbor': 'DeterministicNeighborSplitter',
+        'semantic_redundancy': 'SemanticRedundancySplitter',
+    }
+    splitter_name = splitter_names.get(config.splitter_type, config.splitter_type)
+    split_info = f"{splitter_name} (coverage∈[{config.token_coverage_min:.0%}, {config.token_coverage_max:.0%}], K=dynamic, {quota_info})"
     tokenizer_name = f'StreamingFractalTokenizerV3 ({split_info})'
 
     # P6-1/P6-2 信息
@@ -3920,9 +4019,9 @@ def main():
     if use_mixup and config.warmup_epochs > 0:
         print(f"[INFO] Mixup/CutMix 将在 warmup 阶段 (epoch 1-{config.warmup_epochs}) 禁用")
     
-    # P14: 长尾效应优化信息
+    # I147: 长尾效应优化信息 (Focal Loss 默认禁用)
     if config.use_focal_loss or config.use_class_balanced or config.progressive_aug:
-        print(f"[INFO] P14 长尾效应优化:")
+        print(f"[INFO] I147 长尾效应优化:")
         if config.use_focal_loss:
             print(f"  - Focal Loss: gamma={config.focal_gamma}")
         if config.use_class_balanced:

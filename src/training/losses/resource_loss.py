@@ -147,7 +147,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from training.core.resource_stats import ModelResourceStats
-from vit_pytorch.constants import EPS  # I112-3: 统一数值稳定性常量
+from vit_pytorch.core.constants import EPS  # I112-3: 统一数值稳定性常量
 
 
 def compute_depth_entropy(

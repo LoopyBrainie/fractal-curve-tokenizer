@@ -605,7 +605,7 @@ def main():
     
     # 创建或加载模型
     from vit_pytorch import FractalCurveViT
-    from vit_pytorch.tokenizer_streaming import StreamingFractalTokenizerV3
+    from vit_pytorch.modules.tokenizer import StreamingFractalTokenizerV3
     
     tokenizer = StreamingFractalTokenizerV3(
         image_size=max(spec['image_size'], 32),

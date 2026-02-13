@@ -35,8 +35,8 @@ import warnings
 
 # I36: 导入 BaseTokenizer 用于 FractalModelProtocol
 try:
-    from vit_pytorch.tokenizer_streaming import BaseTokenizer
-    from vit_pytorch.model_fractal_vit import TrainingStats
+    from vit_pytorch.modules.tokenizer import BaseTokenizer
+    from vit_pytorch.models.fractal_vit import TrainingStats
 except ImportError:
     BaseTokenizer = None  # type: ignore
     TrainingStats = None  # type: ignore

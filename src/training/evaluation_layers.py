@@ -104,7 +104,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from vit_pytorch.constants import EPS  # I112-3: 统一数值稳定性常量
+from vit_pytorch.core.constants import EPS  # I112-3: 统一数值稳定性常量
 
 
 # ============================================================================
@@ -180,7 +180,9 @@ class L2TokenizerMetrics:
     
     # 内容感知分析
     content_token_correlation: float = 0.0  # 图像复杂度与 token 数相关性
-    
+    complexity_depth_correlation: float = 0.0  # I133-2: 图像复杂度与平均深度相关性
+    complexity_shallow_ratio_correlation: float = 0.0  # I133-2: 复杂度与浅层token比例相关性
+
     # 每类分析
     per_class_avg_tokens: Dict[int, float] = field(default_factory=dict)
     
@@ -766,6 +768,8 @@ class TokenizerEvaluator:
         per_class_tokens = defaultdict(list)
         total_coverage = 0.0
         image_complexities = []
+        # I133-2: 收集每张图像的复杂度与深度信息，用于相关性分析
+        complexity_depth_pairs = []  # (complexity, avg_depth, shallow_ratio, deep_ratio)
         
         with torch.no_grad():
             for batch_idx, (imgs, labels) in enumerate(tqdm(
@@ -815,13 +819,34 @@ class TokenizerEvaluator:
                     per_class_tokens[labels[i].item()].append(n_tokens)
                 
                 # 深度分布 (I139: 修复 - 使用 levels_list() 方法替代废弃的 output.sequences)
+                # I133-2: 同时收集每个样本的深度信息用于相关性分析
                 levels_list = output.levels_list()
+                max_depth = getattr(model, 'max_depth', 4)  # 获取最大深度
                 for i in range(B):
                     levels = levels_list[i]
-                    # 修复: 展平并确保每个元素是 Python 标量
-                    for d in levels.cpu().flatten().numpy():
-                        d_val = d.item() if isinstance(d, (list, tuple, torch.Tensor)) else d
-                        depth_counts[int(d_val)] += 1
+                    levels_np = levels.cpu().flatten().numpy()
+                    # 计算该样本的深度统计
+                    level_counts = np.bincount(levels_np.astype(int), minlength=max_depth+1)
+                    total_level_tokens = level_counts.sum()
+                    if total_level_tokens > 0:
+                        # 平均深度 (加权)
+                        depths = np.arange(len(level_counts))
+                        avg_depth = (depths * level_counts).sum() / total_level_tokens
+                        # 浅层比例 (depth <= 1): 通常捕获粗粒度语义
+                        shallow_ratio = (level_counts[:2].sum()) / total_level_tokens if len(level_counts) >= 2 else 1.0
+                        # 深层比例 (depth >= 3): 捕获细粒度细节
+                        deep_ratio = (level_counts[3:].sum()) / total_level_tokens if len(level_counts) >= 4 else 0.0
+                        # 存储供后续相关性计算 (索引逆序因为token_counts是append的)
+                        complexity_depth_pairs.append({
+                            'avg_depth': avg_depth,
+                            'shallow_ratio': shallow_ratio,
+                            'deep_ratio': deep_ratio,
+                            'token_count': total_level_tokens
+                        })
+                    # 聚合深度计数
+                    for d_val in levels_np:
+                        d = d_val.item() if isinstance(d_val, (list, tuple, torch.Tensor)) else d_val
+                        depth_counts[int(d)] += 1
                 
                 # 空间覆盖率
                 regions, _ = output.get_padded_regions()
@@ -844,12 +869,38 @@ class TokenizerEvaluator:
                 edges_x = F.conv2d(gray.unsqueeze(1), sobel_x, padding=1)
                 edges_y = F.conv2d(gray.unsqueeze(1), sobel_y, padding=1)
                 edge_magnitude = torch.sqrt(edges_x**2 + edges_y**2)
-                
+
                 for i in range(B):
                     complexity = edge_magnitude[i].mean().item()
-                    image_complexities.append((complexity, token_counts[-(B - i)]))
-        
+                    # I133-2: 配对复杂度与深度信息 (逆序索引)
+                    depth_info = complexity_depth_pairs[-(B - i)]
+                    image_complexities.append((complexity, depth_info['token_count']))
+                    # 更新复杂度-深度配对信息
+                    complexity_depth_pairs[-(B - i)]['complexity'] = complexity
+
+        # I133-2: 计算复杂度与深度分布的相关性
+        valid_pairs = [p for p in complexity_depth_pairs if 'complexity' in p]
+        if len(valid_pairs) > 10:
+            complexities = np.array([p['complexity'] for p in valid_pairs])
+            avg_depths = np.array([p['avg_depth'] for p in valid_pairs])
+            shallow_ratios = np.array([p['shallow_ratio'] for p in valid_pairs])
+            deep_ratios = np.array([p['deep_ratio'] for p in valid_pairs])
+
+            # 复杂度与平均深度相关性
+            if np.std(complexities) > 1e-6 and np.std(avg_depths) > 1e-6:
+                complexity_depth_corr = float(np.corrcoef(complexities, avg_depths)[0, 1])
+
+            # 复杂度与浅层token比例相关性
+            if np.std(complexities) > 1e-6 and np.std(shallow_ratios) > 1e-6:
+                complexity_shallow_corr = float(np.corrcoef(complexities, shallow_ratios)[0, 1])
+
+        # I133-2: 创建metrics并设置相关性（在最后设置以避免被覆盖）
         metrics = L2TokenizerMetrics()
+        if len(valid_pairs) > 10:
+            if np.std(complexities) > 1e-6 and np.std(avg_depths) > 1e-6:
+                metrics.complexity_depth_correlation = complexity_depth_corr
+            if np.std(complexities) > 1e-6 and np.std(shallow_ratios) > 1e-6:
+                metrics.complexity_shallow_ratio_correlation = complexity_shallow_corr
         
         # Token 统计
         token_counts = np.array(token_counts)
