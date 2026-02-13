@@ -460,10 +460,8 @@ class FractalCurveViT(nn.Module):
             self.splitter = splitter
         else:
             # I98-1: 确定 max_level_limit (根据 tokenizer 或默认值)
-            # I130-3: DeterministicNeighborSplitter 使用较小的 max_level_limit 以避免 OOM
-            # 注意: 候选区域数量 = sum(4^d for d in 0..max_level_limit)
-            # max_level_limit=4: N=341, max_level_limit=8: N=87381 (会 OOM!)
-            max_level_limit = 4  # 降低默认值以避免 OOM
+            # I164-1: 现在使用分块处理，不再有 OOM 问题
+            max_level_limit = 8  # I164-1: 支持完整的 Hilbert 层级
             if tokenizer is not None:
                 if hasattr(tokenizer, 'max_level'):
                     max_level_limit = tokenizer.max_level

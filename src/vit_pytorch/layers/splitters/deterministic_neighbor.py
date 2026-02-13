@@ -85,7 +85,7 @@ class DeterministicNeighborSplitterConfig:
 
     # ==================== Hilbert 曲线参数 ====================
     min_patch_size: int = 4
-    max_level_limit: int = 4
+    max_level_limit: int = 8  # I164-1: 提升至 8 以充分利用 Hilbert 局部性
 
     # ==================== 邻居感知参数 ====================
     neighbor_threshold: int = 2  # ℓ 阈值
@@ -787,11 +787,19 @@ class DeterministicNeighborSplitter(
         features: Tensor,
         regions: Tensor,
         output_size: Tuple[int, int],
+        chunk_size: int = 64,  # I164-1: 分块处理，避免 OOM
     ) -> Tensor:
         """
-        ROI Align操作 - 可微实现
+        ROI Align操作 - 可微实现 (分块处理版本)
 
         使用grid_sample进行双线性插值采样
+        I164-1: 改为分块处理以支持 max_level_limit=8
+
+        数学:
+            原显存: M = N × C × h × w × 4 bytes
+            分块后: M_chunk = chunk_size × C × h × w × 4 bytes
+            若 chunk_size=64, C=384, h=w=14: M_chunk ≈ 1.9 MB
+            相比 L=8 时的 ~42GB，降低 ~22,000 倍
         """
         B, C, H_feat, W_feat = features.shape
         N = regions.shape[0]
@@ -800,50 +808,62 @@ class DeterministicNeighborSplitter(
         if N == 0:
             return torch.zeros(B * N, C, device=features.device)
 
-        # 归一化区域坐标到[-1, 1]
-        h, w = self.image_size
-        normalized = regions.clone()
-        normalized[:, 0] = 2.0 * regions[:, 0] / w - 1.0
-        normalized[:, 1] = 2.0 * regions[:, 1] / h - 1.0
-        normalized[:, 2] = 2.0 * regions[:, 2] / w - 1.0
-        normalized[:, 3] = 2.0 * regions[:, 3] / h - 1.0
+        # 预分配输出张量
+        roi_features = torch.zeros(B * N, C, device=features.device, dtype=features.dtype)
 
-        # P-OPT: 向量化创建所有采样网格，避免循环
-        # normalized: [N, 4] where each row is [x0, y0, x1, y1]
-        # 创建相对坐标网格
+        # 归一化区域坐标到[-1, 1]
+        h_img, w_img = self.image_size
+        normalized = regions.clone()
+        normalized[:, 0] = 2.0 * regions[:, 0] / w_img - 1.0
+        normalized[:, 1] = 2.0 * regions[:, 1] / h_img - 1.0
+        normalized[:, 2] = 2.0 * regions[:, 2] / w_img - 1.0
+        normalized[:, 3] = 2.0 * regions[:, 3] / h_img - 1.0
+
+        # 创建相对坐标网格 (只创建一次，复用到所有chunks)
         y_rel = torch.linspace(0, 1, oh, device=features.device, dtype=features.dtype)
         x_rel = torch.linspace(0, 1, ow, device=features.device, dtype=features.dtype)
-        # y_rel: [oh, 1], x_rel: [1, ow]
         y_2d = y_rel.unsqueeze(1).expand(oh, ow)  # [oh, ow]
         x_2d = x_rel.unsqueeze(0).expand(oh, ow)  # [oh, ow]
-        # 提取坐标并广播: [N, oh, ow]
-        x0 = normalized[:, 0:1].unsqueeze(1).expand(N, oh, ow)
-        y0 = normalized[:, 1:2].unsqueeze(1).expand(N, oh, ow)
-        x1 = normalized[:, 2:3].unsqueeze(1).expand(N, oh, ow)
-        y1 = normalized[:, 3:4].unsqueeze(1).expand(N, oh, ow)
-        # 扩展相对坐标
-        y_2d_exp = y_2d.unsqueeze(0).expand(N, oh, ow)
-        x_2d_exp = x_2d.unsqueeze(0).expand(N, oh, ow)
-        # 线性插值: coord = start + (end - start) * t
-        y_grid = y0 + (y1 - y0) * y_2d_exp
-        x_grid = x0 + (x1 - x0) * x_2d_exp
-        # 堆叠为 [N, oh, ow, 2]
-        all_grids = torch.stack([x_grid, y_grid], dim=-1)
 
-        # 采样
-        roi_features_list = []
-        for b in range(B):
-            sampled = F.grid_sample(
-                features[b:b+1].expand(N, -1, -1, -1),
-                all_grids,
-                mode='bilinear',
-                padding_mode='zeros',
-                align_corners=False,
-            )
-            pooled = sampled.mean(dim=[2, 3])
-            roi_features_list.append(pooled)
+        # I164-1: 分块处理
+        num_chunks = (N + chunk_size - 1) // chunk_size
 
-        return torch.cat(roi_features_list, dim=0)
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * chunk_size
+            end_idx = min(start_idx + chunk_size, N)
+            chunk_n = end_idx - start_idx
+
+            # 获取当前chunk的归一化坐标
+            chunk_normalized = normalized[start_idx:end_idx]  # [chunk_n, 4]
+
+            # 为当前chunk创建采样网格
+            x0 = chunk_normalized[:, 0:1].unsqueeze(1).expand(chunk_n, oh, ow)
+            y0 = chunk_normalized[:, 1:2].unsqueeze(1).expand(chunk_n, oh, ow)
+            x1 = chunk_normalized[:, 2:3].unsqueeze(1).expand(chunk_n, oh, ow)
+            y1 = chunk_normalized[:, 3:4].unsqueeze(1).expand(chunk_n, oh, ow)
+            # 扩展相对坐标
+            y_2d_exp = y_2d.unsqueeze(0).expand(chunk_n, oh, ow)
+            x_2d_exp = x_2d.unsqueeze(0).expand(chunk_n, oh, ow)
+            # 线性插值: coord = start + (end - start) * t
+            y_grid = y0 + (y1 - y0) * y_2d_exp
+            x_grid = x0 + (x1 - x0) * x_2d_exp
+            # 堆叠为 [chunk_n, oh, ow, 2]
+            chunk_grids = torch.stack([x_grid, y_grid], dim=-1)
+
+            # 对每个batch item执行采样
+            for b in range(B):
+                sampled = F.grid_sample(
+                    features[b:b+1].expand(chunk_n, -1, -1, -1),
+                    chunk_grids,
+                    mode='bilinear',
+                    padding_mode='zeros',
+                    align_corners=False,
+                )
+                pooled = sampled.mean(dim=[2, 3])  # [chunk_n, C]
+                # 写入预分配的张量
+                roi_features[b * N + start_idx:b * N + end_idx] = pooled
+
+        return roi_features
 
     def _depth_aware_selection(
         self,
