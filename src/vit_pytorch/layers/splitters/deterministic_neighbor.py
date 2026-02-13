@@ -296,17 +296,19 @@ class HilbertAwareSimilarity(nn.Module):
 
         if self.use_hilbert_decay and hilbert_indices is not None:
             # Hilbert距离衰减
+            # P-OPT: 使用 .clamp() 替代 .item() 避免GPU-CPU同步
             h_diff = hilbert_indices.unsqueeze(0) - hilbert_indices.unsqueeze(1)
             h_diff = h_diff.abs()
-            max_h = max(hilbert_indices.max().item(), 1)
+            max_h = hilbert_indices.max().clamp(min=1).float()
             h_decay = (1 - h_diff.float() / max_h).clamp(min=0)
             sim_matrix = sim_matrix * h_decay.pow(self.decay_power)
 
         if self.use_spatial_decay and positions is not None:
             # 空间距离衰减（L∞距离）
+            # P-OPT: 使用 .clamp() 替代 .item() 避免GPU-CPU同步
             pos_diff = positions.unsqueeze(0) - positions.unsqueeze(1)  # [N, N, 2]
             distances = pos_diff.norm(p=float('inf'), dim=-1)  # [N, N]
-            max_dist = max(positions.max().item(), 1.0)
+            max_dist = positions.max().clamp(min=1.0).float()
             s_decay = (1 - distances / max_dist).clamp(min=0)
             sim_matrix = sim_matrix * s_decay.pow(self.decay_power)
 
@@ -700,13 +702,13 @@ class DeterministicNeighborSplitter(
         # 5. 选择策略：训练模式使用软概率，推理模式使用硬选择
         if self.training or not hard:
             # 训练模式：使用软概率进行梯度流
-            # 应用深度配额权重（不使用inplace操作）
+            # P-OPT: 向量化深度配额权重应用，避免嵌套循环
+            # 使用广播机制替代 B*D 次循环操作
             soft_mask = probs_all.clone()
-            for b in range(B):
-                for d in range(self._max_level + 1):
-                    depth_mask = (self._depth_indices == d)
-                    depth_weight = quota_probs[d] if quota_probs is not None else 1.0
-                    soft_mask[b, depth_mask] = soft_mask[b, depth_mask] * depth_weight
+            if quota_probs is not None:
+                # depth_indices: [N] -> 扩展为 [1, N] 广播到 [B, N]
+                depth_weight_expanded = quota_probs[self._depth_indices]  # [N]
+                soft_mask = soft_mask * depth_weight_expanded.unsqueeze(0)  # [B, N]
             # 重新归一化
             selected_mask = soft_mask / (soft_mask.sum(dim=-1, keepdim=True) + EPS)
         else:
@@ -741,12 +743,22 @@ class DeterministicNeighborSplitter(
             # 先按 Hilbert 索引排序，再按 batch 索引排序
             hilbert_order = torch.argsort(selected_hilbert, stable=True)
             batch_sorted = batch_indices[hilbert_order]
-            # 计算每个 batch 内的顺序索引
-            token_indices = torch.zeros(selected_depths.numel(), dtype=torch.long, device=features.device)
-            for b in range(B):
-                mask_b = batch_sorted == b
-                if mask_b.sum() > 0:
-                    token_indices[mask_b] = torch.arange(mask_b.sum(), dtype=torch.long, device=features.device)
+            # P-OPT: 完全向量化计算每个 batch 内的顺序索引，避免 Python 循环
+            # 原理：先按 batch 排序（用 stable sort），然后用 cumsum 计算每个 batch 内的顺序
+            # 由于我们先按 hilbert 排序，这里需要用另一种方法：
+            # 使用 scatter_add 基于 batch 计数来分配索引
+            M = selected_depths.numel()
+            # 创建位置 tensor [0, 1, 2, ..., M-1]
+            positions = torch.arange(M, device=features.device)
+            # 使用 bincount 计算每个 batch 的累积起始位置
+            batch_counts = batch_sorted.bincount(minlength=B)  # [B]
+            # cumsum[:-1] 给出每个 batch 的起始偏移量
+            batch_starts = torch.zeros(M, dtype=torch.long, device=features.device)
+            if B > 1:
+                batch_starts = F.pad(batch_counts.cumsum(0)[:-1], (1, 0))  # [B]
+            # 将起始偏移量广播到每个元素，然后减去
+            start_offsets = batch_starts[batch_sorted]  # [M]
+            token_indices = positions - start_offsets
             # 按原始排序反序回去
             token_indices = token_indices[torch.argsort(hilbert_order, stable=True)]
         else:
@@ -796,17 +808,27 @@ class DeterministicNeighborSplitter(
         normalized[:, 2] = 2.0 * regions[:, 2] / w - 1.0
         normalized[:, 3] = 2.0 * regions[:, 3] / h - 1.0
 
-        # 创建采样网格
-        grid_list = []
-        for i in range(N):
-            x0, y0, x1, y1 = normalized[i]
-            y_grid = torch.linspace(y0, y1, oh, device=features.device, dtype=features.dtype)
-            x_grid = torch.linspace(x0, x1, ow, device=features.device, dtype=features.dtype)
-            y_g, x_g = torch.meshgrid(y_grid, x_grid, indexing='ij')
-            grid = torch.stack([x_g, y_g], dim=-1)
-            grid_list.append(grid.unsqueeze(0))
-
-        all_grids = torch.cat(grid_list, dim=0)
+        # P-OPT: 向量化创建所有采样网格，避免循环
+        # normalized: [N, 4] where each row is [x0, y0, x1, y1]
+        # 创建相对坐标网格
+        y_rel = torch.linspace(0, 1, oh, device=features.device, dtype=features.dtype)
+        x_rel = torch.linspace(0, 1, ow, device=features.device, dtype=features.dtype)
+        # y_rel: [oh, 1], x_rel: [1, ow]
+        y_2d = y_rel.unsqueeze(1).expand(oh, ow)  # [oh, ow]
+        x_2d = x_rel.unsqueeze(0).expand(oh, ow)  # [oh, ow]
+        # 提取坐标并广播: [N, oh, ow]
+        x0 = normalized[:, 0:1].unsqueeze(1).expand(N, oh, ow)
+        y0 = normalized[:, 1:2].unsqueeze(1).expand(N, oh, ow)
+        x1 = normalized[:, 2:3].unsqueeze(1).expand(N, oh, ow)
+        y1 = normalized[:, 3:4].unsqueeze(1).expand(N, oh, ow)
+        # 扩展相对坐标
+        y_2d_exp = y_2d.unsqueeze(0).expand(N, oh, ow)
+        x_2d_exp = x_2d.unsqueeze(0).expand(N, oh, ow)
+        # 线性插值: coord = start + (end - start) * t
+        y_grid = y0 + (y1 - y0) * y_2d_exp
+        x_grid = x0 + (x1 - x0) * x_2d_exp
+        # 堆叠为 [N, oh, ow, 2]
+        all_grids = torch.stack([x_grid, y_grid], dim=-1)
 
         # 采样
         roi_features_list = []
@@ -852,6 +874,9 @@ class DeterministicNeighborSplitter(
         # 确保K_d至少为1
         K_d = K_d.clamp(min=1)
 
+        # P-OPT: 一次性转换为Python列表，避免循环内多次GPU-CPU同步
+        K_d_list = K_d.tolist()
+
         selected_mask = torch.zeros(B, N, device=device)
 
         for b in range(B):
@@ -866,7 +891,8 @@ class DeterministicNeighborSplitter(
                     continue
 
                 depth_probs = probs_b[depth_mask]
-                k_d = min(K_d[d].item(), len(depth_probs))
+                # P-OPT: 使用预转换的K_d_list，避免循环内.item()调用
+                k_d = min(K_d_list[d], len(depth_probs))
 
                 if k_d > 0:
                     _, topk_local = depth_probs.topk(k_d)

@@ -3768,7 +3768,11 @@ def main():
 
             # 设置编译缓存和错误处理
             # I107-6: 优化编译配置，提升训练性能
-            torch._inductor.config.cache_size_limit = 512
+            # I162-1 fix: 添加 try-except 处理 PyTorch 版本兼容性问题
+            try:
+                torch._inductor.config.cache_size_limit = 512
+            except AttributeError:
+                pass  # 旧版本 PyTorch 没有这个配置项
             torch._dynamo.config.suppress_errors = False
 
             # P-OPT: 启用 cudagraphs (CUDA图优化 ~10% 性能提升)
