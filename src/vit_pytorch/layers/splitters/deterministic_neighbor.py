@@ -43,6 +43,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from vit_pytorch.layers.splitters.gumbel_topk import TensorSplitResult
 from vit_pytorch.core.splitter_protocol import (
     CoreSplitter,
     AnnealingSplitter,
@@ -622,7 +623,7 @@ class DeterministicNeighborSplitter(
         features: Tensor,
         image_size: Optional[Tuple[int, int]] = None,
         hard: bool = False,
-    ) -> SplitResult:
+    ) -> TensorSplitResult:  # I162-1: 返回 TensorSplitResult 以兼容 tokenizer
         """
         执行确定性邻居感知分割决策
 
@@ -650,12 +651,17 @@ class DeterministicNeighborSplitter(
         regions = self._regions  # [N, 4]
         N = regions.shape[0]
 
+        # I162-1 fix: 返回 TensorSplitResult 以兼容 tokenizer
         if N == 0:
-            return SplitResult(
-                regions=torch.empty(0, 4, device=features.device),
-                depths=torch.empty(0, dtype=torch.long, device=features.device),
-                batch_indices=torch.empty(0, dtype=torch.long, device=features.device),
-                hilbert_indices=torch.empty(0, dtype=torch.long, device=features.device),
+            empty_tensor = torch.empty(0, dtype=torch.long, device=features.device)
+            return TensorSplitResult(
+                regions=torch.empty(0, 4, device=features.device, dtype=torch.long),
+                depths=empty_tensor,
+                batch_indices=empty_tensor,
+                hilbert_indices=empty_tensor,
+                token_indices=empty_tensor,
+                complexities=torch.empty(0, dtype=torch.float32, device=features.device),
+                tokens_per_batch=torch.ones(B, dtype=torch.long, device=features.device),
             )
 
         roi_features = self._roi_align(features, regions, (14, 14))  # [B*N, C]
@@ -728,14 +734,40 @@ class DeterministicNeighborSplitter(
         batch_indices_all = torch.arange(B, device=features.device).unsqueeze(1).expand(-1, N).reshape(B * N)
         batch_indices = batch_indices_all[selected_mask_bool]
 
-        return SplitResult(
-            regions=selected_regions,
+        # I162-1 fix: 返回 TensorSplitResult 以兼容 tokenizer
+        # 计算 token_indices: 每个选中 token 在其 batch 内的顺序索引
+        if selected_depths.numel() > 0:
+            # 使用 Hilbert 排序后的顺序作为 token_indices
+            # 先按 Hilbert 索引排序，再按 batch 索引排序
+            hilbert_order = torch.argsort(selected_hilbert, stable=True)
+            batch_sorted = batch_indices[hilbert_order]
+            # 计算每个 batch 内的顺序索引
+            token_indices = torch.zeros(selected_depths.numel(), dtype=torch.long, device=features.device)
+            for b in range(B):
+                mask_b = batch_sorted == b
+                if mask_b.sum() > 0:
+                    token_indices[mask_b] = torch.arange(mask_b.sum(), dtype=torch.long, device=features.device)
+            # 按原始排序反序回去
+            token_indices = token_indices[torch.argsort(hilbert_order, stable=True)]
+        else:
+            token_indices = torch.empty(0, dtype=torch.long, device=features.device)
+
+        # 计算 tokens_per_batch
+        tokens_per_batch = torch.bincount(batch_indices, minlength=B)
+        # 确保至少每个 batch 有 1 个 token（避免除零错误）
+        tokens_per_batch = torch.clamp(tokens_per_batch, min=1)
+
+        # complexities: 使用 depths 作为复杂度代理（深度越大越复杂）
+        complexities = selected_depths.float()
+
+        return TensorSplitResult(
+            regions=selected_regions.long(),  # I20: 转为 long 以支持位运算
             depths=selected_depths,
             batch_indices=batch_indices,
             hilbert_indices=selected_hilbert,
-            selected_mask=selected_mask,
-            logits=final_scores.view(B, N),
-            probs=probs_all,
+            token_indices=token_indices,
+            complexities=complexities,
+            tokens_per_batch=tokens_per_batch,
         )
 
     def _roi_align(
