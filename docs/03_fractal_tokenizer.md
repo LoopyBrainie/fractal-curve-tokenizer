@@ -26,15 +26,16 @@ where:
 
 Instead of making threshold decisions per region, we evaluate all candidates in parallel and select the Top-K with the highest scores.
 
-**Decision Logits** (I30-4 Updated):
+**Decision Logits** (I30-4 Updated, I131-1 Revised):
 
-$$\text{logits}_i = \text{MLP}(\text{ROI}(F, R_i)) + b_{explore} + \beta \cdot \gamma^{d_i} - \tau_{d_i}$$
+$$\text{logits}_i = \text{MLP}(\text{ROI}(F, R_i)) + b_{explore} - \tau_{d_i}$$
 
 where:
 - $\text{MLP}(\text{ROI}(F, R_i))$: Learnable complexity score (I30-4)
 - $\tau_{d_i}$: Learnable per-depth threshold.
 - $b_{explore}$: Annealed exploration bias.
-- $\gamma^{d_i}$: Depth penalty term (optional).
+
+> **Note (I131-1)**: The depth penalty term $\beta \cdot \gamma^{d_i}$ has been removed. Depth distribution is now fully controlled by the learnable quota mechanism (Scheme E), eliminating the conflict between fixed depth bias and learnable quotas.
 
 > **Note (I30-4)**: The Log-Compensation Bias $b_{log}(d_i) = \log(N_{total} / N_{d_i})$ has been removed in favor of the learnable quota mechanism (Scheme E).
 
@@ -115,12 +116,84 @@ $$E_{shape}(R) = \text{MLP}([r \cdot g; s \cdot (1-g)])$$
 | A (BFS) | ~30% | Partial | Fixed | Deprecated |
 | B (Relaxation) | ~60% | Partial | Fixed | Deprecated |
 | C (Fixed Budget) | 100% | STE | Fixed | Deprecated |
-| **D (Gumbel-Top-K)** | **100%** | **STE** | **Fixed** | **Current** |
-| **E (Learnable Quota)** | **100%** | **STE** | **Learned** | **Recommended** |
+| **D (Gumbel-Top-K)** | **100%** | **STE** | **Fixed** | Legacy |
+| **E (Learnable Quota)** | **100%** | **STE** | **Learned** | Legacy |
+| **F (DeterministicNeighbor)** | **100%** | **100% Direct** | **Learned** | ✓ **Recommended** |
 
 ---
 
-## 3.4 Token Embedding
+## 3.4 DeterministicNeighborSplitter (I160-1)
+
+> **Recommended**: This scheme represents the optimal implementation for Hilbert Curve ViT
+
+### 3.4.1 Overview
+
+`DeterministicNeighborSplitter` is a deterministic alternative to GumbelTopKSplitter, addressing the train/eval inconsistency and gradient sparsity issues caused by Gumbel randomness.
+
+### 3.4.2 Comparison with GumbelTopK
+
+| Dimension | GumbelTopK | DeterministicNeighbor |
+|:---------|:------------|:---------------------|
+| **Randomness Source** | $g \sim Gumbel(0,1)$ | None (deterministic) |
+| **Gradient Coverage** | ~100% (STE) | **100%** (direct) |
+| **Hilbert Locality** | 100% | 100% |
+| **Redundancy Removal** | None | ✓ Neighbor propagation |
+| **train/eval Consistency** | Needs DeterministicTopK | **Inherently consistent** |
+| **Numerical Stability** | Gumbel overflow risk | Stable |
+
+### 3.4.3 Mathematical Formulation
+
+**Hilbert Adjacency Matrix**:
+
+$$A_{ij} = \mathbb{1}[\text{LCA}(i,j) \geq \ell]$$
+
+where $\ell$ is the adjacency threshold (default $\ell=2$).
+
+**Neighbor-Aware Propagation (NAP-style)**:
+
+$$s'_i = s_i + \alpha \cdot \frac{1}{|\mathcal{N}_\ell(i)|} \sum_{j \in \mathcal{N}_\ell(i)} \text{sim}(f_i, f_j) \cdot s_j$$
+
+**Deterministic Selection**:
+
+$$p_i = \text{softmax}(s'_i / \tau)_i$$
+
+**Locality Consistency Loss**:
+
+$$\mathcal{L}_{local} = \sum_{(i,j) \in \mathcal{E}} |\sigma(s_i) - \sigma(s_j)|$$
+
+### 3.4.4 Configuration Parameters
+
+```python
+from vit_pytorch.layers.splitters.deterministic_neighbor import DeterministicNeighborSplitterConfig
+
+config = DeterministicNeighborSplitterConfig(
+    max_level_limit=4,
+    feature_dim=256,
+    hidden_dim=64,
+    neighbor_threshold=2,      # ℓ threshold
+    enable_neighbor_aware=True,
+    alpha_init=0.5,          # Neighbor weight initialization
+    temperature_init=1.0,
+    enable_learnable_quota=True,
+    locality_weight=0.1,      # Locality consistency loss weight
+)
+```
+
+### 3.4.5 Usage Example
+
+```python
+from vit_pytorch import StreamingFractalTokenizerV3
+
+tokenizer = StreamingFractalTokenizerV3(
+    image_size=224,
+    d_model=384,
+    splitter_type='deterministic_neighbor',  # Use DeterministicNeighbor
+)
+```
+
+---
+
+## 3.5 Token Embedding
 
 ### 3.4.1 HilbertNativePatchEmbed
 

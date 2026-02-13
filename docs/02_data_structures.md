@@ -240,7 +240,61 @@ $$\|p_1 - p_2\|_2 \leq C \cdot |H^{-1}(p_1) - H^{-1}(p_2)|^{1/2}$$
 
 ---
 
-## 2.8 Tensor Shape Conventions
+## 2.8 HilbertPatternEncoder (I162-1)
+
+> **New**: Hilbert Order Pattern Encoder
+
+### 2.8.1 Overview
+
+`HilbertPatternEncoder` leverages Hilbert order for spatial pattern extraction. It rearranges tokens by Hilbert order and applies multi-scale 1D convolutions, which is equivalent to 2D window convolutions but more efficient.
+
+### 2.8.2 Mathematical Formulation
+
+$$\tilde{t} = t[\sigma_H]$$
+
+$$f^{(w)} = \text{Conv1D}_w(\tilde{t})$$
+
+$$f = \text{Fusion}([f^{(w_1)}, f^{(w_2)}, \ldots])$$
+
+where $\sigma_H$ is the Hilbert ordering, satisfying $\|pos_i - pos_{i+1}\|_2 \leq \sqrt{2}$.
+
+### 2.8.3 Multi-Scale Design
+
+| Kernel Size | Equivalent Receptive Field | Use Case |
+|:------------|:--------------------------|:---------|
+| k=3 | ~3×3 | Fine-grained texture |
+| k=7 | ~7×7 | Medium-scale patterns |
+| k=15 | ~15×15 | Regional structure |
+
+### 2.8.4 Complexity Analysis
+
+**Time Complexity**: $O(B \cdot N \cdot \sum k_i)$
+
+**Space Complexity**: $O(B \cdot N \cdot D \cdot m)$
+
+Compared to 2D Convolution: $O(B \cdot H \cdot W \cdot \sum k_i^2)$
+
+When $k_i \ll \min(H, W)$, 1D convolution is more efficient.
+
+### 2.8.5 Usage Example
+
+```python
+from vit_pytorch.core.pattern_encoder import HilbertPatternEncoder
+
+encoder = HilbertPatternEncoder(
+    dim=384,
+    window_sizes=(3, 7, 15),  # Multi-scale convolutions
+    out_dim=384,
+)
+
+# Input: tokens [B, N, D], hilbert_order [N]
+pattern_features = encoder(tokens, hilbert_order)
+# Output: [B, N, out_dim]
+```
+
+---
+
+## 2.9 Tensor Shape Conventions
 
 ### Input/Output Shapes
 

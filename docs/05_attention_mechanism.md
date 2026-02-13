@@ -236,19 +236,63 @@ where $\tau$ is a learnable zero-initialized weight.
 
 ---
 
-## 5.7 Bias Mode Comparison
+## 5.7 Hierarchical Soft-Hard Attention (I160-2)
+
+> **Recommended**: Use with DeterministicNeighborSplitter for hard locality guarantees
+
+### 5.7.1 Overview
+
+`HierarchicalSoftHardAttention` (HSHA) provides hard locality guarantees through three-region partitioning, solving the problem where standard attention mechanisms cannot forcibly exclude distant tokens.
+
+### 5.7.2 Three-Region Partitioning
+
+| Region | LCA Depth Condition | Attention Behavior |
+|:-------|:------------------|:------------------|
+| **HARD_ZERO** | $\ell < \ell_{min}$ | Force exclusion (mask = 0) |
+| **SOFT_POSITIVE** | $\ell_{min} \leq \ell < \ell_{soft}$ | Soft bias encouragement |
+| **HARD_ONE** | $\ell \geq \ell_{soft}$ | Full encouragement (mask = 1) |
+
+Default values: $\ell_{min} = 1$ (quadrant boundary), $\ell_{soft} = 2$ (sub-quadrant boundary)
+
+### 5.7.3 Mathematical Formulation
+
+**Hierarchical Mask**:
+
+$$M(\ell) = \begin{cases} 0 & \text{if } \ell < \ell_{min} \\ \sigma(\ell - \ell_{soft}/2) & \text{if } \ell_{min} \leq \ell < \ell_{soft} \\ 1 & \text{if } \ell \geq \ell_{soft} \end{cases}$$
+
+**Attention Formula**:
+
+$$\tilde{A}_{ij} = \frac{QK^T}{\sqrt{d_k}}[i,j] + \alpha(\ell_{ij}) \cdot B_{hilbert}[i,j]$$
+
+### 5.7.4 Configuration Parameters
+
+```python
+from vit_pytorch.layers.attention.hierarchical_soft_hard import HierarchicalAttentionConfig
+
+config = HierarchicalAttentionConfig(
+    lca_min=1.0,
+    lca_soft=2.0,
+    use_temperature=True,
+    learn_thresholds=True,
+)
+```
+
+---
+
+## 5.8 Bias Mode Comparison
 
 | Mode | Parameters | Complexity | Geometric Meaning |
 |:-----|:-----------|:-----------|:------------------|
 | `lca` | ~100 | $O(N^2)$ | Explicit (LCA depth) |
 | `affine_modulation` | ~1K | $O(N^2)$ | Area-aware spatial bias |
 | `shape_scale` | ~1K | $O(N^2)$ | Geometry-aware bias |
+| `hierarchical_soft_hard` | ~100 | $O(N^2)$ | Hard locality guarantee |
 
-**Recommendation**: Use `lca` mode for efficiency, `affine_modulation` for improved performance on datasets with size variation.
+**Recommendation**: Use `lca` for efficiency, `hierarchical_soft_hard` with DeterministicNeighborSplitter for best Hilbert locality.
 
 ---
 
-## 5.8 Implementation
+## 5.9 Implementation
 
 ### Class: HilbertAwareMultiScaleAttention
 
