@@ -635,8 +635,14 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             tensor_result = split_result.to_tensor_split_result()
         elif isinstance(split_result, TensorSplitResult):
             tensor_result = split_result
-        else:
-            raise ValueError(f"Unexpected split result type: {type(split_result)}")
+        elif split_result is not None:
+            # I130-4: 支持 SemanticRedundancySplitter 的 SplitResult 类型
+            # 需要转换为 TensorSplitResult
+            from vit_pytorch.layers.splitters.semantic_redundancy import SplitResult
+            if isinstance(split_result, SplitResult):
+                tensor_result = self.convert_split_result_to_tensor(split_result, images)
+            else:
+                raise ValueError(f"Unexpected split result type: {type(split_result)}")
 
         # I99-1 FIX: 使用强制 clamp 版本处理 tensor_result
         # 始终确保 batch_indices 和 depths 在有效范围内，避免 CUDA assert
