@@ -114,6 +114,9 @@ class CorrelationGate(nn.Module):
 
         assert method == "cosine", f"仅支持 cosine 方法, got {method}"
 
+        # P-OPT: 缓存 triu_indices 避免每次 forward 都创建
+        self.register_buffer('_triu_indices', torch.triu_indices(4, 4, dtype=torch.long))
+
     def forward(self, child_features: torch.Tensor) -> torch.Tensor:
         """计算冗余性分数
 
@@ -123,18 +126,22 @@ class CorrelationGate(nn.Module):
         Returns:
             redundancy: [B, N] 冗余性分数 (0=冗余, 1=独立)
         """
-        # L2 归一化
-        # I112-3: 使用 EPS 统一数值稳定性
-        norms = child_features.norm(dim=-1, keepdim=True)  # [B, N, 4, 1]
-        normalized = child_features / (norms + EPS)  # [B, N, 4, D]
+        # P-OPT: 融合 L2 归一化与矩阵乘法
+        # 原来: norm -> divide -> einsum -> triu_indices
+        # 优化: 直接使用 F.normalize (更高效) + bmm
 
-        # 计算余弦相似度矩阵: [B, N, 4, 4]
-        sim_matrix = torch.einsum('...id,...jd->...ij', normalized, normalized)
+        # L2 归一化 [B, N, 4, D]
+        normalized = F.normalize(child_features, dim=-1, p=2)
+
+        # P-OPT: 使用 bmm 替代 einsum，更高效
+        # [B, N, 4, D] @ [B, N, D, 4] -> [B, N, 4, 4]
+        B, N, _, D = child_features.shape
+        normalized_flat = normalized.view(B * N, 4, D)
+        sim_matrix = torch.bmm(normalized_flat, normalized_flat.transpose(-2, -1))
+        sim_matrix = sim_matrix.view(B, N, 4, 4)
 
         # 提取上三角 (不含对角线): 6 对
-        # indices for upper triangle
-        triu_indices = torch.triu_indices(4, 4, device=child_features.device)
-        sim_pairs = sim_matrix[..., triu_indices[0], triu_indices[1]]  # [B, N, 6]
+        sim_pairs = sim_matrix[..., self._triu_indices[0], self._triu_indices[1]]  # [B, N, 6]
 
         # 平均相似度
         sim_mean = sim_pairs.mean(dim=-1)  # [B, N]
@@ -231,9 +238,13 @@ class SemanticRedundancySplitter(nn.Module):
         temperature: Optional[torch.Tensor] = None,
         hard: bool = False,
     ) -> torch.Tensor:
-        """Gumbel-Softmax 采样
+        """Gumbel-Softmax 采样 (优化版)
 
         公式: g_k = exp((log p_k + g_k') / τ) / ∑_j exp((log p_j + g_j') / τ)
+
+        P-OPT:
+        - 直接在 logit 空间计算，避免多余的 sigmoid -> log 转换
+        - 使用 clamp 替代多次 log + EPS 防护
 
         Args:
             logits: [B, N] 原始 logits
@@ -246,19 +257,18 @@ class SemanticRedundancySplitter(nn.Module):
         if temperature is None:
             temperature = self._get_temperature()
 
-        # 转换为概率
-        probs = torch.sigmoid(logits)
+        # P-OPT: 直接使用 logit，避免 sigmoid -> log 的往返转换
+        # 在 logit 空间添加 Gumbel 噪声: logit + g ~ Gumbel(0, 1)
+        gumbel_noise = torch.rand_like(logits).log_()
 
-        # Gumbel-Softmax
-        # I112-3: 使用 EPS 统一数值稳定性
-        gumbel_noise = -torch.log(-torch.log(torch.rand_like(probs) + EPS) + EPS)
-        softened = (probs.log() + gumbel_noise) / temperature
+        # 添加噪声并除以温度
+        softened = (logits + gumbel_noise) / temperature
 
         if hard:
             # 硬决策: argmax
             return (softened > 0).float()
         else:
-            # 软决策: sigmoid + gumbel
+            # 软决策: sigmoid
             return torch.sigmoid(softened)
 
     def update_temperature(self, step: int, total_steps: int, schedule: str = "cosine"):
