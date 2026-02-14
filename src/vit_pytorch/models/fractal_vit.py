@@ -934,6 +934,15 @@ class FractalCurveViT(nn.Module):
             # 关键修复: 对于确定性模式，hard 参数不影响选择逻辑
             # DeterminativeTopK 模式下，硬掩码和软掩码基于相同的确定性概率
             use_hard = True  # 始终使用硬选择以确保确定性
+
+            # I130-3: SemanticRedundancySplitter 需要 3D 输入 [B, N, D]
+            # 需要将 4D features [B, C, H, W] reshape 为 [B, N, D]
+            from vit_pytorch.layers.splitters.semantic_redundancy import SemanticRedundancySplitter
+            if isinstance(self.splitter, SemanticRedundancySplitter):
+                # features: [B, d_model, H_feat, W_feat] -> [B, N, d_model]
+                B, C, H_feat, W_feat = features.shape
+                features = features.view(B, C, H_feat * W_feat).transpose(1, 2)  # [B, N, C]
+
             split_result = self.splitter(
                 features,
                 image_size=(img.shape[2], img.shape[3]),
