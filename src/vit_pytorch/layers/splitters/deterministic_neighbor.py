@@ -1,5 +1,5 @@
 """
-Deterministic Neighbor-Aware Splitter - Hilbert Curve ViT 最佳实现
+Deterministic Neighbor-Aware Splitter
 
 数学形式化
 ==========
@@ -26,9 +26,6 @@ Deterministic Neighbor-Aware Splitter - Hilbert Curve ViT 最佳实现
     3. 确定性选择: p_i = softmax(s'_i / τ)_i
     4. 局部一致性损失: L_local = Σ_(i,j)∈E |p_i - p_j|
 
-作者: Claude Code
-日期: 2026-02-12
-版本: v1.0
 """
 
 from __future__ import annotations

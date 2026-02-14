@@ -56,12 +56,6 @@ I30-4 更新 (2026-01-15):
     K_opt = clip(estimate_split_count(logits), K_min, K_max)
     estimate 基于 sigmoid(logits) > 0.5 的数量
 
-作者: GitHub Copilot
-日期: 2026-01-15
-版本: 方案 E v1.0 (基于方案D演进)
-版本: I30-2 修正 (2026-01-22): 梯度覆盖率修正为 K/N (~37.6%)
-版本: I109-6 优化 (2026-01-29): 梯度缩放STE，α = K/N
-版本: I113-5 优化 (2026-02-03): 可学习 STE，α = (N/K) × σ(log β) × min(τ/τ_ref, 1)
 """
 
 from __future__ import annotations

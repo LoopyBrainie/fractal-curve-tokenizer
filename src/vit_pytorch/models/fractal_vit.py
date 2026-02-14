@@ -540,6 +540,10 @@ class FractalCurveViT(nn.Module):
                     image_size=self.image_size,
                 )
 
+        # P-OPT: 缓存是否为 SemanticRedundancySplitter，避免每次 forward 都做 isinstance 检查
+        from vit_pytorch.layers.splitters.semantic_redundancy import SemanticRedundancySplitter
+        self._is_semantic_splitter = isinstance(self.splitter, SemanticRedundancySplitter)
+
         # === Tokenizer ===
         if tokenizer is None:
             # 创建 StreamingFractalTokenizerV3
@@ -936,9 +940,8 @@ class FractalCurveViT(nn.Module):
             use_hard = True  # 始终使用硬选择以确保确定性
 
             # I130-3: SemanticRedundancySplitter 需要 3D 输入 [B, N, D]
-            # 需要将 4D features [B, C, H, W] reshape 为 [B, N, D]
-            from vit_pytorch.layers.splitters.semantic_redundancy import SemanticRedundancySplitter
-            if isinstance(self.splitter, SemanticRedundancySplitter):
+            # P-OPT: 使用缓存的 _is_semantic_splitter 避免 isinstance 检查
+            if self._is_semantic_splitter:
                 # features: [B, d_model, H_feat, W_feat] -> [B, N, d_model]
                 B, C, H_feat, W_feat = features.shape
                 features = features.view(B, C, H_feat * W_feat).transpose(1, 2)  # [B, N, C]
@@ -1525,6 +1528,10 @@ class FractalCurveViT(nn.Module):
         with torch.no_grad():
             # I98-2 Bug 修复: 使用完整 pipeline，需要 split_result 参数
             features = self._feature_extractor(img)
+            # P-OPT: SemanticRedundancySplitter 需要 3D 输入
+            if self._is_semantic_splitter:
+                B, C, H_feat, W_feat = features.shape
+                features = features.view(B, C, H_feat * W_feat).transpose(1, 2)
             split_result = self.splitter(
                 features,
                 image_size=(img.shape[2], img.shape[3]),

@@ -12,6 +12,7 @@ SemanticRedundancySplitter - 基于语义冗余的分裂器
 
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
+import math
 
 import torch
 import torch.nn as nn
@@ -29,13 +30,13 @@ class SplitResult:
         child_features: [B, N, 4, D] 预测的子节点特征
         redundancy: [B, N] 冗余性分数 (0=冗余, 1=独立)
         logits: [B, N] 原始 logits
-        temperature: 当前温度 (用于 Gumbel-Softmax)
+        temperature: 当前温度 (用于 Gumbel-Softmax)，使用 tensor 避免 GPU-CPU 同步
     """
     split_decision: torch.Tensor
     child_features: torch.Tensor
     redundancy: torch.Tensor
     logits: torch.Tensor
-    temperature: float = 1.0
+    temperature: Optional[torch.Tensor] = None  # P-OPT: 改为 Optional tensor 避免 .item() 同步
 
 
 class LookAheadHead(nn.Module):
@@ -274,6 +275,8 @@ class SemanticRedundancySplitter(nn.Module):
     def update_temperature(self, step: int, total_steps: int, schedule: str = "cosine"):
         """更新温度调度
 
+        P-OPT: 使用 math.cos 替代 torch.tensor 避免破坏 torch.compile
+
         Args:
             step: 当前步
             total_steps: 总步数
@@ -284,8 +287,9 @@ class SemanticRedundancySplitter(nn.Module):
         if schedule == "linear":
             temp = self.gumbel_temp_start + (self.gumbel_temp_end - self.gumbel_temp_start) * progress
         elif schedule == "cosine":
+            # P-OPT: 使用 math.cos 直接计算 float，避免 torch.tensor 破坏计算图
             temp = self.gumbel_temp_end + 0.5 * (self.gumbel_temp_start - self.gumbel_temp_end) * (
-                1 + torch.cos(torch.tensor(progress * 3.14159))
+                1 + math.cos(progress * math.pi)
             )
         elif schedule == "exponential":
             temp = self.gumbel_temp_start * (self.gumbel_temp_end / self.gumbel_temp_start) ** progress
@@ -293,8 +297,8 @@ class SemanticRedundancySplitter(nn.Module):
             temp = self.gumbel_temp_start
 
         if hasattr(self, 'log_temp'):
-            # I112-3: 使用 EPS 统一数值稳定性
-            self.log_temp.data = torch.log(torch.tensor(temp + EPS))
+            # P-OPT: 使用已有的 log_temp device，避免额外同步
+            self.log_temp.data = torch.tensor(math.log(temp + EPS), device=self.log_temp.device, dtype=self.log_temp.dtype)
         else:
             self.fixed_temp.fill_(temp)
 
@@ -343,12 +347,13 @@ class SemanticRedundancySplitter(nn.Module):
             split_decision = self._gumbel_softmax(logits, temperature)
 
         # Step 5: 构建 SplitResult
+        # P-OPT: 直接传递 tensor，避免 .item() 触发 GPU-CPU 同步
         return SplitResult(
             split_decision=split_decision,
             child_features=child_features,
             redundancy=redundancy,
             logits=logits,
-            temperature=temperature.item(),
+            temperature=temperature,
         )
 
     def get_split_regions(
@@ -358,6 +363,8 @@ class SemanticRedundancySplitter(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """根据分裂决策生成子区域
 
+        P-OPT: 使用 nonzero 替代 torch.where，避免 graph break
+
         Args:
             split_result: SplitResult 分裂结果
             region_bounds: [M, 4] 原始区域坐标 (x0, y0, x1, y1)
@@ -366,12 +373,16 @@ class SemanticRedundancySplitter(nn.Module):
             child_bounds: [4*M, 4] 子区域坐标
             child_depths: [4*M] 子区域深度
         """
-        # 获取需要分裂的区域
-        split_mask = split_result.split_decision.bool()  # [B, N]
-        batch_indices = torch.where(split_mask)[0]
-        region_indices = torch.where(split_mask)[1]
+        # P-OPT: 使用比较操作替代 bool()，使用 nonzero 替代 torch.where
+        # 原来: split_mask = split_result.split_decision.bool()
+        #       batch_indices = torch.where(split_mask)[0]
+        #       region_indices = torch.where(split_mask)[1]
+        split_mask = split_result.split_decision > 0.5  # [B, N] - 比较操作更兼容 torch.compile
 
-        if len(region_indices) == 0:
+        # P-OPT: 使用 nonzero(as_tuple=True) 直接获取索引元组
+        batch_indices, region_indices = split_mask.nonzero(as_tuple=True)
+
+        if region_indices.numel() == 0:
             return region_bounds.new_zeros(0, 4), region_bounds.new_zeros(0, dtype=torch.long)
 
         # 计算子区域坐标
