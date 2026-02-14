@@ -217,7 +217,11 @@ class VectorizedPathEncoder:
         # 缩放: grid_x = cx * grid_size // img_size
         gx = cx * grid_size // safe_img_size  # [B, N]
         gy = cy * grid_size // safe_img_size  # [B, N]
-        
+
+        # I130-6: 转换为整数类型以支持位运算
+        gx = gx.long()
+        gy = gy.long()
+
         # 确保在有效范围内
         gx = gx.clamp(0, grid_size - 1)
         gy = gy.clamp(0, grid_size - 1)
