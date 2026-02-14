@@ -291,17 +291,19 @@ class SemanticRedundancySplitter(nn.Module):
     def forward(
         self,
         features: torch.Tensor,
-        depth: int,
-        remaining_quota: float,
+        depth: int = 0,  # I140: 兼容 GumbelTopK 接口，默认从根节点开始
+        remaining_quota: float = 1.0,  # I140: 兼容 GumbelTopK 接口，默认全配额
         hard: bool = False,
+        image_size: Optional[tuple] = None,  # I140: 兼容 GumbelTopK 接口但不使用
     ) -> SplitResult:
         """前向传播
 
         Args:
             features: [B, N, D] 区域特征
-            depth: 当前深度 (绝对值)
-            remaining_quota: 剩余配额比例 (0~1)
+            depth: 当前深度 (绝对值)，默认 0
+            remaining_quota: 剩余配额比例 (0~1)，默认 1.0
             hard: 硬决策 (推理模式)
+            image_size: (H, W) 图像尺寸 (可选，用于接口兼容，SemanticRedundancy 不使用)
 
         Returns:
             SplitResult: 分裂结果

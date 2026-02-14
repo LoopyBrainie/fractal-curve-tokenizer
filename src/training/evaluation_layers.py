@@ -828,26 +828,25 @@ class TokenizerEvaluator:
                     levels_np = levels.cpu().flatten().numpy()
                     # 过滤负值（padding），只保留有效的非负深度值
                     valid_levels = levels_np[levels_np >= 0]
+                    # I140 FIX: 即使 valid_levels 为空也添加占位条目，保持索引对齐
                     if len(valid_levels) == 0:
+                        complexity_depth_pairs.append({
+                            'avg_depth': 0.0,
+                            'shallow_ratio': 0.0,
+                            'deep_ratio': 0.0,
+                            'token_count': 0
+                        })
                         continue
                     # 计算该样本的深度统计
                     level_counts = np.bincount(valid_levels.astype(int), minlength=max_depth+1)
                     total_level_tokens = level_counts.sum()
-                    if total_level_tokens > 0:
-                        # 平均深度 (加权)
-                        depths = np.arange(len(level_counts))
-                        avg_depth = (depths * level_counts).sum() / total_level_tokens
-                        # 浅层比例 (depth <= 1): 通常捕获粗粒度语义
-                        shallow_ratio = (level_counts[:2].sum()) / total_level_tokens if len(level_counts) >= 2 else 1.0
-                        # 深层比例 (depth >= 3): 捕获细粒度细节
-                        deep_ratio = (level_counts[3:].sum()) / total_level_tokens if len(level_counts) >= 4 else 0.0
-                        # 存储供后续相关性计算 (索引逆序因为token_counts是append的)
-                        complexity_depth_pairs.append({
-                            'avg_depth': avg_depth,
-                            'shallow_ratio': shallow_ratio,
-                            'deep_ratio': deep_ratio,
-                            'token_count': total_level_tokens
-                        })
+                    # 存储供后续相关性计算 (索引逆序因为token_counts是append的)
+                    complexity_depth_pairs.append({
+                        'avg_depth': (np.arange(len(level_counts)) * level_counts).sum() / total_level_tokens if total_level_tokens > 0 else 0.0,
+                        'shallow_ratio': level_counts[:2].sum() / total_level_tokens if total_level_tokens > 0 and len(level_counts) >= 2 else 1.0,
+                        'deep_ratio': level_counts[3:].sum() / total_level_tokens if total_level_tokens > 0 and len(level_counts) >= 4 else 0.0,
+                        'token_count': total_level_tokens
+                    })
                     # 聚合深度计数 (跳过负值/padding)
                     for d_val in valid_levels:
                         d = int(d_val)
