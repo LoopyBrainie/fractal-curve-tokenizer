@@ -147,8 +147,12 @@ class CorrelationGate(nn.Module):
         # 平均相似度
         sim_mean = sim_pairs.mean(dim=-1)  # [B, N]
 
-        # 冗余性: 0 = 完全冗余, 1 = 完全独立
-        redundancy = 1.0 - sim_mean
+        # CRITICAL FIX: 使用 sigmoid 归一化，避免随机特征 100% 倾向分裂
+        # 原公式: r = 1 - sim_mean
+        # 问题: 随机独立特征 E[sim]=0，导致 r≈1 (总是分裂)
+        # 修正: 使用 sigmoid 将均值映射到 [0,1] 范围
+        # 当 sim_mean=0.5 时 r=0.5 (中性)；sim_mean=1 时 r≈1 (完全冗余→不分裂)
+        redundancy = torch.sigmoid(sim_mean * 10 - 5)
 
         return redundancy
 
@@ -221,10 +225,17 @@ class SemanticRedundancySplitter(nn.Module):
 
     def _init_parameters(self):
         """初始化决策参数"""
-        # 初始时倾向于不分裂 (负偏置)
-        nn.init.constant_(self.bias, -0.5)
-        # 冗余性权重初始为正 (冗余 → 不分裂)
-        nn.init.constant_(self.w_r, 1.0)
+        # CRITICAL FIX: 修正决策边界初始化
+        # 原始: bias=-0.5, w_r=1.0 → logits = r - 0.5，分裂条件 r > 0.5
+        # 问题: 随机特征期望 r≈0.5，会导致 100% 倾向分裂
+        # 修正后:
+        #   - bias=0: 中性偏置
+        #   - w_r=-1.0: 冗余高 → logits 低 → 不分裂 (符合直觉)
+        #   - w_d=0.5, w_q=0.5: 深度越深/配额越多 → 倾向于分裂
+        nn.init.constant_(self.bias, 0.0)
+        nn.init.constant_(self.w_r, -1.0)  # 负权重: 冗余高 → 不分裂
+        nn.init.constant_(self.w_d, 0.5)
+        nn.init.constant_(self.w_q, 0.5)
 
     def _get_temperature(self) -> torch.Tensor:
         """获取当前温度"""
@@ -233,15 +244,18 @@ class SemanticRedundancySplitter(nn.Module):
         else:
             return self.fixed_temp
 
-    def _gumbel_softmax(
+    def _binary_gumbel_sigmoid(
         self,
         logits: torch.Tensor,
         temperature: Optional[torch.Tensor] = None,
         hard: bool = False,
     ) -> torch.Tensor:
-        """Gumbel-Softmax 采样 (优化版)
+        """二元 Gumbel-Sigmoid 采样
 
-        公式: g_k = exp((log p_k + g_k') / τ) / ∑_j exp((log p_j + g_j') / τ)
+        数学说明:
+        - 原名 _gumbel_softmax 命名不当：实际实现的是二元 sigmoid 而非多元 softmax
+        - 公式: p = sigmoid((logits + g) / τ)，其中 g ~ Gumbel(0, 1)
+        - 等价于: p = σ(logits/τ + g')，其中 g' ~ Gumbel(0, 1)
 
         P-OPT:
         - 直接在 logit 空间计算，避免多余的 sigmoid -> log 转换
@@ -253,7 +267,7 @@ class SemanticRedundancySplitter(nn.Module):
             hard: 硬决策 (argmax)
 
         Returns:
-            samples: [B, N] 采样结果
+            samples: [B, N] 采样结果，范围 [0, 1]
         """
         if temperature is None:
             temperature = self._get_temperature()
@@ -266,11 +280,21 @@ class SemanticRedundancySplitter(nn.Module):
         softened = (logits + gumbel_noise) / temperature
 
         if hard:
-            # 硬决策: argmax
+            # 硬决策: threshold at 0 (等价于 sigmoid > 0.5)
             return (softened > 0).float()
         else:
-            # 软决策: sigmoid
+            # 软决策: sigmoid 将实数映射到 [0, 1]
             return torch.sigmoid(softened)
+
+    # 兼容旧接口
+    def _gumbel_softmax(
+        self,
+        logits: torch.Tensor,
+        temperature: Optional[torch.Tensor] = None,
+        hard: bool = False,
+    ) -> torch.Tensor:
+        """兼容别名 (已弃用，请使用 _binary_gumbel_sigmoid)"""
+        return self._binary_gumbel_sigmoid(logits, temperature, hard)
 
     def update_temperature(self, step: int, total_steps: int, schedule: str = "cosine"):
         """更新温度调度
@@ -297,8 +321,11 @@ class SemanticRedundancySplitter(nn.Module):
             temp = self.gumbel_temp_start
 
         if hasattr(self, 'log_temp'):
-            # P-OPT: 使用已有的 log_temp device，避免额外同步
-            self.log_temp.data = torch.tensor(math.log(temp + EPS), device=self.log_temp.device, dtype=self.log_temp.dtype)
+            # P-OPT: 优化 CPU-GPU 同步
+            # 原始: torch.tensor(math.log(temp + EPS), ...) - 触发 CPU 计算
+            # 优化: 将 temp 转换为 tensor 后在 GPU 上计算 log
+            temp_tensor = torch.tensor(temp, device=self.log_temp.device, dtype=self.log_temp.dtype)
+            self.log_temp.data = (temp_tensor + EPS).log()
         else:
             self.fixed_temp.fill_(temp)
 

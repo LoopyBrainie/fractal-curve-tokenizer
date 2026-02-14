@@ -525,6 +525,51 @@ CURRICULUM_BASE_BUDGET_WEIGHT: float = 0.01
 #: 数学: λ_depth = 0.1 与其他辅助损失量级匹配
 DEPTH_BALANCE_WEIGHT: float = 0.1
 
+# ============================================================================
+# Hilbert 空间均匀性优化常量 (I150 新增)
+# ============================================================================
+# 解决 GumbelTopK 采样空间分布不均问题的优化方案
+
+# I150-1: 几何密度惩罚 (Hilbert Space Density Bias)
+#: Hilbert 邻近度窗口大小
+#: 数学: w 决定了局部邻域的范围，w 越大惩罚范围越广
+#: 选择: w=64 覆盖约 1/4 的 Hilbert 曲线，适合中等尺度均匀性
+HILBERT_DENSITY_WINDOW: int = 64
+
+#: 几何密度惩罚权重
+#: 数学: L_density = γ × Σ density_i，γ 控制均匀性强度
+#: 选择: γ=0.1 与 quota 正则化权重相当
+DENSITY_PENALTY_WEIGHT: float = 0.1
+
+#: 密度惩罚学习率系数 (可选，让模型学习最优 γ)
+#: 如果为 None，则使用固定权重
+DENSITY_PENALTY_LEARNABLE: bool = False
+
+# I150-2: 深度自适应温度 (Adaptive Temperature per Depth)
+#: 深度温度缩放指数
+#: 数学: τ_d = τ_base × (N_max / N_d)^γ，其中 N_d = 4^d
+#: γ ∈ (0, 1) 控制缩放强度，γ=0.5 提供温和的平衡
+DEPTH_TEMPERATURE_GAMMA: float = 0.5
+
+#: 是否启用深度自适应温度
+#: 推荐: True，与 quota 机制协同工作
+DEPTH_ADAPTIVE_TEMPERATURE_ENABLED: bool = True
+
+# I150-3: Hilbert-DPP 贪心采样
+#: DPP 贪心多样性权重
+#: 数学: score_i = logits_i - λ × max_{j∈selected} S[i,j]
+#: λ 控制多样性-质量权衡，λ 越大多样性越高
+DIVERSITY_LAMBDA: float = 0.5
+
+#: 是否启用 Hilbert-DPP 贪心采样
+#: 注意: 目前与分层 Top-K 不兼容
+DIVERSITY_SAMPLING_ENABLED: bool = False
+
+#: Hilbert 距离带宽参数 (用于相似度计算)
+#: 数学: S[i,j] = exp(-|h_i - h_j|² / σ²)
+#: σ 决定相似度衰减速度，σ 越大相似度衰减越慢
+HILBERT_DIVERSITY_SIGMA: float = 128.0
+
 
 # ============================================================================
 # TIER 2: 变参数计算函数 (Variables)

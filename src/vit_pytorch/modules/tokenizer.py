@@ -451,6 +451,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         语义分裂器返回的是 split_decision（二值掩码），需要转换为
         实际的 regions/depths/batch_indices 用于 tokenization。
 
+        P-OPT: 使用预分配 tensor 替代 Python list，避免频繁内存分配
+
         Args:
             split_result: SplitResult 包含 split_decision [B, N]
             features: [B, C, H, W] 输入图像
@@ -464,21 +466,23 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         device = features.device
         split_decision = split_result.split_decision  # [B, N]
 
-        # 递归构建四叉树区域
-        # 初始区域：整个图像
-        all_regions = []  # [total_regions, 4]
-        all_depths = []  # [total_regions]
-        all_batch_indices = []  # [total_regions]
+        # P-OPT: 预分配最大可能大小的 buffer
+        # 最大节点数: 每个 batch 有 4^(max_level+1) - 1 个节点 (四叉树)
+        max_nodes_per_batch = (4 ** (self.max_level + 1) - 1) // 3
+        max_total_nodes = max_nodes_per_batch * B
 
-        # BFS 构建四叉树 (I-OPT: 使用 deque 避免 O(N) pop(0))
+        # 预分配 buffer
+        regions_buffer = torch.zeros(max_total_nodes, 4, dtype=torch.float32, device=device)
+        depths_buffer = torch.zeros(max_total_nodes, dtype=torch.long, device=device)
+        batch_buffer = torch.zeros(max_total_nodes, dtype=torch.long, device=device)
+
+        # BFS 构建四叉树
         queue = deque()  # (bounds, depth, batch_idx)
         initial_bounds = self._get_initial_region_bounds(device)
 
-        # I145: 使用计数器追踪每个 batch 的区域索引，避免 O(N) 列表遍历
+        # 使用计数器追踪每个 batch 的区域索引
         batch_region_counters = {b: 0 for b in range(B)}
-        all_regions = []
-        all_depths = []
-        all_batch_indices = []
+        count = 0  # 实际使用的节点数
 
         for b in range(B):
             queue.append((initial_bounds, 0, b))
@@ -486,15 +490,16 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         while queue:
             bounds, depth, b_idx = queue.popleft()
 
-            # I145: 使用计数器获取当前 batch 的区域索引（O(1)）
+            # 获取当前 batch 的区域索引
             region_idx_in_batch = batch_region_counters[b_idx]
             batch_region_counters[b_idx] += 1
 
             if depth >= self.max_level:
-                # 达到最大深度，添加为叶子节点
-                all_regions.append(bounds)
-                all_depths.append(depth)
-                all_batch_indices.append(b_idx)
+                # 达到最大深度，添加到 buffer
+                regions_buffer[count] = bounds
+                depths_buffer[count] = depth
+                batch_buffer[count] = b_idx
+                count += 1
                 continue
 
             # 检查是否应该分裂
@@ -503,40 +508,41 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             else:
                 should_split = False
 
-            if should_split:
-                # P-OPT: 使用张量运算直接在 GPU 上计算子边界，避免 .cpu().tolist() 同步
-                # bounds: [x0, y0, x1, y1] (tensor on device)
-                x0, y0, x1, y1 = bounds.unbind()  # 解绑为 4 个标量张量
+            if should_split and count + 4 < max_total_nodes:
+                # 计算子边界
+                x0, y0, x1, y1 = bounds.unbind()
                 cx = (x0 + x1) / 2
                 cy = (y0 + y1) / 2
 
-                # 直接在 GPU 上创建子边界张量，避免创建 Python 列表
-                child_bounds_list = [
-                    torch.stack([x0, y0, cx, cy]),  # 左上
-                    torch.stack([cx, y0, x1, cy]),  # 右上
-                    torch.stack([x0, cy, cx, y1]),  # 左下
-                    torch.stack([cx, cy, x1, y1]),  # 右下
-                ]
-                for child_bound in child_bounds_list:
-                    queue.append((child_bound, depth + 1, b_idx))
-            else:
-                # P-OPT: 保持 tensor 格式直接追加，避免重复转换
-                all_regions.append(bounds)
-                all_depths.append(depth)
-                all_batch_indices.append(b_idx)
+                # 直接在 GPU 上创建子边界张量
+                child1 = torch.stack([x0, y0, cx, cy], dim=0)
+                child2 = torch.stack([cx, y0, x1, cy], dim=0)
+                child3 = torch.stack([x0, cy, cx, y1], dim=0)
+                child4 = torch.stack([cx, cy, x1, y1], dim=0)
 
-        # 转换为张量
-        if len(all_regions) == 0:
+                queue.append((child1, depth + 1, b_idx))
+                queue.append((child2, depth + 1, b_idx))
+                queue.append((child3, depth + 1, b_idx))
+                queue.append((child4, depth + 1, b_idx))
+            else:
+                # 添加为叶子节点
+                regions_buffer[count] = bounds
+                depths_buffer[count] = depth
+                batch_buffer[count] = b_idx
+                count += 1
+
+        # 裁剪到实际大小
+        if count == 0:
             regions = torch.zeros(0, 4, dtype=torch.float32, device=device)
             depths = torch.zeros(0, dtype=torch.long, device=device)
             batch_indices = torch.zeros(0, dtype=torch.long, device=device)
             token_indices = torch.zeros(0, dtype=torch.long, device=device)
         else:
-            regions = torch.stack(all_regions)
-            depths = torch.tensor(all_depths, dtype=torch.long, device=device)
-            batch_indices = torch.tensor(all_batch_indices, dtype=torch.long, device=device)
+            regions = regions_buffer[:count]
+            depths = depths_buffer[:count]
+            batch_indices = batch_buffer[:count]
             # token_indices 是顺序索引 (0, 1, 2, ..., N-1)，用于正确的概率索引
-            token_indices = torch.arange(len(all_regions), dtype=torch.long, device=device)
+            token_indices = torch.arange(count, dtype=torch.long, device=device)
 
         # 计算 Hilbert 索引用于排序 (I113-18: 使用 HilbertScanner)
         # P-OPT: 使用 self.max_level 替代 depths.max().item() 避免 GPU-CPU 同步
@@ -1335,7 +1341,14 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 if model_ref is not None and hasattr(model_ref, 'splitter'):
                     model = model_ref
                     # 获取特征图
-                    features = self.shared_conv(images)
+                    features = self.shared_conv(images)  # [B, C, H, W]
+
+                    # I131-2: SemanticRedundancySplitter 需要 3D 输入 [B, N, D]
+                    from vit_pytorch.layers.splitters.semantic_redundancy import SemanticRedundancySplitter
+                    if isinstance(model.splitter, SemanticRedundancySplitter):
+                        B, C, H_feat, W_feat = features.shape
+                        features = features.view(B, C, H_feat * W_feat).transpose(1, 2)  # [B, N, C]
+
                     # 调用 splitter
                     split_result = model.splitter(features, image_size=(images.shape[2], images.shape[3]))
 
