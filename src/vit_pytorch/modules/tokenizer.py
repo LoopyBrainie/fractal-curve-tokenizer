@@ -539,13 +539,15 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             token_indices = torch.arange(len(all_regions), dtype=torch.long, device=device)
 
         # 计算 Hilbert 索引用于排序 (I113-18: 使用 HilbertScanner)
+        # I130-5: 使用最大深度作为 grid_size，因为 region_to_hilbert_index 期望单一深度值
         from vit_pytorch.core.curve_hilbert import HilbertScanner
+        max_depth = depths.max().item() if depths.numel() > 0 else 0
         hilbert_indices = HilbertScanner.region_to_hilbert_index(
             regions[:, 0],  # x0
             regions[:, 1],  # y0
             regions[:, 2],  # x1
             regions[:, 3],  # y1
-            depths,  # depth per region
+            max_depth,  # 使用最大深度作为单一深度值
             H,
             W
         )
