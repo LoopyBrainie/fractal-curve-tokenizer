@@ -874,10 +874,10 @@ def main():
         # 运行分析，结果保存到与评估报告相同的目录
         run_depth_diff_analysis(
             checkpoint_path=str(args.checkpoint),
-            dataset_name=dataset_name,
-            batch_size=batch_size,
+            dataset_name=args.dataset,
+            batch_size=args.batch_size,
             max_samples=1000,
-            output_dir=str(output_dir),
+            output_dir=str(args.output),
         )
 
     except KeyboardInterrupt:
