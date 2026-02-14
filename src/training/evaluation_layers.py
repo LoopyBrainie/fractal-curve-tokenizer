@@ -820,13 +820,18 @@ class TokenizerEvaluator:
                 
                 # 深度分布 (I139: 修复 - 使用 levels_list() 方法替代废弃的 output.sequences)
                 # I133-2: 同时收集每个样本的深度信息用于相关性分析
+                # I140: 修复 - 过滤掉负值（padding 导致的负数）
                 levels_list = output.levels_list()
                 max_depth = getattr(model, 'max_depth', 4)  # 获取最大深度
                 for i in range(B):
                     levels = levels_list[i]
                     levels_np = levels.cpu().flatten().numpy()
+                    # 过滤负值（padding），只保留有效的非负深度值
+                    valid_levels = levels_np[levels_np >= 0]
+                    if len(valid_levels) == 0:
+                        continue
                     # 计算该样本的深度统计
-                    level_counts = np.bincount(levels_np.astype(int), minlength=max_depth+1)
+                    level_counts = np.bincount(valid_levels.astype(int), minlength=max_depth+1)
                     total_level_tokens = level_counts.sum()
                     if total_level_tokens > 0:
                         # 平均深度 (加权)
@@ -843,10 +848,11 @@ class TokenizerEvaluator:
                             'deep_ratio': deep_ratio,
                             'token_count': total_level_tokens
                         })
-                    # 聚合深度计数
-                    for d_val in levels_np:
-                        d = d_val.item() if isinstance(d_val, (list, tuple, torch.Tensor)) else d_val
-                        depth_counts[int(d)] += 1
+                    # 聚合深度计数 (跳过负值/padding)
+                    for d_val in valid_levels:
+                        d = int(d_val)
+                        if d >= 0:
+                            depth_counts[d] += 1
                 
                 # 空间覆盖率
                 regions, _ = output.get_padded_regions()
