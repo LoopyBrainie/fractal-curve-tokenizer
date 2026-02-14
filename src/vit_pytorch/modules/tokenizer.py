@@ -557,7 +557,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                        torch.zeros(len(regions), dtype=torch.float32, device=device)
 
         return TensorSplitResult(
-            regions=regions,
+            regions=regions.long(),  # I131-1: 转换为 long 以匹配 padded_regions 的 dtype
             depths=depths,
             batch_indices=batch_indices,
             hilbert_indices=hilbert_indices,
