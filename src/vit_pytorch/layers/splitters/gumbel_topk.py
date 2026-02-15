@@ -361,7 +361,11 @@ class GradientFeatureExtractor(nn.Module):
     def forward(self, features: Tensor) -> Tensor:
         B, C, H, W = features.shape
         # 投影 features 到 2*hidden_dim（x 和 y 梯度各 hidden_dim 通道）
-        features_proj = self._get_input_proj(C)(features)
+        input_proj = self._get_input_proj(C)
+        # I150-2-FIX: 确保 Conv 权重与输入 dtype 一致（AMP 兼容性）
+        if features.dtype == torch.float16:
+            input_proj = input_proj.half()
+        features_proj = input_proj(features)
         # P-OPT: Sobel 卷积向量化 - 使用 groups 参数一次处理所有通道
         # 原始: hidden_dim 次独立卷积循环
         # 优化: 单次深度分离卷积，groups=hidden_dim
@@ -382,7 +386,11 @@ class GradientFeatureExtractor(nn.Module):
         grad_mag = torch.sqrt(grad_squared + EPS)
         grad_mag_mean = grad_mag.mean(dim=1, keepdim=True)
         combined = torch.cat([features_proj, grad_mag_mean], dim=1)
-        return self.grad_proj(combined)
+        # I150-2-FIX: 确保 grad_proj 与输入 dtype 一致（AMP 兼容性）
+        grad_proj = self.grad_proj
+        if features.dtype == torch.float16:
+            grad_proj = grad_proj.half()
+        return grad_proj(combined)
 
 
 class SemanticDensityHead(nn.Module):
@@ -409,6 +417,10 @@ class SemanticDensityHead(nn.Module):
 
     def forward(self, features: Tensor) -> Tensor:
         proj = self._get_input_proj(features.shape[1])
+        # I150-2-FIX: 确保 Conv 权重与输入 dtype 一致（AMP 兼容性）
+        if features.dtype == torch.float16:
+            proj = proj.half()
+            self.net = self.net.half()
         return torch.sigmoid(self.net(proj(features)))
 
 
@@ -450,7 +462,11 @@ class HybridDensityHead(nn.Module):
         sem_density = self.sem_branch(features)
         sem_expanded = sem_density.expand_as(grad_features)
         fused = torch.cat([grad_features, sem_expanded], dim=1)
-        density_map = self.fusion(fused)
+        # I150-2-FIX: 确保 fusion 与输入 dtype 一致（AMP 兼容性）
+        fusion = self.fusion
+        if features.dtype == torch.float16:
+            fusion = fusion.half()
+        density_map = fusion(fused)
         # 数值稳定性：使用 clamp 防止溢出
         density_map = density_map.clamp(min=-100, max=100)
         density = density_map.mean(dim=[1, 2, 3])
