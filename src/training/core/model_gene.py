@@ -89,7 +89,7 @@ class ModelGene:
     # I145-修复: dropout 默认值从 0.1 改为 0.0，与 ModelArchitectureConfig.transformer_dropout 一致
     dropout: float = 0.0           # Dropout 比率 (实际为 transformer_dropout，build_model() 时传递)
     emb_dropout: float = 0.0        # 嵌入 dropout (与 args --emb-dropout 一致)
-    drop_path_rate: float = 0.25   # Drop path 比率 (与 args --drop-path 一致)
+    drop_path_rate: float = 0.0    # P6-FIX: Drop path 比率 (与 ModelArchitectureConfig 一致)
 
     # ==================== 编码选项 ====================
     use_hilbert_encoding: bool = True   # 使用 Hilbert 编码
@@ -105,7 +105,7 @@ class ModelGene:
 
     # ==================== I24-2: 可学习配额 ====================
     quota_learnable: Optional[bool] = None  # 是否启用可学习配额
-    quota_entropy_weight: float = 0.01  # 配额熵正则化权重
+    quota_entropy_weight: float = 0.5  # P3-FIX: 配额熵正则化权重 (统一为 0.5)
 
     # ==================== I31-3: 形状-尺度编码 ====================
     use_area_encoding: bool = False      # 使用面积编码

@@ -80,6 +80,7 @@ class ModelArchitectureConfig:
     token_coverage_min: float = 0.01   # α = 1% 最小覆盖率 (向后兼容别名)
     token_coverage_max: float = 0.25   # β = 25% 最大覆盖率 (向后兼容别名，I145: 保持 0.25 以避免大 OOM)
     K_min_abs: int = 8                 # 绝对下界保护 (与 K_MIN_HARD_LIMIT 一致，I145-修复)
+    K_max_hard: int = 8192            # 绝对上界保护 (与 ModelGene 一致)
 
     # FFN 类型
     ffn_type: str = "swiglu_level"  # "swiglu", "swiglu_level"
@@ -125,7 +126,7 @@ class ModelArchitectureConfig:
     # I24-2: 可学习配额控制
     # None = 使用常量默认值, True/False = 显式覆盖
     quota_learnable: Optional[bool] = None
-    quota_entropy_weight: float = 0.01  # 配额熵正则化权重
+    quota_entropy_weight: float = 0.5  # I165-1: 增强熵驱动 (从0.01提升)
 
     # I140: Splitter 架构参数
     # 这些参数控制 Splitter 内部 MLP 的维度配置
@@ -135,6 +136,10 @@ class ModelArchitectureConfig:
     splitter_hidden_dim: Optional[int] = None  # Splitter MLP 隐藏层维度 (默认 64)
     splitter_feature_dim: Optional[int] = None  # Splitter 特征维度 (默认等于 dim)
     splitter_pool_size: Optional[int] = None    # Splitter 池化大小 (默认 4)
+
+    # Splitter 温度参数 (确保训练-评估一致性)
+    splitter_temp_start: float = 1.0   # 初始温度 (与 constants.SPLITTER_TEMP_START 一致)
+    splitter_temp_end: float = 0.4     # 最终温度 (与 constants.SPLITTER_TEMP_END 一致)
 
     # I136: Elastic Budget 配置 (训练时损失参数)
     elastic_coverage_min: float = 0.03  # 最小弹性覆盖率
