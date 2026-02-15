@@ -378,6 +378,38 @@ class HilbertDispatcher:
         return FastBitwiseHilbert.infer_bit_width(tensor.dtype)
 
 
+def _fast_lca_vectorized(idx1: Tensor, idx2: Tensor) -> Tensor:
+    """
+    全向量化的 LCA 计算，无需 Python 循环
+
+    数学原理:
+        - xor = idx1 ^ idx2 (逐元素异或)
+        - depth = xor.bit_length() - 1 (分歧深度)
+        - mask = ~((1 << (2 * depth)) - 1) (保留到分歧点的掩码)
+        - LCA = idx1 & mask
+
+    Args:
+        idx1: Hilbert 索引 Tensor
+        idx2: Hilbert 索引 Tensor
+
+    Returns:
+        LCA 索引 Tensor
+    """
+    xor = idx1 ^ idx2
+
+    # 计算分歧深度
+    depth = xor.bit_length() - 1
+    # 确保深度非负（xor=0 时 bit_length=0，depth=-1）
+    depth = depth.clamp(min=0)
+
+    # 构建掩码：~((1 << (2 * depth)) - 1)
+    # 使用 long 类型确保掩码正确
+    masks = ~((1 << (2 * depth)) - 1)
+
+    # 使用 torch.where 避免分支：xor==0 时返回 idx1
+    return torch.where(xor == 0, idx1, idx1 & masks)
+
+
 def fast_lca(idx1: int | Tensor, idx2: int | Tensor) -> int | Tensor:
     """
     计算两个 Hilbert 索引的最近公共祖先 (LCA)
@@ -410,19 +442,14 @@ def fast_lca(idx1: int | Tensor, idx2: int | Tensor) -> int | Tensor:
     idx2_is_tensor = isinstance(idx2, Tensor)
 
     if idx1_is_tensor or idx2_is_tensor:
-        # 向量化版本：使用逐元素处理
+        # 向量化版本：使用全张量运算，无 Python 循环
         if not idx1_is_tensor:
-            idx1 = torch.tensor([idx1], dtype=torch.long)
+            idx1 = torch.tensor([idx1], dtype=torch.long, device=idx2.device)
         if not idx2_is_tensor:
-            idx2 = torch.tensor([idx2], dtype=torch.long)
+            idx2 = torch.tensor([idx2], dtype=torch.long, device=idx1.device)
 
-        result_list = []
-        for i in range(idx1.numel()):
-            i1 = idx1[i].item()
-            i2 = idx2[i].item()
-            result_list.append(fast_lca(i1, i2))
-
-        result = torch.tensor(result_list, dtype=torch.long)
+        # 保持与输入设备一致
+        result = _fast_lca_vectorized(idx1, idx2)
         return result.squeeze() if result.numel() == 1 else result
     else:
         # 标量版本

@@ -73,7 +73,7 @@ model = FractalCurveViT(
 )
 model.train()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = model.to(device)
+model = model.to(device, non_blocking=True)
 
 print(f"  模型设备: {next(model.parameters()).device}")
 

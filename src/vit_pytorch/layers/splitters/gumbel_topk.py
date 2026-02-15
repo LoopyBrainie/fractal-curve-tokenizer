@@ -362,20 +362,16 @@ class GradientFeatureExtractor(nn.Module):
         B, C, H, W = features.shape
         # 投影 features 到 2*hidden_dim（x 和 y 梯度各 hidden_dim 通道）
         input_proj = self._get_input_proj(C)
-        # I150-2-FIX: 确保 Conv 权重与输入 dtype 和设备一致（AMP 兼容性）
-        if features.dtype == torch.float16:
-            input_proj = input_proj.half()
-            input_proj = input_proj.to(device=features.device)
+        # I150-5-FIX: 始终确保 Conv 权重与输入 dtype 和设备一致（AMP 兼容性）
+        # 训练时输入是 FP16，eval 时输入是 FP32，需要动态匹配
+        input_proj = input_proj.to(dtype=features.dtype, device=features.device)
         features_proj = input_proj(features)
         # P-OPT: Sobel 卷积向量化 - 使用 groups 参数一次处理所有通道
         # 原始: hidden_dim 次独立卷积循环
         # 优化: 单次深度分离卷积，groups=hidden_dim
         # _sobel_kernel shape: [2, 1, 3, 3] -> repeat 后: [2, hidden_dim, 3, 3]
-        # I150-2-FIX: 确保 sobel_kernel 与输入 dtype 和设备一致
-        sobel_kernel = self._sobel_kernel
-        if features.dtype == torch.float16:
-            sobel_kernel = sobel_kernel.half()
-        sobel_kernel = sobel_kernel.to(device=features.device)
+        # I150-5-FIX: 确保 sobel_kernel 与输入 dtype 和设备一致
+        sobel_kernel = self._sobel_kernel.to(dtype=features.dtype, device=features.device)
         grad = F.conv2d(
             features_proj,
             sobel_kernel.repeat(self.hidden_dim, 1, 1, 1),
@@ -392,11 +388,8 @@ class GradientFeatureExtractor(nn.Module):
         grad_mag = torch.sqrt(grad_squared + EPS)
         grad_mag_mean = grad_mag.mean(dim=1, keepdim=True)
         combined = torch.cat([features_proj, grad_mag_mean], dim=1)
-        # I150-2-FIX: 确保 grad_proj 与输入 dtype 和设备一致（AMP 兼容性）
-        grad_proj = self.grad_proj
-        if features.dtype == torch.float16:
-            grad_proj = grad_proj.half()
-            grad_proj = grad_proj.to(device=features.device)
+        # I150-5-FIX: 确保 grad_proj 与输入 dtype 和设备一致（AMP 兼容性）
+        grad_proj = self.grad_proj.to(dtype=features.dtype, device=features.device)
         return grad_proj(combined)
 
 
@@ -424,13 +417,10 @@ class SemanticDensityHead(nn.Module):
 
     def forward(self, features: Tensor) -> Tensor:
         proj = self._get_input_proj(features.shape[1])
-        # I150-2-FIX: 确保 Conv 权重与输入 dtype 和设备一致（AMP 兼容性）
-        if features.dtype == torch.float16:
-            proj = proj.half()
-            proj = proj.to(device=features.device)
-            self.net = self.net.half()
-            self.net = self.net.to(device=features.device)
-        return torch.sigmoid(self.net(proj(features)))
+        # I150-5-FIX: 始终确保 Conv 权重与输入 dtype 和设备一致（AMP 兼容性）
+        proj = proj.to(dtype=features.dtype, device=features.device)
+        net = self.net.to(dtype=features.dtype, device=features.device)
+        return torch.sigmoid(net(proj(features)))
 
 
 class HybridDensityHead(nn.Module):
@@ -471,11 +461,8 @@ class HybridDensityHead(nn.Module):
         sem_density = self.sem_branch(features)
         sem_expanded = sem_density.expand_as(grad_features)
         fused = torch.cat([grad_features, sem_expanded], dim=1)
-        # I150-2-FIX: 确保 fusion 与输入 dtype 和设备一致（AMP 兼容性）
-        fusion = self.fusion
-        if features.dtype == torch.float16:
-            fusion = fusion.half()
-            fusion = fusion.to(device=features.device)
+        # I150-5-FIX: 始终确保 fusion 与输入 dtype 和设备一致（AMP 兼容性）
+        fusion = self.fusion.to(dtype=features.dtype, device=features.device)
         density_map = fusion(fused)
         # 数值稳定性：使用 clamp 防止溢出
         density_map = density_map.clamp(min=-100, max=100)

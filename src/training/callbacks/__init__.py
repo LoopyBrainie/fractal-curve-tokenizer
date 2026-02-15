@@ -997,7 +997,7 @@ class LayeredEvaluationCallback:
             # L5: 效率
             if "L5" in self.config.enabled_layers and "L5" in self._evaluators:
                 if self.val_loader:
-                    sample_input = next(iter(self.val_loader))[0][:8].to(device)
+                    sample_input = next(iter(self.val_loader))[0][:8].to(device, non_blocking=True)
                     report.L5_efficiency = self._evaluators["L5"].evaluate(
                         model, sample_input, device
                     )

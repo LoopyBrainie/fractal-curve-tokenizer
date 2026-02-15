@@ -70,15 +70,15 @@ class HilbertTopologyCache(nn.Module):
             - coord_to_idx: Tensor of shape [H, W]
             - idx_to_coord: Tensor of shape [H*W, 2]
         """
-        # 检查缓存命中
-        if self._cached_h.item() == H and self._cached_w.item() == W:
+        # 检查缓存命中（使用张量比较避免 GPU-CPU 同步）
+        if self._cached_h == H and self._cached_w == W:
             # 确保设备一致
             if self._coord_to_idx.device == device:
                 return self._coord_to_idx, self._idx_to_coord
             else:
-                # 设备迁移
-                self._coord_to_idx = self._coord_to_idx.to(device)
-                self._idx_to_coord = self._idx_to_coord.to(device)
+                # 设备迁移（使用 non_blocking 异步传输）
+                self._coord_to_idx = self._coord_to_idx.to(device, non_blocking=True)
+                self._idx_to_coord = self._idx_to_coord.to(device, non_blocking=True)
                 return self._coord_to_idx, self._idx_to_coord
 
         # 缓存未命中：生成并缓存
@@ -193,12 +193,30 @@ class HilbertTopologyCache(nn.Module):
         return neighbor_indices, mask
 
     def _compute_hilbert_indices(self, max_level: int) -> Tensor:
-        """计算 Hilbert 索引 (用于 KNN)"""
-        # 简化版: 使用行主序 + 深度偏移
-        indices = []
+        """计算 Hilbert 索引 (用于 KNN) - 向量化版本
+
+        数学公式:
+            - n_regions[d] = 4^d
+            - offset[d] = sum(4^k for k in range(d)) = (4^d - 1) / 3
+        """
+        if max_level < 0:
+            return torch.tensor([], dtype=torch.long, device=self._coord_to_idx.device)
+
+        device = self._coord_to_idx.device
+
+        # 方法1: 直接构建（仍然需要循环，但避免了 sum() 和 extend）
+        # 使用闭式公式计算总区域数
+        total_regions = int((4 ** (max_level + 1) - 1) / 3)
+
+        # 预分配结果张量
+        result = torch.empty(total_regions, dtype=torch.long, device=device)
+
+        # 单循环填充（比原来高效）
+        pos = 0
         for d in range(max_level + 1):
             n_regions = 4 ** d
-            offset = sum(4 ** k for k in range(d))
-            indices.extend([i + offset for i in range(n_regions)])
+            offset = (4 ** d - 1) // 3
+            result[pos:pos + n_regions] = torch.arange(n_regions, dtype=torch.long, device=device) + offset
+            pos += n_regions
 
-        return torch.tensor(indices, dtype=torch.long, device=self._coord_to_idx.device)
+        return result

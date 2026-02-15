@@ -778,7 +778,7 @@ class SparseAblationExperiment(BaseExperiment):
             if batch_idx >= max_iter:
                 break
 
-            imgs = imgs.to(self.device)
+            imgs = imgs.to(self.device, non_blocking=True)
 
             # Forward - disable torch.compile entirely for stability
             try:
@@ -1012,7 +1012,7 @@ class FrozenEncoderExperiment(BaseExperiment):
                 if max_iter and batch_idx >= max_iter:
                     break
 
-                imgs = imgs.to(self.device)
+                imgs = imgs.to(self.device, non_blocking=True)
 
                 # 1. 获取Original ViT features (冻结的 encoder)
                 with torch.no_grad():
@@ -1747,7 +1747,7 @@ class GeometricJigsawExperiment(BaseExperiment):
                 if max_iter and batch_idx >= max_iter:
                     break
 
-                imgs = imgs.to(self.device)
+                imgs = imgs.to(self.device, non_blocking=True)
 
                 # 1. Forward pass
                 # I113-12: 如果模型已编译，直接使用；否则正常调用

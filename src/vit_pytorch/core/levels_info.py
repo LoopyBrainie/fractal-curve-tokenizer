@@ -277,8 +277,8 @@ class LevelsInfo:
         paths = torch.tensor(paths_list, dtype=torch.long).view(B, N, max_level)
 
         if device:
-            depths = depths.to(device)
-            paths = paths.to(device)
+            depths = depths.to(device, non_blocking=True)
+            paths = paths.to(device, non_blocking=True)
 
         return LevelsInfo.from_arrays(depths, paths, max_level)
 

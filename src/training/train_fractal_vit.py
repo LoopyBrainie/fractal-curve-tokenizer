@@ -2788,7 +2788,7 @@ def verify_train_eval_consistency(
     
     # 获取一个 batch 用于测试
     sample_batch = next(iter(loader))
-    imgs = sample_batch[0][:4].to(device)  # 只用 4 张图
+    imgs = sample_batch[0][:4].to(device, non_blocking=True)  # 只用 4 张图
     if config.use_channels_last:
         imgs = imgs.to(memory_format=torch.use_channels_last)
     

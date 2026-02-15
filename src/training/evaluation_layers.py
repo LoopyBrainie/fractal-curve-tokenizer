@@ -1559,7 +1559,7 @@ class EfficiencyEvaluator:
         try:
             from thop import profile
             B = sample_input.shape[0]
-            dummy_input = sample_input.to(device)
+            dummy_input = sample_input.to(device, non_blocking=True)
             flops, params = profile(model, inputs=(dummy_input,), verbose=False)
             metrics.total_flops = int(flops)
             print(f"  [L5] FLOPs: {flops/1e9:.2f} G")
@@ -1570,7 +1570,7 @@ class EfficiencyEvaluator:
 
         # 尝试测量延迟，如果失败则使用估计值
         try:
-            sample_input = sample_input.to(device)
+            sample_input = sample_input.to(device, non_blocking=True)
             B = sample_input.shape[0]
 
             # 简单的预热（不实际运行模型）
