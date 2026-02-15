@@ -4049,6 +4049,26 @@ def main():
     #   - STE 梯度仍依赖温度，退火保证梯度质量
     # =========================================================================
     splitter_annealing_enabled = False
+
+    # I36-2: 优先使用模型协议接口配置训练
+    if hasattr(model, 'configure_training'):
+        batches_per_epoch = len(train_loader) // config.accum_steps
+        post_warmup_steps = max(1, (config.epochs - config.splitter_temp_warmup) * batches_per_epoch)
+        schedule = getattr(config, 'temp_schedule', SPLITTER_TEMP_SCHEDULE)
+
+        training_config = {
+            'temperature_annealing': True,
+            'total_steps': post_warmup_steps,
+            'temp_start': config.splitter_temp_start,
+            'temp_end': config.splitter_temp_end,
+            'schedule': schedule,
+        }
+        model.configure_training(training_config)
+        print(f"[I36-2 OK] 通过协议接口配置训练:")
+        print(f"     T: {config.splitter_temp_start} → {config.splitter_temp_end}")
+        print(f"     Steps: {post_warmup_steps}")
+        splitter_annealing_enabled = True
+
     if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
         splitter = model.splitter
         # 计算总训练步数 (epochs × batches_per_epoch)

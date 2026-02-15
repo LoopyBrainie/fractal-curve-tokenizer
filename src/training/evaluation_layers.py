@@ -140,6 +140,11 @@ class L1ClassificationMetrics:
     avg_semantic_loss: float = 0.0  # 平均语义冗余损失
     avg_redundancy: float = 0.0  # 平均冗余性分数
 
+    # I36-4: 新增 TrainingStats 字段支持
+    avg_splitter_entropy: float = 0.0  # 平均分裂器熵
+    avg_temperature: float = 0.0  # 平均温度
+    child_features_used: bool = False  # 是否使用了 child_features
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -379,6 +384,10 @@ class L7SplitterMetrics:
     gate_weight_stats: Dict[int, Dict[str, float]] = field(default_factory=dict)
     gate_imbalance_detected: bool = False
 
+    # I36-5: 语义分裂器指标
+    semantic_splitter_enabled: bool = False
+    semantic_split_rate: float = 0.0  # 语义分裂率
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -524,6 +533,8 @@ class ClassificationEvaluator:
         all_depth_distributions: List[Dict[int, float]] = []  # I35: 收集深度分布
         all_semantic_losses: List[float] = []  # I110-7: 收集语义损失
         all_redundancies: List[float] = []  # I110-7: 收集冗余性分数
+        all_splitter_entropies: List[float] = []  # I36-4: 收集分裂器熵
+        all_temperatures: List[float] = []  # I36-4: 收集温度
         total_loss = 0.0
         total_samples = 0  # 用于加权平均损失计算
         
@@ -582,7 +593,26 @@ class ClassificationEvaluator:
                         all_redundancies.append(stats.redundancy.mean().item())
                     else:
                         all_redundancies.append(float(stats.redundancy))
-        
+
+                # I36-4: 收集 splitter_entropy 和 temperature
+                if hasattr(stats, 'splitter_entropy'):
+                    entropy = stats.splitter_entropy
+                    if isinstance(entropy, torch.Tensor):
+                        all_splitter_entropies.append(entropy.mean().item())
+                    else:
+                        all_splitter_entropies.append(float(entropy))
+
+                if hasattr(stats, 'temperature'):
+                    temp = stats.temperature
+                    if isinstance(temp, torch.Tensor):
+                        all_temperatures.append(temp.mean().item())
+                    else:
+                        all_temperatures.append(float(temp))
+
+                # I36-4: 检查 child_features 是否被使用
+                if hasattr(stats, 'child_features') and stats.child_features is not None:
+                    metrics.child_features_used = True
+
         all_preds = torch.cat(all_preds)
         all_labels = torch.cat(all_labels)
         all_probs = torch.cat(all_probs)
@@ -699,6 +729,13 @@ class ClassificationEvaluator:
         if all_redundancies:
             metrics.avg_redundancy = float(np.mean(all_redundancies))
 
+        # I36-4: 计算 splitter_entropy 和 temperature 平均值
+        if all_splitter_entropies:
+            metrics.avg_splitter_entropy = float(np.mean(all_splitter_entropies))
+
+        if all_temperatures:
+            metrics.avg_temperature = float(np.mean(all_temperatures))
+
         return metrics
     
     def _compute_calibration_error(
@@ -789,7 +826,9 @@ class TokenizerEvaluator:
                         # I140: 修复 - splitter 期望特征图，不是原始图像
                         # 先用 tokenizer 的 shared_conv 提取特征
                         features = tokenizer.shared_conv(imgs)  # [B, C, H', W']
-                        split_result = model.splitter(features)
+                        # I165-2: 传递 image_size 和 hard 参数以确保训练/评估一致性
+                        image_size = (imgs.shape[2], imgs.shape[3])
+                        split_result = model.splitter(features, image_size=image_size, hard=True)
                         output = tokenizer.tokenize(imgs, split_result)
                     else:
                         raise ValueError("Tokenizer requires splitter but model has no 'splitter' attribute")
@@ -1085,6 +1124,7 @@ class AttentionEvaluator:
                         break
                     
                     imgs = imgs.to(device, non_blocking=True)
+                    B, C, H, W = imgs.shape
 
                     # I139: 先获取 tokenizer 输出以获取深度信息
                     if hasattr(model, 'tokenizer'):
@@ -1094,7 +1134,8 @@ class AttentionEvaluator:
                             # I140: 修复 - splitter 期望特征图，不是原始图像
                             # 先用 tokenizer 的 shared_conv 提取特征
                             features = tokenizer.shared_conv(imgs)  # [B, C, H', W']
-                            split_result = model.splitter(features)
+                            # I165-2: 传递 image_size 和 hard 参数以确保训练/评估一致性
+                            split_result = model.splitter(features, image_size=(H, W), hard=True)
                             tok_output = tokenizer.tokenize(imgs, split_result)
                         else:
                             tok_output = tokenizer.tokenize(imgs)
@@ -1667,7 +1708,9 @@ class EfficiencyEvaluator:
                     tokenizer = model.tokenizer
                     needs_split_result = hasattr(tokenizer, 'shared_conv')
                     if needs_split_result and hasattr(model, 'splitter'):
-                        split_result = model.splitter(sample_input)
+                        # I165-2: 传递 image_size 和 hard 参数以确保训练/评估一致性
+                        image_size = (sample_input.shape[2], sample_input.shape[3])
+                        split_result = model.splitter(sample_input, image_size=image_size, hard=True)
                         tokenizer_output = tokenizer.tokenize(sample_input, split_result)
                     else:
                         tokenizer_output = tokenizer.tokenize(sample_input)
@@ -2170,7 +2213,11 @@ class SplitterEvaluator:
             return metrics
 
         splitter = model.splitter
-        
+
+        # I36-5: 检查语义分裂器
+        if hasattr(model, 'use_semantic_splitter'):
+            metrics.semantic_splitter_enabled = model.use_semantic_splitter()
+
         # 基础参数提取
         if hasattr(splitter, 'current_temperature'):
             tau = splitter.current_temperature

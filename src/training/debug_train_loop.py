@@ -83,8 +83,8 @@ print("\n[TEST 3] 模拟训练迭代")
 # 获取一个 batch
 batch = next(iter(train_loader))
 imgs, labels = batch
-imgs = imgs.to(device)
-labels = labels.to(device)
+imgs = imgs.to(device, non_blocking=True)
+labels = labels.to(device, non_blocking=True)
 
 print(f"  输入形状: {imgs.shape}")
 print(f"  标签形状: {labels.shape}")
@@ -135,8 +135,8 @@ for epoch in range(1, 4):
     for batch_idx in range(2):  # 只运行 2 个 batch
         batch = next(iter(train_loader))
         imgs, labels = batch
-        imgs = imgs.to(device)
-        labels = labels.to(device)
+        imgs = imgs.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 

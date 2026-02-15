@@ -1131,10 +1131,11 @@ class LayeredEvaluator:
         print(f"Using num_classes={num_classes}")
 
         # 6. 检测其他关键参数
-        # dropout
-        dropout = config.get('dropout', 0.1)
-        emb_dropout = config.get('emb_dropout', 0.1)
-        drop_path_rate = config.get('drop_path_rate', 0.15)
+        # P7-FIX: 添加缺失的 dropout 参数
+        tokenizer_dropout = config.get('tokenizer_dropout', 0.0)
+        transformer_dropout = config.get('transformer_dropout', config.get('dropout', 0.0))
+        emb_dropout = config.get('emb_dropout', 0.0)
+        drop_path_rate = config.get('drop_path_rate', 0.0)  # P6-FIX: 统一为 0.0
 
         # Pool 类型
         pool = config.get('pool', 'weighted')
@@ -1157,6 +1158,25 @@ class LayeredEvaluator:
         use_area_encoding = config.get('use_area_encoding', False)
         use_affine_modulation = config.get('use_affine_modulation', True)
         fourier_levels = config.get('fourier_levels', 4)
+
+        # P7-FIX: 添加缺失的高级编码参数
+        target_ratio = config.get('target_ratio', 0.5)  # I113-2: L1 相对参数
+        lca_fp16 = config.get('lca_fp16', False)  # I104-3: LCA FP16 存储
+
+        # P7-FIX: 添加 Hilbert 模式编码器参数 (I162-1)
+        use_pattern_encoder = config.get('use_pattern_encoder', False)
+        pattern_encoder_mode = config.get('pattern_encoder_mode', 'light')
+        pattern_encoder_window_sizes = config.get('pattern_encoder_window_sizes', None)
+
+        # P7-FIX: 添加语义分裂器参数 (I110-7)
+        use_semantic_splitter = config.get('use_semantic_splitter', False)
+        semantic_splitter_config = config.get('semantic_splitter_config', None)
+
+        # P7-FIX: 添加深度缩放参数 (P6-1)
+        depth_scale_range = config.get('depth_scale_range', None)
+
+        # P7-FIX: 添加可学习配额参数 (I24-2)
+        quota_learnable = config.get('quota_learnable', None)
 
         pos_dropout = config.get('pos_dropout', None)
 
@@ -1290,6 +1310,7 @@ class LayeredEvaluator:
 
         # 创建模型（使用检测到的所有参数）
         # I145: 注入已配置好的 splitter（splitter 包含完整配置，无需重复传递 token_coverage_*）
+        # P7-FIX: 添加所有缺失的参数
         model = FractalCurveViT(
             image_size=image_size,
             num_classes=num_classes,
@@ -1300,7 +1321,8 @@ class LayeredEvaluator:
             pool=pool,
             channels=channels,
             dim_head=ckpt_dim_head,
-            dropout=dropout,
+            tokenizer_dropout=tokenizer_dropout,
+            transformer_dropout=transformer_dropout,
             emb_dropout=emb_dropout,
             min_patch_size=min_patch_size,
             max_level=None,  # P0: None = 自动从 tokenizer.max_level 获取 (原 max_depth)
@@ -1309,6 +1331,17 @@ class LayeredEvaluator:
             use_checkpoint=use_checkpoint,
             drop_path_rate=drop_path_rate,
             ffn_type=ffn_type,
+            # P7-FIX: 添加目标比率参数 (I113-2)
+            target_ratio=target_ratio,
+            # P7-FIX: 添加 LCA FP16 参数 (I104-3)
+            lca_fp16=lca_fp16,
+            # P7-FIX: 添加 Hilbert 模式编码器参数 (I162-1)
+            use_pattern_encoder=use_pattern_encoder,
+            pattern_encoder_mode=pattern_encoder_mode,
+            pattern_encoder_window_sizes=pattern_encoder_window_sizes,
+            # P7-FIX: 添加可学习配额参数 (I24-2)
+            quota_learnable=quota_learnable,
+            quota_entropy_weight=quota_entropy_weight,
             # I122-2: lca_temperature 已移除，由 hilbert_bias_scale 统一缩放
             # I140: 注入已配置好的 splitter（splitter 包含完整配置）
             splitter=splitter,
@@ -1317,8 +1350,11 @@ class LayeredEvaluator:
             use_area_encoding=use_area_encoding,
             use_affine_modulation=use_affine_modulation,
             fourier_levels=fourier_levels,
-            # 注意: quota_learnable 不再单独传递
-            # 因为 splitter 已包含完整的 enable_learnable_quota 配置
+            # P7-FIX: 添加语义分裂器参数 (I110-7)
+            use_semantic_splitter=use_semantic_splitter,
+            semantic_splitter_config=semantic_splitter_config,
+            # P7-FIX: 添加深度缩放参数 (P6-1)
+            depth_scale_range=depth_scale_range,
         )
         
         # 加载权重

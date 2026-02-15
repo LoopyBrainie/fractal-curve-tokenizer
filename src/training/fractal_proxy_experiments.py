@@ -1350,7 +1350,7 @@ class SpatialJigsawLoss(nn.Module):
 
         # 确保 predictor 在正确设备上
         device = tokens_list[0].device
-        self.offset_predictor = self.offset_predictor.to(device)
+        self.offset_predictor = self.offset_predictor.to(device, non_blocking=True)
 
         for idx, (tokens, levels) in enumerate(zip(tokens_list, levels_list)):
             N_k = tokens.shape[0]

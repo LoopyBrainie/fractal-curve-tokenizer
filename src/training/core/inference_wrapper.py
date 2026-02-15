@@ -120,7 +120,7 @@ def inference(
     4. Post-processing 标准化
     """
     # Data Preprocessing
-    imgs = imgs.to(device)
+    imgs = imgs.to(device, non_blocking=True)
 
     # Forward
     with get_amp_context(device, use_amp):
@@ -138,7 +138,7 @@ def inference(
 
     # Post-processing
     if labels is not None:
-        labels = labels.to(device)
+        labels = labels.to(device, non_blocking=True)
         loss = F.cross_entropy(logits, labels)
         return loss, logits, inference_stats
     else:

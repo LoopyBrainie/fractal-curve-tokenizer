@@ -801,6 +801,64 @@ class CUB200Trainer:
         self.logger.info(f"[A21 OK] 温度退火已配置: {T_start} → {T_end}")
         self.logger.info(f"     步数: {post_warmup_steps} (warmup: {warmup_epochs} epochs)")
 
+    # I36-2: 使用模型协议接口配置训练
+    def _configure_training_via_protocol(self, train_loader: DataLoader) -> None:
+        """通过模型协议接口配置训练参数
+
+        使用 FractalModelProtocol 的 configure_training 方法，
+        替代直接访问 splitter 的旧方式。
+
+        Args:
+            train_loader: 训练数据加载器，用于计算总步数
+        """
+        # 检查模型是否支持协议接口
+        if not hasattr(self.model, 'configure_training'):
+            self.logger.info("[I36-2] 模型不支持 configure_training，使用旧方法")
+            # 回退到旧方法
+            self._setup_temperature_annealing(train_loader)
+            return
+
+        # 计算每 epoch 的步数
+        batches_per_epoch = len(train_loader) // self.config.accum_steps
+
+        # warmup 后的步数
+        warmup_epochs = 8  # 默认 warmup epochs
+        post_warmup_steps = max(1, (self.config.num_epochs - warmup_epochs) * batches_per_epoch)
+
+        # 构建配置字典
+        training_config = {
+            'temperature_annealing': True,
+            'total_steps': post_warmup_steps,
+            'temp_start': 1.0,
+            'temp_end': SPLITTER_TEMP_END,
+            'schedule': 'exponential',
+            'aux_loss_weights': {
+                'sparsity': getattr(self.config, 'splitter_sparsity_weight', 0.0),
+                'elastic': getattr(self.config, 'elastic_budget_weight', 0.0),
+                'depth_kl': getattr(self.config, 'depth_kl_weight', 0.0),
+            }
+        }
+
+        # 调用模型的协议接口
+        self.model.configure_training(training_config)
+
+        self.logger.info(f"[I36-2 OK] 通过协议配置训练: temp 1.0 → {SPLITTER_TEMP_END}")
+        self.logger.info(f"     步数: {post_warmup_steps} (warmup: {warmup_epochs} epochs)")
+
+    # I36-3: 收集 Splitter 诊断信息
+    def _collect_splitter_diagnostics(self) -> Dict[str, Any]:
+        """收集分割器诊断信息
+
+        使用 FractalModelProtocol 的 get_splitter_diagnostics 方法。
+        在训练结束后调用，收集最终的诊断信息。
+
+        Returns:
+            诊断信息字典
+        """
+        if hasattr(self.model, 'get_splitter_diagnostics'):
+            return self.model.get_splitter_diagnostics()
+        return {}
+
     # A21: Warmup 处理方法 (I111-1: 从 SplitterConfig 读取温度)
     def _handle_warmup(self, epoch: int) -> None:
         """处理 warmup 期间的温度/偏置 (A21)
@@ -1383,8 +1441,9 @@ class CUB200Trainer:
         # 初始化 Center Loss 优化器
         self.initialize_center_optimizer(optimizer)
 
-        # A21: 设置温度退火 (使用内置 API)
-        self._setup_temperature_annealing(train_loader)
+        # A21: 配置训练参数 (使用模型协议接口)
+        # I36-2: 使用 configure_training 替代旧的 _setup_temperature_annealing
+        self._configure_training_via_protocol(train_loader)
 
         # 创建检查点目录
         checkpoint_dir = None
@@ -1495,6 +1554,16 @@ class CUB200Trainer:
                 self.state.epoch,
                 self.state.best_metric,
             )
+
+        # I36-3: 收集最终诊断信息
+        final_diagnostics = self._collect_splitter_diagnostics()
+        if final_diagnostics:
+            self.logger.info(f"[I36-3] 最终 Splitter 诊断:")
+            for key, value in final_diagnostics.items():
+                if isinstance(value, float):
+                    self.logger.info(f"  {key}: {value:.4f}")
+                else:
+                    self.logger.info(f"  {key}: {value}")
 
         self.logger.info(f"训练完成! 最佳准确率: {self.state.best_metric:.2f}% (epoch {self.state.best_epoch})")
 
@@ -1761,6 +1830,7 @@ def create_cub200_trainer(
     config.validate_model_config_consistency()
 
     # I36: 使用 config.arch_config 创建模型
+    # P5-FIX: 补充所有缺失参数，与 train_fractal_vit.py 保持一致
     model = FractalCurveViT(
         num_classes=config.arch_config.num_classes,
         dim=config.arch_config.dim,
@@ -1769,13 +1839,26 @@ def create_cub200_trainer(
         mlp_dim=config.arch_config.mlp_dim,
         image_size=config.arch_config.image_size,
         min_patch_size=config.arch_config.min_patch_size,
+        # 编码配置
         use_area_encoding=config.arch_config.use_area_encoding,
         use_affine_modulation=config.arch_config.use_affine_modulation,
         fourier_levels=config.arch_config.fourier_levels,
-        # 从 config 获取训练策略参数
+        use_hilbert_encoding=config.arch_config.use_hilbert_encoding,
+        use_spatial_encoding=config.arch_config.use_spatial_encoding,
+        ffn_type=config.arch_config.ffn_type,
+        # Dropout 配置 (P5-FIX: 补充所有 dropout 参数)
         dropout=config.dropout,
         drop_path_rate=config.drop_path_rate,
+        tokenizer_dropout=config.arch_config.tokenizer_dropout,
+        transformer_dropout=config.arch_config.transformer_dropout,
+        emb_dropout=config.arch_config.emb_dropout,
+        # Splitter 配置 (P5-FIX: 补充 splitter 参数)
         use_checkpoint=config.use_checkpoint,
+        splitter_type=config.arch_config.splitter_type,
+        splitter_temp_start=config.arch_config.splitter_temp_start,
+        splitter_temp_end=config.arch_config.splitter_temp_end,
+        quota_learnable=config.arch_config.quota_learnable,
+        quota_entropy_weight=config.arch_config.quota_entropy_weight,
     )
 
     # 创庺训练器

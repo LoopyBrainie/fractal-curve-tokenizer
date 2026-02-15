@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+from torch import nn
 
 # 添加 src 目录到路径（与 train_fractal_vit.py 一致）
 src_path = Path(__file__).parent.parent
@@ -73,11 +74,18 @@ PARAMETER_TIERS = {
             # 形状-尺度编码
             "use_area_encoding", "use_affine_modulation", "fourier_levels",
             # Splitter 架构
+            "splitter_type",
             "splitter_hidden_dim", "splitter_feature_dim", "splitter_pool_size",
             # 语义分裂器
             "use_semantic_splitter", "semantic_splitter_config", "semantic_loss_weight",
             # 深度缩放
             "depth_scale_range",
+            # 目标比率
+            "target_ratio",
+            # 模式编码器
+            "use_pattern_encoder", "pattern_encoder_mode", "pattern_encoder_window_sizes",
+            # LCA 存储
+            "lca_fp16",
         ],
     },
     # ========== 训练损失超参数（不保存到 ModelGene） ==========
@@ -393,6 +401,171 @@ def verify_training_save_load(
     print(f"\n{'='*70}")
 
 
+def verify_evaluator_load(checkpoint_path: str, device: str = "cpu") -> Dict[str, Any]:
+    """验证评估器加载的一致性
+
+    确保评估器（LayeredEvaluator）能够正确加载模型。
+
+    Returns:
+        包含验证结果的字典
+    """
+    print(f"\n{'='*70}")
+    print(f"验证评估器加载一致性")
+    print(f"{'='*70}")
+
+    checkpoint = load_checkpoint(checkpoint_path, device)
+
+    # 检查是否有 model_gene
+    if 'model_gene' not in checkpoint:
+        print("[ERROR] No model_gene found in checkpoint!")
+        print("  评估器需要 model_gene 才能正确加载模型")
+        return {"status": "error", "reason": "No model_gene in checkpoint"}
+
+    gene_dict = checkpoint['model_gene']
+
+    # 验证 ModelGene 可解析
+    try:
+        from training.core.model_gene import ModelGene
+        gene = ModelGene.from_dict(gene_dict)
+        print("[OK] ModelGene 解析成功")
+    except Exception as e:
+        print(f"[ERROR] ModelGene 解析失败: {e}")
+        return {"status": "error", "reason": f"ModelGene parse failed: {e}"}
+
+    # 验证可重建模型
+    try:
+        model = gene.build_model()
+        print("[OK] 模型构建成功")
+    except Exception as e:
+        print(f"[ERROR] 模型构建失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "reason": f"Model build failed: {e}"}
+
+    # 验证评估器加载路径
+    try:
+        from training.core.checkpoint import load_model
+        loaded_model, loaded_gene = load_model(
+            gene_dict,
+            state_dict=checkpoint.get('model_state_dict', checkpoint),
+            device=device,
+            strict=False,
+            verbose=False,
+        )
+        print("[OK] 评估器加载路径验证成功")
+    except Exception as e:
+        print(f"[ERROR] 评估器加载失败: {e}")
+        return {"status": "error", "reason": f"Evaluator load failed: {e}"}
+
+    # 验证参数一致性
+    print(f"\n[INFO] 参数一致性检查:")
+    model_params = {
+        'dim': model.dim,
+        'num_layers': model.num_layers,
+        'heads': model.heads,
+        'mlp_dim': model.mlp_dim,
+        'num_classes': model.num_classes,
+        'image_size': model.image_size,
+    }
+
+    loaded_params = {
+        'dim': loaded_model.dim,
+        'num_layers': loaded_model.num_layers,
+        'heads': loaded_model.heads,
+        'mlp_dim': loaded_model.mlp_dim,
+        'num_classes': loaded_model.num_classes,
+        'image_size': loaded_model.image_size,
+    }
+
+    mismatches = []
+    for key in model_params:
+        if model_params[key] != loaded_params[key]:
+            mismatches.append((key, model_params[key], loaded_params[key]))
+
+    if mismatches:
+        print(f"[ERROR] 发现 {len(mismatches)} 处参数不一致:")
+        for key, expected, actual in mismatches:
+            print(f"   {key}: 模型={expected}, 加载={actual}")
+        return {"status": "error", "mismatches": mismatches}
+
+    print("[OK] 评估器加载参数完全一致")
+
+    print(f"\n{'='*70}")
+    return {
+        "status": "ok",
+        "gene": gene.to_dict(),
+        "model_params": model_params,
+    }
+
+
+def verify_training_params(config: Any, model: nn.Module) -> Dict[str, Any]:
+    """验证训练配置参数与模型参数的一致性
+
+    Args:
+        config: 训练配置对象（ModelArchitectureConfig 或类似）
+        model: 模型实例
+
+    Returns:
+        包含验证结果的字典
+    """
+    print(f"\n{'='*70}")
+    print(f"验证训练配置参数一致性")
+    print(f"{'='*70}")
+
+    # 从模型获取参数字典
+    if hasattr(model, 'get_model_config'):
+        model_config = model.get_model_config()
+    else:
+        # 尝试从 ModelGene 获取
+        try:
+            from training.core.model_gene import ModelGene
+            gene = ModelGene.from_model(model)
+            model_config = gene.to_dict()
+        except Exception as e:
+            print(f"[ERROR] 无法获取模型配置: {e}")
+            return {"status": "error", "reason": str(e)}
+
+    # 定义需要检查的关键参数
+    key_params = [
+        'dim', 'num_layers', 'heads', 'mlp_dim',
+        'num_classes', 'image_size', 'min_patch_size',
+    ]
+
+    mismatches = []
+    for key in key_params:
+        config_value = getattr(config, key, None)
+        model_value = model_config.get(key)
+
+        if config_value is not None and model_value is not None:
+            if config_value != model_value:
+                mismatches.append({
+                    'param': key,
+                    'config': config_value,
+                    'model': model_value,
+                })
+
+    print(f"\n[INFO] 关键参数检查:")
+    print(f"   {'参数名':<20} {'训练配置':<15} {'模型配置':<15} {'状态'}")
+    print(f"   {'-'*65}")
+
+    for key in key_params:
+        config_value = getattr(config, key, None)
+        model_value = model_config.get(key)
+        status = "✓" if config_value == model_value else "✗"
+        print(f"   {key:<20} {str(config_value):<15} {str(model_value):<15} {status}")
+
+    if mismatches:
+        print(f"\n[ERROR] 发现 {len(mismatches)} 处参数不一致:")
+        for m in mismatches:
+            print(f"   {m['param']}: config={m['config']}, model={m['model']}")
+        print(f"\n{'='*70}")
+        return {"status": "error", "mismatches": mismatches}
+
+    print(f"\n[OK] 训练配置与模型参数完全一致")
+    print(f"\n{'='*70}")
+    return {"status": "ok", "checked_params": key_params}
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="参数一致性检查工具",
@@ -407,6 +580,12 @@ def main():
 
   # 验证训练-保存-加载一致性
   uv run python src/training/checkpoint_param_checker.py --checkpoint checkpoints/best.pth --verify
+
+  # 验证评估器加载一致性
+  uv run python src/training/checkpoint_param_checker.py --checkpoint checkpoints/best.pth --evaluator-check
+
+  # 完整检查（所有验证）
+  uv run python src/training/checkpoint_param_checker.py --checkpoint checkpoints/best.pth --full-check
         """
     )
 
@@ -431,6 +610,21 @@ def main():
         help="验证训练-保存-加载一致性"
     )
     parser.add_argument(
+        "--evaluator-check",
+        action="store_true",
+        help="验证评估器加载一致性"
+    )
+    parser.add_argument(
+        "--full-check",
+        action="store_true",
+        help="完整检查（包含所有验证）"
+    )
+    parser.add_argument(
+        "--training-config",
+        type=str,
+        help="训练配置文件路径（用于验证训练参数）"
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cpu",
@@ -448,8 +642,43 @@ def main():
     if args.checkpoint:
         print_checkpoint_info(args.checkpoint, args.device)
 
-        if args.verify:
+        # 验证训练-保存-加载一致性
+        if args.verify or args.full_check:
             verify_training_save_load(args.checkpoint, args.device)
+
+        # 验证评估器加载一致性
+        if args.evaluator_check or args.full_check:
+            verify_evaluator_load(args.checkpoint, args.device)
+
+        # 验证训练配置参数一致性
+        if args.training_config and args.full_check:
+            try:
+                # 加载训练配置
+                import yaml
+                with open(args.training_config) as f:
+                    config_dict = yaml.safe_load(f)
+
+                # 转换为简单对象
+                class Config:
+                    def __init__(self, d):
+                        for k, v in d.items():
+                            setattr(self, k, v)
+
+                config = Config(config_dict)
+
+                # 创建模型并验证
+                checkpoint = load_checkpoint(args.checkpoint, args.device)
+                gene_dict = checkpoint.get('model_gene', {})
+                from training.core.model_gene import ModelGene
+                gene = ModelGene.from_dict(gene_dict)
+                model = gene.build_model()
+
+                verify_training_params(config, model)
+            except Exception as e:
+                print(f"[ERROR] 训练配置验证失败: {e}")
+                import traceback
+                traceback.print_exc()
+
         return
 
     # 无参数

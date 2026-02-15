@@ -130,7 +130,7 @@ def build_model(
 
     # 移动到设备
     if device is not None:
-        model = model.to(device)
+        model = model.to(device, non_blocking=True)
 
     return model, gene
 
