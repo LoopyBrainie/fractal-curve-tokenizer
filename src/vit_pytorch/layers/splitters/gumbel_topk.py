@@ -2584,6 +2584,10 @@ class GumbelTopKSplitter(
         if hilbert_indices is None:
             return torch.zeros_like(selected_mask)
 
+        # I150-4-FIX: 确保 hilbert_indices 与 selected_mask 在同一设备上（torch.compile 兼容性）
+        if hilbert_indices.device != selected_mask.device:
+            hilbert_indices = hilbert_indices.to(device=selected_mask.device)
+
         # 计算稀疏邻域密度 (向量化 GPU 实现)
         # 使用 torch.cdist 计算距离矩阵，避免 CPU 同步
         window = int(HILBERT_DENSITY_WINDOW)
@@ -2717,6 +2721,10 @@ class GumbelTopKSplitter(
 
         if hilbert_indices is None:
             hilbert_indices = self.hilbert_indices
+
+        # I150-4-FIX: 确保 hilbert_indices 与 logits 在同一设备上（torch.compile 兼容性）
+        if hilbert_indices.device != device:
+            hilbert_indices = hilbert_indices.to(device=device)
 
         # 初始化输出
         selected_mask = torch.zeros(B, N, device=device, dtype=logits.dtype)
