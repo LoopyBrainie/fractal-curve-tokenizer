@@ -2630,6 +2630,10 @@ class GumbelTopKSplitter(
         D = int(depths.max().item() + 1)
         device = depths.device
 
+        # I150-2-FIX: 确保 base_temperature 在正确的设备上
+        if isinstance(base_temperature, Tensor):
+            base_temperature = base_temperature.to(device=device)
+
         # 计算每个深度的温度缩放因子 (向量化实现)
         # τ_d = τ_base × (N_max / N_d)^γ = τ_base × (4^{max_depth - d})^gamma
         gamma = DEPTH_TEMPERATURE_GAMMA

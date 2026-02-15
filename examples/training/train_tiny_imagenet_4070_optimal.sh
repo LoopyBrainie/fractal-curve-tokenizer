@@ -38,7 +38,6 @@ uv run python src/training/train_fractal_vit.py \
   --heads 6 \
   --mlp-dim 1536 \
   --min-patch-size 4 \
-  --image-size 64 \
   --token-coverage-min 0.03 \
   --token-coverage-max 0.25 \
   --K-min-abs 8 \
@@ -55,7 +54,6 @@ uv run python src/training/train_fractal_vit.py \
   --mixup-alpha 0.4 \
   --cutmix-alpha 1.0 \
   --mixup-prob 0.5 \
-  --focal-gamma 2.5 \
   --include-soft-entropy \
   --soft-entropy-mode maximize \
   --soft-entropy-weight 0.1 \
