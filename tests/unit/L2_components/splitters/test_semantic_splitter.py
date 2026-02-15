@@ -98,7 +98,7 @@ class TestCorrelationGate:
         assert redundancy.max() <= 1, f"冗余性上限 > 1: {redundancy.max()}"
 
     def test_identical_features_redundancy(self):
-        """测试完全相同特征的冗余性（应接近 0）"""
+        """测试完全相同特征的冗余性（应接近 1，即高冗余）"""
         B, N, D = 2, 10, 256
         gate = CorrelationGate(D)
 
@@ -106,7 +106,11 @@ class TestCorrelationGate:
         features = torch.randn(B, N, 1, D).expand(-1, -1, 4, -1)
         redundancy = gate(features)
 
-        assert redundancy.abs().max() < 1e-5, f"相同特征冗余性应接近 0, got {redundancy.abs().max()}"
+        # CRITICAL FIX 后语义变化:
+        # 原始: r = 1 - sim_mean → 完全相同(sim=1) → r=0 (错误!)
+        # 修正后: r = sigmoid(sim_mean * 10 - 5) → 完全相同(sim=1) → r≈1 (正确!)
+        # 语义: 高相似度 = 高冗余 = 不分裂
+        assert redundancy.min() > 0.9, f"相同特征冗余性应接近 1, got {redundancy.min()}"
 
     def test_orthogonal_features_independence(self):
         """测试近似正交特征的独立性"""
@@ -133,9 +137,12 @@ class TestCorrelationGate:
         features = torch.stack([v1, v2, v3, v4]).unsqueeze(0).unsqueeze(0)
         redundancy = gate(features)
 
-        # 经过 Gram-Schmidt 正交化后，平均余弦相似度应接近 0
-        # 冗余性 = 1 - sim_mean ≈ 1 - 0 = 1
-        assert redundancy.item() > 0.5, f"正交特征冗余性应大于 0.5, got {redundancy.item():.4f}"
+        # CRITICAL FIX 后语义变化:
+        # 原始: r = 1 - sim_mean → 正交(sim≈0) → r≈1 (总是分裂!)
+        # 修正后: r = sigmoid(sim_mean * 10 - 5) → 正交(sim≈0) → r≈0 (正确!)
+        # 语义: 低相似度 = 低冗余 = 应分裂
+        # 注意: 由于浮点误差，正交特征的 sim_mean 可能略大于 0
+        assert redundancy.item() < 0.5, f"正交特征冗余性应小于 0.5, got {redundancy.item():.4f}"
 
     def test_gradient_flow(self):
         """测试梯度流"""
@@ -251,6 +258,32 @@ class TestSemanticRedundancySplitter:
         # Temperature: 1 (log_temp)
         expected_base = 164992 + 4 + 1  # = 164997
         assert param_count == expected_base, f"期望 {expected_base}, 实际 {param_count}"
+
+    def test_initial_split_bias(self):
+        """CRITICAL FIX 验证: 初始化后随机特征应倾向于不分裂
+
+        修正前: bias=-0.5, w_r=1.0 → logits = r - 0.5
+        分裂条件 r > 0.5，随机特征 r≈0.5，会导致过度分裂 (~100%)
+
+        修正后: bias=0, w_r=-1.0 → logits = -r
+        随机特征 r≈0.5 → logits≈-0.5 → 不分裂
+
+        实际值约 0.36，比修正前大幅改善
+        """
+        B, N, D = 4, 100, 256
+        splitter = SemanticRedundancySplitter(D, hidden_dim=128)
+
+        # 使用随机特征
+        torch.manual_seed(42)
+        features = torch.randn(B, N, D)
+
+        # 前向传播
+        result = splitter(features, depth=0, remaining_quota=1.0)
+
+        # 修正后: 由于 w_r=-1.0，随机特征应倾向于不分裂
+        # 阈值设为 0.5，相比修正前的 ~100% 大幅改善
+        split_rate = result.split_decision.mean().item()
+        assert split_rate < 0.5, f"随机特征分裂率应 < 0.5, got {split_rate:.3f}"
 
 
 class TestSemanticRedundancyLoss:
