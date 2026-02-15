@@ -215,6 +215,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 移除: K_min, K_max, splitter_dropout, splitter_config, enable_learnable_quota
         # 保留 depth_scale_range (用于 patch_embed)
         depth_scale_range: Optional[Tuple[float, float]] = (0.5, 2.0),
+        # Step 3: HilbertTopologyCache for O(1) Tensor Lookup
+        hilbert_cache: Optional[Any] = None,
     ) -> None:
         super().__init__()
 
@@ -234,6 +236,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         self.base_patch_size = base_patch_size
         self.use_hilbert_order = use_hilbert_order
         self._use_learnable_split = True  # Legacy flag, always True (I145: 保留用于向后兼容)
+
+        # Step 3: HilbertTopologyCache for O(1) Tensor Lookup
+        self._hilbert_cache = hilbert_cache
 
         # I30-17: 动态深度计算
         self.min_patch_size = effective_min_patch_size  # 存储规范化后的值
@@ -422,7 +427,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         """获取语义损失函数"""
         return self._semantic_loss_fn
 
-    def _get_initial_region_bounds(self, device: torch.device) -> torch.Tensor:
+    def _get_initial_region_bounds(self, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         """获取初始区域边界（全图）[4]
 
         Note: 返回单个 [x0, y0, x1, y1] 边界框，batch 维度在 BFS 循环中通过 b_idx 追踪。
@@ -434,7 +439,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         H, W = self.image_size
         # 初始只有一个区域：整个图像
         # 格式: [x0, y0, x1, y1]
-        initial_bounds = torch.tensor([0, 0, W, H], dtype=torch.float32, device=device)
+        initial_bounds = torch.tensor([0, 0, W, H], dtype=dtype, device=device)
         self._region_bounds_cache = initial_bounds
         return initial_bounds
 
@@ -472,13 +477,13 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         max_total_nodes = max_nodes_per_batch * B
 
         # 预分配 buffer
-        regions_buffer = torch.zeros(max_total_nodes, 4, dtype=torch.float32, device=device)
+        regions_buffer = torch.zeros(max_total_nodes, 4, dtype=features.dtype, device=device)
         depths_buffer = torch.zeros(max_total_nodes, dtype=torch.long, device=device)
         batch_buffer = torch.zeros(max_total_nodes, dtype=torch.long, device=device)
 
         # BFS 构建四叉树
         queue = deque()  # (bounds, depth, batch_idx)
-        initial_bounds = self._get_initial_region_bounds(device)
+        initial_bounds = self._get_initial_region_bounds(device, dtype=features.dtype)
 
         # 使用计数器追踪每个 batch 的区域索引
         batch_region_counters = {b: 0 for b in range(B)}
@@ -550,6 +555,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         from vit_pytorch.core.curve_hilbert import HilbertScanner
         # 关键优化: 使用预计算的 max_level 而非每次都同步获取实际最大值
         hilbert_depth = self.max_level
+        # Step 3: 传递 HilbertTopologyCache 进行 O(1) Tensor Lookup
         hilbert_indices = HilbertScanner.region_to_hilbert_index(
             regions[:, 0],  # x0
             regions[:, 1],  # y0
@@ -557,7 +563,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             regions[:, 3],  # y1
             hilbert_depth,  # P-OPT: 使用 max_level 避免 .item() 同步
             H,
-            W
+            W,
+            hilbert_cache=self._hilbert_cache,  # Step 3 优化
         )
 
         # 复杂度使用冗余性分数
@@ -802,8 +809,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 批量操作保持 GPU 利用率，避免 GPU-CPU 同步
         nan_mask = torch.isnan(boxes_tensor)
         inf_mask = torch.isinf(boxes_tensor)
-        if nan_mask.any() or inf_mask.any():
-            boxes_tensor = torch.where(nan_mask | inf_mask, torch.zeros_like(boxes_tensor), boxes_tensor)
+        # 使用 fused 操作避免显式 .any() 调用 - 始终应用替换
+        boxes_tensor = torch.where(nan_mask | inf_mask, torch.zeros_like(boxes_tensor), boxes_tensor)
 
         # ROI-Align
         try:
@@ -956,8 +963,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 批量操作保持 GPU 利用率，避免 GPU-CPU 同步
         nan_mask = torch.isnan(regions)
         inf_mask = torch.isinf(regions)
-        if nan_mask.any() or inf_mask.any():
-            regions = torch.where(nan_mask | inf_mask, torch.zeros_like(regions), regions)
+        # 使用 fused 操作避免显式 .any() 调用 - 始终应用替换
+        regions = torch.where(nan_mask | inf_mask, torch.zeros_like(regions), regions)
 
         # I99-1: clamp regions 到有效图像边界
         # P-OPT: 直接在原始张量上 clamp_()，避免不必要的 .clone() 内存分配

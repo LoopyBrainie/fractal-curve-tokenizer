@@ -443,7 +443,7 @@ class TokenizerOutput:
         from vit_pytorch.core.levels_info import LevelsInfo
         B = self.batch_size
         N = 1
-        all_levels = torch.zeros(B, N, max_level + 1, dtype=torch.long)
+        all_levels = torch.zeros(B, N, max_level + 1, dtype=torch.long, device=self.device)
         return LevelsInfo(data=all_levels, max_level=max_level)
 
     def to_legacy(self) -> "LegacyTokenizerOutput":
