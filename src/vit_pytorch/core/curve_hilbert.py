@@ -37,7 +37,7 @@ from __future__ import annotations
 import functools
 import math
 from functools import lru_cache
-from typing import Dict, List, Literal, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -1167,6 +1167,147 @@ class PseudoHilbertCurve:
         """
         cls._get_coord_cache.cache_clear()
 
+    # =========================================================================
+    # 批量方法：向量化实现 + LRU 缓存
+    # =========================================================================
+
+    # 批量方法的 LRU 缓存（独立于 scan 的缓存）
+    _coord_to_idx_cache: Dict[Tuple[int, int, str], Tensor] = {}
+    _idx_to_coord_cache: Dict[Tuple[int, int, str], Tensor] = {}
+
+    @classmethod
+    @torch.no_grad()
+    def xy_to_d_batch(cls, H: int, W: int, x: Tensor, y: Tensor) -> Tensor:
+        """
+        向量化坐标 → Pseudo-Hilbert 索引
+
+        使用预计算的 scan 序列进行 O(1) 查询。
+
+        Args:
+            H: 图像高度
+            W: 图像宽度
+            x: [B] x 坐标 Tensor
+            y: [B] y 坐标 Tensor
+
+        Returns:
+            d: [B] Pseudo-Hilbert 索引 Tensor
+        """
+        # 缓存 key
+        cache_key = (H, W, str(x.device))
+
+        if cache_key not in cls._coord_to_idx_cache:
+            # 预计算 scan 序列
+            scan_points = cls.scan(H, W)
+            coord_to_idx = torch.full(
+                (H, W), -1, dtype=torch.long, device=x.device
+            )
+            for idx, (cx, cy) in enumerate(scan_points):
+                if 0 <= cy < H and 0 <= cx < W:
+                    coord_to_idx[cy, cx] = idx
+            cls._coord_to_idx_cache[cache_key] = coord_to_idx
+
+        coord_to_idx = cls._coord_to_idx_cache[cache_key]
+        return coord_to_idx[y, x]
+
+    @classmethod
+    @torch.no_grad()
+    def d_to_xy_batch(cls, H: int, W: int, d: Tensor) -> Tuple[Tensor, Tensor]:
+        """
+        向量化 Pseudo-Hilbert 索引 → 坐标
+
+        使用预计算的 scan 序列进行 O(1) 查询。
+
+        Args:
+            H: 图像高度
+            W: 图像宽度
+            d: [B] Pseudo-Hilbert 索引 Tensor
+
+        Returns:
+            (x, y): [B] 坐标 Tensor
+        """
+        # 缓存 key
+        cache_key = (H, W, str(d.device))
+
+        if cache_key not in cls._idx_to_coord_cache:
+            scan_points = cls.scan(H, W)
+            scan_tensor = torch.tensor(
+                scan_points, dtype=torch.long, device=d.device
+            )
+            cls._idx_to_coord_cache[cache_key] = scan_tensor
+
+        scan_tensor = cls._idx_to_coord_cache[cache_key]
+        # 边界保护
+        d_clamped = torch.clamp(d, 0, H * W - 1)
+        coords = scan_tensor[d_clamped]
+        return coords[:, 0], coords[:, 1]
+
+    # =========================================================================
+    # 向量化方法：直接输出 Tensor，替代 Python List
+    # =========================================================================
+
+    @staticmethod
+    @torch.no_grad()
+    def scan_tensor(H: int, W: int, device: torch.device) -> Tensor:
+        """
+        直接输出 Tensor 格式的扫描序列
+
+        Args:
+            H: 高度
+            W: 宽度
+            device: 目标设备
+
+        Returns:
+            Tensor of shape [H*W, 2], dtype=torch.long
+        """
+        # 使用现有的 scan 方法获取 Python List，然后转换为 Tensor
+        scan_points = PseudoHilbertCurve.scan(H, W)
+        if len(scan_points) == 0:
+            return torch.empty((0, 2), dtype=torch.long, device=device)
+
+        # 转换为 Tensor
+        scan_tensor = torch.tensor(
+            scan_points, dtype=torch.long, device=device
+        )
+        return scan_tensor
+
+    @staticmethod
+    @torch.no_grad()
+    def build_coord_to_idx_tensor(H: int, W: int, device: torch.device) -> Tensor:
+        """
+        直接构建 coord_to_idx Tensor
+
+        Args:
+            H: 高度
+            W: 宽度
+            device: 目标设备
+
+        Returns:
+            Tensor of shape [H, W], dtype=torch.long
+        """
+        scan_tensor = PseudoHilbertCurve.scan_tensor(H, W, device)
+
+        if scan_tensor.numel() == 0:
+            return torch.empty((H, W), dtype=torch.long, device=device)
+
+        # 构建 coord_to_idx: 使用 scatter 方法
+        coord_to_idx = torch.full(
+            (H, W), -1, dtype=torch.long, device=device
+        )
+
+        # 使用 scatter_ 进行向量化赋值
+        # scan_tensor[:, 0] 是 x，scan_tensor[:, 1] 是 y
+        y_coords = scan_tensor[:, 1]  # [H*W]
+        x_coords = scan_tensor[:, 0]  # [H*W]
+        indices = torch.arange(scan_tensor.shape[0], device=device)
+
+        # 过滤有效坐标
+        valid_mask = (x_coords >= 0) & (x_coords < W) & \
+                     (y_coords >= 0) & (y_coords < H)
+
+        coord_to_idx[y_coords[valid_mask], x_coords[valid_mask]] = indices[valid_mask]
+
+        return coord_to_idx
+
 
 # I113-8: 矩形区域 Hilbert 索引直接计算
 class RectHilbertIndex:
@@ -2247,18 +2388,22 @@ class HilbertScanner:
         y1: Tensor,
         depth: int,
         H: int,
-        W: int
+        W: int,
+        hilbert_cache: Optional[Any] = None,
     ) -> Tensor:
         """
         从区域边界直接计算 Hilbert 索引（最佳实现）
 
         替代 RectHilbertIndex.from_region()，使用统一的 HilbertScanner API
 
+        Step 3 优化: 支持 HilbertTopologyCache 进行 O(1) Tensor Lookup
+
         Args:
             x0, y0, x1, y1: 区域边界坐标 (Tensor, [M])
             depth: 四叉树深度
             H: 图像高度
             W: 图像宽度
+            hilbert_cache: 可选的 HilbertTopologyCache 实例
 
         Returns:
             Hilbert 索引 (Tensor, [M])
@@ -2291,16 +2436,25 @@ class HilbertScanner:
         num_points = cx.shape[0]
 
         if num_points > 0:
-            # 优化: 使用预计算的 Hilbert 顺序表进行向量化查询
-            # hilbert_order_table 返回 [H, W] 张量，table[y, x] = Hilbert 索引
-            order_table = RectHilbertIndex.hilbert_order_table(H, W, cx.device)
+            # Step 3 优化: 优先使用 HilbertTopologyCache (O(1) Tensor Lookup)
+            if hilbert_cache is not None:
+                # 使用 HilbertTopologyCache 进行 O(1) 查询
+                # 将中心坐标转换为整数坐标
+                cx_int = (norm_x * (W - 1)).long().clamp(max=W - 1)
+                cy_int = (norm_y * (H - 1)).long().clamp(max=H - 1)
+                pseudo_d = hilbert_cache.xy_to_d(cx_int, cy_int, H, W)
+            else:
+                # 回退到 RectHilbertIndex.hilbert_order_table
+                # 优化: 使用预计算的 Hilbert 顺序表进行向量化查询
+                # hilbert_order_table 返回 [H, W] 张量，table[y, x] = Hilbert 索引
+                order_table = RectHilbertIndex.hilbert_order_table(H, W, cx.device)
 
-            # 将中心坐标转换为整数坐标
-            cx_int = (norm_x * (W - 1)).long().clamp(max=W - 1)
-            cy_int = (norm_y * (H - 1)).long().clamp(max=H - 1)
+                # 将中心坐标转换为整数坐标
+                cx_int = (norm_x * (W - 1)).long().clamp(max=W - 1)
+                cy_int = (norm_y * (H - 1)).long().clamp(max=H - 1)
 
-            # 向量化的 2D 张量索引查询：order_table[cy_int, cx_int]
-            pseudo_d = order_table[cy_int, cx_int]
+                # 向量化的 2D 张量索引查询：order_table[cy_int, cx_int]
+                pseudo_d = order_table[cy_int, cx_int]
         else:
             pseudo_d = torch.zeros(0, device=cx.device, dtype=torch.long)
 
@@ -2422,3 +2576,67 @@ class HilbertScanner:
 
         # 注意：from_center 不添加深度偏移
         return pseudo_d
+
+    # =========================================================================
+    # 批量方法：使用 Pseudo-Hilbert 映射
+    # =========================================================================
+
+    @staticmethod
+    def xy_to_d_batch(H: int, W: int, x: Tensor, y: Tensor) -> Tensor:
+        """
+        向量化坐标 → Pseudo-Hilbert 索引
+
+        使用预计算的 lookup table 进行 O(1) 查询
+
+        Args:
+            H: 图像高度
+            W: 图像宽度
+            x: [B] x 坐标 Tensor
+            y: [B] y 坐标 Tensor
+
+        Returns:
+            d: [B] Pseudo-Hilbert 索引 Tensor
+        """
+        # 使用 HilbertScanner.scan 获取扫描序列
+        scan_points = HilbertScanner.scan(H, W)
+
+        # 构建坐标到索引的 lookup table
+        # 注意: scan_points 是 (x, y) 元组列表
+        coord_to_idx = torch.full(
+            (H, W), -1, dtype=torch.long, device=x.device
+        )
+        for idx, (cx, cy) in enumerate(scan_points):
+            if 0 <= cy < H and 0 <= cx < W:
+                coord_to_idx[cy, cx] = idx
+
+        # 查询
+        result = coord_to_idx[y, x]
+        return result
+
+    @staticmethod
+    def d_to_xy_batch(H: int, W: int, d: Tensor) -> Tuple[Tensor, Tensor]:
+        """
+        向量化 Pseudo-Hilbert 索引 → 坐标
+
+        使用预计算的 scan 序列进行索引查询
+
+        Args:
+            H: 图像高度
+            W: 图像宽度
+            d: [B] Pseudo-Hilbert 索引 Tensor
+
+        Returns:
+            (x, y): [B] 坐标 Tensor
+        """
+        # 预计算或缓存 scan 序列
+        scan_points = HilbertScanner.scan(H, W)
+        scan_tensor = torch.tensor(
+            scan_points, dtype=torch.long, device=d.device
+        )
+
+        # 索引查询
+        coords = scan_tensor[d]
+        x = coords[:, 0]
+        y = coords[:, 1]
+
+        return x, y
