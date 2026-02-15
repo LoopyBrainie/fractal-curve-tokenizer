@@ -417,10 +417,14 @@ class SemanticDensityHead(nn.Module):
 
     def forward(self, features: Tensor) -> Tensor:
         proj = self._get_input_proj(features.shape[1])
-        # I150-5-FIX: 始终确保 Conv 权重与输入 dtype 和设备一致（AMP 兼容性）
-        proj = proj.to(dtype=features.dtype, device=features.device)
-        net = self.net.to(dtype=features.dtype, device=features.device)
-        return torch.sigmoid(net(proj(features)))
+        # I150-2-FIX: 确保 Conv 权重与输入 dtype 和设备一致（AMP 兼容性）
+        # 只有 float16 时才转换，避免每次 forward 都创建新张量
+        if features.dtype == torch.float16:
+            proj = proj.half()
+            proj = proj.to(device=features.device)
+            self.net = self.net.half()
+            self.net = self.net.to(device=features.device)
+        return torch.sigmoid(self.net(proj(features)))
 
 
 class HybridDensityHead(nn.Module):
