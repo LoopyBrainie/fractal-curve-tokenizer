@@ -1431,6 +1431,11 @@ class FractalCurveViT(nn.Module):
 
             # 计算 batch 平均分布
             avg_distribution = normalized_counts.mean(dim=0)
+
+            # I150-3-FIX: 确保归一化到 1.0
+            depth_sum = avg_distribution.sum().clamp(min=1e-8)
+            avg_distribution = avg_distribution / depth_sum
+
             depth_dist = {d: float(avg_distribution[d]) for d in range(max_level_range) if avg_distribution[d] > 0}
 
         # I135: 辅助函数 - 递归展平嵌套结构，提取所有整数值
