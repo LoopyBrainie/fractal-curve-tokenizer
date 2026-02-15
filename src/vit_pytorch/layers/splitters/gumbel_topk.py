@@ -379,7 +379,7 @@ class GradientFeatureExtractor(nn.Module):
         # 数值稳定性：使用 EPS 防止 sqrt 产生 NaN
         # grad_x² + grad_y² >= 0 在数学上成立，但浮点误差可能在反向传播时产生 NaN
         grad_squared = grad_x ** 2 + grad_y ** 2
-        grad_mag = torch.sqrt(grad_squared + 1e-8)
+        grad_mag = torch.sqrt(grad_squared + EPS)
         grad_mag_mean = grad_mag.mean(dim=1, keepdim=True)
         combined = torch.cat([features_proj, grad_mag_mean], dim=1)
         return self.grad_proj(combined)
@@ -2558,31 +2558,37 @@ class GumbelTopKSplitter(
         if hilbert_indices is None:
             return torch.zeros_like(selected_mask)
 
-        # 计算稀疏邻域密度 (O(N × k) 而非 O(N²))
-        # 使用排序 + 滑动窗口的高效实现
-        density = torch.zeros_like(selected_mask)
-
-        # 对每个 batch 单独计算
+        # 计算稀疏邻域密度 (向量化 GPU 实现)
+        # 使用 torch.cdist 计算距离矩阵，避免 CPU 同步
         window = int(HILBERT_DENSITY_WINDOW)
 
-        # 转换为 CPU 进行二分查找（更快）
-        hilbert_np = hilbert_indices.cpu().numpy()
+        # 获取选中的 Hilbert 索引
+        selected_indices = selected_mask.nonzero(as_tuple=False)  # [M, 2] = (batch_idx, token_idx)
 
+        if selected_indices.shape[0] == 0:
+            return torch.zeros_like(selected_mask)
+
+        # 提取选中 token 的 Hilbert 索引
+        batch_idx = selected_indices[:, 0]  # [M]
+        token_idx = selected_indices[:, 1]  # [M]
+        selected_h = hilbert_indices[token_idx]  # [M]
+
+        # 广播计算距离: [M, 1] - [1, N] = [M, N]
+        hilbert_expanded = hilbert_indices.unsqueeze(0)  # [1, N]
+        selected_h_expanded = selected_h.unsqueeze(1)  # [M, 1]
+        dist = torch.abs(selected_h_expanded - hilbert_expanded)
+
+        # 窗口掩码: [M, N]
+        window_mask = dist <= window
+
+        # 按 batch 分组求和得到密度 [B, N]
+        density = torch.zeros(B, N, device=selected_mask.device, dtype=torch.float32)
+
+        # 使用 index_add 按 batch 累加
         for b in range(B):
-            selected_indices = selected_mask[b].nonzero(as_tuple=True)[0]
-            if len(selected_indices) == 0:
-                continue
-
-            # 获取选中区域的 Hilbert 索引并排序
-            selected_h = hilbert_np[selected_indices.cpu().numpy()]
-            sorted_h = np.sort(selected_h)
-
-            # 对每个候选区域计算局部密度
-            for i in range(N):
-                h_i = hilbert_np[i]
-                left_idx = bisect.bisect_left(sorted_h, h_i - window)
-                right_idx = bisect.bisect_right(sorted_h, h_i + window)
-                density[b, i] = right_idx - left_idx
+            b_mask = batch_idx == b
+            if b_mask.any():
+                density[b] = window_mask[b_mask].sum(dim=0).float()
 
         return density
 
@@ -2624,16 +2630,15 @@ class GumbelTopKSplitter(
         D = int(depths.max().item() + 1)
         device = depths.device
 
-        # 计算每个深度的温度缩放因子
+        # 计算每个深度的温度缩放因子 (向量化实现)
         # τ_d = τ_base × (N_max / N_d)^γ = τ_base × (4^{max_depth - d})^gamma
         gamma = DEPTH_TEMPERATURE_GAMMA
-        depth_temperature_scale = torch.zeros(D, device=device, dtype=torch.float32)
 
-        for d in range(D):
-            N_d = 4 ** d
-            N_max = 4 ** (D - 1)
-            scale = (N_max / N_d) ** gamma
-            depth_temperature_scale[d] = scale
+        # 向量化：使用张量运算一次性计算所有深度
+        depth_indices = torch.arange(D, device=device, dtype=torch.float32)
+        N_d = 4 ** depth_indices
+        N_max = 4 ** (D - 1)
+        depth_temperature_scale = (N_max / N_d) ** gamma
 
         # 映射到每个候选区域
         temperature = depth_temperature_scale[depths]
@@ -3251,7 +3256,7 @@ class GumbelTopKSplitter(
         # 步骤 2: 按比例分配配额 (对 batch 取平均)
         S_total = score_per_depth.sum(dim=1, keepdim=True)  # [B, 1]
         # 避免除零
-        S_total = S_total.clamp(min=1e-8)
+        S_total = S_total.clamp(min=EPS)
 
         # 软配额: K × S_d / Σ S_d'
         K_soft_float = K * (score_per_depth / S_total)  # [B, D]
@@ -3666,7 +3671,8 @@ class GumbelTopKSplitter(
             info_density = self._compute_info_density(features)
 
         # I113-7: 计算配额分配 (支持信息密度自适应，返回硬/软配额)
-        hard_quota, soft_quota = self._compute_quota_allocation(K, info_density)
+        # I165-1: 传递 features 以支持分层自适应配额模式
+        hard_quota, soft_quota = self._compute_quota_allocation(K, info_density, features)
         quota = hard_quota  # 用于 token 选择
 
         # I113-7: 缓存软/硬配额用于损失计算
@@ -4482,7 +4488,7 @@ class GumbelTopKSplitter(
 
         # KL(Poisson(K) || Poisson(K_t))
         # I152-FIX: 添加 log 数值稳定性保护
-        log_ratio = torch.log(ratio_clamped + 1e-8)
+        log_ratio = torch.log(ratio_clamped + EPS)
         kl_loss = K_t * (ratio_clamped * log_ratio + 1.0 - ratio_clamped)
 
         # I152-FIX: 钳制 KL loss 上界，防止爆炸

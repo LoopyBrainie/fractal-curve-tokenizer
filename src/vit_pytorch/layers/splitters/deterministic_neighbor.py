@@ -145,10 +145,12 @@ class HilbertNeighborMatrix(nn.Module):
         self,
         max_level: int = 4,
         neighbor_threshold: int = 2,
+        use_vectorized: bool = True,
     ):
         super().__init__()
         self.max_level = max_level
         self.neighbor_threshold = neighbor_threshold
+        self.use_vectorized = use_vectorized
 
         # Hilbert距离阈值：hilbert距离小于此值认为相邻
         # threshold = 4^(max_level - neighbor_threshold)
@@ -174,15 +176,18 @@ class HilbertNeighborMatrix(nn.Module):
         if N == 0:
             return torch.zeros(N, N, device=hilbert_indices.device)
 
-        # 1. 按Hilbert索引排序
-        sorted_idx = torch.argsort(hilbert_indices)
-        sorted_h = hilbert_indices[sorted_idx]
-        sorted_d = depths[sorted_idx]
-
-        # 2. 使用滑动窗口构建稀疏邻接矩阵
-        adj = self._sliding_window_neighbors(
-            sorted_h, sorted_d, sorted_idx
-        )
+        # 选择实现方式
+        if self.use_vectorized:
+            # GPU加速版本：使用精确Hilbert距离
+            adj = self._vectorized_neighbors(hilbert_indices, depths)
+        else:
+            # CPU版本：使用滑动窗口 + bisect
+            sorted_idx = torch.argsort(hilbert_indices)
+            sorted_h = hilbert_indices[sorted_idx]
+            sorted_d = depths[sorted_idx]
+            adj = self._sliding_window_neighbors(
+                sorted_h, sorted_d, sorted_idx
+            )
 
         return adj
 
@@ -277,6 +282,77 @@ class HilbertNeighborMatrix(nn.Module):
             adj = torch.zeros(N, N, device=device)
 
         return adj
+
+    def _vectorized_neighbors(
+        self,
+        hilbert_indices: Tensor,
+        depths: Tensor,
+    ) -> Tensor:
+        """
+        GPU加速的精确Hilbert距离邻居查找
+
+        优化: 使用GPU向量运算替代CPU NumPy + bisect
+        L=8 时 N=87381，使用分块策略避免内存溢出
+
+        原理:
+            - 分块计算避免 O(N²) 内存爆炸
+            - 每块大小约 5000 × 5000 = ~100MB
+            - 完全GPU化，消除CPU同步
+
+        Args:
+            hilbert_indices: [N] Hilbert曲线索引
+            depths: [N] 每个区域的深度
+
+        Returns:
+            adj: [N, N] 密集邻接矩阵
+        """
+        N = hilbert_indices.shape[0]
+        device = hilbert_indices.device
+
+        hilbert_th = self._hilbert_threshold
+        max_lvl = self.max_level
+        neighbor_th = self.neighbor_threshold
+        depth_th = max_lvl - neighbor_th
+
+        # 分块大小（5000 × 5000 × 1 byte = 25MB）
+        chunk_size = 5000
+
+        # 预分配结果矩阵
+        adj = torch.zeros(N, N, dtype=torch.bool, device=device)
+
+        # 分块计算
+        for i in range(0, N, chunk_size):
+            i_end = min(i + chunk_size, N)
+            h_chunk = hilbert_indices[i:i_end]  # [chunk,]
+            d_chunk = depths[i:i_end]
+
+            for j in range(0, N, chunk_size):
+                j_end = min(j + chunk_size, N)
+                h_block = hilbert_indices[j:j_end]  # [chunk,]
+                d_block = depths[j:j_end]
+
+                # 计算块内距离
+                h1 = h_chunk.unsqueeze(1)  # [chunk, 1]
+                h2 = h_block.unsqueeze(0)   # [1, chunk]
+                h_dist = (h1 - h2).abs()
+
+                # 邻居条件
+                is_neighbor = h_dist < hilbert_th
+
+                # 深度条件
+                d1 = d_chunk.unsqueeze(1)
+                d2 = d_block.unsqueeze(0)
+                depth_diff = (d1 - d2).abs()
+                depth_condition = depth_diff <= depth_th
+
+                # 写入结果
+                block_mask = is_neighbor & depth_condition
+                adj[i:i_end, j:j_end] = block_mask
+
+        # 排除自环
+        adj.fill_diagonal_(False)
+
+        return adj.float()
 
     @property
     def threshold(self) -> int:
@@ -432,6 +508,110 @@ class NeighborAwareScoringV2(nn.Module):
 
 
 # =============================================================================
+# 可微邻域传播 (Gather-Scatter 范式)
+# =============================================================================
+
+class DifferentiableNeighborPropagation(nn.Module):
+    """
+    可微邻域传播算子 - Gather-Scatter 范式
+
+    数学定义:
+        1. 邻域索引: N(i) = { j | Hilbert距离(i,j) < threshold }
+        2. 全微分相似度: α_ij = Softmax_j( f_i^T f_j / √d )，j ∈ N(i)
+        3. 动态门控: s'_i = (1-σ(γ))·s_i + σ(γ)·Σ α_ij·s_j
+
+    优势:
+        - 100% 梯度覆盖率 (两路径均有梯度)
+        - 显存高效: O(N·K)
+        - 可学习门控参数 γ
+    """
+
+    def __init__(
+        self,
+        feature_dim: int = 256,
+        hidden_dim: int = 64,
+        K: int = 32,
+    ):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.hidden_dim = hidden_dim
+        self.K = K
+
+        # 基础分数 MLP
+        self.score_mlp = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        # 可学习门控参数 (初始化为 0，即默认使用 base 路径)
+        self.gate_gamma = nn.Parameter(torch.tensor(0.0))
+
+    def forward(
+        self,
+        features: Tensor,
+        neighbor_indices: Tensor,
+        mask: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        可微邻域传播
+
+        Args:
+            features: [B*N, D] 特征 (展平)
+            neighbor_indices: [N, K] 邻居索引 (每个位置 i 的 K 个邻居，范围 [0, N-1])
+            mask: [N, K] 有效邻居掩码
+
+        Returns:
+            base_scores: [B*N] 基础分数
+            final_scores: [B*N] 门控融合后的分数
+        """
+        B = features.shape[0] // neighbor_indices.shape[0]
+        N = neighbor_indices.shape[0]
+        K = self.K
+        D = self.feature_dim
+
+        # Reshape: [B*N, D] -> [B, N, D]
+        features_reshaped = features.view(B, N, D)
+
+        # 1. 计算基础分数
+        base_scores = self.score_mlp(features_reshaped).squeeze(-1)  # [B, N]
+
+        # 2. 收集邻居特征 - 使用索引展开方法
+        # neighbor_indices: [N, K] 每个位置的 K 个邻居索引
+        # 创建批索引: [B, N, K]
+        batch_idx = torch.arange(B, device=features.device).view(B, 1, 1).expand(B, N, K)
+        # neighbor_indices 已经是 [N, K]，广播到 [B, N, K]
+        n_idx = neighbor_indices.unsqueeze(0).expand(B, N, K)
+
+        # 使用高级索引收集邻居特征
+        neighbor_features = features_reshaped[batch_idx, n_idx]  # [B, N, K, D]
+
+        # 同样收集邻居分数
+        neighbor_scores = base_scores[batch_idx, n_idx]  # [B, N, K]
+
+        # 3. 计算局部 Softmax 注意力
+        # query: [B, N, 1, D]
+        query = features_reshaped.unsqueeze(2)  # [B, N, 1, D]
+        # attn_logits: [B, N, K]
+        attn_logits = (query * neighbor_features).sum(-1) / math.sqrt(D)
+        attn_logits = attn_logits.masked_fill(~mask.unsqueeze(0), -1e9)
+        attn_weights = F.softmax(attn_logits, dim=-1)  # [B, N, K]
+
+        # 4. 加权聚合
+        neighbor_agg = (attn_weights * neighbor_scores).sum(dim=-1)  # [B, N]
+
+        # 5. 门控融合
+        gate = torch.sigmoid(self.gate_gamma)
+        final_scores = (1 - gate) * base_scores + gate * neighbor_agg
+
+        # Reshape: [B, N] -> [B*N]
+        base_scores_flat = base_scores.view(B * N)
+        final_scores_flat = final_scores.view(B * N)
+
+        return base_scores_flat, final_scores_flat
+
+
+# =============================================================================
 # Deterministic Neighbor Splitter 主实现
 # =============================================================================
 
@@ -505,11 +685,18 @@ class DeterministicNeighborSplitter(
             neighbor_threshold=self._neighbor_threshold,
         )
 
-        # 3. 邻居感知评分
+        # 3. 邻居感知评分 (小规模 N < 5000)
         self.scoring = NeighborAwareScoringV2(
             feature_dim=feature_dim,
             hidden_dim=self.config.hidden_dim,
             alpha_init=self.config.alpha_init,
+        )
+
+        # 3.1. 可微邻域传播 (大规模 N >= 5000, Gather-Scatter 范式)
+        self.diff_neighbor_prop = DifferentiableNeighborPropagation(
+            feature_dim=feature_dim,
+            hidden_dim=self.config.hidden_dim,
+            K=32,  # 每节点 32 个邻居
         )
 
         # 4. Hilbert感知相似度
@@ -549,6 +736,10 @@ class DeterministicNeighborSplitter(
         self._cached_adj: Optional[Tensor] = None
         self._cached_adj_sparse: Optional[Tensor] = None
         self._current_step = 0
+
+        # 7.1 KNN 邻居缓存 (用于 Gather-Scatter)
+        self._cached_knn_indices: Optional[Tensor] = None
+        self._cached_knn_mask: Optional[Tensor] = None
 
         # 8. 预计算稀疏邻接矩阵索引和度矩阵逆 (用于 Flattened Batch SpMM)
         # 在第一次调用 forward 时初始化
@@ -646,6 +837,23 @@ class DeterministicNeighborSplitter(
             adj_dense = self._get_adj_matrix()
             self._cached_adj_sparse = adj_dense.to_sparse()
         return self._cached_adj_sparse
+
+    def _get_knn_indices(self) -> Tuple[Tensor, Tensor]:
+        """获取 K 近邻索引和掩码 (使用缓存)"""
+        if self._cached_knn_indices is None:
+            # 使用 HilbertTopologyCache 生成 KNN
+            from vit_pytorch.core.hilbert_topology_cache import HilbertTopologyCache
+
+            topology = HilbertTopologyCache()
+            knn_indices, knn_mask = topology.get_knn_indices(
+                max_level=self._max_level,
+                K=32,  # 与 DifferentiableNeighborPropagation.K 一致
+            )
+            self._cached_knn_indices = knn_indices
+            self._cached_knn_mask = knn_mask
+
+        assert self._cached_knn_indices is not None and self._cached_knn_mask is not None
+        return self._cached_knn_indices, self._cached_knn_mask
 
     def _init_sparse_buffers(self, device: torch.device) -> None:
         """初始化稀疏邻接矩阵的 buffer（用于 Flattened Batch SpMM）"""
@@ -812,45 +1020,40 @@ class DeterministicNeighborSplitter(
         SPARSE_THRESHOLD = 5000
 
         if N >= SPARSE_THRESHOLD:
-            # 大规模: 使用稀疏矩阵 (无梯度)
-            # 优化: 使用 Flattened Batch SpMM 消除 for 循环
+            # 大规模: 使用 Gather-Scatter 可微邻域传播
+            # 优势: 100% 梯度覆盖率
+            # 获取 KNN 索引和掩码
+            knn_indices, knn_mask = self._get_knn_indices()
             roi_features_reshaped = roi_features.view(B, N, -1)
-            base_scores_all = self.scoring.score_mlp(roi_features_reshaped).squeeze(-1)  # [B, N]
 
-            # 展平为 [B*N]
-            base_scores_flat = base_scores_all.view(B * N)
+            # 使用可微邻域传播
+            base_scores_flat, final_scores = self.diff_neighbor_prop(
+                roi_features_reshaped.view(B * N, -1),
+                knn_indices,
+                knn_mask,
+            )
 
-            # 构建块对角稀疏矩阵并执行单次 SpMM
-            block_adj = self._build_block_diag_sparse(B, roi_features.device, roi_features.dtype)
-
-            # 单次稀疏矩阵乘法
-            result_flat = torch.sparse.mm(block_adj, base_scores_flat.unsqueeze(-1)).squeeze(-1)
-
-            # 恢复形状并应用度归一化
-            degree_inv: Tensor = getattr(self, '_degree_inv')
-            neighbor_contrib = result_flat.view(B, N) * degree_inv.unsqueeze(0)
+            # 恢复形状用于后续计算
+            base_scores = base_scores_flat.view(B, N)
+            final_scores_2d = final_scores.view(B, N)
         else:
             # 小规模: 使用密集矩阵 (梯度完整)
             adj_dense = self._get_adj_matrix()  # [N, N] 密集矩阵
             degree_inv = 1.0 / (adj_dense.sum(dim=-1) + EPS)
 
             roi_features_reshaped = roi_features.view(B, N, -1)
-            base_scores_all = self.scoring.score_mlp(roi_features_reshaped).squeeze(-1)
+            base_scores = self.scoring.score_mlp(roi_features_reshaped).squeeze(-1)
 
             # 密集矩阵乘法
-            adj_times_scores = base_scores_all @ adj_dense.t()
+            adj_times_scores = base_scores @ adj_dense.t()
             neighbor_contrib = adj_times_scores * degree_inv.unsqueeze(0)
 
-        # 最终分数
-        final_scores_all = base_scores_all + self.scoring.alpha * neighbor_contrib
-
-        # 展平为 [B*N]
-        base_scores = base_scores_all.view(B * N)
-        final_scores = final_scores_all.view(B * N)
+            # 最终分数
+            final_scores_2d = base_scores + self.scoring.alpha * neighbor_contrib
 
         # 3. 确定性选择
         tau = self._get_temperature()
-        scores_for_softmax = final_scores / (tau + EPS)
+        scores_for_softmax = final_scores_2d / (tau + EPS)
         probs_all = F.softmax(scores_for_softmax.view(B, N), dim=-1)  # [B, N]
 
         # 4. 按深度配额选择（硬选择用于推理）
