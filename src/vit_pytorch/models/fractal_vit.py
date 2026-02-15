@@ -47,7 +47,7 @@ from vit_pytorch.modules.base_tokenizer import BaseTokenizer, TokenizerOutput
 from vit_pytorch.modules.transformer_block import FractalTransformer, FFNType
 from vit_pytorch.core.utils import pair
 from vit_pytorch.core.constants import (
-    DIVISION_EPSILON, PROB_EPSILON,
+    EPS, DIVISION_EPSILON, PROB_EPSILON,
     compute_max_level, compute_num_candidates, compute_k_bounds,
     K_COVERAGE_MAX_HARD,
     SPLITTER_TEMP_START, SPLITTER_TEMP_END,
@@ -146,7 +146,8 @@ class TrainingStats:
     # I139: num_tokens 现在支持 int (单样本) 或 List[int] (多样本批次)
     # I141: 添加 torch.Tensor 支持，避免 forward 中的 .cpu() 调用导致 cudagraphs 失败
     num_tokens: Union[int, List[int], torch.Tensor]  # Token 数量
-    depth_used: int                   # 使用的深度
+    # I99-1 OPT: depth_used 支持 Tensor 类型以避免 CPU 同步
+    depth_used: Union[int, torch.Tensor]  # 使用的深度
     depth_distribution: Dict[int, float]  # 深度分布
     features: torch.Tensor            # [B, dim] 池化特征
     transformer_tokens: torch.Tensor  # [B, N, dim] Transformer token
@@ -184,7 +185,12 @@ class TrainingStats:
             )
         else:
             assert 0 <= self.num_tokens <= 4096, f"Token 数异常: {self.num_tokens}"
-        assert 0 <= self.depth_used <= 50, f"深度越界: {self.depth_used}"
+        # P4-FIX: 支持 depth_used 为 Tensor 类型
+        if isinstance(self.depth_used, torch.Tensor):
+            depth_valid = (self.depth_used >= 0) & (self.depth_used <= 50)
+            assert depth_valid.all(), f"深度越界: {self.depth_used}"
+        else:
+            assert 0 <= self.depth_used <= 50, f"深度越界: {self.depth_used}"
         if self.depth_distribution:
             total = sum(self.depth_distribution.values())
             assert abs(total - 1.0) < 1e-5, f"分布未归一化: {total}"
@@ -271,7 +277,7 @@ class FractalCurveViT(nn.Module):
         fourier_levels: int = 4,
         encoder_config: Optional[AttentionEncoderConfig] = None,
         quota_learnable: Optional[bool] = None,
-        quota_entropy_weight: float = 0.01,  # I24-2: 配额熵正则化权重
+        quota_entropy_weight: float = 0.5,  # I165-1: 增加熵权重以驱动深度分布变化 (原0.01)
         lca_fp16: bool = False,  # I104-3: 使用 FP16 存储 LCA embedding
         # I140: Splitter 架构参数
         splitter_hidden_dim: Optional[int] = None,
@@ -530,7 +536,10 @@ class FractalCurveViT(nn.Module):
                     coverage_min=token_coverage_min,
                     coverage_max_hard=token_coverage_max if token_coverage_max else K_COVERAGE_MAX_HARD,
                     # I120-3: 选中率均衡配额 (解决深度分布单一化)
-                    enable_rate_balanced_quota=True,
+                    # I165-1: 禁用 rate_balanced 以启用可学习的 ContinuousQuotaAllocator
+                    enable_rate_balanced_quota=False,
+                    # I165-1: 启用分层自适应配额 (根据图像内容动态调整深度分布)
+                    enable_hierarchical_quota=True,
                     # I145: 传递温度参数
                     temperature_init=splitter_temp_start if splitter_temp_start is not None else SPLITTER_TEMP_START,
                     temperature_min=splitter_temp_end if splitter_temp_end is not None else SPLITTER_TEMP_END,
@@ -544,6 +553,12 @@ class FractalCurveViT(nn.Module):
         from vit_pytorch.layers.splitters.semantic_redundancy import SemanticRedundancySplitter
         self._is_semantic_splitter = isinstance(self.splitter, SemanticRedundancySplitter)
 
+        # === HilbertTopologyCache (Step 3 优化) ===
+        # O(1) Tensor Lookup for Hilbert 坐标转换
+        # 必须在 tokenizer 创建之前创建
+        from vit_pytorch.core.hilbert_topology_cache import HilbertTopologyCache
+        self.hilbert_cache = HilbertTopologyCache()
+
         # === Tokenizer ===
         if tokenizer is None:
             # 创建 StreamingFractalTokenizerV3
@@ -555,6 +570,7 @@ class FractalCurveViT(nn.Module):
                 base_patch_size=effective_min_patch_size,
                 min_patch_size=effective_min_patch_size,
                 depth_scale_range=self.depth_scale_range,
+                hilbert_cache=self.hilbert_cache,  # Step 3: O(1) Hilbert lookup
             )
 
         # I110-7: 配置语义分裂器（必须在 tokenizer 赋值之前）
@@ -574,6 +590,10 @@ class FractalCurveViT(nn.Module):
 
         # I98-1: 设置 tokenizer 对 model 的弱引用，避免循环引用导致递归遍历失败
         tokenizer._model = weakref.ref(self)
+
+        # Step 3: 确保 tokenizer 有 hilbert_cache（如果外部传入 tokenizer）
+        if not hasattr(tokenizer, '_hilbert_cache') or tokenizer._hilbert_cache is None:
+            tokenizer._hilbert_cache = self.hilbert_cache
 
         # 从 tokenizer 动态获取 max_level（变参数）
         if hasattr(tokenizer, 'max_level'):
@@ -1201,7 +1221,7 @@ class FractalCurveViT(nn.Module):
                 all_depth_counts.scatter_add_(dim=1, index=depths_for_count, src=valid_pos_mask.float())
 
                 # 归一化分布
-                depth_sums = all_depth_counts.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                depth_sums = all_depth_counts.sum(dim=1, keepdim=True).clamp(min=EPS)
                 normalized_counts = all_depth_counts / depth_sums
 
                 # I144: 向量化计算所有 num_tokens - 完全 GPU 计算，避免循环中的 .item()
@@ -1250,7 +1270,8 @@ class FractalCurveViT(nn.Module):
                     num_tokens = lengths_list[i]  # 使用预转换的 Python list
                     levels_used = levels_used_list[i]
 
-                    if not valid_bool[i] or not levels_used:
+                    # P1 Fix: 使用已定义的 has_tokens_mask 替代未定义的 valid_bool
+                    if not has_tokens_mask[i] or not levels_used:
                         aux_info = {
                             "num_tokens": num_tokens,
                             "levels_used": [],
@@ -1388,9 +1409,29 @@ class FractalCurveViT(nn.Module):
             split_probs=split_probs
         )
 
-        # P0-FIX: 移除 aux_infos 依赖，避免 forward 中的 GPU-CPU 同步
-        # depth_distribution 延迟到 callbacks 中计算（使用 TrainingStats 中的 tensor）
-        depth_dist = {}
+        # P2-FIX: 计算实际的 depth_distribution 而非空字典
+        # 基于 _prepare_auxiliary_output 中的逻辑，避免 GPU-CPU 同步
+        depth_dist: Dict[int, float] = {}
+        if levels_list and len(levels_list) > 0:
+            # 计算 batch 平均深度分布
+            max_level_range = self.max_level + 1
+            depth_counts = torch.zeros(batch_size, max_level_range, dtype=torch.long, device=lengths.device)
+
+            for i, levels in enumerate(levels_list):
+                if levels.numel() > 0:
+                    depths = levels[:, 0].long()
+                    depths = depths[depths >= 0]
+                    valid_depths = depths[depths < max_level_range]
+                    if valid_depths.numel() > 0:
+                        depth_counts[i].index_add_(0, valid_depths, torch.ones_like(valid_depths))
+
+            # 归一化为概率分布
+            total_counts = depth_counts.sum(dim=1, keepdim=True).clamp(min=1)
+            normalized_counts = depth_counts.float() / total_counts.float()
+
+            # 计算 batch 平均分布
+            avg_distribution = normalized_counts.mean(dim=0)
+            depth_dist = {d: float(avg_distribution[d]) for d in range(max_level_range) if avg_distribution[d] > 0}
 
         # I135: 辅助函数 - 递归展平嵌套结构，提取所有整数值
         # P-OPT: 避免在 forward 中使用 .cpu()，使用 GPU 计算 max_level

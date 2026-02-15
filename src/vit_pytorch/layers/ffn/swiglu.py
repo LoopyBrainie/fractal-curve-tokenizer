@@ -76,6 +76,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vit_pytorch.core.constants import EPS
 from vit_pytorch.core.levels_info import LevelsInfo  # I98-4
 
 
@@ -304,7 +305,7 @@ class AdaptiveFractalFeedForward(nn.Module):
         # 标准 LayerNorm 计算
         mean = x.mean(dim=-1, keepdim=True)
         var = x.var(dim=-1, keepdim=True, unbiased=False)
-        x_norm = (x - mean) / torch.sqrt(var + 1e-5)
+        x_norm = (x - mean) / torch.sqrt(var + EPS)
 
         # 层级感知仿射变换
         gamma = self.ffn_gamma(depths)  # [B, S, D]

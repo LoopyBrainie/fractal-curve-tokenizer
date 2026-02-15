@@ -135,8 +135,9 @@ class HilbertBiasBase(ABC, nn.Module):
             if levels_info.data.numel() > 0:
                 depths = levels_info.data[:, :, 0]  # [B, S]
                 # 向量化检查：仅在有问题时才同步，避免每次 forward 都触发 .item()
+                # P-OPT: 使用 torch.any() 保持张量在 GPU 上，避免 .any() 方法触发同步
                 exceeds_mask = depths > self.max_level
-                if exceeds_mask.any():
+                if torch.any(exceeds_mask):
                     # 延迟同步：只有真正出错时才获取具体值
                     max_depth_in_input = depths.max().item()
                     raise ValueError(
@@ -402,7 +403,8 @@ class LCAHilbertBias(HilbertBiasBase):
         # P-OPT: 仅在调试模式检查 LCA 有效性，避免每次 forward 都触发 GPU 同步
         # I34-13: 静默钳位掩盖计算 bug，所以在调试时抛出异常
         if getattr(self, '_debug_mode', False):
-            lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_level).any()
+            # P-OPT: 使用 torch.any() 保持张量在 GPU 上
+            lca_invalid = torch.any(lca_depths < 0) or torch.any(lca_depths > self.max_level)
             if lca_invalid:
                 min_depth = lca_depths.min().item()
                 actual_max = lca_depths.max().item()
@@ -478,7 +480,8 @@ class LCAHilbertBias(HilbertBiasBase):
         # P-OPT: 仅在调试模式检查 LCA，移除热路径中的 GPU 同步
         # I34-13: LCA 钳位警告 - 静默钳位可能隐藏计算 bug
         if getattr(self, '_debug_mode', False):
-            lca_invalid = (lca_depths < 0).any() or (lca_depths > self.max_level).any()
+            # P-OPT: 使用 torch.any() 保持张量在 GPU 上
+            lca_invalid = torch.any(lca_depths < 0) or torch.any(lca_depths > self.max_level)
             if lca_invalid:
                 warnings.warn(
                     f"LCA depth clamped to [0, {self.max_level}]. "
@@ -984,8 +987,8 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             depth_count = depth_mask.sum(dim=1)  # [B]
 
             # 检查是否有深度 d 的 token（跨所有 batch）
-            # P-OPT: 使用 torch.any() 代替 sum() == 0，避免 GPU-CPU 同步
-            if not depth_count.any():
+            # P-OPT: 使用 torch.any() 保持张量在 GPU 上，避免 .any() 方法触发同步
+            if not torch.any(depth_count):
                 continue
 
             # 掩码: 只保留深度 d 的 token 之间的注意力

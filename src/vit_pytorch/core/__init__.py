@@ -11,6 +11,7 @@ from .curve_hilbert import (
     xy_to_hilbert_distance,
 )
 from .hilbert_indexer import HilbertIndexer, HilbertPathCache
+from .hilbert_topology_cache import HilbertTopologyCache
 # I162-1: Pattern Encoder
 from .pattern_encoder import (
     HilbertPatternEncoder,
@@ -64,6 +65,7 @@ __all__ = [
     # Indexer
     "HilbertIndexer",
     "HilbertPathCache",
+    "HilbertTopologyCache",
     # I162-1: Pattern Encoder
     "HilbertPatternEncoder",
     "HilbertPatternEncoderLight",

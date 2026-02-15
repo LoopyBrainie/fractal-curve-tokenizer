@@ -165,7 +165,7 @@ class DualPathFractalViT(nn.Module):
         fourier_levels: int = 4,
         encoder_config: Optional[Any] = None,
         quota_learnable: Optional[bool] = None,
-        quota_entropy_weight: float = 0.01,
+        quota_entropy_weight: float = 0.5,  # P3-FIX: 统一为 0.5
         lca_fp16: bool = False,
         splitter_hidden_dim: Optional[int] = None,
         splitter_feature_dim: Optional[int] = None,
