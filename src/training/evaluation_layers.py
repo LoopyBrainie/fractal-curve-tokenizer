@@ -362,6 +362,11 @@ class L7SplitterMetrics:
     I101-4: 移除 MLP 输出分析死代码
     原 mlp_logits_*/selection_prob_* 字段已移除，因为它们需要访问 splitter
     内部状态但从未正确实现。这些信息可从 splitter_diagnostics 获取。
+
+    行为指标 (从实际模型运行中收集):
+        - actual_depth_distribution: 实际深度使用分布
+        - actual_num_tokens_stats: 实际 token 数量统计
+        - actual_splitter_entropy: 实际分裂器熵
     """
     # 温度状态
     temperature: float = 1.0
@@ -387,6 +392,20 @@ class L7SplitterMetrics:
     # I36-5: 语义分裂器指标
     semantic_splitter_enabled: bool = False
     semantic_split_rate: float = 0.0  # 语义分裂率
+
+    # ===== 行为指标 (从实际模型运行中收集) =====
+    # 实际深度分布
+    actual_depth_distribution: Dict[int, float] = field(default_factory=dict)
+    # 实际 token 数量统计
+    actual_num_tokens_mean: float = 0.0
+    actual_num_tokens_std: float = 0.0
+    actual_num_tokens_min: int = 0
+    actual_num_tokens_max: int = 0
+    # 实际分裂器熵
+    actual_splitter_entropy_mean: float = 0.0
+    actual_splitter_entropy_std: float = 0.0
+    # 目标配额 vs 实际配额对比
+    quota_usage_ratio: Dict[int, float] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -2262,6 +2281,81 @@ class SplitterEvaluator:
 
         # I101-4: 门控权重统计已移入 L7SplitterMetrics
         # 门控权重在 L6StabilityEvaluator 中收集
+
+        # ===== 行为指标: 运行模型收集实际的分裂行为 =====
+        all_num_tokens: List[int] = []
+        all_depth_distributions: List[Dict[int, float]] = []
+        all_splitter_entropies: List[float] = []
+
+        with torch.no_grad():
+            for batch_idx, (imgs, labels) in enumerate(tqdm(data_loader, desc="L7: Splitter")):
+                if batch_idx >= max_batches:
+                    break
+                imgs = imgs.to(device, non_blocking=True)
+
+                # 运行模型获取实际的分裂行为
+                stats = model(imgs)
+
+                # 收集 num_tokens
+                if hasattr(stats, 'num_tokens') and stats.num_tokens is not None:
+                    num_tokens = stats.num_tokens
+                    if isinstance(num_tokens, torch.Tensor):
+                        all_num_tokens.extend(num_tokens.cpu().tolist())
+                    elif isinstance(num_tokens, (list, tuple)):
+                        all_num_tokens.extend(num_tokens)
+                    else:
+                        all_num_tokens.append(num_tokens)
+
+                # 收集 depth_distribution
+                if hasattr(stats, 'depth_distribution') and stats.depth_distribution:
+                    all_depth_distributions.append(stats.depth_distribution)
+
+                # 收集 splitter_entropy
+                if hasattr(stats, 'splitter_entropy') and stats.splitter_entropy is not None:
+                    entropy = stats.splitter_entropy
+                    if isinstance(entropy, torch.Tensor):
+                        all_splitter_entropies.append(entropy.item())
+                    else:
+                        all_splitter_entropies.append(float(entropy))
+
+        # 计算实际 token 数量统计
+        if all_num_tokens:
+            num_tokens_tensor = torch.tensor(all_num_tokens)
+            metrics.actual_num_tokens_mean = num_tokens_tensor.float().mean().item()
+            metrics.actual_num_tokens_std = num_tokens_tensor.float().std().item()
+            metrics.actual_num_tokens_min = num_tokens_tensor.min().item()
+            metrics.actual_num_tokens_max = num_tokens_tensor.max().item()
+
+        # 计算实际深度分布 (平均)
+        if all_depth_distributions:
+            # 合并所有批次的深度分布
+            all_depths: Dict[int, List[float]] = {}
+            for dist in all_depth_distributions:
+                for d, p in dist.items():
+                    if d not in all_depths:
+                        all_depths[d] = []
+                    all_depths[d].append(p)
+            # 计算每个深度的平均概率
+            for d, probs in all_depths.items():
+                metrics.actual_depth_distribution[d] = sum(probs) / len(probs)
+
+        # 计算实际分裂器熵统计
+        if all_splitter_entropies:
+            entropy_tensor = torch.tensor(all_splitter_entropies)
+            metrics.actual_splitter_entropy_mean = entropy_tensor.mean().item()
+            metrics.actual_splitter_entropy_std = entropy_tensor.std().item()
+
+        # 计算目标配额 vs 实际配额的使用比例
+        # 实际配额 = depth_distribution 的归一化概率
+        if metrics.actual_depth_distribution and metrics.quotas:
+            total_tokens = sum(all_num_tokens) if all_num_tokens else 1
+            for d in metrics.quotas:
+                target_quota = metrics.quotas.get(d, 0.0)
+                actual_ratio = metrics.actual_depth_distribution.get(d, 0.0)
+                if target_quota > 0:
+                    metrics.quota_usage_ratio[d] = actual_ratio / target_quota
+                else:
+                    metrics.quota_usage_ratio[d] = 0.0
 
         return metrics
 
