@@ -1732,13 +1732,29 @@ class LayeredEvaluator:
             report.L7_splitter = splitter_eval.evaluate(
                 self.model, eval_loader, self.device
             )
+            # 静态配置指标
             if report.L7_splitter.temperature > 0:
                 print(f"  - Temperature: {report.L7_splitter.temperature:.3f}")
                 print(f"  - Quota entropy: {report.L7_splitter.quota_entropy:.3f}")
                 if report.L7_splitter.quotas:
-                    print(f"  - Quotas: {report.L7_splitter.quotas}")
+                    print(f"  - Target quotas: {report.L7_splitter.quotas}")
             else:
-                print("  - (Splitter metrics not available)")
+                print("  - (Splitter config not available)")
+
+            # 行为指标 (实际运行结果)
+            if report.L7_splitter.actual_num_tokens_mean > 0:
+                print(f"  - Actual tokens: mean={report.L7_splitter.actual_num_tokens_mean:.1f}, "
+                      f"std={report.L7_splitter.actual_num_tokens_std:.1f}, "
+                      f"range=[{report.L7_splitter.actual_num_tokens_min}-{report.L7_splitter.actual_num_tokens_max}]")
+            if report.L7_splitter.actual_depth_distribution:
+                depth_str = ", ".join([f"d{d}:{p:.2%}" for d, p in sorted(report.L7_splitter.actual_depth_distribution.items())])
+                print(f"  - Actual depth dist: {depth_str}")
+            if report.L7_splitter.actual_splitter_entropy_mean > 0:
+                print(f"  - Splitter entropy: mean={report.L7_splitter.actual_splitter_entropy_mean:.3f}, "
+                      f"std={report.L7_splitter.actual_splitter_entropy_std:.3f}")
+            if report.L7_splitter.quota_usage_ratio:
+                ratio_str = ", ".join([f"d{d}:{r:.2f}x" for d, r in sorted(report.L7_splitter.quota_usage_ratio.items())])
+                print(f"  - Quota usage ratio: {ratio_str}")
         
         # L8: 梯度流评估 (需要一个 sample batch)
         if 'L8' not in skip_layers:

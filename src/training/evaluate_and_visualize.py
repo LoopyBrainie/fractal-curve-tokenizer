@@ -612,10 +612,29 @@ def _print_summary(report: LayeredEvaluationReport) -> None:
     if hasattr(report, 'L7_splitter') and report.L7_splitter is not None:
         l7 = report.L7_splitter
         print(f"\n[L7] Splitter:")
+
+        # 静态配置指标
         if l7.temperature > 0:
             print(f"     Temperature: {l7.temperature:.3f}")
-        # I101-4: decision_confidence_mean 字段已移除
         print(f"     Quota Entropy: {l7.quota_entropy:.3f}")
+        if l7.quotas:
+            quotas_str = ", ".join([f"d{d}:{v:.2f}" for d, v in sorted(l7.quotas.items())])
+            print(f"     Target Quotas: {quotas_str}")
+
+        # 行为指标 (实际运行结果)
+        if l7.actual_num_tokens_mean > 0:
+            print(f"     Actual Tokens: mean={l7.actual_num_tokens_mean:.1f}, "
+                  f"std={l7.actual_num_tokens_std:.1f}, "
+                  f"range=[{l7.actual_num_tokens_min}-{l7.actual_num_tokens_max}]")
+        if l7.actual_depth_distribution:
+            depth_str = ", ".join([f"d{d}:{p:.1%}" for d, p in sorted(l7.actual_depth_distribution.items())])
+            print(f"     Actual Depth Dist: {depth_str}")
+        if l7.actual_splitter_entropy_mean > 0:
+            print(f"     Splitter Entropy: mean={l7.actual_splitter_entropy_mean:.3f}, "
+                  f"std={l7.actual_splitter_entropy_std:.3f}")
+        if l7.quota_usage_ratio:
+            ratio_str = ", ".join([f"d{d}:{r:.2f}x" for d, r in sorted(l7.quota_usage_ratio.items())])
+            print(f"     Quota Usage Ratio: {ratio_str}")
 
     # L8: Gradient Flow
     if hasattr(report, 'L8_gradient_flow') and report.L8_gradient_flow is not None:
