@@ -1,7 +1,7 @@
 #!/bin/bash
 # Tiny-ImageNet Optimal Training Script (RTX 4070 Laptop 8GB)
 # Splitter: DeterministicNeighborSplitter (neighbor-based, no Gumbel randomness)
-# Mathematical Formalization (2026-02-13 Update)
+# Mathematical Formalization (2026-02-16 Update)
 # Target: 200 epochs, batch=192
 
 set -e
@@ -15,7 +15,8 @@ set -e
 #   Image size: 64×64 (native)
 #   max_level = ceil(log2(64/4)) = 4
 #   Candidate regions = 341 (vs 21,845 for ImageNet)
-#   Token range: [8, 36] for 64×64 images
+#   Token range: [12, 51] for 64×64 images (coverage 0.03-0.15)
+#   Adjusted: K-min-abs=12, token-coverage-max=0.15
 #
 # [MEMORY CONSTRAINT MODEL]
 #   M_total = M_params + M_gradients + M_optimizer + M_activations
@@ -45,9 +46,9 @@ uv run python src/training/train_fractal_vit.py \
   --heads 6 \
   --mlp-dim 1536 \
   --min-patch-size 4 \
-  --token-coverage-min 0.01 \
-  --token-coverage-max 0.20 \
-  --K-min-abs 8 \
+  --token-coverage-min 0.03 \
+  --token-coverage-max 0.15 \
+  --K-min-abs 12 \
   --batch-size 192 \
   --lr 1e-04 \
   --weight-decay 0.05 \
@@ -66,7 +67,7 @@ uv run python src/training/train_fractal_vit.py \
   --soft-entropy-weight 0.1 \
   --include-elastic-budget \
   --elastic-coverage-min 0.03 \
-  --elastic-coverage-max 0.25 \
+  --elastic-coverage-max 0.20 \
   --elastic-lambda-over 0.1 \
   --elastic-lambda-under 0.01 \
   --quota-learnable enable \
