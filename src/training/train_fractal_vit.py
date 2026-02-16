@@ -2830,9 +2830,11 @@ def verify_train_eval_consistency(
         print(f"  [WARN] 输出差异: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
     
     # 检查 3: 尺度选择稳定性 (多次推理应产生相同结果)
+    # I150-1: 需要在 AMP 上下文中调用，以确保输入 dtype 与模型参数匹配
     if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'compute_scale_distribution'):
-        dist1 = model.tokenizer.compute_scale_distribution(imgs)
-        dist2 = model.tokenizer.compute_scale_distribution(imgs)
+        with get_amp_context(device, config.use_amp):
+            dist1 = model.tokenizer.compute_scale_distribution(imgs)
+            dist2 = model.tokenizer.compute_scale_distribution(imgs)
         
         # 比较两次的尺度比例
         scale_stable = all(
@@ -4300,7 +4302,9 @@ def main():
                 # 使用 val_loader 的一个 batch 计算尺度分布
                 sample_batch = next(iter(val_loader))
                 sample_imgs = sample_batch[0][:8].to(device)  # 只用 8 张图
-                scale_distribution = model.tokenizer.compute_scale_distribution(sample_imgs)
+                # I150-1: 需要在 AMP 上下文中调用，以确保输入 dtype 与模型参数匹配
+                with get_amp_context(device, config.use_amp):
+                    scale_distribution = model.tokenizer.compute_scale_distribution(sample_imgs)
         
         epoch_time = time.time() - start
         
