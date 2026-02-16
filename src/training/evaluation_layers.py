@@ -2215,8 +2215,9 @@ class SplitterEvaluator:
         splitter = model.splitter
 
         # I36-5: 检查语义分裂器
+        # 修复: use_semantic_splitter 是 @property，不是方法
         if hasattr(model, 'use_semantic_splitter'):
-            metrics.semantic_splitter_enabled = model.use_semantic_splitter()
+            metrics.semantic_splitter_enabled = model.use_semantic_splitter
 
         # 基础参数提取
         if hasattr(splitter, 'current_temperature'):

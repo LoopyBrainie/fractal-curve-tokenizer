@@ -1889,6 +1889,9 @@ def train_epoch(
     # P-OPT: 使用 GPU 张量累加 entropy loss，避免每 batch 的 .item() 同步
     entropy_loss_sum = torch.tensor(0.0, device=device)
     entropy_loss_count = 0
+    # [Loss诊断] 单独跟踪 CE loss 以便与 eval loss 对比
+    ce_loss_sum = torch.tensor(0.0, device=device)
+    ce_loss_count = 0
     cuda_mem_peak = 0.0
     use_mixup = mixup_fn is not None
     nan_count = 0  # NaN 计数器
@@ -2094,7 +2097,11 @@ def train_epoch(
                         outs, labels, 
                         label_smoothing=config.label_smoothing
                     ) / config.accum_steps
-            
+
+            # [Loss诊断] 累加 CE loss 用于统计
+            ce_loss_sum = ce_loss_sum + ce_loss.detach()
+            ce_loss_count += 1
+
             # P1-5 修复: 收集熵正则化损失
             # 熵损失鼓励尺度分布多样性，防止 CrossScaleAttention 崩塌到单一尺度
             entropy_loss = None
@@ -2170,9 +2177,17 @@ def train_epoch(
                     if torch.isnan(splitter_loss_f32) or torch.isinf(splitter_loss_f32):
                         print(f"[WARN] splitter_loss 为 NaN/Inf: {splitter_loss_f32.item()}")
                         splitter_loss = None  # 跳过该损失
+                    elif splitter_loss_f32.abs() > 1000:
+                        # [Loss诊断] 检测异常大的 splitter_loss
+                        print(f"[WARN] splitter_loss 异常大: {splitter_loss_f32.item():.2f}, 将被裁剪")
+                        splitter_loss_f32 = splitter_loss_f32.clamp(min=-100, max=100)
+                        loss = loss + splitter_loss_f32 / config.accum_steps
                     else:
                         loss = loss + splitter_loss_f32 / config.accum_steps
                 else:
+                    # 非调试模式也做异常值保护，防止 90+ loss
+                    if splitter_loss_f32.abs() > 1000:
+                        splitter_loss_f32 = splitter_loss_f32.clamp(min=-100, max=100)
                     loss = loss + splitter_loss_f32 / config.accum_steps
 
             # I110-7: 语义分裂器损失集成
@@ -2190,6 +2205,18 @@ def train_epoch(
                     else:
                         semantic_weight = getattr(config, 'semantic_loss_weight', 0.1)
                         loss = loss + semantic_loss_f32.mean() * semantic_weight / config.accum_steps
+
+            # [Loss诊断] 分离打印各损失组件
+            if debug_mode and i % 10 == 0:
+                ce_loss_val = ce_loss.item() * config.accum_steps  # 还原为真实CE loss
+                splitter_val = splitter_loss_f32.item() if splitter_loss is not None and splitter_loss.numel() > 0 else 0.0
+                total_val = loss.item() * config.accum_steps
+                print(f"[Loss] batch={i}, ce={ce_loss_val:.4f}, splitter={splitter_val:.4f}, total={total_val:.4f}")
+
+        # [Loss诊断] 检查总 loss 是否异常大
+        if loss.abs() > 100:
+            print(f"[WARN] total loss 异常大: {loss.item()*config.accum_steps:.2f}, 将被裁剪")
+            loss = loss.clamp(min=-50, max=50)
 
         # P-OPT: 仅在调试模式检查 loss NaN/Inf，避免 GPU-CPU 同步
         # 训练时依赖 AMP 的安全机制，跳过检查
@@ -2307,6 +2334,8 @@ def train_epoch(
         'cuda_utilization': None,
         # P1-5: 使用 GPU 张量计算平均熵损失，避免 per-batch .item() 同步
         'avg_entropy_loss': (entropy_loss_sum / entropy_loss_count).item() if entropy_loss_count > 0 else None,
+        # [Loss诊断] 添加 CE loss 跟踪以便与 eval loss 对比
+        'avg_ce_loss': (ce_loss_sum / ce_loss_count).item() if ce_loss_count > 0 else None,
     }
     
     # P1-5: 获取当前尺度熵值用于监控
@@ -4272,7 +4301,11 @@ def main():
             epoch=epoch,
             hard_mining=hard_mining,
         )
-        print(f"[INFO] Epoch {epoch}: train_epoch 完成, loss={train_loss:.4f}, acc={train_acc:.2f}%")
+        # [Loss诊断] 打印 CE loss vs Total loss 以识别辅助损失影响
+        ce_loss_info = ""
+        if perf_stats.get('avg_ce_loss') is not None:
+            ce_loss_info = f", ce_loss={perf_stats['avg_ce_loss']:.4f}"
+        print(f"[INFO] Epoch {epoch}: train_epoch 完成, loss={train_loss:.4f}, acc={train_acc:.2f}%{ce_loss_info}")
 
         # P15: 恢复 CudaPrefetcher 和清理临时 loader
         if disable_prefetch_this_epoch:
@@ -4332,7 +4365,11 @@ def main():
         history.append(history_entry)
         
         print(f"\nEpoch {epoch}/{config.epochs}:")
-        print(f"  Train: loss={train_loss:.4f}, acc={train_acc:.2f}%")
+        # [Loss诊断] 显示 CE loss vs Total loss
+        ce_loss_str = ""
+        if perf_stats.get('avg_ce_loss') is not None:
+            ce_loss_str = f" (ce={perf_stats['avg_ce_loss']:.4f})"
+        print(f"  Train: loss={train_loss:.4f}{ce_loss_str}, acc={train_acc:.2f}%")
         print(f"  Val:   loss={val_loss:.4f}, acc={val_acc:.2f}%")
         print(f"  Time:  {epoch_time:.1f}s, Throughput: {perf_stats['throughput']:.1f} samples/s")
         
