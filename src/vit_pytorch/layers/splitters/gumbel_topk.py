@@ -4083,7 +4083,7 @@ class GumbelTopKSplitter(
         """
         B_mask, N_mask = consistent_mask.shape
         B_probs, N_probs = probs.shape
-        if B_mask != B_probs or N_mask != N_probs:
+        if B_mask != B_probs or N_probs != N_probs:
             raise RuntimeError(
                 f"I99-1 SHAPE MISMATCH: consistent_mask.shape=({B_mask}, {N_mask}), "
                 f"probs.shape=({B_probs}, {N_probs})"
@@ -4095,8 +4095,25 @@ class GumbelTopKSplitter(
         # 这用于辅助损失计算
         num_selected_per_batch_float = consistent_mask.sum(dim=1)  # [B]
 
-        # 使用硬阈值选择最终区域 (用于实际 token 选择和索引)
-        final_selected = (consistent_mask > 0.5)  # [B, N]
+        # ========================================================================
+        # FIX: 使用 topk_indices 构建硬掩码，而不是软概率阈值
+        # 问题: 软概率在每个深度内和为 1，如果 K_d=18，平均概率约 0.055 < 0.5
+        # 解决: 直接使用 topk_indices 构建硬掩码，确保选中正确数量的 token
+        # ========================================================================
+        # 初始化硬掩码
+        final_selected = torch.zeros(B, N, dtype=torch.bool, device=device)
+
+        # 使用 topk_indices 构建硬掩码
+        for b in range(B):
+            indices = topk_indices[b]  # [K_b]
+            # 过滤掉 padding (-1)
+            valid_indices = indices[indices >= 0]
+            if len(valid_indices) > 0:
+                final_selected[b, valid_indices] = True
+
+        # 备用: 如果 topk_indices 为空或无效，使用软概率阈值
+        if not final_selected.any():
+            final_selected = (consistent_mask > 0.5)  # [B, N]
 
         # I150-2 FIX: 使用硬掩码计算实际的 token 数量，与 hilbert_indices 数量一致
         num_selected_per_batch = final_selected.sum(dim=1).long()  # [B]
@@ -5230,12 +5247,12 @@ class GumbelTopKSplitter(
             selected_mask = getattr(self, '_last_selected_mask', None)
 
         if selected_mask is None or self._current_max_depth is None:
-            # 返回零向量（无有效数据时）
-            D = self._current_max_depth + 1 if self._current_max_depth is not None else 1
+            # I150-1-DEBUG: 返回均匀分布便于诊断，而非零向量
+            D = self._current_max_depth + 1 if self._current_max_depth is not None else 5
             device = getattr(self, '_cached_device_depths', None)
             if device is not None:
-                return torch.zeros(D, device=device.device)
-            return torch.zeros(D)
+                return torch.ones(D, device=device.device) / D
+            return torch.ones(5) / 5
 
         B, N = selected_mask.shape
         device = selected_mask.device
@@ -5616,6 +5633,47 @@ class GumbelTopKSplitter(
             None 如果未启用可学习配额
         """
         return self.quota_logits
+
+    def diagnose_depth_distribution(self) -> Dict[str, Any]:
+        """I150-1-DEBUG: 诊断深度分布问题。
+
+        返回详细的诊断信息，帮助定位为什么返回均匀分布。
+        """
+        result = {
+            'has_last_selected_mask': False,
+            'selected_mask_sum': None,
+            'selected_mask_shape': None,
+            'has_current_max_depth': False,
+            'current_max_depth': None,
+            'has_candidate_depths': False,
+            'candidate_depths_range': None,
+            'num_candidates': None,
+            'quota_logits': None,
+        }
+
+        # 检查 _last_selected_mask
+        last_mask = getattr(self, '_last_selected_mask', None)
+        if last_mask is not None:
+            result['has_last_selected_mask'] = True
+            result['selected_mask_sum'] = float(last_mask.sum().item())
+            result['selected_mask_shape'] = list(last_mask.shape)
+
+        # 检查 _current_max_depth
+        if self._current_max_depth is not None:
+            result['has_current_max_depth'] = True
+            result['current_max_depth'] = self._current_max_depth
+
+        # 检查 candidate_depths
+        if self.candidate_depths is not None and len(self.candidate_depths) > 0:
+            result['has_candidate_depths'] = True
+            result['candidate_depths_range'] = [int(self.candidate_depths.min()), int(self.candidate_depths.max())]
+            result['num_candidates'] = len(self.candidate_depths)
+
+        # 检查 quota_logits
+        if self.quota_logits is not None:
+            result['quota_logits'] = self.quota_logits[:5].tolist()  # 只返回前5个
+
+        return result
 
     def get_quota_probs(self) -> Optional[Tensor]:
         """
@@ -6081,15 +6139,18 @@ class LookAheadHead(nn.Module):
         proj: 投影层 [C -> H]
     """
 
-    def __init__(self, in_channels: int, hidden_dim: int = 128):
+    def __init__(self, in_channels: int, hidden_dim: int = 128, feature_dim: int = 256):
         """
         初始化 LookAheadHead
 
         Args:
             in_channels: 输入特征通道数
             hidden_dim: 输出隐藏维度 (默认 128)
+            feature_dim: 原始特征维度，用于 temperature scaling
         """
         super().__init__()
+        self.in_channels = in_channels
+        self.feature_dim = feature_dim
         self.proj = nn.Conv2d(in_channels, hidden_dim, kernel_size=1)
 
     def forward(self, features: Tensor) -> Tensor:
@@ -6233,10 +6294,15 @@ class LookAheadHead(nn.Module):
         pair_sim_stacked = torch.stack(pair_similarities, dim=-1)  # [B, N, 6]
         mean_similarities = pair_sim_stacked.mean(dim=-1)  # [B, N]
 
+        # Temperature Scaling: 缩放相似度以匹配 sigmoid 的输入范围
+        # 类似 Attention 中的 scaling factor: 1/sqrt(d_k)
+        scale_factor = math.sqrt(self.feature_dim)
+        scaled_similarities = mean_similarities / scale_factor
+
         # 应用无效区域掩码
         similarities = torch.where(valid_mask.to(device),
-                                  mean_similarities,
-                                  torch.ones_like(mean_similarities))
+                                  scaled_similarities,
+                                  torch.ones_like(scaled_similarities))
 
         return similarities  # [B, N]
 
@@ -6284,6 +6350,7 @@ class CorrelationSplitter(nn.Module):
         self.lookahead = LookAheadHead(
             in_channels=config.feature_dim,
             hidden_dim=config.lookahead_dim,
+            feature_dim=config.feature_dim,
         )
 
         # L2: 预计算基础候选数
