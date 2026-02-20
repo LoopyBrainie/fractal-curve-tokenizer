@@ -302,12 +302,12 @@ class AdaptiveFractalFeedForward(nn.Module):
             depths = depths.where(depths >= 0, torch.tensor(self.max_level + 1, device=depths.device))
             depths = depths.clamp(min=0, max=self.max_level + 1)
 
-        # 标准 LayerNorm 计算
-        mean = x.mean(dim=-1, keepdim=True)
-        var = x.var(dim=-1, keepdim=True, unbiased=False)
-        x_norm = (x - mean) / torch.sqrt(var + EPS)
+        # Task 4 重构: 使用 F.layer_norm 启用 torch.compile Kernel Fusion
+        # 分离标准归一化与层级感知仿射变换，使 PyTorch 识别为融合模式
+        x_norm = F.layer_norm(x, [self.dim], weight=None, bias=None)
 
-        # 层级感知仿射变换
+        # 层级感知仿射变换 (level_offset)
+        # 注意: 在 F.layer_norm 之后应用，确保融合内核仅包含归一化
         gamma = self.ffn_gamma(depths)  # [B, S, D]
         beta = self.ffn_beta(depths)    # [B, S, D]
         x_norm = x_norm * gamma + beta
