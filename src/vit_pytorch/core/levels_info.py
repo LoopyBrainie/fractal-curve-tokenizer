@@ -298,7 +298,7 @@ class LevelsInfo:
             device: 目标设备
 
         Returns:
-            weights: [d] 权重张量
+            weights: [d] 权重张量 (clone 以避免 CUDA Graphs 覆盖问题)
         """
         if d not in _hilbert_weights_cache:
             # 首次访问: 计算并缓存
@@ -308,7 +308,8 @@ class LevelsInfo:
                 dtype=torch.long,
                 device=device
             )
-        return _hilbert_weights_cache[d].to(device, non_blocking=True)
+        # I162-1: clone() 避免 CUDA Graphs 覆盖问题 (torch.compile + CUDA Graphs 兼容性)
+        return _hilbert_weights_cache[d].clone().to(device, non_blocking=True)
 
     # ========== 深度根归一化 (I161-1 修复) ==========
 
