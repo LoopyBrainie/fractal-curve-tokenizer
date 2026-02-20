@@ -32,7 +32,8 @@ set -e
 #   - tokenizer_dropout=0.0  : Deterministic tokenization (critical)
 #   - transformer_dropout=0.25: Strong regularization (200 epochs)
 #   - focal_gamma=2.5        : Hard/easy sample ratio 243x
-#   - soft_entropy + elastic_budget: Depth diversity + token budget
+#   - DeterministicNeighbor 内置损失: locality_loss + entropy_loss + variance_reg
+#   - Elastic Budget / Soft Entropy: DISABLED (not needed for deterministic_neighbor)
 #
 # Expected: Top-1 Accuracy 52-62% | Time: ~20-30 hours
 # Note: May converge differently due to deterministic nature
@@ -62,14 +63,8 @@ uv run python src/training/train_fractal_vit.py \
   --mixup-alpha 0.4 \
   --cutmix-alpha 0 \
   --focal-gamma 2.5 \
-  --include-soft-entropy \
-  --soft-entropy-mode maximize \
-  --soft-entropy-weight 0.1 \
-  --include-elastic-budget \
-  --elastic-coverage-min 0.03 \
-  --elastic-coverage-max 0.20 \
-  --elastic-lambda-over 0.1 \
-  --elastic-lambda-under 0.01 \
+  --no-soft-entropy \
+  --no-elastic-budget \
   --quota-learnable enable \
   --quota-entropy-weight 0.01 \
   --splitter-type deterministic_neighbor \

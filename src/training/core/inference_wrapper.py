@@ -68,6 +68,11 @@ class InferenceStats:
     splitter_entropy: float = 0.0
     temperature: float = 1.0
 
+    # I170: 添加语义分裂器相关字段，与 TrainingStats 保持一致
+    semantic_loss: Optional[torch.Tensor] = None  # 语义冗余损失
+    child_features: Optional[torch.Tensor] = None  # [B, N, 4, D] 子节点特征
+    redundancy: Optional[torch.Tensor] = None  # [B, N] 冗余性分数
+
     # 向后兼容字段 (I139 修复: 统一默认值与 TrainingStats)
     aux_infos: Optional[List[Dict[str, Any]]] = None
     split_info: Dict[str, Any] = field(default_factory=dict)
@@ -82,6 +87,8 @@ class EvalResult:
     top5_accuracy: float = 0.0  # Top-5 准确率
     per_class_accuracy: Optional[Dict[int, float]] = None  # 逐类别准确率
     ece: float = 0.0          # Expected Calibration Error (%)
+    # I170: 添加 split_info 到评估结果
+    split_info: Dict[str, Any] = field(default_factory=dict)
 
 
 # ============================================================================
@@ -179,10 +186,12 @@ def evaluate(
     # P-OPT: 使用 GPU tensor 累积损失，避免每个 batch .item() 同步
     total_loss = torch.tensor(0.0, device=device)
     total_samples = 0
+    # I170: 累积 split_info 统计
+    split_info_samples = []  # 用于累积每个 batch 的 split_info
 
     for batch in tqdm(loader, desc="Evaluating"):
         imgs, batch_labels = batch
-        loss, logits, _ = inference(model, imgs, batch_labels, device=device, use_amp=use_amp)
+        loss, logits, inference_stats = inference(model, imgs, batch_labels, device=device, use_amp=use_amp)
 
         probs = F.softmax(logits, dim=1)
         preds = logits.argmax(dim=1)
@@ -196,6 +205,10 @@ def evaluate(
         total_loss += loss * len(batch_labels)
         total_samples += len(batch_labels)
 
+        # I170: 捕获 split_info
+        if hasattr(inference_stats, 'split_info') and inference_stats.split_info:
+            split_info_samples.append(inference_stats.split_info)
+
     # P-OPT: 最后统一同步到 CPU
     all_preds = torch.cat(all_preds).cpu()
     all_labels = torch.cat(all_labels).cpu()
@@ -206,10 +219,38 @@ def evaluate(
     correct = (all_preds == all_labels).sum().item()
     accuracy = correct / total_samples * 100
 
+    # I170: 聚合 split_info
+    aggregated_split_info: Dict[str, Any] = {}
+    if split_info_samples:
+        # 聚合 levels_list 统计
+        all_levels = []
+        batch_sizes = []
+        for si in split_info_samples:
+            if 'levels_list' in si:
+                all_levels.extend(si['levels_list'])
+            if 'batch_size' in si:
+                batch_sizes.append(si['batch_size'])
+
+        if all_levels:
+            # 计算每个深度的平均 token 数量
+            depth_counts: Dict[int, int] = {}
+            for levels in all_levels:
+                if hasattr(levels, 'numel') and levels.numel() > 0:
+                    depths = levels[:, 0].long()
+                    for d in depths.unique().tolist():
+                        depth_counts[d] = depth_counts.get(d, 0) + (depths == d).sum().item()
+
+            aggregated_split_info['depth_histogram'] = depth_counts
+            aggregated_split_info['num_samples'] = len(split_info_samples)
+
+        if batch_sizes:
+            aggregated_split_info['total_batch_size'] = sum(batch_sizes)
+
     result = EvalResult(
         accuracy=accuracy,
         avg_loss=final_loss,
         num_samples=total_samples,
+        split_info=aggregated_split_info,
     )
 
     # Top-5 准确率
@@ -289,6 +330,11 @@ def wrap_stats(stats: Any, logits: torch.Tensor) -> InferenceStats:
     # I99-1: 提取 ema_stats 字段
     ema_stats = getattr(stats, 'ema_stats', None)
 
+    # I170: 提取语义分裂器相关字段
+    semantic_loss = getattr(stats, 'semantic_loss', None)
+    child_features = getattr(stats, 'child_features', None)
+    redundancy = getattr(stats, 'redundancy', None)
+
     # 构造 InferenceStats
     return InferenceStats(
         logits=logits,
@@ -301,6 +347,9 @@ def wrap_stats(stats: Any, logits: torch.Tensor) -> InferenceStats:
         ema_stats=ema_stats,  # I99-1: 新增字段
         splitter_entropy=getattr(stats, 'splitter_entropy', 0.0),
         temperature=getattr(stats, 'temperature', 1.0),
+        semantic_loss=semantic_loss,  # I170: 语义损失
+        child_features=child_features,  # I170: 子节点特征
+        redundancy=redundancy,  # I170: 冗余性分数
         aux_infos=getattr(stats, 'aux_infos', None),
         split_info=getattr(stats, 'split_info', {}),
     )

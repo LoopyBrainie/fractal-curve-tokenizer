@@ -1949,17 +1949,15 @@ def train_epoch(
         batch_start = time.time()
         
         imgs, labels = batch
+        # P-OPT: 统一使用 non_blocking=True，避免条件分支
+        imgs = imgs.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
         if device.type != 'cuda':
-            imgs = imgs.to(device)
-            labels = labels.to(device)
-        else:
-            # 当不使用 CudaPrefetcher 时，需要手动处理 GPU 传输和 use_channels_last
+            # 非CUDA设备需要手动处理
             if not use_prefetcher:
-                imgs = imgs.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
                 if config.use_channels_last:
                     imgs = imgs.to(memory_format=torch.use_channels_last)
-        
+
         # P-OPT: 使用张量比较避免 GPU-CPU 同步
         # 原代码: labels.min() < 0 or labels.max() >= num_classes
         # 问题: .min()/.max() 触发 CUDA 同步
