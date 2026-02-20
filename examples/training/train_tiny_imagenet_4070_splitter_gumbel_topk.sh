@@ -71,8 +71,8 @@ uv run python src/training/train_fractal_vit.py \
   --quota-learnable enable \
   --quota-entropy-weight 0.01 \
   --splitter-type gumbel_topk \
-  --splitter-temp-start 10.0 \
-  --splitter-temp-end 0.5 \
+  --splitter-temp-start 1.0 \
+  --splitter-temp-end 0.4 \
   --splitter-temp-warmup 5 \
   --use-amp \
   --gradient-checkpoint \

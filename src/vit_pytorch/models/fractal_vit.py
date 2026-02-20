@@ -1212,7 +1212,8 @@ class FractalCurveViT(nn.Module):
                 # 空列表保护
                 if max_tokens == 0:
                     # I144: 批量转换避免循环中的 .item()
-                    lengths_cpu = lengths.cpu() if lengths.is_cuda else lengths
+                    # I141: 添加 non_blocking=True 避免同步阻塞
+                    lengths_cpu = lengths.cpu(non_blocking=True) if lengths.is_cuda else lengths
                     lengths_list = lengths_cpu.tolist()
                     # I145: 使用模块级 LazyDiagnostics，避免 forward 中的 CPU 同步
                     lazy_diag = LazyDiagnostics(self)
@@ -1265,7 +1266,7 @@ class FractalCurveViT(nn.Module):
 
                 # I144: 向量化计算所有 num_tokens - 完全 GPU 计算，避免循环中的 .item()
                 # lengths 是 GPU tensor，直接在 GPU 上操作
-                lengths_cpu = lengths.cpu() if lengths.is_cuda else lengths  # 只在需要时同步一次
+                lengths_cpu = lengths.cpu(non_blocking=True) if lengths.is_cuda else lengths  # 只在需要时同步一次
                 lengths_list = lengths_cpu.tolist()  # 单次批量转换
 
                 # I144: 向量化计算 entropy - 完全在 GPU 上计算，避免 Python 循环
@@ -1397,8 +1398,9 @@ class FractalCurveViT(nn.Module):
             hilbert_indices = temp_levels_info.get_hilbert_indices()  # [B, MaxLen]
             # 将 Hilbert 索引转换为排序位置 (使用第一个样本的排序，对所有batch通用)
             hilbert_order = torch.argsort(hilbert_indices[0], dim=0)  # [MaxLen]
-            # 裁剪到实际 token 数量
-            actual_num_tokens = lengths[0].item() if lengths.dim() > 0 else lengths.item()
+            # 裁剪到实际 token 数量 (P-OPT: avoid .item() sync)
+            actual_num_tokens = lengths[0] if lengths.dim() > 0 else lengths
+            actual_num_tokens = actual_num_tokens.clamp(max=hilbert_order.shape[0])
             hilbert_order = hilbert_order[:actual_num_tokens]
 
         # 2. 添加位置编码和 CLS token (v6.0: 同时获取 geometry_emb)
@@ -1711,7 +1713,8 @@ class FractalCurveViT(nn.Module):
                 else:
                     depths = levels[:, 0] if levels.numel() > 0 else levels.new_empty(0)
                     unique_levels = depths.unique().tolist()
-                    max_level = depths.max().item() if depths.numel() > 0 else 0
+                    # P-OPT: avoid .item() in loop - compute max once
+                    max_level = int(depths.max().item()) if depths.numel() > 0 else 0
 
                     image_stats = {
                         "num_tokens": tokens.shape[0],
@@ -1732,7 +1735,8 @@ class FractalCurveViT(nn.Module):
                     "avg_tokens_per_image": total_tokens / len(tokens_list),
                     "unique_levels_used": sorted(list(set(all_levels))),
                     "max_level_overall": max(all_levels),
-                    "level_usage_distribution": dict(zip(*torch.unique(level_tensor.cpu(), return_counts=True))),
+                    # I141: 添加 non_blocking=True 避免同步阻塞
+                    "level_usage_distribution": dict(zip(*torch.unique(level_tensor.cpu(non_blocking=True), return_counts=True))),
                 }
             else:
                 analysis["overall_stats"] = {

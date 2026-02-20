@@ -983,8 +983,8 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         combined = (batch_indices * seq_len + pos_indices)  # [B, N]
 
         # P-OPT: 将 QK^T 和 Hilbert bias 移到循环外，只计算一次
-        # 循环内只做 mask 和 gather，减少 80% 计算量
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        # P-OPT: add .contiguous() for Tensor Core efficiency
+        dots = torch.matmul(q, k.transpose(-1, -2).contiguous()) * self.scale
 
         # I103-1: 添加批量 Hilbert 偏置
         # I113-11: 量纲对齐 - 乘以 √d_k 确保与 QK^T / √d_k 量级相当
@@ -1193,8 +1193,8 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             # P-OPT: 使用 Flash SDP 优化 (30-50% 加速)
             # Flash SDP 不支持自定义偏置，所以只有无偏置时使用
             if attention_mask is not None:
-                # 需要将 mask 转换为正确的格式
-                attn_mask = attention_mask.float().squeeze(1).unsqueeze(-1)  # [B, 1, 1, N]
+                # P-OPT: avoid float() cast - use q.dtype directly for Tensor Core
+                attn_mask = attention_mask.to(dtype=q.dtype).squeeze(1).unsqueeze(-1)  # [B, 1, 1, N]
                 attn_mask = (1.0 - attn_mask) * torch.finfo(q.dtype).min
             else:
                 attn_mask = None
@@ -1215,7 +1215,8 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             return self.to_out(out)
 
         # 标准实现（有偏置时使用）
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        # P-OPT: add .contiguous() for Tensor Core efficiency
+        dots = torch.matmul(q, k.transpose(-1, -2).contiguous()) * self.scale
         # A19: 移除可学习 scale_weights，仅使用标准 1/√d_k
         # Var(dots) = 1.0 (理论最优)，softmax 输入在 O(1) 量级
 
