@@ -80,7 +80,29 @@ for d in range(1, _MAX_HILBERT_DEPTH + 1):
 # I103-2: Hilbert 索引权重缓存 (类级缓存)
 # 避免在 get_hilbert_indices() 中重复创建权重张量
 # 内存: D_max=8 时仅需存储 36 个整数 (< 1KB)
+# I162-1: 预填充缓存 (torch.compile + CUDA Graphs 兼容性)
+# 在模块加载时预填充，避免在编译区域内创建张量
 _hilbert_weights_cache: dict = {}
+
+# 预填充缓存: 常见的深度值 (1-12)
+# 这确保缓存在 torch.compile 之前就准备好
+_MAX_PREPOPULATE_DEPTH = 12
+
+
+def _prepopulate_hilbert_weights_cache():
+    """预填充 Hilbert 权重缓存 (torch.compile 兼容性)"""
+    for d in range(1, _MAX_PREPOPULATE_DEPTH + 1):
+        weights_list = [4 ** (d - t - 1) for t in range(d)]
+        # 创建张量并存入缓存 (使用 CPU，稍后移到 GPU)
+        _hilbert_weights_cache[d] = torch.tensor(
+            weights_list,
+            dtype=torch.long,
+            device='cpu'  # 预填充 CPU 张量，运行时移到目标设备
+        )
+
+
+# 模块加载时预填充缓存
+_prepopulate_hilbert_weights_cache()
 
 
 @dataclass
@@ -286,9 +308,10 @@ class LevelsInfo:
 
     @staticmethod
     def _get_hilbert_weights_for_depth(d: int, device: torch.device) -> torch.Tensor:
-        """获取深度 d 的 Hilbert 编码权重 (使用类级缓存)。
+        """获取深度 d 的 Hilbert 编码权重 (使用预填充缓存)。
 
-        I103-2 优化: 使用类级缓存避免重复计算。
+        I103-2 优化: 使用预填充缓存避免重复计算。
+        I162-1 修复: 预填充缓存在模块加载时完成，确保 torch.compile + CUDA Graphs 兼容性。
 
         数学:
             weights = [4^(d-1), 4^(d-2), ..., 4^0]
@@ -300,15 +323,7 @@ class LevelsInfo:
         Returns:
             weights: [d] 权重张量 (clone 以避免 CUDA Graphs 覆盖问题)
         """
-        if d not in _hilbert_weights_cache:
-            # 首次访问: 计算并缓存
-            weights_list = [4 ** (d - t - 1) for t in range(d)]
-            _hilbert_weights_cache[d] = torch.tensor(
-                weights_list,
-                dtype=torch.long,
-                device=device
-            )
-        # I162-1: clone() 避免 CUDA Graphs 覆盖问题 (torch.compile + CUDA Graphs 兼容性)
+        # I162-1: 缓存已预填充，直接访问并 clone 以避免 CUDA Graphs 覆盖
         return _hilbert_weights_cache[d].clone().to(device, non_blocking=True)
 
     # ========== 深度根归一化 (I161-1 修复) ==========
