@@ -41,7 +41,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vit_pytorch.layers.embeddings.fractal_position import FractalPositionEmbedding
+from vit_pytorch.layers.embeddings.fractal_path import BitFlippedPositionEncoder
 from vit_pytorch.modules.tokenizer import StreamingFractalTokenizerV3
 from vit_pytorch.modules.base_tokenizer import BaseTokenizer, TokenizerOutput
 from vit_pytorch.modules.transformer_block import FractalTransformer, FFNType
@@ -230,7 +230,7 @@ class FractalCurveViT(nn.Module):
         splitter: Optional[Any] = None,
         tokenizer: Optional[BaseTokenizer] = None,
         transformer: Optional[Any] = None,
-        position_embedding: Optional[FractalPositionEmbedding] = None,
+        position_embedding: Optional[BitFlippedPositionEncoder] = None,
         mlp_head: Optional[nn.Sequential] = None,
         cls_token: Optional[nn.Parameter] = None,
         # I98-2: 内部状态标记（由工厂函数设置）
@@ -297,6 +297,11 @@ class FractalCurveViT(nn.Module):
         use_pattern_encoder: bool = False,  # 是否启用模式编码器
         pattern_encoder_mode: str = "light",  # "light", "standard", "multihead"
         pattern_encoder_window_sizes: Optional[Tuple[int, ...]] = None,  # 多尺度窗口大小
+
+        # Scheme C: Structured Manifold Bias 参数
+        use_geometry_field: bool = False,  # 是否启用几何流形场
+        geometry_field_dim: Optional[int] = None,  # 几何流形场维度 (默认等于 dim)
+        manifold_bias_scale: float = 1.0,  # 流形偏置缩放因子
     ) -> None:
         """初始化 FractalCurveViT。
 
@@ -604,34 +609,30 @@ class FractalCurveViT(nn.Module):
 
         self.token_processor = None
 
-        # === Position Embedding ===
+        # === Position Embedding (v6.0: 使用 BitFlippedPositionEncoder) ===
         if position_embedding is None:
-            # I98-2: 动态创建位置编码（向后兼容）
-            # I27: 传递 pos_dropout 到 Position Embedding
-            # I31-3: 支持面积增强位置编码
-            # 使用 self.max_level（从 tokenizer 获取的变参数）
-            if use_area_encoding:
-                from vit_pytorch.layers.embeddings.fractal_position import AreaEnhancedPositionEmbedding
-                position_embedding = AreaEnhancedPositionEmbedding(
-                    dim=dim,
-                    max_level=self.max_level,
-                    fourier_levels=fourier_levels,
-                    use_hilbert_encoding=use_hilbert_encoding,
-                    use_spatial_encoding=use_spatial_encoding,
-                    dropout=effective_pos_dropout,
-                )
-            else:
-                position_embedding = FractalPositionEmbedding(
-                    dim=dim,
-                    max_level=self.max_level,
-                    max_seq_len=10000,
-                    use_hilbert_encoding=use_hilbert_encoding,
-                    use_spatial_encoding=use_spatial_encoding,
-                    dropout=effective_pos_dropout,
-                )
+            position_embedding = BitFlippedPositionEncoder(
+                dim=dim,
+                max_level=self.max_level,
+                grid_size=256,
+            )
 
         self.pos_embedding = position_embedding
         self.position_embedding = position_embedding
+
+        # === Scheme C: GeometryField ===
+        self.use_geometry_field = use_geometry_field
+        self.manifold_bias_scale = manifold_bias_scale
+        self.geometry_field_dim = geometry_field_dim or dim
+        self.geometry_field = None
+
+        if use_geometry_field:
+            from vit_pytorch.layers.embeddings.fractal_position import GeometryField
+            self.geometry_field = GeometryField(
+                dim=self.geometry_field_dim,
+                max_level=self.max_level,
+                heads=heads,
+            )
 
         # === CLS Token ===
         if cls_token is not None:
@@ -825,6 +826,10 @@ class FractalCurveViT(nn.Module):
             'ffn_type': self.ffn_type,
             # I24-2: 可学习配额
             'quota_learnable': quota_learnable,
+            # Scheme C: 几何流形场参数
+            'use_geometry_field': getattr(self, 'use_geometry_field', False),
+            'geometry_field_dim': getattr(self, 'geometry_field_dim', None),
+            'manifold_bias_scale': getattr(self, 'manifold_bias_scale', 1.0),
         }
 
     # I98-2: 特征提取器抽象 - 封装 tokenizer.shared_conv
@@ -902,7 +907,7 @@ class FractalCurveViT(nn.Module):
     @torch._dynamo.disable
     def _prepare_tokens(
         self, img: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], "TokenizerOutput", torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], "TokenizerOutput", torch.Tensor, Optional[Any]]:
         """准备 tokens 和进行 padding。
 
         数学形式化：
@@ -925,17 +930,20 @@ class FractalCurveViT(nn.Module):
             原始流程: feature_extractor → splitter → tokenizer (再次计算 shared_conv)
             优化后: feature_extractor → splitter → tokenizer (复用 features)
 
+        I170: 返回 split_result 用于提取语义分裂器的 redundancy 和 child_features
+
         Args:
             img: 输入图像 [B, C, H, W]
 
         Returns:
-            (padded_tokens, padded_levels, lengths, levels_list, token_output, features):
+            (padded_tokens, padded_levels, lengths, levels_list, token_output, features, split_result):
             - padded_tokens: tokens [B, MaxN, Dim] (padded)
             - padded_levels: 层级信息 [B, MaxN, InfoDim]
             - lengths: Tensor[B] 每个样本的实际 token 数量
             - levels_list: 原始层级列表（用于辅助输出）
             - token_output: TokenizerOutput (P11-3: 用于获取 regions)
             - features: 共享特征图 [B, d_model, H/p, W/p] (I107-7: 避免重复计算)
+            - split_result: Splitter 返回的分裂结果（可选，用于提取语义信息）
         """
         # I78: 动态分辨率支持 - 根据实际输入更新 splitter 候选区域
         # I99-10: 仅在尺寸变化时更新，避免不必要的计算
@@ -952,6 +960,8 @@ class FractalCurveViT(nn.Module):
         # I98-2: 检测 tokenizer 是否需要 split_result
         # 对于自定义 tokenizer (没有 shared_conv)，假设不需要 split_result
         needs_split_result = hasattr(self.tokenizer, 'shared_conv')
+
+        split_result = None  # I170: 初始化 split_result
 
         if needs_split_result:
             # I130-2: Hilbert 最佳实现 - DeterministicTopK 模式始终使用硬选择
@@ -989,7 +999,8 @@ class FractalCurveViT(nn.Module):
         lengths = lengths.clamp(min=1)
 
         # I107-7: 返回 features 避免训练循环中重复计算 shared_conv
-        return padded_tokens, padded_levels, lengths, levels_list, token_output, features
+        # I170: 返回 split_result 用于提取语义分裂器的 redundancy 和 child_features
+        return padded_tokens, padded_levels, lengths, levels_list, token_output, features, split_result
 
     def _apply_position_and_cls(
         self,
@@ -997,10 +1008,11 @@ class FractalCurveViT(nn.Module):
         padded_levels: torch.Tensor,
         regions: Optional[torch.Tensor] = None,
         image_size: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, "LevelsInfo"]:
+    ) -> Tuple[torch.Tensor, "LevelsInfo", torch.Tensor]:
         """添加位置编码和 CLS token。
 
         I98-4: 返回 LevelsInfo 而非 raw tensor
+        v6.0: 返回 geometry_emb_with_cls 用于 Attention 注入
 
         Args:
             padded_tokens: 填充后的 tokens [B, MaxLen, Dim]
@@ -1009,9 +1021,10 @@ class FractalCurveViT(nn.Module):
             image_size: (I31-3) 图像尺寸，可以是整数或 (W, H) 元组
 
         Returns:
-            (x, levels_info):
+            (x, levels_info, geometry_emb_with_cls):
             - x: 带位置编码和 CLS 的序列 [B, 1+MaxLen, Dim]
             - levels_info: LevelsInfo 实例（包含 CLS）
+            - geometry_emb_with_cls: 带 CLS 的几何嵌入 [B, 1+MaxLen, Dim]
         """
         batch_size = padded_tokens.shape[0]
         device = padded_tokens.device
@@ -1020,11 +1033,15 @@ class FractalCurveViT(nn.Module):
         from vit_pytorch.core.levels_info import LevelsInfo
         levels_info = LevelsInfo(data=padded_levels, max_level=self.max_level)
 
-        # I31-3: 传递 regions 和 image_size 给位置编码器（用于面积编码）
-        pos_emb = self.pos_embedding(levels_info, regions=regions, image_size=image_size)
+        # v6.0: BitFlippedPositionEncoder 返回 pos_emb 和 geometry_emb
+        pos_emb, geometry_emb = self.pos_embedding(levels_info)
         x = padded_tokens + pos_emb
 
+        # v6.0: 为 CLS 添加零几何嵌入
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        cls_geometry = torch.zeros(batch_size, 1, self.dim, device=x.device)
+        geometry_emb_with_cls = torch.cat([cls_geometry, geometry_emb], dim=1)  # [B, N+1, D]
+
         x = torch.cat((cls_tokens, x), dim=1)
 
         # I98-4: 构造包含 CLS 的 LevelsInfo
@@ -1039,7 +1056,8 @@ class FractalCurveViT(nn.Module):
 
         x = self.emb_dropout_module(x)
 
-        return x, levels_info_with_cls
+        # v6.0: 返回 geometry_emb_with_cls
+        return x, levels_info_with_cls, geometry_emb_with_cls
 
     def _create_attention_mask(
         self,
@@ -1337,7 +1355,15 @@ class FractalCurveViT(nn.Module):
 
         # 1. 准备 tokens
         # I107-7: _prepare_tokens 现在返回 features (避免重复计算)
-        padded_tokens, padded_levels, lengths, levels_list, token_output, features = self._prepare_tokens(img)
+        # I170: _prepare_tokens 返回 split_result 用于提取语义分裂器信息
+        padded_tokens, padded_levels, lengths, levels_list, token_output, features, split_result = self._prepare_tokens(img)
+
+        # I170: 提取语义分裂器的 redundancy 和 child_features
+        redundancy = None
+        child_features = None
+        if self._is_semantic_splitter and split_result is not None:
+            redundancy = split_result.redundancy  # [B, N]
+            child_features = split_result.child_features  # [B, N, 4, D]
 
         # P11-3: 获取 regions 和 image_size 用于正确的 LCA 偏置计算
         regions, image_size = token_output.get_padded_regions()
@@ -1351,10 +1377,20 @@ class FractalCurveViT(nn.Module):
             # 将 Hilbert 索引转换为排序位置 (使用第一个样本的排序，对所有batch通用)
             hilbert_order = torch.argsort(hilbert_indices[0], dim=0)  # [MaxLen]
 
-        # 2. 添加位置编码和 CLS token
-        x, levels_info = self._apply_position_and_cls(
+        # 2. 添加位置编码和 CLS token (v6.0: 同时获取 geometry_emb)
+        x, levels_info, geometry_emb_with_cls = self._apply_position_and_cls(
             padded_tokens, padded_levels, regions=regions, image_size=image_size
         )
+
+        # Scheme C: 如果启用 GeometryField，计算流形场偏置并与现有 geometry_emb 融合
+        # 注意: levels_info 已经包含 CLS，所以 manifold_emb 形状已经是 [B, N+1, dim]
+        if self.use_geometry_field and self.geometry_field is not None:
+            # 计算几何流形场编码 (levels_info 已包含 CLS)
+            manifold_emb = self.geometry_field(levels_info)  # [B, N+1, dim]
+
+            # 缩放并融合到现有的 geometry_emb
+            # geometry_emb_with_cls 形状: [B, N+1, dim]
+            geometry_emb_with_cls = geometry_emb_with_cls + self.manifold_bias_scale * manifold_emb
 
         # P11-3: 为 regions 添加 CLS 对应的零填充
         if regions is not None:
@@ -1380,8 +1416,12 @@ class FractalCurveViT(nn.Module):
             batch_size, x.shape[1], lengths, device
         )
 
-        # 4. Transformer 处理
-        x = self.transformer(x, levels_info, attn_mask, regions=regions, image_size=image_size)
+        # 4. Transformer 处理 (v6.0: 注入 geometry_emb)
+        x = self.transformer(
+            x, levels_info, attn_mask,
+            regions=regions, image_size=image_size,
+            geometry_emb=geometry_emb_with_cls,
+        )
 
         # 获取 transformer 输出 (排除 CLS token)
         transformer_tokens = x[:, 1:]
@@ -1466,6 +1506,7 @@ class FractalCurveViT(nn.Module):
 
         # I141: num_tokens 直接使用 GPU tensor，训练器负责转换
         # 保持原始 tensor 格式，避免 .cpu() 调用
+        # I170: 添加 redundancy 和 child_features 到 TrainingStats
         stats = TrainingStats(
             logits=final_output,
             num_tokens=num_tokens_tensor,  # GPU tensor，避免 CPU 同步
@@ -1475,6 +1516,8 @@ class FractalCurveViT(nn.Module):
             transformer_tokens=transformer_tokens,
             shared_features=return_features,  # I107-7: 避免训练循环重复计算
             split_info=split_info,
+            redundancy=redundancy,  # I170: 语义分裂器的冗余性分数
+            child_features=child_features,  # I170: 语义分裂器的子节点特征
         )
 
         return stats

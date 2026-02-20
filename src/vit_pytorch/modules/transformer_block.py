@@ -190,10 +190,10 @@ class FractalTransformerBlock(nn.Module):
         # 使用 inverse_sigmoid 反算: sigmoid(x) * 2 = target → x = logit(target/2)
         # target=0.7 → x ≈ -0.36, target=1.0 → x = 0, target=0.65 → x ≈ -0.54
         #
-        # I34-10 修复: 简化为单门控设计
-        # - 降低参数量: 2×D → 1×D (减少50%)
-        # - 零初始化确保训练初期残差路径畅通
-        # - tanh激活支持双向调制 [-1, 1]
+        # Task 3 重构: 替换为 Sigmoid 门控
+        # - 零初始化确保训练初期残差路径畅通 (sigmoid(0) = 0.5)
+        # - sigmoid 激活值域 [0, 1]，梯度始终为正
+        # - 添加梯度比例监控确保邻域路径梯度 >= 40%
         self._residual_gate = nn.Embedding(max_level + 1, 1)
         nn.init.zeros_(self._residual_gate.weight)
         
@@ -211,10 +211,12 @@ class FractalTransformerBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         regions: Optional[torch.Tensor] = None,
         image_size: Optional[int] = None,
+        geometry_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """前向传播。
 
         I98-4: levels_info 参数类型从 torch.Tensor 改为 LevelsInfo
+        v5.0: 新增 geometry_emb 参数，用于 Attention 注入
 
         Args:
             x: 输入张量，形状为 [B, S, D]。
@@ -222,6 +224,7 @@ class FractalTransformerBlock(nn.Module):
             attention_mask: 注意力掩码（可选）。
             regions: 区域边界张量，形状为 [B, N, 4]，格式 [x1, y1, x2, y2]。
             image_size: 图像边长，与 regions 配合使用。
+            geometry_emb: 几何嵌入 (可选)，形状为 [B, S, D]，用于 Attention 注入
 
         Returns:
             输出张量，形状为 [B, S, D]。
@@ -237,14 +240,14 @@ class FractalTransformerBlock(nn.Module):
             inferred_max_level = info_dim - 1
             levels_info = LevelsInfo(data=levels_info, max_level=inferred_max_level)
 
-        # I34-10 修复: 使用单门控设计
-        # gate ∈ [-1, 1] 支持双向调制 (抑制/增强)
+        # Task 3 重构: 使用 Sigmoid 门控
+        # gate ∈ [0, 1] 确保梯度方向始终正确
         if levels_info is not None and levels_info.data.numel() > 0:
             depths = levels_info.depths  # (B, S)
             # I98-4: clamp depths to [0, max_level] to handle padding sentinel (-1)
             depths_clamped = depths.clamp(min=0, max=self.max_level)
             gate_raw = self._residual_gate(depths_clamped)  # (..., 1)
-            gate = torch.tanh(gate_raw)  # (..., 1) ∈ [-1, 1]
+            gate = torch.sigmoid(gate_raw)  # (..., 1) ∈ [0, 1]
 
             # 调整形状以便广播: (B, S, 1) for element-wise multiplication
             if gate.dim() == 2:
@@ -252,8 +255,8 @@ class FractalTransformerBlock(nn.Module):
                 gate = gate.view(1, -1, 1)
             # gate 现在是 (B, S, 1) 或 (1, S, 1)
         else:
-            # 无 levels_info 时使用深度 0 的默认权重 (零初始化 → tanh(0) = 0)
-            gate = torch.tanh(self._residual_gate.weight[0])  # scalar ∈ [-1, 1]
+            # 无 levels_info 时使用深度 0 的默认权重 (零初始化 → sigmoid(0) = 0.5)
+            gate = torch.sigmoid(self._residual_gate.weight[0])  # scalar ∈ [0, 1]
             gate = gate.view(1, 1, 1)  # (1, 1, 1) for broadcasting
 
         # I106-2: 使用标准 LayerNorm (替代层级感知归一化)
@@ -265,15 +268,16 @@ class FractalTransformerBlock(nn.Module):
             attention_mask=attention_mask,
             regions=regions,
             image_size=image_size,
+            geometry_emb=geometry_emb,
         )
-        # I34-10: 使用单门控 (1 + gate) 确保残差连接始终畅通
-        # gate ∈ [-1, 1] → (1 + gate) ∈ [0, 2]
-        x = x + self.drop_path(attn_out * (1.0 + gate))
+        # Task 3 重构: 使用 Sigmoid 门控残差
+        # gate ∈ [0, 1] → 直接使用 gate 确保梯度流通
+        x = x + self.drop_path(attn_out * gate)
 
         # I106-2: FFN 跳过 Block 级别的归一化
         # FFN 内部有自己的层级感知归一化 (ffn_swiglu.py)
         ff_out = self.ff(x, levels_info)
-        x = x + self.drop_path(ff_out * (1.0 + gate))
+        x = x + self.drop_path(ff_out * gate)
 
         return x
 
@@ -399,11 +403,13 @@ class FractalTransformer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         regions: Optional[torch.Tensor] = None,
         image_size: Optional[int] = None,
+        geometry_emb: Optional[torch.Tensor] = None,
         return_extra_info: bool = False,
     ) -> tuple[torch.Tensor, dict] | torch.Tensor:
         """前向传播。
 
         I98-4: levels_info 参数类型从 torch.Tensor 改为 LevelsInfo
+        v5.0: 新增 geometry_emb 参数，用于 Attention 注入
 
         Args:
             x: 输入张量，形状为 [B, S, D]。
@@ -411,6 +417,7 @@ class FractalTransformer(nn.Module):
             attention_mask: 注意力掩码（可选）。
             regions: 区域边界张量，形状为 [B, N, 4]，格式 [x1, y1, x2, y2]。
             image_size: 图像边长，与 regions 配合使用。
+            geometry_emb: 几何嵌入 (可选)，形状为 [B, S, D]
             return_extra_info: (I97-11) 是否返回额外信息。
 
         Returns:
@@ -442,8 +449,9 @@ class FractalTransformer(nn.Module):
                 # Gradient checkpointing: 重新计算激活值以节省显存
                 # Note: checkpoint 不支持关键字参数，需要使用位置参数
                 # P11-3: 传递 regions 和 image_size
+                # v5.0: 添加 geometry_emb 参数
                 x = checkpoint(
-                    layer, x, levels_info, attention_mask, regions, image_size,
+                    layer, x, levels_info, attention_mask, regions, image_size, geometry_emb,
                     use_reentrant=False
                 )
             else:
@@ -453,6 +461,7 @@ class FractalTransformer(nn.Module):
                     attention_mask=attention_mask,
                     regions=regions,
                     image_size=image_size,
+                    geometry_emb=geometry_emb,
                 )
 
         # ARCH-R1: 删除了冗余的 global_context_attn 调用

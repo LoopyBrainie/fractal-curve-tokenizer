@@ -70,7 +70,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vit_pytorch.layers.embeddings.fractal_position import FractalPositionEmbedding
+from vit_pytorch.layers.embeddings.fractal_path import BitFlippedPositionEncoder
 from vit_pytorch.modules.tokenizer import StreamingFractalTokenizerV3
 from vit_pytorch.modules.base_tokenizer import BaseTokenizer, TokenizerOutput
 from vit_pytorch.modules.transformer_block import FractalTransformer, FFNType
@@ -127,7 +127,7 @@ class DualPathFractalViT(nn.Module):
         splitter: Optional[Any] = None,
         tokenizer: Optional[BaseTokenizer] = None,
         transformer: Optional[Any] = None,
-        position_embedding: Optional[FractalPositionEmbedding] = None,
+        position_embedding: Optional[BitFlippedPositionEncoder] = None,
         mlp_head: Optional[nn.Sequential] = None,
         cls_token: Optional[nn.Parameter] = None,
         # 架构参数
@@ -220,17 +220,12 @@ class DualPathFractalViT(nn.Module):
         # 获取max_level
         self.max_level = self.tokenizer.max_level
 
-        # 2. 位置编码
+        # 2. 位置编码 (v6.0: 使用 BitFlippedPositionEncoder)
         if position_embedding is None:
-            position_embedding = FractalPositionEmbedding(
-                max_level=self.max_level,
+            position_embedding = BitFlippedPositionEncoder(
                 dim=dim,
-                use_hilbert=use_hilbert_encoding,
-                use_spatial=use_spatial_encoding,
-                use_area=use_area_encoding,
-                use_affine=use_affine_modulation,
-                fourier_levels=fourier_levels,
-                dropout=emb_dropout,
+                max_level=self.max_level,
+                grid_size=256,
             )
         self.pos_embedding = position_embedding
 
@@ -305,12 +300,17 @@ class DualPathFractalViT(nn.Module):
         tokens = token_output.tokens  # [B, N, D]
         levels_info = token_output.levels_info  # [B, N, D+1]
 
-        # 2. 位置编码
-        tokens = self.pos_embedding(tokens, levels_info)
+        # 2. 位置编码 (v6.0: BitFlippedPositionEncoder 返回 pos_emb 和 geometry_emb)
+        pos_emb, geometry_emb = self.pos_embedding(levels_info)
+        tokens = tokens + pos_emb  # 基础位置编码
 
         # 3. 添加CLS Token
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x_with_cls = torch.cat([cls_tokens, tokens], dim=1)  # [B, N+1, D]
+
+        # v6.0: 为 CLS 添加零几何嵌入
+        cls_geometry = torch.zeros(B, 1, self.dim, device=tokens.device)
+        geometry_emb_with_cls = torch.cat([cls_geometry, geometry_emb], dim=1)  # [B, N+1, D]
 
         # ============================================================
         # V2新增：双路径处理
@@ -337,14 +337,22 @@ class DualPathFractalViT(nn.Module):
             # 双路径并行处理
             # ============================================================
 
-            # Path 1: 直接分支 → 原始Transformer
-            direct_out = self.transformer(x_with_cls)  # [B, N+1, D]
+            # Path 1: 直接分支 → 原始Transformer (v6.0: 注入 geometry_emb)
+            direct_out = self.transformer(
+                x_with_cls,
+                levels_info=levels_info,
+                geometry_emb=geometry_emb_with_cls,
+            )  # [B, N+1, D]
 
             # Path 2: 模式分支 → 需要构建模式增强的输入
             # 将模式特征融入Transformer
             # 方法：残差连接
             pattern_with_cls = pattern_features_with_cls * self.pattern_scale
-            pattern_out = self.transformer(pattern_with_cls)  # [B, N+1, D]
+            pattern_out = self.transformer(
+                pattern_with_cls,
+                levels_info=levels_info,
+                geometry_emb=geometry_emb_with_cls,
+            )  # [B, N+1, D]
 
             # ============================================================
             # 特征融合
@@ -368,8 +376,12 @@ class DualPathFractalViT(nn.Module):
             pattern_features_for_stats = pattern_features
 
         else:
-            # V1兼容模式：无模式编码器
-            direct_out = self.transformer(x_with_cls)  # [B, N+1, D]
+            # V1兼容模式：无模式编码器 (v6.0: 注入 geometry_emb)
+            direct_out = self.transformer(
+                x_with_cls,
+                levels_info=levels_info,
+                geometry_emb=geometry_emb_with_cls,
+            )  # [B, N+1, D]
 
             pooled = direct_out[:, 0, :]  # [B, D]
             fused = direct_out[:, 1:, :]  # [B, N, D]
