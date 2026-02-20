@@ -2744,20 +2744,22 @@ class GumbelTopKSplitter(
             for step in range(K):
                 # 贪心选择
                 if len(selected) > 0:
-                    # 计算多样性惩罚
-                    selected_h = hilbert_indices[selected]
-                    current_h = hilbert_indices[sort_order]
+                    # 计算多样性惩罚 - P-OPT: 向量化替代内层循环
+                    selected_h = hilbert_indices[selected]  # [M]
+                    # 使用广播计算所有候选与已选候选的距离矩阵
+                    # [N, 1] - [1, M] = [N, M]
+                    diff_matrix = hilbert_indices.unsqueeze(1) - selected_h.unsqueeze(0)
+                    abs_diff = torch.abs(diff_matrix)  # [N, M]
 
-                    # 计算与已选的最大相似度（滑动窗口近似）
-                    max_sim = torch.zeros(N, device=device)
-                    for i in range(N):
-                        h_i = hilbert_indices[i]
-                        # 窗口内的相似度
-                        in_window = torch.abs(selected_h - h_i) < window
-                        if in_window.any():
-                            diff = torch.abs(selected_h[in_window] - h_i)
-                            sim = torch.exp(-(diff ** 2) / sigma_sq)
-                            max_sim[i] = sim.max()
+                    # 窗口掩码: |h_i - h_j| < window
+                    in_window = abs_diff < window  # [N, M]
+
+                    # 高斯核: exp(-diff^2 / sigma_sq)
+                    gauss_kernel = torch.exp(-(abs_diff ** 2) / sigma_sq)  # [N, M]
+
+                    # 应用窗口掩码后取最大值
+                    masked_sim = torch.where(in_window, gauss_kernel, torch.zeros_like(gauss_kernel))
+                    max_sim = masked_sim.max(dim=1)[0]  # [N]
 
                     # 更新得分
                     scores = remaining_logits - lambda_div * max_sim
