@@ -3363,6 +3363,8 @@ def main():
             self.use_pattern_encoder = arch_config.use_pattern_encoder
             self.pattern_encoder_mode = arch_config.pattern_encoder_mode
             self.pattern_encoder_window_sizes = arch_config.pattern_encoder_window_sizes
+            # I162-1: 双路径插件 (并行双路径架构)
+            self.use_pattern_plugin = arch_config.use_pattern_plugin
             self.quota_learnable = arch_config.quota_learnable
             self.quota_entropy_weight = arch_config.quota_entropy_weight
             self.freeze_quota = arch_config.freeze_quota

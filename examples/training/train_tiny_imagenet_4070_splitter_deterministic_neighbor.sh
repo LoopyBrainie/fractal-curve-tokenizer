@@ -62,7 +62,6 @@ uv run python src/training/train_fractal_vit.py \
   --warmup-epochs 10 \
   --mixup-alpha 0.4 \
   --cutmix-alpha 0 \
-  --focal-gamma 2.5 \
   --no-soft-entropy \
   --no-elastic-budget \
   --quota-learnable enable \
