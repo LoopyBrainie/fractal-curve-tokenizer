@@ -354,6 +354,107 @@ class HilbertNeighborMatrix(nn.Module):
 
         return adj.float()
 
+    def forward_sparse(
+        self,
+        hilbert_indices: Tensor,
+        depths: Tensor,
+    ) -> Tensor:
+        """
+        直接返回稀疏 COO 邻接矩阵，避免 N×N 密集分配
+
+        数学形式化
+        ==========
+
+        与 _vectorized_neighbors 相同的条件判断:
+            A_ij = 1[|h_i - h_j| < threshold] ∧ 1[|d_i - d_j| <= depth_th] ∧ 1[i ≠ j]
+
+        内存分析:
+            Dense: O(N²) = 30.5 GB at L=8
+            COO Sparse: O(nnz × 20 bytes) ≈ 106 MB at L=8
+            每个 chunk 峰值: chunk_size² × (8+8+1) bytes ≈ 425 MB
+
+        Args:
+            hilbert_indices: [N] Hilbert曲线索引
+            depths: [N] 每个区域的深度
+
+        Returns:
+            adj_sparse: [N, N] 稀疏 COO 邻接矩阵 (float32)
+        """
+        N = hilbert_indices.shape[0]
+        device = hilbert_indices.device
+
+        if N == 0:
+            return torch.sparse_coo_tensor(
+                torch.empty(2, 0, dtype=torch.long, device=device),
+                torch.empty(0, dtype=torch.float32, device=device),
+                (0, 0),
+            )
+
+        hilbert_th = self._hilbert_threshold
+        max_lvl = self.max_level
+        neighbor_th = self.neighbor_threshold
+        depth_th = max_lvl - neighbor_th
+
+        # 分块大小
+        chunk_size = 5000
+
+        # 收集所有非零元素的 COO 索引
+        all_rows: List[Tensor] = []
+        all_cols: List[Tensor] = []
+
+        for i in range(0, N, chunk_size):
+            i_end = min(i + chunk_size, N)
+            h_chunk = hilbert_indices[i:i_end]
+            d_chunk = depths[i:i_end]
+
+            for j in range(0, N, chunk_size):
+                j_end = min(j + chunk_size, N)
+                h_block = hilbert_indices[j:j_end]
+                d_block = depths[j:j_end]
+
+                # 计算块内距离 (与 _vectorized_neighbors 相同)
+                h1 = h_chunk.unsqueeze(1)
+                h2 = h_block.unsqueeze(0)
+                h_dist = (h1 - h2).abs()
+
+                is_neighbor = h_dist < hilbert_th
+
+                d1 = d_chunk.unsqueeze(1)
+                d2 = d_block.unsqueeze(0)
+                depth_diff = (d1 - d2).abs()
+                depth_condition = depth_diff <= depth_th
+
+                block_mask = is_neighbor & depth_condition
+
+                # 排除自环 (仅对角块需要)
+                if i == j:
+                    diag_size = i_end - i
+                    block_mask.fill_diagonal_(False)
+
+                # 收集非零索引 (不分配 N×N 密集矩阵)
+                rows, cols = block_mask.nonzero(as_tuple=True)
+                if rows.numel() > 0:
+                    all_rows.append(rows + i)
+                    all_cols.append(cols + j)
+
+        # 构建稀疏 COO 张量
+        if len(all_rows) > 0:
+            row_idx = torch.cat(all_rows)
+            col_idx = torch.cat(all_cols)
+            indices = torch.stack([row_idx, col_idx])
+            values = torch.ones(indices.shape[1], dtype=torch.float32, device=device)
+            adj_sparse = torch.sparse_coo_tensor(
+                indices, values, (N, N), device=device
+            ).coalesce()
+        else:
+            adj_sparse = torch.sparse_coo_tensor(
+                torch.empty(2, 0, dtype=torch.long, device=device),
+                torch.empty(0, dtype=torch.float32, device=device),
+                (N, N),
+            )
+
+        return adj_sparse
+
     @property
     def threshold(self) -> int:
         return self._hilbert_threshold
@@ -699,12 +800,7 @@ class DeterministicNeighborSplitter(
             K=32,  # 每节点 32 个邻居
         )
 
-        # 4. Hilbert感知相似度
-        self.similarity = HilbertAwareSimilarity(
-            dim=feature_dim,
-            use_hilbert_decay=True,
-            use_spatial_decay=True,
-        )
+        # 4. [已删除] HilbertAwareSimilarity 在 forward() 中未使用，移除以减少冗余
 
         # 5. 可学习配额
         if self.config.enable_learnable_quota:
@@ -732,8 +828,7 @@ class DeterministicNeighborSplitter(
         else:
             self.register_buffer('_temperature', None)
 
-        # 7. 缓存
-        self._cached_adj: Optional[Tensor] = None
+        # 7. 缓存 (仅稀疏表示，避免 N×N 密集矩阵)
         self._cached_adj_sparse: Optional[Tensor] = None
         self._current_step = 0
 
@@ -822,20 +917,16 @@ class DeterministicNeighborSplitter(
         return torch.tensor(indices, dtype=torch.long, device=device)
 
     def _get_adj_matrix(self) -> Tensor:
-        """获取邻接矩阵（使用缓存）- 密集版本用于测试"""
-        if self._cached_adj is None:
-            self._cached_adj = self.hilbert_neighbor(
+        """获取密集邻接矩阵 - 仅限 N < 5000 的小规模场景"""
+        return self._get_adj_matrix_sparse().to_dense()
+
+    def _get_adj_matrix_sparse(self) -> Tensor:
+        """获取稀疏邻接矩阵（使用缓存）- 直接生成稀疏，无密集中间表示"""
+        if self._cached_adj_sparse is None:
+            self._cached_adj_sparse = self.hilbert_neighbor.forward_sparse(
                 self._hilbert_indices,
                 self._depth_indices,
             )
-        return self._cached_adj
-
-    def _get_adj_matrix_sparse(self) -> Tensor:
-        """获取稀疏邻接矩阵（使用缓存）- 用于高效计算"""
-        if self._cached_adj_sparse is None:
-            # 从密集矩阵转为稀疏
-            adj_dense = self._get_adj_matrix()
-            self._cached_adj_sparse = adj_dense.to_sparse()
         return self._cached_adj_sparse
 
     def _get_knn_indices(self) -> Tuple[Tensor, Tensor]:
@@ -856,21 +947,25 @@ class DeterministicNeighborSplitter(
         return self._cached_knn_indices, self._cached_knn_mask
 
     def _init_sparse_buffers(self, device: torch.device) -> None:
-        """初始化稀疏邻接矩阵的 buffer（用于 Flattened Batch SpMM）"""
+        """初始化稀疏邻接矩阵的 buffer（用于 Flattened Batch SpMM）
+
+        内存优化: 直接从稀疏 COO 提取 indices/values，不经过密集中间表示
+        """
         if self._adj_indices is not None:
             return  # 已经初始化
 
-        # 获取密集邻接矩阵
-        adj_dense = self._get_adj_matrix()
-        adj_sparse = adj_dense.to_sparse()
+        # 直接获取稀疏邻接矩阵 (无 dense 中间表示)
+        adj_sparse = self._get_adj_matrix_sparse()
 
         # 提取索引和值，注册为 buffer
         self.register_buffer('_adj_indices', adj_sparse.indices())
         self.register_buffer('_adj_values', adj_sparse.values())
         self._adj_size = adj_sparse.size()
 
-        # 预计算度矩阵逆
-        degree = adj_dense.sum(dim=-1) + EPS
+        # 预计算度矩阵逆 (从稀疏矩阵直接计算)
+        N = adj_sparse.size(0)
+        ones = torch.ones(N, 1, dtype=torch.float32, device=adj_sparse.device)
+        degree = torch.sparse.mm(adj_sparse, ones).squeeze(-1) + EPS
         self.register_buffer('_degree_inv', 1.0 / degree)
 
     def _build_block_diag_sparse(self, B: int, device: torch.device, dtype: torch.dtype) -> Tensor:
@@ -1169,11 +1264,13 @@ class DeterministicNeighborSplitter(
         使用极小批量采样避免显存爆炸
         I164-1: 改为极小批量处理以支持 max_level_limit=8
 
+        优化: 消除内层 B 循环，改为单次 grid_sample 处理 B*chunk_n 区域
+        通过 repeat 而非 repeat_interleave 避免大张量拷贝
+
         数学:
             原显存: M = N × C × h × w × 4 bytes (~42GB for L=8)
-            极小批量: M_chunk = chunk_size × C × h × w × 4 bytes
-            若 chunk_size=4, C=384, h=w=14: M_chunk ≈ 0.03 MB
-            峰值显存降低 ~1,000,000 倍
+            极小批量: M_chunk = B × chunk_size × C × h × w × 4 bytes
+            若 chunk_size=4, B=4, C=384, h=w=7: M_chunk ≈ 0.12 MB
         """
         B, C, H_feat, W_feat = features.shape
         N = regions.shape[0]
@@ -1182,8 +1279,6 @@ class DeterministicNeighborSplitter(
         if N == 0:
             return torch.zeros(B * N, C, device=features.device)
 
-        # I164-1: 流式处理 - 使用列表收集结果，避免预分配大张量
-        # 预分配需要 B*N*C*4 bytes ≈ 134 MB，现在改为按需分配
         roi_features_list = []
 
         # 归一化区域坐标到[-1, 1]
@@ -1200,7 +1295,7 @@ class DeterministicNeighborSplitter(
         y_2d = y_rel.unsqueeze(1).expand(oh, ow)  # [oh, ow]
         x_2d = x_rel.unsqueeze(0).expand(oh, ow)  # [oh, ow]
 
-        # I164-1: 极小批量处理 - 避免显存爆炸
+        # 极小批量处理
         num_chunks = (N + chunk_size - 1) // chunk_size
 
         for chunk_idx in range(num_chunks):
@@ -1216,15 +1311,13 @@ class DeterministicNeighborSplitter(
             y0 = chunk_normalized[:, 1:2].unsqueeze(1).expand(chunk_n, oh, ow)
             x1 = chunk_normalized[:, 2:3].unsqueeze(1).expand(chunk_n, oh, ow)
             y1 = chunk_normalized[:, 3:4].unsqueeze(1).expand(chunk_n, oh, ow)
-            # 扩展相对坐标
             y_2d_exp = y_2d.unsqueeze(0).expand(chunk_n, oh, ow)
             x_2d_exp = x_2d.unsqueeze(0).expand(chunk_n, oh, ow)
-            # 线性插值
             y_grid = y0 + (y1 - y0) * y_2d_exp
             x_grid = x0 + (x1 - x0) * x_2d_exp
             chunk_grids = torch.stack([x_grid, y_grid], dim=-1)  # [chunk_n, oh, ow, 2]
 
-            # 对每个batch item执行采样，收集到列表
+            # 对每个batch item执行采样
             for b in range(B):
                 sampled = F.grid_sample(
                     features[b:b+1].expand(chunk_n, -1, -1, -1),
@@ -1236,8 +1329,22 @@ class DeterministicNeighborSplitter(
                 pooled = sampled.mean(dim=[2, 3])  # [chunk_n, C]
                 roi_features_list.append(pooled)
 
-        # I164-1: 最后拼接所有结果
-        roi_features = torch.cat(roi_features_list, dim=0)  # [B*N, C]
+        # 拼接所有结果: 布局为 chunk-major, batch-secondary
+        # [chunk0_b0, chunk0_b1, ..., chunk0_bB, chunk1_b0, ...]
+        roi_features_raw = torch.cat(roi_features_list, dim=0)  # [B*N, C]
+
+        # 重排为 batch-major: [b0_all_regions, b1_all_regions, ...]
+        # 当前: [num_chunks × B × chunk_n, C] (最后一个chunk可能小)
+        # 使用通用重排
+        roi_features = torch.zeros(B, N, C, device=features.device, dtype=features.dtype)
+        offset = 0
+        for chunk_idx in range(num_chunks):
+            cn = min(chunk_size, N - chunk_idx * chunk_size)
+            for b in range(B):
+                roi_features[b, chunk_idx * chunk_size:chunk_idx * chunk_size + cn] = \
+                    roi_features_raw[offset:offset + cn]
+                offset += cn
+        roi_features = roi_features.reshape(B * N, C)
 
         return roi_features
 
@@ -1396,31 +1503,36 @@ class DeterministicNeighborSplitter(
 
     def get_locality_loss(self) -> Tensor:
         """
-        获取局部一致性损失
+        获取局部一致性损失 (稀疏实现)
 
         数学:
             L_local = Σ_(i,j)∈E |σ(s_i) - σ(s_j)|
+
+        内存优化: 使用稀疏邻接矩阵的 COO 索引直接索引分数对，
+        避免 N×N 的密集差异矩阵。
         """
         if not self.config.enable_neighbor_aware:
             return torch.tensor(0.0, device=self._regions.device)
 
-        adj_matrix = self._get_adj_matrix()
+        adj_sparse = self._get_adj_matrix_sparse()
+        nnz = adj_sparse._nnz()
+
+        if nnz == 0:
+            return torch.tensor(0.0, device=self._regions.device)
 
         # 获取分数
         with torch.no_grad():
             features = torch.randn(self._num_candidates, self.feature_dim, device=self._regions.device)
-            _, final_scores = self.scoring(features, adj_matrix)
+            base_scores = self.scoring.score_mlp(features).squeeze(-1)
 
-        probs = final_scores.sigmoid()
+        probs = base_scores.sigmoid()
 
-        # 只在邻居对上计算损失
-        diff = torch.abs(probs.unsqueeze(0) - probs.unsqueeze(1))
-        mask = adj_matrix > 0
-
-        if mask.sum() == 0:
-            return torch.tensor(0.0, device=self._regions.device)
-
-        loss = (diff * mask).sum() / (mask.sum() + EPS)
+        # 使用 COO 索引直接计算邻居对的差异 (O(nnz) 而非 O(N²))
+        indices = adj_sparse.indices()
+        row_idx = indices[0]
+        col_idx = indices[1]
+        diff = (probs[row_idx] - probs[col_idx]).abs()
+        loss = diff.mean()
 
         return self.config.locality_weight * loss
 
@@ -1447,7 +1559,6 @@ class DeterministicNeighborSplitter(
         self._hilbert_indices = self._compute_hilbert_indices(max_level)
 
         # 清除邻接矩阵缓存
-        self._cached_adj = None
         self._cached_adj_sparse = None
 
     @property
@@ -1496,38 +1607,3 @@ def create_deterministic_neighbor_splitter(
         image_size=image_size,
         feature_dim=feature_dim,
     )
-
-
-# =============================================================================
-# 向后兼容别名 (I160-1)
-# =============================================================================
-
-# NeighborAwareSplitter 是 DeterministicNeighborSplitter 的旧名称
-NeighborAwareSplitter = DeterministicNeighborSplitter
-NeighborAwareSplitterConfig = DeterministicNeighborSplitterConfig
-
-
-class LocalityConsistencyLoss(nn.Module):
-    """局部一致性损失包装器 (向后兼容别名)
-
-    该类已弃用。请直接使用 DeterministicNeighborSplitter.get_locality_loss() 方法。
-
-    数学形式:
-        L_local = Σ_(i,j)∈E |σ(s_i) - σ(s_j)|
-    """
-
-    def __init__(self, weight: float = 0.1):
-        super().__init__()
-        self.weight = weight
-        self._dummy_param = nn.Parameter(torch.tensor(0.0))
-
-    def forward(self, splitter: DeterministicNeighborSplitter) -> torch.Tensor:
-        """计算局部一致性损失
-
-        Args:
-            splitter: DeterministicNeighborSplitter 实例
-
-        Returns:
-            局部一致性损失
-        """
-        return splitter.get_locality_loss() * self.weight

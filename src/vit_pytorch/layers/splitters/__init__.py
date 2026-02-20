@@ -15,10 +15,6 @@ from .deterministic_neighbor import (
     HilbertNeighborMatrix,
     HilbertAwareSimilarity,
     create_deterministic_neighbor_splitter,
-    # 向后兼容别名 (I160-1)
-    NeighborAwareSplitter,
-    NeighborAwareSplitterConfig,
-    LocalityConsistencyLoss,
 )
 from .semantic_redundancy import SemanticRedundancySplitter
 
@@ -33,9 +29,5 @@ __all__ = [
     "HilbertNeighborMatrix",
     "HilbertAwareSimilarity",
     "create_deterministic_neighbor_splitter",
-    # 向后兼容别名 (I160-1)
-    "NeighborAwareSplitter",
-    "NeighborAwareSplitterConfig",
-    "LocalityConsistencyLoss",
     "SemanticRedundancySplitter",
 ]

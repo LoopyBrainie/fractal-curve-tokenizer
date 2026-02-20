@@ -12,7 +12,7 @@ Layer 3 (管道层):
 
 Layer 2 (组件层):
     layers/attention/       HilbertAwareMultiScaleAttention
-    layers/splitters/       GumbelTopKSplitter, NeighborAwareSplitter
+    layers/splitters/       GumbelTopKSplitter, DeterministicNeighborSplitter
     layers/ffn/             SwiGLUFFN
     layers/embeddings/      FractalPositionEmbedding, FractalPathEmbedding
 
@@ -50,9 +50,8 @@ from .layers import (
     GumbelTopKSplitter,
     TensorSplitResult,
     GumbelTopKResult,
-    NeighborAwareSplitter,
-    NeighborAwareSplitterConfig,
-    LocalityConsistencyLoss,
+    DeterministicNeighborSplitter,
+    DeterministicNeighborSplitterConfig,
     SemanticRedundancySplitter,
     SwiGLUFFN,
     AdaptiveFractalFeedForward,
@@ -155,9 +154,8 @@ __all__ = [
     "GumbelTopKSplitter",
     "TensorSplitResult",
     "GumbelTopKResult",
-    "NeighborAwareSplitter",
-    "NeighborAwareSplitterConfig",
-    "LocalityConsistencyLoss",
+    "DeterministicNeighborSplitter",
+    "DeterministicNeighborSplitterConfig",
     "SemanticRedundancySplitter",
     "SemanticRedundancyLoss",
     "SwiGLUFFN",

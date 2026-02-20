@@ -12,9 +12,8 @@ from .splitters import (
     TensorSplitResult,
     GumbelTopKResult,
     DepthMonitor,  # I111-6: 深度分布监控
-    NeighborAwareSplitter,
-    NeighborAwareSplitterConfig,
-    LocalityConsistencyLoss,
+    DeterministicNeighborSplitter,
+    DeterministicNeighborSplitterConfig,
     SemanticRedundancySplitter,
 )
 from .ffn import (
@@ -43,9 +42,8 @@ __all__ = [
     "TensorSplitResult",
     "GumbelTopKResult",
     "DepthMonitor",  # I111-6: 深度分布监控
-    "NeighborAwareSplitter",
-    "NeighborAwareSplitterConfig",
-    "LocalityConsistencyLoss",
+    "DeterministicNeighborSplitter",
+    "DeterministicNeighborSplitterConfig",
     "SemanticRedundancySplitter",
     # FFN
     "SwiGLUFFN",
