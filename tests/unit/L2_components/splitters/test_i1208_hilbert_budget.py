@@ -227,7 +227,7 @@ class TestAuxiliaryLossesIntegration:
         # 应该包含新的损失项
         assert 'hilbert_continuity_loss' in losses
         assert 'spatial_coverage_loss' in losses
-        assert 'adaptive_target_tokens' in losses
+        # 注意: adaptive_target_tokens 不是损失，只是内部计算值（I165-FIX）
 
     def test_losses_are_valid(self):
         """所有损失应该是有效的数值"""

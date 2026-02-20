@@ -105,7 +105,7 @@ class VectorizedPathEncoder:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """获取指定设备上的坐标张量."""
         x, y = self._get_hilbert_coords(grid_size)
-        return x.to(device), y.to(device)
+        return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
     
     @staticmethod
     @torch._dynamo.disable  # 排除此函数被 torch.compile 追踪

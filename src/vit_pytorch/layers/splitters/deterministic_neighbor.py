@@ -850,32 +850,44 @@ class DeterministicNeighborSplitter(
         # I162-1 fix: 确保 tensor 在正确的设备上创建
         device = next(self.parameters()).device if list(self.parameters()) else torch.device('cpu')
         H, W = image_size
-        regions = []
 
+        # P-OPT: 使用 meshgrid 向量化替代三重循环
+        all_regions = []
         for d in range(max_level + 1):
             grid_size = 2 ** d
             cell_h = H / grid_size
             cell_w = W / grid_size
 
-            for i in range(grid_size):
-                for j in range(grid_size):
-                    x0 = int(j * cell_w)
-                    y0 = int(i * cell_h)
-                    x1 = int((j + 1) * cell_w)
-                    y1 = int((i + 1) * cell_h)
-                    regions.append([x0, y0, x1, y1])
+            # 使用 meshgrid 生成坐标网格
+            j_indices, i_indices = torch.meshgrid(
+                torch.arange(grid_size, dtype=torch.float32, device=device),
+                torch.arange(grid_size, dtype=torch.float32, device=device),
+                indexing='xy'
+            )
 
-        return torch.tensor(regions, dtype=torch.float32, device=device)
+            # 计算边界 [grid_size, grid_size]
+            x0 = (j_indices * cell_w).floor().long()
+            y0 = (i_indices * cell_h).floor().long()
+            x1 = ((j_indices + 1) * cell_w).floor().long()
+            y1 = ((i_indices + 1) * cell_h).floor().long()
+
+            # 展平并堆叠为 [grid_size^2, 4]
+            depth_regions = torch.stack([x0.flatten(), y0.flatten(), x1.flatten(), y1.flatten()], dim=1)
+            all_regions.append(depth_regions)
+
+        return torch.cat(all_regions, dim=0).to(dtype=torch.float32)
 
     def _compute_depth_indices(self, max_level: int) -> Tensor:
         """计算每个区域的深度"""
         # I162-1 fix: 确保 tensor 在正确的设备上创建
         device = next(self.parameters()).device if list(self.parameters()) else torch.device('cpu')
-        depth_indices = []
-        for d in range(max_level + 1):
-            n_regions = 4 ** d
-            depth_indices.extend([d] * n_regions)
-        return torch.tensor(depth_indices, dtype=torch.long, device=device)
+
+        # P-OPT: 使用 repeat_interleave 向量化替代循环
+        depth_levels = torch.arange(max_level + 1, device=device, dtype=torch.long)
+        num_per_depth = torch.pow(4, depth_levels)  # [D]
+        depth_indices = depth_levels.repeat_interleave(num_per_depth)
+
+        return depth_indices
 
     def _compute_hilbert_indices(self, max_level: int) -> Tensor:
         """

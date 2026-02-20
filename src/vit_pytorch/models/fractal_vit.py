@@ -1497,6 +1497,14 @@ class FractalCurveViT(nn.Module):
             'batch_size': batch_size,
         }
 
+        # [Gradient Monitor] 添加 selected_mask 到 split_info 用于死节点检测
+        # 检查 split_result 是否有 selected_mask 属性（GumbelTopKResult 有）
+        if split_result is not None and hasattr(split_result, 'selected_mask'):
+            # 使用 detach() 避免引入额外的梯度追踪
+            split_info['selected_mask'] = split_result.selected_mask.detach()
+            # 同时保存选中次数（按 batch 维度求和）
+            split_info['selection_counts'] = split_result.selected_mask.sum(dim=0).detach()
+
         # I162-1: 仅在非插件模式下调用需要 split_probs 的函数
         if not _plugin_mode:
             aux_infos, _ = self._prepare_auxiliary_output(

@@ -911,6 +911,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         image_size: Optional[int],
         batch: int,
         seq_len: int,
+        geometry_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """I103-1: 完全向量化的深度内独立Attention前向传播。
 
@@ -1084,7 +1085,8 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         # I97-10: 层级化注意力模式
         if self.use_hierarchical_attention and levels_info is not None and levels_info.data.numel() > 0:
             return self._forward_hierarchical(
-                x, levels_info, attention_mask, regions, image_size, batch, seq_len
+                x, levels_info, attention_mask, regions, image_size, batch, seq_len,
+                geometry_emb=geometry_emb
             )
 
         x = self.norm(x)

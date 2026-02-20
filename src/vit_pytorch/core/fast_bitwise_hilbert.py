@@ -486,9 +486,11 @@ def _fast_lca_vectorized(idx1: Tensor, idx2: Tensor) -> Tensor:
     """
     xor = idx1 ^ idx2
 
-    # 计算分歧深度
-    depth = xor.bit_length() - 1
-    # 确保深度非负（xor=0 时 bit_length=0，depth=-1）
+    # 计算分歧深度: bit_length(x) = floor(log2(x)) + 1 (对于 x > 0)
+    # 使用 log2 方式兼容旧版 PyTorch
+    # xor=0 时 log2(1)=0，bit_length=0，depth=-1，需要 clamp
+    depth = torch.log2(xor.float() + 1).ceil().long() - 1
+    # 确保深度非负
     depth = depth.clamp(min=0)
 
     # 构建掩码：~((1 << (2 * depth)) - 1)

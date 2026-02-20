@@ -37,9 +37,13 @@ import warnings
 try:
     from vit_pytorch.modules.tokenizer import BaseTokenizer
     from vit_pytorch.models.fractal_vit import TrainingStats
+    # [Gradient Monitor] 导入梯度监控模块
+    from vit_pytorch.core.gradient_monitor import GradientMonitor, create_gradient_monitor
 except ImportError:
     BaseTokenizer = None  # type: ignore
     TrainingStats = None  # type: ignore
+    GradientMonitor = None  # type: ignore
+    create_gradient_monitor = None  # type: ignore
 
 # 延迟导入 ModelArchitectureConfig（避免循环导入）
 def _get_model_arch_config():
@@ -510,7 +514,60 @@ class ModularTrainer:
         
         # 混合精度
         self.scaler = torch.amp.GradScaler('cuda') if self.config.use_amp else None
-    
+
+        # [Gradient Monitor] 初始化梯度监控
+        self._gradient_monitor: Optional[GradientMonitor] = None
+        self._gradient_monitor_log_interval = getattr(config, 'gradient_monitor_interval', 100)
+
+    def setup_gradient_monitor(self, enabled: bool = True):
+        """初始化梯度监控器
+
+        Args:
+            enabled: 是否启用监控
+        """
+        if GradientMonitor is None:
+            warnings.warn("GradientMonitor 不可用，跳过梯度监控初始化")
+            return
+
+        if self._gradient_monitor is not None:
+            return  # 已经初始化
+
+        self._gradient_monitor = create_gradient_monitor(
+            self.model,
+            enabled=enabled,
+        )
+        if enabled:
+            print(f"[Gradient Monitor] 已启用，采样间隔: {self._gradient_monitor_log_interval}")
+
+    def _record_gradient_stats(self, outputs):
+        """记录梯度统计
+
+        Args:
+            outputs: 模型输出 (TrainingStats)
+        """
+        if self._gradient_monitor is None:
+            return
+
+        # 记录梯度（backward 后调用）
+        self._gradient_monitor.record()
+
+        # 记录节点选中情况
+        if hasattr(outputs, 'split_info') and outputs.split_info:
+            self._gradient_monitor.record_selection_from_split_info(outputs.split_info)
+
+    def _log_gradient_stats(self, step: int):
+        """输出梯度统计日志
+
+        Args:
+            step: 当前步数
+        """
+        if self._gradient_monitor is None:
+            return
+
+        if step % self._gradient_monitor_log_interval == 0:
+            report = self._gradient_monitor.generate_report(step)
+            print(f"\n{report}\n")
+
     def train_epoch(self) -> Dict[str, float]:
         """单轮训练
 
@@ -575,6 +632,11 @@ class ModularTrainer:
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
+
+            # [Gradient Monitor] 记录梯度统计
+            if self._gradient_monitor is not None and self._gradient_monitor.enabled:
+                self._record_gradient_stats(outputs)
+                self._log_gradient_stats(self.state.global_step)
 
             # 梯度更新 (考虑累积)
             if (batch_idx + 1) % self.config.accumulation_steps == 0:

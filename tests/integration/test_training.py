@@ -51,7 +51,8 @@ class DummyPositional(nn.Module):
         *,
         regions: torch.Tensor | None = None,
         image_size: tuple[int, int] | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """返回 (pos_emb, geometry_emb) 元组，符合 FractalCurveViT 接口预期."""
         self.called = True
         # I98-4: Support both LevelsInfo and raw tensor
         if hasattr(levels_info, 'data'):
@@ -60,16 +61,23 @@ class DummyPositional(nn.Module):
             data = levels_info
 
         if data.numel() == 0:
-            return torch.zeros(0, self.dim, device=data.device)
+            return (
+                torch.zeros(0, self.dim, device=data.device),
+                torch.zeros(0, self.dim, device=data.device),
+            )
 
         # levels_info shape is (Batch, Seq, Info) from FractalCurveViT
-        # We need to return (Batch, Seq, Dim) matching the expected shape
+        # We need to return (Batch, Seq, Dim) for both pos_emb and geometry_emb
         if data.dim() == 3:
             # Shape: (B, Seq, Info) -> return (B, Seq, Dim)
-            return torch.zeros(data.shape[0], data.shape[1], self.dim, device=data.device)
+            pos_emb = torch.zeros(data.shape[0], data.shape[1], self.dim, device=data.device)
+            geometry_emb = torch.zeros(data.shape[0], data.shape[1], self.dim, device=data.device)
+            return pos_emb, geometry_emb
         else:
             # Shape: (Batch*Seq, Info) -> return (Batch*Seq, Dim)
-            return torch.zeros(data.shape[0], self.dim, device=data.device)
+            pos_emb = torch.zeros(data.shape[0], self.dim, device=data.device)
+            geometry_emb = torch.zeros(data.shape[0], self.dim, device=data.device)
+            return pos_emb, geometry_emb
 
 
 def test_vit_uses_custom_components() -> None:

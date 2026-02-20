@@ -8,6 +8,13 @@ r"""Train/Eval Loss 診斷工具
 
     diagnostics = register_loss_hooks(model)
     # 訓練後打印 diagnostics.stats
+
+梯度監控:
+    from vit_pytorch.core.training_diagnostics import create_gradient_monitor
+
+    monitor = create_gradient_monitor(model)
+    # 訓練循環中 backward 後調用 monitor.record()
+    # 定期打印 monitor.generate_report(step)
 """
 
 from __future__ import annotations
@@ -16,6 +23,12 @@ import torch
 import torch.nn as nn
 from collections import defaultdict
 from typing import Dict, List, Optional
+
+# 導入梯度監控模塊
+from vit_pytorch.core.gradient_monitor import (
+    GradientMonitor,
+    create_gradient_monitor,
+)
 
 
 class LossDiagnostics:

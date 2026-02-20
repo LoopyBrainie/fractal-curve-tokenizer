@@ -533,12 +533,20 @@ class ContinuousQuotaAllocator(nn.Module):
         tau: float = 1.0,
         tau_warmup_steps: int = 1000,
         enable_warmup: bool = True,
+        tau_min: float = 0.1,
+        tau_max: float = 2.0,
+        tau_decay_steps: int = 50000,
     ):
         super().__init__()
         self.D = D
         self.tau = tau
         self.tau_warmup_steps = tau_warmup_steps
         self.enable_warmup = enable_warmup
+
+        # 温度调度器参数 (I153-1: 增强版温度调度)
+        self.tau_min = tau_min
+        self.tau_max = tau_max
+        self.tau_decay_steps = tau_decay_steps
 
         # 可学习logits (I113-17: 替换原有的quota_logits)
         # 修复: 使用 Xavier 初始化 + 小初始缩放，防止初始 softmax 过于极端
@@ -552,14 +560,27 @@ class ContinuousQuotaAllocator(nn.Module):
 
     @property
     def temperature(self) -> Tensor:
-        """动态温度，支持warmup"""
+        """
+        动态温度调度器：warmup → cosine 衰减
+
+        调度策略：
+        - 0 ~ tau_warmup_steps: 线性 warmup (τ → 2τ)
+        - tau_warmup_steps ~ (tau_warmup_steps + tau_decay_steps): cosine 衰减 (2τ → τ_min)
+        """
+        import math
+
         if self.enable_warmup and self._current_step < self.tau_warmup_steps:
-            # 线性warmup: τ_current = τ + (τ_final - τ) * step/total
-            # 初始使用更高温度以获得更平滑的梯度
-            warmup_ratio = self._current_step / self.tau_warmup_steps
-            tau_current = self.tau + (self.tau * 2 - self.tau) * warmup_ratio
-            return torch.tensor(tau_current, device=self.quota_logits.device)
-        return torch.tensor(self.tau, device=self.quota_logits.device)
+            # 线性 warmup: τ → 2τ
+            warmup_ratio = self._current_step / max(self.tau_warmup_steps, 1)
+            tau_current = self.tau + (self.tau_max - self.tau) * warmup_ratio
+            return torch.tensor(tau_current, device=self.quota_logits.device, dtype=torch.float32)
+        else:
+            # Cosine 衰减: τ_max → τ_min
+            decay_progress = (self._current_step - self.tau_warmup_steps) / max(self.tau_decay_steps, 1)
+            decay_progress = min(decay_progress, 1.0)
+            cosine_decay = 0.5 * (1 + math.cos(math.pi * decay_progress))
+            tau_current = self.tau_min + (self.tau_max - self.tau_min) * cosine_decay
+            return torch.tensor(tau_current, device=self.quota_logits.device, dtype=torch.float32)
 
     def forward(self, K: Union[int, Tensor]) -> Tuple[Tensor, Tensor]:
         """
@@ -640,6 +661,85 @@ class ContinuousQuotaAllocator(nn.Module):
             floor_quota[indices] += 1
 
         return floor_quota.long()
+
+    def compute_quota_align_loss(
+        self,
+        target_dist: Tensor,
+        weight: float = 0.1,
+    ) -> Tensor:
+        """
+        计算配额分布与目标深度分布的 KL 散度 (I153-1)
+
+        数学形式:
+            L_quota_align = KL(softmax(φ/τ) || target_dist)
+
+        梯度流:
+            φ → softmax(φ/τ) → KL → ∂L/∂φ ✓ 有梯度
+
+        这提供了任务驱动的梯度，使 quota_logits 可以根据实际任务需求调整深度配额。
+
+        Args:
+            target_dist: [D] 目标深度分布
+            weight: 损失权重
+
+        Returns:
+            标量损失
+        """
+        tau = self.temperature
+        q = F.softmax(self.quota_logits / tau, dim=0)
+
+        # 数值稳定的 KL 散度: KL(target || q)
+        # 使用 log_target - log_q 格式确保数值稳定
+        loss = F.kl_div(
+            target_dist,
+            q,
+            reduction='sum'
+        )
+
+        return weight * loss
+
+    def get_target_depth_distribution(
+        self,
+        step: int,
+        total_steps: int,
+        mode: str = "curriculum",
+    ) -> Tensor:
+        """
+        生成目标深度分布 (I153-1)
+
+        模式:
+        - "uniform": 均匀分布
+        - "curriculum": 课程学习 (初期均匀 → 后期偏向浅层)
+        - "adaptive": 基于图像复杂度自适应
+
+        Args:
+            step: 当前训练步
+            total_steps: 总训练步数
+            mode: 分布模式
+
+        Returns:
+            [D] 归一化深度分布
+        """
+        D = self.D
+        device = self.quota_logits.device
+
+        if mode == "uniform":
+            return torch.ones(D, device=device, dtype=torch.float32) / D
+
+        elif mode == "curriculum":
+            # 初期 (step < 0.3*total): 均匀分布
+            # 后期 (step > 0.3*total): 偏向浅层 (高分辨率特征)
+            progress = step / max(total_steps, 1)
+            if progress < 0.3:
+                return torch.ones(D, device=device, dtype=torch.float32) / D
+            else:
+                # 指数衰减偏向浅层: d=0 → 1.0, d=4 → ~0.04
+                depths = torch.arange(D, device=device, dtype=torch.float32)
+                weights = torch.exp(-0.5 * depths)
+                return weights / weights.sum()
+
+        # 默认返回均匀分布
+        return torch.ones(D, device=device, dtype=torch.float32) / D
 
     def compute_quota_loss(self) -> Tensor:
         """
@@ -2583,7 +2683,7 @@ class GumbelTopKSplitter(
 
         # I150-4-FIX: 确保 hilbert_indices 与 selected_mask 在同一设备上（torch.compile 兼容性）
         if hilbert_indices.device != selected_mask.device:
-            hilbert_indices = hilbert_indices.to(device=selected_mask.device)
+            hilbert_indices = hilbert_indices.to(device=selected_mask.device, non_blocking=True)
 
         # 计算稀疏邻域密度 (向量化 GPU 实现)
         # 使用 torch.cdist 计算距离矩阵，避免 CPU 同步
@@ -2608,14 +2708,13 @@ class GumbelTopKSplitter(
         # 窗口掩码: [M, N]
         window_mask = dist <= window
 
-        # 按 batch 分组求和得到密度 [B, N]
+        # P-OPT: 向量化批量累加 - 使用 scatter_add 替代 for 循环
+        # window_mask: [M, N], batch_idx: [M], 输出: [B, N]
+        # 扩展 batch_idx 到 [M, N]
+        batch_idx_expanded = batch_idx.unsqueeze(1).expand(-1, N)  # [M, N]
+        # 使用 scatter_add 按 batch 累加
         density = torch.zeros(B, N, device=selected_mask.device, dtype=torch.float32)
-
-        # 使用 index_add 按 batch 累加
-        for b in range(B):
-            b_mask = batch_idx == b
-            if b_mask.any():
-                density[b] = window_mask[b_mask].sum(dim=0).float()
+        density.scatter_add_(0, batch_idx_expanded, window_mask.float())
 
         return density
 
@@ -2659,7 +2758,7 @@ class GumbelTopKSplitter(
 
         # I150-2-FIX: 确保 base_temperature 在正确的设备上
         if isinstance(base_temperature, Tensor):
-            base_temperature = base_temperature.to(device=device)
+            base_temperature = base_temperature.to(device=device, non_blocking=True)
 
         # 计算每个深度的温度缩放因子 (向量化实现)
         # τ_d = τ_base × (N_max / N_d)^γ = τ_base × (4^{max_depth - d})^gamma
@@ -2721,14 +2820,10 @@ class GumbelTopKSplitter(
 
         # I150-4-FIX: 确保 hilbert_indices 与 logits 在同一设备上（torch.compile 兼容性）
         if hilbert_indices.device != device:
-            hilbert_indices = hilbert_indices.to(device=device)
+            hilbert_indices = hilbert_indices.to(device=device, non_blocking=True)
 
         # 初始化输出
         selected_mask = torch.zeros(B, N, device=device, dtype=logits.dtype)
-        all_indices = []
-
-        # 获取排序的 Hilbert 索引
-        sorted_hilbert, sort_order = torch.sort(hilbert_indices)
 
         # 对每个 batch 独立处理
         for b in range(B):
@@ -2738,14 +2833,15 @@ class GumbelTopKSplitter(
             sigma_sq = HILBERT_DIVERSITY_SIGMA ** 2
             lambda_div = DIVERSITY_LAMBDA
 
-            selected = []
+            # P-OPT: 使用张量而非 Python list 避免循环中的 .item() 同步
             remaining_logits = logits[b].clone()
+            selected_indices = torch.zeros(K, dtype=torch.long, device=device)
 
             for step in range(K):
                 # 贪心选择
-                if len(selected) > 0:
+                if step > 0:
                     # 计算多样性惩罚 - P-OPT: 向量化替代内层循环
-                    selected_h = hilbert_indices[selected]  # [M]
+                    selected_h = hilbert_indices[selected_indices[:step]]  # [M]
                     # 使用广播计算所有候选与已选候选的距离矩阵
                     # [N, 1] - [1, M] = [N, M]
                     diff_matrix = hilbert_indices.unsqueeze(1) - selected_h.unsqueeze(0)
@@ -2766,18 +2862,16 @@ class GumbelTopKSplitter(
                 else:
                     scores = remaining_logits
 
-                # 选择得分最高的
+                # P-OPT: 选择得分最高的 - 保留张量索引避免 .item() 同步
                 _, best_idx = scores.max(dim=0)
-                selected.append(best_idx.item())
+                selected_indices[step] = best_idx  # 保留张量索引，不做 .item() 转换
                 remaining_logits[best_idx] = -float('inf')  # 避免重复选择
 
-            # 构建掩码
-            selected_indices = torch.tensor(selected, dtype=torch.long, device=device)
-            selected_mask[b, selected_indices] = 1.0
-            all_indices.append(selected_indices)
+            # 构建掩码 - 使用 scatter_ 一次性完成
+            selected_mask[b].scatter_(0, selected_indices, 1.0)
 
-        # 合并索引
-        topk_indices = torch.stack(all_indices, dim=0)
+        # P-OPT: 从 selected_mask 重建 topk_indices（避免循环中重复构建）
+        topk_indices = selected_mask.nonzero(as_tuple=False)[:, 1].view(B, K)
 
         return selected_mask, topk_indices
 
@@ -3061,10 +3155,11 @@ class GumbelTopKSplitter(
 
         损失组件:
             1. L_align: 软配额与硬配额的对齐损失
-            2. L_min: 软下界正则化损失
+            2. L_align_kl: KL(softmax(φ) || target_dist) 配额对齐损失 (I153-1)
+            3. L_min: 软下界正则化损失
 
         梯度流:
-            ∂L/∂φ = ∂L_align/∂φ + ∂L_min/∂φ
+            ∂L/∂φ = ∂L_align/∂φ + ∂L_align_kl/∂φ + ∂L_min/∂φ
                    (通过 softmax 自然传递，无需 STE 近似)
 
         Args:
@@ -3085,6 +3180,23 @@ class GumbelTopKSplitter(
 
         # 应用权重
         loss = loss * QUOTA_ENTROPY_WEIGHT
+
+        # I153-1: 配额对齐损失 - KL(softmax(φ) || target_dist)
+        # 使用当前 step 和估计的 total_steps
+        current_step = self.quota_allocator._current_step
+        estimated_total_steps = getattr(self, '_quota_total_steps', 50000)
+
+        target_dist = self.quota_allocator.get_target_depth_distribution(
+            step=current_step,
+            total_steps=estimated_total_steps,
+            mode="curriculum"
+        )
+
+        align_kl_loss = self.quota_allocator.compute_quota_align_loss(
+            target_dist=target_dist,
+            weight=0.1
+        )
+        loss = loss + align_kl_loss
 
         # I96-7: 软下界正则化损失
         # 获取当前软配额
@@ -3284,11 +3396,11 @@ class GumbelTopKSplitter(
         B, D = info_density.shape
         device = info_density.device
 
-        # 步骤 1: 计算每个深度的总分值
+        # 步骤 1: P-OPT: 向量化计算每个深度的总分值
         # S_d = density_d × N_d (每个区域的密度 × 区域数)
-        score_per_depth = torch.zeros(B, D, device=device, dtype=torch.float32)
-        for d in range(D):
-            score_per_depth[:, d] = info_density[:, d] * num_per_depth[d]
+        # 使用广播替代 for d in range(D) 循环
+        num_per_depth_tensor = torch.tensor(num_per_depth, device=device, dtype=torch.float32)
+        score_per_depth = info_density * num_per_depth_tensor.unsqueeze(0)  # [B, D] = [B, D] * [1, D]
 
         # 步骤 2: 按比例分配配额 (对 batch 取平均)
         S_total = score_per_depth.sum(dim=1, keepdim=True)  # [B, 1]
@@ -4101,13 +4213,12 @@ class GumbelTopKSplitter(
         # 初始化硬掩码
         final_selected = torch.zeros(B, N, dtype=torch.bool, device=device)
 
-        # 使用 topk_indices 构建硬掩码
-        for b in range(B):
-            indices = topk_indices[b]  # [K_b]
-            # 过滤掉 padding (-1)
-            valid_indices = indices[indices >= 0]
-            if len(valid_indices) > 0:
-                final_selected[b, valid_indices] = True
+        # P-OPT: 向量化构建硬掩码，替代 for b 循环
+        # 过滤掉 padding (-1)，将其替换为 N（超出范围，scatter 不会填充）
+        valid_mask = topk_indices >= 0  # [B, K]
+        topk_indices_safe = torch.where(valid_mask, topk_indices, torch.full_like(topk_indices, N))
+        final_selected.scatter_(1, topk_indices_safe, True)
+        # 无需额外恢复操作，因为超出范围的索引不会被 scatter
 
         # 备用: 如果 topk_indices 为空或无效，使用软概率阈值
         if not final_selected.any():
@@ -4848,7 +4959,7 @@ class GumbelTopKSplitter(
         # I145-修复: 确保 hilbert_indices 在正确的设备上
         # 候选区域初始化时可能使用 CPU，但训练时 selected_mask 在 GPU 上
         if hilbert_indices.device != device:
-            hilbert_indices = hilbert_indices.to(device=device)
+            hilbert_indices = hilbert_indices.to(device=device, non_blocking=True)
 
         # 获取选中掩码
         # I145-FIX: 使用带梯度的版本用于损失计算
@@ -4857,7 +4968,7 @@ class GumbelTopKSplitter(
 
         # I145-修复: 确保 selected_mask 在正确的设备上
         if selected_mask is not None and selected_mask.device != device:
-            selected_mask = selected_mask.to(device)
+            selected_mask = selected_mask.to(device, non_blocking=True)
 
         if selected_mask is None or hilbert_indices is None:
             return torch.tensor(0.0, device=device)
@@ -5121,33 +5232,25 @@ class GumbelTopKSplitter(
         if region_areas.device != target_device:
             region_areas = region_areas.to(target_device)
 
-        # 计算选中区域的覆盖面积
-        B = selected_mask.shape[0]
-        coverage_losses = []
+        # P-OPT: 向量化计算覆盖面积，替代 for b 循环
+        # 选中的区域 [B, N]
+        B = selected_mask.shape[0]  # batch size
+        selected = selected_mask > 0.5  # [B, N]
+        # 扩展 region_areas 到 [B, N]
+        region_areas_expanded = region_areas.unsqueeze(0).expand(B, -1)  # [B, N]
+        # 计算每个 batch 的覆盖面积
+        selected_areas = region_areas_expanded * selected.float()  # [B, N]
+        total_areas = selected_areas.sum(dim=1)  # [B]
 
-        for b in range(B):
-            # 选中的区域
-            selected = selected_mask[b] > 0.5
-            selected_areas = region_areas[selected]
+        # 覆盖率
+        image_area = H * W
+        coverages = total_areas / image_area  # [B]
 
-            if selected_areas.numel() == 0:
-                coverage_losses.append(torch.tensor(0.0, device=device))
-                continue
-
-            # 覆盖面积（去重，使用并集估计）
-            total_area = selected_areas.sum()
-
-            # 覆盖率
-            image_area = H * W
-            coverage = total_area / image_area
-
-            # 损失: 鼓励达到最小覆盖率
-            coverage_loss = torch.relu(SPATIAL_COVERAGE_MIN - coverage)
-
-            coverage_losses.append(coverage_loss)
+        # 损失: 鼓励达到最小覆盖率
+        coverage_losses = torch.relu(SPATIAL_COVERAGE_MIN - coverages)  # [B]
 
         # 批次平均
-        loss = torch.stack(coverage_losses).mean()
+        loss = coverage_losses.mean()
 
         return weight * loss
 
@@ -6301,7 +6404,7 @@ class LookAheadHead(nn.Module):
         scaled_similarities = mean_similarities / scale_factor
 
         # 应用无效区域掩码
-        similarities = torch.where(valid_mask.to(device),
+        similarities = torch.where(valid_mask.to(device, non_blocking=True),
                                   scaled_similarities,
                                   torch.ones_like(scaled_similarities))
 
