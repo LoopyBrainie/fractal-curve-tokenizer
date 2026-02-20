@@ -59,6 +59,10 @@ from vit_pytorch.core.pattern_encoder import (
     HilbertPatternEncoderLight,
     create_hilbert_pattern_encoder,
 )  # I162-1
+from vit_pytorch.core.pattern_plugin import (
+    HilbertPatternPlugin,
+    create_hilbert_pattern_plugin,
+)  # I162-1: 双路径插件
 
 
 # =============================================================================
@@ -297,6 +301,9 @@ class FractalCurveViT(nn.Module):
         use_pattern_encoder: bool = False,  # 是否启用模式编码器
         pattern_encoder_mode: str = "light",  # "light", "standard", "multihead"
         pattern_encoder_window_sizes: Optional[Tuple[int, ...]] = None,  # 多尺度窗口大小
+        # I162-1: 双路径插件参数
+        use_pattern_plugin: bool = False,  # 是否启用双路径插件 (替代串行模式)
+        pattern_plugin_config: Optional[dict] = None,  # 插件配置字典
 
         # Scheme C: Structured Manifold Bias 参数
         use_geometry_field: bool = False,  # 是否启用几何流形场
@@ -411,6 +418,18 @@ class FractalCurveViT(nn.Module):
                     window_sizes=window_sizes,
                     out_dim=dim,
                 )
+
+        # I162-1: 双路径插件配置
+        self.use_pattern_plugin = use_pattern_plugin
+        self.pattern_plugin = None
+        if use_pattern_plugin:
+            self.pattern_plugin = create_hilbert_pattern_plugin(
+                dim=dim,
+                enabled=True,
+                pattern_dim=dim,
+                pattern_scale=1.0,
+                pattern_encoder=self.pattern_encoder,  # 复用已有的模式编码器
+            )
 
         # ====================================================================
         # I120-2: 子模块 Dropout 配置 (确定性 + 正则化分离)
@@ -687,6 +706,8 @@ class FractalCurveViT(nn.Module):
                 )
 
         # === MLP Head ===
+        # I162-1: 双路径插件模式下，输入维度翻倍
+        mlp_input_dim = dim * 2 if use_pattern_plugin else dim
         if mlp_head is not None:
             self.mlp_head = mlp_head
         else:
@@ -694,11 +715,11 @@ class FractalCurveViT(nn.Module):
             # I120-2: 使用 transformer_dropout 而非 dropout
             # I147: 添加 LogitsClamp 解决训练损失异常 (~82)
             self.mlp_head = nn.Sequential(
-                nn.LayerNorm(dim),
-                nn.Linear(dim, mlp_dim // 2),
+                nn.LayerNorm(mlp_input_dim),
+                nn.Linear(mlp_input_dim, mlp_dim),
                 nn.GELU(),
                 nn.Dropout(transformer_dropout),
-                nn.Linear(mlp_dim // 2, num_classes),
+                nn.Linear(mlp_dim, num_classes),
                 LogitsClamp(LOGIT_CLAMP_BOUND),  # I147: 钳制 logits 防止损失爆炸
             )
             self.num_classes = num_classes
@@ -1370,12 +1391,15 @@ class FractalCurveViT(nn.Module):
 
         # I162-1: Hilbert 模式编码 - 在添加 CLS 之前获取 Hilbert 索引
         hilbert_order = None
-        if self.pattern_encoder is not None:
+        if self.pattern_encoder is not None or self.pattern_plugin is not None:
             from vit_pytorch.core.levels_info import LevelsInfo
             temp_levels_info = LevelsInfo(data=padded_levels, max_level=self.max_level)
             hilbert_indices = temp_levels_info.get_hilbert_indices()  # [B, MaxLen]
             # 将 Hilbert 索引转换为排序位置 (使用第一个样本的排序，对所有batch通用)
             hilbert_order = torch.argsort(hilbert_indices[0], dim=0)  # [MaxLen]
+            # 裁剪到实际 token 数量
+            actual_num_tokens = lengths[0].item() if lengths.dim() > 0 else lengths.item()
+            hilbert_order = hilbert_order[:actual_num_tokens]
 
         # 2. 添加位置编码和 CLS token (v6.0: 同时获取 geometry_emb)
         x, levels_info, geometry_emb_with_cls = self._apply_position_and_cls(
@@ -1397,8 +1421,32 @@ class FractalCurveViT(nn.Module):
             cls_region = torch.zeros(batch_size, 1, 4, dtype=regions.dtype, device=device)
             regions = torch.cat([cls_region, regions], dim=1)
 
-        # I162-1: 应用模式编码器 (Tokenizer后、Transformer前)
-        if self.pattern_encoder is not None and hilbert_order is not None:
+        # 3. 创建 attention mask
+        attn_mask, key_padding_mask = self._create_attention_mask(
+            batch_size, x.shape[1], lengths, device
+        )
+
+        # ============================================================
+        # I162-1: 双路径插件模式 vs 串行模式
+        # ============================================================
+        _plugin_mode = self.pattern_plugin is not None
+
+        if _plugin_mode:
+            # === 双路径插件模式 (真正的并行处理) ===
+            # 使用插件进行双路径处理
+            fused_tokens, pooled = self.pattern_plugin(
+                direct_tokens=x,  # [B, N+1, D] 含 CLS
+                levels_info=levels_info,
+                geometry_emb=geometry_emb_with_cls,
+                transformer=self.transformer,
+                hilbert_order=hilbert_order,
+            )
+            transformer_tokens = fused_tokens  # [B, N, 2D]
+            final_output = self.mlp_head(pooled)  # [B, num_classes]
+            pooled_for_stats = pooled  # 保存用于 stats
+
+        elif self.pattern_encoder is not None and hilbert_order is not None:
+            # === 串行模式 (原有逻辑，残差连接) ===
             # 使用与实际 token 数量匹配的 Hilbert 排序索引
             # x 形状: [B, 1+MaxLen, D], 跳过 CLS 后: [B, MaxLen, D]
             actual_num_tokens = x.shape[1] - 1  # 减去 CLS
@@ -1411,27 +1459,32 @@ class FractalCurveViT(nn.Module):
             x_enhanced = x[:, 1:max_len+1, :] + pattern_features
             x = torch.cat([x[:, :1, :], x_enhanced, x[:, max_len+1:, :]], dim=1)
 
-        # 3. 创建 attention mask
-        attn_mask, key_padding_mask = self._create_attention_mask(
-            batch_size, x.shape[1], lengths, device
-        )
+            # 标记为非插件模式
+            _plugin_mode = False
 
-        # 4. Transformer 处理 (v6.0: 注入 geometry_emb)
-        x = self.transformer(
-            x, levels_info, attn_mask,
-            regions=regions, image_size=image_size,
-            geometry_emb=geometry_emb_with_cls,
-        )
+        else:
+            # 标记为非插件模式
+            _plugin_mode = False
 
-        # 获取 transformer 输出 (排除 CLS token)
-        transformer_tokens = x[:, 1:]
+        # 如果不是插件模式，继续执行原有的 transformer 处理逻辑
+        if not _plugin_mode:
+            # 4. Transformer 处理 (v6.0: 注入 geometry_emb)
+            x = self.transformer(
+                x, levels_info, attn_mask,
+                regions=regions, image_size=image_size,
+                geometry_emb=geometry_emb_with_cls,
+            )
 
-        # I30-11: 获取 split_probs 用于加权池化
-        split_probs = token_output.get_padded_split_probs()
+            # 获取 transformer 输出 (排除 CLS token)
+            transformer_tokens = x[:, 1:]
 
-        # 5. 池化 + 分类
-        pooled = self._apply_pooling(x, key_padding_mask, split_probs)
-        final_output = self.mlp_head(pooled)
+            # I30-11: 获取 split_probs 用于加权池化
+            split_probs = token_output.get_padded_split_probs()
+
+            # 5. 池化 + 分类
+            pooled = self._apply_pooling(x, key_padding_mask, split_probs)
+            final_output = self.mlp_head(pooled)
+            pooled_for_stats = pooled
 
         # 6. 构建 TrainingStats
         # I141: 直接返回 GPU tensor，避免 .cpu() 调用导致 cudagraphs 失败
@@ -1444,13 +1497,16 @@ class FractalCurveViT(nn.Module):
             'batch_size': batch_size,
         }
 
-        aux_infos, _ = self._prepare_auxiliary_output(
-            batch_size, lengths, levels_list, pooled, return_aux_info=False, return_features=False,
-            split_probs=split_probs
-        )
+        # I162-1: 仅在非插件模式下调用需要 split_probs 的函数
+        if not _plugin_mode:
+            aux_infos, _ = self._prepare_auxiliary_output(
+                batch_size, lengths, levels_list, pooled, return_aux_info=False, return_features=False,
+                split_probs=split_probs
+            )
 
         # P2-FIX: 计算实际的 depth_distribution 而非空字典
         # 基于 _prepare_auxiliary_output 中的逻辑，避免 GPU-CPU 同步
+        # I162-1: 插件模式下也需要计算深度分布
         depth_dist: Dict[int, float] = {}
         if levels_list and len(levels_list) > 0:
             # 计算 batch 平均深度分布
@@ -1512,7 +1568,7 @@ class FractalCurveViT(nn.Module):
             num_tokens=num_tokens_tensor,  # GPU tensor，避免 CPU 同步
             depth_used=depth_used,
             depth_distribution=depth_dist,
-            features=pooled,
+            features=pooled_for_stats,  # I162-1: 支持双路径模式下的 2D 特征
             transformer_tokens=transformer_tokens,
             shared_features=return_features,  # I107-7: 避免训练循环重复计算
             split_info=split_info,

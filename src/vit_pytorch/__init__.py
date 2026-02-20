@@ -88,6 +88,9 @@ from .core import (
     HilbertPatternEncoder,
     HilbertPatternEncoderLight,
     create_hilbert_pattern_encoder,
+    # I162-1: Pattern Plugin
+    HilbertPatternPlugin,
+    create_hilbert_pattern_plugin,
     FractalConfig,
     SplitterConfig,
     create_fractal_config,
@@ -183,6 +186,9 @@ __all__ = [
     "HilbertPatternEncoder",
     "HilbertPatternEncoderLight",
     "create_hilbert_pattern_encoder",
+    # I162-1: Pattern Plugin
+    "HilbertPatternPlugin",
+    "create_hilbert_pattern_plugin",
     "FractalConfig",
     "SplitterConfig",
     "create_fractal_config",

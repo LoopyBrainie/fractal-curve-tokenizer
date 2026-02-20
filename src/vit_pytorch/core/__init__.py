@@ -18,6 +18,11 @@ from .pattern_encoder import (
     HilbertPatternEncoderLight,
     create_hilbert_pattern_encoder,
 )
+# I162-1: Pattern Plugin (双路径插件)
+from .pattern_plugin import (
+    HilbertPatternPlugin,
+    create_hilbert_pattern_plugin,
+)
 from .config import (
     FractalConfig,
     SplitterConfig,
@@ -70,6 +75,9 @@ __all__ = [
     "HilbertPatternEncoder",
     "HilbertPatternEncoderLight",
     "create_hilbert_pattern_encoder",
+    # I162-1: Pattern Plugin
+    "HilbertPatternPlugin",
+    "create_hilbert_pattern_plugin",
     # Config
     "FractalConfig",
     "SplitterConfig",
