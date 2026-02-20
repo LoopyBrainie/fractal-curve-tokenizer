@@ -80,5 +80,4 @@ uv run python src/training/train_fractal_vit.py \
   --channels-last \
   --patience 25 \
   --num-workers 8 \
-  --use-pattern-plugin \
   --use-pattern-encoder

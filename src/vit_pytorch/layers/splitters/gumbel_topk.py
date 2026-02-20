@@ -4452,12 +4452,15 @@ class GumbelTopKSplitter(
             losses['spatial_coverage_loss'] = spatial_coverage_loss
 
         # 3. 自适应目标覆盖率（I120-8: 替换固定的 K_COVERAGE_BASE）
+        # I165-FIX: get_adaptive_target_tokens 返回的是目标 token 数，不是损失！
+        # 移除：将此值添加到 losses 字典（会导致 90+ loss）
         if ADAPTIVE_COVERAGE_ENABLED:
-            adaptive_target = self.get_adaptive_target_tokens(
+            _ = self.get_adaptive_target_tokens(
                 info_density=getattr(self, '_last_info_density', None),
                 image_size=image_size,
             )
-            losses['adaptive_target_tokens'] = adaptive_target
+            # 注意：adaptive_target_tokens 不是损失，不添加到 losses 字典
+            # 只用于内部计算（如弹性预算损失的目标值）
 
         # ====================================================================
         # I120-8: 深度平衡损失
