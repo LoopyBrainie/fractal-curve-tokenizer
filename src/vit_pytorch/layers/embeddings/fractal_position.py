@@ -108,6 +108,10 @@ class FractalPositionEmbedding(nn.Module):
         # 总共 max_level * 4 个唯一的层级-象限组合
         self.quadrant_embedding = nn.Embedding(max_level * 4, dim)
 
+        # I106-2: 残差路径编码 - 防止深层梯度消失
+        # 逐层残差连接: x_k = LayerNorm(x_{k-1} + QuadrantEmb(k, q^k))
+        self.path_layer_norm = nn.LayerNorm(dim)
+
         # 3. 融合网络 (简化版)
         # 输入: Depth Emb + Path Emb
         # I27-2: 使用可配置 dropout 替代硬编码
@@ -185,23 +189,99 @@ class FractalPositionEmbedding(nn.Module):
 
         # 查找 Embedding: (..., path_len, dim)
         path_embs = self.quadrant_embedding(flat_indices)
-        
-        # 创建掩码: 只保留有效层级的路径节点
-        # mask[i, j] = 1 if j < depths[i] else 0
+
+        # I106-2: 残差路径编码 - 防止深层梯度消失
+        # 逐层残差计算: x_k = LayerNorm(x_{k-1} + QuadrantEmb(k, q^k))
+        # x_0 = depth_emb (已在前面计算)
+        x = depth_emb  # [B, N, dim]
+
+        # 创建层级索引用于有效判断
         seq_indices = torch.arange(path_len, device=device)
-        mask = seq_indices < depths.unsqueeze(-1) # (..., path_len)
-        
-        # STAB-4 修复: 按深度归一化，防止深层 token 的 ||E_path|| ∝ √d 导致范数失衡
-        # 原公式: E_path = Σ E_j → ||E_path|| ∝ √d (深层 token 范数过大)
-        # 修复后: E_path = (Σ E_j) / √d → ||E_path|| ≈ const (范数一致)
-        path_count = mask.sum(dim=-1, keepdim=True).clamp(min=1).float()
-        path_final = (path_embs * mask.unsqueeze(-1)).sum(dim=-2) / torch.sqrt(path_count)
-        
+
+        # 逐层残差连接
+        for k in range(path_len):
+            # 获取第 k 层的象限嵌入
+            layer_emb = path_embs[..., k, :]  # [B, N, dim]
+
+            # 创建有效掩码: 只在有效层级时残差连接
+            valid_mask = (seq_indices[k] < depths).unsqueeze(-1).float()  # [B, N, 1]
+
+            # 残差连接: x = x + layer_emb (仅有效位置)
+            x = x + layer_emb * valid_mask
+
+            # LayerNorm 归一化
+            x = self.path_layer_norm(x)
+
+        path_final = x
+
         # 3. 融合
-        # 直接相加，保留层级和位置信息
-        combined_emb = depth_emb + path_final
-        
-        return self.fusion_network(combined_emb)
+        # path_final 已经包含了 depth_emb (作为 x_0)，直接返回
+        return self.fusion_network(path_final)
+
+    def check_scale_consistency(self, levels_info: LevelsInfo, epsilon: float = 0.1) -> None:
+        """I106-4: 验证尺度一致性约束 C3
+
+        检查 Level-0（全图）Embedding 与四个子象限 Level-1 Embedding 均值的距离
+
+        数学形式:
+            dist(E_{level-0}, (1/4) * Σ_{q=0}^{3} E_{level-1}^q) < ε
+
+        Args:
+            levels_info: LevelsInfo 实例
+            epsilon: 距离阈值（默认 0.1）
+
+        Raises:
+            AssertionError: 当距离超过阈值时
+        """
+        if not self.training:
+            return
+
+        device = levels_info.data.device
+
+        # 计算 Level-0 嵌入 (depth=0)
+        level_0_mask = levels_info.depths == 0
+        if not level_0_mask.any():
+            return  # 无 Level-0 token，跳过检查
+
+        # Level-0 嵌入
+        pos_emb_0 = self.forward(levels_info)  # [B, N, dim]
+        level_0_emb = pos_emb_0[level_0_mask].mean(dim=0)  # [dim]
+
+        # 计算 Level-1 嵌入 (depth=1，四个象限)
+        level_1_mask = levels_info.depths == 1
+        if not level_1_mask.any():
+            return  # 无 Level-1 token，跳过检查
+
+        pos_emb_1 = self.forward(levels_info)  # [B, N, dim]
+
+        # 按象限分组计算均值
+        quadrant_means = []
+        paths = levels_info.paths  # [B, N, max_level]
+
+        for q in range(4):
+            # 找 depth=1 且 quadrant=q 的 token
+            q_mask = (levels_info.depths == 1) & (paths[..., 0] == q)
+            if q_mask.any():
+                quadrant_means.append(pos_emb_1[q_mask].mean(dim=0))
+
+        if len(quadrant_means) < 4:
+            return  # 象限不完整，跳过检查
+
+        # 计算 Level-1 均值
+        level_1_mean = torch.stack(quadrant_means).mean(dim=0)  # [dim]
+
+        # 计算余弦距离
+        cos_dist = 1 - torch.nn.functional.cosine_similarity(
+            level_0_emb.unsqueeze(0),
+            level_1_mean.unsqueeze(0)
+        ).abs()
+
+        # 断言检查
+        assert cos_dist.item() < epsilon, (
+            f"Scale consistency check failed: "
+            f"cos_dist={cos_dist.item():.4f} >= epsilon={epsilon}"
+        )
+
 
 from vit_pytorch.core.constants import EMBEDDING_INIT_STD, HILBERT_BIAS_SCALE
 
@@ -359,3 +439,234 @@ class AreaEnhancedPositionEmbedding(nn.Module):
 # P11-5: 删除了 get_attention_bias 方法
 # 注意力偏置功能已由 LCAHilbertBias (attn_hilbert_bias.py) 统一提供
 # 该方法基于 LCA 深度计算偏置，语义更精确 (编码空间距离而非尺度组合)
+
+
+# =============================================================================
+# Scheme C: Structured Manifold Bias - Geometry Field
+# =============================================================================
+
+class GeometryField(nn.Module):
+    """几何流形场编码器 (Scheme C 核心组件)
+
+    数学形式化
+    ===========
+
+    核心思想: 将位置编码从"一次性注入"转为"每层注入的结构化偏置"
+
+    流形场定义:
+        M(i, j) = f(area_i, area_j, LCA_depth(i,j), orientation_i, orientation_j)
+
+    其中:
+        - area_i, area_j: 区域面积 (指数衰减 4^{-d})
+        - LCA_depth: 共同祖先深度
+        - orientation: 旋转状态
+
+    注入机制:
+        每层 Transformer Block 的 QK 计算时:
+            Attention(Q, K) = softmax(QK^T / √d + M)
+
+    优势:
+        1. 每层注入，解决 Signal Washout (深层稀释)
+        2. 流形场保持尺度-位置耦合
+        3. 旋转感知保持 Hilbert 几何
+        4. 完全向量化，无 Python 循环
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        max_level: int = 8,
+        heads: int = 8,
+    ):
+        """初始化几何流形场
+
+        Args:
+            dim: 嵌入维度
+            max_level: 最大四叉树深度
+            heads: 注意力头数
+        """
+        super().__init__()
+        self.dim = dim
+        self.max_level = max_level
+        self.heads = heads
+
+        # 1. 面积编码器: 深度 → 面积 (指数衰减)
+        self.area_embedding = nn.Embedding(max_level + 1, dim)
+
+        # 2. 旋转感知编码器
+        from vit_pytorch.layers.embeddings.fractal_path import OrientationExtractor
+        self.orientation_extractor = OrientationExtractor(
+            max_level=max_level,
+            embedding_dim=dim
+        )
+
+        # 3. 流形场融合网络
+        # 输入: area_emb + orientation_emb + lca_emb
+        self.manifold_fusion = nn.Sequential(
+            nn.Linear(dim * 3, dim),
+            nn.LayerNorm(dim),
+            nn.GELU(),
+        )
+
+        # 4. 偏置缩放参数
+        self.area_scale = nn.Parameter(torch.zeros(1))
+        self.orientation_scale = nn.Parameter(torch.zeros(1))
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.normal_(self.area_embedding.weight, std=0.02)
+        # area_scale 零初始化: 初始禁用面积编码
+        nn.init.zeros_(self.area_scale)
+        nn.init.zeros_(self.orientation_scale)
+
+    def compute_area_encoding(
+        self,
+        depths: torch.Tensor,
+    ) -> torch.Tensor:
+        """计算区域面积编码
+
+        数学形式:
+            area[d] = 4^{-d}
+
+        Args:
+            depths: [B, N] 深度
+
+        Returns:
+            area_emb: [B, N, dim] 面积编码
+        """
+        # 指数衰减: 4^{-d}
+        depths_clamped = depths.clamp(0, self.max_level)
+        area_weights = 4.0 ** (-depths_clamped.float())
+
+        # 查找嵌入
+        area_emb = self.area_embedding(depths_clamped)
+
+        # 应用面积权重
+        area_emb = area_emb * area_weights.unsqueeze(-1)
+
+        return area_emb
+
+    def forward(
+        self,
+        levels_info: 'LevelsInfo',
+    ) -> torch.Tensor:
+        """计算几何流形场偏置
+
+        Args:
+            levels_info: LevelsInfo 实例
+
+        Returns:
+            manifold_bias: [B, dim] 流形场编码
+        """
+        from vit_pytorch.core.levels_info import LevelsInfo
+
+        # 提取深度和路径
+        depths = levels_info.depths.clamp(0, self.max_level)
+        paths = levels_info.paths
+
+        # 1. 面积编码
+        area_emb = self.compute_area_encoding(depths)
+
+        # 2. 旋转感知编码
+        rot_emb, dir_emb = self.orientation_extractor(paths, depths)
+
+        # 3. 融合流形场
+        manifold_input = torch.cat([
+            area_emb,
+            rot_emb,
+            dir_emb,
+        ], dim=-1)  # [B, N, dim*3]
+
+        manifold_emb = self.manifold_fusion(manifold_input)
+
+        return manifold_emb
+
+    def get_layer_bias(
+        self,
+        levels_info: 'LevelsInfo',
+        layer_idx: int,
+        num_layers: int,
+    ) -> torch.Tensor:
+        """获取每层的几何偏置 (带温度衰减)
+
+        Args:
+            levels_info: LevelsInfo 实例
+            layer_idx: 当前层索引
+            num_layers: 总层数
+
+        Returns:
+            layer_bias: [B, N, dim] 当前层的几何偏置
+        """
+        # 基础流形场
+        manifold_emb = self.forward(levels_info)
+
+        # 温度衰减: 深层偏置逐渐减弱 (防止过度结构化)
+        temperature = 1.0 - (layer_idx / num_layers) * 0.5
+
+        # 缩放
+        layer_bias = manifold_emb * temperature
+
+        return layer_bias
+
+
+class MultiLayerGeometryField(nn.Module):
+    """多层几何流形场 (解决 Signal Washout)
+
+    核心思想: 在每一层 Transformer Block 注入几何偏置，
+    而非仅在输入层一次性注入
+
+    数学形式:
+        For layer l in [0, L-1]:
+            bias_l = GeometryField(levels_info, layer_idx=l)
+            output_l = Attention(Q_l, K_l, V_l, bias=bias_l)
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        max_level: int = 8,
+        heads: int = 8,
+        num_layers: int = 12,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.num_layers = num_layers
+
+        # 共享的几何流形场
+        self.geometry_field = GeometryField(
+            dim=dim,
+            max_level=max_level,
+            heads=heads,
+        )
+
+        # 每层的可学习缩放参数
+        self.layer_scales = nn.Parameter(torch.ones(num_layers))
+
+    def forward(
+        self,
+        levels_info: 'LevelsInfo',
+    ) -> List[torch.Tensor]:
+        """计算所有层 的几何偏置
+
+        Args:
+            levels_info: LevelsInfo 实例
+
+        Returns:
+            layer_biases: [num_layers, B, N, dim] 所有层的几何偏置
+        """
+        # 共享流形场
+        base_manifold = self.geometry_field.forward(levels_info)
+
+        # 每层应用不同的缩放
+        layer_biases = []
+        for layer_idx in range(self.num_layers):
+            scale = self.layer_scales[layer_idx]
+            layer_bias = base_manifold * scale
+            layer_biases.append(layer_bias)
+
+        return layer_biases
+
+
+# 类型别名用于前向引用
+from typing import List

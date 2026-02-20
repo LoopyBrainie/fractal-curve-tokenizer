@@ -303,17 +303,296 @@ class VectorizedPathEncoder:
             return result
 
 
+class BitFlippedPositionEncoder(nn.Module):
+    """Bit-Flipped 位置编码器 (基于递归位翻转)
+
+    数学形式化
+    ============
+
+    核心思想：模拟 Hilbert 曲线的递归旋转/翻转性质
+
+    递归位翻转逻辑：
+        对于每一层级 l，若父节点象限为 0 或 3，则对当前层级的
+        Embedding 应用可学习的位翻转（Bit-flip via rotation_gate）
+
+    编码公式:
+        E_pos = LayerNorm(E_depth(d) + E_path_recursive(q, rotation_gate))
+
+    其中:
+        rotation_gate_l = σ(W_gate · q_parent(l-1)) ∈ [0, 1]
+        E_flipped(l) = rotation_gate_l · (-E_quad(l)) + (1 - rotation_gate_l) · E_quad(l)
+
+    输出:
+        - pos_emb: 位置编码 [B, N, dim]
+        - geometry_emb: 传给 Attention 的几何嵌入 [B, N, dim]
+
+    数学优势
+    =========
+
+    1. Hilbert旋转对称捕获:
+       位翻转操作自然对应 Hilbert 曲线的旋转/翻转
+
+    2. 几何感知:
+       geometry_emb 为 Attention 提供坐标系一致性的向量对齐
+
+    3. 递归结构:
+       x_k = LayerNorm(x_{k-1} + E_flipped(k, q^k))
+
+    对比传统方案
+    ============
+
+    | 方案 | 公式 | Hilbert局部性 | 几何感知 |
+    |------|------|--------------|---------|
+    | 传统象限累加 | ΣE_quad(q_k) | ❌ 无序 | ❌ 无 |
+    | 本方案 | 递归位翻转 | ✅ 有序 | ✅ 有 |
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        max_level: int = 8,
+        grid_size: int = 256,
+    ):
+        """初始化 Bit-Flipped 位置编码器
+
+        Args:
+            dim: 嵌入维度
+            max_level: 最大四叉树深度
+            grid_size: Hilbert 网格大小
+        """
+        super().__init__()
+        self.dim = dim
+        self.max_level = max_level
+        self.grid_size = grid_size
+
+        # 深度编码 (与尺度相关)
+        self.depth_embedding = nn.Embedding(max_level + 1, dim)
+
+        # 递归位翻转: 每层一个门控参数
+        # rotation_gate[l] = 0 表示不翻转，= 1 表示翻转
+        # 使用 Sigmoid 将参数映射到 [0, 1]
+        self.rotation_gate = nn.Parameter(torch.zeros(max_level))
+
+        # v5.1: 深度衰减 Scale 参数
+        # 使用 Sigmoid 约束到 (0, 1)，初始值 Sigmoid(0) = 0.5
+        # scale(d) = gamma^d，gamma 随深度指数衰减
+        self.depth_decay_scale = nn.Parameter(torch.zeros(1))
+
+        # 层级路径编码: 每层 4 个象限
+        self.quadrant_embedding = nn.Embedding(max_level * 4, dim)
+
+        # 最终 LayerNorm
+        self.layer_norm = nn.LayerNorm(dim)
+
+        # v6.0: 几何嵌入投影 (保持 dim 维度，Attention 中处理维度匹配)
+        self.geometry_projection = nn.Linear(dim, dim)
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.normal_(self.depth_embedding.weight, std=0.02)
+        nn.init.normal_(self.quadrant_embedding.weight, std=0.02)
+        # rotation_gate 零初始化: 初始不翻转
+        nn.init.zeros_(self.rotation_gate)
+        # v5.1: depth_decay_scale 零初始化，Sigmoid(0) = 0.5
+        # 即初始 gamma = 0.5，scale(d) = 0.5^d
+        nn.init.zeros_(self.depth_decay_scale)
+
+    def _compute_quadrant_indices(self, paths: torch.Tensor) -> torch.Tensor:
+        """从路径计算象限索引
+
+        Args:
+            paths: [B, N, max_level] 四叉树路径
+
+        Returns:
+            quadrant_indices: [B, N, max_level] 每层的象限索引
+        """
+        # 路径直接就是象限序列，无需额外计算
+        return paths
+
+    def forward(
+        self,
+        levels_info,
+        regions: Optional[torch.Tensor] = None,
+        image_size: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """计算 Bit-Flipped 位置编码
+
+        Args:
+            levels_info: LevelsInfo 实例，包含 depths 和 paths
+            regions: 区域边界 (可选，未使用)
+            image_size: 图像尺寸 (可选，未使用)
+
+        Returns:
+            pos_emb: [B, N, dim] 位置编码
+            geometry_emb: [B, N, dim] 传给 Attention 的几何嵌入
+        """
+        # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
+        from vit_pytorch.core.levels_info import LevelsInfo
+
+        if isinstance(levels_info, torch.Tensor):
+            if levels_info.dtype != torch.long:
+                levels_info = levels_info.long()
+            info_dim = levels_info.shape[-1]
+            inferred_max_level = info_dim - 1
+            levels_info = LevelsInfo(data=levels_info, max_level=inferred_max_level)
+
+        if levels_info.data.numel() == 0:
+            return (
+                torch.zeros(0, self.dim, device=levels_info.data.device, dtype=torch.float32),
+                torch.zeros(0, self.dim, device=levels_info.data.device, dtype=torch.float32),
+            )
+
+        device = levels_info.data.device
+        B, N = levels_info.depths.shape
+
+        # 提取 depths 和 paths
+        depths = levels_info.depths.clamp(0, self.max_level).long()  # [B, N]
+        paths = levels_info.paths  # [B, N, max_level]
+
+        # 1. 深度编码
+        depth_emb = self.depth_embedding(depths)  # [B, N, dim]
+
+        # 2. 递归位翻转路径编码
+        path_emb = self._recursive_bit_flip_encoding(paths, depths)  # [B, N, dim]
+
+        # 3. 位置编码 = 深度编码 + 路径编码
+        pos_emb = depth_emb + path_emb  # [B, N, dim]
+
+        # 4. LayerNorm
+        pos_emb = self.layer_norm(pos_emb)
+
+        # 5. 生成 geometry_emb (用于 Attention 注入)
+        # v5.1: 对 geometry_emb 也应用深度衰减
+        # 使用 gamma^depth 对每个 token 进行缩放
+        gamma = torch.sigmoid(self.depth_decay_scale)  # [1]
+        # 计算每个 token 的 scale: scale[d] = gamma^d
+        token_scales = gamma ** depths.float()  # [B, N]
+        token_scales = token_scales.unsqueeze(-1)  # [B, N, 1]
+
+        geometry_emb = self.geometry_projection(path_emb)  # [B, N, dim]
+        geometry_emb = geometry_emb * token_scales  # 应用深度衰减
+
+        return pos_emb, geometry_emb
+
+    def _recursive_bit_flip_encoding(
+        self,
+        paths: torch.Tensor,
+        depths: torch.Tensor,
+    ) -> torch.Tensor:
+        """递归位翻转编码 (v5.1: 带深度衰减)
+
+        数学形式:
+            x_0 = 0
+            x_k = x_{k-1} + scale(k) * E_flipped(k, q_k)
+            其中 scale(k) = gamma^k，gamma = σ(depth_decay_scale)
+
+            E_flipped(k, q_k) = rotation_gate[k] * (-E_quad(k, q_k)) + (1 - rotation_gate[k]) * E_quad(k, q_k)
+
+        Args:
+            paths: [B, N, max_level] 四叉树路径
+            depths: [B, N] 每个 token 的有效深度
+
+        Returns:
+            path_emb: [B, N, dim] 递归位翻转后的路径编码
+        """
+        B, N, max_level = paths.shape
+        device = paths.device
+
+        # Sigmoid 激活 rotation_gate
+        gate_values = torch.sigmoid(self.rotation_gate)  # [max_level]
+
+        # v5.1: 计算深度衰减 scale
+        # gamma = sigmoid(depth_decay_scale) ∈ (0, 1)
+        gamma = torch.sigmoid(self.depth_decay_scale)  # [1]
+        # scale(k) = gamma^k: [1, γ, γ², γ³, ..., γ^(max_level-1)]
+        level_indices = torch.arange(max_level, device=device)  # [max_level]
+        depth_scales = (gamma ** level_indices).unsqueeze(0).unsqueeze(-1)  # [1, max_level, 1]
+
+        # 生成层级偏移量: [0, 4, 8, ..., (max_level-1)*4]
+        level_offsets = torch.arange(max_level, device=device) * 4
+
+        # 广播: paths + level_offsets -> [B, N, max_level]
+        flat_indices = paths + level_offsets
+
+        # 安全截断
+        flat_indices = flat_indices.clamp(0, self.max_level * 4 - 1)
+
+        # 查找象限嵌入: [B, N, max_level, dim]
+        quadrant_embs = self.quadrant_embedding(flat_indices)
+
+        # 初始化输出
+        x = torch.zeros(B, N, self.dim, device=device)  # [B, N, dim]
+
+        # 递归计算
+        for k in range(max_level):
+            # 获取第 k 层的象限嵌入
+            layer_emb = quadrant_embs[..., k, :]  # [B, N, dim]
+
+            # v5.1: 应用深度衰减 scale
+            scale = depth_scales[:, k, :]  # [1, 1]
+            layer_emb = layer_emb * scale
+
+            # 判断是否需要翻转: 父节点象限为 0 或 3 时翻转
+            if k > 0:
+                parent_quadrants = paths[..., k - 1]  # [B, N]
+                flip_mask = ((parent_quadrants == 0) | (parent_quadrants == 3)).float()  # [B, N]
+            else:
+                # 第 0 层无父节点，不翻转
+                flip_mask = torch.zeros(B, N, device=device)
+
+            # 获取当前层的门控值
+            gate = gate_values[k]  # scalar
+
+            # 应用翻转: E_flipped = gate * (-E) + (1-gate) * E = E * (1 - 2*gate)
+            flip_factor = 1 - 2 * gate  # [1] - 翻转时为 -1，不翻转时为 1
+            layer_emb = layer_emb * flip_factor
+
+            # 有效掩码: 只在有效层级时累加
+            valid_mask = (level_indices[k] < depths).unsqueeze(-1).float()  # [B, N, 1]
+
+            # 递归累加
+            x = x + layer_emb * valid_mask
+
+        return x
+
+    def _encode_morton(self, morton_norm: torch.Tensor) -> torch.Tensor:
+        """使用正弦编码 Morton 码 (保留兼容性)
+
+        Args:
+            morton_norm: [N] 归一化到 [0, 1] 的 Morton 码
+
+        Returns:
+            enc: [N, dim//2] 编码向量
+        """
+        pos_dim = self.dim // 2
+        freqs = torch.pow(2.0, torch.arange(0, pos_dim, 2, device='cpu') / pos_dim) * 3.141592653589793
+        freqs = freqs.to(morton_norm.device)
+
+        # 角度: morton_norm * freqs
+        angles = morton_norm.unsqueeze(-1) * freqs  # [N, dim//4]
+
+        # 正弦和余弦编码
+        sin_enc = torch.sin(angles)  # [N, dim//4]
+        cos_enc = torch.cos(angles)  # [N, dim//4]
+
+        # 交错拼接: [sin, cos, sin, cos, ...]
+        enc = torch.cat([sin_enc, cos_enc], dim=-1)  # [N, dim//2]
+
+        return enc
+
+
 class FractalPathEmbedding(nn.Module):
     """基于四叉树路径的位置编码.
-    
+
     结合深度编码和路径编码:
         E_pos = Fusion(E_depth(scale) + E_path(x, y, depth))
-    
+
     其中:
         E_depth: 尺度级别编码
         E_path: 四叉树路径的聚合编码
     """
-    
+
     def __init__(
         self,
         dim: int,
@@ -522,3 +801,168 @@ class HierarchicalAttentionBias(nn.Module):
         bias = bias.unsqueeze(0).expand(batch_size, -1, -1, -1)  # [B, H, N, N]
         
         return bias
+
+
+# =============================================================================
+# Scheme C: Structured Manifold Bias - Orientation Extractor
+# =============================================================================
+
+class OrientationExtractor(nn.Module):
+    """从 Hilbert 路径提取旋转状态 (Scheme C 核心组件)
+
+    数学形式化
+    ===========
+
+    Hilbert 曲线的核心性质是递归旋转/镜像:
+        - 进入象限 0 (左下) 和 3 (右下) 时，坐标系发生翻转
+        - 进入象限 1 (右上) 和 2 (左上) 时，坐标系保持不变
+
+    旋转状态定义:
+        orientation[l] = ∏_{k=0}^{l} r_k
+        其中 r_k = 1 if path[k] ∈ {0, 3} else 0
+
+    旋转检测 (位运算):
+        r_k = 1 - ((path[k] >> 1) & 1)  # 00,01→1, 10,11→0
+
+    优势:
+        - 完全向量化，无 Python 循环
+        - 使用 cumprod 实现累积旋转
+        - 输出可直接用于注意力偏置
+    """
+
+    def __init__(
+        self,
+        max_level: int = 8,
+        embedding_dim: int = 64,
+    ):
+        """初始化旋转提取器
+
+        Args:
+            max_level: 最大四叉树深度
+            embedding_dim: 旋转嵌入维度
+        """
+        super().__init__()
+        self.max_level = max_level
+        self.embedding_dim = embedding_dim
+
+        # 旋转状态编码: 2 種状态 (旋转/不旋转) → 可学习嵌入
+        self.rotation_embedding = nn.Embedding(2, embedding_dim)
+
+        # 旋转方向编码 (4 種: 0°, 90°, 180°, 270°)
+        self.direction_embedding = nn.Embedding(4, embedding_dim)
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.normal_(self.rotation_embedding.weight, std=0.02)
+        nn.init.normal_(self.direction_embedding.weight, std=0.02)
+
+    @staticmethod
+    def compute_rotation_states(paths: torch.Tensor) -> torch.Tensor:
+        """计算累积旋转状态 (向量化)
+
+        数学形式:
+            r[l] = ∏_{k=0}^{l} 1[path[k] ∈ {0, 3}]
+
+        即: 累积乘积 (cumprod) 指示从根到深度 l 是否经历偶数次翻转
+
+        Args:
+            paths: [B, N, L] 四叉树路径，值 ∈ {0, 1, 2, 3}
+
+        Returns:
+            rotation_states: [B, N, L] 旋转状态 (0=无旋转, 1=有旋转)
+        """
+        # 检测翻转触发: 象限 0, 3 触发翻转
+        flip_trigger = (paths == 0) | (paths == 3)  # [B, N, L]
+
+        # 累积翻转: cumprod 实现 AND 逻辑
+        # 0→0 (无翻转), 1→1 (翻转), 0→0 (保持), 1→1 (保持)
+        rotation_states = flip_trigger.cumprod(dim=-1).long()
+
+        return rotation_states
+
+    @staticmethod
+    def compute_rotation_directions(paths: torch.Tensor) -> torch.Tensor:
+        """计算旋转方向 (向量化)
+
+        数学形式:
+            direction[l] = sum_{k=0}^{l} (path[k] ∈ {0, 3}) mod 4
+
+        即: 累积翻转次数模 4 (对应 0°, 90°, 180°, 270°)
+
+        Args:
+            paths: [B, N, L] 四叉树路径
+
+        Returns:
+            directions: [B, N, L] 旋转方向 (0,1,2,3 对应 0°, 90°, 180°, 270°)
+        """
+        # 检测翻转次数
+        flip_count = ((paths == 0) | (paths == 3)).long()  # [B, N, L]
+
+        # 累积次数模 4
+        directions = flip_count.cumsum(dim=-1).clamp(0, 3)
+
+        return directions
+
+    def forward(
+        self,
+        paths: torch.Tensor,
+        depths: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """提取旋转状态和方向
+
+        Args:
+            paths: [B, N, L] 四叉树路径
+            depths: [B, N] 有效深度 (可选)
+
+        Returns:
+            rotation_emb: [B, N, embedding_dim] 旋转状态嵌入
+            direction_emb: [B, N, embedding_dim] 旋转方向嵌入
+        """
+        # 计算旋转状态
+        rotation_states = self.compute_rotation_states(paths)  # [B, N, L]
+
+        # 计算旋转方向
+        directions = self.compute_rotation_directions(paths)  # [B, N, L]
+
+        # 对路径维度求和 (按有效深度加权)
+        if depths is not None:
+            # 创建有效掩码
+            level_indices = torch.arange(
+                paths.shape[-1], device=paths.device
+            ).unsqueeze(0).unsqueeze(0)  # [1, 1, L]
+            valid_mask = (level_indices < depths.unsqueeze(-1)).float()  # [B, N, L]
+
+            rotation_states = (rotation_states * valid_mask).sum(dim=-1).clamp(0, 1)
+            directions = (directions * valid_mask).sum(dim=-1).clamp(0, 3)
+        else:
+            # 使用平均
+            rotation_states = rotation_states.mean(dim=-1).clamp(0, 1)
+            directions = directions.mean(dim=-1).clamp(0, 3)
+
+        # 查找嵌入
+        rotation_emb = self.rotation_embedding(rotation_states.long())  # [B, N, dim]
+        direction_emb = self.direction_embedding(directions.long())  # [B, N, dim]
+
+        return rotation_emb, direction_emb
+
+    def get_orientation_mask(
+        self,
+        paths: torch.Tensor,
+    ) -> torch.Tensor:
+        """获取旋转角度掩码 (用于注意力偏置)
+
+        输出:
+            orientation_mask: [B, N, L] 旋转角度 (弧度)
+                - 无旋转: 0
+                - 有旋转: -π/2 (90°)
+        """
+        rotation_states = self.compute_rotation_states(paths)  # [B, N, L]
+
+        # 旋转 → -π/2, 不旋转 → 0
+        orientation_mask = rotation_states.float() * (-math.pi / 2)
+
+        return orientation_mask
+
+
+import math  # 需要用于 pi 常数

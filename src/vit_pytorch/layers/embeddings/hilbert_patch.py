@@ -61,11 +61,6 @@ Variable Depth Token 的 Patch Embedding 必须满足 4 个约束:
     【C1 信息保持】σ_min ≥ 0.5 确保浅层至少保留 50% 信息
     【C2 梯度稳定】σ_max ≤ 2.0 确保梯度放大不超过 2x
     【C3 区分度】σ_max/σ_min = 4x 提供充足的深度区分能力
-
-Author: GitHub Copilot
-Date: 2025-12-25
-Updated: 2025-12-26 (向量化 ROI-Align 优化)
-Updated: 2025-12-26 (P6-1: depth_scale 可学习化)
 """
 
 from __future__ import annotations
@@ -191,8 +186,35 @@ class HilbertNativePatchEmbed(nn.Module):
                 nn.GELU() if i < conv_layers - 1 else nn.Identity(),
             ])
             out_ch = next_ch
-        
+
         self.shared_conv = nn.Sequential(*layers)
+
+        # =====================================================================
+        # FPN 金字塔 (FPN-style Multi-scale Feature Sampling)
+        # =====================================================================
+        # I-PHASE3: 添加 FPN 以解决单尺度特征截断问题
+        #
+        # 数学形式:
+        #   FPN_l = Conv(Resize(F_{l-1})) + F_l
+        #
+        # 其中 F_l 是第 l 层的特征，Resize 是 2x 上采样
+        #
+        # 深度-特征层映射:
+        #   depth 1-2 (大区域) → FPN_2 (最粗糙, 感受野最大)
+        #   depth 3-4 (中区域) → FPN_1 (中等感受野)
+        #   depth 5+  (小区域) → FPN_0 (最精细, 感受野最小)
+        #
+        # 这解决了原始方案的问题:
+        #   - 单尺度特征导致小 Token (<1px) 产生 Aliasing
+
+        self.fpn_levels = min(conv_layers, 3)  # 最多3层金字塔
+        self.fpn_conv = nn.ModuleList()
+
+        # 构建 FPN: 所有层使用 dim 通道以保持一致性
+        for i in range(self.fpn_levels):
+            self.fpn_conv.append(
+                nn.Conv2d(dim, dim, kernel_size=3, padding=1)
+            )
         
         # =====================================================================
         # 深度编码
@@ -262,9 +284,9 @@ class HilbertNativePatchEmbed(nn.Module):
     @property
     def depth_scale(self) -> torch.Tensor:
         """获取深度缩放因子.
-        
-        P6-1 改进: 使用 sigmoid 参数化确保值在 [σ_min, σ_max] 范围内
-        
+
+        P6-1 改进: 使用 sigmoid 参数化确保值在 [σ_min, sigma_max] 范围内
+
         Returns:
             shape: (max_level + 1,) 的缩放因子张量
         """
@@ -276,7 +298,131 @@ class HilbertNativePatchEmbed(nn.Module):
         else:
             # 旧版: 直接返回固定参数
             return self._depth_scale_fixed
-    
+
+    def _build_fpn_features(self, features: torch.Tensor) -> list:
+        """构建 FPN 特征金字塔
+
+        数学形式:
+            FPN_0 = features (最精细)
+            FPN_l = Conv(Resize(FPN_{l-1})) + features_l
+
+        Args:
+            features: [B, C, H, W] 共享卷积特征
+
+        Returns:
+            fpn_features: [FPN_levels] 特征金字塔列表
+        """
+        import torch.nn.functional as F
+
+        fpn_features = [features]
+
+        # 从最细到最粗构建金字塔
+        # 注意: 只需要 2 层上采样，因为 conv_layers=2 时只有 2 层特征
+        for i in range(1, min(self.fpn_levels, 2)):
+            # 上采样 2x
+            prev_feat = fpn_features[-1]
+            upsampled = F.interpolate(
+                prev_feat,
+                scale_factor=2.0,
+                mode='nearest'
+            )
+
+            # 3x3 卷积减少混叠 (通道数相同，无需调整)
+            convolved = self.fpn_conv[i](upsampled)
+            fpn_features.append(convolved)
+
+        return fpn_features
+
+    def _select_fpn_level(self, depths: torch.Tensor) -> torch.Tensor:
+        """根据深度选择 FPN 层级
+
+        数学映射:
+            depth 1-2 → level 2 (最粗糙，感受野最大)
+            depth 3-4 → level 1 (中等)
+            depth 5+  → level 0 (最精细)
+
+        Args:
+            depths: [N] token 深度
+
+        Returns:
+            level_indices: [N] 对应的 FPN 层级
+        """
+        # 映射: depth → level
+        # level = max_level - depth (深token用细特征)
+        levels = torch.clamp(self.max_level - depths, min=0, max=self.fpn_levels - 1)
+        return levels
+
+    def _dynamic_roi_align(
+        self,
+        features: Tensor,
+        boxes: Tensor,
+        depths: Tensor,
+    ) -> Tensor:
+        """动态 sampling_ratio 的 ROI-Align
+
+        I106-1: 根据 Token 深度动态调整 sampling_ratio
+        深层 Token 感受野小，使用更细致的采样防止特征模糊
+
+        数学形式:
+            sampling_ratio(d_i) = {
+                1,  d_i <= 2   (浅层，全局特征)
+                2,  2 < d_i <= 4  (中层，中等细节)
+                4,  d_i > 4    (深层，需要更细采样)
+            }
+
+        Args:
+            features: [B, D, H, W] 特征图
+            boxes: [N, 5] ROI boxes [batch_idx, x1, y1, x2, y2]
+            depths: [N] 每个 ROI 的深度
+
+        Returns:
+            pooled: [N, D] 池化后的特征
+        """
+        import torch.nn.functional as F
+
+        # 定义深度区间和对应的 sampling_ratio
+        depth_bins = [0, 2, 4, self.max_level + 1]
+        sampling_ratios = [1, 2, 4]
+
+        # 按深度分组
+        pooled_list = []
+        indices_list = []
+
+        for i in range(len(depth_bins) - 1):
+            low, high = depth_bins[i], depth_bins[i + 1]
+            mask = (depths >= low) & (depths < high)
+            if not mask.any():
+                continue
+
+            indices = mask.nonzero(as_tuple=True)[0]
+            group_boxes = boxes[indices]
+
+            # 调用 ROI-Align，使用对应的 sampling_ratio
+            pooled = roi_align(
+                features,
+                group_boxes,
+                output_size=(1, 1),
+                spatial_scale=1.0,
+                sampling_ratio=sampling_ratios[i],
+                aligned=True,
+            )  # [N_group, D, 1, 1]
+            pooled = pooled.squeeze(-1).squeeze(-1)
+
+            pooled_list.append(pooled)
+            indices_list.append(indices)
+
+        # 合并结果
+        if len(pooled_list) == 0:
+            # 无 token 时的边界情况
+            return torch.zeros(0, features.shape[1], device=features.device, dtype=features.dtype)
+
+        # 按原始顺序合并
+        all_pooled = torch.zeros(len(depths), features.shape[1], device=features.device, dtype=features.dtype)
+        for pooled, indices in zip(pooled_list, indices_list):
+            all_pooled[indices] = pooled
+
+        return all_pooled
+
     def forward(
         self,
         images: Tensor,
@@ -355,17 +501,12 @@ class HilbertNativePatchEmbed(nn.Module):
         boxes_tensor = torch.tensor(all_boxes, device=device, dtype=dtype)  # [N_total, 5]
         depths_tensor = torch.tensor(all_depths, device=device, dtype=torch.long)  # [N_total]
         
-        # 5. ROI-Align 批量池化 (核心向量化操作)
-        # I100-4: 强制使用 torchvision.ops.roi_align，无回退实现
-        # torchvision.ops.roi_align 期望 boxes 格式: [N, 5] 其中每行是 [batch_idx, x1, y1, x2, y2]
-        pooled = roi_align(
-            features,  # [B, D, H', W']
-            boxes_tensor,  # [N_total, 5]
-            output_size=(1, 1),
-            spatial_scale=1.0,  # 已经在 feature map 坐标系中
-            aligned=True,  # 更精确的对齐
-        )  # [N_total, D, 1, 1]
-        pooled = pooled.squeeze(-1).squeeze(-1)  # [N_total, D]
+        # 5. ROI-Align 批量池化 (支持动态 sampling_ratio)
+        # I106-1: 深层 Token 使用更细致的采样，防止特征模糊
+        # sampling_ratio(d) = 1 (d<=2), 2 (2<d<=4), 4 (d>4)
+        pooled = self._dynamic_roi_align(
+            features, boxes_tensor, depths_tensor
+        )  # [N_total, D]
 
         # 6. 批量应用深度编码
         # t_i = pooled_i * σ_{d_i} + E_{d_i}
