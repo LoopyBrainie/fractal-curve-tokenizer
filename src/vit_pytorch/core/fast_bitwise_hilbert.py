@@ -96,6 +96,95 @@ class FastBitwiseHilbert:
         return xv, yv
 
     @staticmethod
+    def xy_to_morton(x: Tensor, y: Tensor, n: int) -> Tensor:
+        """
+        批量将 2D 坐标转换为 Morton 码（位交织）
+
+        数学形式:
+            M = Σ_{k=0}^{B-1} (bit(x, k) << (2*k)) + (bit(y, k) << (2*k+1))
+
+        这正是 Hilbert 曲线 Gray 码变换前的中间态。
+        Morton 码保留了 Hilbert 曲线的：
+        1. 局部性：相邻 Morton 码的位模式相似
+        2. 旋转对称：位翻转对应 Hilbert 曲线的旋转
+
+        I106-3: 向量化实现，使用 torch.bitwise_left_shift 避免 Python 循环
+
+        Args:
+            x: [B] x 坐标 Tensor (支持 int32/int64)
+            y: [B] y 坐标 Tensor (支持 int32/int64)
+            n: 网格大小 (必须是 2 的幂)
+
+        Returns:
+            M: [B] Morton 码 Tensor
+        """
+        # 转换为长整型并取模
+        xv = x.long() % n
+        yv = y.long() % n
+
+        # 计算实际位宽
+        max_bits = n.bit_length() - 1
+
+        # I106-3: 向量化位交织 - 预计算所有位移
+        # 创建位移数组: [0, 2, 4, ..., 2*(max_bits-1)]
+        shifts_x = torch.arange(0, 2 * max_bits, 2, device=xv.device, dtype=torch.long)  # [max_bits]
+        shifts_y = shifts_x + 1  # [1, 3, 5, ..., 2*max_bits-1]
+
+        # 预计算的位掩码
+        masks = (1 << torch.arange(max_bits, device=xv.device, dtype=torch.long)).unsqueeze(0)  # [1, max_bits]
+
+        # 提取所有位: [B, max_bits]
+        x_bits = ((xv.unsqueeze(-1) & masks) >> torch.arange(max_bits, device=xv.device)).long()
+        y_bits = ((yv.unsqueeze(-1) & masks) >> torch.arange(max_bits, device=yv.device)).long()
+
+        # 位交织: x 在偶数位，y 在奇数位
+        # 使用移位而非乘法，减少开销
+        x_morton = torch.bitwise_left_shift(x_bits, shifts_x.unsqueeze(0))  # [B, max_bits]
+        y_morton = torch.bitwise_left_shift(y_bits, shifts_y.unsqueeze(0))  # [B, max_bits]
+
+        # 按位求和
+        morton = (x_morton + y_morton).sum(dim=-1)  # [B]
+
+        return morton
+
+    @staticmethod
+    def morton_to_xy(morton: Tensor, n: int) -> Tuple[Tensor, Tensor]:
+        """
+        批量将 Morton 码转换为 2D 坐标
+
+        数学:
+            M = Σ (x_k << 2k) + (y_k << (2k+1))
+            x_k = (M >> (2k)) & 1
+            y_k = (M >> (2k+1)) & 1
+
+        I106-3: 向量化实现，使用 torch.bitwise_left_shift 避免 Python 循环
+
+        Args:
+            morton: [B] Morton 码 Tensor
+            n: 网格大小 (必须是 2 的幂)
+
+        Returns:
+            (x, y): [B] 坐标 Tensor
+        """
+        max_bits = n.bit_length() - 1
+
+        # I106-3: 向量化位提取
+        # 位移数组: [0, 2, 4, ..., 2*(max_bits-1)]
+        shifts = torch.arange(0, 2 * max_bits, 2, device=morton.device, dtype=torch.long)  # [max_bits]
+
+        # 提取 x 位和 y 位
+        # [B, max_bits]
+        x_bits = ((morton.unsqueeze(-1) >> shifts.unsqueeze(0)) & 1).long()
+        y_bits = ((morton.unsqueeze(-1) >> (shifts + 1).unsqueeze(0)) & 1).long()
+
+        # 位移回原位
+        x_shifts = torch.arange(max_bits, device=morton.device, dtype=torch.long)  # [max_bits]
+        x = (torch.bitwise_left_shift(x_bits, x_shifts.unsqueeze(0))).sum(dim=-1)  # [B]
+        y = (torch.bitwise_left_shift(y_bits, x_shifts.unsqueeze(0))).sum(dim=-1)  # [B]
+
+        return x, y
+
+    @staticmethod
     def xy_to_d(x: Tensor, y: Tensor, H: int, W: int) -> Tensor:
         """
         批量将 2D 坐标转换为 Hilbert 距离
