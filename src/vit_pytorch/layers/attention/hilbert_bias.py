@@ -610,6 +610,9 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
 
+        # v6.0: 几何嵌入投影 (将 dim 投影到 inner_dim 用于 QK 注入)
+        self.geometry_proj = nn.Linear(dim, inner_dim)
+
         # P11-8 简化: 仅使用 LCA 模式
         if use_hilbert_bias:
             self.hilbert_bias_impl: Optional[nn.Module] = LCAHilbertBias(
@@ -945,6 +948,16 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.heads), qkv)
 
+        # v6.0: 注入 geometry_emb 到 Q 和 K (层级化注意力路径)
+        if geometry_emb is not None:
+            # v6.0: 先投影到 inner_dim，再 reshape
+            geo_proj = self.geometry_proj(geometry_emb)  # [B, N, inner_dim]
+            geometry_emb_expanded = rearrange(
+                geo_proj, "b n (h d) -> b h n d", h=self.heads
+            )
+            q = q + geometry_emb_expanded
+            k = k + geometry_emb_expanded
+
         # 初始化输出
         output = torch.zeros(batch, seq_len, self.heads * self.dim_head, device=x.device, dtype=x.dtype)
 
@@ -1032,10 +1045,12 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         regions: Optional[torch.Tensor] = None,
         image_size: Optional[int] = None,
+        geometry_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """前向传播。
 
         I98-4: levels_info 参数类型从 torch.Tensor 改为 LevelsInfo
+        v5.0: 新增 geometry_emb 参数，用于 Q/K 注入
 
         Args:
             x: 输入张量，形状为 [B, N, D]
@@ -1043,6 +1058,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             attention_mask: 注意力掩码（可选）
             regions: 区域边界张量，形状为 [B, N, 4]，格式 [x1, y1, x2, y2]
             image_size: 图像边长，与 regions 配合使用
+            geometry_emb: 几何嵌入 (可选)，形状为 [B, N, D]
 
         Returns:
             输出张量，形状为 [B, N, D]
@@ -1074,6 +1090,18 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         x = self.norm(x)
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.heads), qkv)
+
+        # v6.0: 注入 geometry_emb 到 Q 和 K
+        # Attn = (Q + geometry_emb) @ (K + geometry_emb)^T / sqrt(d)
+        if geometry_emb is not None:
+            # v6.0: 先投影到 inner_dim，再 reshape
+            # geometry_emb: [B, N, D] -> [B, H, N, D_head]
+            geo_proj = self.geometry_proj(geometry_emb)  # [B, N, inner_dim]
+            geometry_emb_expanded = rearrange(
+                geo_proj, "b n (h d) -> b h n d", h=self.heads
+            )
+            q = q + geometry_emb_expanded
+            k = k + geometry_emb_expanded
 
         # P-OPT: 检查是否有偏置，无偏置时使用 Flash SDP
         has_level_scaling = self.use_level_scaling and levels_info is not None and levels_info.data.numel() > 0
@@ -1515,6 +1543,143 @@ class ShapeScaleEncoder(nn.Module):
 
         # 调整维度 [B, 1, N, N] 以匹配注意力矩阵
         return bias.permute(0, 3, 1, 2) * self.shape_scale_weight
+
+
+class ContinuousHilbertBias(nn.Module):
+    """连续 Hilbert 距离注意力偏置 (Bit-Flipped 方案)
+
+    数学形式化
+    ============
+
+    核心思想：使用连续的 Hilbert 距离替代离散的 LCA 深度
+
+        B[i,j] = f(|h_i - h_j|)
+
+    其中:
+        h_i = HilbertIndex(token_i)  (Hilbert 曲线上的位置)
+        |h_i - h_j| = 连续的 Hilbert 距离
+
+    与离散 LCA 的对比
+    =================
+
+    | 方案 | 距离类型 | 范围 | 精度 |
+    |------|---------|------|------|
+    | LCAHilbertBias | 离散深度 | [0, max_level] | 粗糙 |
+    | ContinuousHilbertBias | 连续距离 | [0, N²] | 精细 |
+
+    数学优势
+    =========
+
+    1. 连续性保证:
+       - |h_i - h_j| ∈ [0, N²-1] 连续整数
+       - 相邻 Hilbert 索引 → 相邻偏置值
+
+    2. Hilbert 局部性:
+       - |h_i - h_j| 小 → 空间距离小 (Hilbert 曲线特性)
+       - 偏置平滑衰减
+
+    3. 对称性:
+       - |h_i - h_j| = |h_j - h_i| (自然满足)
+
+    实现细节
+    =========
+
+    使用可学习的 MLP 将连续距离映射到偏置值:
+        distance_norm = |h_i - h_j| / max_distance
+        bias = MLP(distance_norm)
+    """
+
+    def __init__(
+        self,
+        max_level: int,
+        heads: int,
+        hidden_dim: int = 32,
+        use_fp16: bool = False,
+    ) -> None:
+        """初始化连续 Hilbert 距离偏置
+
+        Args:
+            max_level: 最大四叉树深度 (用于计算最大距离)
+            heads: 注意力头数
+            hidden_dim: MLP 隐藏层维度
+            use_fp16: 是否使用 FP16 存储
+        """
+        super().__init__()
+        self.max_level = max_level
+        self.heads = heads
+
+        # 最大 Hilbert 距离: N² - 1，其中 N = 2^max_level
+        self.max_distance = (1 << (2 * max_level)) - 1
+
+        # MLP: 连续距离 → 偏置
+        # 输入: 归一化距离 (1维)
+        # 输出: 每头偏置 (heads维)
+        self.mlp = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, heads),
+        )
+
+        # 初始化: 使相邻 token 获得正偏置
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """初始化 MLP 权重，使偏置随距离单调递减"""
+        with torch.no_grad():
+            # 输入层: 接近 0 的距离 → 正值
+            nn.init.constant_(self.mlp[0].bias, 0.5)
+            nn.init.normal_(self.mlp[0].weight, std=0.02)
+
+            # 输出层: 接近 0 的距离 → 高偏置
+            nn.init.constant_(self.mlp[2].bias, 0.1)
+            nn.init.normal_(self.mlp[2].weight, std=0.02)
+
+    def forward(
+        self,
+        levels_info,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """计算连续 Hilbert 距离偏置
+
+        Args:
+            levels_info: LevelsInfo 实例，包含 depths 和 paths
+            padding_mask: [B, N] padding 掩码
+
+        Returns:
+            bias: [B, H, N, N] 注意力偏置矩阵
+        """
+        # 获取 Hilbert 索引
+        hilbert_indices = levels_info.get_hilbert_indices()  # [B, N]
+
+        # 计算距离矩阵: |h_i - h_j|
+        # [B, N] → [B, N, 1] - [B, 1, N] = [B, N, N]
+        h_i = hilbert_indices.unsqueeze(-1)  # [B, N, 1]
+        h_j = hilbert_indices.unsqueeze(-2)  # [B, 1, N]
+        distances = torch.abs(h_i - h_j)  # [B, N, N]
+
+        # 归一化到 [0, 1]
+        distances_norm = distances.float() / self.max_distance  # [B, N, N]
+
+        # MLP 映射到偏置
+        # 输入形状: [B, N, N, 1]
+        distances_flat = distances_norm.unsqueeze(-1)  # [B, N, N, 1]
+        bias = self.mlp(distances_flat)  # [B, N, N, H]
+
+        # 调整维度: [B, N, N, H] → [B, H, N, N]
+        bias = bias.permute(0, 3, 1, 2)
+
+        # 应用 padding mask (可选)
+        if padding_mask is not None:
+            # 创建掩码: [B, N, N]
+            mask_i = padding_mask.unsqueeze(-1)  # [B, N, 1]
+            mask_j = padding_mask.unsqueeze(-2)  # [B, 1, N]
+            mask = mask_i | mask_j  # [B, N, N]
+
+            # 扩展到 heads 维度
+            mask = mask.unsqueeze(1).expand(-1, self.heads, -1, -1)  # [B, H, N, N]
+            bias = bias.masked_fill(mask, float('-inf'))
+
+        return bias
 
 
 class LCAHilbertBiasWithShapeScale(nn.Module):
@@ -2519,3 +2684,234 @@ class BiasMagnitudeMonitor(nn.Module):
                 val_f = val.item() if val.numel() == 1 else val.mean().item()
                 lines.append(f"  {key}: {val_f:.4f}")
         return "\n".join(lines)
+
+
+# =============================================================================
+# Scheme C: Structured Manifold Bias - Manifold Field Attention Bias
+# =============================================================================
+
+class ManifoldFieldBias(nn.Module):
+    """几何流形场注意力偏置 (Scheme C 核心组件)
+
+    数学形式化
+    ===========
+
+    核心思想: 在每层注意力计算中注入结构化偏置，解决 Signal Washout
+
+    流形场偏置:
+        M[i,j] = α · area_bias[i,j] + β · orientation_bias[i,j] + γ · scale_bias[i,j]
+
+    其中:
+        - area_bias: 区域面积衰减偏置 (4^{-|d_i - d_j|})
+        - orientation_bias: 旋转一致性偏置 (同旋转状态 → 高偏置)
+        - scale_bias: 尺度差异偏置 (LCA_depth)
+
+    注入机制:
+        Attention(Q, K, V) = softmax(QK^T / √d_k + M) · V
+
+    优势:
+        1. 每层注入，解决深层稀释问题
+        2. 旋转感知保持 Hilbert 几何
+        3. 指数尺度衰减符合四叉树结构
+        4. 完全向量化实现
+    """
+
+    def __init__(
+        self,
+        max_level: int,
+        heads: int,
+    ):
+        """初始化流形场偏置
+
+        Args:
+            max_level: 最大四叉树深度
+            heads: 注意力头数
+        """
+        super().__init__()
+        self.max_level = max_level
+        self.heads = heads
+
+        # 1. 面积衰减嵌入: |d_i - d_j| → 偏置
+        self.area_decay_embedding = nn.Embedding(max_level + 1, heads)
+
+        # 2. 旋转一致性嵌入: 同(旋转状态) → 高偏置
+        self.rotation_consistency = nn.Embedding(2, heads)
+
+        # 3. 尺度差异嵌入: LCA_depth → 偏置 (复用现有 LCA 嵌入)
+        self.lca_embedding = nn.Embedding(max_level + 1, heads)
+
+        # 4. 可学习缩放参数
+        self.area_scale = nn.Parameter(torch.zeros(1))
+        self.orientation_scale = nn.Parameter(torch.zeros(1))
+        self.scale_bias_scale = nn.Parameter(torch.zeros(1))
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        # 面积衰减: 深度差异越小，偏置越大
+        with torch.no_grad():
+            depths = torch.arange(self.max_level + 1)
+            # 指数衰减: exp(-λ * |Δd|)
+            decay = torch.exp(-0.5 * depths.float())
+            for h in range(self.heads):
+                self.area_decay_embedding.weight[:, h] = decay
+
+        # 旋转一致性: 相同=正，不同=负
+        nn.init.zeros_(self.rotation_consistency.weight)
+        self.rotation_consistency.weight.data[1] = 0.1  # 不同旋转
+
+    def compute_area_decay_bias(
+        self,
+        depths_i: torch.Tensor,
+        depths_j: torch.Tensor,
+    ) -> torch.Tensor:
+        """计算面积衰减偏置
+
+        数学形式:
+            area_decay[i,j] = 4^{-|d_i - d_j|}
+
+        Args:
+            depths_i: [B, N] 深度矩阵 i
+            depths_j: [B, N] 深度矩阵 j
+
+        Returns:
+            bias: [B, H, N, N] 面积衰减偏置
+        """
+        B, N = depths_i.shape
+        device = depths_i.device
+
+        # 深度差异: |d_i - d_j|
+        depth_diff = depths_i.unsqueeze(-1) - depths_j.unsqueeze(-2)  # [B, N, N]
+        depth_diff = depth_diff.abs().clamp(0, self.max_level)  # [B, N, N]
+
+        # 查找嵌入: [B, N, N, H]
+        area_bias = self.area_decay_embedding(depth_diff.long())
+
+        # 调整维度: [B, H, N, N]
+        area_bias = area_bias.permute(0, 3, 1, 2)
+
+        return area_bias
+
+    def compute_rotation_consistency_bias(
+        self,
+        paths: torch.Tensor,
+    ) -> torch.Tensor:
+        """计算旋转一致性偏置
+
+        数学形式:
+            rotation_same[i,j] = 1 if orientation(i) == orientation(j) else 0
+
+        Args:
+            paths: [B, N, L] 四叉树路径
+
+        Returns:
+            bias: [B, H, N, N] 旋转一致性偏置
+        """
+        from vit_pytorch.layers.embeddings.fractal_path import OrientationExtractor
+
+        # 提取旋转状态
+        extractor = OrientationExtractor(self.max_level)
+        rotation_states = extractor.compute_rotation_states(paths)  # [B, N, L]
+
+        # 对 L 维度求和得到最终旋转状态
+        rotation_final = rotation_states.sum(dim=-1).clamp(0, 1)  # [B, N]
+
+        # 计算一致性: [B, N, 1] == [B, 1, N] → [B, N, N]
+        same_rotation = rotation_final.unsqueeze(-1) == rotation_final.unsqueeze(-2)
+
+        # 转换为偏置: [B, N, N] → [B, H, N, N]
+        rotation_bias = self.rotation_consistency(same_rotation.long())
+
+        # 调整维度
+        rotation_bias = rotation_bias.permute(0, 3, 1, 2)
+
+        return rotation_bias
+
+    def compute_scale_bias(
+        self,
+        paths: torch.Tensor,
+    ) -> torch.Tensor:
+        """计算尺度差异偏置 (基于 LCA 深度)
+
+        Args:
+            paths: [B, N, L] 四叉树路径
+
+        Returns:
+            bias: [B, H, N, N] 尺度差异偏置
+        """
+        from vit_pytorch.layers.embeddings.fractal_path import VectorizedPathEncoder
+
+        # 计算 LCA 深度
+        lca_depths = VectorizedPathEncoder.compute_common_ancestor_depth(paths)  # [B, N, N]
+
+        # 查找嵌入
+        scale_bias = self.lca_embedding(lca_depths)  # [B, N, N, H]
+
+        # 调整维度
+        scale_bias = scale_bias.permute(0, 3, 1, 2)
+
+        return scale_bias
+
+    def forward(
+        self,
+        levels_info: 'LevelsInfo',
+    ) -> torch.Tensor:
+        """计算几何流形场注意力偏置
+
+        Args:
+            levels_info: LevelsInfo 实例
+
+        Returns:
+            manifold_bias: [B, H, N, N] 流形场偏置
+        """
+        from vit_pytorch.core.levels_info import LevelsInfo
+
+        # 提取数据
+        depths = levels_info.depths.clamp(0, self.max_level)
+        paths = levels_info.paths
+
+        # 1. 面积衰减偏置
+        area_bias = self.compute_area_decay_bias(depths, depths)
+
+        # 2. 旋转一致性偏置
+        rotation_bias = self.compute_rotation_consistency_bias(paths)
+
+        # 3. 尺度差异偏置
+        scale_bias = self.compute_scale_bias(paths)
+
+        # 4. 加权融合
+        manifold_bias = (
+            self.area_scale * area_bias +
+            self.orientation_scale * rotation_bias +
+            self.scale_bias_scale * scale_bias
+        )
+
+        return manifold_bias
+
+    def get_layer_bias(
+        self,
+        levels_info: 'LevelsInfo',
+        layer_idx: int,
+        num_layers: int,
+    ) -> torch.Tensor:
+        """获取每层的几何偏置 (带温度衰减)
+
+        Args:
+            levels_info: LevelsInfo 实例
+            layer_idx: 当前层索引
+            num_layers: 总层数
+
+        Returns:
+            layer_bias: [B, H, N, N] 当前层的几何偏置
+        """
+        # 基础流形场
+        base_bias = self.forward(levels_info)
+
+        # 温度衰减: 深层偏置逐渐减弱
+        temperature = 1.0 - (layer_idx / num_layers) * 0.5
+
+        return base_bias * temperature
+
+
+# 类型别名
+from typing import Dict, Union, List
