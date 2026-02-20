@@ -2997,6 +2997,10 @@ def main():
     parser.add_argument("--pattern-encoder-window-sizes", type=str, default=None,
                        help="I162-1: Pattern encoder window sizes as comma-separated (e.g., '3,7')")
 
+    # I162-1: 双路径插件 (并行双路径架构)
+    parser.add_argument("--use-pattern-plugin", action="store_true",
+                       help="I162-1: Enable dual-path plugin (parallel direct + pattern branches)")
+
     # I33: 相对预算参数 (替代绝对 K_min/K_max)
     # 覆盖率 = tokens / max_patches, 与图像分辨率无关
     parser.add_argument("--token-coverage-min", type=float, default=0.01,
@@ -3292,6 +3296,8 @@ def main():
         use_pattern_encoder=getattr(args, 'use_pattern_encoder', False),
         pattern_encoder_mode=getattr(args, 'pattern_encoder_mode', 'light'),
         pattern_encoder_window_sizes=_parse_window_sizes(getattr(args, 'pattern_encoder_window_sizes', None)),
+        # I162-1: 双路径插件 (并行双路径架构)
+        use_pattern_plugin=getattr(args, 'use_pattern_plugin', False),
         # I122-2: lca_temperature 已移除，由 hilbert_bias_scale 统一缩放
         quota_learnable=quota_learnable_value,
         quota_entropy_weight=args.quota_entropy_weight,
@@ -3486,6 +3492,8 @@ def main():
         use_pattern_encoder=config.use_pattern_encoder,
         pattern_encoder_mode=config.pattern_encoder_mode,
         pattern_encoder_window_sizes=config.pattern_encoder_window_sizes,
+        # I162-1: 双路径插件 (并行双路径架构)
+        use_pattern_plugin=config.use_pattern_plugin,
         # I24-2: 可学习配额控制 (Scheme E)
         quota_learnable=config.quota_learnable,
         quota_entropy_weight=config.quota_entropy_weight,

@@ -111,6 +111,10 @@ class ModelArchitectureConfig:
     pattern_encoder_mode: str = "light"  # "light", "standard", "multihead"
     pattern_encoder_window_sizes: Optional[Tuple[int, ...]] = None  # 多尺度窗口大小
 
+    # I162-1: 双路径插件 (基于模式编码器的并行双路径架构)
+    use_pattern_plugin: bool = False  # 是否启用双路径插件 (替代串行模式)
+    pattern_plugin_config: Optional[Dict[str, Any]] = None  # 插件配置字典
+
     # P6-1: 深度缩放参数 (从 FractalViTConfig 迁移)
     depth_scale_range: Optional[tuple] = None  # (σ_min, σ_max)，默认 (0.5, 2.0)
 
