@@ -138,8 +138,9 @@ class HilbertBiasBase(ABC, nn.Module):
                 # P-OPT: 使用 torch.any() 保持张量在 GPU 上，避免 .any() 方法触发同步
                 exceeds_mask = depths > self.max_level
                 if torch.any(exceeds_mask):
-                    # 延迟同步：只有真正出错时才获取具体值
-                    max_depth_in_input = depths.max().item()
+                    # I170-4 FIX: 使用 no_grad 包裹避免梯度流被阻断
+                    with torch.no_grad():
+                        max_depth_in_input = depths.max().item()
                     raise ValueError(
                         f"LCA depth out of bounds: max depth in input is {max_depth_in_input}, "
                         f"but LCAHilbertBias.max_level is {self.max_level}. "
@@ -406,8 +407,10 @@ class LCAHilbertBias(HilbertBiasBase):
             # P-OPT: 使用 torch.any() 保持张量在 GPU 上
             lca_invalid = torch.any(lca_depths < 0) or torch.any(lca_depths > self.max_level)
             if lca_invalid:
-                min_depth = lca_depths.min().item()
-                actual_max = lca_depths.max().item()
+                # I170-4 FIX: 使用 no_grad 包裹避免梯度流被阻断
+                with torch.no_grad():
+                    min_depth = lca_depths.min().item()
+                    actual_max = lca_depths.max().item()
                 raise ValueError(
                     f"LCA depth out of bounds [0, {self.max_level}]: "
                     f"min={min_depth}, max={actual_max}. "
@@ -483,9 +486,13 @@ class LCAHilbertBias(HilbertBiasBase):
             # P-OPT: 使用 torch.any() 保持张量在 GPU 上
             lca_invalid = torch.any(lca_depths < 0) or torch.any(lca_depths > self.max_level)
             if lca_invalid:
+                # I170-4 FIX: 使用 no_grad 包裹避免梯度流被阻断
+                with torch.no_grad():
+                    min_d = lca_depths.min().item()
+                    max_d = lca_depths.max().item()
                 warnings.warn(
                     f"LCA depth clamped to [0, {self.max_level}]. "
-                    f"Min: {lca_depths.min().item():.2f}, Max: {lca_depths.max().item():.2f}"
+                    f"Min: {min_d:.2f}, Max: {max_d:.2f}"
                 )
         lca_depths = lca_depths.clamp(0, self.max_level)  # [B, N, N]
         
@@ -690,6 +697,13 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             torch.tensor(0.0)  # γ ≈ 1
         )
 
+        # I150-2: Global Context Anchor - 强制 CLS 在前几层关注 Depth 0
+        # 解决: 全局信息链路被切断的问题
+        # 参数: 前几层启用 anchor, 初始强度（对数尺度）
+        self.use_global_context_anchor: bool = False
+        self._global_anchor_layers: int = 3
+        self._global_anchor_log_strength = nn.Parameter(torch.tensor(2.0))  # exp(2) ≈ 7.39
+
         # A19: 移除可学习 scale_weights，保留标准 1/√d_k
         # 理由: LayerNorm 已将 Q,K 方差控制在 1，1/√d_k 已足够
         # 双重缩放导致 Var(dots) ≈ 0.69 而非理论最优的 1.0
@@ -819,6 +833,60 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         rel_pos_bias = self.relative_pos_embedding(level_diff)  # (B, S, S, H)
         return rel_pos_bias.permute(0, 3, 1, 2)  # (B, H, S, S)
 
+    def _compute_global_anchor_bias(
+        self,
+        depths: torch.Tensor,
+        batch: int,
+        seq_len: int,
+    ) -> Optional[torch.Tensor]:
+        """I150-2: 计算 Global Context Anchor 偏置
+
+        强制 CLS（位置 0）在前几层关注 Depth 0 的全局 Token，
+        确保全局信息链路畅通。
+
+        Args:
+            depths: 各 token 的深度 [B, S]
+            batch: 批次大小
+            seq_len: 序列长度
+
+        Returns:
+            Anchor 偏置 [B, H, S, S] 或 None
+        """
+        if depths is None or depths.numel() == 0:
+            return None
+
+        # 计算 anchor 强度（使用 exp 确保为正）
+        anchor_strength = self._global_anchor_log_strength.exp()
+
+        # 创建 Depth 0 的 mask
+        # CLS 位于位置 0，我们需要找到所有 Depth 0 的 token
+        depth0_mask = (depths == 0).float()  # [B, S]
+
+        # 为 CLS（位置 0）对 Depth 0 token 添加偏置
+        # 我们需要在 dots 矩阵中 [:, :, 0, :] 位置添加偏置
+        # 即 CLS 对所有 token 的注意力位置
+
+        # 创建 anchor 偏置
+        # anchor_bias[b, h, i, j] = anchor_strength if i == 0 and depth[j] == 0
+        cls_mask = torch.zeros(batch, seq_len, dtype=torch.bool, device=depths.device)
+        cls_mask[:, 0] = True  # CLS 位置
+
+        # 创建 [B, 1, S] 的偏置，只在 CLS -> Depth 0 时非零
+        anchor_bias = torch.zeros(
+            batch, 1, seq_len, dtype=torch.float32, device=depths.device
+        )
+
+        # 为每个样本添加 anchor
+        for b in range(batch):
+            depth0_indices = depths[b] == 0
+            # CLS 对 Depth 0 的注意力添加偏置
+            anchor_bias[b, 0, 0, depth0_indices] = anchor_strength
+
+        # 扩展到所有 head: [B, 1, S, S] -> [B, H, S, S]
+        anchor_bias = anchor_bias.unsqueeze(1).expand(-1, self.heads, -1, -1)
+
+        return anchor_bias
+
     # I106-1: Flash Attention 2 偏置格式转换
     def _prepare_flash_attn_bias(
         self,
@@ -896,7 +964,9 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             and bias_total.numel() > 0
             and getattr(self, '_debug_mode', False)
         ):
-            bias_abs_max = bias_total.abs().max().item()
+            # I170-4 FIX: 使用 no_grad 包裹避免梯度流被阻断
+            with torch.no_grad():
+                bias_abs_max = bias_total.abs().max().item()
             # 当偏置量级接近 clamp 边界时发出警告
             if bias_abs_max > 40:  # 接近 50 的 80%
                 import warnings
@@ -1003,16 +1073,12 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         if hilbert_bias_batch is not None:
             dots = dots + hilbert_bias_batch * self.hilbert_bias_scale * math.sqrt(self.dim_head)
 
-        # 序列长度感知缩放: S(N) = 1 / (√d_head * max(log2(N)/log2(16), 1))
-        # 缩放作用于 (QK^T + Bias) 整体，保持几何偏置的相对权重不变
-        n_actual = q.shape[2]  # [B, H, N, D_head]
+        # 修复: 移除 N-Dependent Scaling，使用标准 Transformer 缩放
+        # 原实现问题: length_scale = 1/(√d × max(log₂N/4, 1))
+        #   当 N=32, d=64, τ=0.5: Scale ≈ 0.006 (过于激进，导致softmax坍塌)
+        # 修复后: 使用标准 1/√d，保持 softmax 输入分布正常
         d_head = q.shape[-1]
-        log_n = torch.log2(torch.tensor(n_actual, dtype=q.dtype, device=q.device))
-        length_scale = 1.0 / (math.sqrt(d_head) * torch.clamp(log_n / math.log2(16), min=1.0))
-        # v6.1: 应用可学习温度补偿 (梯度缩小问题对策)
-        temperature = torch.exp(self.log_temperature)
-        length_scale = length_scale * temperature
-        dots = dots * length_scale
+        dots = dots * self.scale  # self.scale = 1/sqrt(d_head)
 
         # 单次 Softmax（深度缩放在 gather 时应用）
         attn_full = self.attend(dots)
@@ -1070,11 +1136,13 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         regions: Optional[torch.Tensor] = None,
         image_size: Optional[int] = None,
         geometry_emb: Optional[torch.Tensor] = None,
+        layer_idx: Optional[int] = None,  # I150-2: Global Context Anchor 需要
     ) -> torch.Tensor:
         """前向传播。
 
         I98-4: levels_info 参数类型从 torch.Tensor 改为 LevelsInfo
         v5.0: 新增 geometry_emb 参数，用于 Q/K 注入
+        I150-2: 新增 layer_idx 参数，用于 Global Context Anchor
 
         Args:
             x: 输入张量，形状为 [B, N, D]
@@ -1083,6 +1151,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             regions: 区域边界张量，形状为 [B, N, 4]，格式 [x1, y1, x2, y2]
             image_size: 图像边长，与 regions 配合使用
             geometry_emb: 几何嵌入 (可选)，形状为 [B, N, D]
+            layer_idx: 当前层索引 (可选)，用于 Global Context Anchor
 
         Returns:
             输出张量，形状为 [B, N, D]
@@ -1190,16 +1259,11 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                 0, seq_len + 1, device=q.device, dtype=torch.int32
             )  # [seq_len + 1]
 
-            # v6.1: N-Dependent Scaling for Flash Attention
-            # Flash Attention 不支持后处理缩放，需要融合到 scale 参数中
+            # 修复: 移除 N-Dependent Scaling，使用标准 Transformer 缩放
+            # Flash Attention 也使用标准 scale，保持与标准注意力一致
             d_head = q.shape[-1]
-            log_n = torch.log2(torch.tensor(seq_len, dtype=q.dtype, device=q.device))
-            length_scale = 1.0 / (math.sqrt(d_head) * torch.clamp(log_n / math.log2(16), min=1.0))
-            # v6.1: 温度补偿融合到基础 scale (保持梯度流)
-            # self.scale 是 float，需要先与 temperature 相乘转为 Tensor
             temperature = torch.exp(self.log_temperature)
-            adjusted_scale = self.scale * temperature  # [1] Tensor，梯度有效
-            flash_scale = adjusted_scale * length_scale
+            flash_scale = self.scale * temperature  # 标准 1/sqrt(d_head) × 温度补偿
 
             # 调用 Flash Attention 2
             attn = flash_attn_varlen_func(
@@ -1237,12 +1301,10 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             else:
                 attn_mask = None
 
-            # v6.1: N-Dependent Scaling for Flash SDP
+            # 修复: 移除 N-Dependent Scaling，使用标准 Transformer 缩放
             d_head = q.shape[-1]
-            log_n = torch.log2(torch.tensor(seq_len, dtype=q.dtype, device=q.device))
-            length_scale = 1.0 / (math.sqrt(d_head) * torch.clamp(log_n / math.log2(16), min=1.0))
-            # v6.1: Flash SDP 需要 float，梯度在 Standard 路径补偿
-            flash_scale = self.scale * length_scale
+            temperature = torch.exp(self.log_temperature)
+            flash_scale = self.scale * temperature  # 标准 1/sqrt(d_head) × 温度补偿
 
             attn = F.scaled_dot_product_attention(
                 q, k, v,
@@ -1332,16 +1394,21 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                 else:
                     dots = dots + level_bias * self.level_bias_scale * dim_scale
 
-        # 序列长度感知缩放: S(N) = 1 / (√d_head * max(log2(N)/log2(16), 1))
-        # 缩放作用于 (QK^T + Bias) 整体，保持几何偏置的相对权重不变
-        n_actual = q.shape[2]  # [B, H, N, D_head]
+        # I150-2: Global Context Anchor - 强制 CLS 在前几层关注 Depth 0
+        if self.use_global_context_anchor and layer_idx is not None and layer_idx < self._global_anchor_layers:
+            if levels_info is not None and levels_info.depths is not None:
+                anchor_bias = self._compute_global_anchor_bias(
+                    levels_info.depths, batch, seq_len
+                )
+                if anchor_bias is not None:
+                    dots = dots + anchor_bias
+
+        # 修复: 移除 N-Dependent Scaling，使用标准 Transformer 缩放
+        # 原实现问题: length_scale = 1/(√d × max(log₂N/4, 1))
+        #   当 N=32, d=64, τ=0.5: Scale ≈ 0.006 (过于激进，导致softmax坍塌)
+        # 修复后: 使用标准 1/√d，保持 softmax 输入分布正常
         d_head = q.shape[-1]
-        log_n = torch.log2(torch.tensor(n_actual, dtype=q.dtype, device=q.device))
-        length_scale = 1.0 / (math.sqrt(d_head) * torch.clamp(log_n / math.log2(16), min=1.0))
-        # v6.1: 应用可学习温度补偿 (梯度缩小问题对策)
-        temperature = torch.exp(self.log_temperature)
-        length_scale = length_scale * temperature
-        dots = dots * length_scale
+        dots = dots * self.scale  # self.scale = 1/sqrt(d_head)
 
         if attention_mask is not None:
             mask_value = -torch.finfo(dots.dtype).max
@@ -1358,6 +1425,24 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         out = torch.matmul(attn, v)
         out = rearrange(out, "b h n d -> b n (h d)")
         return self.to_out(out)
+
+    # I150-2: Global Context Anchor 辅助方法
+    def enable_global_context_anchor(self, anchor_layers: int = 3):
+        """启用 Global Context Anchor 机制
+
+        Args:
+            anchor_layers: 前几层启用 anchor（默认 3 层）
+        """
+        self.use_global_context_anchor = True
+        self._global_anchor_layers = anchor_layers
+
+    def disable_global_context_anchor(self):
+        """禁用 Global Context Anchor 机制"""
+        self.use_global_context_anchor = False
+
+    def get_global_anchor_strength(self) -> float:
+        """获取当前 Global Context Anchor 强度"""
+        return self._global_anchor_log_strength.exp().item()
 
 
 # ==================== I31/I35: 形状-尺度编码器 ====================
@@ -2720,8 +2805,11 @@ class BiasMagnitudeMonitor(nn.Module):
 
             # 超阈值警告 (仅在训练模式下)
             if self.training and normalized > self.warning_threshold:
+                # I170-4 FIX: 使用 no_grad 包裹避免梯度流被阻断
+                with torch.no_grad():
+                    norm_val = normalized.item()
                 warnings.warn(
-                    f"Bias '{name}' normalized magnitude {normalized.item():.2f} "
+                    f"Bias '{name}' normalized magnitude {norm_val:.2f} "
                     f"exceeds threshold {self.warning_threshold}. "
                     f"Scale factor: √{self.dim_head} = {self.scale_factor:.2f}"
                 )
@@ -2740,7 +2828,9 @@ class BiasMagnitudeMonitor(nn.Module):
         lines = ["=== Bias Magnitude Summary ==="]
         for key, val in stats.items():
             if isinstance(val, Tensor):
-                val_f = val.item() if val.numel() == 1 else val.mean().item()
+                # I170-4 FIX: 使用 no_grad 包裹避免梯度流被阻断
+                with torch.no_grad():
+                    val_f = val.item() if val.numel() == 1 else val.mean().item()
                 lines.append(f"  {key}: {val_f:.4f}")
         return "\n".join(lines)
 

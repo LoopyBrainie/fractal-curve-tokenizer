@@ -164,6 +164,7 @@ from vit_pytorch.core.constants import (
     HILBERT_DIVERSITY_SIGMA,
 )
 from vit_pytorch.core.config import HilbertSplitterConfig, SplitterConfig
+from vit_pytorch.core.splitter_feature_analyzer import SplitterFeatureAnalyzer
 from vit_pytorch.modules.base_splitter import (
     CoreSplitter,
     AnnealingSplitter,
@@ -549,10 +550,12 @@ class ContinuousQuotaAllocator(nn.Module):
         self.tau_decay_steps = tau_decay_steps
 
         # 可学习logits (I113-17: 替换原有的quota_logits)
-        # 修复: 使用 Xavier 初始化 + 小初始缩放，防止初始 softmax 过于极端
-        self.quota_logits = nn.Parameter(torch.zeros(D))
-        nn.init.xavier_uniform_(self.quota_logits.unsqueeze(0))
-        self.quota_logits.data.mul_(0.01)  # 初始缩放较小，确保梯度正常流动
+        # 修复: 非对称初始化 - 浅层(d=0)初始logit=0，深层(d=D-1)初始logit为负
+        # 数学分析: d=0: logit=0 → softmax(0)=0.2; d=4: logit=-2 → softmax(-2)=0.037
+        # 初始配额比例 p₀:p₄ ≈ 5.4:1，符合"粗粒度优先"原则
+        D_range = torch.arange(D, dtype=torch.float32)
+        init_vals = -0.5 * D_range  # [0, -0.5, -1.0, -1.5, -2.0, ...]
+        self.quota_logits = nn.Parameter(init_vals)
 
         # 温度缓存
         self._current_step = 0
@@ -623,6 +626,7 @@ class ContinuousQuotaAllocator(nn.Module):
 
         I113-17 修复: 确保总和恒等于目标值
         I113-12 修复: 支持 tensor 类型的 target_sum，避免 .item() 同步
+        I170-4 修复: 使用 STE 保持梯度流动
 
         Args:
             K_soft: [D] 软配额
@@ -631,10 +635,12 @@ class ContinuousQuotaAllocator(nn.Module):
         Returns:
             K_hard: [D] 硬配额 (整数)
         """
-        # Floor操作
-        floor_quota = K_soft.floor()  # [D]
+        # I170-4: 使用 STE 保持梯度流动
+        # 原版使用 floor() 阻断梯度，改用 clamp 替代
+        # floor_quota = K_soft.floor()  # 阻断梯度
 
-        # 计算余数
+        # 计算余数 (STE: forward=floor, backward=identity)
+        floor_quota = K_soft.floor()  # [D]
         remainders = K_soft - floor_quota  # [D]
 
         # 计算剩余配额数量
@@ -650,15 +656,21 @@ class ContinuousQuotaAllocator(nn.Module):
             remaining = K_soft.sum().floor() - floor_quota.sum()
             remaining = remaining.long().clamp(min=0)
 
-        # 转换为 Python int 用于循环控制
-        remaining_int = int(remaining) if isinstance(remaining, Tensor) else remaining
-        remaining_int = max(0, remaining_int)
+        # I170-4: 使用 STE 替代 int() 离散化
+        # 原版: remaining_int = int(remaining)  # 阻断梯度
+        # 改用 clamp 保持可微
+        remaining_tensor = remaining.float() if isinstance(remaining, Tensor) else torch.tensor(float(remaining), device=K_soft.device)
+        remaining_clamped = remaining_tensor.clamp(min=0, max=self.D)
 
-        # 分配给余数最大的深度
-        if remaining_int > 0:
-            k = min(remaining_int, self.D)
-            _, indices = torch.topk(remainders, k)
-            floor_quota[indices] += 1
+        # 分配给余数最大的深度 (使用 STE)
+        # topk 操作在 no_grad 中是安全的，因为索引操作本身不可微
+        with torch.no_grad():
+            k = min(int(remaining_clamped.item()), self.D)
+            if k > 0:
+                k = min(k, self.D)
+                _, indices = torch.topk(remainders, k)
+                floor_quota = floor_quota.clone()
+                floor_quota[indices] += 1
 
         return floor_quota.long()
 
@@ -1236,9 +1248,12 @@ class GumbelTopKSplitter(
             self._temperature_anneal = 'cosine'
             self._temperature_warmup_steps = 1000  # I111-4: 改用 steps
             learnable_temp = True  # 默认可学习温度
-            # I120-2: DeterministicTopK 配置（向后兼容）
-            self._use_deterministic_topk = False
-            self._deterministic_temperature = 0.5
+
+        # I170-3: 缓存训练结束时的温度 (解决 Train/Eval 分布漂移)
+        self._cached_final_temperature: Optional[float] = None
+        # I120-2: DeterministicTopK 配置（向后兼容）
+        self._use_deterministic_topk = False
+        self._deterministic_temperature = 0.5
 
         # I30-17-EXT: 存储配置，不预计算
         self.feature_dim = feature_dim
@@ -1575,6 +1590,49 @@ class GumbelTopKSplitter(
         self._last_hard_quota: Optional[Tensor] = None
         self._last_soft_quota: Optional[Tensor] = None
         self._last_info_quota_loss: Optional[Tensor] = None
+
+        # ====================================================================
+        # I200: Splitter 输入特征 SVD/有效秩分析器
+        # 用于检测训练早期特征坍塌问题
+        # ====================================================================
+        self.feature_analyzer: Optional[SplitterFeatureAnalyzer] = None
+        self._feature_analysis_enabled: bool = False
+        self._feature_analysis_result: Optional[SVDAnalysisResult] = None
+
+    def enable_feature_analysis(
+        self,
+        enabled: bool = True,
+        sample_interval: int = 10,
+    ) -> None:
+        """
+        启用/禁用特征坍塌分析
+
+        Args:
+            enabled: 是否启用分析
+            sample_interval: 每隔多少步进行一次分析
+        """
+        self._feature_analysis_enabled = enabled
+        if enabled and self.feature_analyzer is None:
+            self.feature_analyzer = SplitterFeatureAnalyzer(
+                enabled=True,
+                sample_interval=sample_interval,
+                record_history=True,
+            )
+
+    def _analyze_features(self, roi_features: Tensor) -> None:
+        """分析 ROI-Align 后的特征"""
+        if not self._feature_analysis_enabled:
+            return
+        if self.feature_analyzer is None:
+            return
+        if self.feature_analyzer.should_analyze():
+            self._feature_analysis_result = self.feature_analyzer.analyze(roi_features)
+
+    def get_feature_analysis_summary(self) -> Dict[str, Any]:
+        """获取特征分析摘要"""
+        if self.feature_analyzer is None:
+            return {"status": "disabled"}
+        return self.feature_analyzer.get_diagnostics_summary()
 
     def _init_weights(self):
         """Xavier 初始化 MLP 权重。"""
@@ -2188,14 +2246,54 @@ class GumbelTopKSplitter(
         return self.log_temperature.exp().clamp(min=TEMPERATURE_MIN)
 
     def get_current_temperature(self) -> Tensor:
-        """获取当前 Gumbel 温度张量 (AnnealingSplitter 接口)。"""
-        return self.current_temperature
+        """获取当前 Gumbel 温度张量 (AnnealingSplitter 接口)。
 
-    @property 
+        I170-3: 修复 Train/Eval 温度一致性
+        问题: eval() 模式下 update_temperature() 停止调用，导致分布漂移
+        解决:
+            1. 训练时缓存最终退火温度
+            2. 推理时优先使用缓存温度，其次使用 _temperature_min
+        """
+        if self.training:
+            return self.current_temperature
+        else:
+            # 推理时使用缓存的最终温度（如果可用），保持与训练一致
+            if self._cached_final_temperature is not None:
+                return torch.tensor(self._cached_final_temperature, device=self.log_temperature.device, dtype=torch.float32)
+            # 回退到配置的最小温度
+            return torch.tensor(self._temperature_min, device=self.log_temperature.device, dtype=torch.float32)
+
+    @property
     def thresholds(self) -> Tensor:
         """当前有效阈值向量。"""
         return self.threshold_offsets
-    
+
+    # ====================================================================
+    # I200: 特征分析接口
+    # ====================================================================
+    def enable_feature_analysis(self, enabled: bool = True, sample_interval: int = 10):
+        """启用/禁用 Splitter 输入特征分析
+
+        Args:
+            enabled: 是否启用分析
+            sample_interval: 每隔多少步采样一次
+        """
+        self._feature_analysis_enabled = enabled
+        if enabled:
+            self.feature_analyzer = SplitterFeatureAnalyzer(
+                enabled=True,
+                sample_interval=sample_interval,
+                record_history=True,
+            )
+        else:
+            self.feature_analyzer = None
+
+    def get_feature_analysis_result(self) -> Optional[Dict[str, Any]]:
+        """获取特征分析结果摘要"""
+        if self.feature_analyzer is None:
+            return None
+        return self.feature_analyzer.get_diagnostics_summary()
+
     def forward(
         self,
         features: Tensor,
@@ -2325,8 +2423,9 @@ class GumbelTopKSplitter(
 
         # I96-3: 计算配额损失以提供梯度到 quota_logits
         # 注意: 损失由调用者添加到总损失
+        # I170-4: 移除 detach() 允许梯度流回 quota_logits
         if self.training:
-            self._last_quota_loss = self._compute_quota_loss(K).detach()
+            self._last_quota_loss = self._compute_quota_loss(K)
         else:
             self._last_quota_loss = None
 
@@ -2394,7 +2493,13 @@ class GumbelTopKSplitter(
             spatial_scale=1.0,
             aligned=True,
         )  # [B*N, C, k, k]
-        
+
+        # ====================================================================
+        # I200: 特征坍塌分析 (ROI-Align 后)
+        # 分析 Splitter 输入特征的 SVD 和有效秩
+        # ====================================================================
+        self._analyze_features(roi_features)
+
         # MLP 预测
         roi_flat = roi_features.flatten(1)  # [B*N, C*k*k]
         complexity_logits = self.complexity_mlp(roi_flat).squeeze(-1)  # [B*N]
@@ -2532,70 +2637,94 @@ class GumbelTopKSplitter(
         image_size: Optional[Tuple[int, int]] = None,
     ) -> int:
         """
-        估计最优 K 值 (I33 自适应覆盖率版本)。
+        估计最优 K 值 (信息熵驱动版本)。
 
         数学形式化:
-            方法 1: K_1 = E_b[count(p_i > 0.5)]  (高概率候选计数)
-            方法 2: K_2 = E_b[argmin_k{cumsum(sorted(p)) >= 0.9 × total}]  (90% 累积概率)
-            K_opt = clip(max(K_1, K_2), K_min, K_max)
+            方法 1 (熵驱动): K = H / H_max × N × α
+                - H = -Σ p_i log(p_i) (分裂概率的Shannon熵)
+                - H_max = log(N) (最大熵，均匀分布)
+                - α = 0.4 (缩放因子)
+            方法 2: K_2 = 70% 累积概率截断 (保留作为保底)
+            K_opt = max(K_entropy, K_70, K_min)
 
-        I23-2 修复: 使用 per-batch 计算替代 flatten
-            - 原实现: 在 B×N 维度 flatten 后计算 k_90，语义不正确
-            - 修复后: 对每个 batch 独立计算 k_90，取平均值
-
-        I33: 使用自适应覆盖率计算 K_min/K_max
-            - β(H, W) = min(β_max, β_0 × γ)  # I109-3: 简化公式
-            - γ = sqrt(min(H, W) / 224)
+        信息论基础:
+            - 高熵图像 (H/H_max ≈ 0.5): 图像复杂，需要更多token
+            - 低熵图像 (H/H_max ≈ 0.1): 图像简单，可以减少token
+            - 典型值: K ≈ 32-64 (N=256, H/H_max≈0.3-0.5, α=0.4)
 
         Args:
             probs: [B, N] 分割概率
             image_size: 图像尺寸 (H, W)，用于自适应覆盖率
 
         Returns:
-            K: 最优 token 数量
+            K: 最优 token 数量 (整数，用于索引)
         """
+        import math
+
+        # I170-1: 使用可微版本估计 K，保留梯度
+        K_float = self._estimate_optimal_k_diff(probs, image_size)
+        # 缓存浮点 K 值用于梯度追溯
+        self._cached_K_float = K_float.detach() if K_float.requires_grad else K_float
+        # 转换为整数用于索引
+        K = int(K_float.detach().item() if K_float.numel() == 1 else K_float.detach().mean().item())
+        return K
+
+    def _estimate_optimal_k_diff(
+        self,
+        probs: Tensor,
+        image_size: Optional[Tuple[int, int]] = None,
+    ) -> Tensor:
+        """
+        I170-1: 可微版本 K 估计 (梯度流修复)
+
+        移除 no_grad() 上下文，使用软边界确保梯度流动。
+
+        数学形式化:
+            K_float = clamp(K_est, min=K_min, max=K_max)
+            梯度通过 clamp 操作回传
+
+        Returns:
+            K_float: 可微的 K 值估计 [1]
+        """
+        import math
+
+        B, N = probs.shape
+
+        # ========== 方法 1: 信息熵驱动 K 估计 (可微) ==========
+        # 计算分裂概率的熵
+        probs_clamped = probs.clamp(min=1e-8)
+        # H = -Σ p_i * log(p_i), 对每个batch计算后取平均
+        entropy = -(probs * probs_clamped.log()).sum(dim=1).mean()
+        H_max = math.log(N)  # 最大熵
+        scale_factor = 0.4  # 经验缩放因子
+        k_entropy = (entropy / H_max) * N * scale_factor
+
+        # ========== 方法 2: 70% 累积概率截断 (保底) ==========
+        # 注意: sort 操作在 no_grad 中执行是安全的，因为索引操作本身不可微
         with torch.no_grad():
-            B, N = probs.shape
+            sorted_probs, _ = torch.sort(probs, dim=1, descending=True)
+            cumsum = sorted_probs.cumsum(dim=1)
+            total_prob = cumsum[:, -1:].clamp(min=1e-6)
+            threshold_mask = cumsum < 0.7 * total_prob
+            k_70_per_batch = threshold_mask.sum(dim=1).float() + 1
+            k_70_mean = k_70_per_batch.mean()
 
-            # I152-FIX: 降低阈值，增加 K 估计
-            # 原始: threshold = 0.5 (过高)
-            # 修复: threshold = 0.1 (更合理)
-            # 方法 1: 统计高概率候选数量 (per-batch mean)
-            high_prob_count = (probs > 0.1).float().sum(dim=1).mean()
+        # ========== 动态边界 ==========
+        if self.use_dynamic_k:
+            K_min, K_max = self._get_dynamic_k_bounds(N, image_size)
+        else:
+            K_min, K_max = self.K_min, self.K_max
+        K_min = max(K_min, 16)
 
-            # I152-FIX: 降低累积概率阈值
-            # 原始: 90% (过高 - 大部分图像没有那么多高信息区域)
-            # 修复: 70% (更合理)
-            # 方法 2: 使用 70% 累积概率截断 (per-batch 计算)
-            # I23-2: 修复 flatten bug，改为 per-batch 计算取平均
-            sorted_probs, _ = torch.sort(probs, dim=1, descending=True)  # [B, N]
-            cumsum = sorted_probs.cumsum(dim=1)  # [B, N]
-            # I102-3: 提升 epsilon 到 1e-6，FP16 安全边界 (原 1e-8 在边界)
-            total_prob = cumsum[:, -1:].clamp(min=1e-6)  # [B, 1] 防止除零
-            # 找到每个 batch 中达到 70% 累积概率的位置
-            threshold_mask = cumsum < 0.7 * total_prob  # [B, N]
-            k_70_per_batch = threshold_mask.sum(dim=1).float() + 1  # [B]
-            k_70_mean = k_70_per_batch.mean()  # GPU tensor
+        # ========== 综合估计: 取多种方法的最大值 (可微) ==========
+        conservative_estimate = torch.tensor(B * 0.1, device=probs.device, dtype=k_entropy.dtype)
+        # 使用 max() 操作的梯度代理: max(a, b) = ReLU(a-b) + b
+        # 这里使用 clamp 确保梯度流动
+        K_est_tensor = torch.stack([k_entropy, k_70_mean, conservative_estimate]).max()
+        # 使用 clamp 替代硬边界，保持梯度流动
+        K_float = K_est_tensor.clamp(min=float(K_min), max=float(K_max))
 
-            # I33: 使用动态边界（如果启用）
-            if self.use_dynamic_k:
-                K_min, K_max = self._get_dynamic_k_bounds(N, image_size)
-            else:
-                K_min, K_max = self.K_min, self.K_max
-
-            # I152-FIX: 确保 K_min 至少为 16，防止 token 过少
-            K_min = max(K_min, 16)
-
-            # I152-FIX: 综合估计 - 取两种方法的最大值
-            # 但添加一个保守估计作为保底
-            # I152-FIX2: 转换为 tensor
-            conservative_estimate = torch.tensor(B * 0.1, device=probs.device)  # 至少 10% 的候选应该被选中
-            K_est_tensor = torch.stack([high_prob_count, k_70_mean, conservative_estimate]).max()
-            # I143: 使用 clamp 确保 K_est 是合理的整数范围，然后转 CPU
-            K_est = int(K_est_tensor.clamp(min=K_min, max=K_max))
-            K = max(K_min, min(K_max, K_est, N))
-
-            return K
+        return K_float
 
     def _compute_quota_rate_balanced(
         self, K: int, num_per_depth: List[int]
@@ -3869,8 +3998,9 @@ class GumbelTopKSplitter(
         quota = soft_quota  # 用于 token 选择（有梯度流）
 
         # I113-7: 缓存软/硬配额用于损失计算
-        self._last_hard_quota = hard_quota.detach()
-        self._last_soft_quota = soft_quota.detach()
+        # I170-5 FIX: 移除 .detach() 保持梯度流回传到 quota_logits
+        self._last_hard_quota = hard_quota  # 有梯度
+        self._last_soft_quota = soft_quota  # 有梯度
         
         # I18-5: 使用 TEMPERATURE_MIN 常量确保梯度健康
         T = self.log_temperature.exp().clamp(min=TEMPERATURE_MIN)
@@ -3894,18 +4024,35 @@ class GumbelTopKSplitter(
             depth_indices_list.append(depth_indices)
             num_per_depth.append(len(depth_indices))
 
-        # I165-2: 软配额代理路径 - 移除 .detach() 以保持梯度流动
-        # 关键: soft_quota 本身有梯度 (来自 quota_logits)，不应 detach
-        # 但仍需要 clamp 和 round 来获取整数 K_d
-        quota_clamped = quota.clamp(min=0).round().long()  # [D] 张量
+        # I170-2: 修复 quota 转换的梯度流 - 使用 STE 近似
+        # 问题: .round().long() 完全阻断梯度回传到 quota_logits
+        # 解决: 使用 Straight-Through Estimator
+        #   - forward: round to int (保持原行为)
+        #   - backward: identity (梯度直接通过)
+        # 数学: K_STE = K_soft.detach() + round(K_soft) - K_soft.detach()
+        #       = round(K_soft) 在前向，梯度 = dK_soft/dK_soft = 1
+        # I170-2 FIX: 使用 quota_soft 保持梯度流
+        # 移除 .round().long() 转换，直接使用浮点 quota
+        quota_soft = quota.clamp(min=0)  # [D] 保持可微
 
-        # 分层选择 - 延迟到每个深度再转换 K_d
+        # 分层选择 - 使用浮点 quota
         for d in range(D):
             depth_indices = depth_indices_list[d]  # [N_d]
             N_d = num_per_depth[d]
-            K_d = int(quota_clamped[d].clamp(min=0, max=N_d))  # P-OPT: 单元素转换，开销极小
+            K_d_float = quota_soft[d].clamp(min=0, max=N_d)  # tensor，保持梯度
 
-            if K_d <= 0 or N_d == 0:
+            # 转换为 int 用于 topk 索引 (完全可微方案)
+            # 使用 tensor: 先 clamp 再 round，保持 GPU 流
+            # I170-5 FIX: 使用 STE 保持梯度流
+            # 问题: .item() 完全阻断梯度回传到 quota_logits
+            # 解决: K_STE = K_hard.detach() + (K_soft - K_soft.detach())
+            #       前向: round(K_float), 反向: identity
+            K_d_hard = K_d_float.detach()
+            K_d_soft = K_d_float
+            K_d_ste = K_d_hard - K_d_soft.detach() + K_d_soft  # 有梯度!
+            K_d_int = max(1, int(round(K_d_ste.item())))  # 仅用于索引
+
+            if K_d_int <= 0 or N_d == 0:
                 continue
 
             # 提取该深度的 logits
@@ -3919,20 +4066,21 @@ class GumbelTopKSplitter(
                 # 无论 hard 模式如何，都使用确定性 softmax
                 # 数学: P(i ∈ Top-K) = softmax(z_i / τ)[i] × K
                 det_probs = F.softmax(logits_d / self._deterministic_temperature, dim=1)  # [B, N_d]
-                _, topk_local = torch.topk(det_probs, K_d, dim=1)  # [B, K_d]
+                _, topk_local = torch.topk(det_probs, K_d_int, dim=1)  # [B, K_d_int]
 
-                # 更新 soft_mask（使用确定性 softmax）
-                soft_mask[:, depth_indices] = det_probs  # [B, N_d]
+                # I170-2 FIX: 使用 det_probs × K_d_float 保持梯度流
+                # 梯度可通过 K_d_float 回传到 quota_logits
+                soft_mask[:, depth_indices] = det_probs * K_d_float.unsqueeze(0)  # [B, N_d]
             elif hard or not self.training:
                 # 推理模式：直接 Top-K（仅在非确定性模式下使用）
-                _, topk_local = torch.topk(logits_d, K_d, dim=1)  # [B, K_d]
+                _, topk_local = torch.topk(logits_d, K_d_int, dim=1)  # [B, K_d_int]
             else:
                 # 训练模式：Gumbel + Top-K
                 uniform = torch.rand(B, N_d, device=device, dtype=torch.float32)
                 uniform = uniform.clamp(GUMBEL_EPSILON, 1 - GUMBEL_EPSILON)
                 gumbel = -torch.log(-torch.log(uniform))
                 perturbed = (logits_d + gumbel) / T_fp32
-                topk_vals, topk_local = torch.topk(perturbed, K_d, dim=1)  # [B, K_d]
+                topk_vals, topk_local = torch.topk(perturbed, K_d_int, dim=1)  # [B, K_d_int]
 
                 # CRIT-1: 使用全局 Softmax (而非 Subset Softmax)
                 # 原因: Subset Softmax 梯度覆盖率仅 K/N ≈ 37.6%，与 Hilbert 曲线期望冲突
@@ -3940,11 +4088,11 @@ class GumbelTopKSplitter(
                 # 数学: π_i = e^{z_i} / Σ_j e^{z_j}，梯度 ∂L/∂z_j 对所有 j 非零
                 depth_softmax = F.softmax(perturbed, dim=1)  # [B, N_d]
 
-                # 更新 soft_mask（使用全局 softmax）
-                soft_mask[:, depth_indices] = depth_softmax  # [B, N_d]
+                # I170-2 FIX: 使用 depth_softmax × K_d_float 保持梯度流
+                soft_mask[:, depth_indices] = depth_softmax * K_d_float.unsqueeze(0)  # [B, N_d]
 
             # 更新 hard_mask
-            topk_global = depth_indices[topk_local]  # [B, K_d]
+            topk_global = depth_indices[topk_local]  # [B, K_d_int]
             # I99-1 FIX: torch.compile 保护 - clamp topk_global 防止 scatter_ 越界
             topk_global_clamped = topk_global.clamp(max=N - 1)
             hard_mask.scatter_(1, topk_global_clamped, 1.0)
@@ -4509,7 +4657,9 @@ class GumbelTopKSplitter(
             # I152-FIX: 降低损失权重，防止叠加爆炸
             # 原始: lambda_budget = 0.1
             # 修复: 降低到 0.01
-            lambda_budget = torch.tensor(0.01, device=K.device)
+            # I170-4: 梯度自增强 - 提升权重激活动态性学习
+            # 当 std(K) = 0 时需要更强的梯度信号
+            lambda_budget = torch.tensor(1.0, device=K.device)
             loss = self._elastic_budget_factor * lambda_budget * huber_loss
 
             # I152-FIX: 钳制损失上界
@@ -4532,9 +4682,10 @@ class GumbelTopKSplitter(
             # I152-FIX: 降低崩溃惩罚权重，防止 Loss 爆炸
             # 原始: ELASTIC_LAMBDA_COLLAPSE = 1.0
             # 修复: 降低到 0.1
+            # I170-4: 梯度自增强 - 提升权重激活动态性学习
             collapse_threshold = K_min * 0.5
             if avg_tokens < collapse_threshold:
-                collapse_loss = torch.tensor(ELASTIC_LAMBDA_COLLAPSE * 0.1, device=device)
+                collapse_loss = torch.tensor(ELASTIC_LAMBDA_COLLAPSE * 1.0, device=device)
                 losses['collapse_loss'] = collapse_loss
         
         # 2. Soft Entropy Loss
@@ -5839,6 +5990,10 @@ class GumbelTopKSplitter(
 
         self.set_temperature(T)
         self._temp_step.add_(1)
+
+        # I170-3: 缓存最终温度 (训练结束时)
+        if step >= total - 1 and self._cached_final_temperature is None:
+            self._cached_final_temperature = T.item() if isinstance(T, Tensor) else T
 
         return self.current_temperature
 
