@@ -340,6 +340,7 @@ from vit_pytorch.core.constants import (
     SPLITTER_TEMP_SCHEDULE,  # I29-4: 导入调度策略
 )
 from vit_pytorch.gumbel_topk_splitter import DepthMonitor  # I111-6: 深度分布监控
+from vit_pytorch.core.cls_attention_tracker import CLSAttentionTracker  # I150-2: CLS 注意力追踪
 
 # Fractal Training 模块 (I15) - 现在位于 examples/training
 from training import (
@@ -2175,6 +2176,23 @@ def train_epoch(
                     entropy_loss_count += 1
             if splitter_loss is not None:
                 splitter_loss_f32 = splitter_loss.float()
+
+                # 相对权重机制：辅助损失始终是 CE loss 的 base_ratio 倍
+                # 公式: relative_weight = base_ratio × CE_loss.item()
+                # 这样确保辅助损失不会掩盖主任务的梯度
+                base_ratio = getattr(config, 'aux_loss_relative_ratio', 0.1)  # 默认 10%
+                ce_loss_scale = ce_loss.detach().mean().item() if ce_loss.numel() > 0 else 1.0
+                relative_weight = base_ratio * max(ce_loss_scale, 0.5)  # 最小值保护
+
+                # 获取课程因子（已在 warmup 逻辑中计算）
+                curriculum_factor = 1.0
+                if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
+                    splitter = model.tokenizer.splitter
+                    curriculum_factor = getattr(splitter, '_elastic_lambda_scale', 1.0)
+
+                # 组合权重
+                aux_weight = curriculum_factor * relative_weight
+
                 # P-OPT: 仅在调试模式检查 NaN/Inf，避免 GPU-CPU 同步
                 if debug_mode:
                     if torch.isnan(splitter_loss_f32) or torch.isinf(splitter_loss_f32):
@@ -2184,14 +2202,14 @@ def train_epoch(
                         # [Loss诊断] 检测异常大的 splitter_loss
                         print(f"[WARN] splitter_loss 异常大: {splitter_loss_f32.item():.2f}, 将被裁剪")
                         splitter_loss_f32 = splitter_loss_f32.clamp(min=-100, max=100)
-                        loss = loss + splitter_loss_f32 / config.accum_steps
+                        loss = loss + splitter_loss_f32 * aux_weight / config.accum_steps
                     else:
-                        loss = loss + splitter_loss_f32 / config.accum_steps
+                        loss = loss + splitter_loss_f32 * aux_weight / config.accum_steps
                 else:
                     # 非调试模式也做异常值保护，防止 90+ loss
                     if splitter_loss_f32.abs() > 1000:
                         splitter_loss_f32 = splitter_loss_f32.clamp(min=-100, max=100)
-                    loss = loss + splitter_loss_f32 / config.accum_steps
+                    loss = loss + splitter_loss_f32 * aux_weight / config.accum_steps
 
             # I110-7: 语义分裂器损失集成
             if config.use_semantic_splitter and stats is not None:
@@ -2266,6 +2284,41 @@ def train_epoch(
             total_grad_norm = total_grad_norm ** 0.5
             print(f"[Grad Monitor] Step {i}: total_grad_norm={total_grad_norm:.4f}")
 
+            # I170: 增强梯度监控 - 监控 Splitter 组件梯度
+            if hasattr(model, 'splitter'):
+                splitter = model.splitter
+
+                # 监控 Splitter MLP 梯度
+                if hasattr(splitter, 'splitter_mlp'):
+                    mlp_grad_norm = 0.0
+                    for param in splitter.splitter_mlp.parameters():
+                        if param.grad is not None:
+                            mlp_grad_norm += param.grad.norm().item() ** 2
+                    mlp_grad_norm = mlp_grad_norm ** 0.5
+                    print(f"[Grad Monitor] Step {i}: splitter_mlp_grad_norm={mlp_grad_norm:.4f}")
+
+                # 监控 Quota Logits 梯度
+                if hasattr(splitter, 'quota_logits') and splitter.quota_logits is not None:
+                    if splitter.quota_logits.grad is not None:
+                        quota_grad_norm = splitter.quota_logits.grad.norm().item()
+                        print(f"[Grad Monitor] Step {i}: quota_logits_grad_norm={quota_grad_norm:.4f}")
+
+                # 监控温度参数梯度
+                if hasattr(splitter, 'log_temperature') and splitter.log_temperature.grad is not None:
+                    temp_grad_norm = splitter.log_temperature.grad.norm().item()
+                    print(f"[Grad Monitor] Step {i}: log_temperature_grad={temp_grad_norm:.6f}")
+
+                # 计算梯度信噪比 (GSNR)
+                param_grad_norms = []
+                for param in splitter.parameters():
+                    if param.grad is not None:
+                        param_grad_norms.append(param.grad.norm().item())
+                if param_grad_norms:
+                    mean_grad = sum(param_grad_norms) / len(param_grad_norms)
+                    variance_grad = sum((g - mean_grad) ** 2 for g in param_grad_norms) / len(param_grad_norms)
+                    gsnr = mean_grad / (variance_grad ** 0.5 + 1e-8) if variance_grad > 0 else 0
+                    print(f"[Grad Monitor] Step {i}: splitter_gsnr={gsnr:.4f}")
+
         # I150-3: Token 稳定性监控 - 记录 IOU
         if getattr(config, 'monitor_token_stability', False) and hasattr(model, 'splitter') and (i + 1) % config.accum_steps == 0 and i % 50 == 0:
             splitter = model.splitter
@@ -2281,6 +2334,35 @@ def train_epoch(
                     stats = splitter.get_token_stability_stats()
                     if stats["iou_mean"] > 0:
                         print(f"[Token Stats] mean={stats['iou_mean']:.3f}, std={stats['iou_std']:.3f}, min={stats['iou_min']:.3f}")
+
+        # I150-5: 梯度比值监控 - 计算 Splitter 和 Backbone 梯度比值
+        if getattr(config, 'monitor_gradient_ratio', False) and (i + 1) % config.accum_steps == 0 and i % 50 == 0:
+            splitter_grad_sum = 0.0
+            splitter_param_count = 0
+            backbone_grad_sum = 0.0
+            backbone_param_count = 0
+
+            for name, param in model.named_parameters():
+                if param.grad is None:
+                    continue
+                grad_norm = param.grad.norm().item()
+                if 'splitter' in name.lower() or 'tokenizer' in name.lower():
+                    splitter_grad_sum += grad_norm ** 2
+                    splitter_param_count += 1
+                elif 'pattern' not in name.lower():
+                    backbone_grad_sum += grad_norm ** 2
+                    backbone_param_count += 1
+
+            splitter_avg_grad = (splitter_grad_sum ** 0.5) / splitter_param_count if splitter_param_count > 0 else 0
+            backbone_avg_grad = (backbone_grad_sum ** 0.5) / backbone_param_count if backbone_param_count > 0 else 0
+
+            gradient_ratio = splitter_avg_grad / (backbone_avg_grad + 1e-8)
+
+            print(f"[Grad Ratio] Step {i}: splitter_avg_grad={splitter_avg_grad:.6f}, backbone_avg_grad={backbone_avg_grad:.6f}, ratio={gradient_ratio:.2f}")
+
+            # 梯度比值信息（不调整，仅记录）- 35x 是正常范围
+            if gradient_ratio > config.gradient_ratio_threshold:
+                print(f"[Grad Ratio INFO] Splitter 梯度是 Backbone 的 {gradient_ratio:.1f} 倍 (正常范围: 2-50x)")
 
         if (i + 1) % config.accum_steps == 0:
             scaler.unscale_(optimizer)
@@ -2440,7 +2522,31 @@ def train_epoch(
         except Exception as e:
             # I111-6: 静默处理收集错误，避免影响训练
             pass
-    
+
+    # =====================================================================
+    # I200: 获取 Splitter 特征分析结果
+    # 用于检测特征坍塌问题
+    # =====================================================================
+    if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
+        splitter = model.tokenizer.splitter
+        if hasattr(splitter, 'get_feature_analysis_summary'):
+            try:
+                feature_summary = splitter.get_feature_analysis_summary()
+                if feature_summary and feature_summary.get('status') == 'analyzing':
+                    # 获取最新的分析结果
+                    analysis_result = splitter._feature_analysis_result
+                    if analysis_result is not None:
+                        perf_stats['feature_analysis'] = {
+                            'effective_rank': analysis_result.effective_rank,
+                            'svd_top1_ratio': analysis_result.svd_top1_ratio,
+                            'svd_top5_ratio': analysis_result.svd_top5_ratio,
+                            'energy_99_percent_dims': analysis_result.energy_99_percent_dims,
+                            'is_collapsed': analysis_result.is_collapsed,
+                            'collapse_severity': analysis_result.collapse_severity,
+                        }
+            except Exception:
+                pass  # 忽略收集错误
+
     # P11-8: 在返回前进行一次 GPU-CPU 同步
     final_loss = (total_loss / len(loader)).item()
     final_acc = (100.0 * correct / total).item() if total > 0 else 0.0
@@ -2825,6 +2931,65 @@ def log_splitter_health_to_tensorboard(
         writer.add_histogram('Splitter/quota_probs',
                            quota_probs.detach().cpu().numpy(), epoch)
 
+    # =====================================================================
+    # I200: Splitter 输入特征 SVD/有效秩分析日志
+    # 用于检测特征坍塌问题
+    # =====================================================================
+    feature_analysis = perf_stats.get('feature_analysis')
+    if feature_analysis is not None:
+        # 有效秩
+        if 'effective_rank' in feature_analysis:
+            writer.add_scalar('Splitter/feature_effective_rank',
+                           feature_analysis['effective_rank'], epoch)
+
+        # 奇异值能量占比
+        if 'svd_top1_ratio' in feature_analysis:
+            writer.add_scalar('Splitter/feature_svd_top1_ratio',
+                           feature_analysis['svd_top1_ratio'], epoch)
+
+        if 'svd_top5_ratio' in feature_analysis:
+            writer.add_scalar('Splitter/feature_svd_top5_ratio',
+                           feature_analysis['svd_top5_ratio'], epoch)
+
+        # 达到99%能量需要的维度数
+        if 'energy_99_percent_dims' in feature_analysis:
+            writer.add_scalar('Splitter/feature_energy_99_percent_dims',
+                           feature_analysis['energy_99_percent_dims'], epoch)
+
+        # 坍塌警告
+        if 'is_collapsed' in feature_analysis:
+            writer.add_scalar('Splitter/feature_collapse_warning',
+                           1 if feature_analysis['is_collapsed'] else 0, epoch)
+
+    # =====================================================================
+    # I150-2: CLS Token 注意力追踪日志
+    # 用于检测全局信息链路是否被切断
+    # =====================================================================
+    cls_analysis = perf_stats.get('cls_attention_analysis')
+    if cls_analysis is not None:
+        # CLS 对各深度的注意力
+        if 'depth0_attention' in cls_analysis:
+            writer.add_scalar('CLS/attention_depth0',
+                           cls_analysis['depth0_attention'], epoch)
+
+        if 'depth1_attention' in cls_analysis:
+            writer.add_scalar('CLS/attention_depth1',
+                           cls_analysis['depth1_attention'], epoch)
+
+        if 'depth2_attention' in cls_analysis:
+            writer.add_scalar('CLS/attention_depth2',
+                           cls_analysis['depth2_attention'], epoch)
+
+        # 链路断开警告
+        if 'link_broken' in cls_analysis:
+            writer.add_scalar('CLS/depth0_warning',
+                           1 if cls_analysis['link_broken'] else 0, epoch)
+
+        # 全局链路完整性
+        if 'global_link_intact' in cls_analysis:
+            writer.add_scalar('CLS/global_link_intact',
+                           1 if cls_analysis['global_link_intact'] else 0, epoch)
+
 
 @torch.no_grad()
 def verify_train_eval_consistency(
@@ -3186,6 +3351,16 @@ def main():
     parser.add_argument("--pattern-lr-mult", type=float, default=1.0,
                        help="Pattern encoder learning rate multiplier (default: 1.0)")
 
+    # I150-5: 梯度比值监控与动态学习率调整
+    parser.add_argument("--monitor-gradient-ratio", action="store_true",
+                       help="监控 Splitter/Backbone 梯度比值")
+    parser.add_argument("--gradient-ratio-threshold", type=float, default=10.0,
+                       help="梯度比值阈值，超过则触发学习率调整 (default: 10.0)")
+    parser.add_argument("--splitter-lr-when-unstable", type=float, default=0.5,
+                       help="当梯度不稳定时 Splitter 学习率乘数 (default: 0.5)")
+    parser.add_argument("--splitter-wd-when-unstable", type=float, default=2.0,
+                       help="当梯度不稳定时 Splitter 权重衰减乘数 (default: 2.0)")
+
     # I120-2: 分离 dropout 配置
     parser.add_argument("--tokenizer-dropout", type=float, default=0.0,
                        help="Tokenizer/Splitter dropout rate (default: 0.0)")
@@ -3477,6 +3652,12 @@ def main():
             self.splitter_lr_mult = args.splitter_lr_mult
             self.splitter_weight_decay_mult = args.splitter_weight_decay_mult
             self.pattern_lr_mult = args.pattern_lr_mult
+
+            # I150-5: 梯度比值监控配置
+            self.monitor_gradient_ratio = args.monitor_gradient_ratio
+            self.gradient_ratio_threshold = args.gradient_ratio_threshold
+            self.splitter_lr_when_unstable = args.splitter_lr_when_unstable
+            self.splitter_wd_when_unstable = args.splitter_wd_when_unstable
 
             self.gradient_clip = args.gradient_clip
             self.accum_steps = args.accum_steps
@@ -4332,7 +4513,15 @@ def main():
         print(f"[INFO] 自适应分割器退火未启用 (不支持或未使用可学习分割器)")
     
     print()
-    
+
+    # ====================================================================
+    # I200: 启用 Splitter 特征坍塌分析（前10个epoch）
+    # 检测由于 LayerNorm 或初始化不当导致的特征同质化
+    # ====================================================================
+    if hasattr(model, 'splitter') and hasattr(model.splitter, 'enable_feature_analysis'):
+        model.splitter.enable_feature_analysis(enabled=True, sample_interval=10)
+        print(f"[INFO] Splitter 特征分析已启用 (前10个epoch)")
+
     for epoch in range(1, config.epochs + 1):
         print(f"\n{'='*60}")
         print(f"EPOCH {epoch}/{config.epochs} - STARTING")
@@ -4405,29 +4594,42 @@ def main():
                 print(f"[INFO] Epoch {epoch}: 温度退火和偏置退火正式开始 (warmup 结束)")
 
         # =====================================================================
-        # 核心改进1: Loss Warmup - 动态调整辅助损失权重
-        # 目的: 在训练初期关闭 budget/entropy 损失，让 Splitter 先学会"无限制"分裂
+        # I200: 启用 Splitter 输入特征分析（前10个epoch）
+        # 用于检测特征坍塌问题
+        # =====================================================================
+        if epoch <= 10:
+            if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
+                splitter = model.tokenizer.splitter
+                if hasattr(splitter, 'enable_feature_analysis'):
+                    if not splitter._feature_analysis_enabled:
+                        splitter.enable_feature_analysis(enabled=True, sample_interval=10)
+                        print(f"[I200] Epoch {epoch}: 启用 Splitter 特征分析 (前10个epoch)")
+
+        # =====================================================================
+        # 核心改进1: Loss Warmup + 相对权重机制
+        # 目的: 使用相对权重替代绝对权重，确保辅助损失始终与 CE loss 成比例
+        # 公式: aux_loss_weight = curriculum_factor × base_ratio × CE_loss
         # =====================================================================
         if hasattr(config, 'aux_loss_warmup_epochs') and config.aux_loss_warmup_epochs > 0:
-            # 计算当前 epoch 的辅助损失权重乘数
+            # 课程学习阶段因子
             if epoch <= config.aux_loss_warmup_epochs:
-                # Warmup 阶段：完全关闭辅助损失
-                aux_loss_scale = 0.0
+                # Warmup 阶段：从 0.1 开始线性增长（避免完全无约束）
+                curriculum_factor = 0.1 * (epoch / config.aux_loss_warmup_epochs)
             else:
-                # 线性增长到 1.0
+                # Warmup 后：慢速增长到 0.8 上限
                 progress = (epoch - config.aux_loss_warmup_epochs) / max(1, config.epochs - config.aux_loss_warmup_epochs)
-                aux_loss_scale = min(1.0, progress * 2)  # 2 倍速增长，尽快达到满权重
+                curriculum_factor = min(0.8, 0.1 + progress * 0.7)
 
-            # 动态调整 Splitter 的辅助损失权重
+            # 将课程因子存储到 splitter，供损失计算时使用
             if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
                 splitter = model.tokenizer.splitter
                 if hasattr(splitter, '_elastic_lambda_scale'):
-                    splitter._elastic_lambda_scale = aux_loss_scale
+                    splitter._elastic_lambda_scale = curriculum_factor
                 if hasattr(splitter, '_entropy_lambda_scale'):
-                    splitter._entropy_lambda_scale = aux_loss_scale
+                    splitter._entropy_lambda_scale = curriculum_factor
                 # 打印日志（仅在 epoch 变化时）
                 if epoch <= config.aux_loss_warmup_epochs or epoch == config.aux_loss_warmup_epochs + 1:
-                    print(f"[Loss Warmup] Epoch {epoch}: aux_loss_scale = {aux_loss_scale:.2f}")
+                    print(f"[Loss Warmup] Epoch {epoch}: curriculum_factor = {curriculum_factor:.2f}")
 
         # =====================================================================
         # 核心改进3: Gumbel-to-Deterministic 平滑切换
@@ -4674,7 +4876,7 @@ def main():
 
             # KL 散度警告
             if kl > 0.5:
-                print(f"  ⚠️  KL divergence high: {kl:.3f} (>0.5)")
+                print(f"  [!] KL divergence high: {kl:.3f} (>0.5)")
         
         # P10-14: 分割器健康检查
         # 动态获取 max_entropy (从 get_depth_distribution_stats 或配置推算)
@@ -4704,7 +4906,7 @@ def main():
                 'collapse': health_status.collapse_detected,
                 'monotone': health_status.monotone_detected,
             }
-        
+
         # 保存最佳
         if val_acc > best_val + config.min_delta:
             best_val = val_acc

@@ -248,7 +248,13 @@ class L3AttentionMetrics:
     
     # 层级感知分析
     per_depth_attention_received: Dict[int, float] = field(default_factory=dict)  # 各深度收到的平均注意力
-    
+
+    # CLS 深度注意力追踪 (新增)
+    cls_attention_by_depth: Dict[int, float] = field(default_factory=dict)  # {depth: attention_ratio}
+    cls_depth0_attention: float = 0.0  # CLS 对 Depth 0 的注意力
+    cls_depth0_below_threshold: bool = False  # 是否 < 20%
+    cls_global_link_intact: bool = True  # 全局信息链路是否完整
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 

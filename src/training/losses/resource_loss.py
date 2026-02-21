@@ -107,7 +107,7 @@ I111-2 自适应熵目标:
 ...     token_budget=128,
 ...     depth_weight_alpha=0.1,
 ...     lambda_flops=0.1,
-...     lambda_token=0.01,
+...     lambda_token=1.0,  # I170-5: 增强梯度信号
 ...     lambda_entropy=0.05,
 ... )
 >>> 
@@ -156,31 +156,31 @@ def compute_depth_entropy(
 ) -> torch.Tensor:
     """
     计算深度分布的 Shannon 熵
-    
+
     数学公式:
         H = -Σ_d p_d · log(p_d)
-    
+
     其中 p_d = N_d / N_total 是深度 d 的概率。
-    
+
     参数
     ----
     depth_distribution : Tensor [D+1]
         各深度的 token 数量 [N_0, N_1, ..., N_D]
     epsilon : float, optional
         数值稳定性参数，防止 log(0)
-        
+
     返回
     ----
     entropy : Tensor (scalar)
         深度分布的熵
-        
+
     示例
     ----
     >>> dist = torch.tensor([50.0, 30.0, 20.0])
     >>> H = compute_depth_entropy(dist)
     >>> print(f"Entropy: {H:.3f}")
     Entropy: 1.030
-    
+
     >>> # 均匀分布应该有最大熵
     >>> uniform = torch.ones(5) * 20.0
     >>> H_uniform = compute_depth_entropy(uniform)
@@ -190,13 +190,93 @@ def compute_depth_entropy(
     # 归一化为概率分布
     total = depth_distribution.sum() + epsilon
     probs = depth_distribution / total
-    
+
     # Shannon 熵: H = -Σ p·log(p)
     # 注意: 当 p=0 时，p·log(p) → 0 (极限)
     log_probs = torch.log(probs + epsilon)
     entropy = -(probs * log_probs).sum()
-    
+
     return entropy
+
+
+def compute_distribution_penalty(
+    depth_distribution: torch.Tensor,
+    epsilon: float = EPS,
+) -> torch.Tensor:
+    """
+    计算深度分布的惩罚项 (Gini + JSD 组合)
+
+    解决 Shannon 熵无法区分"两极化"和"均匀分布"的问题:
+        - Shannon熵 [0.5, 0.5, 0, 0, 0] ≈ 0.69 (看似中等)
+        - Shannon熵 [0.2, 0.2, 0.2, 0.2, 0.2] ≈ 1.61 (最大)
+
+    数学公式:
+        1. Gini系数: Gini = 1 - Σ p_d²
+            - 两极化分布 Gini ≈ 0.5 (极度不均)
+            - 均匀分布 Gini ≈ 0.8 (最大)
+        2. JSD散度: JSD(p||U) = 0.5×KL(p||M) + 0.5×KL(U||M)
+            - M = 0.5 × (p + U)
+            - JSD = 0 表示完全均匀
+
+    组合优势:
+        - Gini 检测"集中度"（少数类别占比）
+        - JSD 检测"与均匀分布的偏差"
+        - 两者组合可精确区分两极化和均匀分布
+
+    参数
+    ----
+    depth_distribution : Tensor [D+1]
+        各深度的 token 数量 [N_0, N_1, ..., N_D]
+    epsilon : float, optional
+        数值稳定性参数
+
+    返回
+    ----
+    penalty : Tensor (scalar)
+        组合惩罚项 (越小越好)
+
+    示例
+    ----
+    >>> # 两极化分布 [0.5, 0.5, 0, 0, 0]
+    >>> dist_bi = torch.tensor([50.0, 50.0, 0.0, 0.0, 0.0])
+    >>> p_bi = compute_distribution_penalty(dist_bi)
+    >>> print(f"Bipolar penalty: {p_bi:.3f}")  # 应该较高
+
+    >>> # 均匀分布 [0.2, 0.2, 0.2, 0.2, 0.2]
+    >>> dist_uni = torch.tensor([20.0, 20.0, 20.0, 20.0, 20.0])
+    >>> p_uni = compute_distribution_penalty(dist_uni)
+    >>> print(f"Uniform penalty: {p_uni:.3f}")  # 应该较低
+    """
+    # 归一化为概率分布
+    total = depth_distribution.sum() + epsilon
+    probs = depth_distribution / total
+
+    # ========== Gini 系数 ==========
+    # Gini = 1 - Σ p_i²
+    # 范围: [0, 1-1/D], 其中 1-1/D 表示完全均匀
+    gini = 1.0 - (probs ** 2).sum()
+
+    # ========== JSD 散度 ==========
+    # 计算与均匀分布的 JSD
+    D = len(probs)
+    uniform = torch.ones(D, device=probs.device, dtype=probs.dtype) / D
+    m = 0.5 * (probs + uniform)
+
+    # KL(p || m) = Σ p_i * log(p_i / m_i)
+    kl_pm = (probs * (probs / (m + epsilon)).log()).sum()
+    # KL(u || m) = Σ u_i * log(u_i / m_i)
+    kl_um = (uniform * (uniform / (m + epsilon)).log()).sum()
+    jsd = 0.5 * (kl_pm + kl_um)
+
+    # ========== 组合惩罚 ==========
+    # Gini 越高越不均匀(惩罚目标), JSD 越高越偏离均匀(惩罚目标)
+    # 目标: 最小化惩罚 → 趋向均匀分布
+    # 注意: Gini 的最大值为 1-1/D ~= 0.8 (D=5)，需要归一化
+    gini_normalized = gini / (1.0 - 1.0 / D)
+
+    penalty = gini_normalized + 0.5 * jsd
+
+    return penalty
 
 
 def get_weighted_token_count(
@@ -285,8 +365,8 @@ class ResourceAwareLoss(nn.Module):
     lambda_flops : float, optional (default=0.1)
         FLOPS 损失权重
         
-    lambda_token : float, optional (default=0.01)
-        Token 数量损失权重
+    lambda_token : float, optional (default=1.0)
+        Token 数量损失权重 (I170-5: 增强以恢复动态性)
         
     lambda_entropy : float, optional (default=0.05)
         深度熵损失权重
@@ -338,7 +418,7 @@ class ResourceAwareLoss(nn.Module):
         token_budget: int = 128,
         depth_weight_alpha: float = 0.1,
         lambda_flops: float = 0.1,
-        lambda_token: float = 0.01,
+        lambda_token: float = 1.0,  # I170-5: 从 0.01 改为 1.0 增强梯度信号
         lambda_entropy: float = 0.05,
         target_entropy_ratio: float = 0.8,
         epsilon: float = EPS,  # I112-3: 使用统一 EPS (1e-6)

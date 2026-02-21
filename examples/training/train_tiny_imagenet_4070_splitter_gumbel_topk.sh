@@ -56,7 +56,6 @@ uv run python src/training/train_fractal_vit.py \
   --token-coverage-min 0.03 \
   --token-coverage-max 0.20 \
   --K-min-abs 8 \
-  --K-max-hard 128 \
   --batch-size 192 \
   --lr 1e-04 \
   --weight-decay 0.05 \
