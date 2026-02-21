@@ -126,6 +126,8 @@ class HilbertSplitterConfig:
     enable_learnable_quota: bool = LEARNABLE_QUOTA_ENABLED  # True
     quota_init_logits: Optional[Tuple[float, ...]] = None
     quota_entropy_weight: float = QUOTA_ENTROPY_WEIGHT  # 0.1
+    quota_align_weight: float = 0.0  # I153-1: KL 对齐损失权重 (0=禁用)
+    quota_align_mode: str = "curriculum"  # 课程学习模式
     quota_min_ratio: float = 0.02  # I96-7: 最小采样比例
     quota_min_lambda: float = 0.1  # 下界软正则化权重
 
@@ -321,6 +323,8 @@ class HilbertSplitterConfig:
             'enable_learnable_quota': self.enable_learnable_quota,
             'quota_init_logits': self.quota_init_logits,
             'quota_entropy_weight': self.quota_entropy_weight,
+            'quota_align_weight': self.quota_align_weight,
+            'quota_align_mode': self.quota_align_mode,
             'quota_min_ratio': self.quota_min_ratio,
             'quota_min_lambda': self.quota_min_lambda,
             'entropy_mode': self.entropy_mode,
@@ -471,6 +475,8 @@ class NeighborAwareSplitterConfig:
     enable_learnable_quota: bool = LEARNABLE_QUOTA_ENABLED
     quota_init_logits: Optional[Tuple[float, ...]] = None
     quota_entropy_weight: float = QUOTA_ENTROPY_WEIGHT
+    quota_align_weight: float = 0.0  # I153-1: KL 对齐损失权重 (0=禁用)
+    quota_align_mode: str = "curriculum"  # 课程学习模式
 
     # ==================== 局部一致性损失 ====================
     locality_weight: float = 0.1
@@ -542,6 +548,8 @@ class NeighborAwareSplitterConfig:
             'enable_learnable_quota': self.enable_learnable_quota,
             'quota_init_logits': self.quota_init_logits,
             'quota_entropy_weight': self.quota_entropy_weight,
+            'quota_align_weight': self.quota_align_weight,
+            'quota_align_mode': self.quota_align_mode,
             'locality_weight': self.locality_weight,
         }# ==================== Attention 配置 ====================
 
@@ -902,6 +910,8 @@ def create_splitter_config(
     enable_learnable_quota: Optional[bool] = None,
     quota_init_logits: Optional[Tuple[float, ...]] = None,
     quota_entropy_weight: Optional[float] = None,
+    quota_align_weight: Optional[float] = None,
+    quota_align_mode: Optional[str] = None,
     quota_min_ratio: Optional[float] = None,
     quota_min_lambda: Optional[float] = None,
     # 熵正则化
@@ -984,6 +994,10 @@ def create_splitter_config(
         config.quota_init_logits = quota_init_logits
     if quota_entropy_weight is not None:
         config.quota_entropy_weight = quota_entropy_weight
+    if quota_align_weight is not None:
+        config.quota_align_weight = quota_align_weight
+    if quota_align_mode is not None:
+        config.quota_align_mode = quota_align_mode
     if quota_min_ratio is not None:
         config.quota_min_ratio = quota_min_ratio
     if quota_min_lambda is not None:

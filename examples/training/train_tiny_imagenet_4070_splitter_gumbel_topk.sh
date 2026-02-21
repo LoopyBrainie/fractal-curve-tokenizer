@@ -70,6 +70,8 @@ uv run python src/training/train_fractal_vit.py \
   --elastic-lambda-under 0.01 \
   --quota-learnable enable \
   --quota-entropy-weight 0.01 \
+  --quota-align-weight 0.5 \
+  --quota-align-mode curriculum \
   --splitter-type gumbel_topk \
   --splitter-temp-start 1.0 \
   --splitter-temp-end 0.4 \

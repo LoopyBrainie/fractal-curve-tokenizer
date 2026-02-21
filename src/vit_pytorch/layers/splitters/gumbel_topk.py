@@ -1260,6 +1260,19 @@ class GumbelTopKSplitter(
         # I121-2: 外部弹性预算因子 (由训练器配置)
         self._elastic_budget_factor = 1.0  # 默认无缩放
 
+        # 核心改进1: Loss Warmup - 辅助损失缩放因子
+        # 由训练器在训练期间动态调整，实现前期关闭 budget/entropy 损失
+        self._elastic_lambda_scale = 1.0  # 弹性预算损失缩放
+        self._entropy_lambda_scale = 1.0   # 熵损失缩放
+
+        # 核心改进3: Gumbel-to-Deterministic 切换 - 噪声缩放因子
+        # 由训练器在训练后期逐步减小，实现从随机到确定性的平滑过渡
+        self._noise_scale = 1.0  # Gumbel 噪声缩放 (1.0 = 全噪声, 0.0 = 无噪声)
+
+        # I150-3: Token 选择历史追踪（用于 IOU 稳定性分析）
+        self._token_history: List[torch.Tensor] = []
+        self._monitor_token_stability = False
+
         # 动态状态 (forward 中确定)
         self._current_max_depth: Optional[int] = None
         self._current_image_size: Optional[Tuple[int, int]] = None
@@ -3822,7 +3835,13 @@ class GumbelTopKSplitter(
         # I113-7: 计算配额分配 (支持信息密度自适应，返回硬/软配额)
         # I165-1: 传递 features 以支持分层自适应配额模式
         hard_quota, soft_quota = self._compute_quota_allocation(K, info_density, features)
-        quota = hard_quota  # 用于 token 选择
+
+        # I165-2: 软配额代理路径 (Soft Quota Proxy)
+        # 关键修复: 使用 soft_quota 而非 hard_quota 进行 token 选择
+        # 原因: K_hard.long() 完全阻断梯度回传到 quota_logits
+        #       使用 soft_quota 可以保持梯度流动
+        # 数学: quota = K_soft = softmax(φ/τ) × K, 有梯度
+        quota = soft_quota  # 用于 token 选择（有梯度流）
 
         # I113-7: 缓存软/硬配额用于损失计算
         self._last_hard_quota = hard_quota.detach()
@@ -3850,9 +3869,10 @@ class GumbelTopKSplitter(
             depth_indices_list.append(depth_indices)
             num_per_depth.append(len(depth_indices))
 
-        # I97-4 优化: 批量提取 K_d（减少 CPU/GPU 同步）
-        # P-OPT: 延迟转换 - 只在每个循环内转换需要的元素，避免一次性转换整个张量
-        quota_clamped = quota.detach().clamp(min=0).long()  # [D] 张量
+        # I165-2: 软配额代理路径 - 移除 .detach() 以保持梯度流动
+        # 关键: soft_quota 本身有梯度 (来自 quota_logits)，不应 detach
+        # 但仍需要 clamp 和 round 来获取整数 K_d
+        quota_clamped = quota.clamp(min=0).round().long()  # [D] 张量
 
         # 分层选择 - 延迟到每个深度再转换 K_d
         for d in range(D):
@@ -3952,6 +3972,10 @@ class GumbelTopKSplitter(
         else:
             self._last_info_quota_loss = None
 
+        # I150-3: 记录 token 选择历史（用于 IOU 稳定性分析）
+        if self._monitor_token_stability and self.training:
+            self._record_token_selection(topk_indices)
+
         return st_mask, topk_indices
 
     def _gumbel_topk_ste(
@@ -4028,12 +4052,24 @@ class GumbelTopKSplitter(
         original_dtype = logits.dtype
         logits_fp32 = logits.float()
         T_fp32 = T.float()
-        
+
+        # ====================================================================
+        # 核心改进3: Gumbel-to-Deterministic 切换
+        # noise_scale 控制 Gumbel 噪声的幅值
+        # noise_scale = 1.0: 全噪声（随机采样）
+        # noise_scale = 0.0: 无噪声（确定性选择）
+        # ====================================================================
+        noise_scale = getattr(self, '_noise_scale', 1.0)
+
         # Gumbel 采样
         uniform = torch.rand(B, N, device=device, dtype=torch.float32)
         uniform = uniform.clamp(GUMBEL_EPSILON, 1 - GUMBEL_EPSILON)
         gumbel = -torch.log(-torch.log(uniform))
-        
+
+        # 应用噪声缩放因子
+        if noise_scale < 1.0:
+            gumbel = gumbel * noise_scale
+
         # 扰动后的 logits
         perturbed = (logits_fp32 + gumbel) / T_fp32
         
@@ -4302,6 +4338,11 @@ class GumbelTopKSplitter(
         entropy_target: Optional[float] = None,
         entropy_weight: float = 0.1,
         entropy_mode: str = 'maximize',
+        # I153-1: Quota 对齐损失参数
+        quota_align_weight: float = 0.0,
+        quota_align_mode: str = 'curriculum',
+        current_epoch: int = 0,
+        total_epochs: int = 100,
         **kwargs,
     ) -> Dict[str, Tensor]:
         """
@@ -4511,6 +4552,25 @@ class GumbelTopKSplitter(
             losses['soft_entropy_loss'] = entropy_loss
 
         # ====================================================================
+        # I153-1: 配额对齐损失 (KL 散度)
+        # 为 quota_logits 提供任务驱动的梯度，解决整数屏障问题
+        # ====================================================================
+        if quota_align_weight > 0 and self._enable_learnable_quota and self.quota_logits is not None:
+            if self.quota_allocator is not None:
+                # 生成目标深度分布
+                target_dist = self.quota_allocator.get_target_depth_distribution(
+                    step=current_epoch,
+                    total_steps=total_epochs,
+                    mode=quota_align_mode,
+                )
+                # 计算 KL 对齐损失
+                align_loss = self.quota_allocator.compute_quota_align_loss(
+                    target_dist=target_dist,
+                    weight=quota_align_weight,
+                )
+                losses['quota_align_loss'] = align_loss
+
+        # ====================================================================
         # I24-2 方案E: 配额熵正则化损失
         # I30-10: 使用配置值
         # 鼓励可学习配额保持多样性，避免崩塌到单一深度
@@ -4593,6 +4653,20 @@ class GumbelTopKSplitter(
         for key, val in list(losses.items()):
             if torch.isnan(val) or torch.isinf(val):
                 losses[key] = zero
+
+        # ====================================================================
+        # 核心改进1: Loss Warmup - 应用辅助损失缩放因子
+        # 在训练前期关闭 budget/entropy 损失，让 Splitter 先学会分裂
+        # ====================================================================
+        # 弹性预算损失缩放
+        if 'elastic_budget_loss' in losses and hasattr(self, '_elastic_lambda_scale'):
+            if self._elastic_lambda_scale < 1.0:
+                losses['elastic_budget_loss'] = losses['elastic_budget_loss'] * self._elastic_lambda_scale
+
+        # 软熵损失缩放
+        if 'soft_entropy_loss' in losses and hasattr(self, '_entropy_lambda_scale'):
+            if self._entropy_lambda_scale < 1.0:
+                losses['soft_entropy_loss'] = losses['soft_entropy_loss'] * self._entropy_lambda_scale
 
         return losses
     
@@ -5571,7 +5645,81 @@ class GumbelTopKSplitter(
         """禁用自动温度退火。"""
         self._temp_enabled = False
         return self
-    
+
+    # ========================================================================
+    # Token 稳定性监控 API (I150-3)
+    # ========================================================================
+
+    def _record_token_selection(self, topk_indices: Tensor) -> None:
+        """记录 token 选择历史（用于 IOU 分析）"""
+        # 只记录第一个样本的索引
+        if topk_indices.shape[0] > 0:
+            self._token_history.append(topk_indices[0].detach().cpu())
+            if len(self._token_history) > 5:
+                self._token_history.pop(0)
+
+    def enable_token_stability_monitoring(self) -> "GumbelTopKSplitter":
+        """启用 token 选择稳定性监控"""
+        self._monitor_token_stability = True
+        self._token_history.clear()
+        return self
+
+    def disable_token_stability_monitoring(self) -> "GumbelTopKSplitter":
+        """禁用 token 选择稳定性监控"""
+        self._monitor_token_stability = False
+        return self
+
+    def compute_token_iou(self) -> Optional[float]:
+        """
+        计算最近两次 token 选择的 IOU（重合率）。
+
+        Returns:
+            IOU 值（0.0-1.0），或 None（如果历史不足）
+        """
+        if len(self._token_history) < 2:
+            return None
+
+        indices1 = set(self._token_history[-2].tolist())
+        indices2 = set(self._token_history[-1].tolist())
+
+        if not indices1 or not indices2:
+            return None
+
+        intersection = len(indices1 & indices2)
+        union = len(indices1 | indices2)
+
+        return intersection / union if union > 0 else 0.0
+
+    def get_token_stability_stats(self) -> Dict[str, float]:
+        """
+        获取 token 稳定性统计信息。
+
+        Returns:
+            包含 iou_mean, iou_std, iou_min 的字典
+        """
+        if len(self._token_history) < 2:
+            return {"iou_mean": 0.0, "iou_std": 0.0, "iou_min": 0.0, "iou_max": 0.0}
+
+        ious = []
+        for i in range(len(self._token_history) - 1):
+            set1 = set(self._token_history[i].tolist())
+            set2 = set(self._token_history[i + 1].tolist())
+            if set1 and set2:
+                intersection = len(set1 & set2)
+                union = len(set1 | set2)
+                ious.append(intersection / union if union > 0 else 0.0)
+
+        if not ious:
+            return {"iou_mean": 0.0, "iou_std": 0.0, "iou_min": 0.0, "iou_max": 0.0}
+
+        import statistics
+        return {
+            "iou_mean": statistics.mean(ious),
+            "iou_std": statistics.stdev(ious) if len(ious) > 1 else 0.0,
+            "iou_min": min(ious),
+            "iou_max": max(ious),
+        }
+
     def enable_explore_bias_annealing(
         self,
         total_steps: int,

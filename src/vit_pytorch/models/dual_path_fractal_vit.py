@@ -189,7 +189,9 @@ class DualPathFractalViT(nn.Module):
         self.pattern_encoder_mode = pattern_encoder_mode
         self.pattern_window_sizes = pattern_window_sizes
         self.pattern_dim = pattern_dim or dim
-        self.pattern_scale = pattern_scale
+
+        # I150-4: pattern_scale 改为可学习参数（原来是 float，无法学习）
+        self.pattern_scale = nn.Parameter(torch.tensor(pattern_scale, dtype=torch.float32))
 
         # Token覆盖率参数
         self.token_coverage_min = token_coverage_min

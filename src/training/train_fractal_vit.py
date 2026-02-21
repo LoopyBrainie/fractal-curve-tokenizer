@@ -2132,6 +2132,11 @@ def train_epoch(
                         entropy_target=config.soft_entropy_target,
                         entropy_weight=config.soft_entropy_weight,
                         entropy_mode=config.soft_entropy_mode,
+                        # I153-1: 配额对齐损失参数
+                        quota_align_weight=config.quota_align_weight,
+                        quota_align_mode=config.quota_align_mode,
+                        current_epoch=epoch,
+                        total_epochs=config.epochs,
                     )
                     # 收集各项损失
                     # I23-5-FIX: 确保 splitter_loss 是张量类型
@@ -2244,8 +2249,38 @@ def train_epoch(
         
         forward_time = time.time() - forward_start
         forward_times.append(forward_time)
-        
+
         scaler.scale(loss).backward()
+
+        # =====================================================================
+        # 梯度监控: 在 backward 后检查梯度范数
+        # 注意: 这只是总梯度范数，不区分 task_loss 和 budget_loss
+        # 完整分析需要分离反向传播（增加 ~20% 时间）
+        # =====================================================================
+        if getattr(config, 'monitor_gradient_balance', False) and (i + 1) % config.accum_steps == 0 and i % 50 == 0:
+            # 计算总梯度范数
+            total_grad_norm = 0.0
+            for param in model.parameters():
+                if param.grad is not None:
+                    total_grad_norm += param.grad.norm().item() ** 2
+            total_grad_norm = total_grad_norm ** 0.5
+            print(f"[Grad Monitor] Step {i}: total_grad_norm={total_grad_norm:.4f}")
+
+        # I150-3: Token 稳定性监控 - 记录 IOU
+        if getattr(config, 'monitor_token_stability', False) and hasattr(model, 'splitter') and (i + 1) % config.accum_steps == 0 and i % 50 == 0:
+            splitter = model.splitter
+            if hasattr(splitter, 'compute_token_iou'):
+                iou = splitter.compute_token_iou()
+                if iou is not None:
+                    print(f"[Token IOU] Step {i}: iou={iou:.3f} ({iou*100:.1f}%)")
+                    # 警告：如果 IOU < 30%，说明 Gumbel 噪声过大
+                    if iou < 0.3:
+                        print(f"[Token IOU] WARNING: Low IOU ({iou*100:.1f}%) - Gumbel noise may be too high!")
+                # 打印稳定性统计
+                if hasattr(splitter, 'get_token_stability_stats'):
+                    stats = splitter.get_token_stability_stats()
+                    if stats["iou_mean"] > 0:
+                        print(f"[Token Stats] mean={stats['iou_mean']:.3f}, std={stats['iou_std']:.3f}, min={stats['iou_min']:.3f}")
 
         if (i + 1) % config.accum_steps == 0:
             scaler.unscale_(optimizer)
@@ -3004,7 +3039,7 @@ def main():
     # I33: 相对预算参数 (替代绝对 K_min/K_max)
     # 覆盖率 = tokens / max_patches, 与图像分辨率无关
     parser.add_argument("--token-coverage-min", type=float, default=0.01,
-                       help="I33: Minimum token coverage ratio (default: 0.01, 1% of patches)")
+                       help="I33: Minimum token coverage ratio (default: 0.01, 1%% of patches)")
     parser.add_argument("--token-coverage-max", type=float, default=0.25,
                        help="I33: Maximum token coverage ratio, participates in adaptive formula (default: 0.25)")
     # I33: 绝对 K 值边界（用于保护最小/最大 token 数）
@@ -3060,6 +3095,11 @@ def main():
                        help="Learnable quota (Scheme E): 'default'=use global, 'enable'=force on, 'disable'=force off")
     parser.add_argument("--quota-entropy-weight", type=float, default=0.01,
                        help="Weight for quota entropy regularization (default: 0.01)")
+    parser.add_argument("--quota-align-weight", type=float, default=0.0,
+                       help="Weight for quota alignment KL loss (default: 0.0, disabled)")
+    parser.add_argument("--quota-align-mode", type=str, default="curriculum",
+                       choices=["uniform", "curriculum", "adaptive"],
+                       help="Quota alignment target mode (default: curriculum)")
 
     # P10-4/P10-5: 软熵损失参数
     parser.add_argument("--include-soft-entropy", action="store_true", default=True,
@@ -3089,6 +3129,30 @@ def main():
     parser.add_argument("--elastic-lambda-under", type=float, default=0.01,
                        help="Penalty weight for tokens below coverage_min (default: 0.01)")
 
+    # 核心改进1: Loss Warmup - 前 N 个 Epoch 关闭辅助损失，让 Splitter 先学习分裂
+    parser.add_argument("--aux-loss-warmup-epochs", type=int, default=10,
+                       help="Disable aux loss for first N epochs to let Splitter learn (default: 10)")
+
+    # 梯度平衡监控 - 诊断 task_loss 和 budget_loss 的梯度冲突
+    parser.add_argument("--monitor-gradient-balance", action="store_true", default=False,
+                       help="Monitor gradient norms of task_loss vs budget_loss to diagnose gradient conflict")
+
+    # I150-3: Token 稳定性监控 - 诊断 Gumbel 噪声导致的输入拓扑抖动
+    parser.add_argument("--monitor-token-stability", action="store_true", default=False,
+                       help="I150-3: Monitor token selection IOU across steps to detect sampling instability")
+
+    # I150-3: 初始温度 - 控制 Gumbel-Softmax 的锐度
+    parser.add_argument("--temperature-init", type=float, default=2.0,
+                       help="I150-3: Initial Gumbel temperature (default: 2.0, decays to 0.5)")
+
+    # I150-3: 测试 eval 模式断崖 - 检测模型是否过度拟合 Gumbel 噪声
+    parser.add_argument("--test-eval-collapse", action="store_true", default=False,
+                       help="I150-3: Test eval mode accuracy gap to detect overfitting to Gumbel noise")
+
+    # 核心改进3: Gumbel-to-Deterministic 切换 - 训练后期逐步减小 Gumbel 噪声
+    parser.add_argument("--gumbel-cooldown-epochs", type=int, default=20,
+                       help="Reduce Gumbel noise in last N epochs for smooth transition to deterministic (default: 20)")
+
     # I110-7: 语义分裂器参数
     parser.add_argument("--use-semantic-splitter", action="store_true",
                        help="I110-7: Use SemanticRedundancySplitter instead of GumbelTopKSplitter")
@@ -3112,13 +3176,23 @@ def main():
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=0.15,
                        help="Weight decay for L2 regularization (default: 0.15, I30-3 tuned for overfitting)")
+
+    # 核心改进2: 分组学习率 - Splitter, Pattern, Backbone 使用不同学习率
+    # I150-4: 重构为三层分组：Splitter(决策), Pattern(特征), Backbone(语义)
+    parser.add_argument("--splitter-lr-mult", type=float, default=5.0,
+                       help="Splitter learning rate multiplier (default: 5.0, I150-4: 增强探索能力)")
+    parser.add_argument("--splitter-weight-decay-mult", type=float, default=0.0,
+                       help="Splitter weight decay multiplier (default: 0.0, I150-4: 移除WD增强探索)")
+    parser.add_argument("--pattern-lr-mult", type=float, default=1.0,
+                       help="Pattern encoder learning rate multiplier (default: 1.0)")
+
     # I120-2: 分离 dropout 配置
     parser.add_argument("--tokenizer-dropout", type=float, default=0.0,
-                       help="Tokenizer/Splitter dropout rate (default: 0.0, 确定性)")
+                       help="Tokenizer/Splitter dropout rate (default: 0.0)")
     parser.add_argument("--transformer-dropout", type=float, default=0.1,
-                       help="Transformer dropout rate (default: 0.1, 正则化)")
+                       help="Transformer dropout rate (default: 0.1)")
     parser.add_argument("--emb-dropout", type=float, default=0.0,
-                       help="Embedding dropout rate (default: 0.0, 确定性)")
+                       help="Embedding dropout rate (default: 0.0)")
     parser.add_argument("--drop-path", type=float, default=0.25,
                        help="Drop path (stochastic depth) rate (default: 0.25, I30-3 tuned for overfitting)")
     parser.add_argument("--label-smoothing", type=float, default=0.1,
@@ -3301,6 +3375,8 @@ def main():
         # I122-2: lca_temperature 已移除，由 hilbert_bias_scale 统一缩放
         quota_learnable=quota_learnable_value,
         quota_entropy_weight=args.quota_entropy_weight,
+        quota_align_weight=getattr(args, 'quota_align_weight', 0.0),
+        quota_align_mode=getattr(args, 'quota_align_mode', 'curriculum'),
         freeze_quota=args.freeze_quota,
         freeze_tokenizer=args.freeze_tokenizer,
         freeze_tokenizer_epochs=args.freeze_tokenizer_epochs,
@@ -3367,6 +3443,8 @@ def main():
             self.use_pattern_plugin = arch_config.use_pattern_plugin
             self.quota_learnable = arch_config.quota_learnable
             self.quota_entropy_weight = arch_config.quota_entropy_weight
+            self.quota_align_weight = arch_config.quota_align_weight  # I147-3
+            self.quota_align_mode = arch_config.quota_align_mode     # I147-3
             self.freeze_quota = arch_config.freeze_quota
             self.freeze_tokenizer = arch_config.freeze_tokenizer
             self.freeze_tokenizer_epochs = arch_config.freeze_tokenizer_epochs
@@ -3394,6 +3472,12 @@ def main():
             self.use_amp = args.use_amp
             self.learning_rate = args.lr
             self.weight_decay = args.weight_decay
+
+            # 核心改进2: 分组学习率 (I150-4: 三层分组)
+            self.splitter_lr_mult = args.splitter_lr_mult
+            self.splitter_weight_decay_mult = args.splitter_weight_decay_mult
+            self.pattern_lr_mult = args.pattern_lr_mult
+
             self.gradient_clip = args.gradient_clip
             self.accum_steps = args.accum_steps
             self.warmup_epochs = args.warmup_epochs
@@ -3430,6 +3514,24 @@ def main():
             self.soft_entropy_target = args.soft_entropy_target
             self.soft_entropy_weight = args.soft_entropy_weight
             self.soft_entropy_mode = args.soft_entropy_mode
+
+            # 核心改进1: Loss Warmup
+            self.aux_loss_warmup_epochs = args.aux_loss_warmup_epochs
+
+            # 梯度平衡监控
+            self.monitor_gradient_balance = args.monitor_gradient_balance
+
+            # I150-3: Token 稳定性监控
+            self.monitor_token_stability = args.monitor_token_stability
+
+            # I150-3: 初始温度
+            self.temperature_init = args.temperature_init
+
+            # I150-3: 测试 eval 模式断崖
+            self.test_eval_collapse = args.test_eval_collapse
+
+            # 核心改进3: Gumbel-to-Deterministic 切换
+            self.gumbel_cooldown_epochs = args.gumbel_cooldown_epochs
 
     # I145: TrainingConfig 不再接收 K_min/K_max（第二层参数由模型动态计算）
     config = TrainingConfig(args, arch_config)
@@ -3543,7 +3645,17 @@ def main():
         model.splitter._quota_entropy_weight = config.quota_entropy_weight
         print(f"[I136] Elastic budget config: coverage∈[{config.elastic_coverage_min:.2%}, {config.elastic_coverage_max:.2%}], λ_over={config.elastic_lambda_over}, λ_under={config.elastic_lambda_under}")
         print(f"[I24-2] Quota entropy weight: {config.quota_entropy_weight}")
-    
+
+        # I150-3: 设置初始温度（指数衰减从 2.0 到 0.5）
+        if config.temperature_init > 0:
+            model.splitter.set_temperature(config.temperature_init)
+            print(f"[I150-3] Set initial temperature: τ={config.temperature_init}")
+
+        # I150-3: 启用 token 稳定性监控
+        if config.monitor_token_stability:
+            model.splitter.enable_token_stability_monitoring()
+            print(f"[I150-3] Enabled token stability monitoring")
+
     # 打印模型信息
     params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -3734,29 +3846,84 @@ def main():
         print(f"\n[OK] CUB-200 fine-grained training completed!")
         print(f"[INFO] Results saved to: {exp_dir}")
         return  # 提前返回，不执行通用训练循环
-    
+
     # =========================================================================
     # 通用分类训练路径 (CIFAR-10, Tiny-ImageNet, ImageNet 等)
     # =========================================================================
-    
+
     # 数据加载
     train_loader, val_loader, test_loader = create_dataloaders(spec, config)
-    
+
+    # =====================================================================
+    # 核心改进2: 分组学习率 - Splitter 和 Backbone 使用不同学习率
+    # 目的: Splitter 负责"决策"，Backbone 负责"提取"
+    #       给 Splitter 较小 LR + 较大 Weight Decay，防止决策过早饱和
+    # =====================================================================
+    # I150-4: 识别 Splitter, Pattern, Backbone 参数（三层分组）
+    splitter_params = []
+    pattern_params = []
+    backbone_params = []
+
+    # 参数分组规则:
+    # - Splitter: tokenizer, splitter (决策层 - 高探索)
+    # - Pattern: pattern_encoder, pattern (特征层 - 适中调整)
+    # - Backbone: transformer, head (语义层 - 稳定优化)
+    for name, param in model.named_parameters():
+        if 'splitter' in name.lower() or 'tokenizer' in name.lower():
+            splitter_params.append(param)
+        elif 'pattern' in name.lower():
+            pattern_params.append(param)
+        else:
+            backbone_params.append(param)
+
+    base_lr = config.learning_rate
+    base_weight_decay = config.weight_decay
+    splitter_lr = base_lr * config.splitter_lr_mult
+    splitter_wd = base_weight_decay * config.splitter_weight_decay_mult
+    pattern_lr = base_lr * config.pattern_lr_mult
+    pattern_wd = base_weight_decay * 0.5  # Pattern 使用 0.5x WD
+
+    # 构建参数组
+    param_groups = []
+    group_info = []
+
+    if splitter_params:
+        param_groups.append({'params': splitter_params, 'lr': splitter_lr, 'weight_decay': splitter_wd})
+        group_info.append(f"Splitter: LR={splitter_lr:.2e} (x{config.splitter_lr_mult}), WD={splitter_wd:.2e}, params={len(splitter_params)}")
+
+    if pattern_params:
+        param_groups.append({'params': pattern_params, 'lr': pattern_lr, 'weight_decay': pattern_wd})
+        group_info.append(f"Pattern:  LR={pattern_lr:.2e} (x{config.pattern_lr_mult}), WD={pattern_wd:.2e}, params={len(pattern_params)}")
+
+    if backbone_params:
+        param_groups.append({'params': backbone_params, 'lr': base_lr, 'weight_decay': base_weight_decay})
+        group_info.append(f"Backbone: LR={base_lr:.2e}, WD={base_weight_decay:.2e}, params={len(backbone_params)}")
+
+    # 打印分组信息
+    print(f"[I150-4] Parameter groups ({len(param_groups)} groups):")
+    for info in group_info:
+        print(f"  - {info}")
+
+    if not param_groups:
+        # 回退到统一学习率
+        param_groups = model.parameters()
+        print("[I150-4] WARNING: No parameter groups identified, using unified LR")
+
     # 优化器 (使用 fused 版本加速)
     use_fused = device.type == 'cuda' and hasattr(torch.optim.AdamW, 'fused')
     try:
         optimizer = AdamW(
-            model.parameters(), 
-            lr=config.learning_rate, 
-            weight_decay=config.weight_decay,
+            param_groups,
+            lr=config.learning_rate,  # base_lr 会被 param_groups 覆盖
+            weight_decay=config.weight_decay,  # base_weight_decay 会被 param_groups 覆盖
             fused=use_fused
         )
         if use_fused:
             print("[OK] Using fused AdamW optimizer")
     except TypeError:
         # 旧版本 PyTorch 不支持 fused 参数
-        optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    
+        optimizer = AdamW(param_groups, lr=config.learning_rate, weight_decay=config.weight_decay)
+
     # 学习率调度
     warmup = min(args.warmup_epochs, config.epochs // 2)
     warmup_sch = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup)
@@ -4236,7 +4403,49 @@ def main():
                         # b_start/b_end 使用模型默认值
                     )
                 print(f"[INFO] Epoch {epoch}: 温度退火和偏置退火正式开始 (warmup 结束)")
-        
+
+        # =====================================================================
+        # 核心改进1: Loss Warmup - 动态调整辅助损失权重
+        # 目的: 在训练初期关闭 budget/entropy 损失，让 Splitter 先学会"无限制"分裂
+        # =====================================================================
+        if hasattr(config, 'aux_loss_warmup_epochs') and config.aux_loss_warmup_epochs > 0:
+            # 计算当前 epoch 的辅助损失权重乘数
+            if epoch <= config.aux_loss_warmup_epochs:
+                # Warmup 阶段：完全关闭辅助损失
+                aux_loss_scale = 0.0
+            else:
+                # 线性增长到 1.0
+                progress = (epoch - config.aux_loss_warmup_epochs) / max(1, config.epochs - config.aux_loss_warmup_epochs)
+                aux_loss_scale = min(1.0, progress * 2)  # 2 倍速增长，尽快达到满权重
+
+            # 动态调整 Splitter 的辅助损失权重
+            if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
+                splitter = model.tokenizer.splitter
+                if hasattr(splitter, '_elastic_lambda_scale'):
+                    splitter._elastic_lambda_scale = aux_loss_scale
+                if hasattr(splitter, '_entropy_lambda_scale'):
+                    splitter._entropy_lambda_scale = aux_loss_scale
+                # 打印日志（仅在 epoch 变化时）
+                if epoch <= config.aux_loss_warmup_epochs or epoch == config.aux_loss_warmup_epochs + 1:
+                    print(f"[Loss Warmup] Epoch {epoch}: aux_loss_scale = {aux_loss_scale:.2f}")
+
+        # =====================================================================
+        # 核心改进3: Gumbel-to-Deterministic 平滑切换
+        # 目的: 训练后期逐步减小 Gumbel 噪声，实现从随机到确定性的过渡
+        # =====================================================================
+        if hasattr(config, 'gumbel_cooldown_epochs') and config.gumbel_cooldown_epochs > 0:
+            if epoch > config.epochs - config.gumbel_cooldown_epochs:
+                # Cooldown 阶段：线性减小噪声
+                cooldown_progress = (epoch - (config.epochs - config.gumbel_cooldown_epochs)) / max(1, config.gumbel_cooldown_epochs)
+                noise_scale = max(0.0, 1.0 - cooldown_progress)
+
+                if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
+                    splitter = model.tokenizer.splitter
+                    if hasattr(splitter, 'set_noise_scale'):
+                        splitter.set_noise_scale(noise_scale)
+                    if epoch == config.epochs - config.gumbel_cooldown_epochs + 1 or epoch == config.epochs:
+                        print(f"[Gumbel Cooldown] Epoch {epoch}: noise_scale = {noise_scale:.2f}")
+
         # Warmup 阶段禁用 Mixup/CutMix
         # 原因: warmup 阶段学习率较低，模型需要学习基本特征
         # Mixup/CutMix 会使学习目标更复杂，可能干扰初始阶段的学习
@@ -4379,8 +4588,30 @@ def main():
             ce_loss_str = f" (ce={perf_stats['avg_ce_loss']:.4f})"
         print(f"  Train: loss={train_loss:.4f}{ce_loss_str}, acc={train_acc:.2f}%")
         print(f"  Val:   loss={val_loss:.4f}, acc={val_acc:.2f}%")
+
+        # I150-3: 测试 eval 模式断崖（检测模型是否过度拟合 Gumbel 噪声）
+        if getattr(config, 'test_eval_collapse', False) and hasattr(model, 'splitter'):
+            # 临时切换到确定性模式
+            original_use_det = getattr(model.splitter, '_use_deterministic_topk', False)
+            model.splitter._use_deterministic_topk = True
+
+            # 用相同的验证集评估
+            det_val_loss, det_val_acc, _ = evaluate(model, val_loader, device, config, writer=None, epoch=epoch)
+
+            # 恢复原始模式
+            model.splitter._use_deterministic_topk = original_use_det
+
+            # 计算 gap
+            gap = train_acc - det_val_acc
+            print(f"  [Eval Collapse Test] train_acc={train_acc:.2f}%, deterministic_acc={det_val_acc:.2f}%, gap={gap:.2f}%")
+
+            # 警告：如果 gap > 5%，说明模型过度拟合 Gumbel 噪声
+            if gap > 5.0:
+                print(f"  ⚠️  WARNING: Large eval gap ({gap:.1f}%) - model may be overfitting to Gumbel noise!")
+                print(f"      Recommendation: Use temperature annealing or increase dropout")
+
         print(f"  Time:  {epoch_time:.1f}s, Throughput: {perf_stats['throughput']:.1f} samples/s")
-        
+
         # 显示尺度分布 (每 10 epoch)
         if scale_distribution is not None:
             ratios = scale_distribution['scale_ratios']

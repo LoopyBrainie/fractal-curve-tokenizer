@@ -131,6 +131,8 @@ class ModelArchitectureConfig:
     # None = 使用常量默认值, True/False = 显式覆盖
     quota_learnable: Optional[bool] = None
     quota_entropy_weight: float = 0.5  # I165-1: 增强熵驱动 (从0.01提升)
+    quota_align_weight: float = 0.0  # I147-3: Quota 对齐损失权重
+    quota_align_mode: str = "curriculum"  # I147-3: 对齐模式 (curriculum, soft, hard)
 
     # I140: Splitter 架构参数
     # 这些参数控制 Splitter 内部 MLP 的维度配置
