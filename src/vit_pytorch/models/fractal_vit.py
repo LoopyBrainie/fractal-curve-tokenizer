@@ -567,6 +567,10 @@ class FractalCurveViT(nn.Module):
                     # I145: 传递温度参数
                     temperature_init=splitter_temp_start if splitter_temp_start is not None else SPLITTER_TEMP_START,
                     temperature_min=splitter_temp_end if splitter_temp_end is not None else SPLITTER_TEMP_END,
+                    # v6.1: Soft-Threshold 课程学习配置
+                    enable_soft_threshold=True,
+                    soft_threshold_max=0.5,
+                    soft_threshold_schedule='linear',
                 )
                 self.splitter = GumbelTopKSplitter(
                     config=splitter_config,

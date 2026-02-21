@@ -1380,13 +1380,26 @@ class GumbelTopKSplitter(
             self._use_deterministic_topk = getattr(self.config, 'use_deterministic_topk', False)
             self._deterministic_temperature = getattr(self.config, 'deterministic_temperature', 0.5)
             self._deterministic_ste_alpha = getattr(self.config, 'deterministic_ste_alpha', 0.5)
+            # Soft-Threshold 课程学习配置
+            self._enable_soft_threshold = getattr(self.config, 'enable_soft_threshold', True)
+            self._soft_threshold_warmup_epochs = getattr(self.config, 'soft_threshold_warmup_epochs', 10)
+            self._soft_threshold_max = getattr(self.config, 'soft_threshold_max', 0.5)
+            self._soft_threshold_schedule = getattr(self.config, 'soft_threshold_schedule', 'linear')
         else:
             self._use_deterministic_topk = False  # 默认使用 Gumbel-TopK
             self._deterministic_temperature = 0.5  # 初始温度
             self._deterministic_ste_alpha = 0.5  # STE 混合系数
+            # Soft-Threshold 默认配置
+            self._enable_soft_threshold = True
+            self._soft_threshold_warmup_epochs = 10
+            self._soft_threshold_max = 0.5
+            self._soft_threshold_schedule = 'linear'
 
         # 延迟初始化 DeterministicTopK（仅在 use_deterministic_topk=True 时创建）
         self._deterministic_topk: Optional[DeterministicTopK] = None
+
+        # Soft-Threshold 当前值（课程学习调度）
+        self._current_soft_threshold = 0.0
 
         # ====================================================================
         # I24-2 方案E: 可学习配额 (Learnable Quota)
@@ -2213,6 +2226,9 @@ class GumbelTopKSplitter(
                 self._update_temperature()
             if self._bias_enabled:
                 self._update_explore_bias()
+            if self._enable_soft_threshold:
+                # 使用步数驱动的课程学习调度
+                self._update_soft_threshold_by_step()
 
         # I30-17-EXT: 动态更新候选区域
         if image_size is not None:
@@ -2268,7 +2284,16 @@ class GumbelTopKSplitter(
         # I23-2: 确保 K >= K_min (硬下界)
         # I23-3: 但不能超过 N（当 N < K_min 时，使用 N）
         K = max(min(K, N), min(self.K_min, N))
-        
+
+        # ====================================================================
+        # v6.1: Soft-Threshold 课程学习
+        # 应用负阈值作为偏置，抑制低分候选（稀疏化效果）
+        # ====================================================================
+        if self._enable_soft_threshold and self._current_soft_threshold > 0:
+            # 创建负阈值偏置（高分候选不受影响，低分候选被抑制）
+            threshold_bias = -self._current_soft_threshold
+            logits = logits + threshold_bias
+
         # I24-2 方案E: 分层 Top-K (可学习配额)
         # I100-7: 传递 features 以支持信息密度自适应配额
         if LEARNABLE_QUOTA_ENABLED and self.quota_logits is not None:
@@ -5853,7 +5878,85 @@ class GumbelTopKSplitter(
         self._bias_step.add_(1)
 
         return self.explore_bias
-    
+
+    def _update_soft_threshold(self, epoch: int, total_epochs: int) -> float:
+        """
+        更新 Soft-Threshold (课程学习调度)。
+
+        课程学习式阈值调度:
+        - Warm-up (0-25%): τ=0, 充分探索
+        - 收缩 (25-75%): 线性 ↑, 稀疏化
+        - 稳定 (75%+): 固定微调
+
+        Args:
+            epoch: 当前训练轮次
+            total_epochs: 总训练轮次
+
+        Returns:
+            当前 Soft-Threshold 值
+        """
+        if not self._enable_soft_threshold:
+            return 0.0
+
+        progress = epoch / max(total_epochs, 1)
+
+        if progress < 0.25:  # Warm-up 阶段
+            self._current_soft_threshold = 0.0
+        elif progress < 0.75:  # 收缩阶段
+            # 线性增长到最大值
+            tau = (progress - 0.25) / 0.5  # 0 到 1
+            if self._soft_threshold_schedule == 'cosine':
+                # 余弦退火
+                tau = 0.5 * (1 + math.cos(tau * math.pi))
+            self._current_soft_threshold = tau * self._soft_threshold_max
+        else:  # 稳定阶段
+            self._current_soft_threshold = self._soft_threshold_max
+
+        return self._current_soft_threshold
+
+    def get_soft_threshold(self) -> float:
+        """获取当前 Soft-Threshold 值。"""
+        return self._current_soft_threshold
+
+    def _update_soft_threshold_by_step(self, total_steps: int = 100000) -> float:
+        """
+        使用步数驱动更新 Soft-Threshold (课程学习调度)。
+
+        与 _update_temperature类似的模式，使用内部步数计数器。
+
+        Args:
+            total_steps: 预计总步数，用于计算进度
+
+        Returns:
+            当前 Soft-Threshold 值
+        """
+        if not self._enable_soft_threshold:
+            return 0.0
+
+        # 初始化步数计数器（惰性初始化）
+        if not hasattr(self, '_soft_threshold_step'):
+            self._soft_threshold_step = 0
+
+        step = self._soft_threshold_step
+        progress = step / max(total_steps, 1)
+
+        if progress < 0.25:  # Warm-up 阶段
+            self._current_soft_threshold = 0.0
+        elif progress < 0.75:  # 收缩阶段
+            tau = (progress - 0.25) / 0.5  # 0 到 1
+            if self._soft_threshold_schedule == 'cosine':
+                tau = 0.5 * (1 + math.cos(tau * math.pi))
+            self._current_soft_threshold = tau * self._soft_threshold_max
+        else:  # 稳定阶段
+            self._current_soft_threshold = self._soft_threshold_max
+
+        self._soft_threshold_step += 1
+        return self._current_soft_threshold
+
+    def set_soft_threshold(self, threshold: float):
+        """设置 Soft-Threshold 值（用于外部调度器）。"""
+        self._current_soft_threshold = threshold
+
     def get_diagnostics(self) -> Dict[str, Any]:
         """获取诊断信息。"""
         # I131-1: depth_bias_beta/gamma 已移除，由 quota_logits 替代

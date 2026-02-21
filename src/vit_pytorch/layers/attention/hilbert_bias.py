@@ -607,11 +607,19 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         inner_dim = dim_head * heads
         self.scale = dim_head ** -0.5
 
+        # v6.1: 可学习温度参数 (N-Dependent Scaling 梯度补偿)
+        # 使用 log_temperature 确保温度 > 0，同时允许正负值学习
+        self.log_temperature = nn.Parameter(torch.tensor(0.0))
+
         self.norm = nn.LayerNorm(dim)
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
 
-        # v6.0: 几何嵌入投影 (将 dim 投影到 inner_dim 用于 QK 注入)
-        self.geometry_proj = nn.Linear(dim, inner_dim)
+        # v6.0: 几何嵌入投影 (将 dim 投影到 2*inner_dim 用于仿射调制)
+        # 输出 [scale, shift] 各 inner_dim 维度
+        self.geometry_proj = nn.Linear(dim, inner_dim * 2)
+        # 零初始化: 初始时 scale=0, shift=0，等价于恒等映射
+        nn.init.zeros_(self.geometry_proj.weight)
+        nn.init.zeros_(self.geometry_proj.bias)
 
         # P11-8 简化: 仅使用 LCA 模式
         if use_hilbert_bias:
@@ -949,15 +957,19 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.heads), qkv)
 
-        # v6.0: 注入 geometry_emb 到 Q 和 K (层级化注意力路径)
+        # v6.0: 注入 geometry_emb 到 Q 和 K (层级化注意力路径 - 仿射调制)
         if geometry_emb is not None:
-            # v6.0: 先投影到 inner_dim，再 reshape
-            geo_proj = self.geometry_proj(geometry_emb)  # [B, N, inner_dim]
-            geometry_emb_expanded = rearrange(
-                geo_proj, "b n (h d) -> b h n d", h=self.heads
-            )
-            q = q + geometry_emb_expanded
-            k = k + geometry_emb_expanded
+            # 投影到 [scale, shift]，各 inner_dim 维度
+            geo_params = self.geometry_proj(geometry_emb)  # [B, N, 2*inner_dim]
+            scale_emb, shift_emb = geo_params.chunk(2, dim=-1)  # 各 [B, N, inner_dim]
+
+            # Reshape 到 [B, H, N, D_head]
+            scale_emb = rearrange(scale_emb, "b n (h d) -> b h n d", h=self.heads)
+            shift_emb = rearrange(shift_emb, "b n (h d) -> b h n d", h=self.heads)
+
+            # 仿射调制: x * (1 + s) + t
+            q = q * (1 + scale_emb) + shift_emb
+            k = k * (1 + scale_emb) + shift_emb
 
         # 初始化输出
         output = torch.zeros(batch, seq_len, self.heads * self.dim_head, device=x.device, dtype=x.dtype)
@@ -990,6 +1002,17 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         # I113-11: 量纲对齐 - 乘以 √d_k 确保与 QK^T / √d_k 量级相当
         if hilbert_bias_batch is not None:
             dots = dots + hilbert_bias_batch * self.hilbert_bias_scale * math.sqrt(self.dim_head)
+
+        # 序列长度感知缩放: S(N) = 1 / (√d_head * max(log2(N)/log2(16), 1))
+        # 缩放作用于 (QK^T + Bias) 整体，保持几何偏置的相对权重不变
+        n_actual = q.shape[2]  # [B, H, N, D_head]
+        d_head = q.shape[-1]
+        log_n = torch.log2(torch.tensor(n_actual, dtype=q.dtype, device=q.device))
+        length_scale = 1.0 / (math.sqrt(d_head) * torch.clamp(log_n / math.log2(16), min=1.0))
+        # v6.1: 应用可学习温度补偿 (梯度缩小问题对策)
+        temperature = torch.exp(self.log_temperature)
+        length_scale = length_scale * temperature
+        dots = dots * length_scale
 
         # 单次 Softmax（深度缩放在 gather 时应用）
         attn_full = self.attend(dots)
@@ -1093,17 +1116,21 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
         qkv = self.to_qkv(x).chunk(3, dim=-1)
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.heads), qkv)
 
-        # v6.0: 注入 geometry_emb 到 Q 和 K
-        # Attn = (Q + geometry_emb) @ (K + geometry_emb)^T / sqrt(d)
+        # v6.0: 注入 geometry_emb 到 Q 和 K (仿射调制)
+        # Attn = ((Q * (1 + s) + t) @ (K * (1 + s) + t)^T) * scale
         if geometry_emb is not None:
-            # v6.0: 先投影到 inner_dim，再 reshape
-            # geometry_emb: [B, N, D] -> [B, H, N, D_head]
-            geo_proj = self.geometry_proj(geometry_emb)  # [B, N, inner_dim]
-            geometry_emb_expanded = rearrange(
-                geo_proj, "b n (h d) -> b h n d", h=self.heads
-            )
-            q = q + geometry_emb_expanded
-            k = k + geometry_emb_expanded
+            # 投影到 [scale, shift]，各 inner_dim 维度
+            # geometry_emb: [B, N, D] -> [B, N, 2*inner_dim]
+            geo_params = self.geometry_proj(geometry_emb)
+            scale_emb, shift_emb = geo_params.chunk(2, dim=-1)  # 各 [B, N, inner_dim]
+
+            # Reshape 到 [B, H, N, D_head]
+            scale_emb = rearrange(scale_emb, "b n (h d) -> b h n d", h=self.heads)
+            shift_emb = rearrange(shift_emb, "b n (h d) -> b h n d", h=self.heads)
+
+            # 仿射调制: x * (1 + s) + t
+            q = q * (1 + scale_emb) + shift_emb
+            k = k * (1 + scale_emb) + shift_emb
 
         # P-OPT: 检查是否有偏置，无偏置时使用 Flash SDP
         has_level_scaling = self.use_level_scaling and levels_info is not None and levels_info.data.numel() > 0
@@ -1163,6 +1190,17 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                 0, seq_len + 1, device=q.device, dtype=torch.int32
             )  # [seq_len + 1]
 
+            # v6.1: N-Dependent Scaling for Flash Attention
+            # Flash Attention 不支持后处理缩放，需要融合到 scale 参数中
+            d_head = q.shape[-1]
+            log_n = torch.log2(torch.tensor(seq_len, dtype=q.dtype, device=q.device))
+            length_scale = 1.0 / (math.sqrt(d_head) * torch.clamp(log_n / math.log2(16), min=1.0))
+            # v6.1: 温度补偿融合到基础 scale (保持梯度流)
+            # self.scale 是 float，需要先与 temperature 相乘转为 Tensor
+            temperature = torch.exp(self.log_temperature)
+            adjusted_scale = self.scale * temperature  # [1] Tensor，梯度有效
+            flash_scale = adjusted_scale * length_scale
+
             # 调用 Flash Attention 2
             attn = flash_attn_varlen_func(
                 q, k, v,
@@ -1170,7 +1208,7 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                 max_seqlen=seq_len,
                 bias=combined_bias,
                 dropout_p=self.dropout.p if self.training else 0.0,
-                scale=self.scale,
+                scale=flash_scale,
             )
 
             # I24-11: 条件存储注意力权重
@@ -1199,10 +1237,17 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             else:
                 attn_mask = None
 
+            # v6.1: N-Dependent Scaling for Flash SDP
+            d_head = q.shape[-1]
+            log_n = torch.log2(torch.tensor(seq_len, dtype=q.dtype, device=q.device))
+            length_scale = 1.0 / (math.sqrt(d_head) * torch.clamp(log_n / math.log2(16), min=1.0))
+            # v6.1: Flash SDP 需要 float，梯度在 Standard 路径补偿
+            flash_scale = self.scale * length_scale
+
             attn = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_mask,
-                scale=self.scale,
+                scale=flash_scale,
             )
 
             # I24-11: 条件存储注意力权重 (评估时启用)
@@ -1286,6 +1331,17 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
                     dots = dots + level_bias.unsqueeze(0) * self.level_bias_scale * dim_scale
                 else:
                     dots = dots + level_bias * self.level_bias_scale * dim_scale
+
+        # 序列长度感知缩放: S(N) = 1 / (√d_head * max(log2(N)/log2(16), 1))
+        # 缩放作用于 (QK^T + Bias) 整体，保持几何偏置的相对权重不变
+        n_actual = q.shape[2]  # [B, H, N, D_head]
+        d_head = q.shape[-1]
+        log_n = torch.log2(torch.tensor(n_actual, dtype=q.dtype, device=q.device))
+        length_scale = 1.0 / (math.sqrt(d_head) * torch.clamp(log_n / math.log2(16), min=1.0))
+        # v6.1: 应用可学习温度补偿 (梯度缩小问题对策)
+        temperature = torch.exp(self.log_temperature)
+        length_scale = length_scale * temperature
+        dots = dots * length_scale
 
         if attention_mask is not None:
             mask_value = -torch.finfo(dots.dtype).max

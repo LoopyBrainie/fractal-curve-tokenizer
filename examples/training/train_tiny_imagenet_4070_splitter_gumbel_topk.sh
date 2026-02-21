@@ -1,8 +1,14 @@
 #!/bin/bash
 # Tiny-ImageNet Optimal Training Script (RTX 4070 Laptop 8GB)
 # Splitter: GumbelTopKSplitter (default, stochastic exploration)
-# Mathematical Formalization (2026-02-13 Update)
+# Mathematical Formalization (2026-02-21 Update)
 # Target: 200 epochs, batch=192
+#
+# Mathematical Verification:
+# - dim=384, num_layers=8: ~21.2M params
+# - Tiny-ImageNet 64x64: max_level=4, N_candidates=341
+# - Token range: [8, 128] with coverage=[0.03, 0.20]
+# - VRAM usage: ~6-7GB with gradient-checkpoint + compile
 
 set -e
 
@@ -15,22 +21,25 @@ set -e
 #   Image size: 64×64 (native)
 #   max_level = ceil(log2(64/4)) = 4
 #   Candidate regions = 341 (vs 21,845 for ImageNet)
-#   Token range: [8, 36] for 64×64 images
+#   Token range: [8, 128] for 64×64 images (coverage=[0.03, 0.20])
 #
 # [MEMORY CONSTRAINT MODEL]
 #   M_total = M_params + M_gradients + M_optimizer + M_activations
-#   dim=384, L=8: ~22M params | VRAM: ~4-5 GB
+#   dim=384, L=8: ~21.2M params | VRAM: ~6-7GB with full optimization
 #
 # [GumbelTopKSplitter Characteristics]
 #   - Uses Gumbel-Softmax for stochastic token splitting
-#   - Temperature annealing: T_start=10.0 → T_end=0.5
-#   - Provides exploration during training
+#   - Temperature annealing: T_start=1.0 → T_end=0.4
+#   - enable_soft_threshold=True (default): Course learning for splitting
+#   - enable_hierarchical_quota=True (default): Adaptive depth distribution
 #   - Best for: General purpose, learns adaptive tokenization
 #
 # [KEY OPTIMIZATIONS]
 #   - tokenizer_dropout=0.0  : Deterministic tokenization (critical)
-#   - transformer_dropout=0.25: Strong regularization (200 epochs)
-#   - focal_gamma=2.5        : Hard/easy sample ratio 243x
+#   - transformer_dropout=0.15: Moderate (fractal sampling provides implicit regularization)
+#   - drop_path=0.1          : Light path dropout for small images
+#   - gradient-checkpoint     : Save ~40% VRAM
+#   - compile + channels-last: JIT optimization
 #   - soft_entropy + elastic_budget: Depth diversity + token budget
 #
 # Expected: Top-1 Accuracy 55-65% | Time: ~20-30 hours
@@ -44,22 +53,22 @@ uv run python src/training/train_fractal_vit.py \
   --heads 6 \
   --mlp-dim 1536 \
   --min-patch-size 4 \
-  --token-coverage-min 0.01 \
+  --token-coverage-min 0.03 \
   --token-coverage-max 0.20 \
   --K-min-abs 8 \
+  --K-max-hard 128 \
   --batch-size 192 \
   --lr 1e-04 \
   --weight-decay 0.05 \
   --tokenizer-dropout 0.0 \
-  --transformer-dropout 0.25 \
+  --transformer-dropout 0.15 \
   --emb-dropout 0.0 \
-  --drop-path 0.25 \
+  --drop-path 0.1 \
   --label-smoothing 0.1 \
   --gradient-clip 1.0 \
   --warmup-epochs 10 \
   --mixup-alpha 0.4 \
   --cutmix-alpha 0 \
-  --focal-gamma 2.5 \
   --include-soft-entropy \
   --soft-entropy-mode maximize \
   --soft-entropy-weight 0.1 \

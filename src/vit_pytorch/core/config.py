@@ -183,6 +183,16 @@ class HilbertSplitterConfig:
     # α = 1: 完全软分布
     deterministic_ste_alpha: float = 0.5
 
+    # ==================== Soft-Threshold 课程学习配置 ====================
+    # 控制模型的"分裂欲望"
+    # Warm-up (0-25%): τ=0, 充分探索
+    # 收缩 (25-75%): 线性 ↑, 稀疏化
+    # 稳定 (75%+): 固定微调
+    enable_soft_threshold: bool = True
+    soft_threshold_warmup_epochs: int = 10
+    soft_threshold_max: float = 0.5  # 最大阈值
+    soft_threshold_schedule: str = "linear"  # linear, cosine
+
     # ==================== I113-12: 静态 K 模式配置 ====================
     # 启用静态 K 模式以支持 torch.compile 的 cudagraphs 优化
     # 启用后，token 数量将 padding 到 static_k_max
@@ -347,6 +357,11 @@ class HilbertSplitterConfig:
             'use_deterministic_topk': self.use_deterministic_topk,
             'deterministic_temperature': self.deterministic_temperature,
             'deterministic_ste_alpha': self.deterministic_ste_alpha,
+            # Soft-Threshold 课程学习配置
+            'enable_soft_threshold': self.enable_soft_threshold,
+            'soft_threshold_warmup_epochs': self.soft_threshold_warmup_epochs,
+            'soft_threshold_max': self.soft_threshold_max,
+            'soft_threshold_schedule': self.soft_threshold_schedule,
         }
 
     # ==================== L2 绝对值计算方法 (I113-2) ====================
@@ -932,6 +947,11 @@ def create_splitter_config(
     temperature_warmup_steps: Optional[int] = None,
     # 冻结控制
     freeze_quota: Optional[bool] = None,
+    # v6.1: Soft-Threshold 课程学习
+    enable_soft_threshold: Optional[bool] = None,
+    soft_threshold_warmup_epochs: Optional[int] = None,
+    soft_threshold_max: Optional[float] = None,
+    soft_threshold_schedule: Optional[str] = None,
     **kwargs,
 ) -> HilbertSplitterConfig:
     """
@@ -1038,6 +1058,16 @@ def create_splitter_config(
     # 冻结控制
     if freeze_quota is not None:
         config.freeze_quota = freeze_quota
+
+    # v6.1: Soft-Threshold 课程学习配置
+    if enable_soft_threshold is not None:
+        config.enable_soft_threshold = enable_soft_threshold
+    if soft_threshold_warmup_epochs is not None:
+        config.soft_threshold_warmup_epochs = soft_threshold_warmup_epochs
+    if soft_threshold_max is not None:
+        config.soft_threshold_max = soft_threshold_max
+    if soft_threshold_schedule is not None:
+        config.soft_threshold_schedule = soft_threshold_schedule
 
     # 应用额外参数
     for key, value in kwargs.items():
