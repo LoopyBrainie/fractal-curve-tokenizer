@@ -2496,12 +2496,9 @@ def train_epoch(
                 loss_val = loss.detach().item() * config.accum_steps
                 acc_val = 100. * correct.detach().item() / total if total > 0 else 0
 
-            # I-CURRICULUM: 获取当前阶段用于日志输出
+            # I-CURRICULUM: 使用缓存的阶段用于日志输出（P-OPT 避免每个 batch 查询）
             stage_name = {1: "TeacherForcing", 2: "AccDriven", 3: "ResourceCoadapt"}
-            if hasattr(model, 'module'):
-                curriculum_stage = model.module.get_curriculum_stage()
-            else:
-                curriculum_stage = model.get_curriculum_stage()
+            curriculum_stage = cached_curriculum_stage
             stage_str = stage_name.get(curriculum_stage, "Unknown")
 
             if profile and (i < 5 or i % 100 == 0):
@@ -4617,11 +4614,14 @@ def main():
 
         # ====================================================================
         # I-CURRICULUM: 传递 epoch 给模型用于三阶段课程学习
+        # P-OPT: 在 epoch 级别缓存课程学习阶段，避免每个 batch 都查询
         # ====================================================================
         if hasattr(model, 'module'):
             model.module.set_epoch(epoch)
+            cached_curriculum_stage = model.module.get_curriculum_stage()
         else:
             model.set_epoch(epoch)
+            cached_curriculum_stage = model.get_curriculum_stage()
 
         start = time.time()
 
