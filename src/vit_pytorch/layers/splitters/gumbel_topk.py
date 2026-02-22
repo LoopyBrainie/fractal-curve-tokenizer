@@ -2565,9 +2565,11 @@ class GumbelTopKSplitter(
         # === SAT-DEFENSE: 梯度平滑 ===
         # 在 logits 上注册梯度缩放 Hook，反向传播时乘 0.1
         # 降低 Splitter 对 Batch 0 巨量梯度的敏感度
-        def _grad_scale_hook(grad):
-            return grad * 0.1
-        logits.register_hook(_grad_scale_hook)
+        # 仅在训练模式下注册（评估时 tensor 不需要梯度）
+        if logits.requires_grad:
+            def _grad_scale_hook(grad):
+                return grad * 0.1
+            logits.register_hook(_grad_scale_hook)
 
         # 分割概率 (I18-5: 使用 TEMPERATURE_MIN 常量)
         T = self.log_temperature.exp().clamp(min=TEMPERATURE_MIN)
