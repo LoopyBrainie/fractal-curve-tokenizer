@@ -1114,10 +1114,10 @@ class CUB200Trainer:
             if (batch_idx + 1) % accum_steps == 0:
                 # I121-6: 动态梯度裁剪
                 if self.config.gradient_clip_norm is not None:
-                    # torch.compile + AMP 可能导致梯度为 FP16，转换为 FP32
+                    # torch.compile + AMP 可能导致梯度 dtype 与参数不匹配
                     for param in self.model.parameters():
-                        if param.grad is not None and param.grad.dtype == torch.float16:
-                            param.grad = param.grad.float()
+                        if param.grad is not None and param.grad.dtype != param.dtype:
+                            param.grad = param.grad.to(param.dtype)
                     self.scaler.unscale_(optimizer)
                     dynamic_clip_norm = self._get_dynamic_clip_norm()
                     grad_norm_curr = torch.nn.utils.clip_grad_norm_(
