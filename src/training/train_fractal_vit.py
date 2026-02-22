@@ -2146,8 +2146,15 @@ def train_epoch(
             # 包含: 软熵损失 + 弹性预算损失 + 阈值 barrier 正则化
             # I14-1 D1: 新增崩溃惩罚，需要传递 actual_token_count
             splitter_loss = None
+
+            # P-OPT: Stage 1 (Teacher Forcing) 中 aux_weight = 0，直接跳过辅助损失计算
+            # 这是一个重要的性能优化，避免不必要的 GPU 计算
+            # Stage 1: epoch 1-9, Stage 2: epoch 10-19, Stage 3: epoch 20+
+            is_curriculum_stage_1_or_2 = epoch < 20
+
             # I98-2: 使用 model.splitter (独立组件)
-            if hasattr(model, 'splitter'):
+            # I182-FIX: 仅在 Stage 3 时才获取 splitter_features，避免不必要的 GPU 操作
+            if not is_curriculum_stage_1_or_2 and hasattr(model, 'splitter'):
                 splitter = model.splitter
                 # I107-7: 从 stats.shared_features 获取已计算的 features
                 # 避免重复调用 model.tokenizer.shared_conv(imgs) (节省 ~5-10% 计算开销)
@@ -2157,12 +2164,7 @@ def train_epoch(
                     # Fallback: 仍需计算时的回退方案
                     splitter_features = model.tokenizer.shared_conv(imgs)
 
-                # P-OPT: Stage 1 (Teacher Forcing) 中 aux_weight = 0，直接跳过辅助损失计算
-                # 这是一个重要的性能优化，避免不必要的 GPU 计算
-                # Stage 1: epoch 1-9, Stage 2: epoch 10-19, Stage 3: epoch 20+
-                is_curriculum_stage_1_or_2 = epoch < 20
-
-                if hasattr(splitter, 'get_auxiliary_losses') and not is_curriculum_stage_1_or_2:
+                if hasattr(splitter, 'get_auxiliary_losses'):
                     # 传递 TrainingStats 中的 num_tokens 和 depth_distribution 到 Splitter
                     # 这样 Splitter 可以直接使用实际统计信息进行效率优化
                     aux_losses = splitter.get_auxiliary_losses(
