@@ -2454,7 +2454,8 @@ class GumbelTopKSplitter(
             self._last_probs_for_loss = probs
             self._last_selected_mask = selected_mask.detach()
             self._last_selected_mask_for_loss = selected_mask
-            self._last_num_selected_for_loss = float(N)
+            # P-OPT-FIX: 使用张量而非 float，避免 get_auxiliary_losses 中 .clamp() 报错
+            self._last_num_selected_for_loss = torch.tensor(N, dtype=torch.float32, device=probs.device)
 
             # 缓存 quota loss（Stage 1 不更新 splitter，设为 None）
             self._last_quota_loss = None
