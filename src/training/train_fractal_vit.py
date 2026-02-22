@@ -2142,7 +2142,12 @@ def train_epoch(
                     # Fallback: 仍需计算时的回退方案
                     splitter_features = model.tokenizer.shared_conv(imgs)
 
-                if hasattr(splitter, 'get_auxiliary_losses'):
+                # P-OPT: Stage 1 (Teacher Forcing) 中 aux_weight = 0，直接跳过辅助损失计算
+                # 这是一个重要的性能优化，避免不必要的 GPU 计算
+                # Stage 1: epoch 1-9, Stage 2: epoch 10-19, Stage 3: epoch 20+
+                is_curriculum_stage_1_or_2 = epoch < 20
+
+                if hasattr(splitter, 'get_auxiliary_losses') and not is_curriculum_stage_1_or_2:
                     # 传递 TrainingStats 中的 num_tokens 和 depth_distribution 到 Splitter
                     # 这样 Splitter 可以直接使用实际统计信息进行效率优化
                     aux_losses = splitter.get_auxiliary_losses(
@@ -2173,6 +2178,9 @@ def train_epoch(
                             splitter_loss = torch.tensor(float(splitter_loss), device=device)
                     else:
                         splitter_loss = torch.tensor(0.0, device=device)
+                else:
+                    # Stage 1/2: 跳过辅助损失计算，aux_weight = 0 时无需计算
+                    splitter_loss = torch.tensor(0.0, device=device)
                     # I102-4: splitter_metrics 是死代码，移除以防止显存泄露
                     # splitter_metrics = aux_losses  # 保留张量引用会导致内存累积
                     # GumbelTopKSplitter 的 get_auxiliary_losses 已包含所有必需损失
