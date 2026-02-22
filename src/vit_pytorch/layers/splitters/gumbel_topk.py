@@ -4737,7 +4737,12 @@ class GumbelTopKSplitter(
         #
         if include_elastic_budget:
             # I145-FIX: 使用当前 batch 的实际 token 数（有梯度）而不是 EMA 值
-            avg_tokens = self._last_num_selected_for_loss if hasattr(self, '_last_num_selected_for_loss') else self._avg_selected
+            raw_avg_tokens = self._last_num_selected_for_loss if hasattr(self, '_last_num_selected_for_loss') else self._avg_selected
+            # P-OPT-FIX: 确保 avg_tokens 是张量（兼容 float fallback）
+            if isinstance(raw_avg_tokens, float):
+                avg_tokens = torch.tensor(raw_avg_tokens, dtype=torch.float32, device=device)
+            else:
+                avg_tokens = raw_avg_tokens
             candidate_count = self.num_candidates
 
             # === 动态目标覆盖率 ===
