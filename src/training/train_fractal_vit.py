@@ -1897,6 +1897,28 @@ def train_epoch(
     use_mixup = mixup_fn is not None
     nan_count = 0  # NaN 计数器
 
+    # ====================================================================
+    # I-CURRICULUM: Stage 1/2 禁用 Mixup/CutMix
+    # 在主干网络学会稳定特征表示之前，不施加数据增强干扰
+    # ====================================================================
+    if use_mixup and epoch is not None:
+        # 获取当前课程学习阶段
+        if hasattr(model, 'module'):
+            curriculum_stage = model.module.get_curriculum_stage()
+        else:
+            curriculum_stage = model.get_curriculum_stage()
+
+        # Stage 1 (Teacher Forcing) 和 Stage 2 (Acc-Driven): 禁用 Mixup
+        if curriculum_stage < 3:
+            # 临时禁用 mixup_fn
+            original_mixup_fn = mixup_fn
+            mixup_fn = None
+            use_mixup = False
+            if epoch <= 2:  # 仅在早期打印一次
+                print(f"[I-CURRICULUM] Stage {curriculum_stage}: 禁用 Mixup/CutMix 以专注语义学习")
+        else:
+            original_mixup_fn = None
+
     # I107-7: 调试模式控制 - 默认关闭以提升性能
     # 设置 DEBUG_MODE=1 启用调试输出
     debug_mode = os.environ.get('DEBUG_MODE', '0') == '1'
@@ -2193,25 +2215,35 @@ def train_epoch(
                 # 组合权重
                 aux_weight = curriculum_factor * relative_weight
 
-                # === Loss Cold-start 机制 (I-COLDSTART) ===
-                # 前 15 个 Epoch 内，强制辅助损失权重为 0，让主干网络独立学习语义
-                cold_start_epochs = 15
-                warmup_epochs = 10
-                aux_weight_scaler = 0.0  # 默认关闭
+                # ====================================================================
+                # I-CURRICULUM: 三阶段课程学习 Loss 控制
+                # Stage 1 (Epoch 1-9): Teacher Forcing - aux_weight = 0
+                # Stage 2 (Epoch 10-19): Acc-Driven - aux_weight = 0
+                # Stage 3 (Epoch 20+): Resource Co-adaptation - Linear Warmup
+                # ====================================================================
+                base_aux_weight = aux_weight  # 配置文件中的原始权重
 
-                if epoch > cold_start_epochs:
-                    # 15 轮后开始线性增长到 10%
-                    progress = min(1.0, (epoch - cold_start_epochs) / warmup_epochs)
-                    aux_weight_scaler = progress * 0.1  # 最多 10%
+                # Stage 1 & 2: 完全关闭资源惩罚
+                if epoch < 20:
+                    current_aux_weight = 0.0
+                # Stage 3: Resource Co-adaptation
+                else:
+                    # 保护锁：如果 val_acc < 5%，不施加资源惩罚
+                    current_val_acc = getattr(config, '_current_val_acc', 0.0)
+                    if current_val_acc < 5.0:
+                        current_aux_weight = 0.0
+                        if hasattr(model, 'module'):
+                            stage = model.module.get_curriculum_stage()
+                        else:
+                            stage = model.get_curriculum_stage()
+                        print(f"[CURRICULUM] Stage {stage} 保护锁: val_acc={current_val_acc:.2f}% < 5%, 资源权重=0")
+                    else:
+                        # 严格的线性 Warmup: 前 10 个 epoch 从 0 增长到目标值
+                        warmup_progress = min(1.0, (epoch - 20) / 10.0)
+                        current_aux_weight = base_aux_weight * warmup_progress
 
-                # === Dynamic Release 条件 ===
-                # 从 metrics 获取验证准确率，仅当 val_acc > 1.0% 时才释放全部权重
-                current_val_acc = getattr(config, '_current_val_acc', 0.0)
-                if current_val_acc > 1.0:
-                    aux_weight_scaler = min(aux_weight_scaler, 1.0)  # 释放全部
-
-                # 应用 scaler
-                aux_weight = aux_weight * aux_weight_scaler
+                # 直接覆盖 aux_weight（不再使用基于比例的缩放）
+                aux_weight = current_aux_weight
 
                 # [I-COLDSTART] 调试日志：每10个batch打印权重缩放因子
                 if debug_mode and i % 10 == 0:
@@ -2463,15 +2495,25 @@ def train_epoch(
             with torch.no_grad():
                 loss_val = loss.detach().item() * config.accum_steps
                 acc_val = 100. * correct.detach().item() / total if total > 0 else 0
+
+            # I-CURRICULUM: 获取当前阶段用于日志输出
+            stage_name = {1: "TeacherForcing", 2: "AccDriven", 3: "ResourceCoadapt"}
+            if hasattr(model, 'module'):
+                curriculum_stage = model.module.get_curriculum_stage()
+            else:
+                curriculum_stage = model.get_curriculum_stage()
+            stage_str = stage_name.get(curriculum_stage, "Unknown")
+
             if profile and (i < 5 or i % 100 == 0):
                 pbar.set_postfix(
                     loss=f'{loss_val:.3f}',
                     acc=f'{acc_val:.1f}%',
+                    stage=stage_str,
                     data=f'{data_time*1000:.0f}ms',
                     fwd=f'{forward_time*1000:.0f}ms'
                 )
             else:
-                pbar.set_postfix(loss=f'{loss_val:.4f}', acc=f'{acc_val:.1f}%')
+                pbar.set_postfix(loss=f'{loss_val:.4f}', acc=f'{acc_val:.1f}%', stage=stage_str)
 
         # P-OPT: 移除无意义的 GC 调用
         # Python GC 对 GPU 内存无影响，使用 torch.cuda.empty_cache() 更有效
@@ -4572,6 +4614,15 @@ def main():
         print(f"\n{'='*60}")
         print(f"EPOCH {epoch}/{config.epochs} - STARTING")
         print(f"{'='*60}")
+
+        # ====================================================================
+        # I-CURRICULUM: 传递 epoch 给模型用于三阶段课程学习
+        # ====================================================================
+        if hasattr(model, 'module'):
+            model.module.set_epoch(epoch)
+        else:
+            model.set_epoch(epoch)
+
         start = time.time()
 
         # P13: 每个 epoch 开始时手动 GC

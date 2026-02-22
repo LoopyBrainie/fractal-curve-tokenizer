@@ -1609,6 +1609,32 @@ class GumbelTopKSplitter(
         self._feature_analysis_enabled: bool = False
         self._feature_analysis_result: Optional[SVDAnalysisResult] = None
 
+        # ====================================================================
+        # 三阶段课程学习状态 (I-CURRICULUM)
+        # Stage 1: Teacher Forcing (Epoch 1-9) - 冻结 Splitter
+        # Stage 2: Acc-Driven Splitting (Epoch 10-19) - 仅 CE Loss 驱动
+        # Stage 3: Resource Co-adaptation (Epoch 20+) - 引入资源惩罚
+        # ====================================================================
+        self._current_epoch: int = 0
+        self._curriculum_stage: int = 1  # 1=Teacher Forcing, 2=Acc-Driven, 3=Resource Co-adapt
+        self._cached_mask_ste: Optional[Tensor] = None  # Stage 1 缓存的全 1 mask
+
+    def set_epoch(self, epoch: int) -> None:
+        """设置当前 epoch，更新课程学习阶段。
+
+        Args:
+            epoch: 当前训练轮次 (从 1 开始)
+        """
+        self._current_epoch = epoch
+
+        # 确定当前阶段
+        if epoch < 10:
+            self._curriculum_stage = 1
+        elif epoch < 20:
+            self._curriculum_stage = 2
+        else:
+            self._curriculum_stage = 3
+
     def enable_feature_analysis(
         self,
         enabled: bool = True,
@@ -2378,41 +2404,74 @@ class GumbelTopKSplitter(
             # 这里缓存供后续使用
 
         # ====================================================================
+        # ====================================================================
+        # 三阶段课程学习控制 (I-CURRICULUM)
+        # Stage 1: Teacher Forcing - 冻结 Splitter，保留所有 Token
+        # ====================================================================
+        if self._curriculum_stage == 1:
+            # 🌟 强制使用所有候选区域，给 Backbone 最大信息量
+            K = N  # 保留所有 N 个 Patch
+
+            # 构建全 1 的掩码，保持前向和反向一致性
+            # 不需要 STE，因为 Stage 1 不更新 Splitter
+            mask_ste = torch.ones_like(probs)
+
+            # 缓存供后续使用
+            self._cached_mask_ste = mask_ste
+
+            # 创建 topk_indices（用于返回值）
+            topk_indices = torch.arange(N, device=logits.device).unsqueeze(0).expand(B, -1)
+
+            # 跳过后续的动态 K 计算和 Top-K 选择
+            # 直接跳转到 Step 3 (mask 应用)
+            # 注意：需要设置 selected_mask 供后续使用
+            selected_mask = mask_ste
+
+            # 直接返回结果（需要继续执行到 return 前的代码）
+            # 为了保持代码结构，这里不提前返回，而是跳过动态选择逻辑
+            # 设置标记让后续代码跳过
+            _skip_dynamic_selection = True
+        else:
+            _skip_dynamic_selection = False
+
         # Step 2: Gumbel-Top-K 选择
         # I24-2: 使用分层 Top-K (方案E) 或全局 Top-K (传统方案)
         # ====================================================================
-        # 计算动态 K (I33: 传递 image_size 用于自适应覆盖率)
-        if self.use_dynamic_k:
-            K = self._estimate_optimal_k(probs, self._current_image_size)
-        else:
-            K = (self.K_min + self.K_max) // 2
-        
-        # 边界检查：K 不能超过候选数量 N
-        K = min(K, N)
-        # I23-2: 确保 K >= K_min (硬下界)
-        # I23-3: 但不能超过 N（当 N < K_min 时，使用 N）
-        K = max(min(K, N), min(self.K_min, N))
+        if not _skip_dynamic_selection:
+            # 计算动态 K (I33: 传递 image_size 用于自适应覆盖率)
+            if self.use_dynamic_k:
+                K = self._estimate_optimal_k(probs, self._current_image_size)
+            else:
+                K = (self.K_min + self.K_max) // 2
+
+            # 边界检查：K 不能超过候选数量 N
+            K = min(K, N)
+            # I23-2: 确保 K >= K_min (硬下界)
+            # I23-3: 但不能超过 N（当 N < K_min 时，使用 N）
+            K = max(min(K, N), min(self.K_min, N))
 
         # ====================================================================
         # v6.1: Soft-Threshold 课程学习
         # 应用负阈值作为偏置，抑制低分候选（稀疏化效果）
+        # 注意：Stage 1 跳过此逻辑（已使用全 1 mask）
         # ====================================================================
-        if self._enable_soft_threshold and self._current_soft_threshold > 0:
-            # 创建负阈值偏置（高分候选不受影响，低分候选被抑制）
-            threshold_bias = -self._current_soft_threshold
-            logits = logits + threshold_bias
+        if not _skip_dynamic_selection:
+            if self._enable_soft_threshold and self._current_soft_threshold > 0:
+                # 创建负阈值偏置（高分候选不受影响，低分候选被抑制）
+                threshold_bias = -self._current_soft_threshold
+                logits = logits + threshold_bias
 
-        # I24-2 方案E: 分层 Top-K (可学习配额)
-        # I100-7: 传递 features 以支持信息密度自适应配额
-        if LEARNABLE_QUOTA_ENABLED and self.quota_logits is not None:
-            selected_mask, topk_indices = self._stratified_gumbel_topk_ste(
-                logits, K, hard, features=features
-            )
-        else:
-            # 传统全局 Top-K
-            selected_mask, topk_indices = self._gumbel_topk_ste(logits, K, hard)
-        # selected_mask: [B, N] (STE 版本，有梯度)
-        # topk_indices: [B, K'] (硬选择索引，K' 可能略小于 K)
+            # I24-2 方案E: 分层 Top-K (可学习配额)
+            # I100-7: 传递 features 以支持信息密度自适应配额
+            if LEARNABLE_QUOTA_ENABLED and self.quota_logits is not None:
+                selected_mask, topk_indices = self._stratified_gumbel_topk_ste(
+                    logits, K, hard, features=features
+                )
+            else:
+                # 传统全局 Top-K
+                selected_mask, topk_indices = self._gumbel_topk_ste(logits, K, hard)
+            # selected_mask: [B, N] (STE 版本，有梯度)
+            # topk_indices: [B, K'] (硬选择索引，K' 可能略小于 K)
 
         # ====================================================================
         # Step 3: I100-1 移除树一致性约束

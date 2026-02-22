@@ -1592,6 +1592,32 @@ class FractalCurveViT(nn.Module):
 
         return stats
 
+    # =====================================================================
+    # 三阶段课程学习接口
+    # =====================================================================
+    def set_epoch(self, epoch: int) -> None:
+        """设置当前 epoch，用于课程学习调度。
+
+        Args:
+            epoch: 当前训练轮次 (从 1 开始)
+        """
+        self._current_epoch = epoch
+        # 传递给 splitter
+        if hasattr(self, 'splitter') and self.splitter is not None:
+            self.splitter.set_epoch(epoch)
+
+    def get_curriculum_stage(self) -> int:
+        """获取当前课程学习阶段。
+
+        Returns:
+            1 = Teacher Forcing (Epoch 1-9)
+            2 = Acc-Driven Splitting (Epoch 10-19)
+            3 = Resource Co-adaptation (Epoch 20+)
+        """
+        if hasattr(self, 'splitter') and self.splitter is not None:
+            return getattr(self.splitter, '_curriculum_stage', 1)
+        return 1
+
     def get_tokenizer_loss(
         self,
         reward: Optional[float] = None,
