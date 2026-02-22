@@ -2365,12 +2365,17 @@ def train_epoch(
                 print(f"[Grad Ratio INFO] Splitter 梯度是 Backbone 的 {gradient_ratio:.1f} 倍 (正常范围: 2-50x)")
 
         if (i + 1) % config.accum_steps == 0:
-            # P-OPT: torch.compile + AMP 导致梯度为 FP16，与 GradScaler/Optimizer 不兼容
-            # 解决方案：跳过 GradScaler，直接使用 FP32 梯度进行优化器更新
-            # 梯度裁剪和优化器更新在 FP32 空间进行
+            # P-OPT: torch.compile + AMP 导致梯度为 FP16，与 Optimizer 状态不兼容
+            # 解决方案：将参数和梯度都转为 FP32 进行优化器更新
+            # 保存原始 dtype
+            param_dtypes = {}
             for param in model.parameters():
-                if param.grad is not None and param.grad.dtype == torch.float16:
-                    param.grad.data = param.grad.data.float()
+                if param.requires_grad:
+                    param_dtypes[id(param)] = param.dtype
+                    if param.dtype == torch.float16:
+                        param.data = param.data.float()
+                    if param.grad is not None and param.grad.dtype == torch.float16:
+                        param.grad.data = param.grad.data.float()
 
             # P-OPT: 首层梯度监控与动态裁剪
             # 获取首层参数（通常是 tokenizer.shared_conv 的第一个卷积层）
@@ -2404,6 +2409,13 @@ def train_epoch(
             optimizer.step()
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+
+            # 恢复原始 dtype
+            for param in model.parameters():
+                if param.requires_grad and id(param) in param_dtypes:
+                    orig_dtype = param_dtypes[id(param)]
+                    if param.dtype != orig_dtype:
+                        param.data = param.data.to(orig_dtype)
 
         # P11-8: 使用 detach() 累加损失，避免保留计算图
         # .item() 延迟到 epoch 结束时调用
