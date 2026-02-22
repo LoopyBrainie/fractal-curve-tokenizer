@@ -2514,6 +2514,8 @@ class GumbelTopKSplitter(
         # Step 2: Gumbel-Top-K 选择
         # I24-2: 使用分层 Top-K (方案E) 或全局 Top-K (传统方案)
         # ====================================================================
+        # P-OPT-FIX: 定义 _skip_dynamic_selection - Stage 1 应该跳过动态选择
+        _skip_dynamic_selection = (self._curriculum_stage == 1)
         if not _skip_dynamic_selection:
             # 计算动态 K (I33: 传递 image_size 用于自适应覆盖率)
             if self.use_dynamic_k:
