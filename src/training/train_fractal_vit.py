@@ -2597,6 +2597,14 @@ def train_epoch(
             except Exception:
                 pass
 
+        # P-OPT: 实际 token 总数（用于检测批量爆炸）
+        if hasattr(splitter, 'get_total_tokens'):
+            try:
+                total_tokens = splitter.get_total_tokens()
+                perf_stats['total_tokens'] = total_tokens
+            except Exception:
+                pass
+
     # I111-6: 使用 DepthMonitor 收集深度分布统计
     # 延迟初始化，避免重复创建
     if not hasattr(model, '_depth_monitor'):
@@ -2983,7 +2991,11 @@ def log_splitter_health_to_tensorboard(
     # 从 perf_stats 提取指标
     if perf_stats.get('soft_token_count') is not None:
         writer.add_scalar('Splitter/soft_token_count', perf_stats['soft_token_count'], epoch)
-    
+
+    # P-OPT: 实际 token 总数（用于检测批量爆炸）
+    if perf_stats.get('total_tokens') is not None:
+        writer.add_scalar('Splitter/total_tokens', perf_stats['total_tokens'], epoch)
+
     if perf_stats.get('entropy_ratio') is not None:
         writer.add_scalar('Splitter/entropy_ratio', perf_stats['entropy_ratio'], epoch)
     

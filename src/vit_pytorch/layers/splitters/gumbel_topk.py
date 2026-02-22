@@ -1619,6 +1619,12 @@ class GumbelTopKSplitter(
         self._curriculum_stage: int = 1  # 1=Teacher Forcing, 2=Acc-Driven, 3=Resource Co-adapt
         self._cached_mask_ste: Optional[Tensor] = None  # Stage 1 缓存的全 1 mask
 
+        # P-OPT: Stage 1 深度限制 - 限制最大递归深度，避免全量计算
+        # 初始化时设为 None，在 set_epoch 时根据 curriculum stage 设置
+        self._stage1_max_depth: Optional[int] = None
+        # 跟踪实际进入 Transformer 的 token 总数（用于检测批量爆炸）
+        self._last_total_tokens: int = 0
+
     def set_epoch(self, epoch: int) -> None:
         """设置当前 epoch，更新课程学习阶段。
 
@@ -1630,10 +1636,16 @@ class GumbelTopKSplitter(
         # 确定当前阶段
         if epoch < 10:
             self._curriculum_stage = 1
+            # P-OPT: Stage 1 深度限制 - 限制最大递归深度
+            # 避免 Stage 1 看到完整的深度递归，聚焦基础特征学习
+            # depth=2 提供 4^0+4^1+4^2 = 21 个候选区域，足以覆盖图像
+            self._stage1_max_depth = 2
         elif epoch < 20:
             self._curriculum_stage = 2
+            self._stage1_max_depth = None  # Stage 2 不限制深度
         else:
             self._curriculum_stage = 3
+            self._stage1_max_depth = None  # Stage 3 不限制深度
 
     def enable_feature_analysis(
         self,
@@ -2406,47 +2418,75 @@ class GumbelTopKSplitter(
         # ====================================================================
         # ====================================================================
         # 三阶段课程学习控制 (I-CURRICULUM)
-        # Stage 1: Teacher Forcing - 冻结 Splitter，保留所有 Token
+        # Stage 1: Teacher Forcing - 使用基于覆盖率的 Token 上限 + 深度限制
         # P-OPT: 提前返回以避免不必要的计算
         # ====================================================================
         if self._curriculum_stage == 1:
-            # 🌟 强制使用所有候选区域，给 Backbone 最大信息量
-            K = N  # 保留所有 N 个 Patch
+            # P-OPT: Stage 1 深度限制 - 如果设置了 _stage1_max_depth，过滤候选
+            effective_N = N
+            effective_depths = depths
+            if self._stage1_max_depth is not None:
+                # 过滤到指定深度的候选
+                depth_mask = depths <= self._stage1_max_depth
+                effective_indices = depth_mask.nonzero(as_tuple=True)[0]
+                effective_N = effective_indices.shape[0]
+                # 如果过滤后候选数太少，使用所有候选
+                if effective_N < 16:
+                    effective_N = N
+                    effective_indices = None
 
-            # 构建全 1 的掩码，保持前向和反向一致性
+            # I-CURRICULUM: 使用 Teacher Forcing 上限而不是 K=N
+            # 自动选择接近 K_COVERAGE_BASE × N 的 N-level，避免 K=N 导致的速度下降
+            # 例如: 224×224 图像，N=5461，目标 K=1365，返回 4096 (4^6)
+            teacher_K = self._get_teacher_forcing_limit(effective_N, self._current_image_size)
+            K = min(teacher_K, effective_N)  # 不超过总候选数
+
+            # P-OPT: 使用 index_select 代替 scatter
+            # 构建 Top-K 掩码 (不是全 1，只选 K 个)
             # 不需要 STE，因为 Stage 1 不更新 Splitter
-            mask_ste = torch.ones_like(probs)
+            if effective_indices is not None and effective_indices.shape[0] < N:
+                # 使用过滤后的概率
+                filtered_probs = probs[:, effective_indices]
+                _, topk_local = torch.topk(filtered_probs, k=min(K, filtered_probs.shape[1]), dim=-1)
+                # 映射回原始索引
+                topk_indices_local = effective_indices[topk_local]
+            else:
+                _, topk_indices_local = torch.topk(probs, k=K, dim=-1)
+
+            # P-OPT: 使用 scatter_ 创建掩码（保持与之前兼容）
+            mask_ste = torch.zeros_like(probs).scatter_(dim=-1, index=topk_indices_local, value=1.0)
 
             # 缓存供后续使用
             self._cached_mask_ste = mask_ste
 
             # P-OPT: 复用缓存的索引，避免每次创建新 tensor
-            # 形状必须是 [B, K] = [B, N]，与 _build_result 期望一致
-            if not hasattr(self, '_cached_full_topk_indices') or self._cached_full_topk_indices.shape[0] != B:
-                self._cached_full_topk_indices = torch.arange(N, device=probs.device, dtype=torch.long).unsqueeze(0).expand(B, -1)
-            topk_indices = self._cached_full_topk_indices
+            if not hasattr(self, '_cached_teacher_topk_indices') or self._cached_teacher_topk_indices.shape[0] != B or self._cached_teacher_topk_indices.shape[1] != K:
+                self._cached_teacher_topk_indices = topk_indices_local
+            topk_indices = self._cached_teacher_topk_indices
 
-            # P-OPT: Stage 1 提前构建结果，跳过 _build_result 中的复杂逻辑
-            # 因为所有 token 都被选中，直接构建结果即可
+            # P-OPT: Stage 1 简化结果构建
             selected_mask = mask_ste
 
-            # P-OPT: Stage 1 简化结果构建，跳过区域坐标计算
-            # 由于返回全 1 mask，调用者会使用所有特征，不需要 regions 等信息
-            # 构建基础的选中索引
+            # P-OPT: 跟踪实际 token 总数（用于检测批量爆炸）
+            total_tokens = K * B
+            self._last_total_tokens = total_tokens
+
+            # 构建基础的选中索引 (只选 K 个)
             all_indices_1d = torch.arange(N, device=features.device, dtype=torch.long)
-            batch_idx = torch.arange(B, device=features.device, dtype=torch.long).unsqueeze(1).expand(B, N)
+            # 只展开 K 个索引
+            batch_idx = torch.arange(B, device=features.device, dtype=torch.long).unsqueeze(1).expand(B, K)
 
             # 直接构建结果对象（跳过 _build_result 中的复杂处理）
             result = GumbelTopKResult(
-                regions=torch.zeros(N * B, 4, dtype=torch.long, device=features.device),  # [M, 4] - dummy
-                depths=torch.zeros(N * B, dtype=torch.long, device=features.device),  # [M] - dummy
+                regions=torch.zeros(K * B, 4, dtype=torch.long, device=features.device),  # [M, 4] - dummy
+                depths=torch.zeros(K * B, dtype=torch.long, device=features.device),  # [M] - dummy
                 batch_indices=batch_idx.reshape(-1),  # [M]
-                hilbert_indices=all_indices_1d.unsqueeze(0).expand(B, -1).reshape(-1),  # [M]
+                hilbert_indices=all_indices_1d.unsqueeze(0).expand(B, -1)[:, :K].reshape(-1),  # [M] - 只取前 K 个
                 selected_mask=selected_mask,
                 logits=logits,
                 probs=probs,
-                candidate_indices=all_indices_1d.unsqueeze(0).expand(B, -1).reshape(-1),  # [M]
-                num_selected_per_batch=torch.full((B,), N, dtype=torch.long, device=features.device),
+                candidate_indices=all_indices_1d.unsqueeze(0).expand(B, -1)[:, :K].reshape(-1),  # [M] - 只取前 K 个
+                num_selected_per_batch=torch.full((B,), K, dtype=torch.long, device=features.device),
             )
 
             # 缓存用于辅助损失
@@ -2455,14 +2495,16 @@ class GumbelTopKSplitter(
             self._last_selected_mask = selected_mask.detach()
             self._last_selected_mask_for_loss = selected_mask
             # P-OPT-FIX: 使用张量而非 float，避免 get_auxiliary_losses 中 .clamp() 报错
-            self._last_num_selected_for_loss = torch.tensor(N, dtype=torch.float32, device=probs.device)
+            # I-CURRICULUM: 使用实际的 K 而不是 N
+            self._last_num_selected_for_loss = torch.tensor(K, dtype=torch.float32, device=probs.device)
 
             # 缓存 quota loss（Stage 1 不更新 splitter，设为 None）
             self._last_quota_loss = None
 
             # 更新统计
             with torch.no_grad():
-                self._avg_selected = 0.9 * self._avg_selected + 0.1 * N
+                # I-CURRICULUM: 使用实际的 K 而不是 N
+                self._avg_selected = 0.9 * self._avg_selected + 0.1 * K
 
             return result
 
@@ -2540,6 +2582,10 @@ class GumbelTopKSplitter(
 
         # I145-FIX: 缓存当前 batch 的 token 数量用于弹性预算损失（有梯度）
         self._last_num_selected_for_loss = result.num_selected_per_batch.float().mean()
+
+        # P-OPT: 跟踪实际 token 总数（用于检测批量爆炸）
+        total_tokens = result.num_selected_per_batch.sum().item()
+        self._last_total_tokens = total_tokens
 
         # 更新统计
         with torch.no_grad():
@@ -2742,6 +2788,54 @@ class GumbelTopKSplitter(
         )
 
         return K_min, K_max
+
+    def _get_teacher_forcing_limit(
+        self,
+        candidate_count: int,
+        image_size: Optional[Tuple[int, int]] = None,
+    ) -> int:
+        """
+        I-CURRICULUM: Teacher Forcing 上限 - 自动选择接近 K 目标的 N-level
+
+        算法:
+            1. 计算目标 K: target_K = K_COVERAGE_BASE × N × γ
+            2. 找到最小的 a 使得 4^a >= target_K (向上取整)
+            3. 返回 K = min(4^a, candidate_count)
+
+        示例 (224×224, N=5461):
+            target_K = 0.25 × 5461 = 1365
+            4^5 = 1024 < 1365 < 4^6 = 4096
+            所以返回 K = 4096 (更接近预算上限)
+
+        这样在 Stage 1 不会选择所有 N 个 token，而是选择更高效的子集，
+        避免 K=N 导致的无 token 压缩和训练速度下降。
+        """
+        import math
+
+        # 计算目标 K (与 _get_dynamic_k_bounds 相同的尺度因子)
+        if image_size is not None:
+            H, W = image_size
+            min_dim = min(H, W)
+            scale_factor = math.sqrt(min_dim / K_ADAPTIVE_REFERENCE_SIZE)
+        else:
+            scale_factor = 1.0
+
+        target_K = K_COVERAGE_BASE * candidate_count * scale_factor
+
+        # 找到最小的 a 使得 4^a >= target_K (向上取整)
+        # a = ceil(log_4(target_K)) = ceil(log(target_K) / log(4))
+        if target_K <= 1:
+            a = 0
+        else:
+            a = math.ceil(math.log(target_K) / math.log(4))
+
+        # K = 4^a，但不超过 candidate_count
+        teacher_K = min(4 ** a, candidate_count)
+
+        # 确保至少有一些 token
+        teacher_K = max(teacher_K, 16)
+
+        return teacher_K
 
     def _estimate_optimal_k(
         self,
@@ -6287,6 +6381,19 @@ class GumbelTopKSplitter(
             # I131-1: 返回配额信息替代深度偏置
             'quota_probs': self.get_quota_probs().detach().cpu().tolist() if self.get_quota_probs() is not None else None,
         }
+
+    def get_total_tokens(self) -> int:
+        """
+        P-OPT: 获取上一个 batch 的实际 token 总数。
+
+        用于检测批量爆炸问题：
+        - 如果 total_tokens >> expected (如 2048)，可能导致 GPU 显存/计算瓶颈
+        - 在 RTX 4070 上，建议 total_tokens < 2048
+
+        Returns:
+            上一个 batch 进入 Transformer 的 token 总数
+        """
+        return self._last_total_tokens
 
     # ============================================================================
     # MetricsSplitter 接口实现 (I98-7)
