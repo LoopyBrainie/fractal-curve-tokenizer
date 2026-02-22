@@ -1521,8 +1521,10 @@ class FractalCurveViT(nn.Module):
         # P2-FIX: 计算实际的 depth_distribution 而非空字典
         # 基于 _prepare_auxiliary_output 中的逻辑，避免 GPU-CPU 同步
         # I162-1: 插件模式下也需要计算深度分布
+        # I182-FIX: 训练模式下跳过 GPU->CPU 转换以提升性能
+        # get_auxiliary_losses 不使用此参数，validate 仅在调试时执行
         depth_dist: Dict[int, float] = {}
-        if levels_list and len(levels_list) > 0:
+        if levels_list and len(levels_list) > 0 and not self.training:
             # 计算 batch 平均深度分布
             max_level_range = self.max_level + 1
             depth_counts = torch.zeros(batch_size, max_level_range, dtype=torch.long, device=lengths.device)

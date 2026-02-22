@@ -1880,6 +1880,21 @@ def train_epoch(
         exp_dir: 实验目录，用于保存 NaN/Inf 诊断日志
     """
     model.train()
+
+    # ====================================================================
+    # P-OPT: 在 epoch 级别缓存课程学习阶段，避免每个 batch 都查询
+    # I-CURRICULUM: 避免 GPU-CPU 同步开销
+    # ====================================================================
+    cached_curriculum_stage_in_epoch = 1  # 默认值
+    if epoch is not None and hasattr(model, 'get_curriculum_stage'):
+        try:
+            if hasattr(model, 'module'):
+                cached_curriculum_stage_in_epoch = model.module.get_curriculum_stage()
+            else:
+                cached_curriculum_stage_in_epoch = model.get_curriculum_stage()
+        except Exception:
+            pass  # 忽略错误，使用默认值
+
     # P11-8: 使用张量累加，延迟 .item() 调用到 epoch 结束
     total_loss = torch.tensor(0.0, device=device)
     correct = torch.tensor(0, device=device, dtype=torch.long)
@@ -2238,11 +2253,9 @@ def train_epoch(
                 # ====================================================================
                 base_aux_weight = aux_weight  # 配置文件中的原始权重
 
-                # 获取当前课程阶段
-                if hasattr(model, 'module'):
-                    curriculum_stage = model.module.get_curriculum_stage()
-                else:
-                    curriculum_stage = model.get_curriculum_stage()
+                # P-OPT: 使用 epoch 级别缓存的课程阶段，避免每个 batch 调用 get_curriculum_stage()
+                # I-CURRICULUM: 避免 GPU-CPU 同步开销
+                curriculum_stage = cached_curriculum_stage_in_epoch
 
                 # 三阶段独立权重配置
                 STAGE_TOKEN_WEIGHTS = {1: 0.0, 2: 0.0, 3: 1.0}
@@ -2523,13 +2536,10 @@ def train_epoch(
                 loss_val = loss.detach().item() * config.accum_steps
                 acc_val = 100. * correct.detach().item() / total if total > 0 else 0
 
-            # I-CURRICULUM: 从模型获取当前阶段（P-OPT 每20个batch才查询一次）
+            # P-OPT: 使用 epoch 级别缓存的课程阶段，避免 GPU-CPU 同步
+            # I-CURRICULUM: 每20个batch显示一次
             stage_name = {1: "TeacherForcing", 2: "AccDriven", 3: "ResourceCoadapt"}
-            # I182-FIX: 从模型获取而非依赖外部变量
-            if hasattr(model, 'module'):
-                curriculum_stage = model.module.get_curriculum_stage()
-            else:
-                curriculum_stage = model.get_curriculum_stage()
+            curriculum_stage = cached_curriculum_stage_in_epoch
             stage_str = stage_name.get(curriculum_stage, "Unknown")
 
             if profile and (i < 5 or i % 100 == 0):
