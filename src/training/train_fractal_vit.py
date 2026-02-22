@@ -2193,6 +2193,30 @@ def train_epoch(
                 # 组合权重
                 aux_weight = curriculum_factor * relative_weight
 
+                # === Loss Cold-start 机制 (I-COLDSTART) ===
+                # 前 15 个 Epoch 内，强制辅助损失权重为 0，让主干网络独立学习语义
+                cold_start_epochs = 15
+                warmup_epochs = 10
+                aux_weight_scaler = 0.0  # 默认关闭
+
+                if epoch > cold_start_epochs:
+                    # 15 轮后开始线性增长到 10%
+                    progress = min(1.0, (epoch - cold_start_epochs) / warmup_epochs)
+                    aux_weight_scaler = progress * 0.1  # 最多 10%
+
+                # === Dynamic Release 条件 ===
+                # 从 metrics 获取验证准确率，仅当 val_acc > 1.0% 时才释放全部权重
+                current_val_acc = getattr(config, '_current_val_acc', 0.0)
+                if current_val_acc > 1.0:
+                    aux_weight_scaler = min(aux_weight_scaler, 1.0)  # 释放全部
+
+                # 应用 scaler
+                aux_weight = aux_weight * aux_weight_scaler
+
+                # [I-COLDSTART] 调试日志：每10个batch打印权重缩放因子
+                if debug_mode and i % 10 == 0:
+                    print(f"[I-COLDSTART] epoch={epoch}, aux_weight_scaler={aux_weight_scaler:.3f}, aux_weight={aux_weight:.4f}")
+
                 # P-OPT: 仅在调试模式检查 NaN/Inf，避免 GPU-CPU 同步
                 if debug_mode:
                     if torch.isnan(splitter_loss_f32) or torch.isinf(splitter_loss_f32):
@@ -3735,7 +3759,10 @@ def main():
 
     # I145: TrainingConfig 不再接收 K_min/K_max（第二层参数由模型动态计算）
     config = TrainingConfig(args, arch_config)
-    
+
+    # [I-COLDSTART] 初始化验证准确率供 Cold-start 机制使用
+    config._current_val_acc = 0.0
+
     # 创建 Tokenizer (默认使用 GumbelTopKSplitter - Scheme D)
     from vit_pytorch.modules.tokenizer import StreamingFractalTokenizerV3
 
@@ -4755,7 +4782,10 @@ def main():
             model, val_loader, device, config.use_amp, spec.num_classes,
             use_channels_last=config.use_channels_last
         )
-        
+
+        # === Loss Cold-start: 更新验证准确率供下一轮训练使用 ===
+        config._current_val_acc = val_acc
+
         # P14: 类别平衡分析
         class_balance_report = analyze_class_balance(per_class_stats, epoch, verbose=True)
         

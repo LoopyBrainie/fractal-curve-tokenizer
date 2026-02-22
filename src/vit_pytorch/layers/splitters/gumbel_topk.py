@@ -75,6 +75,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+
 # I12-7: 从 constants 统一导入数值稳定性常量
 # I24-2: 导入方案E可学习配额常量
 # I23-1: 导入深度方差归一化常量
@@ -1312,6 +1313,15 @@ class GumbelTopKSplitter(
             nn.Linear(intermediate_dim, 1),
         )
 
+        # === SAT-DEFENSE: Zero-Init 最后一层 ===
+        # 确保训练初期所有深度层级的 Logits 严格相等
+        # 防止 Batch 0 巨量梯度将 Splitter 推向饱和区
+        if self.complexity_mlp:
+            last_layer = self.complexity_mlp[-1]
+            if isinstance(last_layer, nn.Linear):
+                nn.init.zeros_(last_layer.weight)
+                nn.init.zeros_(last_layer.bias)
+
         # I30-17-EXT: 深度嵌入使用上界维度
         # I20: 深度嵌入维度基于信息论下界自适应选择
         # 数学: E = max(4, min(8, ceil(log2(D)))) 确保 E >= log2(D)
@@ -2504,9 +2514,11 @@ class GumbelTopKSplitter(
         roi_flat = roi_features.flatten(1)  # [B*N, C*k*k]
         complexity_logits = self.complexity_mlp(roi_flat).squeeze(-1)  # [B*N]
         complexity_logits = complexity_logits.view(B, N)  # [B, N]
-        # I23-4: Clamp MLP 输出，防止归一化后数值溢出
-        # 数学: logits ∈ [-10, 10] 确保 sigmoid ∈ [4.5e-5, 0.99995]，梯度健康
-        complexity_logits = complexity_logits.clamp(-10.0, 10.0)
+        # === SAT-DEFENSE: Logits 约束 ===
+        # 收紧 clamp 范围从 [-10, 10] 到 [-5, 5]
+        # 防止梯度冲击导致 Logits 进入激活函数死区
+        # 数学: logits ∈ [-5, 5] 确保 sigmoid ∈ [0.0067, 0.9933]
+        complexity_logits = complexity_logits.clamp(-5.0, 5.0)
         
         # ====================================================================
         # I23-1 方案C: 深度方差归一化 (核心修复)
@@ -2550,6 +2562,13 @@ class GumbelTopKSplitter(
                   + self.explore_bias
                   - taus.unsqueeze(0))
         
+        # === SAT-DEFENSE: 梯度平滑 ===
+        # 在 logits 上注册梯度缩放 Hook，反向传播时乘 0.1
+        # 降低 Splitter 对 Batch 0 巨量梯度的敏感度
+        def _grad_scale_hook(grad):
+            return grad * 0.1
+        logits.register_hook(_grad_scale_hook)
+
         # 分割概率 (I18-5: 使用 TEMPERATURE_MIN 常量)
         T = self.log_temperature.exp().clamp(min=TEMPERATURE_MIN)
         probs = torch.sigmoid(logits / T)
@@ -2637,7 +2656,7 @@ class GumbelTopKSplitter(
         image_size: Optional[Tuple[int, int]] = None,
     ) -> int:
         """
-        估计最优 K 值 (信息熵驱动版本)。
+        估计最优 K 值 (信息熵驱动版本) - Mask STE 实现
 
         数学形式化:
             方法 1 (熵驱动): K = H / H_max × N × α
@@ -2652,22 +2671,45 @@ class GumbelTopKSplitter(
             - 低熵图像 (H/H_max ≈ 0.1): 图像简单，可以减少token
             - 典型值: K ≈ 32-64 (N=256, H/H_max≈0.3-0.5, α=0.4)
 
-        Args:
-            probs: [B, N] 分割概率
-            image_size: 图像尺寸 (H, W)，用于自适应覆盖率
-
         Returns:
             K: 最优 token 数量 (整数，用于索引)
         """
         import math
 
-        # I170-1: 使用可微版本估计 K，保留梯度
+        # I170-MASK-STE: 使用可微版本估计 K
         K_float = self._estimate_optimal_k_diff(probs, image_size)
-        # 缓存浮点 K 值用于梯度追溯
-        self._cached_K_float = K_float.detach() if K_float.requires_grad else K_float
-        # 转换为整数用于索引
-        K = int(K_float.detach().item() if K_float.numel() == 1 else K_float.detach().mean().item())
-        return K
+
+        # ========== Mask STE 核心实现 ==========
+        # 步骤 1: 计算整数 K（仅用于索引，前向传播用）
+        # 注意: .item() 在这里使用是安全的，因为我们已经构建了替代梯度路径
+        K_int = int(K_float.item())
+
+        # 边界检查
+        B, N = probs.shape
+        if self.use_dynamic_k:
+            K_min, K_max = self._get_dynamic_k_bounds(N, image_size)
+        else:
+            K_min, K_max = self.K_min, self.K_max
+        K_min = max(K_min, 16)
+        K_int = max(K_min, min(K_max, K_int))
+
+        # 步骤 2: 获取 Top-K 索引（不可微，但这是前向传播，允许）
+        topk_probs, topk_indices = torch.topk(probs, k=K_int, dim=-1)
+
+        # 步骤 3: 构建 Hard Mask（0 和 1 组成的张量）
+        mask_hard = torch.zeros_like(probs).scatter_(dim=-1, index=topk_indices, value=1.0)
+
+        # 步骤 4: 🌟 掩码 STE 注入 🌟
+        # 前向传播时是 0/1 掩码
+        # 反向传播时梯度流向 probs（进而流向 quota_logits 和 log_temperature）
+        mask_ste = (mask_hard - probs).detach() + probs
+
+        # 步骤 5: 🌟 极其关键 - 缓存 mask_ste 供外部使用 🌟
+        # 这一步让主干网络的 CrossEntropy 梯度能够沿着掩码回传给 Splitter
+        self._cached_K_float = K_float  # 保留浮点 K 用于调试
+        self._cached_mask_ste = mask_ste  # Mask STE 用于梯度流
+
+        return K_int
 
     def _estimate_optimal_k_diff(
         self,
@@ -2695,9 +2737,11 @@ class GumbelTopKSplitter(
         probs_clamped = probs.clamp(min=1e-8)
         # H = -Σ p_i * log(p_i), 对每个batch计算后取平均
         entropy = -(probs * probs_clamped.log()).sum(dim=1).mean()
-        H_max = math.log(N)  # 最大熵
+        # I170-GRADIENT-FIX: H_max 转为 Tensor 保持计算图
+        H_max = math.log(N)  # 最大熵 (Python float)
+        H_max_tensor = torch.tensor(H_max, device=probs.device, dtype=entropy.dtype)
         scale_factor = 0.4  # 经验缩放因子
-        k_entropy = (entropy / H_max) * N * scale_factor
+        k_entropy = (entropy / H_max_tensor) * N * scale_factor  # 梯度流保持完整
 
         # ========== 方法 2: 70% 累积概率截断 (保底) ==========
         # 注意: sort 操作在 no_grad 中执行是安全的，因为索引操作本身不可微
