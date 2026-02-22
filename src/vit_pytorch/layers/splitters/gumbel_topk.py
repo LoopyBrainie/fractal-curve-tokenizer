@@ -2445,6 +2445,8 @@ class GumbelTopKSplitter(
             # 构建 Top-K 掩码 (不是全 1，只选 K 个)
             # 不需要 STE，因为 Stage 1 不更新 Splitter
             if effective_indices is not None and effective_indices.shape[0] < N:
+                # P-FIX: 确保 effective_indices 与 probs 在同一设备上
+                effective_indices = effective_indices.to(probs.device)
                 # 使用过滤后的概率
                 filtered_probs = probs[:, effective_indices]
                 _, topk_local = torch.topk(filtered_probs, k=min(K, filtered_probs.shape[1]), dim=-1)
