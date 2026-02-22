@@ -645,7 +645,7 @@ class ModularTrainer:
                         # torch.compile + AMP 可能导致梯度为 FP16，GradScaler 需要 FP32 梯度
                         for param in self.model.parameters():
                             if param.grad is not None and param.grad.dtype == torch.float16:
-                                param.grad = param.grad.detach().clone().float()
+                                param.grad.data = param.grad.data.float()
                         self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
