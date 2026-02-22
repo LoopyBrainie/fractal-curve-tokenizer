@@ -2365,13 +2365,12 @@ def train_epoch(
                 print(f"[Grad Ratio INFO] Splitter 梯度是 Backbone 的 {gradient_ratio:.1f} 倍 (正常范围: 2-50x)")
 
         if (i + 1) % config.accum_steps == 0:
-            # P-OPT: torch.compile + AMP 可能导致梯度 dtype 与参数不匹配
-            # 修复: "Attempting to unscale FP16 gradients" 错误
+            # P-OPT: torch.compile + AMP 可能导致梯度为 FP16
+            # GradScaler.unscale_() 需要 FP32 梯度，修复: "Attempting to unscale FP16 gradients" 错误
             for param in model.parameters():
-                if param.grad is not None:
-                    # 确保梯度 dtype 与参数 dtype 匹配
-                    if param.grad.dtype != param.dtype:
-                        param.grad = param.grad.to(param.dtype)
+                if param.grad is not None and param.grad.dtype == torch.float16:
+                    # 正确方式：创建新的 FP32 梯度张量并替换
+                    param.grad = param.grad.detach().clone().float()
             scaler.unscale_(optimizer)
 
             # P-OPT: 首层梯度监控与动态裁剪
