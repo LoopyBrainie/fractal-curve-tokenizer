@@ -4824,10 +4824,14 @@ class GumbelTopKSplitter(
             # === Token 效率损失 (基于 TrainingStats 传递的实际 token 数) ===
             # L_efficiency = max(0, K - K_budget)² / N
             # 鼓励模型使用不超过预算的 token 数量
-            if actual_token_count is not None and actual_token_count > 0:
+            # I182: 修复 Tensor 布尔值检查错误
+            token_count_val = actual_token_count
+            if isinstance(token_count_val, torch.Tensor):
+                token_count_val = token_count_val.item() if token_count_val.nelement() == 1 else float(token_count_val.sum())
+            if token_count_val is not None and token_count_val > 0:
                 token_budget = getattr(self, '_token_budget', 128)
                 # 使用传入的 actual_token_count 而非内部缓存
-                actual_tokens = float(actual_token_count)
+                actual_tokens = float(token_count_val)
                 # 相对误差: diff / N
                 eff_diff = (avg_tokens - token_budget) / float(candidate_count)
                 eff_diff = eff_diff.clamp(min=0.0)  # 只惩罚超过预算的情况
