@@ -2078,8 +2078,10 @@ def train_epoch(
                 outs_has_inf = torch.isinf(outs).any()
                 if outs_has_nan or outs_has_inf:
                     nan_count += 1
+                    warn_msg = f"Logits NaN/Inf (batch {i})"
+                    epoch_warnings.append(warn_msg)
                     if nan_count <= 3:
-                        print(f"\n[WARN] Logits 包含 NaN/Inf (batch {i}), 跳过此 batch")
+                        print(f"\n[WARN] {warn_msg}, 跳过此 batch")
                         report = diagnose_nan_inf(
                             batch_idx=i,
                             imgs=imgs,
@@ -2214,7 +2216,9 @@ def train_epoch(
                 # P-OPT: 仅在调试模式检查 NaN/Inf，避免 GPU-CPU 同步
                 if debug_mode:
                     if torch.isnan(entropy_loss_f32) or torch.isinf(entropy_loss_f32):
-                        print(f"[WARN] entropy_loss 为 NaN/Inf: {entropy_loss_f32.item()}")
+                        warn_msg = f"entropy_loss NaN/Inf: {entropy_loss_f32.item()}"
+                        epoch_warnings.append(warn_msg)
+                        print(f"[WARN] {warn_msg}")
                         entropy_loss = None  # 跳过该损失
                     else:
                         loss = loss + entropy_loss_f32 / config.accum_steps
@@ -2278,11 +2282,15 @@ def train_epoch(
                 # P-OPT: 仅在调试模式检查 NaN/Inf，避免 GPU-CPU 同步
                 if debug_mode:
                     if torch.isnan(splitter_loss_f32) or torch.isinf(splitter_loss_f32):
-                        print(f"[WARN] splitter_loss 为 NaN/Inf: {splitter_loss_f32.item()}")
+                        warn_msg = f"splitter_loss NaN/Inf: {splitter_loss_f32.item()}"
+                        epoch_warnings.append(warn_msg)
+                        print(f"[WARN] {warn_msg}")
                         splitter_loss = None  # 跳过该损失
                     elif splitter_loss_f32.abs() > 1000:
                         # [Loss诊断] 检测异常大的 splitter_loss
-                        print(f"[WARN] splitter_loss 异常大: {splitter_loss_f32.item():.2f}, 将被裁剪")
+                        warn_msg = f"splitter_loss 异常: {splitter_loss_f32.item():.2f}"
+                        epoch_warnings.append(warn_msg)
+                        print(f"[WARN] {warn_msg}, 将被裁剪")
                         splitter_loss_f32 = splitter_loss_f32.clamp(min=-100, max=100)
                         loss = loss + splitter_loss_f32 * aux_weight / config.accum_steps
                     else:
@@ -2301,7 +2309,9 @@ def train_epoch(
                     # P-OPT: 仅在调试模式检查 NaN/Inf，避免 GPU-CPU 同步
                     if debug_mode:
                         if torch.isnan(semantic_loss_f32).any() or torch.isinf(semantic_loss_f32).any():
-                            print(f"[WARN] semantic_loss 包含 NaN/Inf，跳过此损失")
+                            warn_msg = "semantic_loss NaN/Inf"
+                            epoch_warnings.append(warn_msg)
+                            print(f"[WARN] {warn_msg}, 跳过此损失")
                         else:
                             semantic_weight = getattr(config, 'semantic_loss_weight', 0.1)
                             loss = loss + semantic_loss_f32.mean() * semantic_weight / config.accum_steps
@@ -2318,7 +2328,9 @@ def train_epoch(
 
         # [Loss诊断] 检查总 loss 是否异常大
         if loss.abs() > 100:
-            print(f"[WARN] total loss 异常大: {loss.item()*config.accum_steps:.2f}, 将被裁剪")
+            warn_msg = f"total_loss 异常: {loss.item()*config.accum_steps:.2f}"
+            epoch_warnings.append(warn_msg)
+            print(f"[WARN] {warn_msg}, 将被裁剪")
             loss = loss.clamp(min=-50, max=50)
 
         # P-OPT: 仅在调试模式检查 loss NaN/Inf，避免 GPU-CPU 同步
@@ -2326,8 +2338,10 @@ def train_epoch(
         if debug_mode:
             if torch.isnan(loss) or torch.isinf(loss):
                 nan_count += 1
+                warn_msg = f"total_loss NaN/Inf (batch {i})"
+                epoch_warnings.append(warn_msg)
                 if nan_count <= 3:
-                    print(f"\n[WARN] Loss 为 NaN/Inf (batch {i}), 跳过此 batch")
+                    print(f"\n[WARN] {warn_msg}, 跳过此 batch")
                     report = diagnose_nan_inf(
                         batch_idx=i,
                         imgs=imgs,
@@ -4646,7 +4660,13 @@ def main():
         model.splitter.enable_feature_analysis(enabled=True, sample_interval=10)
         print(f"[INFO] Splitter 特征分析已启用 (前10个epoch)")
 
+    # P-DEBUG: 收集 epoch 级别的警告用于调试
+    epoch_warnings = []
+
     for epoch in range(1, config.epochs + 1):
+        # 每个 epoch 开始时清空警告列表
+        epoch_warnings.clear()
+
         print(f"\n{'='*60}")
         print(f"EPOCH {epoch}/{config.epochs} - STARTING")
         print(f"{'='*60}")
@@ -4898,7 +4918,7 @@ def main():
                     scale_distribution = model.tokenizer.compute_scale_distribution(sample_imgs)
         
         epoch_time = time.time() - start
-        
+
         # 记录历史
         history_entry = {
             'epoch': epoch,
@@ -4908,6 +4928,7 @@ def main():
             'val_acc': val_acc,
             'lr': optimizer.param_groups[0]['lr'],
             'time': epoch_time,
+            'warnings': list(epoch_warnings),  # P-DEBUG: 记录本 epoch 的警告
         }
         if training_stats is not None:
             history_entry['training_stats'] = training_stats

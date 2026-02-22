@@ -2864,12 +2864,29 @@ class GumbelTopKSplitter(
             - 典型值: K ≈ 32-64 (N=256, H/H_max≈0.3-0.5, α=0.4)
 
         Returns:
-            K: 最优 token 数量 (整数，用于索引)
+            K: 最优 token 数量 (整数，用于索引）
         """
         import math
 
         # I170-MASK-STE: 使用可微版本估计 K
         K_float = self._estimate_optimal_k_diff(probs, image_size)
+
+        # P-NAN-GUARD: 检测 NaN 并使用安全默认值
+        if torch.isnan(K_float) or torch.isinf(K_float):
+            B, N = probs.shape
+            if self.use_dynamic_k:
+                K_min, K_max = self._get_dynamic_k_bounds(N, image_size)
+            else:
+                K_min, K_max = self.K_min, self.K_max
+            K_safe = max(K_min, 32)  # 使用安全的默认值 32
+            K_float = torch.tensor(K_safe, device=probs.device, dtype=K_float.dtype)
+            # 记录警告（仅在前几次时）
+            if not hasattr(self, '_nan_warn_count'):
+                self._nan_warn_count = 0
+            if self._nan_warn_count < 3:
+                import warnings
+                warnings.warn(f"[WARN] K_float NaN/Inf detected, using safe default K={K_safe}")
+                self._nan_warn_count += 1
 
         # ========== Mask STE 核心实现 ==========
         # 步骤 1: 计算整数 K（仅用于索引，前向传播用）
@@ -2923,6 +2940,11 @@ class GumbelTopKSplitter(
         import math
 
         B, N = probs.shape
+
+        # P-NAN-GUARD: 检查输入 probs 是否有效
+        if torch.isnan(probs).any() or torch.isinf(probs).any():
+            # 用均匀分布替换无效概率
+            probs = torch.ones_like(probs) / N
 
         # ========== 方法 1: 信息熵驱动 K 估计 (可微) ==========
         # 计算分裂概率的熵
