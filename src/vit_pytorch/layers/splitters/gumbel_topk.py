@@ -2407,6 +2407,7 @@ class GumbelTopKSplitter(
         # ====================================================================
         # 三阶段课程学习控制 (I-CURRICULUM)
         # Stage 1: Teacher Forcing - 冻结 Splitter，保留所有 Token
+        # P-OPT: 提前返回以避免不必要的计算
         # ====================================================================
         if self._curriculum_stage == 1:
             # 🌟 强制使用所有候选区域，给 Backbone 最大信息量
@@ -2419,20 +2420,50 @@ class GumbelTopKSplitter(
             # 缓存供后续使用
             self._cached_mask_ste = mask_ste
 
-            # 创建 topk_indices（用于返回值）
-            topk_indices = torch.arange(N, device=logits.device).unsqueeze(0).expand(B, -1)
+            # P-OPT: 复用缓存的索引，避免每次创建新 tensor
+            # 形状必须是 [B, K] = [B, N]，与 _build_result 期望一致
+            if not hasattr(self, '_cached_full_topk_indices') or self._cached_full_topk_indices.shape[0] != B:
+                self._cached_full_topk_indices = torch.arange(N, device=probs.device, dtype=torch.long).unsqueeze(0).expand(B, -1)
+            topk_indices = self._cached_full_topk_indices
 
-            # 跳过后续的动态 K 计算和 Top-K 选择
-            # 直接跳转到 Step 3 (mask 应用)
-            # 注意：需要设置 selected_mask 供后续使用
+            # P-OPT: Stage 1 提前构建结果，跳过 _build_result 中的复杂逻辑
+            # 因为所有 token 都被选中，直接构建结果即可
             selected_mask = mask_ste
 
-            # 直接返回结果（需要继续执行到 return 前的代码）
-            # 为了保持代码结构，这里不提前返回，而是跳过动态选择逻辑
-            # 设置标记让后续代码跳过
-            _skip_dynamic_selection = True
-        else:
-            _skip_dynamic_selection = False
+            # P-OPT: Stage 1 简化结果构建，跳过区域坐标计算
+            # 由于返回全 1 mask，调用者会使用所有特征，不需要 regions 等信息
+            # 构建基础的选中索引
+            all_indices_1d = torch.arange(N, device=features.device, dtype=torch.long)
+            batch_idx = torch.arange(B, device=features.device, dtype=torch.long).unsqueeze(1).expand(B, N)
+
+            # 直接构建结果对象（跳过 _build_result 中的复杂处理）
+            result = GumbelTopKResult(
+                regions=torch.zeros(N * B, 4, dtype=torch.long, device=features.device),  # [M, 4] - dummy
+                depths=torch.zeros(N * B, dtype=torch.long, device=features.device),  # [M] - dummy
+                batch_indices=batch_idx.reshape(-1),  # [M]
+                hilbert_indices=all_indices_1d.unsqueeze(0).expand(B, -1).reshape(-1),  # [M]
+                selected_mask=selected_mask,
+                logits=logits,
+                probs=probs,
+                candidate_indices=all_indices_1d.unsqueeze(0).expand(B, -1).reshape(-1),  # [M]
+                num_selected_per_batch=torch.full((B,), N, dtype=torch.long, device=features.device),
+            )
+
+            # 缓存用于辅助损失
+            self._last_probs = probs.detach()
+            self._last_probs_for_loss = probs
+            self._last_selected_mask = selected_mask.detach()
+            self._last_selected_mask_for_loss = selected_mask
+            self._last_num_selected_for_loss = float(N)
+
+            # 缓存 quota loss（Stage 1 不更新 splitter，设为 None）
+            self._last_quota_loss = None
+
+            # 更新统计
+            with torch.no_grad():
+                self._avg_selected = 0.9 * self._avg_selected + 0.1 * N
+
+            return result
 
         # Step 2: Gumbel-Top-K 选择
         # I24-2: 使用分层 Top-K (方案E) 或全局 Top-K (传统方案)
