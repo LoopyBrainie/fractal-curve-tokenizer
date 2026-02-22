@@ -2143,15 +2143,17 @@ def train_epoch(
                     splitter_features = model.tokenizer.shared_conv(imgs)
 
                 if hasattr(splitter, 'get_auxiliary_losses'):
-                    # I142: 不再需要传递 actual_token_count，splitter 内部使用 _avg_selected 进行崩溃检测
-                    # 这避免了训练循环中的 .item() 调用导致的 CPU 同步
+                    # 传递 TrainingStats 中的 num_tokens 和 depth_distribution 到 Splitter
+                    # 这样 Splitter 可以直接使用实际统计信息进行效率优化
                     aux_losses = splitter.get_auxiliary_losses(
                         features=splitter_features,
                         image_size=(imgs.shape[2], imgs.shape[3]),
                         include_elastic_budget=config.include_elastic_budget,
                         include_soft_entropy=config.include_soft_entropy,
                         batch_size=imgs.shape[0],
-                        # I142: 移除 actual_token_count 参数，使用内部缓存值
+                        # 传递 TrainingStats 数据以增强辅助损失计算
+                        actual_token_count=getattr(stats, 'num_tokens', None),
+                        depth_distribution=getattr(stats, 'depth_distribution', None),
                         entropy_target=config.soft_entropy_target,
                         entropy_weight=config.soft_entropy_weight,
                         entropy_mode=config.soft_entropy_mode,
@@ -2220,8 +2222,28 @@ def train_epoch(
                 # Stage 1 (Epoch 1-9): Teacher Forcing - aux_weight = 0
                 # Stage 2 (Epoch 10-19): Acc-Driven - aux_weight = 0
                 # Stage 3 (Epoch 20+): Resource Co-adaptation - Linear Warmup
+                #
+                # 三阶段独立权重配置:
+                #   Stage 1: token_weight=0.0, entropy_weight=0.0 (纯分类学习)
+                #   Stage 2: token_weight=0.0, entropy_weight=0.0 (纯分类学习)
+                #   Stage 3: token_weight=1.0, entropy_weight=0.1 (资源共适应)
                 # ====================================================================
                 base_aux_weight = aux_weight  # 配置文件中的原始权重
+
+                # 获取当前课程阶段
+                if hasattr(model, 'module'):
+                    curriculum_stage = model.module.get_curriculum_stage()
+                else:
+                    curriculum_stage = model.get_curriculum_stage()
+
+                # 三阶段独立权重配置
+                STAGE_TOKEN_WEIGHTS = {1: 0.0, 2: 0.0, 3: 1.0}
+                STAGE_ENTROPY_WEIGHTS = {1: 0.0, 2: 0.0, 3: 0.1}
+
+                # 获取当前阶段的权重
+                stage_token_w = STAGE_TOKEN_WEIGHTS.get(curriculum_stage, 0.0)
+                stage_entropy_w = STAGE_ENTROPY_WEIGHTS.get(curriculum_stage, 0.0)
+                stage_max_weight = max(stage_token_w, stage_entropy_w)
 
                 # Stage 1 & 2: 完全关闭资源惩罚
                 if epoch < 20:
@@ -2232,15 +2254,12 @@ def train_epoch(
                     current_val_acc = getattr(config, '_current_val_acc', 0.0)
                     if current_val_acc < 5.0:
                         current_aux_weight = 0.0
-                        if hasattr(model, 'module'):
-                            stage = model.module.get_curriculum_stage()
-                        else:
-                            stage = model.get_curriculum_stage()
-                        print(f"[CURRICULUM] Stage {stage} 保护锁: val_acc={current_val_acc:.2f}% < 5%, 资源权重=0")
+                        print(f"[CURRICULUM] Stage {curriculum_stage} 保护锁: val_acc={current_val_acc:.2f}% < 5%, 资源权重=0")
                     else:
                         # 严格的线性 Warmup: 前 10 个 epoch 从 0 增长到目标值
                         warmup_progress = min(1.0, (epoch - 20) / 10.0)
-                        current_aux_weight = base_aux_weight * warmup_progress
+                        # 应用阶段权重和 warmup
+                        current_aux_weight = base_aux_weight * warmup_progress * stage_max_weight
 
                 # 直接覆盖 aux_weight（不再使用基于比例的缩放）
                 aux_weight = current_aux_weight

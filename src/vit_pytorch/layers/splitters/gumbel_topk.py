@@ -4645,6 +4645,7 @@ class GumbelTopKSplitter(
         include_soft_entropy: bool = True,
         batch_size: int = 1,
         actual_token_count: Optional[int] = None,
+        depth_distribution: Optional[Dict[int, float]] = None,
         entropy_target: Optional[float] = None,
         entropy_weight: float = 0.1,
         entropy_mode: str = 'maximize',
@@ -4681,7 +4682,8 @@ class GumbelTopKSplitter(
             include_elastic_budget: 是否包含弹性预算损失 (相对覆盖率版本)
             include_soft_entropy: 是否包含软熵损失
             batch_size: batch 大小
-            actual_token_count: 实际 token 数 (用于相对崩溃检测)
+            actual_token_count: 实际 token 数 (用于 token 效率损失计算)
+            depth_distribution: 深度分布字典 (用于深度分布正则化)
             entropy_target: 熵目标值 (target mode)
             entropy_weight: 熵损失权重
             entropy_mode: 'maximize' 或 'target'
@@ -4818,6 +4820,19 @@ class GumbelTopKSplitter(
             loss = loss + boundary_penalty
 
             losses['elastic_budget_loss'] = loss
+
+            # === Token 效率损失 (基于 TrainingStats 传递的实际 token 数) ===
+            # L_efficiency = max(0, K - K_budget)² / N
+            # 鼓励模型使用不超过预算的 token 数量
+            if actual_token_count is not None and actual_token_count > 0:
+                token_budget = getattr(self, '_token_budget', 128)
+                # 使用传入的 actual_token_count 而非内部缓存
+                actual_tokens = float(actual_token_count)
+                # 相对误差: diff / N
+                eff_diff = (avg_tokens - token_budget) / float(candidate_count)
+                eff_diff = eff_diff.clamp(min=0.0)  # 只惩罚超过预算的情况
+                token_efficiency_loss = eff_diff.pow(2) * 0.1  # 权重 0.1
+                losses['token_efficiency_loss'] = token_efficiency_loss
 
             # === 崩溃检测 ===
             # I142: 使用内部缓存的 _avg_selected 值
