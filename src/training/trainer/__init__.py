@@ -642,6 +642,10 @@ class ModularTrainer:
             if (batch_idx + 1) % self.config.accumulation_steps == 0:
                 if self.config.gradient_clip_norm:
                     if self.scaler:
+                        # torch.compile + AMP 可能导致梯度为 FP16，转换为 FP32
+                        for param in self.model.parameters():
+                            if param.grad is not None and param.grad.dtype == torch.float16:
+                                param.grad = param.grad.float()
                         self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
