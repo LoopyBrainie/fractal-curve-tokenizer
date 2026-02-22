@@ -1104,40 +1104,42 @@ class CUB200Trainer:
                     loss, loss_stats = self.compute_loss(logits, labels)
 
                 # I142-1: 添加 splitter 辅助损失（与 train_fractal_vit.py 对齐）
-                # 计算分割器辅助损失（弹性预算、软熵、token 效率等）
+                # P-OPT: 预先计算 aux_weight，如果为 0 则跳过 splitter_loss 计算
                 # I-CURRICULUM: 三阶段课程学习权重控制
                 #   Stage 1-2: aux_weight = 0 (纯分类学习)
                 #   Stage 3: aux_weight = warmup * max_weight (资源共适应)
-                splitter_loss = self._compute_splitter_loss(imgs, stats)
-                if splitter_loss is not None:
-                    # 获取课程阶段
-                    curriculum_stage = 1
-                    if hasattr(self.model, 'get_curriculum_stage'):
-                        curriculum_stage = self.model.get_curriculum_stage()
-                    elif hasattr(self.model, 'tokenizer') and hasattr(self.model.tokenizer, 'get_curriculum_stage'):
-                        curriculum_stage = self.model.tokenizer.get_curriculum_stage()
+                # 获取课程阶段
+                curriculum_stage = 1
+                if hasattr(self.model, 'get_curriculum_stage'):
+                    curriculum_stage = self.model.get_curriculum_stage()
+                elif hasattr(self.model, 'tokenizer') and hasattr(self.model.tokenizer, 'get_curriculum_stage'):
+                    curriculum_stage = self.model.tokenizer.get_curriculum_stage()
 
-                    # 三阶段独立权重配置
-                    STAGE_TOKEN_WEIGHTS = {1: 0.0, 2: 0.0, 3: 1.0}
-                    STAGE_ENTROPY_WEIGHTS = {1: 0.0, 2: 0.0, 3: 0.1}
-                    stage_max_weight = max(
-                        STAGE_TOKEN_WEIGHTS.get(curriculum_stage, 0.0),
-                        STAGE_ENTROPY_WEIGHTS.get(curriculum_stage, 0.0)
-                    )
+                # 三阶段独立权重配置
+                STAGE_TOKEN_WEIGHTS = {1: 0.0, 2: 0.0, 3: 1.0}
+                STAGE_ENTROPY_WEIGHTS = {1: 0.0, 2: 0.0, 3: 0.1}
+                stage_max_weight = max(
+                    STAGE_TOKEN_WEIGHTS.get(curriculum_stage, 0.0),
+                    STAGE_ENTROPY_WEIGHTS.get(curriculum_stage, 0.0)
+                )
 
-                    # I-CURRICULUM 权重控制
-                    if epoch < 20:
+                # I-CURRICULUM 权重控制 - 预先计算
+                if epoch < 20:
+                    aux_weight = 0.0
+                else:
+                    # 保护锁：val_acc < 5% 时不施加资源惩罚
+                    val_acc = getattr(self, '_current_val_acc', 0.0)
+                    if val_acc < 5.0:
                         aux_weight = 0.0
                     else:
-                        # 保护锁：val_acc < 5% 时不施加资源惩罚
-                        val_acc = getattr(self, '_current_val_acc', 0.0)
-                        if val_acc < 5.0:
-                            aux_weight = 0.0
-                        else:
-                            warmup_progress = min(1.0, (epoch - 20) / 10.0)
-                            aux_weight = warmup_progress * stage_max_weight
+                        warmup_progress = min(1.0, (epoch - 20) / 10.0)
+                        aux_weight = warmup_progress * stage_max_weight
 
-                    loss = loss + splitter_loss * aux_weight
+                # P-OPT: 仅在 aux_weight > 0 时计算 splitter_loss
+                if aux_weight > 0:
+                    splitter_loss = self._compute_splitter_loss(imgs, stats)
+                    if splitter_loss is not None:
+                        loss = loss + splitter_loss * aux_weight
 
                 # 累积归一化
                 loss = loss * scale_factor

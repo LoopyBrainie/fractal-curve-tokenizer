@@ -2064,7 +2064,8 @@ def train_epoch(
                 outs = stats.logits if hasattr(stats, 'logits') else stats
 
             # I145: 验证 TrainingStats 字段类型
-            if hasattr(stats, 'validate'):
+            # P-OPT: 仅在调试模式执行验证，避免 GPU-CPU 同步和 torch.compile 干扰
+            if debug_mode and hasattr(stats, 'validate'):
                 stats.validate()
 
             if debug_mode and i == 0 and use_mixup:
@@ -2223,69 +2224,52 @@ def train_epoch(
                     loss = loss + entropy_loss_f32 / config.accum_steps
                     entropy_loss_sum = entropy_loss_sum + entropy_loss_f32.detach()
                     entropy_loss_count += 1
-            if splitter_loss is not None:
+            # P-OPT: 提前计算 I-CURRICULUM 权重，如果 aux_weight=0 则跳过 splitter_loss 计算
+            # 这避免了不必要的 GPU 计算和 .item() 同步开销
+            # ====================================================================
+            # I-CURRICULUM: 三阶段课程学习 Loss 控制
+            # Stage 1 (Epoch 1-9): Teacher Forcing - aux_weight = 0
+            # Stage 2 (Epoch 10-19): Acc-Driven - aux_weight = 0
+            # Stage 3 (Epoch 20+): Resource Co-adaptation - Linear Warmup
+            # ====================================================================
+            # 预先计算当前阶段的权重
+            curriculum_stage = cached_curriculum_stage_in_epoch
+            STAGE_TOKEN_WEIGHTS = {1: 0.0, 2: 0.0, 3: 1.0}
+            STAGE_ENTROPY_WEIGHTS = {1: 0.0, 2: 0.0, 3: 0.1}
+            stage_token_w = STAGE_TOKEN_WEIGHTS.get(curriculum_stage, 0.0)
+            stage_entropy_w = STAGE_ENTROPY_WEIGHTS.get(curriculum_stage, 0.0)
+            stage_max_weight = max(stage_token_w, stage_entropy_w)
+
+            # 预先计算 current_aux_weight
+            base_ratio = getattr(config, 'aux_loss_relative_ratio', 0.1)  # 移到外层作用域
+            if epoch < 20:
+                current_aux_weight = 0.0
+            else:
+                # Stage 3: Resource Co-adaptation
+                current_val_acc = getattr(config, '_current_val_acc', 0.0)
+                if current_val_acc < 5.0:
+                    current_aux_weight = 0.0
+                else:
+                    warmup_progress = min(1.0, (epoch - 20) / 10.0)
+                    current_aux_weight = base_ratio * warmup_progress * stage_max_weight
+
+            # P-OPT: 仅在 aux_weight > 0 时计算 splitter_loss，避免不必要的 GPU-CPU 同步
+            if splitter_loss is not None and current_aux_weight > 0:
                 splitter_loss_f32 = splitter_loss.float()
 
-                # 相对权重机制：辅助损失始终是 CE loss 的 base_ratio 倍
-                # 公式: relative_weight = base_ratio × CE_loss.item()
-                # 这样确保辅助损失不会掩盖主任务的梯度
-                base_ratio = getattr(config, 'aux_loss_relative_ratio', 0.1)  # 默认 10%
-                ce_loss_scale = ce_loss.detach().mean().item() if ce_loss.numel() > 0 else 1.0
-                relative_weight = base_ratio * max(ce_loss_scale, 0.5)  # 最小值保护
+                # P-OPT: 使用张量计算 ce_loss_scale，避免 .item() 同步
+                # 相对权重: relative_weight = base_ratio × CE_loss (张量)
+                ce_loss_mean = ce_loss.detach().mean()  # 保持在 GPU 上
+                relative_weight = base_ratio * torch.clamp(ce_loss_mean, min=0.5)
 
-                # 获取课程因子（已在 warmup 逻辑中计算）
+                # 获取课程因子
                 curriculum_factor = 1.0
                 if hasattr(model, 'tokenizer') and hasattr(model.tokenizer, 'splitter'):
                     splitter = model.tokenizer.splitter
                     curriculum_factor = getattr(splitter, '_elastic_lambda_scale', 1.0)
 
-                # 组合权重
+                # 组合权重 (保持在 GPU 上)
                 aux_weight = curriculum_factor * relative_weight
-
-                # ====================================================================
-                # I-CURRICULUM: 三阶段课程学习 Loss 控制
-                # Stage 1 (Epoch 1-9): Teacher Forcing - aux_weight = 0
-                # Stage 2 (Epoch 10-19): Acc-Driven - aux_weight = 0
-                # Stage 3 (Epoch 20+): Resource Co-adaptation - Linear Warmup
-                #
-                # 三阶段独立权重配置:
-                #   Stage 1: token_weight=0.0, entropy_weight=0.0 (纯分类学习)
-                #   Stage 2: token_weight=0.0, entropy_weight=0.0 (纯分类学习)
-                #   Stage 3: token_weight=1.0, entropy_weight=0.1 (资源共适应)
-                # ====================================================================
-                base_aux_weight = aux_weight  # 配置文件中的原始权重
-
-                # P-OPT: 使用 epoch 级别缓存的课程阶段，避免每个 batch 调用 get_curriculum_stage()
-                # I-CURRICULUM: 避免 GPU-CPU 同步开销
-                curriculum_stage = cached_curriculum_stage_in_epoch
-
-                # 三阶段独立权重配置
-                STAGE_TOKEN_WEIGHTS = {1: 0.0, 2: 0.0, 3: 1.0}
-                STAGE_ENTROPY_WEIGHTS = {1: 0.0, 2: 0.0, 3: 0.1}
-
-                # 获取当前阶段的权重
-                stage_token_w = STAGE_TOKEN_WEIGHTS.get(curriculum_stage, 0.0)
-                stage_entropy_w = STAGE_ENTROPY_WEIGHTS.get(curriculum_stage, 0.0)
-                stage_max_weight = max(stage_token_w, stage_entropy_w)
-
-                # Stage 1 & 2: 完全关闭资源惩罚
-                if epoch < 20:
-                    current_aux_weight = 0.0
-                # Stage 3: Resource Co-adaptation
-                else:
-                    # 保护锁：如果 val_acc < 5%，不施加资源惩罚
-                    current_val_acc = getattr(config, '_current_val_acc', 0.0)
-                    if current_val_acc < 5.0:
-                        current_aux_weight = 0.0
-                        print(f"[CURRICULUM] Stage {curriculum_stage} 保护锁: val_acc={current_val_acc:.2f}% < 5%, 资源权重=0")
-                    else:
-                        # 严格的线性 Warmup: 前 10 个 epoch 从 0 增长到目标值
-                        warmup_progress = min(1.0, (epoch - 20) / 10.0)
-                        # 应用阶段权重和 warmup
-                        current_aux_weight = base_aux_weight * warmup_progress * stage_max_weight
-
-                # 直接覆盖 aux_weight（不再使用基于比例的缩放）
-                aux_weight = current_aux_weight
 
                 # [I-COLDSTART] 调试日志：每10个batch打印权重缩放因子
                 if debug_mode and i % 10 == 0:
