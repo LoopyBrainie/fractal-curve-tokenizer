@@ -2425,6 +2425,7 @@ class GumbelTopKSplitter(
             # P-OPT: Stage 1 深度限制 - 如果设置了 _stage1_max_depth，过滤候选
             effective_N = N
             effective_depths = depths
+            effective_indices = None  # 初始化为 None
             if self._stage1_max_depth is not None:
                 # 过滤到指定深度的候选
                 depth_mask = depths <= self._stage1_max_depth
