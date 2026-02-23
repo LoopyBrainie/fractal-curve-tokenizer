@@ -2099,7 +2099,21 @@ def train_epoch(
             
             if use_mixup and mixed_labels is not None:
                 # 使用混合标签的交叉熵 (Mixup 模式下不使用 Focal Loss)
-                ce_loss = mixup_criterion(outs, mixed_labels) / config.accum_steps
+                # P-NAN-GUARD: 捕获 mixup_criterion 中的 NaN 错误
+                try:
+                    ce_loss = mixup_criterion(outs, mixed_labels) / config.accum_steps
+                except ValueError as e:
+                    if "NaN/Inf" in str(e):
+                        nan_count += 1
+                        warn_msg = f"mixup_criterion NaN: {e}"
+                        epoch_warnings.append(warn_msg)
+                        if nan_count <= 3:
+                            print(f"\n[WARN] {warn_msg}, 跳过此 batch")
+                        if nan_count > 10:
+                            raise RuntimeError(f"连续出现 {nan_count} 次 NaN，训练终止")
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
+                    raise
                 if debug_mode and i == 0:
                     print(f"[DEBUG] Batch 0: mixup_criterion 计算完成，ce_loss={ce_loss.item():.4f}", flush=True)
             else:
@@ -2125,17 +2139,39 @@ def train_epoch(
                         ce_loss = loss_fn(outs, labels) / config.accum_steps
                 elif class_weights is not None:
                     # 使用类别平衡权重
-                    ce_loss = F.cross_entropy(
-                        outs, labels, 
-                        weight=class_weights,
-                        label_smoothing=config.label_smoothing
-                    ) / config.accum_steps
+                    # P-NAN-GUARD: 捕获损失计算中的 NaN 错误
+                    try:
+                        ce_loss = F.cross_entropy(
+                            outs, labels,
+                            weight=class_weights,
+                            label_smoothing=config.label_smoothing
+                        ) / config.accum_steps
+                    except (ValueError, RuntimeError) as e:
+                        if "nan" in str(e).lower() or "inf" in str(e).lower():
+                            nan_count += 1
+                            warn_msg = f"cross_entropy NaN: {e}"
+                            epoch_warnings.append(warn_msg)
+                            print(f"\n[WARN] {warn_msg}, 跳过此 batch")
+                            optimizer.zero_grad(set_to_none=True)
+                            continue
+                        raise
                 else:
                     # 默认交叉熵
-                    ce_loss = F.cross_entropy(
-                        outs, labels, 
-                        label_smoothing=config.label_smoothing
-                    ) / config.accum_steps
+                    # P-NAN-GUARD: 捕获损失计算中的 NaN 错误
+                    try:
+                        ce_loss = F.cross_entropy(
+                            outs, labels,
+                            label_smoothing=config.label_smoothing
+                        ) / config.accum_steps
+                    except (ValueError, RuntimeError) as e:
+                        if "nan" in str(e).lower() or "inf" in str(e).lower():
+                            nan_count += 1
+                            warn_msg = f"cross_entropy NaN: {e}"
+                            epoch_warnings.append(warn_msg)
+                            print(f"\n[WARN] {warn_msg}, 跳过此 batch")
+                            optimizer.zero_grad(set_to_none=True)
+                            continue
+                        raise
 
             # [Loss诊断] 累加 CE loss 用于统计
             ce_loss_sum = ce_loss_sum + ce_loss.detach()
