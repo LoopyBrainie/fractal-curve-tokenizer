@@ -1879,6 +1879,9 @@ def train_epoch(
     Args:
         exp_dir: 实验目录，用于保存 NaN/Inf 诊断日志
     """
+    # P-DEBUG: 在函数内部初始化 epoch_warnings，避免作用域问题
+    epoch_warnings = []
+
     model.train()
 
     # ====================================================================
@@ -2717,7 +2720,7 @@ def train_epoch(
     # P11-8: 在返回前进行一次 GPU-CPU 同步
     final_loss = (total_loss / len(loader)).item()
     final_acc = (100.0 * correct / total).item() if total > 0 else 0.0
-    return final_loss, final_acc, perf_stats
+    return final_loss, final_acc, perf_stats, epoch_warnings
 
 
 @torch.no_grad()
@@ -4901,7 +4904,7 @@ def main():
         current_train_loader = simple_train_loader if disable_prefetch_this_epoch else train_loader
 
         print(f"[INFO] Epoch {epoch}: 即将开始 train_epoch...")
-        train_loss, train_acc, perf_stats = train_epoch(
+        train_result = train_epoch(
             model, current_train_loader, optimizer, device, scaler, config,
             mixup_fn=current_mixup_fn,
             num_classes=spec.num_classes,
@@ -4912,6 +4915,7 @@ def main():
             epoch=epoch,
             hard_mining=hard_mining,
         )
+        train_loss, train_acc, perf_stats, epoch_warnings = train_result
         # [Loss诊断] 打印 CE loss vs Total loss 以识别辅助损失影响
         ce_loss_info = ""
         if perf_stats.get('avg_ce_loss') is not None:
