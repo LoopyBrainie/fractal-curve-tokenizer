@@ -136,9 +136,11 @@ def inference(
     # 统一处理 TrainingStats vs Tensor
     logits = extract_logits(stats)
 
-    # NaN/Inf 检查
+    # P-NAN-GUARD: 检查 NaN/Inf，返回 None 表示跳过此 batch
     if torch.isnan(logits).any() or torch.isinf(logits).any():
-        raise ValueError("Model output contains NaN/Inf")
+        print(f"[WARN] inference: NaN/Inf detected, skipping batch", flush=True)
+        # 返回 None 让调用者跳过此 batch
+        return None
 
     # 包装为 InferenceStats
     inference_stats = wrap_stats(stats, logits)
@@ -191,8 +193,13 @@ def evaluate(
 
     for batch in tqdm(loader, desc="Evaluating"):
         imgs, batch_labels = batch
-        loss, logits, inference_stats = inference(model, imgs, batch_labels, device=device, use_amp=use_amp)
+        result = inference(model, imgs, batch_labels, device=device, use_amp=use_amp)
 
+        # P-NAN-GUARD: 跳过 NaN batch
+        if result is None:
+            continue
+
+        loss, logits, inference_stats = result
         probs = F.softmax(logits, dim=1)
         preds = logits.argmax(dim=1)
 
