@@ -4308,7 +4308,12 @@ class GumbelTopKSplitter(
             K_d_hard = K_d_float.detach()
             K_d_soft = K_d_float
             K_d_ste = K_d_hard - K_d_soft.detach() + K_d_soft  # 有梯度!
-            K_d_int = max(1, int(round(K_d_ste.item())))  # 仅用于索引
+
+            # P-NAN-GUARD: 检查 K_d_ste 是否为 NaN/Inf
+            if torch.isnan(K_d_ste) or torch.isinf(K_d_ste):
+                K_d_int = 1  # 使用安全的默认值
+            else:
+                K_d_int = max(1, int(round(K_d_ste.item())))  # 仅用于索引
 
             if K_d_int <= 0 or N_d == 0:
                 continue
