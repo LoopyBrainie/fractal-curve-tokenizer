@@ -2040,8 +2040,9 @@ def train_epoch(
 
             # P-OPT: Stage 1 (Teacher Forcing) 中 aux_weight = 0，直接跳过辅助损失计算
             # 这是一个重要的性能优化，避免不必要的 GPU 计算
-            # Stage 1: epoch 1-9, Stage 2: epoch 10-19, Stage 3: epoch 20+
-            is_curriculum_stage_1_or_2 = epoch < 20
+            # [FIX] I170: Stage 1/2 阈值从 20 → 3，确保分裂器尽早收到梯度
+            # Stage 1: epoch 1-2, Stage 2: epoch 3+, Stage 3: epoch 3+ (已合并)
+            is_curriculum_stage_1_or_2 = epoch < 3
 
             # I98-2: 使用 model.splitter (独立组件)
             # I182-FIX: 仅在 Stage 3 时才获取 splitter_features，避免不必要的 GPU 操作
@@ -2133,16 +2134,19 @@ def train_epoch(
             stage_max_weight = max(stage_token_w, stage_entropy_w)
 
             # 预先计算 current_aux_weight
-            base_ratio = getattr(config, 'aux_loss_relative_ratio', 0.1)  # 移到外层作用域
-            if epoch < 20:
+            # I170 Fix: 降低阈值确保分裂器尽早收到梯度
+            # 原问题: epoch<20 时 aux_weight=0, 且 val_acc<5% 时也=0
+            # 这导致模型在20 epoch内无法改善，分裂器从未收到梯度！
+            base_ratio = getattr(config, 'aux_loss_relative_ratio', 0.1)
+            if epoch < 3:  # [FIX] 20 → 3: 仅前3个epoch禁用
                 current_aux_weight = 0.0
             else:
                 # Stage 3: Resource Co-adaptation
                 current_val_acc = getattr(config, '_current_val_acc', 0.0)
-                if current_val_acc < 5.0:
+                if current_val_acc < 0.5:  # [FIX] 5.0 → 0.5: 允许极低准确率时也启用
                     current_aux_weight = 0.0
                 else:
-                    warmup_progress = min(1.0, (epoch - 20) / 10.0)
+                    warmup_progress = min(1.0, (epoch - 3) / 10.0)  # [FIX] 20 → 3
                     current_aux_weight = base_ratio * warmup_progress * stage_max_weight
 
             # P-OPT: 仅在 aux_weight > 0 时计算 splitter_loss，避免不必要的 GPU-CPU 同步
@@ -2269,28 +2273,99 @@ def train_epoch(
             print(f"[Grad Monitor] Step {i}: total_grad_norm={total_grad_norm:.4f}")
 
             # I170: 增强梯度监控 - 监控 Splitter 组件梯度
+            # 支持 hilbert_optimal 和 gumbel_topk 分裂器
             if hasattr(model, 'splitter'):
                 splitter = model.splitter
 
-                # 监控 Splitter MLP 梯度
+                # I170: 新增 - 梯度断裂检测标志
+                grad_flow_to_splitter = False
+
+                # 监控 Splitter MLP 梯度 (GumbelTopK)
                 if hasattr(splitter, 'splitter_mlp'):
                     mlp_grad_norm = 0.0
                     for param in splitter.splitter_mlp.parameters():
                         if param.grad is not None:
                             mlp_grad_norm += param.grad.norm().item() ** 2
+                            grad_flow_to_splitter = True
                     mlp_grad_norm = mlp_grad_norm ** 0.5
                     print(f"[Grad Monitor] Step {i}: splitter_mlp_grad_norm={mlp_grad_norm:.4f}")
 
-                # 监控 Quota Logits 梯度
+                # I170: 新增 - HilbertOptimalSplitter 特定组件监控
+                # 1. manifold_conv (conv1d_hilbert) 梯度
+                if hasattr(splitter, 'conv1d_hilbert'):
+                    conv_grad_norm = 0.0
+                    for param in splitter.conv1d_hilbert.parameters():
+                        if param.grad is not None:
+                            conv_grad_norm += param.grad.norm().item() ** 2
+                            grad_flow_to_splitter = True
+                    conv_grad_norm = conv_grad_norm ** 0.5
+                    print(f"[Grad Monitor] Step {i}: splitter_conv1d_grad_norm={conv_grad_norm:.4f}")
+
+                # 2. density_field (密度场网络) 梯度
+                if hasattr(splitter, 'density_field'):
+                    density_grad_norm = 0.0
+                    for param in splitter.density_field.parameters():
+                        if param.grad is not None:
+                            density_grad_norm += param.grad.norm().item() ** 2
+                            grad_flow_to_splitter = True
+                    density_grad_norm = density_grad_norm ** 0.5
+                    print(f"[Grad Monitor] Step {i}: splitter_density_field_grad_norm={density_grad_norm:.4f}")
+
+                # 3. depth_quota 梯度
+                if hasattr(splitter, 'depth_quota') and splitter.depth_quota.grad is not None:
+                    depth_quota_grad_norm = splitter.depth_quota.grad.norm().item()
+                    grad_flow_to_splitter = True
+                    print(f"[Grad Monitor] Step {i}: splitter_depth_quota_grad_norm={depth_quota_grad_norm:.6f}")
+
+                # 4. feature_proj 梯度
+                if hasattr(splitter, 'feature_proj'):
+                    proj_grad_norm = 0.0
+                    for param in splitter.feature_proj.parameters():
+                        if param.grad is not None:
+                            proj_grad_norm += param.grad.norm().item() ** 2
+                            grad_flow_to_splitter = True
+                    proj_grad_norm = proj_grad_norm ** 0.5
+                    print(f"[Grad Monitor] Step {i}: splitter_feature_proj_grad_norm={proj_grad_norm:.4f}")
+
+                # 5. 监控 Quota Logits 梯度 (GumbelTopK)
                 if hasattr(splitter, 'quota_logits') and splitter.quota_logits is not None:
                     if splitter.quota_logits.grad is not None:
                         quota_grad_norm = splitter.quota_logits.grad.norm().item()
+                        grad_flow_to_splitter = True
                         print(f"[Grad Monitor] Step {i}: quota_logits_grad_norm={quota_grad_norm:.4f}")
 
-                # 监控温度参数梯度
-                if hasattr(splitter, 'log_temperature') and splitter.log_temperature.grad is not None:
-                    temp_grad_norm = splitter.log_temperature.grad.norm().item()
-                    print(f"[Grad Monitor] Step {i}: log_temperature_grad={temp_grad_norm:.6f}")
+                # 6. 监控温度参数梯度
+                if hasattr(splitter, 'temperature'):
+                    if hasattr(splitter, 'temperature') and isinstance(splitter.temperature, torch.Tensor):
+                        if splitter.temperature.grad is not None:
+                            temp_grad_norm = splitter.temperature.grad.norm().item()
+                            print(f"[Grad Monitor] Step {i}: temperature_grad={temp_grad_norm:.6f}")
+
+                # I170: 新增 - 梯度断裂警告
+                if not grad_flow_to_splitter:
+                    print(f"[Grad Monitor] WARNING Step {i}: NO GRADIENTS FLOWING TO SPLITTER!")
+                    print(f"[Grad Monitor] WARNING: Splitter parameters exist but receive no gradients!")
+                    print(f"[Grad Monitor] WARNING: This indicates gradient flow is broken!")
+
+                # I170: 收集梯度数据用于历史记录
+                grad_entry = {
+                    'step': i,
+                    'epoch': epoch,
+                    'total_grad_norm': total_grad_norm,
+                    'grad_flow_to_splitter': grad_flow_to_splitter,
+                }
+                # 添加各组件梯度
+                if hasattr(splitter, 'splitter_mlp'):
+                    grad_entry['splitter_mlp_grad_norm'] = mlp_grad_norm
+                if hasattr(splitter, 'conv1d_hilbert'):
+                    grad_entry['splitter_conv1d_grad_norm'] = conv_grad_norm
+                if hasattr(splitter, 'density_field'):
+                    grad_entry['splitter_density_field_grad_norm'] = density_grad_norm
+                if hasattr(splitter, 'depth_quota') and splitter.depth_quota.grad is not None:
+                    grad_entry['splitter_depth_quota_grad_norm'] = depth_quota_grad_norm
+                if hasattr(splitter, 'feature_proj'):
+                    grad_entry['splitter_feature_proj_grad_norm'] = proj_grad_norm
+                gradient_history.append(grad_entry)
 
                 # 计算梯度信噪比 (GSNR)
                 param_grad_norms = []
@@ -3334,11 +3409,13 @@ def main():
                        help="Disable aux loss for first N epochs to let Splitter learn (default: 10)")
 
     # 梯度平衡监控 - 诊断 task_loss 和 budget_loss 的梯度冲突
-    parser.add_argument("--monitor-gradient-balance", action="store_true", default=False,
+    # I170: 默认为 True 以便诊断梯度流问题
+    parser.add_argument("--monitor-gradient-balance", action="store_true", default=True,
                        help="Monitor gradient norms of task_loss vs budget_loss to diagnose gradient conflict")
 
     # I150-3: Token 稳定性监控 - 诊断 Gumbel 噪声导致的输入拓扑抖动
-    parser.add_argument("--monitor-token-stability", action="store_true", default=False,
+    # I170: 默认为 True 以便诊断梯度流问题
+    parser.add_argument("--monitor-token-stability", action="store_true", default=True,
                        help="I150-3: Monitor token selection IOU across steps to detect sampling instability")
 
     # I150-3: 初始温度 - 控制 Gumbel-Softmax 的锐度
@@ -3387,7 +3464,8 @@ def main():
                        help="Pattern encoder learning rate multiplier (default: 1.0)")
 
     # I150-5: 梯度比值监控与动态学习率调整
-    parser.add_argument("--monitor-gradient-ratio", action="store_true",
+    # I170: 默认为 True 以便诊断梯度流问题
+    parser.add_argument("--monitor-gradient-ratio", action="store_true", default=True,
                        help="监控 Splitter/Backbone 梯度比值")
     parser.add_argument("--gradient-ratio-threshold", type=float, default=10.0,
                        help="梯度比值阈值，超过则触发学习率调整 (default: 10.0)")
@@ -4453,7 +4531,10 @@ def main():
         json.dump(config_dict, f, indent=2)
     
     history = []
-    
+
+    # I170: 梯度历史记录 - 用于追踪训练过程中的梯度流
+    gradient_history = []
+
     print(f"[INFO] Early stopping: patience={config.patience}, min_delta={config.min_delta}")
     # I120-2: 分离 dropout 配置
     print(f"[INFO] Regularization: tokenizer_dropout={config.tokenizer_dropout}, "
@@ -4578,13 +4659,16 @@ def main():
     # P-DEBUG: 收集 epoch 级别的警告用于调试
     epoch_warnings = []
 
-    for epoch in range(1, config.epochs + 1):
-        # 每个 epoch 开始时清空警告列表
-        epoch_warnings.clear()
+    # I170: 使用 try-finally 确保在任何退出情况下都保存训练历史
+    # 包括: early stopping, KeyboardInterrupt, 异常等
+    try:
+        for epoch in range(1, config.epochs + 1):
+            # 每个 epoch 开始时清空警告列表
+            epoch_warnings.clear()
 
-        print(f"\n{'='*60}")
-        print(f"EPOCH {epoch}/{config.epochs} - STARTING")
-        print(f"{'='*60}")
+            print(f"\n{'='*60}")
+            print(f"EPOCH {epoch}/{config.epochs} - STARTING")
+            print(f"{'='*60}")
 
         # ====================================================================
         # I-CURRICULUM: 传递 epoch 给模型用于三阶段课程学习
@@ -5011,11 +5095,44 @@ def main():
                 print(f"[EARLY STOPPING] Best val acc: {best_val:.2f}% at epoch {epoch - patience_counter}")
                 early_stopped = True
                 break
-    
-    # 保存训练历史
-    with open(exp_dir / "training_history.json", 'w') as f:
-        json.dump(history, f, indent=2)
-    
+
+    # I170: finally 块 - 确保在任何退出情况下都保存训练历史和梯度历史
+    # 包括: early stopping, KeyboardInterrupt, 异常等
+    finally:
+        # 保存当前已经收集的训练历史（即使训练未完成）
+        print("\n[I170] 保存训练中断时的历史数据...")
+        with open(exp_dir / "training_history.json", 'w') as f:
+            json.dump(history, f, indent=2)
+        print(f"[I170] 训练历史已保存 ({len(history)} 个 epoch)")
+
+        # 保存梯度历史到单独文件
+        if gradient_history:
+            # 计算梯度统计信息
+            grad_stats = {
+                'total_samples': len(gradient_history),
+                'samples_with_grad_flow': sum(1 for g in gradient_history if g.get('grad_flow_to_splitter', False)),
+                'grad_flow_ratio': sum(1 for g in gradient_history if g.get('grad_flow_to_splitter', False)) / len(gradient_history) if gradient_history else 0,
+            }
+            # 添加各组件的平均梯度
+            for key in ['splitter_mlp_grad_norm', 'splitter_conv1d_grad_norm', 'splitter_density_field_grad_norm',
+                        'splitter_depth_quota_grad_norm', 'splitter_feature_proj_grad_norm', 'total_grad_norm']:
+                values = [g[key] for g in gradient_history if key in g and g[key] is not None]
+                if values:
+                    grad_stats[f'{key}_mean'] = sum(values) / len(values)
+                    grad_stats[f'{key}_max'] = max(values)
+                    grad_stats[f'{key}_min'] = min(values)
+
+            # 保存完整历史和统计
+            grad_data = {
+                'gradient_history': gradient_history,
+                'statistics': grad_stats,
+            }
+            with open(exp_dir / "logs" / "gradient_history.json", 'w') as f:
+                json.dump(grad_data, f, indent=2)
+            print(f"[I170] 梯度历史已保存 ({len(gradient_history)} 个样本)")
+
+        print("[I170] 中断保存完成")
+
     # ========== Train/Eval 一致性验证 ==========
     print("\n" + "="*70)
     print("TRAIN/EVAL CONSISTENCY CHECK")

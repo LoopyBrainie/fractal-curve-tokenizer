@@ -88,4 +88,7 @@ uv run python src/training/train_fractal_vit.py \
   --depth-scale-max 2.0 \
   --patience 25 \
   --num-workers 8 \
-  --seed 42
+  --seed 42 \
+  --monitor-gradient-balance \
+  --monitor-gradient-ratio \
+  --monitor-token-stability
