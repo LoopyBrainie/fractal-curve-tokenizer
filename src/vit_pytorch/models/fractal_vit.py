@@ -327,6 +327,9 @@ class FractalCurveViT(nn.Module):
         use_geometry_field: bool = False,  # 是否启用几何流形场
         geometry_field_dim: Optional[int] = None,  # 几何流形场维度 (默认等于 dim)
         manifold_bias_scale: float = 1.0,  # 流形偏置缩放因子
+        # I-MANIFOLD: Manifold-Native 注意力参数 (使用新版几何流形框架)
+        use_manifold_native: bool = True,  # 默认启用 Manifold-Native 注意力
+        manifold_beta: float = 4.0,  # Hilbert 带宽系数
     ) -> None:
         """初始化 FractalCurveViT。
 
@@ -764,6 +767,8 @@ class FractalCurveViT(nn.Module):
                 fourier_levels=fourier_levels,
                 encoder_config=encoder_config,
                 use_fp16=lca_fp16,  # I104-3
+                use_manifold_native=use_manifold_native,  # I-MANIFOLD: Manifold-Native 注意力
+                manifold_beta=manifold_beta,  # I-MANIFOLD: Hilbert 带宽系数
             )
 
         # === 一致性检查：确保 tokenizer 和 transformer 使用相同的 max_level ===

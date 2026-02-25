@@ -156,6 +156,7 @@ class FractalTransformerBlock(nn.Module):
         self.dim = dim
         self.max_level = max_level
         self.use_manifold_native = use_manifold_native
+        self.manifold_beta = manifold_beta  # I-MANIFOLD: Hilbert 带宽系数
 
         # 选择注意力模块
         if use_manifold_native:
@@ -350,6 +351,8 @@ class FractalTransformer(nn.Module):
         fourier_levels: int = 4,
         encoder_config: Optional[AttentionEncoderConfig] = None,  # I98-3
         use_fp16: bool = False,  # I104-3: FP16 存储 LCA embedding
+        use_manifold_native: bool = True,  # I-MANIFOLD: Manifold-Native 注意力
+        manifold_beta: float = 4.0,  # I-MANIFOLD: Hilbert 带宽系数
     ):
         super().__init__()
         self.dim = dim
@@ -358,6 +361,8 @@ class FractalTransformer(nn.Module):
         self.ffn_type = ffn_type
         self.use_checkpoint = use_checkpoint
         self.use_fp16 = use_fp16  # I104-3
+        self.use_manifold_native = use_manifold_native  # I-MANIFOLD: Manifold-Native 注意力
+        self.manifold_beta = manifold_beta  # I-MANIFOLD: Hilbert 带宽系数
 
         # P-OPT: Stochastic depth decay rule
         # 使用 torch.linspace 预计算，避免 numpy 依赖和 .tolist() 转换
@@ -378,6 +383,8 @@ class FractalTransformer(nn.Module):
                     fourier_levels=fourier_levels,
                     encoder_config=encoder_config,  # I98-3
                     use_fp16=use_fp16,  # I104-3
+                    use_manifold_native=use_manifold_native,  # I-MANIFOLD
+                    manifold_beta=manifold_beta,  # I-MANIFOLD
                 )
                 for i in range(depth)
             ]
