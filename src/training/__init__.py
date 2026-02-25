@@ -53,6 +53,20 @@ trainer.fit()
 ```
 """
 
+# I170-FIX: 在所有导入之前设置 sys.path，确保 vit_pytorch 可用
+# 这必须在 __init__.py 最开头执行，因为在 -m 模式下会先加载 __init__.py
+import sys
+from pathlib import Path
+
+# 找到项目根目录 (src/training/ 的父目录的父目录)
+_project_root = Path(__file__).resolve().parents[2]
+_src_path = _project_root / "src"
+
+if str(_src_path) not in sys.path:
+    sys.path.insert(0, str(_src_path))
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
 # Data transforms (I170-FIX: 添加 data 模块导入)
 from .data.transforms import (
     DatasetSpec,
