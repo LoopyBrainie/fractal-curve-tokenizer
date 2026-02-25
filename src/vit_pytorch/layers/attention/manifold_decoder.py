@@ -35,7 +35,7 @@ import torch.nn.functional as F
 def poincare_distance(
     coords: torch.Tensor,
     image_size: Tuple[int, int],
-    epsilon: float = 1e-8,
+    epsilon: float = 1e-7,  # I-NAN: 改为 1e-7，acosh 导数在 1+ 处不会爆炸
 ) -> torch.Tensor:
     """
     计算 Poincaré 圆盘上的双曲距离。
@@ -48,11 +48,11 @@ def poincare_distance(
     双曲距离:
         d_H(u, v) = acosh(1 + 2 ||u-v||^2 / ((1-||u||^2)(1-||v||^2)))
 
-    性质
+    数值稳定性 (I-NAN)
     ----
-    - 天然捕捉深度层次: d_H ≈ Δd (近距离)
-    - 深度越大 → 距离越大
-    - 与 Hilbert 顺序兼容
+    - 强制内部计算使用 FP32，防止 FP16 下溢导致 acosh(x) -> 0
+    - acosh(x) 的导数在 x -> 1+ 时趋向无穷大，需确保 x >= 1 + epsilon
+    - epsilon = 1e-7 确保在 FP16 下仍有足够的精度
 
     参数
     ----
@@ -69,27 +69,38 @@ def poincare_distance(
     torch.Tensor
         双曲距离矩阵，形状 [B, N, N] 或 [N, N]
     """
-    was_2d = coords.dim() == 2
-    if was_2d:
-        coords = coords.unsqueeze(0)  # [1, N, 2]
+    # I-NAN: 强制 FP32 计算，防止精度下溢
+    orig_dtype = coords.dtype
+    coords_fp32 = coords.float()
 
-    B, N, _ = coords.shape
+    was_2d = coords_fp32.dim() == 2
+    if was_2d:
+        coords_fp32 = coords_fp32.unsqueeze(0)  # [1, N, 2]
+
+    B, N, _ = coords_fp32.shape
     W, H = image_size
 
     # 图像中心
     cx, cy = W / 2, H / 2
 
     # 归一化坐标到 [-1, 1]
-    normalized = coords.clone()
-    normalized[..., 0] = (coords[..., 0] - cx) / (cx + epsilon)
-    normalized[..., 1] = (coords[..., 1] - cy) / (cy + epsilon)
+    normalized = coords_fp32.clone()
+    normalized[..., 0] = (coords_fp32[..., 0] - cx) / (cx + epsilon)
+    normalized[..., 1] = (coords_fp32[..., 1] - cy) / (cy + epsilon)
 
-    # 计算到中心的距离
+    # I-NAN: r 安全保护，防止 r=0 导致除零
     r = torch.norm(normalized, dim=-1, keepdim=True)  # [B, N, 1]
+    r_safe = r.clamp(min=epsilon)
 
     # 映射到 Poincaré 圆盘: u = tanh(r/2) · v / ||v||
-    # 使用 tanh(r/2) 确保 ||u|| < 1
-    u = torch.tanh(r / 2) * (normalized / (r + epsilon))
+    # 使用 tanh(r/2) 确保 ||u|| < 1，但加双重保险
+    u_numerator = torch.tanh(r_safe / 2) * normalized
+    u_denominator = r_safe + epsilon
+    u = u_numerator / u_denominator
+
+    # I-NAN: 归一化确保 ||u|| < 1，防止任何边界情况
+    u_norm = torch.norm(u, dim=-1, keepdim=True).clamp(min=epsilon)
+    u = u / u_norm * torch.tanh(r_safe / 2).clamp(max=0.9999)
 
     # 计算 ||u - v||^2
     u_i = u.unsqueeze(2)  # [B, N, 1, 2]
@@ -101,24 +112,29 @@ def poincare_distance(
     u_norm_sq_i = u_norm_sq.unsqueeze(2)  # [B, N, 1]
     u_norm_sq_j = u_norm_sq.unsqueeze(1)  # [B, 1, N]
 
-    # 双曲距离公式
+    # I-NAN: 双曲距离公式，增强 denominator 保护
     # d_H = acosh(1 + 2 ||u-v||^2 / ((1-||u||^2)(1-||v||^2)))
     numerator = 2 * diff_norm_sq
-    denominator = (1 - u_norm_sq_i) * (1 - u_norm_sq_j)
 
-    # 数值稳定性: 确保 denominator > 0
-    denominator = denominator.clamp(min=epsilon)
+    # I-NAN: 分别 clamp 避免相乘后下溢
+    denom_i = (1 - u_norm_sq_i).clamp(min=epsilon)
+    denom_j = (1 - u_norm_sq_j).clamp(min=epsilon)
+    denominator = denom_i * denom_j
 
     # acosh(x) = log(x + sqrt(x^2 - 1))
     x = 1 + numerator / denominator
-    x = x.clamp(min=1 + epsilon)  # 确保 x >= 1
+
+    # I-NAN: acosh 定义域保护，确保 x >= 1 + epsilon
+    # 这是最关键的修复：防止 x=1 导致 acosh(1)=0
+    x = x.clamp(min=1.0 + epsilon)
 
     distance = torch.acosh(x)
 
     if was_2d:
         distance = distance.squeeze(0)
 
-    return distance
+    # I-NAN: 转回原始 dtype
+    return distance.to(orig_dtype)
 
 
 def compute_rotational_similarity(

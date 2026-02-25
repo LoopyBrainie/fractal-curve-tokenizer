@@ -184,9 +184,14 @@ class HilbertOptimalSplitterConfig:
 
     # ========== 超参数 (Hyper) - 可调优 ==========
     # Entmax 参数
-    entmax_alpha_init: float = 1.5
-    entmax_alpha_max: float = 2.0
-    entmax_schedule_epochs: int = 10
+    # I107: 从 1.5 改为 1.2，防止 alpha=1.5 导致 Entmax 硬截断
+    # 测试结果: alpha=1.5 产生 0% 非零输出，梯度无法回传
+    # I107: 添加 alpha 预热策略
+    entmax_alpha_init: float = 1.2      # 起始值 (保证梯度流动)
+    entmax_alpha_warmup: float = 1.5    # 预热目标值
+    entmax_alpha_max: float = 2.0       # 最终稀疏度
+    entmax_warmup_epochs: int = 10       # 预热 epoch 数
+    entmax_schedule_epochs: int = 20     # 总调度 epoch 数
 
     # 树约束参数
     tree_constraint_weight: float = 0.1
@@ -243,7 +248,7 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         K_min: int = 8,
         K_max: int = 64,
         sampling_ratio_schedule: tuple = (2, 4),
-        entmax_alpha: float = 1.5,
+        entmax_alpha: float = 1.2,  # I107: 改为 1.2 防止硬截断
         tree_constraint_weight: float = 0.1,
         temperature_init: float = 1.0,
         temperature_min: float = 0.3,
@@ -287,11 +292,13 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         self._K_max_rounded = self._compute_min_level_regions(K_max, max_level_limit)
         self.sampling_ratio_schedule = sampling_ratio_schedule
 
-        # Entmax 参数
+        # Entmax 参数 (I107: 添加预热策略)
         self.entmax_alpha = entmax_alpha
-        self.entmax_alpha_init = entmax_alpha
-        self.entmax_alpha_max = 2.0
-        self.entmax_schedule_epochs = 10
+        self.entmax_alpha_init = 1.2      # 起始值
+        self.entmax_alpha_warmup = 1.5     # 预热目标
+        self.entmax_alpha_max = 2.0       # 最终稀疏度
+        self.entmax_warmup_epochs = 10     # 预热 epoch 数
+        self.entmax_schedule_epochs = 20  # 总调度 epoch 数
 
         # 树约束
         self.tree_constraint_weight = tree_constraint_weight
@@ -370,6 +377,11 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             nn.Sigmoid(),
         )
 
+        # I-NAN: 初始化 density_field 偏置为 -1.1
+        # sigmoid(-1.1) ≈ 0.25，强迫模型在训练初期产生更多 token
+        # 这解决了 avg_tokens 死锁在 5 个的问题
+        self._init_density_field_bias()
+
         # 候选区域缓存
         self.register_buffer('candidate_regions', torch.zeros(0, 4))
         self.register_buffer('candidate_depths', torch.zeros(0, dtype=torch.long))
@@ -378,6 +390,38 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         self.register_buffer('children_matrix', torch.zeros(0, 4, dtype=torch.long))
 
         self._children_matrix: Optional[Tensor] = None
+
+    def _init_density_field_bias(self) -> None:
+        """
+        初始化 density_field 的最后一层偏置为 -1.1
+
+        数学原理：
+            sigmoid(x + b) 当 b = -1.1 时，初始密度 ≈ 0.25
+            这迫使模型在训练初期产生更多 token (K > 5)
+
+        效果：
+            - 训练初期：更多 token → 更多梯度流动 → 更好的学习
+            - 训练后期：模型自动调整偏置以优化 token 数量
+        """
+        # density_field 结构: Linear -> GELU -> Linear -> Sigmoid
+        # 最后一层是索引 2
+        last_linear = self.density_field[2]
+
+        # 重置权重为较小的值
+        nn.init.xavier_uniform_(last_linear.weight, gain=0.1)
+
+        # I-NAN: 关键 - 偏置设为 -1.1，使初始 sigmoid 输出 ≈ 0.25
+        nn.init.constant_(last_linear.bias, -1.1)
+
+    def reset_density_field(self) -> None:
+        """
+        重置 density_field 参数（公开接口）
+
+        用于：
+            - 训练中断后恢复
+            - 调试 token 数量问题
+        """
+        self._init_density_field_bias()
 
     @property
     def max_level_limit(self) -> int:
@@ -934,11 +978,21 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         else:
             self._curriculum_stage = 3
 
-        # Entmax 课程学习调度
-        if epoch < self.entmax_schedule_epochs:
-            self.entmax_alpha = self.entmax_alpha_init + \
-                (self.entmax_alpha_max - self.entmax_alpha_init) * epoch / self.entmax_schedule_epochs
+        # I107: Entmax Alpha 预热策略
+        # α(t) = min(1.5, 1.2 + 0.3 × epoch / T_warmup) for t < T_warmup
+        # α(t) = min(2.0, α(t)) for t >= T_warmup
+        if epoch < self.entmax_warmup_epochs:
+            # 预热阶段: 1.2 → 1.5
+            self.entmax_alpha = min(
+                self.entmax_alpha_warmup,
+                self.entmax_alpha_init + (self.entmax_alpha_warmup - self.entmax_alpha_init) * epoch / self.entmax_warmup_epochs
+            )
+        elif epoch < self.entmax_schedule_epochs:
+            # 过渡阶段: 1.5 → 2.0
+            warmup_progress = (epoch - self.entmax_warmup_epochs) / (self.entmax_schedule_epochs - self.entmax_warmup_epochs)
+            self.entmax_alpha = self.entmax_alpha_warmup + (self.entmax_alpha_max - self.entmax_alpha_warmup) * warmup_progress
         else:
+            # 稳定阶段: 保持 2.0
             self.entmax_alpha = self.entmax_alpha_max
 
         # 温度退火

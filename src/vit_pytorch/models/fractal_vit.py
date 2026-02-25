@@ -293,6 +293,8 @@ class FractalCurveViT(nn.Module):
         # I145-H1SS: Splitter token 比例超参数 (K 将由模型根据 image_size 动态计算)
         splitter_token_ratio_min: float = 0.02,  # 最小 token 比例 (2%)
         splitter_token_ratio_max: float = 0.15,  # 最大 token 比例 (15%)
+        # I-NAN: K_min_abs 硬下限保护 (确保不会因动态计算导致 K 过小)
+        K_min_abs: int = 8,  # 绝对最小 token 数
         # I145-H1SS: HilbertOptimalSplitter 特定参数
         jump_loss_weight: Optional[float] = None,  # H1SS Jump Loss 权重
         density_field_hidden_dim: Optional[int] = None,  # H1SS Density Field 隐藏层维度
@@ -583,6 +585,9 @@ class FractalCurveViT(nn.Module):
                 computed_k_min = max(1, int(max_possible_tokens * splitter_token_ratio_min))
                 computed_k_max = max(computed_k_min + 1, int(max_possible_tokens * splitter_token_ratio_max))
 
+                # I-NAN: 使用 K_min_abs 硬下限保护，确保不会因动态计算导致 K 过小
+                effective_k_min = max(K_min_abs, computed_k_min)
+
                 # H1SS: 三层参数配置
                 # 参数 (Parameters): feature_dim, hidden_dim, max_level_limit, min_patch_size
                 # 变参数 (Variable): K_min, K_max, sampling_ratio_schedule (由 image_size 动态计算)
@@ -592,10 +597,11 @@ class FractalCurveViT(nn.Module):
                     hidden_dim=splitter_hidden_dim or 64,
                     max_level_limit=max_level_limit,
                     min_patch_size=effective_min_patch_size,
-                    K_min=computed_k_min,
+                    K_min=effective_k_min,  # I-NAN: 使用受保护的 K_min
                     K_max=computed_k_max,
                     sampling_ratio_schedule=(2, 4),  # 动态 sampling_ratio
-                    entmax_alpha=2.0,
+                    # I107: 改为 1.2 (不再用 2.0)，防止 Entmax 硬截断导致梯度消失
+                    entmax_alpha=1.2,
                     tree_constraint_weight=0.1,
                     temperature_init=splitter_temp_start if splitter_temp_start is not None else 1.0,
                     temperature_min=splitter_temp_end if splitter_temp_end is not None else 0.3,

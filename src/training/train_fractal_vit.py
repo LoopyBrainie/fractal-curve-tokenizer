@@ -391,6 +391,7 @@ from vit_pytorch.core.constants import (
 )
 from vit_pytorch.gumbel_topk_splitter import DepthMonitor  # I111-6: 深度分布监控
 from vit_pytorch.core.cls_attention_tracker import CLSAttentionTracker  # I150-2: CLS 注意力追踪
+from vit_pytorch.utils.diagnostic_hook import DiagnosticHook  # NaN 诊断钩子
 
 # Fractal Training 模块 (I15) - 现在位于 examples/training
 from training import (
@@ -1757,6 +1758,7 @@ def train_epoch(
     class_weights: Optional[torch.Tensor] = None,
     epoch: int = 1,
     hard_mining: Optional[HilbertAwareHardMining] = None,
+    diagnostic_hook: Optional[DiagnosticHook] = None,
 ) -> Tuple[float, float, Dict[str, float]]:
     """训练一个 epoch
 
@@ -1988,6 +1990,22 @@ def train_epoch(
                     optimizer.zero_grad(set_to_none=True)
                     continue
                 nan_count = 0
+
+            # ====================================================================
+            # I-NAN: DiagnosticHook 诊断 - 精确定位 NaN 产生位置
+            # ====================================================================
+            if diagnostic_hook is not None:
+                diagnostic_hook.increment_batch()
+                if diagnostic_hook.has_nan_detected():
+                    report = diagnostic_hook.get_diagnostic_report()
+                    print(f"\n[DIAGNOSTIC] NaN 检测报告:", flush=True)
+                    for name, diag in report.layers:
+                        if not diag.is_finite:
+                            print(f"  层 {diag.layer_idx} ({diag.layer_name}): NaN={diag.has_nan}, Inf={diag.has_inf}", flush=True)
+                    if report.suggestions:
+                        print(f"  建议: {report.suggestions}", flush=True)
+                    # 重置以便继续追踪
+                    diagnostic_hook.reset()
             
             if use_mixup and mixed_labels is not None:
                 # 使用混合标签的交叉熵 (Mixup 模式下不使用 Focal Loss)
@@ -3449,13 +3467,13 @@ def main():
                        help="Disable aux loss for first N epochs to let Splitter learn (default: 10)")
 
     # 梯度平衡监控 - 诊断 task_loss 和 budget_loss 的梯度冲突
-    # I170: 默认为 True 以便诊断梯度流问题
-    parser.add_argument("--monitor-gradient-balance", action="store_true", default=True,
+    # I170-FIX: 默认关闭，避免 GPU-CPU 同步干扰 AMP 训练和梯度流
+    parser.add_argument("--monitor-gradient-balance", action="store_true", default=False,
                        help="Monitor gradient norms of task_loss vs budget_loss to diagnose gradient conflict")
 
     # I150-3: Token 稳定性监控 - 诊断 Gumbel 噪声导致的输入拓扑抖动
-    # I170: 默认为 True 以便诊断梯度流问题
-    parser.add_argument("--monitor-token-stability", action="store_true", default=True,
+    # I170-FIX: 默认关闭，避免 GPU-CPU 同步干扰 AMP 训练和梯度流
+    parser.add_argument("--monitor-token-stability", action="store_true", default=False,
                        help="I150-3: Monitor token selection IOU across steps to detect sampling instability")
 
     # I150-3: 初始温度 - 控制 Gumbel-Softmax 的锐度
@@ -3502,6 +3520,10 @@ def main():
                        help="Splitter weight decay multiplier (default: 0.0, I150-4: 移除WD增强探索)")
     parser.add_argument("--pattern-lr-mult", type=float, default=1.0,
                        help="Pattern encoder learning rate multiplier (default: 1.0)")
+
+    # I-NAN: NaN 诊断钩子 - 精确定位训练过程中 NaN 产生位置
+    parser.add_argument("--diagnostic-hook", action="store_true", default=False,
+                       help="启用 DiagnosticHook 诊断 NaN 产生位置 (默认关闭，避免 GPU-CPU 同步开销)")
 
     # I150-5: 梯度比值监控与动态学习率调整
     # I170: 默认为 True 以便诊断梯度流问题
@@ -3821,6 +3843,9 @@ def main():
             self.gradient_ratio_threshold = args.gradient_ratio_threshold
             self.splitter_lr_when_unstable = args.splitter_lr_when_unstable
             self.splitter_wd_when_unstable = args.splitter_wd_when_unstable
+
+            # I-NAN: DiagnosticHook 配置
+            self.diagnostic_hook = args.diagnostic_hook
 
             self.gradient_clip = args.gradient_clip
             self.accum_steps = args.accum_steps
@@ -4739,6 +4764,20 @@ def main():
             _original_handler(signum, frame)
     _original_handler = signal.signal(signal.SIGINT, _signal_handler)
 
+    # ====================================================================
+    # I-NAN: 创建 DiagnosticHook 用于 NaN 诊断
+    # ====================================================================
+    # 默认禁用诊断，避免 GPU-CPU 同步干扰 AMP 训练
+    # 使用 --diagnostic-hook 参数启用
+    diagnostic_hook = DiagnosticHook(
+        enabled=getattr(config, 'diagnostic_hook', False),
+        log_frequency=10,
+        stop_on_first_nan=False,
+    )
+    if diagnostic_hook.enabled:
+        model = diagnostic_hook.register_hooks(model)
+        print(f"[INFO] DiagnosticHook 已启用 (--diagnostic-hook)")
+
     for epoch in range(1, config.epochs + 1):
         # 每个 epoch 开始时清空警告列表
         epoch_warnings.clear()
@@ -4951,6 +4990,7 @@ def main():
             class_weights=class_weights,
             epoch=epoch,
             hard_mining=hard_mining,
+            diagnostic_hook=diagnostic_hook,
         )
         train_loss, train_acc, perf_stats, epoch_warnings = train_result
         # [Loss诊断] 打印 CE loss vs Total loss 以识别辅助损失影响
