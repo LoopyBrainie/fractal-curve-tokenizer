@@ -139,12 +139,16 @@ P12 内部向量化优化 (2025-12-29)
 from __future__ import annotations
 
 # I170-FIX: 将项目路径添加到 sys.path，确保模块导入正常工作
+# 问题: Python 自动将脚本所在目录 (src/training/) 添加到 sys.path[0]
+# 这导致 "from src.training.data.transforms" 会在 "src/training/src/training/..." 查找
+# 解决: 需要将项目根目录添加到 sys.path[0]，而不是 src/
 import os
 import sys
 from pathlib import Path
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+# 使用 parents[2] 获取项目根目录 (不是 src/)
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# 强制将项目根目录添加到 sys.path[0]
+sys.path.insert(0, str(_PROJECT_ROOT))
 
 import platform
 import time
