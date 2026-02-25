@@ -126,10 +126,16 @@ class ModelGene:
     # ==================== Splitter 关键参数 (I140, I145) ====================
     # 注意: 这些是模型内部的默认值，如果为 None 则使用以下值
     # I145: 新增 splitter_type 参数选择 Splitter 类型（第三层：超参数）
-    splitter_type: str = 'gumbel_topk'  # 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy'
+    splitter_type: str = 'gumbel_topk'  # 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy', 'hilbert_optimal'
     splitter_hidden_dim: Optional[int] = None   # Splitter MLP 隐藏层维度 (None → 64)
     splitter_feature_dim: Optional[int] = None  # Splitter 特征维度 (None → 使用 dim)
     splitter_pool_size: Optional[int] = None    # Splitter 池化大小 (None → 4)
+
+    # I145-H1SS: HilbertOptimalSplitter token 比例超参数 (K 由模型动态计算)
+    splitter_token_ratio_min: float = 0.02  # 最小 token 比例 (2%)
+    splitter_token_ratio_max: float = 0.15  # 最大 token 比例 (15%)
+    jump_loss_weight: Optional[float] = None  # H1SS Jump Loss 权重 (None → 0.1)
+    density_field_hidden_dim: Optional[int] = None  # H1SS Density Field 隐藏层维度 (None → 32)
 
     # 注意: I136: Elastic Budget 配置 (elastic_coverage_min/max, elastic_lambda_over/under)
     # 是训练损失超参数，不是模型架构参数，不保存到 ModelGene 中
@@ -239,6 +245,12 @@ class ModelGene:
             'splitter_hidden_dim': self.splitter_hidden_dim,
             'splitter_feature_dim': self.splitter_feature_dim,
             'splitter_pool_size': self.splitter_pool_size,
+
+            # I145-H1SS: HilbertOptimalSplitter token 比例超参数
+            'splitter_token_ratio_min': self.splitter_token_ratio_min,
+            'splitter_token_ratio_max': self.splitter_token_ratio_max,
+            'jump_loss_weight': self.jump_loss_weight,
+            'density_field_hidden_dim': self.density_field_hidden_dim,
 
             # 注意: I136: Elastic Budget 配置已移除（训练损失超参数，不属于模型架构）
 
@@ -394,6 +406,11 @@ class ModelGene:
             splitter_hidden_dim=self.splitter_hidden_dim,
             splitter_feature_dim=self.splitter_feature_dim,
             splitter_pool_size=self.splitter_pool_size,
+            # I145-H1SS: HilbertOptimalSplitter token 比例超参数
+            splitter_token_ratio_min=self.splitter_token_ratio_min,
+            splitter_token_ratio_max=self.splitter_token_ratio_max,
+            jump_loss_weight=self.jump_loss_weight,
+            density_field_hidden_dim=self.density_field_hidden_dim,
             # I145: Splitter 温度参数
             splitter_temp_start=self.splitter_temp_start,
             splitter_temp_end=self.splitter_temp_end,
@@ -645,6 +662,11 @@ class ModelGene:
             splitter_hidden_dim=getattr(config, 'splitter_hidden_dim', None),
             splitter_feature_dim=getattr(config, 'splitter_feature_dim', None),
             splitter_pool_size=getattr(config, 'splitter_pool_size', None),
+            # I145-H1SS: HilbertOptimalSplitter token 比例超参数
+            splitter_token_ratio_min=getattr(config, 'splitter_token_ratio_min', 0.02),
+            splitter_token_ratio_max=getattr(config, 'splitter_token_ratio_max', 0.15),
+            jump_loss_weight=getattr(config, 'jump_loss_weight', None),
+            density_field_hidden_dim=getattr(config, 'density_field_hidden_dim', None),
             # 注意: I136: Elastic Budget 配置已移除（训练损失超参数，不属于模型架构）
 
             # I110-7: 语义分裂器配置

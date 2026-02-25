@@ -3414,15 +3414,27 @@ def main():
     # I29-1 修复: 从 constants.py 导入常量，确保一致性
     # I24-7 分析: T_end=0.5 保持探索能力，T=0.3 过低会导致梯度消失
     # I145: 新增 splitter_type 参数
+    # I145-H1 hilbert_optimalSS: 新增 选择
     parser.add_argument("--splitter-type", type=str, default='gumbel_topk',
-                       choices=['gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy'],
-                       help="Splitter type: 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy' (default: gumbel_topk)")
+                       choices=['gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy', 'hilbert_optimal'],
+                       help="Splitter type: 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy', 'hilbert_optimal' (default: gumbel_topk)")
     parser.add_argument("--splitter-temp-start", type=float, default=SPLITTER_TEMP_START,
                        help=f"Learnable splitter initial temperature (default: {SPLITTER_TEMP_START})")
     parser.add_argument("--splitter-temp-end", type=float, default=SPLITTER_TEMP_END,
                        help=f"Learnable splitter final temperature (default: {SPLITTER_TEMP_END}, I24-7 optimized)")
     parser.add_argument("--splitter-temp-warmup", type=int, default=5,
                        help="Warmup epochs with fixed T_start (default: 5)")
+
+    # I145-H1SS: HilbertOptimalSplitter token 比例超参数
+    # 变参数 K 将由模型根据 image_size 和 min_patch_size 动态计算
+    parser.add_argument("--splitter-token-ratio-min", type=float, default=0.02,
+                       help="H1SS: Min token ratio (relative to max possible tokens, default: 0.02)")
+    parser.add_argument("--splitter-token-ratio-max", type=float, default=0.15,
+                       help="H1SS: Max token ratio (relative to max possible tokens, default: 0.15)")
+    parser.add_argument("--jump-loss-weight", type=float, default=None,
+                       help="H1SS: Jump loss weight for locality (default: 0.1)")
+    parser.add_argument("--density-field-hidden-dim", type=int, default=None,
+                       help="H1SS: Density field hidden dimension (default: 32)")
     # I100-2: 添加温度调度策略参数 (原为 constants.py 常量)
     parser.add_argument("--temp-schedule", type=str, default=SPLITTER_TEMP_SCHEDULE,
                        choices=["linear", "cosine", "exponential"],
@@ -3739,6 +3751,11 @@ def main():
         semantic_splitter_config=semantic_config_dict,
         # I145: Splitter 类型选择
         splitter_type=args.splitter_type,
+        # I145-H1SS: HilbertOptimalSplitter token 比例超参数 (K 将在模型内动态计算)
+        splitter_token_ratio_min=args.splitter_token_ratio_min,
+        splitter_token_ratio_max=args.splitter_token_ratio_max,
+        jump_loss_weight=args.jump_loss_weight,
+        density_field_hidden_dim=args.density_field_hidden_dim,
     )
 
     # 创建训练配置对象 (满足 FractalConfigProtocol)
@@ -3804,6 +3821,11 @@ def main():
             self.splitter_hidden_dim = arch_config.splitter_hidden_dim
             self.splitter_feature_dim = arch_config.splitter_feature_dim
             self.splitter_pool_size = arch_config.splitter_pool_size
+            # I145-H1SS: HilbertOptimalSplitter token 比例超参数
+            self.splitter_token_ratio_min = arch_config.splitter_token_ratio_min
+            self.splitter_token_ratio_max = arch_config.splitter_token_ratio_max
+            self.jump_loss_weight = arch_config.jump_loss_weight
+            self.density_field_hidden_dim = arch_config.density_field_hidden_dim
 
             # I110-7: 语义分裂器配置
             self.use_semantic_splitter = arch_config.use_semantic_splitter
@@ -3964,6 +3986,11 @@ def main():
         splitter_hidden_dim=config.splitter_hidden_dim,
         splitter_feature_dim=config.splitter_feature_dim,
         splitter_pool_size=config.splitter_pool_size,
+        # I145-H1SS: HilbertOptimalSplitter token 比例超参数 (K 将在模型内动态计算)
+        splitter_token_ratio_min=config.splitter_token_ratio_min,
+        splitter_token_ratio_max=config.splitter_token_ratio_max,
+        jump_loss_weight=config.jump_loss_weight,
+        density_field_hidden_dim=config.density_field_hidden_dim,
         # I145: Splitter 温度参数
         splitter_temp_start=config.splitter_temp_start,
         splitter_temp_end=config.splitter_temp_end,

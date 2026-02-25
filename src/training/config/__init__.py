@@ -138,10 +138,16 @@ class ModelArchitectureConfig:
     # 这些参数控制 Splitter 内部 MLP 的维度配置
     # I145: 新增 splitter_type 选择器，遵循三层参数原则
     # splitter_type 是超参数（第三层），决定使用哪种 Splitter
-    splitter_type: str = 'gumbel_topk'  # 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy'
+    splitter_type: str = 'gumbel_topk'  # 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy', 'hilbert_optimal'
     splitter_hidden_dim: Optional[int] = None  # Splitter MLP 隐藏层维度 (默认 64)
     splitter_feature_dim: Optional[int] = None  # Splitter 特征维度 (默认等于 dim)
     splitter_pool_size: Optional[int] = None    # Splitter 池化大小 (默认 4)
+
+    # I145-H1SS: HilbertOptimalSplitter token 比例超参数 (K 由模型根据 image_size 动态计算)
+    splitter_token_ratio_min: float = 0.02  # 最小 token 比例 (默认 2%)
+    splitter_token_ratio_max: float = 0.15  # 最大 token 比例 (默认 15%)
+    jump_loss_weight: Optional[float] = None  # H1SS Jump Loss 权重 (默认 0.1)
+    density_field_hidden_dim: Optional[int] = None  # H1SS Density Field 隐藏层维度 (默认 32)
 
     # Splitter 温度参数 (确保训练-评估一致性)
     splitter_temp_start: float = 1.0   # 初始温度 (与 constants.SPLITTER_TEMP_START 一致)
