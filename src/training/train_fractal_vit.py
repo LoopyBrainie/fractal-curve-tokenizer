@@ -4659,16 +4659,49 @@ def main():
     # P-DEBUG: 收集 epoch 级别的警告用于调试
     epoch_warnings = []
 
-    # I170: 使用 try-finally 确保在任何退出情况下都保存训练历史
-    # 包括: early stopping, KeyboardInterrupt, 异常等
-    try:
-        for epoch in range(1, config.epochs + 1):
-            # 每个 epoch 开始时清空警告列表
-            epoch_warnings.clear()
+    # I170: 定义保存函数，在各种退出情况下都会被调用
+    def save_history_and_exit(reason: str = "normal"):
+        """保存训练历史和梯度历史"""
+        print(f"\n[I170] 保存训练历史 ({reason})...")
+        with open(exp_dir / "training_history.json", 'w') as f:
+            json.dump(history, f, indent=2)
 
-            print(f"\n{'='*60}")
-            print(f"EPOCH {epoch}/{config.epochs} - STARTING")
-            print(f"{'='*60}")
+        if gradient_history:
+            grad_stats = {
+                'total_samples': len(gradient_history),
+                'samples_with_grad_flow': sum(1 for g in gradient_history if g.get('grad_flow_to_splitter', False)),
+                'grad_flow_ratio': sum(1 for g in gradient_history if g.get('grad_flow_to_splitter', False)) / len(gradient_history) if gradient_history else 0,
+            }
+            for key in ['splitter_mlp_grad_norm', 'splitter_conv1d_grad_norm', 'splitter_density_field_grad_norm',
+                        'splitter_depth_quota_grad_norm', 'splitter_feature_proj_grad_norm', 'total_grad_norm']:
+                values = [g[key] for g in gradient_history if key in g and g[key] is not None]
+                if values:
+                    grad_stats[f'{key}_mean'] = sum(values) / len(values)
+                    grad_stats[f'{key}_max'] = max(values)
+                    grad_stats[f'{key}_min'] = min(values)
+            grad_data = {'gradient_history': gradient_history, 'statistics': grad_stats}
+            with open(exp_dir / "logs" / "gradient_history.json", 'w') as f:
+                json.dump(grad_data, f, indent=2)
+            print(f"[I170] 梯度历史已保存 ({len(gradient_history)} 个样本)")
+        print(f"[I170] 保存完成 ({reason})")
+
+    # I170: 注册 signal 处理器来处理 KeyboardInterrupt
+    import signal
+    _original_handler = None
+    def _signal_handler(signum, frame):
+        print("\n[I170] 检测到中断信号，正在保存...")
+        save_history_and_exit("keyboard_interrupt")
+        if _original_handler:
+            _original_handler(signum, frame)
+    _original_handler = signal.signal(signal.SIGINT, _signal_handler)
+
+    for epoch in range(1, config.epochs + 1):
+        # 每个 epoch 开始时清空警告列表
+        epoch_warnings.clear()
+
+        print(f"\n{'='*60}")
+        print(f"EPOCH {epoch}/{config.epochs} - STARTING")
+        print(f"{'='*60}")
 
         # ====================================================================
         # I-CURRICULUM: 传递 epoch 给模型用于三阶段课程学习
@@ -5094,18 +5127,11 @@ def main():
                 print(f"\n[EARLY STOPPING] No improvement for {config.patience} epochs.")
                 print(f"[EARLY STOPPING] Best val acc: {best_val:.2f}% at epoch {epoch - patience_counter}")
                 early_stopped = True
+                # I170: 保存历史后退出
+                save_history_and_exit("early_stopping")
                 break
 
-    # I170: finally 块 - 确保在任何退出情况下都保存训练历史和梯度历史
-    # 包括: early stopping, KeyboardInterrupt, 异常等
-    finally:
-        # 保存当前已经收集的训练历史（即使训练未完成）
-        print("\n[I170] 保存训练中断时的历史数据...")
-        with open(exp_dir / "training_history.json", 'w') as f:
-            json.dump(history, f, indent=2)
-        print(f"[I170] 训练历史已保存 ({len(history)} 个 epoch)")
-
-        # 保存梯度历史到单独文件
+        # I170: for 循环结束 - 正常完成后保存历史
         if gradient_history:
             # 计算梯度统计信息
             grad_stats = {
@@ -5131,7 +5157,8 @@ def main():
                 json.dump(grad_data, f, indent=2)
             print(f"[I170] 梯度历史已保存 ({len(gradient_history)} 个样本)")
 
-        print("[I170] 中断保存完成")
+    # I170: 正常循环结束后保存历史
+    save_history_and_exit("normal_completion")
 
     # ========== Train/Eval 一致性验证 ==========
     print("\n" + "="*70)
