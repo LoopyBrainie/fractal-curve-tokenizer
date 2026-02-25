@@ -312,6 +312,12 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         self._epoch = 0
 
         # =====================================================================
+        # I150-3: Token 稳定性监控
+        # =====================================================================
+        self._monitor_token_stability = False
+        self._token_history: List[Tensor] = []
+
+        # =====================================================================
         # 核心组件
         # =====================================================================
 
@@ -727,12 +733,6 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         else:
             # 软选择 (用于训练)
             return probs_scaled, probs_scaled
-
-        # =====================================================================
-        # I150-3: Token 稳定性监控
-        # =====================================================================
-        self._monitor_token_stability = False
-        self._token_history: List[Tensor] = []
 
     def enable_token_stability_monitoring(self) -> "HilbertOptimalSplitter":
         """启用 token 选择稳定性监控"""
