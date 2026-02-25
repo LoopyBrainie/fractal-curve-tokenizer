@@ -138,10 +138,10 @@ P12 内部向量化优化 (2025-12-29)
 
 from __future__ import annotations
 
+# ============================================================================
 # I170-FIX: 将项目路径添加到 sys.path，确保模块导入正常工作
-# 问题: Python 自动将脚本所在目录 (src/training/) 添加到 sys.path[0]
-# 这导致 "from src.training.data.transforms" 会在 "src/training/src/training/..." 查找
-# 解决: 需要将项目根目录添加到 sys.path[0]，而不是 src/
+# 必须在所有其他导入之前执行！
+# ============================================================================
 import os
 import sys
 from pathlib import Path
@@ -156,14 +156,24 @@ def _find_project_root(start_path: Path) -> Path:
         if current.parent == current:  # 已经到达根目录
             break
         current = current.parent
+    # 回退：尝试多个可能的 parents
+    for i in range(2, 5):
+        try:
+            p = start_path.resolve().parents[i]
+            if p.exists():
+                return p
+        except IndexError:
+            pass
     return start_path.resolve().parents[2]  # 默认返回 parents[2]
 
 _PROJECT_ROOT = _find_project_root(Path(__file__))
 # 先添加 src/ 目录（位置 1），再添加项目根目录（位置 0）
-# 这样 "from src.training.data.transforms" 可以正确解析
+# 这样可以正确解析 "from src.training.data.transforms" 和 "from vit_pytorch"
 SRC_PATH = _PROJECT_ROOT / "src"
-sys.path.insert(0, str(SRC_PATH))
-sys.path.insert(0, str(_PROJECT_ROOT))
+if str(SRC_PATH) not in sys.path:
+    sys.path.insert(0, str(SRC_PATH))
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import platform
 import time

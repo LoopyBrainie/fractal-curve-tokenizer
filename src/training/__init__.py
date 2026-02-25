@@ -53,6 +53,14 @@ trainer.fit()
 ```
 """
 
+# Data transforms (I170-FIX: 添加 data 模块导入)
+from .data.transforms import (
+    DatasetSpec,
+    DATASETS,
+    MixupCutmix,
+    mixup_criterion,
+)
+
 # Samplers
 from .samplers import (
     ClassBalancedSampler,
