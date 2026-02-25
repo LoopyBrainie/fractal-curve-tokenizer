@@ -147,11 +147,11 @@ import sys
 from pathlib import Path
 # 使用 parents[2] 获取项目根目录 (不是 src/)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-# 强制将项目根目录添加到 sys.path[0]
-sys.path.insert(0, str(_PROJECT_ROOT))
-# 同时添加 src/ 目录，确保 vit_pytorch 包可以被找到
+# 先添加 src/ 目录（位置 1），再添加项目根目录（位置 0）
+# 这样 "from src.training.data.transforms" 可以正确解析
 SRC_PATH = _PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_PATH))
+sys.path.insert(0, str(_PROJECT_ROOT))
 
 import platform
 import time
