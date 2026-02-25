@@ -80,7 +80,6 @@ uv run python -m src.training.train_fractal_vit \
   --jump-loss-weight 0.1 \
   --use-amp \
   --gradient-checkpoint \
-  --compile \
   --channels-last \
   --use-area-encoding \
   --use-pattern-encoder \
