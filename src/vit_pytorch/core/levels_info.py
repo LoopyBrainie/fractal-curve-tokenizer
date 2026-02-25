@@ -150,9 +150,10 @@ class LevelsInfo:
         if actual_dim != 3:
             # I-TOK: torch.compile 可能导致维度问题，尝试恢复
             shape = actual_data.shape
+            expected_cols = self.max_level + 1
+
             if actual_dim == 2:
                 # 尝试恢复为 (B, N, D+1)
-                expected_cols = self.max_level + 1
                 if shape[1] % expected_cols == 0:
                     N = shape[1] // expected_cols
                     self.data = actual_data.view(shape[0], N, expected_cols)
@@ -160,6 +161,21 @@ class LevelsInfo:
                     raise ValueError(
                         f"levels_info 维度错误: 期望 3 维张量 (B, N, D+1)，"
                         f"实际 2 维 {shape}，无法恢复。"
+                    )
+            elif actual_dim == 4:
+                # I-TOK: torch.compile 可能将张量扩展为 4D [B, 1, 1, D+1]
+                if shape[1] == 1 and shape[2] == 1:
+                    # [B, 1, 1, D+1] -> [B, 1, D+1] -> [B, D+1] -> [B, 1, D+1]
+                    squeezed = actual_data.squeeze(2)  # [B, 1, D+1]
+                    squeezed = squeezed.squeeze(1)  # [B, D+1]
+                    self.data = squeezed.unsqueeze(1)  # [B, 1, D+1]
+                elif shape[1] == 1:
+                    # [B, 1, N, D+1] -> [B, N, D+1]
+                    self.data = actual_data.squeeze(1)
+                else:
+                    raise ValueError(
+                        f"levels_info 维度错误: 期望 3 维张量 (B, N, D+1)，"
+                        f"实际 4 维 {shape}，无法恢复。"
                     )
             else:
                 raise ValueError(
