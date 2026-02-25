@@ -215,6 +215,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 移除: K_min, K_max, splitter_dropout, splitter_config, enable_learnable_quota
         # 保留 depth_scale_range (用于 patch_embed)
         depth_scale_range: Optional[Tuple[float, float]] = (0.5, 2.0),
+        # I-PHASE4: 池化方法选择
+        use_interpolated_pooling: bool = False,
+        # I-PHASE4: 动态权重 (C3 尺度等变性)
+        use_dynamic_weight: bool = False,
         # Step 3: HilbertTopologyCache for O(1) Tensor Lookup
         hilbert_cache: Optional[Any] = None,
     ) -> None:
@@ -272,6 +276,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             conv_layers=2,
             use_batch_norm=False,  # I130-2: 禁用 BatchNorm 确保确定性
             depth_scale_range=depth_scale_range,
+            # I-PHASE4: 新参数
+            use_interpolated_pooling=use_interpolated_pooling,
+            use_dynamic_weight=use_dynamic_weight,
         )
 
         # =====================================================================
@@ -654,9 +661,35 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             tensor_result = split_result
         elif split_result is not None:
             # I130-4: 支持 SemanticRedundancySplitter 的 SplitResult 类型
-            # 需要转换为 TensorSplitResult
+            # H1SS (hilbert_optimal): 也返回 SplitResult 类型
             from vit_pytorch.layers.splitters.semantic_redundancy import SplitResult
-            if isinstance(split_result, SplitResult):
+            from vit_pytorch.core.splitter_protocol import SplitResult as CoreSplitResult
+
+            if isinstance(split_result, CoreSplitResult):
+                # H1SS 已经返回了 regions/depths/batch_indices/hilbert_indices
+                # 直接构建 TensorSplitResult
+                if (hasattr(split_result, 'regions') and hasattr(split_result, 'depths') and
+                    hasattr(split_result, 'batch_indices') and split_result.regions is not None):
+                    regions = split_result.regions
+                    depths = split_result.depths
+                    batch_indices = split_result.batch_indices
+                    hilbert_indices = split_result.hilbert_indices
+
+                    token_indices = torch.arange(len(regions), dtype=torch.long, device=regions.device)
+                    complexities = split_result.probs.view(-1) if split_result.probs is not None and split_result.probs.numel() > 0 else \
+                                  torch.zeros(len(regions), dtype=torch.float32, device=regions.device)
+
+                    tensor_result = TensorSplitResult(
+                        regions=regions.long(),
+                        depths=depths,
+                        batch_indices=batch_indices,
+                        hilbert_indices=hilbert_indices,
+                        token_indices=token_indices,
+                        complexities=complexities,
+                    )
+                else:
+                    tensor_result = self.convert_split_result_to_tensor(split_result, images)
+            elif isinstance(split_result, SplitResult):
                 tensor_result = self.convert_split_result_to_tensor(split_result, images)
             else:
                 raise ValueError(f"Unexpected split result type: {type(split_result)}")

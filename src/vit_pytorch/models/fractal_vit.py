@@ -290,13 +290,31 @@ class FractalCurveViT(nn.Module):
         # I145: Splitter 温度参数 (用于温度退火)
         splitter_temp_start: Optional[float] = None,
         splitter_temp_end: Optional[float] = None,
+        # I145-H1SS: Splitter token 比例超参数 (K 将由模型根据 image_size 动态计算)
+        splitter_token_ratio_min: float = 0.02,  # 最小 token 比例 (2%)
+        splitter_token_ratio_max: float = 0.15,  # 最大 token 比例 (15%)
+        # I145-H1SS: HilbertOptimalSplitter 特定参数
+        jump_loss_weight: Optional[float] = None,  # H1SS Jump Loss 权重
+        density_field_hidden_dim: Optional[int] = None,  # H1SS Density Field 隐藏层维度
         # I130-3: Splitter 类型选择 (I145: 新增 semantic_redundancy 支持)
-        splitter_type: str = 'gumbel_topk',  # 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy'
+        splitter_type: str = 'gumbel_topk',  # 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy', 'hilbert_optimal'
+        # I170-NEW: Hilbert 平滑参数 (I165-1: 解决空间碎片化)
+        enable_hilbert_smoothness: bool = False,  # 是否启用 Hilbert 感知平滑
+        hilbert_smoothness_weight: float = 0.1,  # 平滑损失权重
+        # I170-NEW: Meta-DVN 参数 (I165-1: 学习深度方差期望)
+        enable_meta_dvn: bool = False,  # 是否启用元感知深度方差网络
+        meta_dvn_hidden_dim: int = 64,  # Meta-DVN MLP 隐藏层维度
         # I110-7: 语义分裂器配置
         use_semantic_splitter: bool = False,
         semantic_splitter_config: Optional[SemanticSplitterConfig] = None,
         # P6-1: 深度缩放参数 (传递给 HilbertPatchEmbed)
         depth_scale_range: Optional[Tuple[float, float]] = None,
+        # I-PHASE4: 池化方法选择 (传递给 HilbertPatchEmbed)
+        use_interpolated_pooling: bool = False,
+        # I-PHASE4: 动态权重 (传递给 HilbertPatchEmbed)
+        use_dynamic_weight: bool = False,
+        # I-PHASE4: Low-Rank 几何场 (传递给 GeometryField)
+        geometry_field_rank: int = 16,
         # I162-1: Hilbert 模式编码器参数
         use_pattern_encoder: bool = False,  # 是否启用模式编码器
         pattern_encoder_mode: str = "light",  # "light", "standard", "multihead"
@@ -398,6 +416,10 @@ class FractalCurveViT(nn.Module):
 
         # P6-1: 深度缩放参数
         self.depth_scale_range = depth_scale_range
+        # I-PHASE4: 新参数
+        self.use_interpolated_pooling = use_interpolated_pooling
+        self.use_dynamic_weight = use_dynamic_weight
+        self.geometry_field_rank = geometry_field_rank
 
         # I162-1: Hilbert 模式编码器配置
         self.use_pattern_encoder = use_pattern_encoder
@@ -538,6 +560,45 @@ class FractalCurveViT(nn.Module):
                     gumbel_temp_end=splitter_temp_end if splitter_temp_end is not None else SPLITTER_TEMP_END,
                     learnable_temperature=True,
                 )
+            elif splitter_type == 'hilbert_optimal':
+                # HilbertOptimalSplitter (H1SS): 基于6条公理的最优实现
+                # A1: 1D Hilbert 流形卷积
+                # A2: 无 Gumbel 扰动
+                # A3: Entmax 稀疏激活
+                # A4: 树一致性软约束
+                # A5: 单次 Entmax 投影
+                # A6: < 10K 参数
+                from vit_pytorch.layers.splitters.hilbert_optimal_splitter import (
+                    HilbertOptimalSplitter,
+                )
+
+                # I145-H1SS: 动态计算 K 范围（变参数）
+                # 根据 image_size 和 token_ratio 动态计算，而非暴露固定数值
+                # K = (H * W / min_patch_size^2) * ratio
+                img_h, img_w = self.image_size
+                max_possible_tokens = (img_h // effective_min_patch_size) * (img_w // effective_min_patch_size)
+                computed_k_min = max(1, int(max_possible_tokens * splitter_token_ratio_min))
+                computed_k_max = max(computed_k_min + 1, int(max_possible_tokens * splitter_token_ratio_max))
+
+                # H1SS: 三层参数配置
+                # 参数 (Parameters): feature_dim, hidden_dim, max_level_limit, min_patch_size
+                # 变参数 (Variable): K_min, K_max, sampling_ratio_schedule (由 image_size 动态计算)
+                # 超参数 (Hyper): entmax_alpha, tree_constraint_weight, temperature, jump_loss_weight
+                self.splitter = HilbertOptimalSplitter(
+                    feature_dim=splitter_feature_dim or dim,
+                    hidden_dim=splitter_hidden_dim or 64,
+                    max_level_limit=max_level_limit,
+                    min_patch_size=effective_min_patch_size,
+                    K_min=computed_k_min,
+                    K_max=computed_k_max,
+                    sampling_ratio_schedule=(2, 4),  # 动态 sampling_ratio
+                    entmax_alpha=2.0,
+                    tree_constraint_weight=0.1,
+                    temperature_init=splitter_temp_start if splitter_temp_start is not None else 1.0,
+                    temperature_min=splitter_temp_end if splitter_temp_end is not None else 0.3,
+                    jump_loss_weight=jump_loss_weight if jump_loss_weight is not None else 0.1,
+                    density_field_hidden_dim=density_field_hidden_dim if density_field_hidden_dim is not None else 32,
+                )
             else:
                 # 默认使用 GumbelTopKSplitter
                 from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
@@ -571,6 +632,12 @@ class FractalCurveViT(nn.Module):
                     enable_soft_threshold=True,
                     soft_threshold_max=0.5,
                     soft_threshold_schedule='linear',
+                    # I170-NEW: Hilbert 平滑参数 (I165-1: 解决空间碎片化)
+                    enable_hilbert_smoothness=enable_hilbert_smoothness,
+                    hilbert_smoothness_weight=hilbert_smoothness_weight,
+                    # I170-NEW: Meta-DVN 参数 (I165-1: 学习深度方差期望)
+                    enable_meta_dvn=enable_meta_dvn,
+                    meta_dvn_hidden_dim=meta_dvn_hidden_dim,
                 )
                 self.splitter = GumbelTopKSplitter(
                     config=splitter_config,
@@ -598,6 +665,9 @@ class FractalCurveViT(nn.Module):
                 base_patch_size=effective_min_patch_size,
                 min_patch_size=effective_min_patch_size,
                 depth_scale_range=self.depth_scale_range,
+                # I-PHASE4: 新参数
+                use_interpolated_pooling=self.use_interpolated_pooling,
+                use_dynamic_weight=self.use_dynamic_weight,
                 hilbert_cache=self.hilbert_cache,  # Step 3: O(1) Hilbert lookup
             )
 
@@ -655,6 +725,7 @@ class FractalCurveViT(nn.Module):
                 dim=self.geometry_field_dim,
                 max_level=self.max_level,
                 heads=heads,
+                rank=geometry_field_rank,  # I-PHASE4: Low-Rank
             )
 
         # === CLS Token ===

@@ -197,7 +197,20 @@ class HilbertSplitterConfig:
     # 启用静态 K 模式以支持 torch.compile 的 cudagraphs 优化
     # 启用后，token 数量将 padding 到 static_k_max
     static_k_mode: bool = False
+
+    # ==================== I170-NEW: Hilbert 感知平滑配置 ====================
+    # 在 Logits 计算阶段注入 Hilbert 先验，通过拉普拉斯平滑正则项
+    # 强制 Hilbert 曲线上相邻的 token 具有相似的分裂意愿
+    # 预期效果: 减少空间碎片化，增强 Hilbert 局部性
+    enable_hilbert_smoothness: bool = False
+    hilbert_smoothness_weight: float = 0.1  # 平滑损失权重
     static_k_max: int = 64  # Padding 目标 K 值
+
+    # ==================== I170-NEW: Meta-DVN 配置 ====================
+    # 使用 MLP 探针预测当前图像各深度的方差期望
+    # 替代静态 EMA 归一化，自适应极端纹理图像
+    enable_meta_dvn: bool = False
+    meta_dvn_hidden_dim: int = 64  # MLP 隐藏层维度
 
     # ==================== 验证与工具方法 ====================
 
