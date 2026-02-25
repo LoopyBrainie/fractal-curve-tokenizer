@@ -145,6 +145,9 @@ class ManifoldNativeAttention(nn.Module):
         if levels_info is not None:
             if hasattr(levels_info, 'depths'):
                 depths = levels_info.depths
+                # 尝试获取 hilbert_indices
+                if hasattr(levels_info, 'get_hilbert_indices'):
+                    hilbert_indices = levels_info.get_hilbert_indices()
             elif isinstance(levels_info, torch.Tensor):
                 # 处理原始 tensor 格式 [B, N, max_level+1]
                 depths = levels_info.argmax(dim=-1)
@@ -160,9 +163,19 @@ class ManifoldNativeAttention(nn.Module):
         attn = (q @ k.transpose(-2, -1)) * self.scale
 
         # 如果启用了新模块，使用几何解码器
-        if self.use_banded or (depths is not None and hilbert_indices is not None):
+        # 只有当 hilbert_indices 可用时才计算几何特征
+        if self.use_banded and hilbert_indices is not None and depths is not None:
             # 计算几何特征
-            if depths is not None and regions is not None and image_size is not None:
+            if regions is not None and image_size is not None:
+                # 处理 image_size 可能是元组 (H, W) 或整数的情况
+                if isinstance(image_size, tuple):
+                    img_h, img_w = image_size
+                    img_area = img_h * img_w
+                    img_size_tuple = (img_h, img_w)
+                else:
+                    img_area = image_size * image_size
+                    img_size_tuple = (image_size, image_size)
+
                 # 从 regions 提取几何信息
                 coords = (regions[..., :2] + regions[..., 2:]) / 2  # 中心点
                 aspect_ratios = torch.log(
@@ -172,7 +185,7 @@ class ManifoldNativeAttention(nn.Module):
                 normalized_areas = (
                     (regions[..., 2] - regions[..., 0]) *
                     (regions[..., 3] - regions[..., 1])
-                ) / (image_size * image_size + 1e-8)
+                ) / (img_area + 1e-8)
 
                 # 模拟 LCA depths (简化版本)
                 lca_depths = depths.unsqueeze(2) + depths.unsqueeze(1)
@@ -188,7 +201,7 @@ class ManifoldNativeAttention(nn.Module):
                     coords=coords,
                     normalized_areas=normalized_areas,
                     paths=paths,
-                    image_size=(image_size, image_size),
+                    image_size=img_size_tuple,
                 )
 
                 # 解码为偏置
