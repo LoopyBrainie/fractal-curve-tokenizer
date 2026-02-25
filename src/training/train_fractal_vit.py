@@ -175,7 +175,8 @@ logging.getLogger('torch.cuda').setLevel(logging.ERROR)
 # =========================================================================
 
 # Data transforms (extracted to data/transforms.py)
-from .data.transforms import (
+# I170-FIX: 使用绝对导入，因为直接运行脚本时相对导入不工作
+from src.training.data.transforms import (
     DatasetSpec,
     DATASETS,
     MixupCutmix,
