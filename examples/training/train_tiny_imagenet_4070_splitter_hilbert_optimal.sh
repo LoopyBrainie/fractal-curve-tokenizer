@@ -89,4 +89,4 @@ uv run python -m src.training.train_fractal_vit \
   --patience 25 \
   --num-workers 8 \
   --seed 42 \
-  --diagnostic-hook
+  --compile
