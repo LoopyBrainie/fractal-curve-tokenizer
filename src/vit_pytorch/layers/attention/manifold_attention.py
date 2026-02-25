@@ -17,6 +17,8 @@ Manifold-Native 多尺度注意力 (ManifoldNativeAttention)
     B_manifold = GeometricLatentDecoder(ξ)
 """
 
+from __future__ import annotations
+
 import math
 from typing import Optional
 
@@ -191,8 +193,8 @@ class ManifoldNativeAttention(nn.Module):
                 lca_depths = depths.unsqueeze(2) + depths.unsqueeze(1)
                 lca_depths = lca_depths.clamp(0, self.max_level)
 
-                # 模拟 paths
-                paths = torch.randint(0, 4, (B, N, self.max_level))
+                # 模拟 paths - 确保在正确的设备上
+                paths = torch.randint(0, 4, (B, N, self.max_level), device=x.device)
 
                 # 计算几何特征
                 geo_features = compute_geometric_features(
