@@ -606,15 +606,18 @@ def main():
     # 创建或加载模型
     from vit_pytorch import FractalCurveViT
     from vit_pytorch.modules.tokenizer import StreamingFractalTokenizerV3
-    
+
+    # I30-17: 动态深度 - max_level 由模型内部根据 min_patch_size 自动计算
+    # 不再需要显式传递 max_level
     tokenizer = StreamingFractalTokenizerV3(
         image_size=max(spec['image_size'], 32),
         channels=spec['channels'],
         d_model=192,
         base_patch_size=4,
-        max_level=4,
+        min_patch_size=4,  # I30-17: 目标最小 patch (max_level 自动计算)
+        use_hilbert_order=True,
     )
-    
+
     model = FractalCurveViT(
         image_size=max(spec['image_size'], 32),
         num_classes=spec['num_classes'],
@@ -623,6 +626,8 @@ def main():
         heads=8,
         mlp_dim=192 * 4,
         channels=spec['channels'],
+        # I30-17: 动态深度参数
+        min_patch_size=4,
         tokenizer=tokenizer,
     ).to(device, non_blocking=True)
     
