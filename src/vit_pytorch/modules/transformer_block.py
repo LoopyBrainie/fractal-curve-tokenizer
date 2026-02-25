@@ -72,6 +72,7 @@ from torch.utils.checkpoint import checkpoint
 logger = logging.getLogger(__name__)
 
 from vit_pytorch.layers.attention.hilbert_bias import HilbertAwareMultiScaleAttention
+from vit_pytorch.layers.attention.manifold_attention import ManifoldNativeAttention
 from vit_pytorch.layers.ffn.swiglu import AdaptiveFractalFeedForward, FFNType
 from vit_pytorch.core.config import AttentionEncoderConfig  # I98-3
 from vit_pytorch.core.levels_info import LevelsInfo  # I98-4
@@ -148,23 +149,40 @@ class FractalTransformerBlock(nn.Module):
         fourier_levels: int = 4,
         encoder_config: Optional["AttentionEncoderConfig"] = None,  # I98-3
         use_fp16: bool = False,  # I104-3: FP16 存储 LCA embedding
+        use_manifold_native: bool = False,  # 新: 使用 Manifold-Native 注意力
+        manifold_beta: float = 4.0,  # 新: Hilbert 带宽系数
     ):
         super().__init__()
         self.dim = dim
         self.max_level = max_level
+        self.use_manifold_native = use_manifold_native
 
-        # I98-3: 支持协议驱动配置
-        self.attention = HilbertAwareMultiScaleAttention(
-            dim=dim,
-            heads=heads,
-            dim_head=dim_head,
-            dropout=dropout,
-            max_level=max_level,
-            use_affine_modulation=use_affine_modulation,
-            fourier_levels=fourier_levels,
-            encoder_config=encoder_config,
-            use_fp16=use_fp16,  # I104-3
-        )
+        # 选择注意力模块
+        if use_manifold_native:
+            # 新: Manifold-Native 注意力 (整合所有最佳实现)
+            self.attention = ManifoldNativeAttention(
+                dim=dim,
+                heads=heads,
+                dim_head=dim_head,
+                max_level=max_level,
+                beta=manifold_beta,
+                dropout=dropout,
+                use_banded=True,
+                use_fractal_residual=True,
+            )
+        else:
+            # 原有: HilbertAwareMultiScaleAttention
+            self.attention = HilbertAwareMultiScaleAttention(
+                dim=dim,
+                heads=heads,
+                dim_head=dim_head,
+                dropout=dropout,
+                max_level=max_level,
+                use_affine_modulation=use_affine_modulation,
+                fourier_levels=fourier_levels,
+                encoder_config=encoder_config,
+                use_fp16=use_fp16,
+            )
 
         self.ff = AdaptiveFractalFeedForward(
             dim=dim,

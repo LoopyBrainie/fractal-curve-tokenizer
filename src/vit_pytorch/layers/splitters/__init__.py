@@ -22,9 +22,16 @@ from .hilbert_optimal_splitter import (
     HilbertOptimalSplitterConfig,
     compute_locality_score,
     compute_determinism_score,
-    compute_gradient_coverage,
+    compute_gradient_coverage as hilbert_gradient_coverage,
     compute_tree_consistency,
     compute_consistency_stats,
+)
+from .hilbert_entmax import (
+    HilbertOrderedEntmaxSplitter,
+    HilbertLocalComplexity,
+    entmax_1_5,
+    entmax,
+    compute_gradient_coverage,
 )
 
 __all__ = [
@@ -46,4 +53,9 @@ __all__ = [
     "compute_gradient_coverage",
     "compute_tree_consistency",
     "compute_consistency_stats",
+    # H-Entmax
+    "HilbertOrderedEntmaxSplitter",
+    "HilbertLocalComplexity",
+    "entmax_1_5",
+    "entmax",
 ]

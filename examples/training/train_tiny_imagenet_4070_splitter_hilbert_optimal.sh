@@ -49,7 +49,6 @@ uv run python src/training/train_fractal_vit.py \
   --heads 8 \
   --mlp-dim 512 \
   --min-patch-size 4 \
-  --image-size 64 \
   --pool weighted \
   --ffn-type swiglu_level \
   --token-coverage-min 0.03 \
@@ -72,7 +71,6 @@ uv run python src/training/train_fractal_vit.py \
   --include-soft-entropy \
   --soft-entropy-mode maximize \
   --soft-entropy-weight 0.1 \
-  \
   --splitter-type hilbert_optimal \
   --splitter-token-ratio-min 0.02 \
   --splitter-token-ratio-max 0.15 \
@@ -83,8 +81,6 @@ uv run python src/training/train_fractal_vit.py \
   --gradient-checkpoint \
   --compile \
   --channels-last \
-  --use-hilbert-encoding \
-  --use-spatial-encoding \
   --use-area-encoding \
   --use-pattern-encoder \
   --pattern-encoder-mode light \

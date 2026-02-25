@@ -252,6 +252,12 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
     ):
         super().__init__()
 
+        # 课程学习阶段 (与 GumbelTopK 保持一致)
+        # 1 = Teacher Forcing (Epoch 1-9)
+        # 2 = Acc-Driven Splitting (Epoch 10-19)
+        # 3 = Resource Co-adaptation (Epoch 20+)
+        self._curriculum_stage: int = 1
+
         if config is not None:
             feature_dim = config.feature_dim
             min_patch_size = config.min_patch_size
@@ -273,6 +279,12 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         self.hidden_dim = hidden_dim
         self.K_min = K_min
         self.K_max = K_max
+        # K 课程学习：当前使用的 K 值（随 epoch 增大）
+        self._current_K = K_min
+        self._K_schedule_epochs = 30  # K 课程学习持续 30 个 epoch
+        # K 向上取整：找到能囊括 K_max 的最小 level 对应的候选区域数
+        # 例如: K_max=38 → level 3 (4^3=64) → K_max_rounded=64
+        self._K_max_rounded = self._compute_min_level_regions(K_max, max_level_limit)
         self.sampling_ratio_schedule = sampling_ratio_schedule
 
         # Entmax 参数
@@ -785,7 +797,8 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # w_i = 4^(-depth_i) 是 Hilbert 曲线下的面积权重
         hilbert_weights = self._area_encoding[self.candidate_depths]  # [N]
         K_float = (density_per_region.squeeze(-1) * hilbert_weights).sum()
-        K = K_float.long().clamp(self.K_min, self.K_max).item()
+        # K 课程学习：使用 _current_K 作为实际上限（从 K_min 逐渐增大到 K_max 向上取整）
+        K = K_float.long().clamp(self.K_min, self._current_K).item()
 
         # 稀疏选择
         selected_mask, probs = self._sparse_select(logits, K, hard=hard)
@@ -835,6 +848,14 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         """设置当前 epoch，用于课程学习调度"""
         self._epoch = epoch
 
+        # 课程学习阶段更新 (与 GumbelTopK 保持一致)
+        if epoch < 10:
+            self._curriculum_stage = 1
+        elif epoch < 20:
+            self._curriculum_stage = 2
+        else:
+            self._curriculum_stage = 3
+
         # Entmax 课程学习调度
         if epoch < self.entmax_schedule_epochs:
             self.entmax_alpha = self.entmax_alpha_init + \
@@ -848,12 +869,40 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             self.temperature_init * 0.5 ** (epoch / 20)
         )
 
+        # K 课程学习：从 K_min 逐渐增大到 K_max（向上取整）
+        # 符合课程学习原则：先学简单（少 token），后学复杂（多 token）
+        K_max_rounded = math.ceil(self.K_max)  # 向上取整
+        if epoch <= self._K_schedule_epochs:
+            # 线性增长：K_min → _K_max_rounded（能囊括 K_max 的最小 level 对应区域数）
+            progress = epoch / self._K_schedule_epochs
+            self._current_K = int(self.K_min + (self._K_max_rounded - self.K_min) * progress)
+        else:
+            # 课程学习阶段结束后，使用 _K_max_rounded
+            self._current_K = self._K_max_rounded
+
+    def _compute_min_level_regions(self, K_target: int, max_level: int) -> int:
+        """计算能囊括 K_target 个 token 的最小 level 对应的候选区域数
+
+        例如: K_target=38, max_level=4
+            - level 0: 4^0 = 1 < 38
+            - level 1: 4^1 = 4 < 38
+            - level 2: 4^2 = 16 < 38
+            - level 3: 4^3 = 64 >= 38 ✓
+            → 返回 64
+        """
+        for level in range(max_level + 1):
+            regions = 4 ** level
+            if regions >= K_target:
+                return regions
+        # 如果所有 level 都不满足，返回最大 level 的区域数
+        return 4 ** max_level
+
     def extra_repr(self) -> str:
         return (
             f"HilbertOptimalSplitter("
             f"max_level={self.max_level_limit}, "
             f"hidden_dim={self.hidden_dim}, "
-            f"K={self.K_min}-{self.K_max}, "
+            f"K={self.K_min}-{self._K_max_rounded}[current={self._current_K}], "
             f"entmax_alpha={self.entmax_alpha:.2f}, "
             f"tree_weight={self.tree_constraint_weight})"
         )
