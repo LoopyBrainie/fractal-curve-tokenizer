@@ -78,13 +78,13 @@ import torchvision
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
-# 添加项目路径
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent.parent
+# 添加项目路径 (evaluation/ -> training/ -> src/ -> 项目根目录 = Path(__file__).resolve().)
+SCRIPT_DIRparent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-# 导入评估层 (使用相对导入)
-from .evaluation_layers import (
+# 导入评估层 (使用绝对导入，支持直接运行)
+from training.evaluation.evaluation_layers import (
     LayeredEvaluationReport,
     L1ClassificationMetrics,
     L2TokenizerMetrics,
@@ -106,8 +106,7 @@ from .evaluation_layers import (
 
 # 导入 CUB-200 专用评估器
 try:
-    # 使用完整导入路径以避免相对导入问题
-    from ..trainer.cub200_trainer import (
+    from training.trainer.cub200_trainer import (
         CUB200Trainer,
         CUB200EvalResult,
         CUB200TrainingConfig,
@@ -119,13 +118,13 @@ except ImportError as e:
     CUB200_IMPORT_ERROR = str(e)
 
 # 导入共享 Checkpoint 加载模块
-from ..core.checkpoint import (
+from training.core.checkpoint import (
     load_checkpoint,
     load_model,
     load_model_legacy,
     get_checkpoint_info,
 )
-from ..core.model_gene import ModelGene
+from training.core.model_gene import ModelGene
 from vit_pytorch.core.depth_utils import compute_max_depth
 
 
