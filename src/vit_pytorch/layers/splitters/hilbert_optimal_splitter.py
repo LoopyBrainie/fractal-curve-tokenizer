@@ -728,6 +728,74 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             # 软选择 (用于训练)
             return probs_scaled, probs_scaled
 
+        # =====================================================================
+        # I150-3: Token 稳定性监控
+        # =====================================================================
+        self._monitor_token_stability = False
+        self._token_history: List[Tensor] = []
+
+    def enable_token_stability_monitoring(self) -> "HilbertOptimalSplitter":
+        """启用 token 选择稳定性监控"""
+        self._monitor_token_stability = True
+        self._token_history.clear()
+        return self
+
+    def disable_token_stability_monitoring(self) -> "HilbertOptimalSplitter":
+        """禁用 token 选择稳定性监控"""
+        self._monitor_token_stability = False
+        return self
+
+    def compute_token_iou(self) -> Optional[float]:
+        """
+        计算最近两次 token 选择的 IOU（重合率）。
+
+        Returns:
+            IOU 值（0.0-1.0），或 None（如果历史不足）
+        """
+        if len(self._token_history) < 2:
+            return None
+
+        indices1 = set(self._token_history[-2].tolist())
+        indices2 = set(self._token_history[-1].tolist())
+
+        if not indices1 or not indices2:
+            return None
+
+        intersection = len(indices1 & indices2)
+        union = len(indices1 | indices2)
+
+        return intersection / union if union > 0 else 0.0
+
+    def get_token_stability_stats(self) -> Dict[str, float]:
+        """
+        获取 token 稳定性统计信息。
+
+        Returns:
+            包含 iou_mean, iou_std, iou_min 的字典
+        """
+        if len(self._token_history) < 2:
+            return {"iou_mean": 0.0, "iou_std": 0.0, "iou_min": 0.0, "iou_max": 0.0}
+
+        ious = []
+        for i in range(len(self._token_history) - 1):
+            set1 = set(self._token_history[i].tolist())
+            set2 = set(self._token_history[i + 1].tolist())
+            if set1 and set2:
+                intersection = len(set1 & set2)
+                union = len(set1 | set2)
+                ious.append(intersection / union if union > 0 else 0.0)
+
+        if not ious:
+            return {"iou_mean": 0.0, "iou_std": 0.0, "iou_min": 0.0, "iou_max": 0.0}
+
+        import numpy as np
+        return {
+            "iou_mean": float(np.mean(ious)),
+            "iou_std": float(np.std(ious)),
+            "iou_min": float(np.min(ious)),
+            "iou_max": float(np.max(ious)),
+        }
+
     def forward(
         self,
         features: Tensor,
@@ -837,6 +905,16 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             logits=logits,
             probs=probs,
         )
+
+        # I150-3: 记录 token 选择历史用于稳定性监控
+        if self._monitor_token_stability and hard:
+            # 记录 batch 0 的选择（用于统计）
+            if B > 0:
+                token_idx = region_idx[batch_idx == 0].cpu()
+                self._token_history.append(token_idx)
+                # 限制历史长度
+                if len(self._token_history) > 100:
+                    self._token_history.pop(0)
 
         return result
 
