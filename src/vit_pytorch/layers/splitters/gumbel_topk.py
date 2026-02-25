@@ -199,6 +199,185 @@ from typing import Optional
 #     - 消除 Gumbel 随机性导致的 Hilbert 局部性破坏
 # =============================================================================
 
+# =============================================================================
+# I170-NEW: Hilbert 感知平滑正则化
+# =============================================================================
+# 核心思想:
+#     在 Logits 计算阶段注入 Hilbert 先验，通过拉普拉斯平滑正则项
+#     强制 Hilbert 曲线上相邻的 token 具有相似的分裂意愿
+#
+# 数学形式:
+#     R_smooth = z^T · L_hilbert · z = Σ_{(i,j) ∈ E} (z_i - z_j)²
+#     logits_smooth = logits + λ · (L_hilbert @ logits)
+#
+# 预期效果:
+#     - 减少空间碎片化: 相邻区域倾向于同选或同不选
+#     - 增强 Hilbert 局部性: 与后处理排序形成前后呼应
+# =============================================================================
+
+# =============================================================================
+# I170-NEW: Meta-DVN (动态元感知方差控制)
+# =============================================================================
+# 核心思想:
+#     废弃 EMA 静态方差归一化，使用 MLP 探针预测当前图像的方差期望
+#     使模型能够自适应极端纹理 (纯色背景 / 高频噪声)
+#
+# 数学形式:
+#     σ̂_d = MLP_probe(feature_L0)  # 预测各深度方差期望
+#     z_norm = (z - μ_batch) / (σ̂_d + ε)
+#
+# 预期效果:
+#     - 自适应极端纹理图像
+#     - 端到端训练，梯度直接来自主损失
+# =============================================================================
+
+class MetaDepthVarianceNetwork(nn.Module):
+    """
+    元感知深度方差预测网络。
+
+    使用 Level-0 全局特征预测各深度的期望方差，
+    替代静态的 EMA 归一化。
+
+    数学形式:
+        σ̂_d = MLP(feature_L0)[d]
+
+    输入: Level-0 特征向量 [C]
+    输出: 各深度方差期望 [D]
+    """
+
+    def __init__(
+        self,
+        feature_dim: int = 256,
+        num_depths: int = 8,
+        hidden_dim: int = 64,
+    ):
+        super().__init__()
+
+        self.feature_dim = feature_dim
+        self.num_depths = num_depths
+
+        # 轻量级 MLP: ℝ^C → ℝ^D
+        self.mlp = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_depths),
+            nn.Softplus(),  # 确保正值 (方差 > 0)
+        )
+
+        # 初始化为保守估计: deeper = higher variance
+        with torch.no_grad():
+            init_vals = torch.tensor([
+                0.1 * (1.5 ** d) for d in range(num_depths)
+            ])
+            # 设置最后一层 bias 为 log(初始值)
+            self.mlp[-2].bias.copy_(init_vals.log())
+
+    def forward(
+        self,
+        level0_features: Tensor,  # [B, C] - Global features
+    ) -> Tensor:
+        """
+        返回各深度的期望方差。
+
+        Args:
+            level0_features: [B, C] 全局特征向量
+
+        Returns:
+            expected_variance: [B, D] 每深度的期望方差
+        """
+        return self.mlp(level0_features)  # [B, D]
+
+
+class HilbertLaplacianCache(nn.Module):
+    """
+    Hilbert 曲线拉普拉斯矩阵缓存。
+
+    预计算 Hilbert 曲线上各 token 之间的邻接关系，
+    用于在 logits 计算时注入空间平滑先验。
+
+    数学形式:
+        L[i,j] = -2  (i = j, 对角线)
+        L[i,j] = 1   (|i-j| = 1, 相邻节点)
+        L[i,j] = 0  (其他)
+
+    使用方式:
+        smooth_logits = logits + λ × (L @ logits)
+        其中 λ = sigmoid(smoothness_logit) 为可学习强度
+    """
+
+    def __init__(
+        self,
+        max_num_tokens: int = 256,
+        device: Optional[torch.device] = None,
+    ):
+        super().__init__()
+        self.max_num_tokens = max_num_tokens
+        self._device = device or torch.device('cpu')
+
+        # 延迟初始化：按需计算
+        self._laplacian: Optional[Tensor] = None
+        self._num_tokens: Optional[int] = None
+
+    @property
+    def laplacian(self) -> Tensor:
+        """获取当前大小对应的拉普拉斯矩阵。"""
+        if self._laplacian is None or self._num_tokens != self.max_num_tokens:
+            self._compute_laplacian(self.max_num_tokens)
+        return self._laplacian
+
+    def _compute_laplacian(self, num_tokens: int) -> None:
+        """
+        计算 Hilbert 曲线的一维链拉普拉斯矩阵。
+
+        简化版本：使用 1D 链近似（每个节点连接前后邻居）
+        更精确版本可使用 Hilbert 距离矩阵
+
+        Args:
+            num_tokens: Token 数量
+        """
+        self._num_tokens = num_tokens
+
+        # 1D 链邻接矩阵（Hilbert 曲线近似）
+        # 每个节点连接前一个和后一个节点
+        A = torch.zeros(num_tokens, num_tokens)
+
+        # 主对角线旁边的两条对角线
+        for i in range(num_tokens - 1):
+            A[i, i + 1] = 1.0
+            A[i + 1, i] = 1.0
+
+        # 度矩阵 D
+        D = torch.diag(A.sum(dim=1))
+
+        # 图拉普拉斯矩阵 L = D - A
+        # 使用对称归一化版本: L_sym = D^(-1/2) L D^(-1/2)
+        L = D - A
+
+        # 归一化处理（可选）
+        # D_inv_sqrt = torch.diag(1.0 / torch.sqrt(A.sum(dim=1) + 1e-8))
+        # L_normalized = D_inv_sqrt @ L @ D_inv_sqrt
+
+        self._laplacian = L.to(self._device)
+
+    def get_laplacian(self, num_tokens: int) -> Tensor:
+        """
+        获取指定 token 数量的拉普拉斯矩阵。
+
+        Args:
+            num_tokens: Token 数量
+
+        Returns:
+            拉普拉斯矩阵 [num_tokens, num_tokens]
+        """
+        if self._laplacian is None or self._num_tokens != num_tokens:
+            self._compute_laplacian(num_tokens)
+        return self._laplacian
+
+    def forward(self, num_tokens: int) -> Tensor:
+        """PyTorch forward 接口。"""
+        return self.get_laplacian(num_tokens)
+
+
 class DeterministicTopK(nn.Module):
     """
     确定性 Top-K 选择（替代 Gumbel-TopK）- 最佳实现 (I147 修复概率归一化)
@@ -1289,6 +1468,52 @@ class GumbelTopKSplitter(
         self._token_history: List[torch.Tensor] = []
         self._monitor_token_stability = False
 
+        # I170-NEW: Hilbert 感知平滑参数
+        self._enable_hilbert_smoothness = getattr(
+            config if config else type('obj', (), {}),
+            'enable_hilbert_smoothness',
+            False
+        ) if config else False
+        self._hilbert_smoothness_weight = getattr(
+            config if config else type('obj', (), {}),
+            'hilbert_smoothness_weight',
+            0.1
+        ) if config else 0.1
+
+        # Hilbert 拉普拉斯缓存（延迟初始化）
+        if self._enable_hilbert_smoothness:
+            self.hilbert_laplacian = HilbertLaplacianCache(
+                max_num_tokens=K_max,
+                device=None,  # 将在 forward 中确定
+            )
+            # 可学习平滑强度 λ = sigmoid(smoothness_logit)
+            self.smoothness_logit = nn.Parameter(torch.tensor(0.0))
+        else:
+            self.hilbert_laplacian = None
+            self.smoothness_logit = None
+
+        # I170-NEW: Meta-DVN (元感知方差控制) 参数
+        self._enable_meta_dvn = getattr(
+            config if config else type('obj', (), {}),
+            'enable_meta_dvn',
+            False
+        ) if config else False
+        self._meta_dvn_hidden_dim = getattr(
+            config if config else type('obj', (), {}),
+            'meta_dvn_hidden_dim',
+            64
+        ) if config else 64
+
+        # Meta-DVN 网络 (延迟初始化)
+        if self._enable_meta_dvn:
+            self.meta_dvn = MetaDepthVarianceNetwork(
+                feature_dim=feature_dim,
+                num_depths=max_level_limit + 1,
+                hidden_dim=self._meta_dvn_hidden_dim,
+            )
+        else:
+            self.meta_dvn = None
+
         # 动态状态 (forward 中确定)
         self._current_max_depth: Optional[int] = None
         self._current_image_size: Optional[Tuple[int, int]] = None
@@ -2078,6 +2303,7 @@ class GumbelTopKSplitter(
         logits: Tensor,
         device: torch.device,
         dtype: torch.dtype,
+        level0_features: Optional[Tensor] = None,
     ) -> Tensor:
         """
         按深度分组归一化 MLP 输出 (I23-1 方案C 核心修复, I35 EMA 改进)。
@@ -2260,6 +2486,36 @@ class GumbelTopKSplitter(
                 # 这样确保 B=1 和 B=4 评估时行为一致
                 mu_normalize = mu_per_batch  # [B, D]
                 sigma_normalize = (variance_per_batch + DEPTH_VARIANCE_NORM_EPS).sqrt()  # [B, D]
+
+        # ====================================================================
+        # I170-NEW: Meta-DVN 集成 - 使用学习到的方差期望
+        # ====================================================================
+        if self._enable_meta_dvn and self.meta_dvn is not None and level0_features is not None:
+            # 使用 Meta-DVN 预测方差期望
+            # level0_features: [B, C, H, W] -> [B, C] 全局平均池化
+            if level0_features.dim() == 4:
+                level0_global = level0_features.mean(dim=[2, 3])  # [B, C]
+            else:
+                level0_global = level0_features  # 已经是 [B, C]
+
+            # 预测各深度的期望方差
+            # Meta-DVN 输出维度: max_level_limit + 1 (来自模型配置)
+            expected_variance = self.meta_dvn(level0_global)  # [B, D_config]
+            expected_sigma = (expected_variance + DEPTH_VARIANCE_NORM_EPS).sqrt()  # [B, D_config]
+
+            # 切片到实际使用的深度维度 D (避免 _current_max_level < max_level_limit 的情况)
+            D_config = expected_sigma.shape[1]
+            if D_config > D:
+                # 截断到实际深度
+                expected_sigma = expected_sigma[:, :D]
+            elif D_config < D:
+                # 扩展（用最后一个值填充，保守策略）
+                padding = expected_sigma[:, -1:].expand(-1, D - D_config)
+                expected_sigma = torch.cat([expected_sigma, padding], dim=1)
+
+            # 使用 EMA 统计量和学习方差的组合（保守策略）
+            # 取两者的最小值，避免方差估计过大
+            sigma_normalize = torch.min(sigma_normalize, expected_sigma)
 
         # ====================================================================
         # 收集每个 batch 每个深度的均值和标准差用于归一化
@@ -2495,6 +2751,7 @@ class GumbelTopKSplitter(
             # 缓存用于辅助损失
             self._last_probs = probs.detach()
             self._last_probs_for_loss = probs
+            self._last_logits = logits.detach()  # I170-NEW: Hilbert 平滑需要
             self._last_selected_mask = selected_mask.detach()
             self._last_selected_mask_for_loss = selected_mask
             # P-OPT-FIX: 使用张量而非 float，避免 get_auxiliary_losses 中 .clamp() 报错
@@ -2582,6 +2839,7 @@ class GumbelTopKSplitter(
         # I145-FIX: 同时保留非 detached 版本用于辅助损失的梯度计算
         self._last_probs = probs.detach()
         self._last_probs_for_loss = probs  # 保留梯度用于辅助损失
+        self._last_logits = logits.detach()  # I170-NEW: Hilbert 平滑需要
         self._last_selected_mask = consistent_mask.detach()  # 用于日志/统计
         self._last_selected_mask_for_loss = consistent_mask  # 保留梯度用于辅助损失
 
@@ -2668,12 +2926,15 @@ class GumbelTopKSplitter(
         # 数学形式化:
         #     问题: MLP 输出方差与深度相关 (σ_3/σ_0 ≈ 8)
         #           导致 Top-K 偏好高方差深度，Log-Compensation 失效
-        #     
+        #
         #     解决: z_i^norm = (z_i - μ_d) / σ_d
         #           使各深度 MLP 输出服从 N(0, 1)
         # ====================================================================
         if DEPTH_VARIANCE_NORM_ENABLED:
-            complexity_logits = self._normalize_by_depth(complexity_logits, device, dtype)
+            # I170-NEW: 传递 features 以支持 Meta-DVN
+            complexity_logits = self._normalize_by_depth(
+                complexity_logits, device, dtype, level0_features=features
+            )
 
         # 深度嵌入偏置 - 确保在正确设备上 (I103-3: 使用缓存)
         depths = self._get_device_tensor(
@@ -2704,6 +2965,11 @@ class GumbelTopKSplitter(
                   + self.explore_bias
                   - taus.unsqueeze(0))
         
+        # I170-NEW: Hilbert 感知平滑
+        # 在返回前应用 Hilbert 拉普拉斯平滑正则项
+        if self._enable_hilbert_smoothness and self.hilbert_laplacian is not None:
+            logits = self._apply_hilbert_smoothness(logits, N)
+
         # === SAT-DEFENSE: 梯度平滑 ===
         # 在 logits 上注册梯度缩放 Hook，反向传播时乘 0.1
         # 降低 Splitter 对 Batch 0 巨量梯度的敏感度
@@ -2841,6 +3107,101 @@ class GumbelTopKSplitter(
         teacher_K = max(teacher_K, 16)
 
         return teacher_K
+
+    # I170-NEW: Hilbert 感知平滑方法
+    def _apply_hilbert_smoothness(
+        self,
+        logits: Tensor,
+        num_tokens: int,
+    ) -> Tensor:
+        """
+        应用 Hilbert 曲线感知的空间平滑正则化。
+
+        数学形式:
+            logits_smooth = logits + λ × (L @ logits)
+            其中:
+            - L: Hilbert 曲线拉普拉斯矩阵
+            - λ = sigmoid(smoothness_logit): 可学习平滑强度
+
+        效果:
+            - Hilbert 曲线上相邻的 token 倾向于相似的分裂概率
+            - 减少空间碎片化
+
+        Args:
+            logits: [B, N] 原始 logits
+            num_tokens: Token 数量 N
+
+        Returns:
+            平滑后的 logits [B, N]
+        """
+        if not self._enable_hilbert_smoothness or self.hilbert_laplacian is None:
+            return logits
+
+        B, N = logits.shape
+        device = logits.device
+
+        # 确保拉普拉斯矩阵在正确的设备上
+        if self.hilbert_laplacian._device != device:
+            self.hilbert_laplacian._device = device
+            self.hilbert_laplacian._laplacian = None  # 强制重新计算
+
+        # 获取当前 token 数量的拉普拉斯矩阵
+        L = self.hilbert_laplacian.get_laplacian(num_tokens)  # [N, N]
+
+        # 计算可学习平滑强度 λ = sigmoid(smoothness_logit)
+        # 使用 clamp 确保数值稳定
+        lambda_strength = torch.sigmoid(self.smoothness_logit)
+        lambda_strength = lambda_strength.clamp(0.0, 1.0)
+
+        # 计算平滑项: L @ logits^T，然后转置回来
+        # [N, N] @ [N, B] -> [N, B] -> [B, N]
+        smooth_term = torch.matmul(L, logits.T).T
+
+        # 应用平滑
+        logits_smooth = logits + lambda_strength * smooth_term
+
+        return logits_smooth
+
+    def _compute_hilbert_smoothness_loss(
+        self,
+        logits: Tensor,
+        num_tokens: int,
+    ) -> Tensor:
+        """
+        计算 Hilbert 平滑正则化损失。
+
+        数学形式:
+            R_smooth = z^T · L · z = Σ_{(i,j) ∈ E} (z_i - z_j)²
+            = ||L @ logits||_F²
+
+        Args:
+            logits: [B, N] logits
+            num_tokens: Token 数量 N
+
+        Returns:
+            平滑损失标量
+        """
+        if not self._enable_hilbert_smoothness or self.hilbert_laplacian is None:
+            return torch.tensor(0.0, device=logits.device)
+
+        device = logits.device
+
+        # 确保拉普拉斯矩阵在正确的设备上
+        if self.hilbert_laplacian._device != device:
+            self.hilbert_laplacian._device = device
+            self.hilbert_laplacian._laplacian = None
+
+        # 获取拉普拉斯矩阵
+        L = self.hilbert_laplacian.get_laplacian(num_tokens)  # [N, N]
+
+        # 计算平滑损失: ||L @ logits||²
+        # [N, N] @ [N, B] -> [N, B]
+        smoothed = torch.matmul(L, logits.T)
+
+        # Frobenius 范数平方
+        loss = (smoothed ** 2).mean()
+
+        return loss
 
     def _estimate_optimal_k(
         self,
@@ -5130,6 +5491,20 @@ class GumbelTopKSplitter(
         if 'soft_entropy_loss' in losses and hasattr(self, '_entropy_lambda_scale'):
             if self._entropy_lambda_scale < 1.0:
                 losses['soft_entropy_loss'] = losses['soft_entropy_loss'] * self._entropy_lambda_scale
+
+        # I170-NEW: Hilbert 平滑损失
+        if self._enable_hilbert_smoothness and self.training:
+            if self._last_probs is not None:
+                # 使用缓存的 logits 计算平滑损失
+                logits_for_loss = self._last_logits if hasattr(self, '_last_logits') else None
+                if logits_for_loss is not None:
+                    num_tokens = logits_for_loss.shape[1]
+                    smoothness_loss = self._compute_hilbert_smoothness_loss(
+                        logits_for_loss, num_tokens
+                    )
+                    # 应用可学习的权重
+                    weighted_smoothness = smoothness_loss * self._hilbert_smoothness_weight
+                    losses['hilbert_smoothness_loss'] = weighted_smoothness
 
         return losses
     

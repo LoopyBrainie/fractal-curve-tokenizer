@@ -388,6 +388,10 @@ class SplitResult:
         self.logits = logits
         self.probs = probs
 
+        # I: 添加 split_decision 别名以兼容 tokenizer
+        # split_decision 用于语义分裂器，selected_mask 用于 H1SS
+        self.split_decision = selected_mask
+
         # 验证形状一致性
         M = regions.shape[0]
         assert depths.shape[0] == M, f"depths 形状不匹配: {depths.shape[0]} vs {M}"
