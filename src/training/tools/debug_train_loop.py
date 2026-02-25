@@ -26,7 +26,7 @@ print("="*60)
 print("\n[TEST 1] DataLoader 测试")
 
 # 直接从 train_fractal_vit.py 导入 create_dataloaders
-from train_fractal_vit import create_dataloaders
+from ..train_fractal_vit import create_dataloaders
 
 # 创建最小配置
 class QuickConfig:
@@ -44,13 +44,13 @@ class QuickConfig:
         self.image_size = None  # 使用数据集默认
         self.use_area_encoding = False
         self.transform_mode = 'default'
-        self.channels_last = False  # 添加 channels_last
+        self.use_channels_last = False  # I139: 统一命名
         self.compile_model = False  # 添加 compile_model
 
 config = QuickConfig()
 
 # 获取数据集配置
-from train_fractal_vit import DATASETS
+from ..train_fractal_vit import DATASETS
 spec = DATASETS['tiny-imagenet']
 
 train_loader, val_loader, test_loader = create_dataloaders(spec, config)
@@ -66,10 +66,9 @@ model = FractalCurveViT(
     image_size=64,
     num_classes=200,
     dim=128,
-    depth=4,
+    num_layers=4,
     heads=4,
     mlp_dim=256,
-    max_depth=4,
 )
 model.train()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

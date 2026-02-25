@@ -143,8 +143,8 @@ from .callbacks import (
     LayeredEvaluationCallback,
 )
 
-# Evaluation
-from .evaluation_layers import (
+# Evaluation (moved to evaluation/ subdirectory)
+from .evaluation import (
     L1ClassificationMetrics,
     L2TokenizerMetrics,
     L3AttentionMetrics,
@@ -162,9 +162,6 @@ from .evaluation_layers import (
     StabilityEvaluator,
     SplitterEvaluator,
     GradientFlowEvaluator,
-)
-
-from .layered_evaluator import (
     LayeredEvaluator,
     create_evaluator,
 )
@@ -205,27 +202,7 @@ from .core.checkpoint import (
     get_checkpoint_info,
 )
 
-# Fractal Proxy Experiments (I74)
-from .fractal_proxy_experiments import (
-    ExperimentMode,
-    ProxyExperimentConfig,
-    SSAConfig,
-    FERConfig,
-    GJPConfig,
-    TokenMetrics,
-    TokenMetricsCollector,
-    MemoryManager,
-    ExperimentWrapper,
-    SubsetSampler,
-    SparseAblationExperiment,
-    FeatureReconstructionLoss,
-    FrozenEncoderExperiment,
-    HilbertIndexShuffler,
-    GeometricJigsawLoss,
-    GeometricJigsawExperiment,
-    SpatialJigsawLoss,
-    create_experiment,
-)
+# Note: fractal_proxy_experiments moved to examples/analysis/
 
 __all__ = [
     # Samplers
@@ -350,23 +327,5 @@ __all__ = [
     "build_model",
     "save_checkpoint_with_gene",
     "get_checkpoint_info",
-    # Fractal Proxy Experiments (I74)
-    "ExperimentMode",
-    "ProxyExperimentConfig",
-    "SSAConfig",
-    "FERConfig",
-    "GJPConfig",
-    "TokenMetrics",
-    "TokenMetricsCollector",
-    "MemoryManager",
-    "ExperimentWrapper",
-    "SubsetSampler",
-    "SparseAblationExperiment",
-    "FeatureReconstructionLoss",
-    "FrozenEncoderExperiment",
-    "HilbertIndexShuffler",
-    "GeometricJigsawLoss",
-    "GeometricJigsawExperiment",
-    "SpatialJigsawLoss",
-    "create_experiment",
+    # Note: fractal_proxy_experiments moved to examples/analysis/
 ]

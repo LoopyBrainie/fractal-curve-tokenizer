@@ -224,8 +224,9 @@ class ManifoldNativeAttention(nn.Module):
             # 应用带宽掩码
             attn = attn.masked_fill(~band_mask.unsqueeze(1), float('-inf'))
 
-        # Softmax + Dropout
-        attn = F.softmax(attn, dim=-1)
+        # Entmax 稀疏激活 + Dropout (替代 Softmax 以保持与分割器一致性)
+        from vit_pytorch.layers.splitters.hilbert_entmax import entmax_1_5
+        attn = entmax_1_5(attn, dim=-1)
         attn = self.attn_dropout(attn)
 
         # 注意力加权

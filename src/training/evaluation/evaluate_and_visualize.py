@@ -101,12 +101,12 @@ for path in [PROJECT_ROOT, SRC_PATH, EXAMPLES_PATH, TRAINING_PATH]:
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-# 导入分层评估系统 (使用绝对导入)
-from training.layered_evaluator import LayeredEvaluator
-from training.evaluation_layers import LayeredEvaluationReport
+# 导入分层评估系统 (使用相对导入)
+from .layered_evaluator import LayeredEvaluator
+from .evaluation_layers import LayeredEvaluationReport
 
 # 导入分层可视化系统
-from training.visualization import (
+from ..visualization import (
     LayeredVisualizer,
     LayeredVisualizationReport,
     FigureConfig,
@@ -114,7 +114,7 @@ from training.visualization import (
 
 # 导入 CUB-200 鸟类类别名称
 try:
-    from training.trainer.cub200_trainer import CUB200_BIRD_CLASSES
+    from ..trainer.cub200_trainer import CUB200_BIRD_CLASSES
 except ImportError:
     CUB200_BIRD_CLASSES = None
 

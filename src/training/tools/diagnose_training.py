@@ -612,7 +612,7 @@ def main():
         channels=spec['channels'],
         d_model=192,
         base_patch_size=4,
-        max_depth=4,
+        max_level=4,
     )
     
     model = FractalCurveViT(

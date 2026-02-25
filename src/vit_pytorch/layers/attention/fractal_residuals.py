@@ -137,9 +137,9 @@ class ScaleAwareResidual(nn.Module):
         # 投影层
         self.proj = nn.Linear(dim, dim)
 
-        # 门控机制
+        # 门控机制 - 初始化为0.5使残差路径半开，允许梯度流通
         self.residual_gate = nn.Embedding(max_level + 1, 1)
-        nn.init.zeros_(self.residual_gate.weight)
+        nn.init.constant_(self.residual_gate.weight, 0.5)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -244,9 +244,9 @@ class FractalTransformerBlockV2(nn.Module):
             max_level=max_level,
         )
 
-        # 门控
+        # 门控 - 初始化为0.5使残差路径半开
         self._residual_gate = nn.Embedding(max_level + 1, 1)
-        nn.init.zeros_(self._residual_gate.weight)
+        nn.init.constant_(self._residual_gate.weight, 0.5)
 
         # DropPath
         self.drop_path = nn.Dropout(drop_path) if drop_path > 0 else nn.Identity()

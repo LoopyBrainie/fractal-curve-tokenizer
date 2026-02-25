@@ -323,8 +323,8 @@ class GeometricLatentDecoder(nn.Module):
         nn.init.xavier_uniform_(self.mlp[0].weight)
         nn.init.xavier_uniform_(self.mlp[2].weight)
 
-        # 初始化 layer_scale 为较小值，避免初始偏置过大
-        nn.init.constant_(self.layer_scale, 0.1)
+        # 初始化 layer_scale 为更小值，避免初始偏置"绑架"语义特征
+        nn.init.constant_(self.layer_scale, 0.01)
 
     def forward(
         self,
