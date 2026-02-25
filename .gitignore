@@ -166,3 +166,8 @@ benchmark_results
 .github
 
 .claude
+.sparv/CHANGELOG.md
+.sparv/kb.md
+.sparv/history/index.md
+.sparv/plan/20260224160338/journal.md
+.sparv/plan/20260224160338/state.yaml

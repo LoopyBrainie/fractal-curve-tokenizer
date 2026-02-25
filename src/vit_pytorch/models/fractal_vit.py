@@ -2105,3 +2105,28 @@ class FractalCurveViT(nn.Module):
         self._channels_last_enabled = True
         return self
 
+
+# =============================================================================
+# 向后兼容别名 (I162-1)
+# =============================================================================
+# DualPathFractalViT 现在是 FractalCurveViT 的别名
+# 使用 use_pattern_plugin=True 启用双路径模式
+DualPathFractalViT = FractalCurveViT
+
+# V2 别名：默认启用双路径模式
+class FractalCurveViTV2(FractalCurveViT):
+    """FractalCurveViT V2 版本 - 默认启用双路径模式
+
+    使用 pattern_plugin 实现真正的双路径并行处理。
+    等价于 FractalCurveViT(use_pattern_plugin=True)
+    """
+
+    def __init__(self, **kwargs):
+        # 默认启用双路径插件
+        kwargs.setdefault('use_pattern_plugin', True)
+        kwargs.setdefault('pattern_encoder_mode', 'light')
+        super().__init__(**kwargs)
+
+
+FractalCurveViT_V2 = FractalCurveViTV2  # 别名
+

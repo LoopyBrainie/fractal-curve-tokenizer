@@ -965,4 +965,207 @@ class OrientationExtractor(nn.Module):
         return orientation_mask
 
 
+class FourierPathEncoder(nn.Module):
+    """Fourier Path Encoder - 连续化路径编码
+
+    I-PHASE4: 解决离散象限嵌入的边界突变问题
+
+    数学形式化
+    ==========
+
+    核心思想：将离散路径向量映射到高频正弦空间
+
+    路径编码:
+        设路径向量 p = (q_1, ..., q_d), q_k ∈ {0,1,2,3}
+        展平为索引: idx = Σ q_k · 4^{k-1} ∈ [0, 4^d)
+
+    Fourier 编码:
+        F(p) = [cos(2πk·idx/4^d), sin(2πk·idx/4^d)]_{k=1}^{K}
+
+    优势:
+        1. 周期性自然处理 q=3 → q=0 边界
+        2. 高频分量捕获精细位置差异
+        3. 维度可控 (K << 4^d)
+        4. 连续平滑的嵌入空间
+
+    对比传统方案
+    ============
+
+    | 方案 | 边界处理 | 平滑性 | 表达能力 |
+    |------|----------|--------|----------|
+    | Quadrant Embedding | 突变 | 离散 | O(4L·D) |
+    | Fourier Path | 周期 | 连续 | O(K·D) |
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        max_level: int = 8,
+        num_frequencies: int = 4,
+    ):
+        """初始化 Fourier Path Encoder
+
+        Args:
+            dim: 嵌入维度
+            max_level: 最大四叉树深度
+            num_frequencies: Fourier 频率数量 (K)
+        """
+        super().__init__()
+        self.dim = dim
+        self.max_level = max_level
+        self.num_frequencies = num_frequencies
+
+        # Fourier 频率: [1, 2, ..., K]
+        self.register_buffer(
+            'frequencies',
+            torch.arange(1, num_frequencies + 1).float()
+        )
+
+        # 深度编码 (可选，与 Fourier 路径结合)
+        self.depth_embedding = nn.Embedding(max_level + 1, dim)
+
+        # 投影层: 将 Fourier 特征投影到目标维度
+        # 输入: 2 * num_frequencies (cos + sin)
+        # 输出: dim
+        self.projection = nn.Linear(num_frequencies * 2, dim)
+
+        # 层归一化
+        self.layer_norm = nn.LayerNorm(dim)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.normal_(self.depth_embedding.weight, std=0.02)
+        nn.init.xavier_uniform_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+
+    def _path_to_index(self, paths: torch.Tensor) -> torch.Tensor:
+        """将路径向量转换为展平索引
+
+        数学:
+            idx = Σ q_k · 4^{k-1}
+
+        Args:
+            paths: [B, N, L] 四叉树路径
+
+        Returns:
+            indices: [B, N] 展平后的索引
+        """
+        B, N, L = paths.shape
+        device = paths.device
+
+        # 计算 4^{L-1}, 4^{L-2}, ..., 4^0
+        powers = torch.arange(L, device=device).flip(0)  # [L]
+        bases = 4 ** powers  # [L]
+
+        # 广播乘法并求和: [B, N, L] * [L] -> [B, N]
+        indices = (paths * bases.unsqueeze(0).unsqueeze(0)).sum(dim=-1)
+
+        return indices
+
+    def forward(
+        self,
+        levels_info,
+    ) -> torch.Tensor:
+        """计算 Fourier 路径编码
+
+        Args:
+            levels_info: LevelsInfo 实例，包含 depths 和 paths
+
+        Returns:
+            path_emb: [B, N, dim] Fourier 路径编码
+        """
+        from vit_pytorch.core.levels_info import LevelsInfo
+
+        # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
+        if isinstance(levels_info, torch.Tensor):
+            if levels_info.dtype != torch.long:
+                levels_info = levels_info.long()
+            info_dim = levels_info.shape[-1]
+            inferred_max_level = info_dim - 1
+            levels_info = LevelsInfo(data=levels_info, max_level=inferred_max_level)
+
+        if levels_info.data.numel() == 0:
+            device = levels_info.data.device
+            return torch.zeros(0, self.dim, device=device, dtype=torch.float32)
+
+        device = levels_info.data.device
+        B, N = levels_info.depths.shape
+
+        # 提取 depths 和 paths
+        depths = levels_info.depths.clamp(0, self.max_level).long()  # [B, N]
+        paths = levels_info.paths  # [B, N, max_level]
+
+        # 1. 将路径转换为展平索引
+        path_len = paths.shape[-1]
+        # 只使用有效深度的路径
+        valid_paths = paths[:, :, :path_len]
+        indices = self._path_to_index(valid_paths)  # [B, N]
+
+        # 2. 归一化索引到 [0, 1]
+        max_index = 4.0 ** path_len
+        normalized_indices = indices / max_index  # [B, N]
+
+        # 3. 生成 Fourier 特征
+        # [B, N, 1] * [K] -> [B, N, K]
+        angles = normalized_indices.unsqueeze(-1) * self.frequencies * 2 * math.pi
+
+        # cos + sin: [B, N, K] + [B, N, K] -> [B, N, 2K]
+        fourier_features = torch.cat([torch.cos(angles), torch.sin(angles)], dim=-1)
+
+        # 4. 投影到目标维度
+        path_emb = self.projection(fourier_features)  # [B, N, dim]
+
+        # 5. 添加深度编码
+        depth_emb = self.depth_embedding(depths)  # [B, N, dim]
+
+        # 6. 融合并归一化
+        combined = path_emb + depth_emb
+        return self.layer_norm(combined)
+
+    def compute_boundary_similarity(
+        self,
+        paths: torch.Tensor,
+    ) -> torch.Tensor:
+        """计算边界处相邻路径的余弦相似度
+
+        用于验证 Fourier 编码的平滑性
+
+        Args:
+            paths: [N, L] 或 [B, N, L] 路径张量
+
+        Returns:
+            similarities: 相邻路径的余弦相似度
+        """
+        import torch.nn.functional as F
+
+        # 处理 2D 输入 [N, L] -> [1, N, L]
+        if paths.dim() == 2:
+            paths = paths.unsqueeze(0)
+            was_2d = True
+        else:
+            was_2d = False
+
+        B, N, L = paths.shape
+
+        # 创建 LevelsInfo 进行编码
+        depths = torch.full((B, N), L, dtype=torch.long, device=paths.device)
+        levels_info = torch.zeros(B, N, L + 1, dtype=torch.long, device=paths.device)
+        levels_info[:, :, 0] = depths
+        levels_info[:, :, 1:] = paths
+
+        # 编码
+        with torch.no_grad():
+            emb = self.forward(levels_info)  # [B, N, dim]
+
+        # 展平并计算相邻路径的余弦相似度
+        emb_flat = emb.view(-1, self.dim)  # [B*N, dim]
+        emb_normalized = F.normalize(emb_flat, dim=-1)
+
+        # 计算相邻的余弦相似度（跨 batch 和 sequence）
+        similarities = (emb_normalized[:-1] * emb_normalized[1:]).sum(dim=-1)
+
+        return similarities if not was_2d else similarities.view(B, -1)
+
+
 import math  # 需要用于 pi 常数

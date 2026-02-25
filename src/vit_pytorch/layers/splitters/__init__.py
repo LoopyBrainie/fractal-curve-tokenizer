@@ -17,6 +17,15 @@ from .deterministic_neighbor import (
     create_deterministic_neighbor_splitter,
 )
 from .semantic_redundancy import SemanticRedundancySplitter
+from .hilbert_optimal_splitter import (
+    HilbertOptimalSplitter,
+    HilbertOptimalSplitterConfig,
+    compute_locality_score,
+    compute_determinism_score,
+    compute_gradient_coverage,
+    compute_tree_consistency,
+    compute_consistency_stats,
+)
 
 __all__ = [
     "GumbelTopKSplitter",
@@ -30,4 +39,11 @@ __all__ = [
     "HilbertAwareSimilarity",
     "create_deterministic_neighbor_splitter",
     "SemanticRedundancySplitter",
+    "HilbertOptimalSplitter",
+    "HilbertOptimalSplitterConfig",
+    "compute_locality_score",
+    "compute_determinism_score",
+    "compute_gradient_coverage",
+    "compute_tree_consistency",
+    "compute_consistency_stats",
 ]

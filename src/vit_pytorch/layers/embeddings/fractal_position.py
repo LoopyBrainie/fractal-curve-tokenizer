@@ -477,6 +477,8 @@ class GeometryField(nn.Module):
         dim: int,
         max_level: int = 8,
         heads: int = 8,
+        # I-PHASE4: Low-Rank 优化
+        rank: int = 16,
     ):
         """初始化几何流形场
 
@@ -484,11 +486,13 @@ class GeometryField(nn.Module):
             dim: 嵌入维度
             max_level: 最大四叉树深度
             heads: 注意力头数
+            rank: Low-Rank 分解的秩 (默认 16，远小于 dim=256)
         """
         super().__init__()
         self.dim = dim
         self.max_level = max_level
         self.heads = heads
+        self.rank = rank
 
         # 1. 面积编码器: 深度 → 面积 (指数衰减)
         self.area_embedding = nn.Embedding(max_level + 1, dim)
@@ -500,10 +504,22 @@ class GeometryField(nn.Module):
             embedding_dim=dim
         )
 
-        # 3. 流形场融合网络
-        # 输入: area_emb + orientation_emb + lca_emb
-        self.manifold_fusion = nn.Sequential(
-            nn.Linear(dim * 3, dim),
+        # I-PHASE4: Low-Rank 流形场融合网络
+        # 原始: O(dim * 3 * dim) 参数
+        # Low-Rank: O(dim * 3 * rank + rank * dim) 参数
+        # 压缩比: ~3*dim / (3*rank + rank) = ~dim/rank
+        # 当 dim=256, rank=16 时，压缩约 16x
+        input_dim = dim * 3
+        self.manifold_fusion_lowrank = nn.Sequential(
+            nn.Linear(input_dim, rank),  # 压缩到低秩
+            nn.LayerNorm(rank),
+            nn.GELU(),
+            nn.Linear(rank, dim),       # 解压回原始维度
+        )
+
+        # 原始融合网络 (当 rank=dim 时退化为完整版本)
+        self.manifold_fusion_full = nn.Sequential(
+            nn.Linear(input_dim, dim),
             nn.LayerNorm(dim),
             nn.GELU(),
         )
@@ -578,7 +594,11 @@ class GeometryField(nn.Module):
             dir_emb,
         ], dim=-1)  # [B, N, dim*3]
 
-        manifold_emb = self.manifold_fusion(manifold_input)
+        # I-PHASE4: 选择 Low-Rank 或完整融合网络
+        if self.rank < self.dim:
+            manifold_emb = self.manifold_fusion_lowrank(manifold_input)
+        else:
+            manifold_emb = self.manifold_fusion_full(manifold_input)
 
         return manifold_emb
 
