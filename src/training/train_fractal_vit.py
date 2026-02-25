@@ -145,8 +145,20 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-# 使用 parents[2] 获取项目根目录 (不是 src/)
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+def _find_project_root(start_path: Path) -> Path:
+    """自动检测项目根目录"""
+    current = start_path.resolve()
+    # 检查常见的项目根目录标识
+    for _ in range(10):  # 最多向上查找 10 层
+        if (current / "pyproject.toml").exists() or (current / "setup.py").exists():
+            return current
+        if current.parent == current:  # 已经到达根目录
+            break
+        current = current.parent
+    return start_path.resolve().parents[2]  # 默认返回 parents[2]
+
+_PROJECT_ROOT = _find_project_root(Path(__file__))
 # 先添加 src/ 目录（位置 1），再添加项目根目录（位置 0）
 # 这样 "from src.training.data.transforms" 可以正确解析
 SRC_PATH = _PROJECT_ROOT / "src"
