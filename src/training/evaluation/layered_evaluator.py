@@ -78,8 +78,8 @@ import torchvision
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
-# 添加项目路径 (evaluation/ -> training/ -> src/ -> 项目根目录 = Path(__file__).resolve().)
-SCRIPT_DIRparent
+# 添加项目路径 (evaluation/ -> training/ -> src/ -> 项目根目录)
+SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
