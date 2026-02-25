@@ -3999,9 +3999,13 @@ def main():
             print(f"[I150-3] Set initial temperature: τ={config.temperature_init}")
 
         # I150-3: 启用 token 稳定性监控
+        # I170-FIX: 检查方法是否存在，因为不是所有 splitter 都有这个方法
         if config.monitor_token_stability:
-            model.splitter.enable_token_stability_monitoring()
-            print(f"[I150-3] Enabled token stability monitoring")
+            if hasattr(model.splitter, 'enable_token_stability_monitoring'):
+                model.splitter.enable_token_stability_monitoring()
+                print(f"[I150-3] Enabled token stability monitoring")
+            else:
+                print(f"[I150-3] Warning: {type(model.splitter).__name__} does not support token stability monitoring")
 
     # 打印模型信息
     params = sum(p.numel() for p in model.parameters())
