@@ -136,7 +136,44 @@ class LevelsInfo:
 
     def __post_init__(self):
         """Invariant validation - Hilbert Curve ViT 核心契约检查。"""
-        B, N, K = self.data.shape
+        # I-TOK: 添加详细的维度检查，帮助调试 torch.compile 问题
+        # 允许传入 LevelsInfo 对象（用于链式转换）
+        if hasattr(self.data, 'data') and isinstance(self.data.data, torch.Tensor):
+            # 传入的是 LevelsInfo 对象，提取其内部张量
+            actual_data = self.data.data
+        elif isinstance(self.data, torch.Tensor):
+            actual_data = self.data
+        else:
+            raise TypeError(f"levels_info 期望 torch.Tensor 或 LevelsInfo，实际 {type(self.data)}")
+
+        actual_dim = actual_data.dim()
+        if actual_dim != 3:
+            # I-TOK: torch.compile 可能导致维度问题，尝试恢复
+            shape = actual_data.shape
+            if actual_dim == 2:
+                # 尝试恢复为 (B, N, D+1)
+                expected_cols = self.max_level + 1
+                if shape[1] % expected_cols == 0:
+                    N = shape[1] // expected_cols
+                    self.data = actual_data.view(shape[0], N, expected_cols)
+                else:
+                    raise ValueError(
+                        f"levels_info 维度错误: 期望 3 维张量 (B, N, D+1)，"
+                        f"实际 2 维 {shape}，无法恢复。"
+                    )
+            else:
+                raise ValueError(
+                    f"levels_info 维度错误: 期望 3 维张量 (B, N, D+1)，"
+                    f"实际 {actual_dim} 维，形状: {shape}。"
+                )
+            B, N, K = self.data.shape
+        else:
+            # 正常情况：直接使用传入的张量
+            if actual_data is not self.data:
+                # 如果我们提取了内部张量，需要更新 data
+                self.data = actual_data
+            B, N, K = self.data.shape
+
         D = self.max_level
 
         # C0: 维度约束
