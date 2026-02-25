@@ -217,6 +217,15 @@ def evaluate(
             split_info_samples.append(inference_stats.split_info)
 
     # P-OPT: 最后统一同步到 CPU
+    # I170-FIX: 添加空列表保护
+    if not all_preds:
+        print("[WARN] evaluate: No valid batches in loader, returning zero metrics")
+        return EvalResult(
+            accuracy=0.0,
+            avg_loss=0.0,
+            num_samples=0,
+        )
+
     all_preds = torch.cat(all_preds).cpu()
     all_labels = torch.cat(all_labels).cpu()
     all_probs = torch.cat(all_probs).cpu()
