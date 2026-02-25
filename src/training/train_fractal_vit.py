@@ -149,6 +149,9 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # 强制将项目根目录添加到 sys.path[0]
 sys.path.insert(0, str(_PROJECT_ROOT))
+# 同时添加 src/ 目录，确保 vit_pytorch 包可以被找到
+SRC_PATH = _PROJECT_ROOT / "src"
+sys.path.insert(0, str(SRC_PATH))
 
 import platform
 import time
