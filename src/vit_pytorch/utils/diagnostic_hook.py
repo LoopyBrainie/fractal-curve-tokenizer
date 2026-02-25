@@ -195,25 +195,39 @@ class DiagnosticHook:
         return model
 
     def _register_transformer_hooks(self, transformer: nn.Module) -> None:
-        """注册 Transformer 层钩子"""
-        for idx, module in enumerate(transformer.modules()):
-            if isinstance(module, (torch.nn.Module)):
-                module_name = f"transformer_block_{idx}"
+        """注册 Transformer 层钩子 - 只包装顶层模块，不包装子模块"""
+        # 只遍历 transformer 的直接子模块（顶层 blocks）
+        # 而不是用 .modules() 遍历所有子模块
+        for idx, module in enumerate(transformer.children()):
+            # 检查是否是 TransformerBlock 或类似的可训练模块
+            # 避免包装 LayerNorm、Linear 等基础组件
+            module_name = f"transformer_block_{idx}"
 
-                # 保存原始 forward
-                original_forward = module.forward
-                self._original_forwards[module_name] = original_forward
+            # 跳过非模块（如 container、Sequential 等）
+            if not isinstance(module, nn.Module):
+                continue
 
-                # 包装 forward
-                def make_wrapper(idx, orig_forward, name):
-                    def wrapper(self_, *args, **kwargs):
-                        result = orig_forward(*args, **kwargs)
-                        self._diagnose_layer_output(idx, name, result)
-                        return result
-                    return wrapper
+            # 跳过基础组件（LayerNorm、Dropout、Activation 等）
+            module_type_name = type(module).__name__
+            skip_types = {'LayerNorm', 'Dropout', 'GELU', 'ReLU', 'SiLU', 'Identity',
+                          'Linear', 'MultiheadAttention', 'Conv2d', 'Buffer'}
+            if module_type_name in skip_types:
+                continue
 
-                module.forward = make_wrapper(idx, original_forward, module_name)
-                self._layer_hooks.append((module_name, module))
+            # 保存原始 forward
+            original_forward = module.forward
+            self._original_forwards[module_name] = original_forward
+
+            # 包装 forward
+            def make_wrapper(idx, orig_forward, name):
+                def wrapper(self_, *args, **kwargs):
+                    result = orig_forward(*args, **kwargs)
+                    self._diagnose_layer_output(idx, name, result)
+                    return result
+                return wrapper
+
+            module.forward = make_wrapper(idx, original_forward, module_name)
+            self._layer_hooks.append((module_name, module))
 
     def _register_splitter_hooks(self, splitter: nn.Module) -> None:
         """注册 Splitter 钩子 - 监控 Entmax 输入"""
