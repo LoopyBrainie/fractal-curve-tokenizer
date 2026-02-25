@@ -619,7 +619,7 @@ def main():
         image_size=max(spec['image_size'], 32),
         num_classes=spec['num_classes'],
         dim=192,
-        depth=8,
+        num_layers=8,
         heads=8,
         mlp_dim=192 * 4,
         channels=spec['channels'],
