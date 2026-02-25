@@ -138,8 +138,14 @@ P12 内部向量化优化 (2025-12-29)
 
 from __future__ import annotations
 
+# I170-FIX: 将项目路径添加到 sys.path，确保模块导入正常工作
 import os
 import sys
+from pathlib import Path
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 import platform
 import time
 import math
@@ -149,7 +155,6 @@ import argparse
 import random
 from typing import Protocol, runtime_checkable, Any, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, asdict
-from pathlib import Path
 
 import numpy as np
 
