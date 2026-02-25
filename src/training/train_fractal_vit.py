@@ -1766,6 +1766,11 @@ def train_epoch(
     # P-DEBUG: 在函数内部初始化 epoch_warnings，避免作用域问题
     epoch_warnings = []
 
+    # I170: 梯度历史记录（如果外部未传入）
+    gradient_history = getattr(train_epoch, 'gradient_history', [])
+    if not hasattr(train_epoch, 'gradient_history'):
+        train_epoch.gradient_history = gradient_history
+
     model.train()
 
     # ====================================================================
