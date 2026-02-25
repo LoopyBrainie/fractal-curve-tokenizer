@@ -132,6 +132,8 @@ dmypy.json
 workspace/*
 !workspace/visualizations/
 data/
+# I170-FIX: 例外 - 允许 src/training/data (Python 代码，不是数据目录)
+!src/training/data/
 
 # Machine Learning model files and checkpoints
 *.pth
