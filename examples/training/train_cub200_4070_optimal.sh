@@ -309,7 +309,8 @@
 #
 # ============================================================================
 
-uv run python src/training/train_fractal_vit.py \
+# I170-FIX: 使用模块模式运行，修复相对导入问题
+uv run python -m src.training.train_fractal_vit \
   --dataset cub200 \
   --epochs 100 \
   --num-workers 4 \
