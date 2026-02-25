@@ -21,8 +21,8 @@ import os
 import sys
 from pathlib import Path
 
-# 项目路径设置
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# 项目路径设置 (tools/ -> training/ -> src/ -> 项目根目录)
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
