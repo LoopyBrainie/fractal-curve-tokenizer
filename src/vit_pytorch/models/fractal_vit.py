@@ -171,6 +171,48 @@ class TrainingStats:
     ema_stats: Optional[torch.Tensor] = None           # I99-1: EMA buffer 统计信息
     split_info: Dict[str, Any] = field(default_factory=dict)  # 分割决策详情
 
+    # === 新增: 实验详细日志记录指标 ===
+
+    # Splitter 统计
+    splitter_logits_mean: float = 0.0
+    splitter_logits_std: float = 0.0
+
+    # 覆盖率
+    active_ratio: float = 0.0  # 实际参与计算的区域覆盖率
+
+    # 流形统计
+    manifold_bias_max: float = 0.0
+    manifold_bias_min: float = 0.0
+    manifold_bias_mean: float = 0.0
+    manifold_bias_std: float = 0.0
+
+    # Poincaré 距离统计
+    poincare_dist_mean: float = 0.0
+    poincare_dist_std: float = 0.0
+
+    # 梯度比值 (backward 时记录)
+    backbone_grad_norm: float = 0.0
+    splitter_grad_norm: float = 0.0
+    backbone_vs_splitter_grad_ratio: float = 0.0
+
+    # Bottleneck 层梯度
+    entmax_grad_norm: float = 0.0
+    manifold_decoder_grad_norm: float = 0.0
+
+    # 损失项
+    budget_penalty: float = 0.0
+    consistency_loss: float = 0.0
+    entropy_loss: float = 0.0
+    # I150-3 NEW: 额外的损失项监控
+    budget_loss: float = 0.0  # Elastic Budget 损失
+    density_regularization: float = 0.0  # 密度正则化损失
+
+    # FLOPs 理论节省
+    theoretical_flops_reduction: float = 0.0
+
+    # I150-3 NEW: Splitter Logits 统计 Hook
+    mean_abs_logits: float = 0.0  # Logits 的平均绝对值
+
     def validate(self) -> None:
         """数学约束验证"""
         # I139: 支持列表和张量类型的 num_tokens
@@ -1660,6 +1702,12 @@ class FractalCurveViT(nn.Module):
 
         # I141: num_tokens 直接使用 GPU tensor，训练器负责转换
         # 保持原始 tensor 格式，避免 .cpu() 调用
+
+        # I150-3 NEW: 从 split_result 提取 mean_abs_logits
+        mean_abs_logits = 0.0
+        if split_result is not None and hasattr(split_result, 'mean_abs_logits'):
+            mean_abs_logits = split_result.mean_abs_logits
+
         # I170: 添加 redundancy 和 child_features 到 TrainingStats
         stats = TrainingStats(
             logits=final_output,
@@ -1672,35 +1720,10 @@ class FractalCurveViT(nn.Module):
             split_info=split_info,
             redundancy=redundancy,  # I170: 语义分裂器的冗余性分数
             child_features=child_features,  # I170: 语义分裂器的子节点特征
+            mean_abs_logits=mean_abs_logits,  # I150-3 NEW: Splitter Logits 平均绝对值
         )
 
         return stats
-
-    # =====================================================================
-    # 三阶段课程学习接口
-    # =====================================================================
-    def set_epoch(self, epoch: int) -> None:
-        """设置当前 epoch，用于课程学习调度。
-
-        Args:
-            epoch: 当前训练轮次 (从 1 开始)
-        """
-        self._current_epoch = epoch
-        # 传递给 splitter
-        if hasattr(self, 'splitter') and self.splitter is not None:
-            self.splitter.set_epoch(epoch)
-
-    def get_curriculum_stage(self) -> int:
-        """获取当前课程学习阶段。
-
-        Returns:
-            1 = Teacher Forcing (Epoch 1-9)
-            2 = Acc-Driven Splitting (Epoch 10-19)
-            3 = Resource Co-adaptation (Epoch 20+)
-        """
-        if hasattr(self, 'splitter') and self.splitter is not None:
-            return getattr(self.splitter, '_curriculum_stage', 1)
-        return 1
 
     def get_tokenizer_loss(
         self,

@@ -1228,7 +1228,10 @@ class GumbelTopKResult:
 
     # 统计信息
     num_selected_per_batch: Tensor  # [B] 每个 batch 选中的 token 数
-    
+
+    # I150-3 NEW: Splitter Logits 统计 Hook 记录
+    mean_abs_logits: float = 0.0  # Logits 的平均绝对值
+
     def to_tensor_split_result(self) -> TensorSplitResult:
         """
         转换为 TensorSplitResult 格式。
@@ -1834,43 +1837,22 @@ class GumbelTopKSplitter(
         self._feature_analysis_enabled: bool = False
         self._feature_analysis_result: Optional[SVDAnalysisResult] = None
 
-        # ====================================================================
-        # 三阶段课程学习状态 (I-CURRICULUM)
-        # Stage 1: Teacher Forcing (Epoch 1-9) - 冻结 Splitter
-        # Stage 2: Acc-Driven Splitting (Epoch 10-19) - 仅 CE Loss 驱动
-        # Stage 3: Resource Co-adaptation (Epoch 20+) - 引入资源惩罚
-        # ====================================================================
+        # 当前训练轮次
         self._current_epoch: int = 0
-        self._curriculum_stage: int = 1  # 1=Teacher Forcing, 2=Acc-Driven, 3=Resource Co-adapt
-        self._cached_mask_ste: Optional[Tensor] = None  # Stage 1 缓存的全 1 mask
+        self._cached_mask_ste: Optional[Tensor] = None
 
-        # P-OPT: Stage 1 深度限制 - 限制最大递归深度，避免全量计算
-        # 初始化时设为 None，在 set_epoch 时根据 curriculum stage 设置
-        self._stage1_max_depth: Optional[int] = None
+        # P-OPT: 深度限制 - 限制最大递归深度，避免全量计算
+        self._max_depth_limit: Optional[int] = None
         # 跟踪实际进入 Transformer 的 token 总数（用于检测批量爆炸）
         self._last_total_tokens: int = 0
 
     def set_epoch(self, epoch: int) -> None:
-        """设置当前 epoch，更新课程学习阶段。
+        """设置当前 epoch。
 
         Args:
             epoch: 当前训练轮次 (从 1 开始)
         """
         self._current_epoch = epoch
-
-        # 确定当前阶段
-        if epoch < 10:
-            self._curriculum_stage = 1
-            # P-OPT: Stage 1 深度限制 - 限制最大递归深度
-            # 避免 Stage 1 看到完整的深度递归，聚焦基础特征学习
-            # depth=2 提供 4^0+4^1+4^2 = 21 个候选区域，足以覆盖图像
-            self._stage1_max_depth = 2
-        elif epoch < 20:
-            self._curriculum_stage = 2
-            self._stage1_max_depth = None  # Stage 2 不限制深度
-        else:
-            self._curriculum_stage = 3
-            self._stage1_max_depth = None  # Stage 3 不限制深度
 
     def enable_feature_analysis(
         self,
@@ -2672,19 +2654,16 @@ class GumbelTopKSplitter(
             # 这里缓存供后续使用
 
         # ====================================================================
+        # 前3个epoch使用简化的token选择逻辑
         # ====================================================================
-        # 三阶段课程学习控制 (I-CURRICULUM)
-        # Stage 1: Teacher Forcing - 使用基于覆盖率的 Token 上限 + 深度限制
-        # P-OPT: 提前返回以避免不必要的计算
-        # ====================================================================
-        if self._curriculum_stage == 1:
-            # P-OPT: Stage 1 深度限制 - 如果设置了 _stage1_max_depth，过滤候选
+        if self._current_epoch < 3:
+            # 深度限制 - 如果设置了 _max_depth_limit，过滤候选
             effective_N = N
             effective_depths = depths
             effective_indices = None  # 初始化为 None
-            if self._stage1_max_depth is not None:
+            if self._max_depth_limit is not None:
                 # 过滤到指定深度的候选
-                depth_mask = depths <= self._stage1_max_depth
+                depth_mask = depths <= self._max_depth_limit
                 effective_indices = depth_mask.nonzero(as_tuple=True)[0]
                 effective_N = effective_indices.shape[0]
                 # 如果过滤后候选数太少，使用所有候选
@@ -2771,8 +2750,8 @@ class GumbelTopKSplitter(
         # Step 2: Gumbel-Top-K 选择
         # I24-2: 使用分层 Top-K (方案E) 或全局 Top-K (传统方案)
         # ====================================================================
-        # P-OPT-FIX: 定义 _skip_dynamic_selection - Stage 1 应该跳过动态选择
-        _skip_dynamic_selection = (self._curriculum_stage == 1)
+        # 前3个epoch跳过动态K选择
+        _skip_dynamic_selection = (self._current_epoch < 3)
         if not _skip_dynamic_selection:
             # 计算动态 K (I33: 传递 image_size 用于自适应覆盖率)
             if self.use_dynamic_k:
@@ -2787,9 +2766,7 @@ class GumbelTopKSplitter(
             K = max(min(K, N), min(self.K_min, N))
 
         # ====================================================================
-        # v6.1: Soft-Threshold 课程学习
-        # 应用负阈值作为偏置，抑制低分候选（稀疏化效果）
-        # 注意：Stage 1 跳过此逻辑（已使用全 1 mask）
+        # Soft-Threshold 应用负阈值作为偏置，抑制低分候选（稀疏化效果）
         # ====================================================================
         if not _skip_dynamic_selection:
             if self._enable_soft_threshold and self._current_soft_threshold > 0:
@@ -5107,6 +5084,9 @@ class GumbelTopKSplitter(
             self.hilbert_indices, "_cached_device_hilbert", device
         )[candidate_indices]  # [total]
 
+        # I150-3 NEW: 计算并记录 Logits 的平均绝对值
+        mean_abs_logits = logits.abs().mean().item() if logits.numel() > 0 else 0.0
+
         return GumbelTopKResult(
             regions=regions,
             depths=depths,
@@ -5117,6 +5097,7 @@ class GumbelTopKSplitter(
             probs=probs,
             candidate_indices=candidate_indices,  # I99-1 FIX: 用于正确的概率索引
             num_selected_per_batch=num_selected_per_batch,
+            mean_abs_logits=mean_abs_logits,  # I150-3 NEW: 记录 Logits 平均绝对值
         )
     
     # ========================================================================
@@ -5136,11 +5117,6 @@ class GumbelTopKSplitter(
         entropy_target: Optional[float] = None,
         entropy_weight: float = 0.1,
         entropy_mode: str = 'maximize',
-        # I153-1: Quota 对齐损失参数
-        quota_align_weight: float = 0.0,
-        quota_align_mode: str = 'curriculum',
-        current_epoch: int = 0,
-        total_epochs: int = 100,
         **kwargs,
     ) -> Dict[str, Tensor]:
         """

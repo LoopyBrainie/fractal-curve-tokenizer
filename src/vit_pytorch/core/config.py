@@ -126,8 +126,6 @@ class HilbertSplitterConfig:
     enable_learnable_quota: bool = LEARNABLE_QUOTA_ENABLED  # True
     quota_init_logits: Optional[Tuple[float, ...]] = None
     quota_entropy_weight: float = QUOTA_ENTROPY_WEIGHT  # 0.1
-    quota_align_weight: float = 0.0  # I153-1: KL 对齐损失权重 (0=禁用)
-    quota_align_mode: str = "curriculum"  # 课程学习模式
     quota_min_ratio: float = 0.02  # I96-7: 最小采样比例
     quota_min_lambda: float = 0.1  # 下界软正则化权重
 
@@ -183,16 +181,6 @@ class HilbertSplitterConfig:
     # α = 1: 完全软分布
     deterministic_ste_alpha: float = 0.5
 
-    # ==================== Soft-Threshold 课程学习配置 ====================
-    # 控制模型的"分裂欲望"
-    # Warm-up (0-25%): τ=0, 充分探索
-    # 收缩 (25-75%): 线性 ↑, 稀疏化
-    # 稳定 (75%+): 固定微调
-    enable_soft_threshold: bool = True
-    soft_threshold_warmup_epochs: int = 10
-    soft_threshold_max: float = 0.5  # 最大阈值
-    soft_threshold_schedule: str = "linear"  # linear, cosine
-
     # ==================== I113-12: 静态 K 模式配置 ====================
     # 启用静态 K 模式以支持 torch.compile 的 cudagraphs 优化
     # 启用后，token 数量将 padding 到 static_k_max
@@ -211,6 +199,13 @@ class HilbertSplitterConfig:
     # 替代静态 EMA 归一化，自适应极端纹理图像
     enable_meta_dvn: bool = False
     meta_dvn_hidden_dim: int = 64  # MLP 隐藏层维度
+
+    # ==================== v6.1: Soft-Threshold 课程学习配置 ====================
+    # 用于控制软阈值课程学习
+    enable_soft_threshold: bool = True
+    soft_threshold_warmup_epochs: int = 10
+    soft_threshold_max: float = 0.5
+    soft_threshold_schedule: str = 'linear'
 
     # ==================== 验证与工具方法 ====================
 
@@ -346,8 +341,6 @@ class HilbertSplitterConfig:
             'enable_learnable_quota': self.enable_learnable_quota,
             'quota_init_logits': self.quota_init_logits,
             'quota_entropy_weight': self.quota_entropy_weight,
-            'quota_align_weight': self.quota_align_weight,
-            'quota_align_mode': self.quota_align_mode,
             'quota_min_ratio': self.quota_min_ratio,
             'quota_min_lambda': self.quota_min_lambda,
             'entropy_mode': self.entropy_mode,
@@ -370,11 +363,6 @@ class HilbertSplitterConfig:
             'use_deterministic_topk': self.use_deterministic_topk,
             'deterministic_temperature': self.deterministic_temperature,
             'deterministic_ste_alpha': self.deterministic_ste_alpha,
-            # Soft-Threshold 课程学习配置
-            'enable_soft_threshold': self.enable_soft_threshold,
-            'soft_threshold_warmup_epochs': self.soft_threshold_warmup_epochs,
-            'soft_threshold_max': self.soft_threshold_max,
-            'soft_threshold_schedule': self.soft_threshold_schedule,
         }
 
     # ==================== L2 绝对值计算方法 (I113-2) ====================
@@ -503,8 +491,6 @@ class NeighborAwareSplitterConfig:
     enable_learnable_quota: bool = LEARNABLE_QUOTA_ENABLED
     quota_init_logits: Optional[Tuple[float, ...]] = None
     quota_entropy_weight: float = QUOTA_ENTROPY_WEIGHT
-    quota_align_weight: float = 0.0  # I153-1: KL 对齐损失权重 (0=禁用)
-    quota_align_mode: str = "curriculum"  # 课程学习模式
 
     # ==================== 局部一致性损失 ====================
     locality_weight: float = 0.1
@@ -576,8 +562,6 @@ class NeighborAwareSplitterConfig:
             'enable_learnable_quota': self.enable_learnable_quota,
             'quota_init_logits': self.quota_init_logits,
             'quota_entropy_weight': self.quota_entropy_weight,
-            'quota_align_weight': self.quota_align_weight,
-            'quota_align_mode': self.quota_align_mode,
             'locality_weight': self.locality_weight,
         }# ==================== Attention 配置 ====================
 
@@ -938,8 +922,6 @@ def create_splitter_config(
     enable_learnable_quota: Optional[bool] = None,
     quota_init_logits: Optional[Tuple[float, ...]] = None,
     quota_entropy_weight: Optional[float] = None,
-    quota_align_weight: Optional[float] = None,
-    quota_align_mode: Optional[str] = None,
     quota_min_ratio: Optional[float] = None,
     quota_min_lambda: Optional[float] = None,
     # 熵正则化
@@ -960,11 +942,6 @@ def create_splitter_config(
     temperature_warmup_steps: Optional[int] = None,
     # 冻结控制
     freeze_quota: Optional[bool] = None,
-    # v6.1: Soft-Threshold 课程学习
-    enable_soft_threshold: Optional[bool] = None,
-    soft_threshold_warmup_epochs: Optional[int] = None,
-    soft_threshold_max: Optional[float] = None,
-    soft_threshold_schedule: Optional[str] = None,
     **kwargs,
 ) -> HilbertSplitterConfig:
     """
@@ -1027,10 +1004,6 @@ def create_splitter_config(
         config.quota_init_logits = quota_init_logits
     if quota_entropy_weight is not None:
         config.quota_entropy_weight = quota_entropy_weight
-    if quota_align_weight is not None:
-        config.quota_align_weight = quota_align_weight
-    if quota_align_mode is not None:
-        config.quota_align_mode = quota_align_mode
     if quota_min_ratio is not None:
         config.quota_min_ratio = quota_min_ratio
     if quota_min_lambda is not None:
@@ -1071,16 +1044,6 @@ def create_splitter_config(
     # 冻结控制
     if freeze_quota is not None:
         config.freeze_quota = freeze_quota
-
-    # v6.1: Soft-Threshold 课程学习配置
-    if enable_soft_threshold is not None:
-        config.enable_soft_threshold = enable_soft_threshold
-    if soft_threshold_warmup_epochs is not None:
-        config.soft_threshold_warmup_epochs = soft_threshold_warmup_epochs
-    if soft_threshold_max is not None:
-        config.soft_threshold_max = soft_threshold_max
-    if soft_threshold_schedule is not None:
-        config.soft_threshold_schedule = soft_threshold_schedule
 
     # 应用额外参数
     for key, value in kwargs.items():

@@ -257,11 +257,8 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
     ):
         super().__init__()
 
-        # 课程学习阶段 (与 GumbelTopK 保持一致)
-        # 1 = Teacher Forcing (Epoch 1-9)
-        # 2 = Acc-Driven Splitting (Epoch 10-19)
-        # 3 = Resource Co-adaptation (Epoch 20+)
-        self._curriculum_stage: int = 1
+        # 当前训练轮次
+        self._current_epoch: int = 0
 
         if config is not None:
             feature_dim = config.feature_dim
@@ -967,16 +964,8 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         self.temperature = temperature
 
     def set_epoch(self, epoch: int):
-        """设置当前 epoch，用于课程学习调度"""
-        self._epoch = epoch
-
-        # 课程学习阶段更新 (与 GumbelTopK 保持一致)
-        if epoch < 10:
-            self._curriculum_stage = 1
-        elif epoch < 20:
-            self._curriculum_stage = 2
-        else:
-            self._curriculum_stage = 3
+        """设置当前 epoch"""
+        self._current_epoch = epoch
 
         # I107: Entmax Alpha 预热策略
         # α(t) = min(1.5, 1.2 + 0.3 × epoch / T_warmup) for t < T_warmup

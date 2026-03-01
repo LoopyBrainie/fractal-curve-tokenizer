@@ -111,6 +111,7 @@ class DiagnosticHook:
         self._has_nan = False
         self._batch_count = 0
         self._layer_hooks: List[Any] = []
+        self._handles: List[Any] = []  # register_forward_hook 的句柄
         self._diagnostics: Dict[str, LayerDiagnostics] = {}
 
         # Splitter 状态
@@ -163,6 +164,13 @@ class DiagnosticHook:
 
         return report
 
+    def remove_hooks(self) -> None:
+        """移除所有注册的 forward hooks"""
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        logger.info("DiagnosticHook: 已移除所有钩子")
+
     def register_hooks(self, model: nn.Module) -> nn.Module:
         """
         注册诊断钩子到模型
@@ -195,68 +203,57 @@ class DiagnosticHook:
         return model
 
     def _register_transformer_hooks(self, transformer: nn.Module) -> None:
-        """注册 Transformer 层钩子 - 只包装顶层模块，不包装子模块"""
-        # 只遍历 transformer 的直接子模块（顶层 blocks）
-        # 而不是用 .modules() 遍历所有子模块
+        """注册 Transformer 层钩子 - 使用 register_forward_hook 更安全"""
+        # 使用 transformer.named_modules() 但只注册顶层 blocks 的 hook
+        # 不替换 forward，只添加观察钩子
         for idx, module in enumerate(transformer.children()):
-            # 检查是否是 TransformerBlock 或类似的可训练模块
-            # 避免包装 LayerNorm、Linear 等基础组件
-            module_name = f"transformer_block_{idx}"
-
-            # 跳过非模块（如 container、Sequential 等）
+            # 跳过非模块
             if not isinstance(module, nn.Module):
                 continue
 
-            # 跳过基础组件（LayerNorm、Dropout、Activation 等）
-            module_type_name = type(module).__name__
-            skip_types = {'LayerNorm', 'Dropout', 'GELU', 'ReLU', 'SiLU', 'Identity',
-                          'Linear', 'MultiheadAttention', 'Conv2d', 'Buffer'}
-            if module_type_name in skip_types:
-                continue
+            module_name = f"transformer_block_{idx}"
 
-            # 保存原始 forward
-            original_forward = module.forward
-            self._original_forwards[module_name] = original_forward
+            # 使用 register_forward_hook 添加诊断
+            # 这是 PyTorch 原生支持的，不会破坏模块内部调用
+            def make_hook(idx, name):
+                def hook(module, input, output):
+                    # output 可能是 tensor 或 tuple
+                    if isinstance(output, torch.Tensor):
+                        self._diagnose_layer_output(idx, name, output)
+                    elif isinstance(output, tuple):
+                        # 取第一个元素（通常是 tensor）
+                        for item in output:
+                            if isinstance(item, torch.Tensor):
+                                self._diagnose_layer_output(idx, name, item)
+                                break
+                return hook
 
-            # 包装 forward
-            def make_wrapper(idx, orig_forward, name):
-                def wrapper(self_, *args, **kwargs):
-                    result = orig_forward(*args, **kwargs)
-                    self._diagnose_layer_output(idx, name, result)
-                    return result
-                return wrapper
-
-            module.forward = make_wrapper(idx, original_forward, module_name)
+            handle = module.register_forward_hook(make_hook(idx, module_name))
+            self._handles.append(handle)
             self._layer_hooks.append((module_name, module))
 
     def _register_splitter_hooks(self, splitter: nn.Module) -> None:
-        """注册 Splitter 钩子 - 监控 Entmax 输入"""
-        if hasattr(splitter, 'forward'):
-            original_forward = splitter.forward
+        """注册 Splitter 钩子 - 使用 register_forward_hook"""
+        # 使用 forward hook 而不是替换 forward 方法
+        def hook(module, input, output):
+            self._diagnose_splitter_output(output)
 
-            def wrapper(*args, **kwargs):
-                result = original_forward(*args, **kwargs)
-                self._diagnose_splitter_output(result)
-                return result
-
-            splitter.forward = wrapper
-            self._layer_hooks.append(("splitter", splitter))
+        handle = splitter.register_forward_hook(hook)
+        self._handles.append(handle)
+        self._layer_hooks.append(("splitter", splitter))
 
     def _register_tokenizer_hooks(self, tokenizer: nn.Module) -> None:
-        """注册 Tokenizer 钩子"""
-        if hasattr(tokenizer, 'forward'):
-            original_forward = tokenizer.forward
+        """注册 Tokenizer 钩子 - 使用 register_forward_hook"""
+        # 使用 forward hook 而不是替换 forward 方法
+        def hook(module, input, output):
+            # Tokenizer 输出诊断
+            if hasattr(output, 'features'):
+                features = output.features
+                self._diagnose_tensor("tokenizer_features", features)
 
-            def wrapper(*args, **kwargs):
-                result = original_forward(*args, **kwargs)
-                # Tokenizer 输出诊断
-                if hasattr(result, 'features'):
-                    features = result.features
-                    self._diagnose_tensor("tokenizer_features", features)
-                return result
-
-            tokenizer.forward = wrapper
-            self._layer_hooks.append(("tokenizer", tokenizer))
+        handle = tokenizer.register_forward_hook(hook)
+        self._handles.append(handle)
+        self._layer_hooks.append(("tokenizer", tokenizer))
 
     def _diagnose_layer_output(
         self,
