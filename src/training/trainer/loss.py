@@ -80,9 +80,10 @@ class MixupCutmixLoss:
         lam = lam.view(batch_size, 1, 1, 1)
         mixed_images = lam * images + (1 - lam) * images[index]
 
-        # Mix labels
+        # Mix labels - 使用正确的形状 [B, 1] 而不是 [B, 1, 1]
+        lam_for_labels = lam.squeeze(-1).squeeze(-1)  # [B, 1, 1] -> [B, 1]
         labels_one_hot = F.one_hot(labels, self.num_classes).float()
-        mixed_labels = lam.squeeze(-1) * labels_one_hot + (1 - lam.squeeze(-1)) * labels_one_hot[index]
+        mixed_labels = lam_for_labels * labels_one_hot + (1 - lam_for_labels) * labels_one_hot[index]
 
         return mixed_images, mixed_labels
 
@@ -194,8 +195,6 @@ def compute_loss(
         loss: Scalar loss tensor
         components: Dict of loss components
     """
-    # DEBUG: 添加临时调试信息
-    print(f"[DEBUG] logits.shape: {logits.shape}, targets.shape: {targets.shape}, targets.dim(): {targets.dim()}")
 
     # Handle one-hot targets (from Mixup/Cutmix)
     if targets.dim() == 2:
