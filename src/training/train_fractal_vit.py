@@ -26,11 +26,11 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler
 
-# Add project root to path
+# Add src directory to path for vit_pytorch imports
 def _setup_path():
-    project_root = Path(__file__).parent.parent.parent
-    if str(project_root) not in sys.path:
-        sys.path.insert(0, str(project_root))
+    src_dir = Path(__file__).parent.parent
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
 _setup_path()
 
 from .config import Config, create_config
