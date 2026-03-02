@@ -194,6 +194,9 @@ def compute_loss(
         loss: Scalar loss tensor
         components: Dict of loss components
     """
+    # DEBUG: 添加临时调试信息
+    print(f"[DEBUG] logits.shape: {logits.shape}, targets.shape: {targets.shape}, targets.dim(): {targets.dim()}")
+
     # Handle one-hot targets (from Mixup/Cutmix)
     if targets.dim() == 2:
         # One-hot targets - use direct computation for mixed labels
