@@ -114,10 +114,10 @@ def train_one_epoch(
             labels = None
 
         # Apply Mixup/Cutmix if enabled
+        # FIX: 修复运算符优先级问题，需要用括号明确分组
         apply_mixup = (
             mixup_cutmix is not None and
-            config.training.mixup_alpha > 0 or
-            config.training.cutmix_alpha > 0
+            (config.training.mixup_alpha > 0 or config.training.cutmix_alpha > 0)
         )
 
         if mixup_cutmix is not None and labels is not None:
