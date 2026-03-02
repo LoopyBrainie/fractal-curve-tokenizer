@@ -262,6 +262,8 @@ def create_dataloader(args, split: str = 'train') -> DataLoader:
     image_size = args.image_size
     if image_size is not None and str(image_size).lower() == 'none':
         image_size = 224  # Default for dynamic resolution
+    elif image_size is not None:
+        image_size = int(image_size)  # Convert string to int
 
     transforms = get_transforms(
         dataset=dataset_name,
