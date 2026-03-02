@@ -153,7 +153,6 @@ uv run python -m src.training.train_fractal_vit \
   --K-min-abs 8 \
   --splitter-temp-start 1.0 \
   --splitter-temp-end 0.3 \
-  --jump-loss-weight 0.1 \
   --token-coverage-min 0.02 \
   --token-coverage-max 0.15 \
   --use-amp \
