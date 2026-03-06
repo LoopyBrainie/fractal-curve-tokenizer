@@ -400,11 +400,11 @@ class LevelsInfo:
         Returns:
             归一化Hilbert索引，范围 [0, 1]
         """
-        # 深度为0时返回0
-        depth_safe = depth.clamp(min=1)
+        # I-NAN: 限制最大深度，防止指数溢出
+        depth_safe = depth.clamp(min=1, max=12)
 
-        # 计算 4^depth [B, N] 或 [N]
-        four_pow_depth = 4 ** depth_safe
+        # 计算 4^depth [B, N] 或 [N]，并 clamp 防止溢出
+        four_pow_depth = (4 ** depth_safe).clamp(max=1e9)
 
         # 深度根归一化: (H / 4^d)^(1/d)
         normalized = (hilbert_dist.float() / four_pow_depth.float()) ** (1.0 / depth_safe.float())

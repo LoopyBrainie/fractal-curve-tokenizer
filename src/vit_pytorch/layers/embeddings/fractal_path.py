@@ -400,6 +400,17 @@ class BitFlippedPositionEncoder(nn.Module):
         # I-NAN: 改为小值初始化
         nn.init.normal_(self.depth_decay_scale, mean=0, std=0.01)
 
+    def _register_nan_grad_hooks(self):
+        """I-NAN: 为所有参数注册梯度 hook，捕获 backward 过程中产生的 NaN"""
+        self._nan_grad_hooks = []
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                hook = param.register_hook(
+                    lambda grad, n=name: torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
+                    if torch.isnan(grad).any() or torch.isinf(grad).any() else grad
+                )
+                self._nan_grad_hooks.append(hook)
+
     def _compute_quadrant_indices(self, paths: torch.Tensor) -> torch.Tensor:
         """从路径计算象限索引
 
@@ -468,8 +479,8 @@ class BitFlippedPositionEncoder(nn.Module):
         # v5.1: 对 geometry_emb 也应用深度衰减
         # 使用 gamma^depth 对每个 token 进行缩放
         gamma = torch.sigmoid(self.depth_decay_scale)  # [1]
-        # 计算每个 token 的 scale: scale[d] = gamma^d
-        token_scales = gamma ** depths.float()  # [B, N]
+        # I-NAN: 添加 clamp 防止指数爆炸
+        token_scales = (gamma ** depths.float()).clamp(min=1e-6, max=1e6)  # [B, N]
         token_scales = token_scales.unsqueeze(-1)  # [B, N, 1]
 
         geometry_emb = self.geometry_projection(path_emb)  # [B, N, dim]
@@ -509,7 +520,8 @@ class BitFlippedPositionEncoder(nn.Module):
         gamma = torch.sigmoid(self.depth_decay_scale)  # [1]
         # scale(k) = gamma^k: [1, γ, γ², γ³, ..., γ^(max_level-1)]
         level_indices = torch.arange(max_level, device=device)  # [max_level]
-        depth_scales = (gamma ** level_indices).unsqueeze(0).unsqueeze(-1)  # [1, max_level, 1]
+        # I-NAN: 添加 clamp 防止指数爆炸
+        depth_scales = (gamma ** level_indices).clamp(min=1e-6, max=1e6).unsqueeze(0).unsqueeze(-1)  # [1, max_level, 1]
 
         # 生成层级偏移量: [0, 4, 8, ..., (max_level-1)*4]
         level_offsets = torch.arange(max_level, device=device) * 4

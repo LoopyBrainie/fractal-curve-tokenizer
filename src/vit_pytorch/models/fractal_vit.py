@@ -1048,7 +1048,21 @@ class FractalCurveViT(nn.Module):
         
         # Transformer 层权重初始化
         self._init_transformer_weights()
-    
+
+        # I-NAN: 注册全局梯度 hook，保护所有参数
+        self._register_all_nan_grad_hooks()
+
+    def _register_all_nan_grad_hooks(self):
+        """I-NAN: 为所有参数注册梯度 hook，捕获 backward 过程中产生的 NaN"""
+        self._all_nan_grad_hooks = []
+        for param in self.parameters():
+            if param.requires_grad:
+                hook = param.register_hook(
+                    lambda grad: torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
+                    if torch.isnan(grad).any() or torch.isinf(grad).any() else grad
+                )
+                self._all_nan_grad_hooks.append(hook)
+
     def _init_transformer_weights(self):
         """初始化 Transformer 层的权重"""
         for module in self.transformer.modules():

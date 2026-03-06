@@ -35,7 +35,7 @@ import torch.nn.functional as F
 def poincare_distance(
     coords: torch.Tensor,
     image_size: Tuple[int, int],
-    epsilon: float = 1e-7,  # I-NAN: 改为 1e-7，acosh 导数在 1+ 处不会爆炸
+    epsilon: float = 1e-4,  # I-NAN: 改为 1e-4，与 FP16 精度匹配
 ) -> torch.Tensor:
     """
     计算 Poincaré 圆盘上的双曲距离。
@@ -126,6 +126,7 @@ def poincare_distance(
 
     # I-NAN: acosh 定义域保护，确保 x >= 1 + epsilon
     # 这是最关键的修复：防止 x=1 导致 acosh(1)=0
+    # I-NAN-2: epsilon 改为 1e-4 与 FP16 精度匹配
     x = x.clamp(min=1.0 + epsilon)
 
     distance = torch.acosh(x)
@@ -255,15 +256,18 @@ def compute_geometric_features(
     delta_h = torch.abs(h_i - h_j).float() / (N ** 2)  # [B, N, N]
 
     # 2. 2^{d_LCA} (LCA 深度指数)
-    lca_exp = torch.pow(2, lca_depths.float())  # [B, N, N]
+    # I-NAN: 添加 clamp 防止指数爆炸 (d_LCA=16 时 2^16=65536 接近 FP16 上限)
+    lca_exp = torch.pow(2, lca_depths.float()).clamp(max=1e3)
 
     # 3. d_H(i,j) (Poincaré 双曲距离)
     d_h = poincare_distance(coords, image_size)  # [B, N, N]
 
-    # 4. log(ω_i / ω_j) (面积比 log)
+    # I-NAN: 4. log(ω_i / ω_j) (面积比 log) - 添加更严格的保护
     area_i = normalized_areas.unsqueeze(2)  # [B, N, 1]
     area_j = normalized_areas.unsqueeze(1)  # [B, 1, N]
-    area_ratio = torch.log(area_i / (area_j + 1e-8) + 1e-8)  # [B, N, N]
+    area_ratio = torch.log(
+        (area_i / (area_j + 1e-6) + 1e-6).clamp(min=1e-6, max=1e6)
+    )  # [B, N, N]
 
     # 5. rot_same(i,j) (旋转相同性)
     rot_same = compute_rotational_similarity(paths)  # [B, N, N]
@@ -323,6 +327,9 @@ class GeometricLatentDecoder(nn.Module):
         # 5 维几何特征 → rank 维
         self.feature_proj = nn.Linear(5, rank)
 
+        # I-NAN: 在投影后添加 LayerNorm，防止多尺度特征融合导致梯度失控
+        self.feature_norm = nn.LayerNorm(rank)
+
         # 两层 MLP: rank → rank → heads
         self.mlp = nn.Sequential(
             nn.Linear(rank, rank),
@@ -331,6 +338,7 @@ class GeometricLatentDecoder(nn.Module):
         )
 
         # 层可学习缩放 (每个头一个)
+        # I-NAN-2: 初始化改为 1.0，避免门控几乎关闭导致梯度消失
         self.layer_scale = nn.Parameter(torch.ones(heads))
 
         # 初始化
@@ -342,9 +350,7 @@ class GeometricLatentDecoder(nn.Module):
         nn.init.xavier_uniform_(self.mlp[0].weight)
         nn.init.xavier_uniform_(self.mlp[2].weight)
 
-        # 初始化 layer_scale 为更小值，避免初始偏置"绑架"语义特征
-        # I-NAN: 使用更小的初始值，避免梯度不稳定
-        nn.init.normal_(self.layer_scale, mean=0.001, std=0.0001)
+        # I-NAN: layer_scale 已初始化为 1.0，无需再初始化
 
     def forward(
         self,
@@ -375,6 +381,9 @@ class GeometricLatentDecoder(nn.Module):
 
         # 投影: [B, N, N, 5] → [B, N, N, rank]
         x = self.feature_proj(geometric_features)
+
+        # I-NAN: 在投影后应用 LayerNorm，防止梯度失控
+        x = self.feature_norm(x)
 
         # MLP + GELU
         x = self.mlp(x)

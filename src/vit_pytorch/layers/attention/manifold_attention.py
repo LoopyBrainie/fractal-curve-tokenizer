@@ -184,16 +184,16 @@ class ManifoldNativeAttention(nn.Module):
                     img_area = image_size * image_size
                     img_size_tuple = (image_size, image_size)
 
-                # 从 regions 提取几何信息
+                # I-NAN: 从 regions 提取几何信息，先确保坐标有效
+                # 确保 x2 >= x1 + 1, y2 >= y1 + 1 避免零或负值
+                width = (regions[..., 2] - regions[..., 0]).clamp(min=1)
+                height = (regions[..., 3] - regions[..., 1]).clamp(min=1)
+
                 coords = (regions[..., :2] + regions[..., 2:]) / 2  # 中心点
                 aspect_ratios = torch.log(
-                    (regions[..., 2] - regions[..., 0]) /
-                    (regions[..., 3] - regions[..., 1] + 1e-8) + 1e-8
+                    (width / (height + 1e-8)) + 1e-8
                 )
-                normalized_areas = (
-                    (regions[..., 2] - regions[..., 0]) *
-                    (regions[..., 3] - regions[..., 1])
-                ) / (img_area + 1e-8)
+                normalized_areas = (width * height) / (img_area + 1e-8)
 
                 # 模拟 LCA depths (简化版本)
                 lca_depths = depths.unsqueeze(2) + depths.unsqueeze(1)
@@ -228,7 +228,8 @@ class ManifoldNativeAttention(nn.Module):
             band_mask = create_hilbert_band_mask(hilbert_indices, bandwidths)
 
             # 应用带宽掩码
-            attn = attn.masked_fill(~band_mask.unsqueeze(1), float('-inf'))
+            # I-NAN: 使用 -1e9 而非 -inf，避免 softmax 梯度产生 NaN
+            attn = attn.masked_fill(~band_mask.unsqueeze(1), -1e9)
 
         # Entmax 稀疏激活 + Dropout (替代 Softmax 以保持与分割器一致性)
         from vit_pytorch.layers.splitters.hilbert_entmax import entmax_1_5

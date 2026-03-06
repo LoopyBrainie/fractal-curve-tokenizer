@@ -5343,7 +5343,7 @@ class GumbelTopKSplitter(
                 depth_probs_t = (prob_sums / (B * depth_counts)).clamp(min=PROB_EPSILON)
 
                 # 归一化
-                depth_probs_t = depth_probs_t / depth_probs_t.sum()
+                depth_probs_t = depth_probs_t / (depth_probs_t.sum() + PROB_EPSILON)
                 # I23-4: 归一化后再次 clamp，防止 FP16 下溢导致 log(0)
                 depth_probs_t = depth_probs_t.clamp(min=PROB_EPSILON)
                 current_entropy = -(depth_probs_t * depth_probs_t.log()).sum()
@@ -5645,7 +5645,7 @@ class GumbelTopKSplitter(
             depth_counts = depth_onehot.sum(dim=0).clamp(min=1.0)  # [D]
             prob_sums = torch.einsum('bn,nd->d', probs, depth_onehot)  # [D]
             depth_probs = (prob_sums / (B * depth_counts)).clamp(min=PROB_EPSILON)
-            depth_probs = depth_probs / depth_probs.sum()
+            depth_probs = depth_probs / (depth_probs.sum() + PROB_EPSILON)
             depth_probs = depth_probs.clamp(min=PROB_EPSILON)
         else:
             # I111-3: 硬选择计数 (正确的深度分布定义)
@@ -5668,7 +5668,7 @@ class GumbelTopKSplitter(
             # 深度分布 p_d = K_d / K_total (对 batch 取平均)
             depth_probs = (K_per_depth / K_total).mean(dim=0)  # [D]
             depth_probs = depth_probs.clamp(min=PROB_EPSILON)
-            depth_probs = depth_probs / depth_probs.sum()
+            depth_probs = depth_probs / (depth_probs.sum() + PROB_EPSILON)
 
         # 计算熵
         entropy = -(depth_probs * depth_probs.log()).sum()
