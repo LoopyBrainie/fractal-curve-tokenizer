@@ -186,6 +186,9 @@ def create_model(args, device: torch.device) -> nn.Module:
         'quota_learnable': quota_learnable,
         'quota_entropy_weight': getattr(args, 'quota_entropy_weight', 0.01),
 
+        # P6-1: depth_scale_range - 使用 sigmoid 参数化防止 CUDA 梯度爆炸
+        'depth_scale_range': (0.5, 2.0),
+
         # FFN type
         'ffn_type': getattr(args, 'ffn_type', 'swiglu_level'),
 
