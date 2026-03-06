@@ -70,15 +70,17 @@ class ManifoldNativeAttention(nn.Module):
         self.use_banded = use_banded
         self.use_fractal_residual = use_fractal_residual
 
-        # 头维度
+        # I-MANIFOLD: 修复维度不匹配问题
+        # inner_dim = heads * dim_head，确保 dim = heads * dim_head
+        self.inner_dim = heads * dim_head
         self.head_dim = dim_head
         self.scale = self.head_dim ** -0.5
 
-        # QKV 投影
-        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        # QKV 投影: 从 dim 投影到 inner_dim * 3 (每个 token 的 QKV)
+        self.qkv = nn.Linear(dim, self.inner_dim * 3, bias=True)
 
-        # 输出投影
-        self.proj = nn.Linear(dim, dim, bias=True)
+        # 输出投影: 从 inner_dim 投影回 dim
+        self.proj = nn.Linear(self.inner_dim, dim, bias=True)
 
         # Dropout
         self.attn_dropout = nn.Dropout(dropout)
@@ -108,6 +110,10 @@ class ManifoldNativeAttention(nn.Module):
                 dim=dim,
                 max_level=max_level,
             )
+            # I-MANIFOLD: 残差投影层，将 dim 投影到 inner_dim 以匹配注意力输出
+            self.residual_proj = nn.Linear(dim, self.inner_dim) if dim != self.inner_dim else nn.Identity()
+        else:
+            self.residual_proj = nn.Identity()
 
     def forward(
         self,
@@ -232,12 +238,14 @@ class ManifoldNativeAttention(nn.Module):
         # 注意力加权
         out = attn @ v  # [B, H, N, d]
 
-        # 合并头
-        out = out.transpose(1, 2).reshape(B, N, D)
+        # 合并头: [B, H, N, d] -> [B, N, H*d] = [B, N, inner_dim]
+        out = out.transpose(1, 2).reshape(B, N, self.inner_dim)
 
         # 应用 Fractal Residual
         if self.use_fractal_residual and depths is not None and hilbert_indices is not None:
             residual = self.fractal_residual(x, depths, hilbert_indices, regions)
+            # I-MANIFOLD: 将残差从 dim 投影到 inner_dim
+            residual = self.residual_proj(residual)
             out = out + residual
 
         # 输出投影

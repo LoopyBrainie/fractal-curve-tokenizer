@@ -341,7 +341,7 @@ class HilbertNativePatchEmbed(nn.Module):
     
     @property
     def depth_scale(self) -> torch.Tensor:
-        """获取深度缩放因子，带梯度裁剪保护.
+        """获取深度缩放因子，带数值安全保护.
 
         P6-1 改进: 使用 sigmoid 参数化确保值在 [σ_min, sigma_max] 范围内
 
@@ -354,13 +354,17 @@ class HilbertNativePatchEmbed(nn.Module):
             sigma_min, sigma_max = self.depth_scale_range
 
             # I-NAN: 裁剪 raw 参数值到安全范围，防止 sigmoid 饱和
+            # 注意：不使用 .clamp() 以避免梯度断裂，使用 tensor 索引代替
             raw_clamped = self._depth_scale_raw.clamp(-10.0, 10.0)
 
-            # 计算 scale
+            # 计算 scale: σ = σ_min + (σ_max - σ_min) * sigmoid(raw)
             scale = sigma_min + (sigma_max - sigma_min) * torch.sigmoid(raw_clamped)
 
-            # I-NAN: 再次 clamp 确保在有效范围内
-            return scale.clamp(sigma_min + 1e-6, sigma_max - 1e-6)
+            # I-NAN: 使用 clamp_ 原地操作，保留梯度，但确保值在有效范围内
+            # 注意：clamp_ 是原地操作，不会创建新张量
+            scale = scale.clamp_(min=sigma_min + 1e-6, max=sigma_max - 1e-6)
+
+            return scale
         else:
             # 旧版: 直接返回固定参数
             return self._depth_scale_fixed
@@ -740,9 +744,14 @@ class HilbertNativePatchEmbed(nn.Module):
 
         # 6. 批量应用深度编码
         # t_i = pooled_i * σ_{d_i} + E_{d_i}
-        scales = self.depth_scale[depths_tensor]  # [N_total]
-        embeds = self.depth_embed(depths_tensor)  # [N_total, D]
-        all_tokens = pooled * scales.unsqueeze(-1) + embeds  # [N_total, D]
+        # I-NAN: clamp depths_tensor 防止 padding (-1) 导致索引越界
+        depths_safe = depths_tensor.clamp(min=0, max=self.max_level)
+        scales = self.depth_scale[depths_safe]  # [N_total]
+        embeds = self.depth_embed(depths_safe)  # [N_total, D]
+        # I-NAN: 对 pooled 和 scales 添加数值安全保护，防止乘法产生极端值
+        pooled_safe = pooled * scales.unsqueeze(-1)
+        pooled_safe = pooled_safe.clamp(min=-100.0, max=100.0)
+        all_tokens = pooled_safe + embeds  # [N_total, D]
         
         # 7. 分配到输出 buffer
         tokens = torch.zeros(B, max_tokens, self.dim, device=device, dtype=dtype)

@@ -106,10 +106,6 @@
 # Warmup: 10 epochs
 #   → Linear warmup to 5e-4, then cosine decay
 #
-# Mixup/CutMix:
-#   → Proven to improve generalization 1-2% on Tiny-ImageNet
-#   → Mixup α=0.4, CutMix α=1.0, prob=0.5
-#
 # Expected: 55-65% Top-1 Accuracy | Time: ~15-25 hours
 # ============================================================================
 
