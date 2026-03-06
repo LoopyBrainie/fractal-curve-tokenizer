@@ -300,6 +300,20 @@ def train_one_epoch(
                     "logits_has_inf": bool(torch.isinf(lgt).any()),
                 }
 
+            # 收集特征模长统计 (mlp_head 前的特征)
+            feature_stats: Dict[str, float] = {}
+            if hasattr(outputs, 'features') and outputs.features is not None:
+                feat = outputs.features.detach()
+                feature_stats = {
+                    "mean": float(feat.mean()),
+                    "std": float(feat.std()),
+                    "min": float(feat.min()),
+                    "max": float(feat.max()),
+                    "norm": float(feat.norm()),
+                    "has_nan": bool(torch.isnan(feat).any()),
+                    "has_inf": bool(torch.isinf(feat).any()),
+                }
+
             # 获取训练环境信息
             current_lr = optimizer.param_groups[0]["lr"]
             amp_loss_scale = float(scaler.get_scale()) if scaler is not None else None
@@ -315,6 +329,7 @@ def train_one_epoch(
                 pre_clip_grad_norm=pre_clip_grad_norm,
                 input_stats=_input_stats,
                 splitter_logits_stats=splitter_logits_stats,
+                feature_stats=feature_stats,
                 amp_loss_scale=amp_loss_scale,
                 learning_rate=current_lr,
                 loss_components=current_loss_components,

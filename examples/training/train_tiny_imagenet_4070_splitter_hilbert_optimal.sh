@@ -139,14 +139,8 @@ uv run python -m src.training.train_fractal_vit \
   --transformer-dropout 0.15 \
   --emb-dropout 0.0 \
   --drop-path 0.2 \
-  --label-smoothing 0.1 \
+  --label-smoothing 0.0 \
   --gradient-clip 1.0 \
-  --mixup-alpha 0.4 \
-  --cutmix-alpha 1.0 \
-  --mixup-prob 0.5 \
-  --include-soft-entropy \
-  --soft-entropy-mode maximize \
-  --soft-entropy-weight 0.1 \
   --splitter-type hilbert_optimal \
   --splitter-token-ratio-min 0.02 \
   --splitter-token-ratio-max 0.15 \
