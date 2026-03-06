@@ -4,11 +4,16 @@ Provides numerical stability protection:
 - Gradient NaN/Inf detection
 - Anomaly detection context
 - Automatic gradient skipping on numerical issues
+- NaN auto-investigation with debug info dumping
 """
 
 from __future__ import annotations
 
-from typing import Optional, Dict, Any, List
+import json
+import os
+from pathlib import Path
+from typing import Optional, Dict, Any, List, Callable
+from collections import OrderedDict
 import torch
 import torch.nn as nn
 from contextlib import contextmanager
@@ -278,9 +283,283 @@ def check_tensor_numerical_health(
     return result
 
 
+# =============================================================================
+# Activation Stats Collector (用于捕获前向传播中的激活值统计)
+# =============================================================================
+
+
+class ActivationStatsCollector:
+    """使用 forward hooks 记录关键节点的激活值统计"""
+
+    def __init__(self, model: nn.Module, target_modules: Optional[List[str]] = None):
+        """初始化激活值收集器
+
+        Args:
+            model: 要监控的模型
+            target_modules: 要监控的模块名称子串列表（如 ["splitter", "manifold", "decoder"]）
+        """
+        self.model = model
+        self.target_modules = target_modules or ["splitter", "manifold", "decoder", "entmax", "density"]
+        self.hooks: List[Callable] = []
+        self.stats: Dict[str, Dict[str, float]] = {}
+        self._register_hooks()
+
+    def _register_hooks(self):
+        """注册 forward hooks"""
+        def create_hook(name: str):
+            def hook(module, input, output):
+                # 处理输出
+                if isinstance(output, torch.Tensor):
+                    self._record_tensor_stats(name, output)
+                elif isinstance(output, (tuple, list)):
+                    for i, o in enumerate(output):
+                        if isinstance(o, torch.Tensor):
+                            self._record_tensor_stats(f"{name}_{i}", o)
+            return hook
+
+        for name, module in self.model.named_modules():
+            # 检查模块名是否匹配目标
+            if any(target in name.lower() for target in self.target_modules):
+                hook = module.register_forward_hook(create_hook(name))
+                self.hooks.append(hook)
+
+    def _record_tensor_stats(self, name: str, tensor: torch.Tensor):
+        """记录张量统计"""
+        if tensor.numel() == 0:
+            return
+
+        # 使用 detach() 避免追踪梯度
+        t = tensor.detach()
+
+        # 计算统计（处理不同维度）
+        if t.dim() > 2:
+            t_flat = t.flatten(start_dim=2)
+        elif t.dim() == 2:
+            t_flat = t
+        else:
+            t_flat = t.unsqueeze(0)
+
+        # 计算统计
+        self.stats[name] = {
+            "mean": t_flat.mean().item(),
+            "std": t_flat.std().item(),
+            "min": t_flat.min().item(),
+            "max": t_flat.max().item(),
+            "norm": t_flat.norm().item(),
+            "has_nan": torch.isnan(t_flat).any().item(),
+            "has_inf": torch.isinf(t_flat).any().item(),
+        }
+
+    def get_stats(self) -> Dict[str, Dict[str, float]]:
+        """获取收集的统计信息"""
+        return self.stats.copy()
+
+    def clear(self):
+        """清除统计信息"""
+        self.stats.clear()
+
+    def remove_hooks(self):
+        """移除所有 hooks"""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks.clear()
+
+
+# =============================================================================
+# NaN Auto-Investigation (自动取证功能)
+# =============================================================================
+
+
+class NaNAutoInvestigation:
+    """NaN 自动取证器 - 当检测到 NaN 时自动收集调试信息"""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        debug_dir: str = "experiments/debug",
+        enabled: bool = True,
+    ):
+        self.model = model
+        self.debug_dir = Path(debug_dir)
+        self.enabled = enabled
+
+        # 创建调试目录
+        if self.enabled:
+            self.debug_dir.mkdir(parents=True, exist_ok=True)
+
+        # 激活值收集器
+        self.activation_collector = ActivationStatsCollector(model) if enabled else None
+
+        # 记录计数器
+        self.investigation_count = 0
+
+    def investigate(
+        self,
+        epoch: int,
+        step: int,
+        loss_value: float,
+        pre_clip_grad_norm: float,
+        input_stats: Optional[Dict[str, float]] = None,
+        splitter_logits_stats: Optional[Dict[str, float]] = None,
+    ) -> Optional[Path]:
+        """执行 NaN 调查并保存调试信息
+
+        Args:
+            epoch: 当前 epoch
+            step: 当前 step
+            loss_value: 损失值
+            pre_clip_grad_norm: 裁剪前的梯度范数
+            input_stats: 输入数据统计（可选）
+            splitter_logits_stats: Splitter logits 统计（可选）
+
+        Returns:
+            保存的调试文件路径
+        """
+        if not self.enabled:
+            return None
+
+        self.investigation_count += 1
+        report: Dict[str, Any] = {
+            "meta": {
+                "epoch": epoch,
+                "step": step,
+                "loss_value": loss_value,
+                "pre_clip_grad_norm": pre_clip_grad_norm,
+                "investigation_count": self.investigation_count,
+            },
+            "input_data_summary": input_stats or {},
+            "splitter_logits_stats": splitter_logits_stats or {},
+        }
+
+        # A. 梯度热力图分析
+        report["gradient_heatmap"] = self._analyze_gradient_heatmap()
+
+        # B. 激活值统计
+        if self.activation_collector:
+            report["activation_stats"] = self.activation_collector.get_stats()
+            self.activation_collector.clear()
+
+        # C. 找到第一个出现 NaN 的层
+        report["first_nan_layer"] = self._find_first_nan_layer()
+
+        # D. 参数范围分析
+        report["param_ranges"] = self._analyze_param_ranges()
+
+        # 保存到文件
+        filename = f"nan_snapshot_epoch_{epoch:04d}_step_{step:06d}.json"
+        filepath = self.debug_dir / filename
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+
+        print(f"[DEBUG] NaN investigation report saved to: {filepath}")
+        return filepath
+
+    def _analyze_gradient_heatmap(self) -> List[Dict[str, Any]]:
+        """分析每层的梯度范数（梯度热力图）"""
+        layers_data = []
+
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                grad = param.grad.detach()
+
+                has_nan = torch.isnan(grad).any().item()
+                has_inf = torch.isinf(grad).any().item()
+
+                # 计算梯度范数
+                grad_norm = grad.norm().item() if not has_nan and not has_inf else float('nan')
+
+                # 计算参数范围
+                param_min = param.detach().min().item()
+                param_max = param.detach().max().item()
+
+                layers_data.append({
+                    "layer_name": name,
+                    "grad_norm": grad_norm,
+                    "has_nan": has_nan,
+                    "has_inf": has_inf,
+                    "param_range": [param_min, param_max],
+                    "param_shape": list(param.shape),
+                    "param_numel": param.numel(),
+                })
+
+        # 按梯度范数排序（异常的在前）
+        layers_data.sort(key=lambda x: float('inf') if x["has_nan"] or x["has_inf"] else -x["grad_norm"])
+
+        return layers_data
+
+    def _find_first_nan_layer(self) -> Optional[Dict[str, Any]]:
+        """找到第一个出现 NaN 的层（反向传播顺序）"""
+        # PyTorch 反向传播是从输出到输入，所以后面的层先有梯度
+        # 我们按参数顺序找最后一个出现 NaN 的（接近 loss 的）
+        for name, param in reversed(list(self.model.named_parameters())):
+            if param.grad is not None and torch.isnan(param.grad).any():
+                grad = param.grad.detach()
+                return {
+                    "layer_name": name,
+                    "grad_norm": grad.norm().item(),
+                    "nan_count": torch.isnan(grad).sum().item(),
+                    "total_params": grad.numel(),
+                    "nan_ratio": torch.isnan(grad).sum().item() / grad.numel(),
+                }
+        return None
+
+    def _analyze_param_ranges(self) -> Dict[str, List[float]]:
+        """分析模型参数范围"""
+        ranges = {}
+        for name, param in self.model.named_parameters():
+            p = param.detach()
+            ranges[name] = [p.min().item(), p.max().item(), p.mean().item(), p.std().item()]
+        return ranges
+
+
+def dump_debug_info(
+    model: nn.Module,
+    epoch: int,
+    step: int,
+    loss_value: float,
+    pre_clip_grad_norm: float,
+    debug_dir: str = "experiments/debug",
+    input_stats: Optional[Dict[str, float]] = None,
+    splitter_logits_stats: Optional[Dict[str, float]] = None,
+    enabled: bool = True,
+) -> Optional[Path]:
+    """Dump debug info when NaN is detected (standalone function)
+
+    Args:
+        model: Model to analyze
+        epoch: Current epoch
+        step: Current step
+        loss_value: Loss value
+        pre_clip_grad_norm: Gradient norm before clipping
+        debug_dir: Directory to save debug info
+        input_stats: Input data statistics
+        splitter_logits_stats: Splitter logits statistics
+        enabled: Whether to actually dump
+
+    Returns:
+        Path to saved debug file, or None if disabled
+    """
+    if not enabled:
+        return None
+
+    investigator = NaNAutoInvestigation(model=model, debug_dir=debug_dir, enabled=True)
+    return investigator.investigate(
+        epoch=epoch,
+        step=step,
+        loss_value=loss_value,
+        pre_clip_grad_norm=pre_clip_grad_norm,
+        input_stats=input_stats,
+        splitter_logits_stats=splitter_logits_stats,
+    )
+
+
 __all__ = [
     "AnomalyDetectionContext",
     "GradientValidator",
     "NumericalDefender",
     "check_tensor_numerical_health",
+    "ActivationStatsCollector",
+    "NaNAutoInvestigation",
+    "dump_debug_info",
 ]

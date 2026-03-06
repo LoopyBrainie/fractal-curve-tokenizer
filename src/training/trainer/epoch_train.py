@@ -19,7 +19,7 @@ from .state import TrainingState, EpochMetrics
 from .loss import MixupCutmixLoss, compute_loss
 from ..monitor.gradient_monitor import GradientMonitor
 from ..monitor.loss_monitor import LossMonitor
-from ..monitor.numerical_defense import NumericalDefender
+from ..monitor.numerical_defense import NumericalDefender, NaNAutoInvestigation, dump_debug_info
 
 
 def train_one_epoch(
@@ -67,6 +67,16 @@ def train_one_epoch(
         skip_on_nan=config.numerical.skip_on_nan_grad,
     )
 
+    # I-NAN: 初始化 NaN 自动取证器
+    nan_investigator = NaNAutoInvestigation(
+        model=model,
+        debug_dir="experiments/debug",
+        enabled=True,  # 始终启用，用于捕获第一次 NaN
+    )
+
+    # 用于记录输入数据统计（用于调试）
+    _input_stats: Dict[str, float] = {}
+
     # Metrics accumulators
     total_loss = 0.0
     total_correct = 0
@@ -112,6 +122,16 @@ def train_one_epoch(
         else:
             images = batch.to(device, non_blocking=True)
             labels = None
+
+        # I-NAN: 记录输入数据统计（用于 NaN 调试）
+        _input_stats = {
+            "images_mean": float(images.mean().detach()),
+            "images_std": float(images.std().detach()),
+            "images_min": float(images.min().detach()),
+            "images_max": float(images.max().detach()),
+            "images_has_nan": bool(torch.isnan(images).any().detach()),
+            "images_has_inf": bool(torch.isinf(images).any().detach()),
+        }
 
         # Apply Mixup/Cutmix if enabled
         # FIX: 修复运算符优先级问题，需要用括号明确分组
@@ -226,6 +246,17 @@ def train_one_epoch(
             if current_memory_mb > peak_memory_mb:
                 peak_memory_mb = current_memory_mb
 
+        # I-NAN: 计算裁剪前的梯度范数（用于 NaN 调试）
+        pre_clip_grad_norm = 0.0
+        try:
+            pre_clip_grad_norm = sum(
+                p.grad.norm().item()
+                for p in model.parameters()
+                if p.grad is not None
+            ) or 0.0
+        except Exception:
+            pass
+
         # Numerical defense
         should_skip = defender.post_backward()
 
@@ -251,6 +282,32 @@ def train_one_epoch(
                 optimizer.step()
             optimizer.zero_grad()
         else:
+            # I-NAN: 检测到 NaN！触发自动取证
+            # 收集 Splitter logits 统计（如果有）
+            splitter_logits_stats: Dict[str, float] = {}
+            if hasattr(outputs, 'logits') and outputs.logits is not None:
+                lgt = outputs.logits.detach()
+                splitter_logits_stats = {
+                    "logits_mean": float(lgt.mean()),
+                    "logits_std": float(lgt.std()),
+                    "logits_min": float(lgt.min()),
+                    "logits_max": float(lgt.max()),
+                    "logits_has_nan": bool(torch.isnan(lgt).any()),
+                    "logits_has_inf": bool(torch.isinf(lgt).any()),
+                }
+
+            # 触发 NaN 自动取证
+            debug_path = nan_investigator.investigate(
+                epoch=state.epoch,
+                step=state.global_step,
+                loss_value=loss.item(),
+                pre_clip_grad_norm=pre_clip_grad_norm,
+                input_stats=_input_stats,
+                splitter_logits_stats=splitter_logits_stats,
+            )
+            if debug_path:
+                print(f"[CRITICAL] NaN detected! Debug info: {debug_path}")
+
             # Skip this step due to numerical issues
             # Still need to update scheduler even when skipping
             if scheduler is not None:
