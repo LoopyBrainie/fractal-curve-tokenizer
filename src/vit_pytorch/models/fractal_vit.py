@@ -1025,6 +1025,14 @@ class FractalCurveViT(nn.Module):
         """
         # CLS token: 使用较小的标准差
         nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+        # I-NAN: 为 cls_token 注册梯度 hook，捕获 backward 过程中产生的 NaN
+        if self.cls_token is not None and self.cls_token.requires_grad:
+            self.cls_token.register_hook(
+                lambda grad: torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
+                if torch.isnan(grad).any() or torch.isinf(grad).any() else grad
+            )
+
         
         # 分类头：使用 Xavier 初始化
         # I17 修复: 使用 xavier_uniform 替代固定 std 的 trunc_normal

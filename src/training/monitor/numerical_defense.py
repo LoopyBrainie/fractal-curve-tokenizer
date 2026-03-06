@@ -615,7 +615,8 @@ class NaNAutoInvestigation:
         ranges = {}
         for name, param in self.model.named_parameters():
             p = param.detach()
-            ranges[name] = [p.min().item(), p.max().item(), p.mean().item(), p.std().item()]
+            std_val = p.std().item() if p.numel() > 1 else 0.0
+            ranges[name] = [p.min().item(), p.max().item(), p.mean().item(), std_val]
         return ranges
 
 

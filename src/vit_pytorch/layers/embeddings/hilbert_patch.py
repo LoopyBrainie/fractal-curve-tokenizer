@@ -309,6 +309,18 @@ class HilbertNativePatchEmbed(nn.Module):
         # 层归一化 (可选，用于稳定训练)
         self.norm = nn.LayerNorm(dim)
 
+        # I-NAN: 为所有参数注册梯度 hook，捕获 backward 过程中产生的 NaN
+        # 解决 patch_embed 内部 backward 产生 NaN 的问题
+        self._nan_grad_hooks = []
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                hook = param.register_hook(
+                    lambda grad, n=name: torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
+                    if torch.isnan(grad).any() or torch.isinf(grad).any() else grad
+                )
+                self._nan_grad_hooks.append(hook)
+
+
     def _apply_depth_modulation(
         self,
         pooled_features: Tensor,
