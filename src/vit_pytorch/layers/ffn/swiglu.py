@@ -189,8 +189,9 @@ class AdaptiveFractalFeedForward(nn.Module):
         self.ffn_beta = nn.Embedding(max_level + 2, dim)
 
         # 初始化为恒等变换: γ=1, β=0
-        nn.init.ones_(self.ffn_gamma.weight)
-        nn.init.zeros_(self.ffn_beta.weight)
+        # I-NAN: 改为小值初始化，避免固定值阻断梯度
+        nn.init.normal_(self.ffn_gamma.weight, mean=0, std=0.01)
+        nn.init.normal_(self.ffn_beta.weight, mean=0, std=0.01)
         
         # ========== FFN 主网络 ==========
         if ffn_type in ('swiglu', 'swiglu_level'):
@@ -230,7 +231,10 @@ class AdaptiveFractalFeedForward(nn.Module):
             )
             # P1-1: 初始化为 0，使 sigmoid(0)=0.5 作为中性起点
             # 语义: α_d = σ(w_d)，50% main FFN + 50% level adapter
-            self.level_mixing_weights: Optional[nn.Parameter] = nn.Parameter(torch.zeros(max_level + 1))
+            # I-NAN: 改为小值初始化
+            self.level_mixing_weights: Optional[nn.Parameter] = nn.Parameter(
+                torch.randn(max_level + 1) * 0.01
+            )
         else:
             self.level_embedding = None
             self.shared_level_adapter = None

@@ -393,10 +393,12 @@ class BitFlippedPositionEncoder(nn.Module):
         nn.init.normal_(self.depth_embedding.weight, std=0.02)
         nn.init.normal_(self.quadrant_embedding.weight, std=0.02)
         # rotation_gate 零初始化: 初始不翻转
-        nn.init.zeros_(self.rotation_gate)
+        # I-NAN: 改为小值初始化，避免梯度不稳定
+        nn.init.normal_(self.rotation_gate, mean=0, std=0.01)
         # v5.1: depth_decay_scale 零初始化，Sigmoid(0) = 0.5
         # 即初始 gamma = 0.5，scale(d) = 0.5^d
-        nn.init.zeros_(self.depth_decay_scale)
+        # I-NAN: 改为小值初始化
+        nn.init.normal_(self.depth_decay_scale, mean=0, std=0.01)
 
     def _compute_quadrant_indices(self, paths: torch.Tensor) -> torch.Tensor:
         """从路径计算象限索引

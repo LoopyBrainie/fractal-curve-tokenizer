@@ -214,7 +214,8 @@ class FractalTransformerBlock(nn.Module):
         # - sigmoid 激活值域 [0, 1]，梯度始终为正
         # - 添加梯度比例监控确保邻域路径梯度 >= 40%
         self._residual_gate = nn.Embedding(max_level + 1, 1)
-        nn.init.zeros_(self._residual_gate.weight)
+        # I-NAN: 改为小值初始化，确保初始梯度流稳定
+        nn.init.normal_(self._residual_gate.weight, mean=0, std=0.01)
         
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 

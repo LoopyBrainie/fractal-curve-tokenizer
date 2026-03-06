@@ -238,7 +238,7 @@ class HilbertNativePatchEmbed(nn.Module):
         if depth_scale_range is not None:
             # 新版: 可学习 sigmoid 参数化
             # σ_d = σ_min + (σ_max - σ_min) · sigmoid(γ_d)
-            self._depth_scale_raw = nn.Parameter(torch.zeros(max_level + 1))
+            self._depth_scale_raw = nn.Parameter(torch.randn(max_level + 1) * 0.01)
             self._init_depth_scale_learnable()
         else:
             # 旧版: 固定线性初始化 (向后兼容)
