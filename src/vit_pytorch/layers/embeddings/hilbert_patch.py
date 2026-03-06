@@ -92,6 +92,54 @@ class SplitResult:
         pass
 
 
+class SafeSoftplus(torch.autograd.Function):
+    """自定义 softplus，在 backward 时主动检查和修复 NaN/Inf 梯度.
+
+    解决 nan_to_num 只保护 forward、不保护 vjp 的问题。
+    当上游梯度为 NaN/Inf 时，backward 计算可能产生级联 NaN。
+    """
+
+    @staticmethod
+    def forward(ctx, x: Tensor, eps: float = 1e-6) -> Tensor:
+        """Forward: y = softplus(x) + eps."""
+        ctx.save_for_backward(x)
+        ctx.eps = eps
+        return F.softplus(x) + eps
+
+    @staticmethod
+    def backward(ctx, *grad_outputs: Tensor) -> Tuple[Tensor, None]:
+        """Backward: 检测并修复 NaN/Inf 梯度.
+
+        Args:
+            grad_outputs: 上游传回的梯度元组
+
+        Returns:
+            修复后的输入梯度
+        """
+        grad_output = grad_outputs[0]
+        x, = ctx.saved_tensors
+        eps = ctx.eps
+
+        # 标准 softplus backward: grad = sigmoid(x) * grad_output
+        sigmoid_x = torch.sigmoid(x)
+        grad_input = grad_output * sigmoid_x
+
+        # I-NAN: 检测 NaN/Inf 并修复
+        has_nan = torch.isnan(grad_input).any()
+        has_inf = torch.isinf(grad_input).any()
+
+        if has_nan or has_inf:
+            # 用 sign-based 方法替换 NaN/Inf
+            grad_sign = torch.sign(grad_output)
+            grad_input = torch.where(
+                torch.isfinite(grad_input),
+                grad_input,
+                grad_sign * eps  # 用小值替换
+            )
+
+        return grad_input, None
+
+
 class HilbertNativePatchEmbed(nn.Module):
     """Hilbert-Native 变深度 Patch Embedding.
 
@@ -324,9 +372,9 @@ class HilbertNativePatchEmbed(nn.Module):
             assert self.depth_scale_range is not None
             sigma_min, sigma_max = self.depth_scale_range
 
-            # 使用 softplus 确保梯度平滑：softplus(x) = log(1 + exp(x))
-            # 添加 1e-6 基础值确保始终为正
-            scale = F.softplus(self._depth_scale_raw) + 1e-6
+            # I-NAN: 使用 SafeSoftplus 在 backward 时检测和修复 NaN/Inf 梯度
+            # 注意：SafeSoftplus 内部已经加了 eps
+            scale = SafeSoftplus.apply(self._depth_scale_raw, 1e-6)
 
             # 裁剪到有效范围
             scale = scale.clamp_(min=sigma_min, max=sigma_max)
@@ -735,6 +783,14 @@ class HilbertNativePatchEmbed(nn.Module):
         
         # 8. 层归一化
         tokens = self.norm(tokens)
+
+        # I-NAN: 注册梯度 hook，捕获从 Transformer 传回的 NaN/Inf
+        # 这是最后一道防线，确保任何 backward 过程中的 NaN 都被修复
+        def safe_grad(grad):
+            if torch.isnan(grad).any() or torch.isinf(grad).any():
+                return torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
+            return grad
+        tokens.register_hook(safe_grad)
         
         return tokens, levels_info
 
