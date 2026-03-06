@@ -170,8 +170,6 @@ def create_model(args, device: torch.device) -> nn.Module:
         'pool': getattr(args, 'pool', 'weighted'),
 
         # Tokenizer config
-        'token_coverage_min': getattr(args, 'token_coverage_min', 0.01),
-        'token_coverage_max': getattr(args, 'token_coverage_max', None),
         'target_ratio': getattr(args, 'target_ratio', 0.5),
 
         # Splitter config
@@ -519,6 +517,7 @@ def train(
             device=device,
             scheduler=scheduler,
             mixup_cutmix=mixup_cutmix,
+            debug_dir=str(output_dir / "debug"),
         )
 
         # Reset monitors

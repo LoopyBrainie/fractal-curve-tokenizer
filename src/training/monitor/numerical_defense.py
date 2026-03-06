@@ -401,6 +401,9 @@ class NaNAutoInvestigation:
         pre_clip_grad_norm: float,
         input_stats: Optional[Dict[str, float]] = None,
         splitter_logits_stats: Optional[Dict[str, float]] = None,
+        amp_loss_scale: Optional[float] = None,
+        learning_rate: Optional[float] = None,
+        loss_components: Optional[Dict[str, float]] = None,
     ) -> Optional[Path]:
         """执行 NaN 调查并保存调试信息
 
@@ -411,6 +414,9 @@ class NaNAutoInvestigation:
             pre_clip_grad_norm: 裁剪前的梯度范数
             input_stats: 输入数据统计（可选）
             splitter_logits_stats: Splitter logits 统计（可选）
+            amp_loss_scale: AMP 损失缩放因子（可选）
+            learning_rate: 学习率（可选）
+            loss_components: 损失分量统计（可选）
 
         Returns:
             保存的调试文件路径
@@ -429,7 +435,19 @@ class NaNAutoInvestigation:
             },
             "input_data_summary": input_stats or {},
             "splitter_logits_stats": splitter_logits_stats or {},
+            "training_env": {
+                "amp_loss_scale": amp_loss_scale,
+                "learning_rate": learning_rate,
+            },
+            "loss_components": loss_components or {},
         }
+
+        # 自动诊断结论
+        report["diagnosis"] = self._diagnose_nan(
+            input_stats=input_stats,
+            splitter_logits_stats=splitter_logits_stats,
+            loss_components=loss_components,
+        )
 
         # A. 梯度热力图分析
         report["gradient_heatmap"] = self._analyze_gradient_heatmap()
@@ -504,6 +522,65 @@ class NaNAutoInvestigation:
                 }
         return None
 
+    def _diagnose_nan(
+        self,
+        input_stats: Optional[Dict[str, float]] = None,
+        splitter_logits_stats: Optional[Dict[str, float]] = None,
+        loss_components: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        """自动诊断 NaN 根因
+        
+        诊断规则:
+        | 记录项        | 如果发现...           | 结论                        |
+        |---------------|----------------------|----------------------------|
+        | Input Data    | has_nan: true       | 数据清洗有问题              |
+        | Splitter      | max > 100            | Entmax 溢出                |
+        | Grad Norm     | 某层突然大 100 倍     | 该层初始化/学习率问题      |
+        | Pre-clip Norm | NaN 但 Input 正常    | 梯度爆炸，需调低 LR        |
+        """
+        diagnosis = []
+        root_cause = "unknown"
+
+        # 规则 1: 输入数据问题
+        if input_stats and input_stats.get("images_has_nan"):
+            diagnosis.append("[R1] INPUT_NAN: 输入数据包含 NaN，可能是数据清洗问题或坏图")
+            root_cause = "input_data"
+
+        # 规则 2: Splitter Logits 溢出
+        if splitter_logits_stats:
+            max_logit = splitter_logits_stats.get("logits_max", 0)
+            min_logit = splitter_logits_stats.get("logits_min", 0)
+            if max_logit > 100:
+                diagnosis.append(f"[R2a] SPLITTER_OVERFLOW: Logits max={max_logit:.2f} > 100，Entmax 溢出")
+                root_cause = "splitter_overflow"
+            if min_logit < -100:
+                diagnosis.append(f"[R2b] SPLITTER_UNDERFLOW: Logits min={min_logit:.2f} < -100")
+                if root_cause == "unknown":
+                    root_cause = "splitter_overflow"
+            if splitter_logits_stats.get("logits_has_nan"):
+                diagnosis.append("[R2c] SPLITTER_NAN: Splitter 输出包含 NaN")
+                root_cause = "splitter_nan"
+            if splitter_logits_stats.get("logits_has_inf"):
+                diagnosis.append("[R2d] SPLITTER_INF: Splitter 输出包含 Inf")
+                root_cause = "splitter_inf"
+
+        # 规则 3: 损失项爆炸
+        if loss_components:
+            for name, value in loss_components.items():
+                if name != "total" and abs(value) > 1e6:
+                    diagnosis.append(f"[R3] LOSS_EXPLODE: {name}={value:.2e} 异常大")
+                    root_cause = "loss_explode"
+
+        # 规则 4: 默认诊断（输入正常但梯度 NaN）
+        if root_cause == "unknown":
+            diagnosis.append("[R4] GRAD_EXPLODE: 输入正常但梯度 NaN，可能是学习率过高或梯度裁剪不足")
+            root_cause = "grad_explode"
+
+        return {
+            "diagnosis": diagnosis,
+            "root_cause": root_cause,
+        }
+
     def _analyze_param_ranges(self) -> Dict[str, List[float]]:
         """分析模型参数范围"""
         ranges = {}
@@ -522,6 +599,9 @@ def dump_debug_info(
     debug_dir: str = "experiments/debug",
     input_stats: Optional[Dict[str, float]] = None,
     splitter_logits_stats: Optional[Dict[str, float]] = None,
+    amp_loss_scale: Optional[float] = None,
+    learning_rate: Optional[float] = None,
+    loss_components: Optional[Dict[str, float]] = None,
     enabled: bool = True,
 ) -> Optional[Path]:
     """Dump debug info when NaN is detected (standalone function)
@@ -551,6 +631,9 @@ def dump_debug_info(
         pre_clip_grad_norm=pre_clip_grad_norm,
         input_stats=input_stats,
         splitter_logits_stats=splitter_logits_stats,
+        amp_loss_scale=amp_loss_scale,
+        learning_rate=learning_rate,
+        loss_components=loss_components,
     )
 
 

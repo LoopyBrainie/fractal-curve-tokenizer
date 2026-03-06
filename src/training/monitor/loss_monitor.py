@@ -83,6 +83,16 @@ class LossMonitor:
                 self.losses[name] = []
             self.losses[name].append(value)
 
+    def get_last_components(self) -> Dict[str, float]:
+        """Get the most recent loss components
+
+        Returns:
+            Dictionary of loss name -> most recent loss value, or empty dict if no data
+        """
+        if self.step_losses:
+            return self.step_losses[-1].copy()
+        return {}
+
     def get_average_components(self) -> Dict[str, float]:
         """Get average of each loss component
 

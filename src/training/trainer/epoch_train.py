@@ -11,7 +11,8 @@ from typing import Optional, Dict, Any
 import time
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast as amp_autocast
+from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 
 from ..config import Config
@@ -32,6 +33,7 @@ def train_one_epoch(
     device: torch.device,
     scheduler: Optional[Any] = None,
     mixup_cutmix: Optional[MixupCutmixLoss] = None,
+    debug_dir: Optional[str] = None,
 ) -> EpochMetrics:
     """Train for one epoch
 
@@ -68,9 +70,11 @@ def train_one_epoch(
     )
 
     # I-NAN: 初始化 NaN 自动取证器
+    # debug_dir 默认为实验目录下的 debug 子目录
+    _debug_dir = debug_dir if debug_dir else "experiments/debug"
     nan_investigator = NaNAutoInvestigation(
         model=model,
-        debug_dir="experiments/debug",
+        debug_dir=_debug_dir,
         enabled=True,  # 始终启用，用于捕获第一次 NaN
     )
 
@@ -146,7 +150,7 @@ def train_one_epoch(
             targets = torch.nn.functional.one_hot(labels, model.num_classes).float() if labels is not None else None
 
         # Forward pass with AMP
-        with autocast(enabled=config.amp.enabled):
+        with amp_autocast('cuda', enabled=config.amp.enabled):
             outputs = model(images)
 
             # Handle TrainingStats from Fractal ViT
@@ -296,6 +300,13 @@ def train_one_epoch(
                     "logits_has_inf": bool(torch.isinf(lgt).any()),
                 }
 
+            # 获取训练环境信息
+            current_lr = optimizer.param_groups[0]["lr"]
+            amp_loss_scale = float(scaler.get_scale()) if scaler is not None else None
+
+            # 获取 Loss Components
+            current_loss_components = loss_monitor.get_last_components() if hasattr(loss_monitor, 'get_last_components') else {}
+
             # 触发 NaN 自动取证
             debug_path = nan_investigator.investigate(
                 epoch=state.epoch,
@@ -304,6 +315,9 @@ def train_one_epoch(
                 pre_clip_grad_norm=pre_clip_grad_norm,
                 input_stats=_input_stats,
                 splitter_logits_stats=splitter_logits_stats,
+                amp_loss_scale=amp_loss_scale,
+                learning_rate=current_lr,
+                loss_components=current_loss_components,
             )
             if debug_path:
                 print(f"[CRITICAL] NaN detected! Debug info: {debug_path}")
