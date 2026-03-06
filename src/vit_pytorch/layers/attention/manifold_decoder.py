@@ -130,6 +130,9 @@ def poincare_distance(
 
     distance = torch.acosh(x)
 
+    # I-NAN: 裁剪输出距离，防止梯度爆炸
+    distance = distance.clamp(max=10.0)
+
     if was_2d:
         distance = distance.squeeze(0)
 

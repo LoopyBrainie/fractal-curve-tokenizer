@@ -298,32 +298,36 @@ class HilbertNativePatchEmbed(nn.Module):
         return modulated
 
     def _init_depth_scale_learnable(self) -> None:
-        """初始化可学习深度缩放因子 (P6-1 改进).
+        """初始化可学习深度缩放因子，防止极端值 (P6-1 改进).
         
         数学形式化:
             σ_d = σ_min + (σ_max - σ_min) · sigmoid(γ_d)
             
         初始化策略:
-            保持与旧版语义一致 (1.0 → 1.0+β)，但允许学习到 [σ_min, σ_max]
+            使用安全的中间值初始化，避免极端 sigmoid 值
             
         计算:
-            目标 σ_d = 1.0 + β·d/D_max
-            sigmoid(γ_d) = (σ_d - σ_min) / (σ_max - σ_min)
-            γ_d = logit(sigmoid_target)
+            目标 σ_d = (σ_min + σ_max) / 2.0 (中点)
+            sigmoid(γ_d) = 0.5 (安全范围)
+            γ_d = logit(0.5) = 0
         """
         assert self.depth_scale_range is not None
         sigma_min, sigma_max = self.depth_scale_range
         
         with torch.no_grad():
             for d in range(self.max_level + 1):
-                # 目标值: 与旧版初始化一致
-                target_sigma = 1.0 + self.depth_scale_beta * d / self.max_level
-                # 裁剪到有效范围
-                target_sigma = max(sigma_min + 0.01, min(sigma_max - 0.01, target_sigma))
-                # 计算 sigmoid 目标值
+                # I-NAN: 使用更安全的初始化策略
+                # 目标值从中间值开始，避免极端 sigmoid 值
+                # sigmoid_target = 0.5 对应 raw = 0
+                target_sigma = (sigma_min + sigma_max) / 2.0  # 使用中点而非线性
+
+                # 限制 sigmoid_target 在安全范围
                 sigmoid_target = (target_sigma - sigma_min) / (sigma_max - sigma_min)
-                # 计算 logit (sigmoid 逆函数)
-                self._depth_scale_raw[d] = math.log(sigmoid_target / (1 - sigmoid_target))
+                sigmoid_target = max(0.1, min(0.9, sigmoid_target))  # 防止饱和
+
+                # I-NAN: 裁剪初始 raw 值到安全范围
+                raw_value = math.log(sigmoid_target / (1 - sigmoid_target))
+                self._depth_scale_raw[d] = max(-5.0, min(5.0, raw_value))
     
     def _init_depth_scale_legacy(self) -> None:
         """旧版初始化 (向后兼容).
@@ -337,7 +341,7 @@ class HilbertNativePatchEmbed(nn.Module):
     
     @property
     def depth_scale(self) -> torch.Tensor:
-        """获取深度缩放因子.
+        """获取深度缩放因子，带梯度裁剪保护.
 
         P6-1 改进: 使用 sigmoid 参数化确保值在 [σ_min, sigma_max] 范围内
 
@@ -348,7 +352,15 @@ class HilbertNativePatchEmbed(nn.Module):
             # 新版: sigmoid 参数化
             assert self.depth_scale_range is not None
             sigma_min, sigma_max = self.depth_scale_range
-            return sigma_min + (sigma_max - sigma_min) * torch.sigmoid(self._depth_scale_raw)
+
+            # I-NAN: 裁剪 raw 参数值到安全范围，防止 sigmoid 饱和
+            raw_clamped = self._depth_scale_raw.clamp(-10.0, 10.0)
+
+            # 计算 scale
+            scale = sigma_min + (sigma_max - sigma_min) * torch.sigmoid(raw_clamped)
+
+            # I-NAN: 再次 clamp 确保在有效范围内
+            return scale.clamp(sigma_min + 1e-6, sigma_max - 1e-6)
         else:
             # 旧版: 直接返回固定参数
             return self._depth_scale_fixed

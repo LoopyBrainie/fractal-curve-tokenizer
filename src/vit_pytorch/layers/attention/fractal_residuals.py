@@ -30,14 +30,15 @@ from typing import Optional, Tuple
 
 class ParentTokenLookup(nn.Module):
     """
-    父节点索引查找表。
+    父节点索引查找表（带数值安全保护）。
 
     从 levels_info 提取父节点索引，实现 O(1) 查找。
     """
 
-    def __init__(self, max_level: int = 8):
+    def __init__(self, max_level: int = 8, eps: float = 1e-6):
         super().__init__()
         self.max_level = max_level
+        self.eps = eps  # I-NAN: 新增
 
     def forward(
         self,
@@ -95,8 +96,9 @@ class ParentTokenLookup(nn.Module):
             # 广播计算距离: [B, num_current, num_parents]
             dist = torch.abs(h_current.unsqueeze(2) - h_parents.unsqueeze(1))
 
-            # 找到最近父节点: [B, num_current]
-            nearest = dist.argmin(dim=2)
+            # I-NAN: 添加 eps 防止 argmin 不稳定
+            dist_safe = dist + self.eps
+            nearest = dist_safe.argmin(dim=2)
 
             # 更新父节点索引 (克隆避免警告)
             parent_indices_clone = parent_indices.clone()
