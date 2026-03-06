@@ -234,12 +234,14 @@ class HilbertNativePatchEmbed(nn.Module):
         nn.init.normal_(self.depth_embed.weight, mean=0.0, std=0.02)
         
         # 深度缩放: 乘法因子，编码 region 的「信息密度」
-        # P6-1 改进: 使用 sigmoid 参数化，扩展动态范围到 4x
+        # P6-1 改进: 使用 softplus 参数化（替代 sigmoid），避免梯度饱和
         if depth_scale_range is not None:
-            # 新版: 可学习 sigmoid 参数化
-            # σ_d = σ_min + (σ_max - σ_min) · sigmoid(γ_d)
-            self._depth_scale_raw = nn.Parameter(torch.randn(max_level + 1) * 0.01)
-            self._init_depth_scale_learnable()
+            # 新版: 可学习 softplus 参数化
+            # σ_d = σ_min + (σ_max - σ_min) · softplus(γ_d) / (1 + softplus(0))
+            # 使用 uniform 初始化确保非零值（避免 randn * 0.01 可能产生的接近 0 问题）
+            self._depth_scale_raw = nn.Parameter(
+                torch.empty(max_level + 1).uniform_(0.3, 0.7)
+            )
         else:
             # 旧版: 固定线性初始化 (向后兼容)
             self._depth_scale_raw = None
@@ -297,38 +299,6 @@ class HilbertNativePatchEmbed(nn.Module):
 
         return modulated
 
-    def _init_depth_scale_learnable(self) -> None:
-        """初始化可学习深度缩放因子，防止极端值 (P6-1 改进).
-        
-        数学形式化:
-            σ_d = σ_min + (σ_max - σ_min) · sigmoid(γ_d)
-            
-        初始化策略:
-            使用安全的中间值初始化，避免极端 sigmoid 值
-            
-        计算:
-            目标 σ_d = (σ_min + σ_max) / 2.0 (中点)
-            sigmoid(γ_d) = 0.5 (安全范围)
-            γ_d = logit(0.5) = 0
-        """
-        assert self.depth_scale_range is not None
-        sigma_min, sigma_max = self.depth_scale_range
-        
-        with torch.no_grad():
-            for d in range(self.max_level + 1):
-                # I-NAN: 使用更安全的初始化策略
-                # 目标值从中间值开始，避免极端 sigmoid 值
-                # sigmoid_target = 0.5 对应 raw = 0
-                target_sigma = (sigma_min + sigma_max) / 2.0  # 使用中点而非线性
-
-                # 限制 sigmoid_target 在安全范围
-                sigmoid_target = (target_sigma - sigma_min) / (sigma_max - sigma_min)
-                sigmoid_target = max(0.1, min(0.9, sigmoid_target))  # 防止饱和
-
-                # I-NAN: 裁剪初始 raw 值到安全范围
-                raw_value = math.log(sigmoid_target / (1 - sigmoid_target))
-                self._depth_scale_raw[d] = max(-5.0, min(5.0, raw_value))
-    
     def _init_depth_scale_legacy(self) -> None:
         """旧版初始化 (向后兼容).
         
@@ -343,26 +313,23 @@ class HilbertNativePatchEmbed(nn.Module):
     def depth_scale(self) -> torch.Tensor:
         """获取深度缩放因子，带数值安全保护.
 
-        P6-1 改进: 使用 sigmoid 参数化确保值在 [σ_min, sigma_max] 范围内
+        使用 softplus 参数化替代 sigmoid，避免梯度饱和问题：
+        - softplus(x) = log(1 + exp(x)) 总是正值且梯度平滑
+        - 不会像 sigmoid 在极端值时梯度接近 0
 
         Returns:
             shape: (max_level + 1,) 的缩放因子张量
         """
         if self._depth_scale_raw is not None:
-            # 新版: sigmoid 参数化
             assert self.depth_scale_range is not None
             sigma_min, sigma_max = self.depth_scale_range
 
-            # I-NAN: 裁剪 raw 参数值到安全范围，防止 sigmoid 饱和
-            # 注意：不使用 .clamp() 以避免梯度断裂，使用 tensor 索引代替
-            raw_clamped = self._depth_scale_raw.clamp(-10.0, 10.0)
+            # 使用 softplus 确保梯度平滑：softplus(x) = log(1 + exp(x))
+            # 添加 1e-6 基础值确保始终为正
+            scale = F.softplus(self._depth_scale_raw) + 1e-6
 
-            # 计算 scale: σ = σ_min + (σ_max - σ_min) * sigmoid(raw)
-            scale = sigma_min + (sigma_max - sigma_min) * torch.sigmoid(raw_clamped)
-
-            # I-NAN: 使用 clamp_ 原地操作，保留梯度，但确保值在有效范围内
-            # 注意：clamp_ 是原地操作，不会创建新张量
-            scale = scale.clamp_(min=sigma_min + 1e-6, max=sigma_max - 1e-6)
+            # 裁剪到有效范围
+            scale = scale.clamp_(min=sigma_min, max=sigma_max)
 
             return scale
         else:
@@ -747,10 +714,13 @@ class HilbertNativePatchEmbed(nn.Module):
         # I-NAN: clamp depths_tensor 防止 padding (-1) 导致索引越界
         depths_safe = depths_tensor.clamp(min=0, max=self.max_level)
         scales = self.depth_scale[depths_safe]  # [N_total]
+        # I-NAN: 添加 eps 保护，防止除零和极端梯度
+        eps = 1e-6
+        scales = scales + eps  # 确保 scale 不为 0
         embeds = self.depth_embed(depths_safe)  # [N_total, D]
-        # I-NAN: 对 pooled 和 scales 添加数值安全保护，防止乘法产生极端值
+        # 使用 nan_to_num 确保数值安全
         pooled_safe = pooled * scales.unsqueeze(-1)
-        pooled_safe = pooled_safe.clamp(min=-100.0, max=100.0)
+        pooled_safe = torch.nan_to_num(pooled_safe, nan=0.0, posinf=100.0, neginf=-100.0)
         all_tokens = pooled_safe + embeds  # [N_total, D]
         
         # 7. 分配到输出 buffer

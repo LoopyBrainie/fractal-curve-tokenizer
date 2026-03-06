@@ -1192,6 +1192,8 @@ class FractalCurveViT(nn.Module):
         geometry_emb_with_cls = torch.cat([cls_geometry, geometry_emb], dim=1)  # [B, N+1, D]
 
         x = torch.cat((cls_tokens, x), dim=1)
+        # I-NAN: 添加数值安全保护，防止反向传播时梯度出现 NaN
+        x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
 
         # I98-4: 构造包含 CLS 的 LevelsInfo
         cls_level = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
