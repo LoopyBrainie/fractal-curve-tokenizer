@@ -20,7 +20,7 @@ Manifold-Native 多尺度注意力 (ManifoldNativeAttention)
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -170,6 +170,10 @@ class ManifoldNativeAttention(nn.Module):
         # 计算注意力分数
         attn = (q @ k.transpose(-2, -1)) * self.scale
 
+        # I171: 初始化流形张量用于返回
+        manifold_bias = None
+        poincare_distances = None
+
         # 如果启用了新模块，使用几何解码器
         # 只有当 hilbert_indices 可用时才计算几何特征
         if self.use_banded and hilbert_indices is not None and depths is not None:
@@ -212,11 +216,14 @@ class ManifoldNativeAttention(nn.Module):
                     image_size=img_size_tuple,
                 )
 
+                # I171: 存储 Poincaré 距离 (geo_features[..., 2] 是 d_H)
+                poincare_distances = geo_features[..., 2]  # [B, N, N]
+
                 # 解码为偏置
-                bias = self.geo_decoder(geo_features)  # [B, H, N, N]
+                manifold_bias = self.geo_decoder(geo_features)  # [B, H, N, N]
 
                 # 应用偏置
-                attn = attn + bias
+                attn = attn + manifold_bias
 
         # 使用 Hilbert 带宽注意力
         if self.use_banded and depths is not None and hilbert_indices is not None:
@@ -253,7 +260,8 @@ class ManifoldNativeAttention(nn.Module):
         out = self.proj(out)
         out = self.proj_dropout(out)
 
-        return out
+        # I171: 返回输出 + 流形张量
+        return out, manifold_bias, poincare_distances
 
     def extra_repr(self) -> str:
         return (

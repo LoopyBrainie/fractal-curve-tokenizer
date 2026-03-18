@@ -62,7 +62,7 @@ FractalTransformer (L 层):
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -79,21 +79,47 @@ from vit_pytorch.core.levels_info import LevelsInfo  # I98-4
 
 
 class DropPath(nn.Module):
-    """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks)."""
+    r"""
+    Drop paths (Stochastic Depth) per sample when applied in main path of residual blocks.
+
+    During training, randomly drops entire residual branches to improve generalization.
+    During inference, returns identity (no dropping) for deterministic behavior.
+
+    See `Deep Networks with Stochastic Depth <https://arxiv.org/abs/1603.09382>`_ for details.
+
+    .. note::
+        This is also known as "Stochastic Depth" and is a regularization technique
+        that helps train deeper networks by reducing vanishing gradient problems.
+    """
 
     def __init__(self, drop_prob: float = 0.0, scale_by_keep: bool = True):
+        r"""
+        Args:
+            drop_prob (float): Drop probability for stochastic depth. Default: ``0.0``
+            scale_by_keep (bool): Whether to scale the remaining paths by ``1 / (1 - drop_prob)``.
+                Default: ``True``
+        """
         super(DropPath, self).__init__()
         self.drop_prob = drop_prob
         self.scale_by_keep = scale_by_keep
 
-    def forward(self, x):
-        """前向传播，应用随机路径丢弃。
-        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        r"""
+        Applies stochastic depth to the input tensor.
+
         Args:
-            x: 输入张量。
-            
+            x (Tensor): Input tensor of any shape
+
         Returns:
-            经过 DropPath 处理后的张量。
+            Tensor: Output tensor of same shape as input, with paths randomly dropped during training
+
+        Examples::
+
+            >>> drop_path = DropPath(drop_prob=0.2)
+            >>> x = torch.randn(2, 4, 64)  # [batch, seq, dim]
+            >>> output = drop_path(x)
+            >>> output.shape
+            torch.Size([2, 4, 64])
         """
         if self.drop_prob == 0.0 or not self.training:
             return x
@@ -106,33 +132,42 @@ class DropPath(nn.Module):
 
 
 class FractalTransformerBlock(nn.Module):
-    """Hierarchically aware transformer block extracted for reuse (I98-3: 协议驱动配置化).
+    r"""
+    Hierarchically aware transformer block with Hilbert-aware attention.
 
-    This block combines Hilbert-aware attention with adaptive feed-forward,
+    This block combines Hilbert-aware attention with adaptive feed-forward networks,
     using level-dependent normalization for depth-aware processing.
 
-    P11-2 修复: 参数 max_level 现在应传入与 tokenizer.max_level 一致的值，
-    而非硬编码的 50。这确保 Embedding 表大小与实际使用的深度范围匹配，
-    减少约 90% 的参数浪费。
+    Architecture (I106-2 Scheme D):
+        x' = x + DropPath(Attention(LN(x), L))
+        x'' = x' + DropPath(FFN_d(x', L))
 
-    P11-8 简化: 移除 hilbert_bias_mode 和 low_rank_r 参数，仅保留 LCA 模式。
+    Where:
+        - Attention: :class:`~vit_pytorch.layers.attention.hilbert_bias.HilbertAwareMultiScaleAttention`
+        - FFN: :class:`~vit_pytorch.layers.ffn.swiglu.AdaptiveFractalFeedForward`
+        - L: levels_info for hierarchical information
 
-    I98-3: 新增 encoder_config 参数，支持协议驱动的编码器配置。
+    .. note::
+        Parameter ``max_level`` should match ``tokenizer.max_level`` to ensure
+        embedding table size matches the actual depth range used.
 
     Args:
-        dim: Input/output dimension.
-        heads: Number of attention heads.
-        dim_head: Dimension per head.
-        mlp_dim: Feed-forward hidden dimension.
-        dropout: Dropout rate.
-        max_level: Maximum hierarchical level (P11-2: should match tokenizer.max_level).
-        drop_path: DropPath rate for stochastic depth.
-        ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
-        use_affine_modulation: (向后兼容) 是否使用仿射调制偏置。
-        fourier_levels: (向后兼容) 傅里叶频率级别数。
-        encoder_config: (I98-3) AttentionEncoderConfig，协议驱动配置。
-
-    I122-2: 移除 lca_temperature，由 hilbert_bias_scale × √d_k 统一缩放
+        dim (int): Input/output dimension
+        heads (int): Number of attention heads
+        dim_head (int): Dimension per head
+        mlp_dim (int): Feed-forward hidden dimension
+        dropout (float): Dropout rate. Default: ``0.0``
+        max_level (int): Maximum hierarchical level. Default: ``8``
+        drop_path (float): DropPath rate for stochastic depth. Default: ``0.0``
+        ffn_type (FFNType): FFN variant. Options: ``'gelu'``, ``'swiglu'``, ``'swiglu_level'``.
+            Default: ``'swiglu_level'``
+        use_affine_modulation (bool): Whether to use affine modulation bias. Default: ``True``
+        fourier_levels (int): Number of Fourier frequency levels. Default: ``4``
+        encoder_config (AttentionEncoderConfig, optional): Protocol-driven encoder configuration.
+            Default: ``None``
+        use_fp16 (bool): Use FP16 for LCA embeddings. Default: ``False``
+        use_manifold_native (bool): Use Manifold-Native attention. Default: ``False``
+        manifold_beta (float): Hilbert bandwidth coefficient. Default: ``4.0``
     """
 
     def __init__(
@@ -152,6 +187,9 @@ class FractalTransformerBlock(nn.Module):
         use_manifold_native: bool = False,  # 新: 使用 Manifold-Native 注意力
         manifold_beta: float = 4.0,  # 新: Hilbert 带宽系数
     ):
+        r"""
+        See class docstring for parameters.
+        """
         super().__init__()
         self.dim = dim
         self.max_level = max_level
@@ -232,22 +270,33 @@ class FractalTransformerBlock(nn.Module):
         regions: Optional[torch.Tensor] = None,
         image_size: Optional[int] = None,
         geometry_emb: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """前向传播。
-
-        I98-4: levels_info 参数类型从 torch.Tensor 改为 LevelsInfo
-        v5.0: 新增 geometry_emb 参数，用于 Attention 注入
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""
+        Forward pass of the fractal transformer block.
 
         Args:
-            x: 输入张量，形状为 [B, S, D]。
-            levels_info: LevelsInfo 实例（可选）。
-            attention_mask: 注意力掩码（可选）。
-            regions: 区域边界张量，形状为 [B, N, 4]，格式 [x1, y1, x2, y2]。
-            image_size: 图像边长，与 regions 配合使用。
-            geometry_emb: 几何嵌入 (可选)，形状为 [B, S, D]，用于 Attention 注入
+            x (Tensor): Input tensor of shape :math:`(B, S, D)`
+            levels_info (LevelsInfo, optional): Hierarchical level information. Default: ``None``
+            attention_mask (Tensor, optional): Attention mask. Default: ``None``
+            regions (Tensor, optional): Region boundary tensor of shape :math:`(B, N, 4)`
+                with format :math:`[x_1, y_1, x_2, y_2]`. Default: ``None``
+            image_size (int, optional): Image side length, used with ``regions``. Default: ``None``
+            geometry_emb (Tensor, optional): Geometry embedding of shape :math:`(B, S, D)`
+                for attention injection. Default: ``None``
 
         Returns:
-            输出张量，形状为 [B, S, D]。
+            Tuple[Tensor, Tensor, Tensor]: Tuple containing:
+                - Output tensor of shape :math:`(B, S, D)`
+                - Manifold bias tensor
+                - Poincaré distances tensor
+
+        Examples::
+
+            >>> block = FractalTransformerBlock(dim=256, heads=8, dim_head=32, mlp_dim=512)
+            >>> x = torch.randn(2, 64, 256)  # [batch, seq, dim]
+            >>> output, manifold, distances = block(x)
+            >>> output.shape
+            torch.Size([2, 64, 256])
         """
         # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
         if isinstance(levels_info, torch.Tensor):
@@ -282,7 +331,8 @@ class FractalTransformerBlock(nn.Module):
         # I106-2: 使用标准 LayerNorm (替代层级感知归一化)
         # Hilbert Bias 已处理不同深度 token 的尺度校准
         norm1_x = self.norm1(x)
-        attn_out = self.attention(
+        # I171: attention 现在返回 (output, manifold_bias, poincare_distances)
+        attn_out, manifold_bias, poincare_distances = self.attention(
             norm1_x,
             levels_info=levels_info,
             attention_mask=attention_mask,
@@ -299,41 +349,47 @@ class FractalTransformerBlock(nn.Module):
         ff_out = self.ff(x, levels_info)
         x = x + self.drop_path(ff_out * gate)
 
-        return x
+        # I171: 返回输出 + 流形张量
+        return x, manifold_bias, poincare_distances
 
 
 class FractalTransformer(nn.Module):
-    """High-level transformer stack coordinating block execution (I98-3: 协议驱动配置化).
+    r"""
+    High-level transformer stack with fractal hierarchical processing.
 
-    This module stacks multiple FractalTransformerBlock layers,
-    adding global context attention and level aggregation for enhanced
-    hierarchical processing.
-
+    This module stacks multiple :class:`FractalTransformerBlock` layers,
+    adding level aggregation for enhanced hierarchical processing.
     Supports gradient checkpointing for memory-efficient training.
 
-    P11-2 修复: 参数 max_level 现在应传入与 tokenizer.max_level 一致的值，
-    而非硬编码的 50。这确保所有子模块的 Embedding 表大小与实际使用的深度范围匹配。
+    Architecture:
+        - Stacks ``depth`` fractal transformer blocks
+        - Uses stochastic depth (DropPath) for regularization
+        - Applies level-aware feature aggregation (ARCH-R2)
+        - Returns manifold bias and Poincaré distances for analysis
 
-    P11-8 简化: 移除 hilbert_bias_mode 和 low_rank_r 参数，仅保留 LCA 模式。
-
-    I98-3: 新增 encoder_config 参数，支持协议驱动的编码器配置。
-
-    I122-2: 移除 lca_temperature，由 hilbert_bias_scale × √d_k 统一缩放
+    .. note::
+        Parameter ``max_level`` should match ``tokenizer.max_level`` to ensure
+        all sub-modules' embedding table sizes match the actual depth range.
 
     Args:
-        dim: Input/output dimension.
-        num_layers: Number of transformer blocks.
-        heads: Number of attention heads.
-        dim_head: Dimension per head.
-        mlp_dim: Feed-forward hidden dimension.
-        dropout: Dropout rate.
-        max_level: Maximum hierarchical level (P11-2: should match tokenizer.max_level).
-        drop_path_rate: Maximum DropPath rate (linearly increased).
-        ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
-        use_checkpoint: Whether to use gradient checkpointing (saves memory).
-        use_affine_modulation: (向后兼容) 是否使用仿射调制偏置。
-        fourier_levels: (向后兼容) 傅里叶频率级别数。
-        encoder_config: (I98-3) AttentionEncoderConfig，协议驱动配置。
+        dim (int): Input/output dimension
+        depth (int): Number of transformer blocks
+        heads (int): Number of attention heads
+        dim_head (int): Dimension per head
+        mlp_dim (int): Feed-forward hidden dimension
+        dropout (float): Dropout rate. Default: ``0.0``
+        max_level (int): Maximum hierarchical level. Default: ``8``
+        drop_path_rate (float): Maximum DropPath rate (linearly increased). Default: ``0.1``
+        ffn_type (FFNType): FFN variant. Options: ``'gelu'``, ``'swiglu'``, ``'swiglu_level'``.
+            Default: ``'swiglu_level'``
+        use_checkpoint (bool): Use gradient checkpointing to save memory. Default: ``False``
+        use_affine_modulation (bool): Whether to use affine modulation bias. Default: ``True``
+        fourier_levels (int): Number of Fourier frequency levels. Default: ``4``
+        encoder_config (AttentionEncoderConfig, optional): Protocol-driven encoder configuration.
+            Default: ``None``
+        use_fp16 (bool): Use FP16 for LCA embeddings. Default: ``False``
+        use_manifold_native (bool): Use Manifold-Native attention. Default: ``True``
+        manifold_beta (float): Hilbert bandwidth coefficient. Default: ``4.0``
     """
 
     def __init__(
@@ -431,24 +487,32 @@ class FractalTransformer(nn.Module):
         image_size: Optional[int] = None,
         geometry_emb: Optional[torch.Tensor] = None,
         return_extra_info: bool = False,
-    ) -> tuple[torch.Tensor, dict] | torch.Tensor:
-        """前向传播。
-
-        I98-4: levels_info 参数类型从 torch.Tensor 改为 LevelsInfo
-        v5.0: 新增 geometry_emb 参数，用于 Attention 注入
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, dict]:
+        r"""
+        Forward pass of the fractal transformer stack.
 
         Args:
-            x: 输入张量，形状为 [B, S, D]。
-            levels_info: LevelsInfo 实例（可选）。
-            attention_mask: 注意力掩码（可选）。
-            regions: 区域边界张量，形状为 [B, N, 4]，格式 [x1, y1, x2, y2]。
-            image_size: 图像边长，与 regions 配合使用。
-            geometry_emb: 几何嵌入 (可选)，形状为 [B, S, D]
-            return_extra_info: (I97-11) 是否返回额外信息。
+            x (Tensor): Input tensor of shape :math:`(B, S, D)`
+            levels_info (LevelsInfo, optional): Hierarchical level information. Default: ``None``
+            attention_mask (Tensor, optional): Attention mask. Default: ``None``
+            regions (Tensor, optional): Region boundary tensor of shape :math:`(B, N, 4)`
+                with format :math:`[x_1, y_1, x_2, y_2]`. Default: ``None``
+            image_size (int, optional): Image side length, used with ``regions``. Default: ``None``
+            geometry_emb (Tensor, optional): Geometry embedding of shape :math:`(B, S, D)`.
+                Default: ``None``
+            return_extra_info (bool): Whether to return extra information. Default: ``False``
 
         Returns:
-            如果 return_extra_info=True: (output, extra_info)
-            否则: output
+            If ``return_extra_info=True``: Tuple of (output, extra_info_dict)
+            Otherwise: Tuple of (output, manifold_bias, poincare_distances)
+
+        Examples::
+
+            >>> transformer = FractalTransformer(dim=256, depth=12, heads=8, dim_head=32, mlp_dim=512)
+            >>> x = torch.randn(2, 64, 256)  # [batch, seq, dim]
+            >>> output, manifold, distances = transformer(x)
+            >>> output.shape
+            torch.Size([2, 64, 256])
         """
         # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
         if isinstance(levels_info, torch.Tensor):
@@ -467,6 +531,10 @@ class FractalTransformer(nn.Module):
         effective_depth = self.num_layers // 2
         extra_info = {'effective_depth': effective_depth}
 
+        # I171: 收集所有 block 的流形张量
+        all_manifold_biases = []
+        all_poincare_distances = []
+
         # 执行 transformer 层
         for i, layer in enumerate(self.layers):
             if i >= effective_depth:
@@ -481,7 +549,8 @@ class FractalTransformer(nn.Module):
                     use_reentrant=False
                 )
             else:
-                x = layer(
+                # I171: layer 现在返回 (x, manifold_bias, poincare_distances)
+                x, manifold_bias, poincare_distances = layer(
                     x,
                     levels_info=levels_info,
                     attention_mask=attention_mask,
@@ -489,6 +558,19 @@ class FractalTransformer(nn.Module):
                     image_size=image_size,
                     geometry_emb=geometry_emb,
                 )
+                # 收集流形张量
+                if manifold_bias is not None:
+                    all_manifold_biases.append(manifold_bias)
+                if poincare_distances is not None:
+                    all_poincare_distances.append(poincare_distances)
+
+        # I171: 聚合流形张量（取平均）
+        final_manifold_bias = None
+        final_poincare_distances = None
+        if all_manifold_biases:
+            final_manifold_bias = torch.stack(all_manifold_biases).mean(0)
+        if all_poincare_distances:
+            final_poincare_distances = torch.stack(all_poincare_distances).mean(0)
 
         # ARCH-R1: 删除了冗余的 global_context_attn 调用
         # HilbertAwareMultiScaleAttention 已经充分保留全局信息流
@@ -512,7 +594,9 @@ class FractalTransformer(nn.Module):
 
         x = self.final_norm(x)
 
+        # I171: 返回输出 + 流形张量
         # I97-11: 返回额外信息
         if return_extra_info:
             return x, extra_info
-        return x
+        # 返回三元组 (output, manifold_bias, poincare_distances)
+        return x, final_manifold_bias, final_poincare_distances

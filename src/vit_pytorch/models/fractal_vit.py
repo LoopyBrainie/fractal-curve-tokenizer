@@ -213,6 +213,16 @@ class TrainingStats:
     # I150-3 NEW: Splitter Logits 统计 Hook
     mean_abs_logits: float = 0.0  # Logits 的平均绝对值
 
+    # === 可微概率字段（用于损失函数）===
+    # 这些字段允许梯度反向传播到 Splitter
+    depth_probs: Optional[torch.Tensor] = None  # [B, max_depth+1] 深度概率分布
+    split_probs: Optional[torch.Tensor] = None  # [B, H*W] 分裂概率（Gumbel-Softmax输出）
+    splitter_probs: Optional[torch.Tensor] = None  # [B, ...] Splitter 概率分布
+
+    # === 流形几何字段（用于 Manifold Loss）===
+    manifold_bias: Optional[torch.Tensor] = None  # [B, H, W] Hilbert 流形偏置张量
+    poincare_distances: Optional[torch.Tensor] = None  # [B, N, N] Poincaré 距离矩阵
+
     def validate(self) -> None:
         """数学约束验证"""
         # I139: 支持列表和张量类型的 num_tokens
@@ -340,8 +350,8 @@ class FractalCurveViT(nn.Module):
         # I145-H1SS: HilbertOptimalSplitter 特定参数
         jump_loss_weight: Optional[float] = None,  # H1SS Jump Loss 权重
         density_field_hidden_dim: Optional[int] = None,  # H1SS Density Field 隐藏层维度
-        # I130-3: Splitter 类型选择 (I145: 新增 semantic_redundancy 支持)
-        splitter_type: str = 'gumbel_topk',  # 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy', 'hilbert_optimal'
+        # I130-3: Splitter 类型选择 (I145: 新增 semantic_redundancy, I164: 改默认hilbert_optimal)
+        splitter_type: str = 'hilbert_optimal',  # 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy', 'hilbert_optimal'
         # I170-NEW: Hilbert 平滑参数 (I165-1: 解决空间碎片化)
         enable_hilbert_smoothness: bool = False,  # 是否启用 Hilbert 感知平滑
         hilbert_smoothness_weight: float = 0.1,  # 平滑损失权重
@@ -1620,10 +1630,15 @@ class FractalCurveViT(nn.Module):
             # 标记为非插件模式
             _plugin_mode = False
 
+        # I171: 初始化流形张量
+        manifold_bias_tensor = None
+        poincare_dist_tensor = None
+
         # 如果不是插件模式，继续执行原有的 transformer 处理逻辑
         if not _plugin_mode:
             # 4. Transformer 处理 (v6.0: 注入 geometry_emb)
-            x = self.transformer(
+            # I171: transformer 现在返回 (output, manifold_bias, poincare_distances)
+            x, manifold_bias_tensor, poincare_dist_tensor = self.transformer(
                 x, levels_info, attn_mask,
                 regions=regions, image_size=image_size,
                 geometry_emb=geometry_emb_with_cls,
@@ -1732,7 +1747,24 @@ class FractalCurveViT(nn.Module):
         if split_result is not None and hasattr(split_result, 'mean_abs_logits'):
             mean_abs_logits = split_result.mean_abs_logits
 
+        # I150-3 NEW: 提取可微概率用于多任务损失函数
+        # split_probs: [B, max_tokens] 从 tokenizer 输出获取（保留梯度）
+        split_probs = None
+        if hasattr(token_output, 'get_padded_split_probs'):
+            split_probs = token_output.get_padded_split_probs()
+
+        # depth_probs: [D] 从 splitter 获取（保留梯度）
+        depth_probs = None
+        if hasattr(self.splitter, 'get_depth_probs'):
+            depth_probs = self.splitter.get_depth_probs()
+
+        # P2 NEW: 提取流形几何张量用于 Manifold Loss
+        # I171: manifold_bias 和 poincare_distances 从 transformer 获取（非插件模式）
+        # 已在上面初始化 manifold_bias_tensor = None / poincare_dist_tensor = None
+
         # I170: 添加 redundancy 和 child_features 到 TrainingStats
+        # I150-3: 添加可微概率字段用于多任务损失函数
+        # P2: 添加流形几何字段
         stats = TrainingStats(
             logits=final_output,
             num_tokens=num_tokens_tensor,  # GPU tensor，避免 CPU 同步
@@ -1745,6 +1777,13 @@ class FractalCurveViT(nn.Module):
             redundancy=redundancy,  # I170: 语义分裂器的冗余性分数
             child_features=child_features,  # I170: 语义分裂器的子节点特征
             mean_abs_logits=mean_abs_logits,  # I150-3 NEW: Splitter Logits 平均绝对值
+            # I150-3 NEW: 可微概率字段（用于 FractalViTLoss）
+            split_probs=split_probs,  # [B, max_tokens] 分裂概率
+            depth_probs=depth_probs,  # [D] 深度概率分布
+            splitter_probs=split_probs,  # 复用 split_probs
+            # P2 NEW: 流形几何字段
+            manifold_bias=manifold_bias_tensor,
+            poincare_distances=poincare_dist_tensor,
         )
 
         return stats

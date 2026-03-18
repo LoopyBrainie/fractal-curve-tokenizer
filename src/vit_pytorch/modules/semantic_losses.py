@@ -35,33 +35,34 @@ import torch.nn.functional as F
 
 
 class DiversityLoss(nn.Module):
-    """多样性损失：鼓励子节点特征正交（语义独立）
+    r"""
+    Diversity loss: Encourages child node features to be orthogonal (semantically independent).
 
-    数学形式化（I112-1 修复版）:
+    Mathematically (I112-1 fixed version):
         L_div = ||Ŝ - I||_F²
 
-    其中:
-        v̂_i = v_i / (||v_i||₂ + ε)  # L2 归一化
-        Ŝ = v̂ · v̂ᵀ                   # 余弦相似度矩阵
-        L_div = ||Ŝ - I||²_F           # Frobenius 范数平方
+    Where:
+        v̂_i = v_i / (||v_i||₂ + ε)  # L2 normalized
+        Ŝ = v̂ · v̂ᵀ                   # Cosine similarity matrix
+        L_div = ||Ŝ - I||²_F           # Squared Frobenius norm
 
-    设计原理:
-        1. 使用余弦相似度而非原始点积，确保损失与特征范数解耦
-        2. 与 CorrelationGate 的归一化策略保持一致
-        3. 损失范围 [0, 4]，4 个子节点完全平行时达到最大值
+    Design principles:
+        1. Uses cosine similarity instead of raw dot product to decouple loss from feature norms
+        2. Consistent with CorrelationGate's normalization strategy
+        3. Loss range [0, 4], maximum when 4 children are parallel
 
-    效果:
-        - 当四个子节点特征正交时，Ŝ = I，L_div = 0
-        - 当子节点特征相似时，L_div 增加（最大 4）
-        - 损失值独立于特征 L2 范数
+    Effects:
+        - When four child features are orthogonal, Ŝ = I, L_div = 0
+        - When child features are similar, L_div increases (max 4)
+        - Loss value is independent of feature L2 norm
     """
 
     def __init__(self, reduction: str = "mean", epsilon: float = EPS):  # I112-3: EPS = 1e-6
-        """初始化多样性损失
-
+        r"""
         Args:
-            reduction: 归约方式 ("mean" | "sum" | "none")
-            epsilon: 防止除零的小常数
+            reduction (str): Reduction method. Options: ``"mean"``, ``"sum"``, ``"none"``.
+                Default: ``"mean"``
+            epsilon (float): Small constant to prevent division by zero. Default: ``1e-6``
         """
         super().__init__()
         assert reduction in ("mean", "sum", "none")
@@ -69,13 +70,25 @@ class DiversityLoss(nn.Module):
         self.epsilon = epsilon
 
     def forward(self, child_features: torch.Tensor) -> torch.Tensor:
-        """计算多样性损失
+        r"""
+        Computes the diversity loss.
 
         Args:
-            child_features: [B, N, 4, D] 子节点特征
+            child_features (Tensor): Child node features of shape :math:`(B, N, 4, D)`
 
         Returns:
-            loss: 多样性损失 (范围 [0, 4])
+            Tensor: Diversity loss with range [0, 4]. Shape depends on ``reduction``:
+                - ``"mean"``: scalar
+                - ``"sum"``: scalar
+                - ``"none"``: :math:`(B, N)`
+
+        Examples::
+
+            >>> child_features = torch.randn(2, 8, 4, 64)  # [B, N, num_children, D]
+            >>> loss_fn = DiversityLoss(reduction="mean")
+            >>> loss = loss_fn(child_features)
+            >>> loss.item()
+            1.234
         """
         # 重塑为 [B*N, 4, D]
         B, N, num_children, D = child_features.shape
@@ -104,20 +117,21 @@ class DiversityLoss(nn.Module):
 
 
 class ReconstructionLoss(nn.Module):
-    """重构一致性损失：确保子节点能重构父节点
+    r"""
+    Reconstruction consistency loss: Ensures child nodes can reconstruct the parent node.
 
-    公式: L_rec = ||F_p - AvgPool(V_c)||^2
+    Formula: :math:`L_{rec} = ||F_p - AvgPool(V_c)||^2`
 
-    效果:
-    - 确保分裂不丢失信息
-    - 子节点特征的均值应接近父节点特征
+    Effects:
+        - Ensures splitting does not lose information
+        - Mean of child features should be close to parent features
     """
 
     def __init__(self, reduction: str = "mean"):
-        """初始化重构损失
-
+        r"""
         Args:
-            reduction: 归约方式 ("mean" | "sum" | "none")
+            reduction (str): Reduction method. Options: ``"mean"``, ``"sum"``, ``"none"``.
+                Default: ``"mean"``
         """
         super().__init__()
         assert reduction in ("mean", "sum", "none")
@@ -128,14 +142,27 @@ class ReconstructionLoss(nn.Module):
         parent_features: torch.Tensor,
         child_features: torch.Tensor,
     ) -> torch.Tensor:
-        """计算重构一致性损失
+        r"""
+        Computes the reconstruction consistency loss.
 
         Args:
-            parent_features: [B, N, D] 父节点特征
-            child_features: [B, N, 4, D] 子节点特征
+            parent_features (Tensor): Parent node features of shape :math:`(B, N, D)`
+            child_features (Tensor): Child node features of shape :math:`(B, N, 4, D)`
 
         Returns:
-            loss: 重构损失
+            Tensor: Reconstruction loss. Shape depends on ``reduction``:
+                - ``"mean"``: scalar
+                - ``"sum"``: scalar
+                - ``"none"``: :math:`(B, N)`
+
+        Examples::
+
+            >>> parent_features = torch.randn(2, 8, 64)  # [B, N, D]
+            >>> child_features = torch.randn(2, 8, 4, 64)  # [B, N, num_children, D]
+            >>> loss_fn = ReconstructionLoss(reduction="mean")
+            >>> loss = loss_fn(parent_features, child_features)
+            >>> loss.item()
+            0.567
         """
         # 重塑为 [B*N, 4, D] 和 [B*N, D]
         B, N, D = parent_features.shape
@@ -157,14 +184,15 @@ class ReconstructionLoss(nn.Module):
 
 
 class SemanticRedundancyLoss(nn.Module):
-    """语义冗余总损失
+    r"""
+    Total semantic redundancy loss.
 
-    总损失:
-        L_total = L_cls + λ_d · L_div + λ_r · L_rec
+    Total loss:
+        :math:`L_{total} = L_{cls} + λ_d · L_{div} + λ_r · L_{rec}`
 
-    设计决策:
-    - λ_d = λ_r = 0.1: 与主分类损失量级匹配
-    - 仅对分裂的区域计算辅助损失
+    Design decisions:
+        - λ_d = λ_r = 0.1: Matches the magnitude of main classification loss
+        - Only computes auxiliary loss for split regions
     """
 
     def __init__(
@@ -173,12 +201,12 @@ class SemanticRedundancyLoss(nn.Module):
         reconstruction_weight: float = 0.1,
         reduction: str = "mean",
     ):
-        """初始化语义冗余损失
-
+        r"""
         Args:
-            diversity_weight: 多样性损失权重
-            reconstruction_weight: 重构损失权重
-            reduction: 归约方式
+            diversity_weight (float): Weight for diversity loss. Default: ``0.1``
+            reconstruction_weight (float): Weight for reconstruction loss. Default: ``0.1``
+            reduction (str): Reduction method. Options: ``"mean"``, ``"sum"``, ``"none"``.
+                Default: ``"mean"``
         """
         super().__init__()
         self.diversity_weight = diversity_weight
@@ -194,19 +222,30 @@ class SemanticRedundancyLoss(nn.Module):
         child_features: torch.Tensor,
         split_decisions: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """计算语义冗余损失
+        r"""
+        Computes the semantic redundancy loss.
 
         Args:
-            parent_features: [B, N, D] 父节点特征
-            child_features: [B, N, 4, D] 子节点特征
-            split_decisions: [B, N] 分裂决策 (可选，不提供则计算所有)
+            parent_features (Tensor): Parent node features of shape :math:`(B, N, D)`
+            child_features (Tensor): Child node features of shape :math:`(B, N, 4, D)`
+            split_decisions (Tensor, optional): Split decisions of shape :math:`(B, N)`.
+                If provided, only computes loss for split regions. Default: ``None``
 
         Returns:
-            losses: {
-                "loss": 总损失,
-                "diversity_loss": 多样性损失,
-                "reconstruction_loss": 重构损失
-            }
+            Dict[str, Tensor]: Dictionary containing:
+                - ``"loss"``: Total weighted loss (scalar)
+                - ``"diversity_loss"``: Diversity loss component
+                - ``"reconstruction_loss"``: Reconstruction loss component
+
+        Examples::
+
+            >>> parent_features = torch.randn(2, 8, 64)
+            >>> child_features = torch.randn(2, 8, 4, 64)
+            >>> split_decisions = torch.randint(0, 2, (2, 8)).bool()
+            >>> loss_fn = SemanticRedundancyLoss(diversity_weight=0.1, reconstruction_weight=0.1)
+            >>> losses = loss_fn(parent_features, child_features, split_decisions)
+            >>> losses["loss"].item()
+            0.234
         """
         # 计算多样性损失
         diversity = self.diversity_loss(child_features)  # [B, N] 或标量
