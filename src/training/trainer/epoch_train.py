@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 
 from ..config import Config
 from .state import TrainingState, EpochMetrics
-from .loss import MixupCutmixLoss, compute_loss
+from .loss import MixupCutmixLoss, compute_loss, FractalViTLoss
 from ..monitor.gradient_monitor import GradientMonitor
 from ..monitor.loss_monitor import LossMonitor
 from ..monitor.numerical_defense import NumericalDefender, NaNAutoInvestigation, dump_debug_info
@@ -33,6 +33,7 @@ def train_one_epoch(
     device: torch.device,
     scheduler: Optional[Any] = None,
     mixup_cutmix: Optional[MixupCutmixLoss] = None,
+    fractal_loss: Optional[FractalViTLoss] = None,
     debug_dir: Optional[str] = None,
 ) -> EpochMetrics:
     """Train for one epoch
@@ -202,10 +203,29 @@ def train_one_epoch(
 
             # Compute loss
             if targets is not None:
-                loss, loss_components = compute_loss(logits, targets)
+                # I150-3: Use FractalViTLoss if differentiable probabilities are available
+                if (hasattr(outputs, 'depth_probs') and outputs.depth_probs is not None) or \
+                   (hasattr(outputs, 'split_probs') and outputs.split_probs is not None):
+                    # New multi-task loss with differentiable probabilities
+                    loss, loss_components = fractal_loss(
+                        logits,
+                        targets,
+                        depth_probs=getattr(outputs, 'depth_probs', None),
+                        split_probs=getattr(outputs, 'split_probs', None),
+                        attention_bias=getattr(outputs, 'manifold_bias', None),
+                        poincare_distances=getattr(outputs, 'poincare_distances', None),
+                        parent_features=getattr(outputs, 'parent_features', None),
+                        child_features=getattr(outputs, 'child_features', None),
+                        splitter_probs=getattr(outputs, 'splitter_probs', None),
+                        epoch=state.epoch,
+                    )
+                else:
+                    # Fallback to standard CE loss
+                    loss, loss_components = compute_loss(logits, targets)
             else:
                 # Fallback if no targets
                 loss = torch.tensor(0.0, device=device)
+                loss_components = {}
 
         # Record loss components
         if config.numerical.record_loss_components:
