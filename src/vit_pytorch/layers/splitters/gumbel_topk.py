@@ -1,6 +1,15 @@
 """
 方案 D/E: Gumbel-Top-K + 可学习配额 自适应分割器
 
+.. deprecated::
+    此splitter已废弃。请使用 HilbertOptimalSplitter (H1SS)。
+
+    废弃理由:
+    - Gumbel噪声引入不必要的随机性
+    - 训练/推理不一致 (Train/Eval Inconsistency)
+    - 梯度覆盖率极低，导致梯度爆炸
+    - 已被H1SS的Entmax方案替代
+
 数学形式化
 ==========
 
@@ -6852,6 +6861,65 @@ class GumbelTopKSplitter(
         # I108-6: 使用 LOGIT_CLAMP_BOUND (50.0) 常量
         quota_logits_clamped = self.quota_logits.clamp(min=-LOGIT_CLAMP_BOUND, max=LOGIT_CLAMP_BOUND)
         return F.softmax(quota_logits_clamped, dim=0)
+
+    def get_depth_probs(self) -> Optional[Tensor]:
+        """计算深度分布的概率（用于辅助损失函数）
+
+        数学形式:
+            depth_probs[d] = (1/N_d) * Σ_{i: depth_i=d} probs[i]
+            其中 N_d 是深度为 d 的候选数量
+
+        这个方法利用 Gumbel-Softmax 的输出 probs 来计算每个深度的
+        平均分裂概率，提供可微分的深度分布信号用于多任务损失。
+
+        Returns:
+            [D] 深度概率分布，保留梯度；或 None 如果无法计算
+        """
+        # 检查是否有可用的概率缓存
+        if not hasattr(self, '_last_probs_for_loss') or self._last_probs_for_loss is None:
+            return None
+
+        probs = self._last_probs_for_loss  # [B, N]
+        if not hasattr(self, 'candidate_depths') or self.candidate_depths is None:
+            return None
+
+        B, N = probs.shape
+        device = probs.device
+
+        # 获取深度信息
+        depth_indices = self.candidate_depths.to(device)  # [N]
+        max_depth = depth_indices.max().item() + 1
+
+        # 构建 depth one-hot 编码 [N, D]
+        depth_onehot = F.one_hot(depth_indices, num_classes=max_depth).float()
+
+        # 计算每个深度的总概率
+        # prob_sums[d] = Σ_{b,i} probs[b,i] * 1[depth_i = d]
+        prob_sums = torch.einsum('bn,nd->d', probs, depth_onehot)  # [D]
+
+        # 深度计数
+        depth_counts = depth_onehot.sum(dim=0)  # [D]
+        depth_counts = torch.clamp(depth_counts, min=1.0)  # 避免除零
+
+        # 平均概率 = 总概率 / (B * 该深度的候选数)
+        depth_probs = prob_sums / (B * depth_counts)  # [D]
+
+        # 归一化
+        depth_probs = depth_probs / depth_probs.sum().clamp(min=1e-8)
+
+        return depth_probs
+
+    def get_split_probs(self) -> Optional[Tensor]:
+        """获取分裂概率（用于辅助损失函数）
+
+        FractalViTLoss 的 budget_loss 和 entropy_loss 需要 split_probs。
+
+        Returns:
+            [B, N] 分裂概率，保留梯度；或 None 如果无法获取
+        """
+        if not hasattr(self, '_last_probs_for_loss') or self._last_probs_for_loss is None:
+            return None
+        return self._last_probs_for_loss
 
     def get_variance_regularization(self) -> Tensor:
         """

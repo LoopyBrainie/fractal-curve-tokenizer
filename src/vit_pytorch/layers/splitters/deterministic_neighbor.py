@@ -1,6 +1,14 @@
 """
 Deterministic Neighbor-Aware Splitter
 
+.. deprecated::
+    此splitter已废弃。请使用 HilbertOptimalSplitter (H1SS)。
+
+    废弃理由:
+    - O(N^2)的邻接矩阵操作过于臃肿
+    - Conv1D在Hilbert序列上的滑动窗口已等效实现高效率邻域感知
+    - 已被H1SS的Conv1D+Entmax方案替代
+
 数学形式化
 ==========
 

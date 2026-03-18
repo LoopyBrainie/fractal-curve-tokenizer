@@ -41,6 +41,8 @@ from vit_pytorch.layers.embeddings.fractal_path import (
     VectorizedPathEncoder,
     OrientationExtractor,
 )
+# I164-1: 导入LookAheadHead (从废弃的SemanticRedundancy迁移)
+from vit_pytorch.layers.splitters.semantic_redundancy import LookAheadHead
 
 logger = logging.getLogger(__name__)
 
@@ -297,8 +299,15 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         self.entmax_warmup_epochs = 10     # 预热 epoch 数
         self.entmax_schedule_epochs = 20  # 总调度 epoch 数
 
-        # 树约束
+        # 树约束 - I164-1: 动态λ调整
+        # 使用log(lambda)确保λ>0，通过课程学习逐步增强约束
         self.tree_constraint_weight = tree_constraint_weight
+        self._log_lambda = nn.Parameter(torch.tensor(0.0))  # 可学习的log(λ)
+        self._lambda_schedule_epochs = 20  # λ课程学习持续20个epoch
+
+        # λ的初始值和目标值（课程学习）
+        self._lambda_init = 0.05
+        self._lambda_max = 0.3
 
         # 温度
         self.temperature = temperature_init
@@ -327,6 +336,13 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         # 1. 特征投影
         self.feature_proj = nn.Linear(feature_dim, hidden_dim)
+
+        # I164-1: LookAheadHead - 预测子节点特征以增强分裂决策
+        # 迁移自废弃的SemanticRedundancySplitter
+        self.look_ahead_head = LookAheadHead(
+            feature_dim=hidden_dim,
+            hidden_dim=hidden_dim
+        )
 
         # 2. 深度嵌入 (A1: 与 Embed 层一致)
         self.depth_embedding = nn.Embedding(max_level_limit + 1, hidden_dim)
@@ -713,9 +729,16 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         数学:
             z_parent -= λ × max(z_children)
+
+        I164-1: 动态λ调整
+            - 课程学习: λ从_init逐步增加到_max
+            - 可学习残差: log_lambda提供额外的学习信号
         """
         if self.tree_constraint_weight <= 0:
             return logits
+
+        # 计算动态λ (课程学习 + 可学习残差)
+        lambda_cur = self._compute_dynamic_lambda()
 
         N = logits.shape[1]
         constrained_logits = logits.clone()
@@ -730,10 +753,27 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
                 if len(children_valid) > 0:
                     max_child_logit = logits[:, children_valid].max(dim=1)[0]
-                    # 降低父节点分数
-                    constrained_logits[:, parent_idx] -= self.tree_constraint_weight * max_child_logit
+                    # 降低父节点分数 (使用动态λ)
+                    constrained_logits[:, parent_idx] -= lambda_cur * max_child_logit
 
         return constrained_logits
+
+    def _compute_dynamic_lambda(self) -> float:
+        """计算动态λ (课程学习)
+
+        λ(t) = λ_init + (λ_max - λ_init) × min(1, t / T_schedule) + σ(log_lambda)
+
+        其中 t 是当前epoch，T_schedule 是课程学习持续时间
+        """
+        # 课程学习组件
+        progress = min(1.0, self._current_epoch / max(1, self._lambda_schedule_epochs))
+        lambda_scheduled = self._lambda_init + (self._lambda_max - self._lambda_init) * progress
+
+        # 可学习残差 (sigmoid确保正值)
+        lambda_learnable = torch.sigmoid(self._log_lambda).item() * 0.2  # 缩放到合理范围
+
+        # 组合
+        return lambda_scheduled + lambda_learnable
 
     def _sparse_select(
         self,
@@ -836,6 +876,65 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             "iou_min": float(np.min(ious)),
             "iou_max": float(np.max(ious)),
         }
+
+    def get_depth_probs(self) -> Optional[Tensor]:
+        """计算深度分布的概率（用于辅助损失函数）
+
+        数学形式:
+            depth_probs[d] = (1/N_d) * Σ_{i: depth_i=d} probs[i]
+            其中 N_d 是深度为 d 的候选数量
+
+        这个方法利用 Entmax 的输出 probs 来计算每个深度的
+        平均分裂概率，提供可微分的深度分布信号用于多任务损失。
+
+        Returns:
+            [D] 深度概率分布，保留梯度；或 None 如果无法计算
+        """
+        # 检查是否有可用的概率缓存
+        if not hasattr(self, '_last_probs_for_loss') or self._last_probs_for_loss is None:
+            return None
+
+        probs = self._last_probs_for_loss  # [B, N]
+        if not hasattr(self, 'candidate_depths') or self.candidate_depths is None:
+            return None
+
+        B, N = probs.shape
+        device = probs.device
+
+        # 获取深度信息
+        depth_indices = self.candidate_depths.to(device)  # [N]
+        max_depth = depth_indices.max().item() + 1
+
+        # 构建 depth one-hot 编码 [N, D]
+        depth_onehot = F.one_hot(depth_indices, num_classes=max_depth).float()
+
+        # 计算每个深度的总概率
+        # prob_sums[d] = Σ_{b,i} probs[b,i] * 1[depth_i = d]
+        prob_sums = torch.einsum('bn,nd->d', probs, depth_onehot)  # [D]
+
+        # 深度计数
+        depth_counts = depth_onehot.sum(dim=0)  # [D]
+        depth_counts = torch.clamp(depth_counts, min=1.0)  # 避免除零
+
+        # 平均概率 = 总概率 / (B * 该深度的候选数)
+        depth_probs = prob_sums / (B * depth_counts)  # [D]
+
+        # 归一化
+        depth_probs = depth_probs / depth_probs.sum().clamp(min=1e-8)
+
+        return depth_probs
+
+    def get_split_probs(self) -> Optional[Tensor]:
+        """获取分裂概率（用于辅助损失函数）
+
+        FractalViTLoss 的 budget_loss 和 entropy_loss 需要 split_probs。
+
+        Returns:
+            [B, N] 分裂概率，保留梯度；或 None 如果无法获取
+        """
+        if not hasattr(self, '_last_probs_for_loss') or self._last_probs_for_loss is None:
+            return None
+        return self._last_probs_for_loss
 
     def forward(
         self,
@@ -956,6 +1055,9 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
                 # 限制历史长度
                 if len(self._token_history) > 100:
                     self._token_history.pop(0)
+
+        # I150-3: 缓存 probs 用于辅助损失计算（保留梯度）
+        self._last_probs_for_loss = probs
 
         return result
 

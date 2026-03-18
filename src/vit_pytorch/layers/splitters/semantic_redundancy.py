@@ -1,6 +1,13 @@
 """
 SemanticRedundancySplitter - 基于语义冗余的分裂器
 
+.. deprecated::
+    此splitter已废弃。LookAheadHead已迁移到HilbertOptimalSplitter (H1SS)。
+
+    迁移说明:
+    - LookAheadHead: 已集成到H1SS作为特征增强模块
+    - CorrelationGate: 冗余性计算逻辑可在H1SS中通过其他方式实现
+
 核心思想：通过 LookAheadHead 预测子节点特征，CorrelationGate 计算冗余性，
 决策是否分裂。实现从开环到闭环的架构转变。
 
