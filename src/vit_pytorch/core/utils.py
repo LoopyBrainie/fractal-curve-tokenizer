@@ -1,21 +1,21 @@
 # -*- coding: utf-8 -*-
-"""
-工具函数模块
+r"""
+Utility functions module.
 
-数学形式化
-============
+Mathematical Formulation
+=========================
 
-核心函数:
+Core functions:
     create_attention_mask(lengths, max_len) → M ∈ {0,1}^{B × N}
         M[b, i] = 1 if i < lengths[b] else 0
 
     sanitize_tensor(T) → T'
-        T' = nan_to_num(T), 替换 NaN/Inf 保证数值稳定性
+        T' = nan_to_num(T), replaces NaN/Inf for numerical stability
 
-函数对照表
-----------
+Function Reference Table
+-------------------------
 +------------------------+-------------------------------+
-| 函数                    | 数学定义                       |
+| Function               | Mathematical Definition       |
 +========================+===============================+
 | pair(x)                | x → (x, x) if int else x      |
 | create_attention_mask  | lengths → bool mask           |
@@ -26,22 +26,74 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Union
 
 import torch
 
 logger = logging.getLogger(__name__)
 
 
-def pair(value: int | Tuple[int, int]) -> Tuple[int, int]:
+def pair(value: Union[int, Tuple[int, int]]) -> Tuple[int, int]:
+    r"""
+    Convert a value to a tuple of length 2.
+
+    If the value is already a tuple, return it as-is.
+    Otherwise, create a tuple with the value repeated twice.
+
+    Args:
+        value (int or Tuple[int, int]): Input value
+
+    Returns:
+        Tuple[int, int]: Tuple of (value, value) if input is int, otherwise the tuple itself
+
+    Examples::
+
+        >>> pair(224)
+        (224, 224)
+        >>> pair((384, 384))
+        (384, 384)
+    """
     return value if isinstance(value, tuple) else (value, value)
 
 
 def exists(value) -> bool:
+    r"""
+    Check if a value is not None.
+
+    Args:
+        value: Any value to check
+
+    Returns:
+        bool: ``True`` if value is not ``None``, ``False`` otherwise
+
+    Examples::
+
+        >>> exists(None)
+        False
+        >>> exists(42)
+        True
+    """
     return value is not None
 
 
 def default(value, default_value):
+    r"""
+    Return value if it exists (not None), otherwise return default_value.
+
+    Args:
+        value: Value to check
+        default_value: Default value to return if value is None
+
+    Returns:
+        value if exists, otherwise default_value
+
+    Examples::
+
+        >>> default(None, 0)
+        0
+        >>> default(42, 0)
+        42
+    """
     return value if exists(value) else default_value
 
 
@@ -51,19 +103,27 @@ def sanitize_tensor(
     posinf_value: float = 1.0,
     neginf_value: float = -1.0,
 ) -> torch.Tensor:
-    """清理张量中的 NaN 和 Inf 值。
-    
-    检查张量中是否存在 NaN 或 Inf 值，如果存在则替换为指定的默认值。
-    这对于数值稳定性很重要，特别是在处理 softmax 或归一化操作时。
-    
+    r"""
+    Clean NaN and Inf values from a tensor.
+
+    Checks if the tensor contains any NaN or Inf values, and replaces them
+    with specified default values if present. This is important for numerical
+    stability, especially when dealing with softmax or normalization operations.
+
     Args:
-        tensor: 输入张量
-        nan_value: NaN 值的替换值，默认为 0.0
-        posinf_value: 正无穷的替换值，默认为 1.0
-        neginf_value: 负无穷的替换值，默认为 -1.0
-        
+        tensor (Tensor): Input tensor
+        nan_value (float): Replacement value for NaN. Default: ``0.0``
+        posinf_value (float): Replacement value for positive infinity. Default: ``1.0``
+        neginf_value (float): Replacement value for negative infinity. Default: ``-1.0``
+
     Returns:
-        清理后的张量（如果没有 NaN/Inf 则返回原张量）
+        Tensor: Cleaned tensor (returns original if no NaN/Inf present)
+
+    Examples::
+
+        >>> x = torch.tensor([1.0, float('nan'), float('inf')])
+        >>> sanitize_tensor(x)
+        tensor([ 1.,  0.,  1.])
     """
     if torch.isnan(tensor).any() or torch.isinf(tensor).any():
         logger.debug(
@@ -77,19 +137,21 @@ def sanitize_tensor(
 
 
 def create_attention_mask(levels_info: List[torch.Tensor], device: torch.device) -> torch.Tensor:
-    """Generate a soft attention prior based on hierarchical depth alignment.
-    
-    向量化实现，将 O(B × S²) 循环复杂度降低为批量张量操作。
-    
+    r"""
+    Generate a soft attention prior based on hierarchical depth alignment.
+
+    Vectorized implementation that reduces O(B × S²) loop complexity to batch tensor operations.
+
     Args:
-        levels_info: List of (N_i, info_len) tensors containing level information for each sample
-        device: Target device for the output tensor
-        
+        levels_info (List[Tensor]): List of (N_i, info_len) tensors containing level information
+            for each sample in the batch
+        device (torch.device): Target device for the output tensor
+
     Returns:
-        (B, max_len, max_len) attention mask with values:
-        - 1.2 for same level
-        - 1.1 for adjacent levels (diff=1)
-        - 1.0 for others or padding
+        Tensor: Attention mask of shape :math:`(B, max\_len, max\_len)` with values:
+            - ``1.2`` for same level (depth diff = 0)
+            - ``1.1`` for adjacent levels (depth diff = 1)
+            - ``1.0`` for other positions or padding
     """
     if len(levels_info) == 0:
         return torch.empty(0, 0, 0, device=device)

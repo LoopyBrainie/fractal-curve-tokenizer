@@ -944,18 +944,111 @@ def create_splitter_config(
     freeze_quota: Optional[bool] = None,
     **kwargs,
 ) -> HilbertSplitterConfig:
-    """
-    工厂函数: 创建 HilbertSplitterConfig（用于 CLI 参数解析）
+    r"""
+    Factory function: Create HilbertSplitterConfig for CLI parameter parsing.
 
-    数学保证
-    =========
-    相对预算公式 (I33):
-        K_min = max(K_min_abs, α × N)
-        K_max = min(K_max_hard, β × γ(H,W) × N)
-        γ(H,W) = √(min(H,W) / 224)
+    This function constructs a :class:`HilbertSplitterConfig` instance with optional
+    parameter overrides. Supports relative budget computation based on image dimensions
+    and coverage targets.
 
-    版本历史:
-        - v2.0 (2026-02-02): 使用 HilbertSplitterConfig，重构参数命名
+    Mathematical Formulation
+    ========================
+    Relative budget formula (I33):
+
+    .. math::
+        K_{min} = \max(K_{min\_abs}, \alpha \times N)
+        K_{max} = \min(K_{max\_hard}, \beta \times \gamma(H,W) \times N)
+        \gamma(H,W) = \sqrt{\min(H,W) / 224}
+
+    Where:
+        - :math:`N` is the total number of candidate regions from Hilbert curve
+        - :math:`\alpha` and :math:`\beta` are coverage bounds
+        - :math:`\gamma(H,W)` scales based on image dimensions
+
+    Version History:
+        - v2.0 (2026-02-02): Refactored to use HilbertSplitterConfig with renamed parameters
+
+    Args:
+        # Core parameters
+        min_patch_size (int, optional): Minimum patch size in pixels. Default: ``4``
+        max_level_limit (int, optional): Maximum partitioning depth. Default: ``8``
+        # Coverage constraints (relative budget)
+        coverage_base (float, optional): Base coverage rate for 224x224 images.
+            Default: ``0.25``
+        coverage_min (float, optional): Minimum coverage bound. Default: ``0.10``
+        coverage_max_hard (float, optional): Maximum coverage hard limit.
+            Default: ``0.50``
+        K_min_abs (int, optional): Absolute minimum token count. Default: ``8``
+        K_max_hard (int, optional): Absolute maximum token count. Default: ``4096``
+        adaptive_reference_size (int, optional): Reference image size for adaptive
+            coverage. Default: ``224``
+        # Architecture parameters
+        feature_dim (int, optional): Feature embedding dimension. Default: ``256``
+        hidden_dim (int, optional): Hidden layer dimension. Default: ``64``
+        intermediate_dim (int, optional): Intermediate dimension. Default: ``64``
+        pool_size (int, optional): Pooling size for child features. Default: ``4``
+        use_dynamic_k (bool, optional): Use dynamic K selection. Default: ``True``
+        dropout (float, optional): Dropout rate (must be 0.0 for deterministic
+            tokenization). Default: ``0.0``
+        # Regularization parameters
+        elastic_lambda_target (float, optional): Elastic budget target loss weight.
+            Default: ``0.1``
+        elastic_lambda_boundary (float, optional): Elastic budget boundary loss weight.
+            Default: ``0.1``
+        enable_learnable_quota (bool, optional): Enable learnable quota parameters.
+            Default: ``True``
+        quota_init_logits (tuple, optional): Initial logits for quota parameters.
+            Default: ``None``
+        quota_entropy_weight (float, optional): Entropy regularization weight for quota.
+            Default: ``0.1``
+        quota_min_ratio (float, optional): Minimum sampling ratio. Default: ``0.02``
+        quota_min_lambda (float, optional): Lower bound regularization weight.
+            Default: ``0.1``
+        # Entropy regularization
+        entropy_mode (str, optional): Entropy mode. Options: ``"adaptive"``,
+            ``"target"``, ``"disabled"``. Default: ``"adaptive"``
+        entropy_weight_base (float, optional): Base weight for entropy regularization.
+            Default: ``0.1``
+        entropy_target (float, optional): Fixed entropy target for ``"target"`` mode.
+            Default: ``None``
+        # LookAheadHead parameters (I113-2)
+        lookahead_dim (int, optional): Look-ahead feature dimension. Default: ``64``
+        target_ratio (float, optional): Target split ratio. Default: ``0.5``
+        max_ratio (float, optional): Maximum split ratio upper bound. Default: ``0.8``
+        gamma (float, optional): Diversity loss weight. Default: ``0.1``
+        lambda_div (float, optional): Diversity loss coefficient. Default: ``0.1``
+        # Temperature scheduling
+        temperature_init (float, optional): Initial temperature. Default: ``1.0``
+        temperature_min (float, optional): Minimum temperature. Default: ``0.1``
+        temperature_anneal (str, optional): Annealing schedule. Options: ``"linear"``,
+            ``"exponential"``, ``"inverse_time"``. Default: ``"linear"``
+        learnable_temperature (bool, optional): Make temperature learnable.
+            Default: ``False``
+        temperature_warmup_steps (int, optional): Warmup steps for temperature.
+            Default: ``0``
+        # Freeze control
+        freeze_quota (bool, optional): Freeze quota parameters during training.
+            Default: ``False``
+
+    Returns:
+        HilbertSplitterConfig: Configured splitter configuration
+
+    Examples::
+
+        >>> from vit_pytorch.core.config import create_splitter_config
+        >>> # Create default config
+        >>> config = create_splitter_config()
+        >>> config.min_patch_size
+        4
+
+        >>> # Override specific parameters
+        >>> config = create_splitter_config(
+        ...     min_patch_size=8,
+        ...     max_level_limit=6,
+        ...     coverage_base=0.3
+        ... )
+        >>> config.min_patch_size
+        8
     """
     config = HilbertSplitterConfig()
 
@@ -1200,7 +1293,89 @@ def create_semantic_splitter_config(
     learnable_temperature: Optional[bool] = None,
     **kwargs,
 ) -> SemanticSplitterConfig:
-    """工厂函数: 创建 SemanticSplitterConfig（用于 CLI 参数解析）"""
+    r"""
+    Factory function: Create SemanticSplitterConfig for CLI parameter parsing.
+
+    This function constructs a :class:`SemanticSplitterConfig` instance with optional
+    parameter overrides. Semantic redundancy splitting encourages child node features
+    to be orthogonal while ensuring reconstruction consistency.
+
+    Mathematical Design Principles
+    ==============================
+    Theoretical maximum depth (pixel-level bound):
+
+    .. math::
+        L_{theory} = \lfloor \log_2(\max(H, W)) \rfloor
+
+    Where :math:`L_{theory}` is the maximum depth when ``min_patch_size=1``.
+
+    Upper bound protection:
+
+    .. math::
+        \text{max\_level\_limit} \leq L_{theory}
+
+    Examples (``min_patch_size=4``):
+
+    - 64x64 image: :math:`L_{theory} = 6`, effective range [2, 6]
+    - 224x224 image: :math:`L_{theory} = 8`, effective range [2, 8]
+    - 512x512 image: :math:`L_{theory} = 9`, effective range [2, 9]
+    - 1024x1024 image: :math:`L_{theory} = 10`, effective range [2, 10]
+
+    Loss weights (impact=0.1):
+    - ``diversity_weight``: 0.1 (standard)
+    - ``reconstruction_weight``: 0.1 (standard)
+
+    Decision parameters (impact=0.5):
+    - ``split_threshold``: 0.5 (standard)
+    - ``use_gumbel_softmax``: True
+
+    Temperature scheduling (impact=0.8):
+    - ``gumbel_temp_start``: 1.0
+    - ``gumbel_temp_end``: 0.5
+    - ``learnable_temperature``: True
+
+    Args:
+        feature_dim (int, optional): Feature embedding dimension. Default: ``256``
+        hidden_dim (int, optional): Hidden layer dimension. Default: ``128``
+        image_size (tuple, optional): Image size (H, W) for computing theoretical
+            depth bound. Default: ``None``
+        min_patch_size (int, optional): Minimum patch size in pixels. Default: ``4``
+        max_level_limit (int, optional): Maximum depth limit. If ``None``, auto-computed
+            to pixel-level bound. Default: ``None``
+        diversity_weight (float, optional): Weight for diversity loss encouraging
+            orthogonal child features. Default: ``0.1``
+        reconstruction_weight (float, optional): Weight for reconstruction loss
+            ensuring child features can reconstruct parent. Default: ``0.1``
+        split_threshold (float, optional): Threshold for split decision. Default: ``0.5``
+        use_gumbel_softmax (bool, optional): Use Gumbel-Softmax for differentiable
+            splitting. Default: ``True``
+        gumbel_temp_start (float, optional): Initial temperature for Gumbel annealing.
+            Default: ``1.0``
+        gumbel_temp_end (float, optional): Final temperature for Gumbel annealing.
+            Default: ``0.5``
+        learnable_temperature (bool, optional): Make temperature a learnable parameter.
+            Default: ``True``
+
+    Returns:
+        SemanticSplitterConfig: Configured semantic splitter configuration
+
+    Examples::
+
+        >>> from vit_pytorch.core.config import create_semantic_splitter_config
+        >>> # Create default config
+        >>> config = create_semantic_splitter_config()
+        >>> config.feature_dim
+        256
+
+        >>> # Override specific parameters
+        >>> config = create_semantic_splitter_config(
+        ...     feature_dim=512,
+        ...     hidden_dim=256,
+        ...     diversity_weight=0.2
+        ... )
+        >>> config.feature_dim
+        512
+    """
     config = SemanticSplitterConfig()
 
     if feature_dim is not None:
