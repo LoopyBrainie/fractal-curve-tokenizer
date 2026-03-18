@@ -193,7 +193,83 @@ tokenizer = StreamingFractalTokenizerV3(
 
 ---
 
-## 3.5 Token Embedding
+## 3.5 HilbertOptimalSplitter (V4)
+
+### 3.5.1 Overview
+
+HilbertOptimalSplitter (V4) uses deterministic Hilbert curve-based token selection with learned density field for content-aware pruning.
+
+### 3.5.2 Key Features
+
+- **Deterministic Selection**: No stochastic sampling, reproducible results
+- **Density Field**: Learned feature density prediction for each region
+- **Jump Loss**: Regularization to encourage uniform token distribution
+- ** Hilbert Bandwidth**: Configurable via `manifold_beta` parameter
+
+### 3.5.3 Configuration Parameters
+
+| Parameter | Type | Default | Description |
+|:----------|:-----|:--------|:------------|
+| `splitter_type` | str | 'hilbert_optimal' | Splitter type |
+| `splitter_token_ratio_min` | float | 0.02 | Minimum token ratio |
+| `splitter_token_ratio_max` | float | 0.15 | Maximum token ratio |
+| `K_min_abs` | int | 8 | Absolute minimum tokens |
+| `jump_loss_weight` | float | 0.01 | Jump loss regularization weight |
+| `density_field_hidden_dim` | int | 64 | Density field hidden dimension |
+| `manifold_beta` | float | 4.0 | Hilbert bandwidth coefficient |
+
+### 3.5.4 Usage Example
+
+```python
+from vit_pytorch import FractalCurveViT
+
+model = FractalCurveViT(
+    image_size=224,
+    num_classes=1000,
+    splitter_type='hilbert_optimal',
+    splitter_token_ratio_min=0.05,
+    splitter_token_ratio_max=0.20,
+    manifold_beta=4.0,
+)
+```
+
+---
+
+## 3.6 SemanticRedundancySplitter
+
+### 3.6.1 Overview
+
+SemanticRedundancySplitter removes semantically redundant tokens based on feature similarity within Hilbert-neighboring regions.
+
+### 3.6.2 Key Features
+
+- **Semantic Similarity**: Removes tokens with high cosine similarity to neighbors
+- **Hilbert Locality**: Operates within Hilbert curve proximity
+- **Redundancy Score**: Learnable scoring function for token importance
+
+### 3.6.3 Configuration Parameters
+
+| Parameter | Type | Default | Description |
+|:----------|:-----|:--------|:------------|
+| `splitter_type` | str | 'semantic_redundancy' | Splitter type |
+| `redundancy_threshold` | float | 0.9 | Similarity threshold for removal |
+| `min_tokens` | int | 16 | Minimum tokens to keep |
+
+### 3.6.4 Usage Example
+
+```python
+from vit_pytorch import FractalCurveViT
+
+model = FractalCurveViT(
+    image_size=224,
+    num_classes=1000,
+    splitter_type='semantic_redundancy',
+)
+```
+
+---
+
+## 3.7 Token Embedding
 
 ### 3.4.1 HilbertNativePatchEmbed
 

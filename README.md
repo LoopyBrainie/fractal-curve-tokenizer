@@ -7,15 +7,18 @@ A Vision Transformer with **Hilbert curve tokenization** and **adaptive multi-sc
 ## Critical Analysis Summary
 
 **Key Strengths:**
+
 - Hilbert curve maintains O(log n) complexity for coordinate transformations
-- Gumbel-Top-K splitter enables parallel evaluation of all candidates
+- **HilbertOptimalSplitter**: Recommended default, based on 6 mathematical axioms for optimal region selection
+- **HilbertOrderedEntmaxSplitter**: 100% gradient coverage (vs Gumbel-STE's 37%)
 - LCA-based attention bias reduces parameters from O(N²) to O(D×H)
 - Depth variance normalization solves variance imbalance across quadtree depths
 
 **Known Limitations:**
+
 - Hilbert locality bound is an upper bound; actual preservation depends on traversal order
 - Path-based LCA uses Hilbert indices, providing good but not exact quadtree correspondence
-- Gradient coverage limited to K selected tokens (K/N ≈ 37.6% with K=32, N=85)
+- Gumbel-STE gradient coverage limited to K selected tokens (K/N ≈ 37.6% with K=32, N=85)
 - Temperature T < 0.3 may cause gradient saturation
 
 ## Architecture
@@ -31,7 +34,8 @@ Image (B, C, H, W)
 ┌─────────────────────────────────────┐
 │  StreamingFractalTokenizerV3        │
 │  ├─ SharedConv: feature extraction  │
-│  ├─ GumbelTopKSplitter: adaptive    │
+│  ├─ HilbertOptimalSplitter (推荐)   │
+│  │   or HilbertOrderedEntmaxSplitter│
 │  └─ HilbertSort: curve ordering     │
 └─────────────────────────────────────┘
        │
@@ -102,6 +106,7 @@ Attention distribution in Hilbert space showing local concentration patterns.
 ![Position Encoding Comparison](workspace/visualizations/position_encoding_comparison.png)
 
 **LCA-based encoding advantages:**
+
 - O(D×H) parameters vs O(N²) for learnable bias
 - Deeper LCA = closer spatial proximity
 - Hierarchical structure encodes scale naturally
@@ -113,7 +118,7 @@ Attention distribution in Hilbert space showing local concentration patterns.
 ### Core Parameters
 
 | Parameter | Default | Range | Description |
-|-----------|---------|-------|-------------|
+| ----------- | --------- | ------- | ------------- |
 | `dim` | 384 | 256-768 | Embedding dimension |
 | `depth` | 6 | 6-12 | Transformer layers |
 | `heads` | 8 | 6-12 | Attention heads |
@@ -124,7 +129,7 @@ Attention distribution in Hilbert space showing local concentration patterns.
 ### Complexity
 
 | Component | Time | Space |
-|-----------|------|-------|
+| ----------- |------ | ------- |
 | Tokenizer | O(B·N·D) | O(B·N·D) |
 | Attention | O(B·H·N²·d) | O(B·H·N²) |
 | FFN | O(B·N·D·D_ff) | O(B·N·D_ff) |
@@ -181,6 +186,25 @@ analysis = model.analyze_tokenization(img)
 
 # Transformer tokens
 logits, tokens, lengths = model(img, return_tokens=True)
+```
+
+### Supported Splitters
+
+| Splitter | Use Case |
+| :--------- | :--------- |
+| **HilbertOptimalSplitter** | Recommended default, based on 6 mathematical axioms |
+| HilbertOrderedEntmaxSplitter | 100% gradient coverage (vs Gumbel-STE's 37%) |
+| HilbertOptimalSplitter (legacy) | Original H1SS implementation |
+
+### Dual Path Mode
+
+```python
+# Enable dual path pattern (V2 features)
+model = FractalCurveViT(
+    image_size=224,
+    num_classes=1000,
+    use_pattern_plugin=True,  # Enable dual path mode
+)
 ```
 
 ## Training

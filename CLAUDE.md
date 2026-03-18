@@ -16,36 +16,19 @@ uv run python src/training/train_fractal_vit.py --quick-test --use-amp
 
 ## Package Import
 
+**CRITICAL**: Before any Python execution, always add src to path:
+
+```python
+import sys
+sys.path.insert(0, 'src')
+```
+
 **Always use**: `from vit_pytorch import FractalCurveViT` (NOT `from fractal_curve_tokenizer import ...`)
 
 ## Development Rules
 
 - Use `uv run pytest ...` / `uv run python ...` (not bare commands)
 - IDE: PowerShell (no CUDA locally); Training: Podman container (CUDA)
-
-## Module Hierarchy
-
-| Layer | Purpose | Key Files |
-|-------|---------|-----------|
-| L4 Application | Main model | `models/fractal_vit.py` |
-| L3 Pipeline | Tokenization & Transformer | `modules/tokenizer.py`, `modules/transformer_block.py` |
-| L2 Components | Splitter, Attention, FFN | `layers/splitters/gumbel_topk.py`, `layers/attention/hilbert_bias.py`, `layers/ffn/swiglu.py` |
-| L1 Foundation | Hilbert curves, config | `core/curve_hilbert.py`, `core/config.py` |
-
-## Import Rules
-
-**Hierarchical** (L1→L2→L3→L4):
-
-- L1 imports: None (base)
-- L2 imports: L1 only
-- L3 imports: L1, L2
-- L4 imports: All
-
-**Example fixes**:
-```python
-# WRONG: from vit_pytorch.modules.base_splitter import CoreSplitter
-# CORRECT: from vit_pytorch.core.splitter_protocol import CoreSplitter
-```
 
 ## Training
 
@@ -73,6 +56,7 @@ uv run python src/training/train_fractal_vit.py --dataset cub200 --image-size No
 **Rule**: Use `arch_config` params, NEVER CLI overrides.
 
 **Save/Load**:
+
 ```python
 # Save: gene = ModelGene.from_config(arch_config=arch_config, model_state=model.state_dict())
 # Load: model = FractalCurveViT(**gene.arch_config.to_dict()); model.load_state_dict(gene.model_state)
@@ -96,6 +80,35 @@ uv run python src/training/train_fractal_vit.py --dataset cub200 --image-size No
 - [docs/](docs): Architecture deep-dives
 - [pyproject.toml](pyproject.toml): pytest markers
 
-## Efficiency
+## Key Strengths
 
-N ≈ 32 tokens (224×224): Fractal ViT ~8K vs Standard ViT ~307K attention elements (**~40× reduction**)
+- **Hilbert curve**: O(log n) coordinate transformation complexity
+- **Gumbel-Top-K**: Parallel evaluation of all N=85 candidate regions
+- **LCA attention**: O(D×H) parameters vs O(N²) for learnable bias
+- **Depth variance normalization**: Solves variance imbalance across quadtree depths
+
+## Known Limitations
+
+- **Hilbert locality**: Upper bound, actual preservation depends on traversal order
+- **Gradient coverage**: Limited to K selected tokens (K/N ≈ 37.6% with K=32, N=85)
+- **Temperature**: T < 0.3 may cause gradient saturation
+- **LCA correspondence**: Hilbert indices provide good but not exact quadtree correspondence
+
+## Common Pitfalls
+
+### Numerical Stability
+
+- Always use constants from `constants.py` instead of magic numbers
+- Prevent log(0)/div(0) with `*_EPSILON` constants
+- Use EMA for stable depth variance normalization
+
+### Gradient Flow
+
+- STE operations require `detach().item()` for loss extraction
+- Hierarchical Top-K breaks computation graph - use `detach()` + separate loss calls
+- Temperature annealing needs proper warmup configuration
+
+### Performance
+
+- Hilbert curve locality is an upper bound
+- LCA computation uses Hilbert indices (good but not exact)

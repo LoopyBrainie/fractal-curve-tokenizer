@@ -4,7 +4,7 @@
 
 `FractalCurveViT` is the complete Vision Transformer model that integrates all components: tokenization, position encoding, transformer encoder, and classification head.
 
-**Architecture Note**: The model internally creates a `GumbelTopKSplitter` (Scheme D/E) for token selection. The tokenizer expects split results from the splitter, following the I98-1 pipeline architecture.
+**Architecture Note**: The model uses configurable splitter (`splitter_type`) for token selection. Supported splitters include `GumbelTopKSplitter`, `DeterministicNeighborSplitter`, `SemanticRedundancySplitter`, and `HilbertOptimalSplitter`. The tokenizer expects split results from the splitter, following the I98-1 pipeline architecture.
 
 ---
 
@@ -64,18 +64,28 @@ class FractalCurveViT(nn.Module):
 
 | Parameter | Type | Default | Description |
 |:----------|:-----|:--------|:------------|
-| `image_size` | int | - | Input image size |
+| `image_size` | int | - | Input image size (None for dynamic) |
 | `num_classes` | int | - | Number of output classes |
 | `dim` | int | 512 | Model embedding dimension |
 | `depth` | int | 6 | Number of transformer layers |
 | `heads` | int | 8 | Number of attention heads |
 | `mlp_dim` | int | dim × 4 | FFN hidden dimension |
-| `pool` | str | 'cls' | Pooling strategy ('cls' or 'mean') |
-| `max_level` | int | None | Max recursion level (auto-inferred) |
-| `dropout` | float | 0.1 | Dropout rate |
-| `tokenizer_type` | str | 'streaming_v3' | Tokenizer type (V3 only) |
-| `hilbert_bias_mode` | str | 'lca' | Attention bias mode (only 'lca' supported) |
-| `ffn_type` | str | 'swiglu_level' | FFN type |
+| `pool` | str | 'weighted' | Pooling strategy ('cls', 'mean', or 'weighted') |
+| `tokenizer_dropout` | float | 0.0 | Tokenizer dropout (must be 0.0 for determinism) |
+| `transformer_dropout` | float | 0.0 | Transformer dropout rate |
+| `emb_dropout` | float | 0.0 | Embedding dropout rate |
+| `drop_path_rate` | float | 0.0 | Drop path rate |
+| `splitter_type` | str | 'gumbel_topk' | Splitter type ('gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy', 'hilbert_optimal') |
+| `splitter_token_ratio_min` | float | 0.02 | Minimum token ratio (2%) |
+| `splitter_token_ratio_max` | float | 0.15 | Maximum token ratio (15%) |
+| `K_min_abs` | int | 8 | Absolute minimum token count |
+| `use_manifold_native` | bool | True | Use manifold-native attention |
+| `manifold_beta` | float | 4.0 | Hilbert bandwidth coefficient |
+| `enable_hilbert_smoothness` | bool | False | Enable Hilbert-aware smoothness regularization |
+| `enable_meta_dvn` | bool | False | Enable meta-aware depth variance network |
+| `use_pattern_encoder` | bool | False | Enable Hilbert pattern encoder |
+| `use_pattern_plugin` | bool | False | Enable dual-path pattern plugin |
+| `ffn_type` | str | 'swiglu_level' | FFN type ('gelu', 'swiglu', 'swiglu_level') |
 
 ---
 
@@ -84,13 +94,17 @@ class FractalCurveViT(nn.Module):
 ### Step-by-Step Data Flow
 
 ```python
-def forward(self, img: Tensor) -> Tensor:
+def forward(self, img: Tensor) -> TrainingStats:
     """
     Args:
         img: (B, C, H, W) - Input images
-    
+
     Returns:
-        logits: (B, num_classes) - Classification logits
+        TrainingStats containing:
+        - logits: (B, num_classes) - Classification logits
+        - num_tokens: int or List[int] - Number of valid tokens
+        - depth_used: int - Maximum depth actually used
+        - depth_distribution: Dict[int, int] - Token count per depth level
     """
 ```
 
@@ -263,7 +277,7 @@ Input Image (B, C, H, W)
 ### Basic Usage
 
 ```python
-from vit_pytorch import FractalCurveViT
+from vit_pytorch import FractalCurveViT, TrainingStats
 
 model = FractalCurveViT(
     image_size=224,
@@ -272,13 +286,44 @@ model = FractalCurveViT(
     depth=6,
     heads=6,
     mlp_dim=768,
-    tokenizer_type='streaming_v3',
-    hilbert_bias_mode='lca',
+    pool='weighted',
+    splitter_type='gumbel_topk',
+    use_manifold_native=True,
+    manifold_beta=4.0,
     ffn_type='swiglu_level',
 )
 
 images = torch.randn(4, 3, 224, 224)
-logits = model(images)  # (4, 1000)
+result = model(images)  # Returns TrainingStats
+logits = result.logits  # (4, 1000)
+print(f"Tokens: {result.num_tokens}, Depth: {result.depth_used}")
+```
+
+### With Different Splitter Types
+
+```python
+# Hilbert Optimal Splitter (V4 - deterministic)
+model = FractalCurveViT(
+    image_size=224,
+    num_classes=1000,
+    splitter_type='hilbert_optimal',
+    splitter_token_ratio_min=0.05,
+    splitter_token_ratio_max=0.20,
+)
+
+# Deterministic Neighbor Splitter
+model = FractalCurveViT(
+    image_size=224,
+    num_classes=1000,
+    splitter_type='deterministic_neighbor',
+)
+
+# Semantic Redundancy Splitter
+model = FractalCurveViT(
+    image_size=224,
+    num_classes=1000,
+    splitter_type='semantic_redundancy',
+)
 ```
 
 ### With FractalConfig

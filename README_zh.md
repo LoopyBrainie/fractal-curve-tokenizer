@@ -8,14 +8,15 @@
 
 **核心优势：**
 - Hilbert 曲线保持 O(log n) 复杂度的坐标转换
-- Gumbel-Top-K 分割器支持所有候选的并行评估
+- **HilbertOptimalSplitter**: 推荐默认选择，基于6条数学公理的最优区域选择
+- **HilbertOrderedEntmaxSplitter**: 100% 梯度覆盖率（vs Gumbel-STE 的 37%）
 - 基于 LCA 的注意力偏置将参数从 O(N²) 减少到 O(D×H)
 - 深度方差归一化解决了四叉树深度的方差不平衡问题
 
 **已知局限性：**
 - Hilbert 局部性界是上界，实际保持取决于遍历顺序
 - 基于路径的 LCA 使用 Hilbert 索引，与四叉树结构有良好但不精确的对应
-- 梯度覆盖率限于 K 个选中 token（K=32, N=85 时约为 37.6%）
+- Gumbel-STE 梯度覆盖率限于 K 个选中 token（K=32, N=85 时约为 37.6%）
 - 温度 T < 0.3 可能导致梯度饱和
 
 ## 架构
@@ -31,7 +32,8 @@
 ┌─────────────────────────────────────┐
 │  StreamingFractalTokenizerV3        │
 │  ├─ SharedConv: 特征提取            │
-│  ├─ GumbelTopKSplitter: 自适应      │
+│  ├─ HilbertOptimalSplitter (推荐)   │
+│  │   或 HilbertOrderedEntmaxSplitter│
 │  └─ HilbertSort: 曲线排序           │
 └─────────────────────────────────────┘
        │
@@ -181,6 +183,24 @@ analysis = model.analyze_tokenization(img)
 
 # Transformer tokens
 logits, tokens, lengths = model(img, return_tokens=True)
+```
+
+### 支持的分割器
+
+| 分割器 | 适用场景 |
+|:-------|:---------|
+| **HilbertOptimalSplitter** | 推荐默认选择，基于6条数学公理 |
+| HilbertOrderedEntmaxSplitter | 100% 梯度覆盖率（vs Gumbel-STE 的 37%） |
+
+### 双路径模式
+
+```python
+# 启用双路径模式（V2 功能）
+model = FractalCurveViT(
+    image_size=224,
+    num_classes=1000,
+    use_pattern_plugin=True,  # 启用双路径模式
+)
 ```
 
 ## 训练

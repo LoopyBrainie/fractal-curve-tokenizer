@@ -524,9 +524,125 @@ python examples/training/train_fractal_vit.py \
 | BudgetScheduler | ✅ Complete | `training.schedulers` |
 | ModularTrainer | ✅ Complete | `training.trainer` |
 | ConfigLoader | ✅ Complete | `training.config` |
+| NumericalConfig | ✅ Complete | `training.config` |
+| MixedPrecisionConfig | ✅ Complete | `training.config` |
+| CheckpointConfig | ✅ Complete | `training.config` |
+| DataConfig | ✅ Complete | `training.config` |
 | W&B Integration | ⏳ Pending | - |
 | Visualization Panel | ⏳ Pending | - |
 
 **Tests**: 31/31 passing
+
+---
+
+## 9.15 Configuration Classes
+
+### 9.15.1 NumericalConfig
+
+Controls numerical stability and gradient monitoring:
+
+```python
+from training.config import NumericalConfig
+
+config = NumericalConfig(
+    detect_anomaly=False,       # Enable torch.autograd.set_detect_anomaly
+    check_gradients=True,      # Check for NaN/Inf gradients
+    skip_on_nan_grad=True,    # Skip batch on NaN gradient
+    record_grad_norms=True,   # Record gradient norms
+    record_layer_grad_norms=True,  # Record per-layer gradients
+    record_loss_components=True,   # Record loss component breakdown
+)
+```
+
+### 9.15.2 MixedPrecisionConfig
+
+Controls automatic mixed precision (AMP) training:
+
+```python
+from training.config import MixedPrecisionConfig
+
+config = MixedPrecisionConfig(
+    enabled=True,           # Enable AMP
+    opt_level="O1",         # O1 or O2
+    loss_scale=None,        # None for dynamic, or fixed float
+)
+```
+
+### 9.15.3 CheckpointConfig
+
+Controls checkpoint saving behavior:
+
+```python
+from training.config import CheckpointConfig
+
+config = CheckpointConfig(
+    checkpoint_dir="./checkpoints",
+    save_best=True,         # Save best model
+    save_last=True,         # Save last checkpoint
+    save_interval=10,       # Save every N epochs
+    monitor_metric="val_accuracy",  # Metric to monitor
+    monitor_mode="max",    # "max" or "min"
+)
+```
+
+### 9.15.4 DataConfig
+
+Controls data loading and augmentation:
+
+```python
+from training.config import DataConfig
+
+config = DataConfig(
+    dataset="tiny-imagenet",
+    data_dir="./data",
+    num_workers=4,
+    pin_memory=True,
+    prefetch_factor=2,
+    persistent_workers=True,
+    image_size=64,
+    augment=True,
+    auto_augment="rand-m9-mstd0.5",  # RandAugment policy
+)
+```
+
+### 9.15.5 Complete Config Usage
+
+```python
+from training.config import (
+    Config,
+    TrainingHyperparams,
+    NumericalConfig,
+    MixedPrecisionConfig,
+    CheckpointConfig,
+    DataConfig,
+)
+
+config = Config(
+    training=TrainingHyperparams(
+        num_epochs=100,
+        batch_size=128,
+        base_lr=5e-4,
+        weight_decay=0.05,
+    ),
+    numerical=NumericalConfig(
+        detect_anomaly=False,
+        check_gradients=True,
+    ),
+    amp=MixedPrecisionConfig(
+        enabled=True,
+        opt_level="O1",
+    ),
+    checkpoint=CheckpointConfig(
+        save_best=True,
+        monitor_metric="val_accuracy",
+    ),
+    data=DataConfig(
+        dataset="tiny-imagenet",
+        augment=True,
+    ),
+    seed=42,
+    output_dir="./outputs",
+)
+```
 
 > **Next**: [10_testing_qa.md](10_testing_qa.md) - Testing and QA
