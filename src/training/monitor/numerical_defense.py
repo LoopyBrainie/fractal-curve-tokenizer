@@ -265,15 +265,27 @@ def check_tensor_numerical_health(
     Returns:
         Dictionary of health metrics
     """
-    result = {
-        "name": name,
-        "has_nan": torch.isnan(tensor).any().item(),
-        "has_inf": torch.isinf(tensor).any().item(),
-        "min": tensor.min().item() if tensor.numel() > 0 else None,
-        "max": tensor.max().item() if tensor.numel() > 0 else None,
-        "mean": tensor.mean().item() if tensor.numel() > 0 else None,
-        "std": tensor.std().item() if tensor.numel() > 0 else None,
-    }
+    # I-OPT: 先在GPU上计算所有统计量，最后批量调用 .item()
+    # 所有GPU操作独立可并行，只在最后同步一次
+    if tensor.numel() > 0:
+        has_nan_t = torch.isnan(tensor).any()
+        has_inf_t = torch.isinf(tensor).any()
+        min_t = tensor.min()
+        max_t = tensor.max()
+        mean_t = tensor.mean()
+        std_t = tensor.std()
+        # 批量 .item() - GPU计算已完成，等待一次同步
+        result = {
+            "name": name,
+            "has_nan": has_nan_t.item(),
+            "has_inf": has_inf_t.item(),
+            "min": min_t.item(),
+            "max": max_t.item(),
+            "mean": mean_t.item(),
+            "std": std_t.item(),
+        }
+    else:
+        result = {"name": name, "has_nan": False, "has_inf": False, "min": None, "max": None, "mean": None, "std": None}
 
     has_issues = result["has_nan"] or result["has_inf"]
 
@@ -339,15 +351,24 @@ class ActivationStatsCollector:
         else:
             t_flat = t.unsqueeze(0)
 
-        # 计算统计
+        # I-OPT: 先在GPU上计算所有统计量，最后批量调用 .item()
+        # 原实现每个 .item() 触发一次同步，共7次；优化后重叠GPU计算，只在最后同步
+        mean_t = t_flat.mean()
+        std_t = t_flat.std()
+        min_t = t_flat.min()
+        max_t = t_flat.max()
+        norm_t = t_flat.norm()
+        has_nan_t = torch.isnan(t_flat).any()
+        has_inf_t = torch.isinf(t_flat).any()
+        # 批量 .item() - 所有GPU计算已完成
         self.stats[name] = {
-            "mean": t_flat.mean().item(),
-            "std": t_flat.std().item(),
-            "min": t_flat.min().item(),
-            "max": t_flat.max().item(),
-            "norm": t_flat.norm().item(),
-            "has_nan": torch.isnan(t_flat).any().item(),
-            "has_inf": torch.isinf(t_flat).any().item(),
+            "mean": mean_t.item(),
+            "std": std_t.item(),
+            "min": min_t.item(),
+            "max": max_t.item(),
+            "norm": norm_t.item(),
+            "has_nan": has_nan_t.item(),
+            "has_inf": has_inf_t.item(),
         }
 
     def get_stats(self) -> Dict[str, Dict[str, float]]:

@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 
 from ..config import Config
 from .state import TrainingState, EpochMetrics
-from .loss import MixupCutmixLoss, compute_loss
+from .loss import MixupCutmixLoss, compute_loss, FractalViTLoss
 from ..monitor.gradient_monitor import GradientMonitor
 from ..monitor.loss_monitor import LossMonitor
 from ..monitor.numerical_defense import NumericalDefender, NaNAutoInvestigation, dump_debug_info
@@ -33,6 +33,7 @@ def train_one_epoch(
     device: torch.device,
     scheduler: Optional[Any] = None,
     mixup_cutmix: Optional[MixupCutmixLoss] = None,
+    fractal_loss: Optional[FractalViTLoss] = None,  # I-NAN: H1SS 可微辅助损失
     debug_dir: Optional[str] = None,
 ) -> EpochMetrics:
     """Train for one epoch
@@ -150,6 +151,8 @@ def train_one_epoch(
             targets = torch.nn.functional.one_hot(labels, model.num_classes).float() if labels is not None else None
 
         # Forward pass with AMP
+        # I-OPT: 预初始化用于延迟 .item() 转换
+        _pending_batch_tokens_t = None  # GPU tensor, .item() 在 autocast 块外调用
         with amp_autocast('cuda', enabled=config.amp.enabled):
             outputs = model(images)
 
@@ -160,14 +163,11 @@ def train_one_epoch(
                 # Extract token info if available
                 if hasattr(outputs, 'num_tokens'):
                     num_tokens_raw = outputs.num_tokens
-                    # Handle different types (int, tensor, list)
+                    # I-OPT: 存储 tensor，在 autocast 块外调用 .item()
                     if isinstance(num_tokens_raw, torch.Tensor):
-                        batch_tokens = num_tokens_raw.float().mean().item()
+                        _pending_batch_tokens_t = num_tokens_raw.float().mean()
                     elif isinstance(num_tokens_raw, (int, float)):
-                        batch_tokens = float(num_tokens_raw)
-                    else:
-                        batch_tokens = float(sum(num_tokens_raw) / len(num_tokens_raw))
-                    total_tokens += batch_tokens
+                        _pending_batch_tokens_t = None
 
                 # 新增: 提取实验详细日志指标
                 if hasattr(outputs, 'splitter_logits_mean'):
@@ -202,10 +202,29 @@ def train_one_epoch(
 
             # Compute loss
             if targets is not None:
-                loss, loss_components = compute_loss(logits, targets)
+                # I-NAN: 优先使用 FractalViTLoss（H1SS 可微辅助损失）
+                if fractal_loss is not None and hasattr(outputs, 'splitter_outputs') and outputs.splitter_outputs is not None:
+                    # 从模型获取 expected_k（splitter 的 K_max 或 K_min）
+                    expected_k = config.training.get('expected_k', 32.0)
+                    if hasattr(model, 'splitter') and hasattr(model.splitter, 'K_max'):
+                        expected_k = float(model.splitter.K_max)
+                    # 获取全局 Hilbert 排序索引（用于 TV Loss 在全量 probs 上计算）
+                    full_hilbert_indices = None
+                    if hasattr(model, 'splitter') and hasattr(model.splitter, 'hilbert_indices'):
+                        full_hilbert_indices = model.splitter.hilbert_indices
+                    loss, loss_components = fractal_loss(
+                        logits, targets, outputs.splitter_outputs, expected_k, full_hilbert_indices
+                    )
+                else:
+                    loss, loss_components = compute_loss(logits, targets)
             else:
                 # Fallback if no targets
                 loss = torch.tensor(0.0, device=device)
+                loss_components = {}
+
+        # I-OPT: 在 autocast 块外执行 .item() 转换（GPU 计算已完成）
+        if _pending_batch_tokens_t is not None:
+            total_tokens += _pending_batch_tokens_t.item()
 
         # Record loss components
         if config.numerical.record_loss_components:
@@ -251,13 +270,12 @@ def train_one_epoch(
                 peak_memory_mb = current_memory_mb
 
         # I-NAN: 计算裁剪前的梯度范数（用于 NaN 调试）
+        # I-OPT: 在 GPU 上批量计算 norm，最后一次性 .item()
         pre_clip_grad_norm = 0.0
         try:
-            pre_clip_grad_norm = sum(
-                p.grad.norm().item()
-                for p in model.parameters()
-                if p.grad is not None
-            ) or 0.0
+            grad_norms = [p.grad.norm() for p in model.parameters() if p.grad is not None]
+            if grad_norms:
+                pre_clip_grad_norm = torch.stack(grad_norms).sum().item()
         except Exception:
             pass
 

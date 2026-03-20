@@ -279,8 +279,152 @@ class AuxiliaryLossTracker:
         self.counts.clear()
 
 
+class FractalViTLoss(nn.Module):
+    """整合 Mixup/Cutmix + H1SS 可微辅助损失
+
+    数学形式:
+        L_total = L_CE + λ_budget * L_budget + λ_tv * L_tv
+
+        其中:
+        - L_budget = MSE(Σ_i p_i, K)        # 连续配额损失
+        - L_tv = E[|p_{i+1} - p_i|]        # Hilbert 全变分连续性损失
+
+    Hilbert 全变分损失的物理意义:
+        - 相邻 Hilbert 位置的概率突变被惩罚
+        - 促进"同选或同不选"的局部一致性
+        - A1 Locality 公理的端到端实现
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        expected_k: float = 32.0,
+        budget_weight: float = 0.05,
+        tv_weight: float = 0.1,
+        label_smoothing: float = 0.0,
+    ):
+        """
+        Args:
+            num_classes: 分类类别数
+            expected_k: 期望的 Token 数量（预算）
+            budget_weight: 配额损失权重
+            tv_weight: 全变分损失权重
+            label_smoothing: 标签平滑因子
+        """
+        super().__init__()
+        self.num_classes = num_classes
+        self.expected_k = expected_k
+        self.budget_weight = budget_weight
+        self.tv_weight = tv_weight
+        self.label_smoothing = label_smoothing
+
+    def _compute_budget_loss(self, probs: torch.Tensor, expected_k: float) -> torch.Tensor:
+        """连续配额损失 (Continuous Budget Loss)
+
+        数学: L_budget = MSE(Σ_i p_i, K)
+
+        目标: Entmax 输出的概率总和等于期望的 Token 数量 K
+        这使得 E[|S|] = K，实现 A5 Consistency 公理
+        """
+        # probs: [B, N] - 所有候选的分割概率
+        current_k = probs.sum(dim=-1)  # [B] - 每个 batch 的实际 token 数量
+        budget_loss = F.mse_loss(current_k, torch.full_like(current_k, expected_k))
+        return budget_loss
+
+    def _compute_tv_loss(
+        self,
+        probs: torch.Tensor,
+        full_hilbert_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Hilbert 全变分连续性损失 (1D Total Variation Loss)
+
+        数学: L_tv = E[|p_{i+1} - p_i|]  在 Hilbert 1D 序列上
+
+        目标: 惩罚在 Hilbert 1D 序列上突变的分裂概率
+        相邻区域（同属一个空间局部流形）应同选或同不选
+
+        实现要点:
+        - 直接在全量 probs [B, N] 上按全局 Hilbert 顺序计算 TV
+        - full_hilbert_indices [N] 来自 splitter.hilbert_indices
+        - 这确保了选中区域与未选中区域边界之间也有梯度约束
+        """
+        if probs is None or full_hilbert_indices is None:
+            return torch.tensor(0.0, device=probs.device if probs is not None else 'cpu')
+
+        # 获取全局 Hilbert 排序索引
+        sort_idx = torch.argsort(full_hilbert_indices)  # [N]
+
+        # 对所有 Batch 按 Hilbert 顺序重排 probs
+        # probs: [B, N] -> sorted_probs: [B, N]
+        # 利用广播效应沿 B 维度同时排序
+        sorted_probs = probs[:, sort_idx]  # [B, N]
+
+        # 计算相邻概率的绝对差
+        # sorted_probs[:, 1:] - sorted_probs[:, :-1] -> [B, N-1]
+        tv_diffs = torch.abs(sorted_probs[:, 1:] - sorted_probs[:, :-1])  # [B, N-1]
+
+        # 返回均值
+        return tv_diffs.mean()
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        splitter_outputs,
+        expected_k: float,
+        full_hilbert_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, dict]:
+        """前向传播
+
+        Args:
+            logits: [B, C] 模型输出的分类 logits
+            targets: [B, C] (one-hot, Mixup/Cutmix) 或 [B] (class indices)
+            splitter_outputs: SplitResult 对象，包含 probs
+            expected_k: 期望的 Token 数量
+            full_hilbert_indices: [N] 全局 Hilbert 排序索引（来自 splitter.hilbert_indices）
+
+        Returns:
+            total_loss: 组合损失
+            components: 各损失分量的字典
+        """
+        # 1. 交叉熵损失
+        if targets.dim() == 2:
+            # One-hot targets (来自 Mixup/Cutmix)
+            log_probs = F.log_softmax(logits, dim=-1)
+            ce_loss = -torch.sum(targets * log_probs, dim=-1).mean()
+        else:
+            # Standard targets
+            ce_loss = F.cross_entropy(
+                logits, targets,
+                label_smoothing=self.label_smoothing if self.label_smoothing > 0 else 0.0,
+            )
+
+        # 2. 连续配额损失 (Continuous Budget Loss)
+        budget_loss = self._compute_budget_loss(splitter_outputs.probs, expected_k)
+
+        # 3. Hilbert 全变分连续性损失（使用全量 probs 和全局 Hilbert 排序）
+        if full_hilbert_indices is not None:
+            tv_loss = self._compute_tv_loss(splitter_outputs.probs, full_hilbert_indices)
+        else:
+            tv_loss = torch.tensor(0.0, device=logits.device)
+
+        # 4. 组合损失
+        total_loss = ce_loss + self.budget_weight * budget_loss + self.tv_weight * tv_loss
+
+        # 5. 构建分量字典
+        components = {
+            "cross_entropy": ce_loss.detach(),
+            "budget_loss": budget_loss.detach(),
+            "tv_loss": tv_loss.detach(),
+            "total": total_loss.detach(),
+        }
+
+        return total_loss, components
+
+
 __all__ = [
     "MixupCutmixLoss",
+    "FractalViTLoss",
     "compute_loss",
     "compute_label_smoothing_loss",
     "AuxiliaryLossTracker",
