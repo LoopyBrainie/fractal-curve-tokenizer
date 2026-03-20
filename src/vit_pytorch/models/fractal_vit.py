@@ -54,6 +54,7 @@ from vit_pytorch.core.constants import (
     LOGIT_CLAMP_BOUND,  # I147: 添加钳制边界导入
 )
 from vit_pytorch.core.config import AttentionEncoderConfig, SemanticSplitterConfig  # I98-3, I110-5
+from vit_pytorch.core.splitter_protocol import SplitResult  # I-NAN: H1SS 辅助损失
 from vit_pytorch.core.pattern_encoder import (
     HilbertPatternEncoder,
     HilbertPatternEncoderLight,
@@ -165,6 +166,9 @@ class TrainingStats:
     semantic_loss: Optional[torch.Tensor] = None  # 语义冗余损失
     child_features: Optional[torch.Tensor] = None  # 预测的子节点特征 [B, N, 4, D]
     redundancy: Optional[torch.Tensor] = None  # 冗余性分数 [B, N]
+
+    # I-NAN: H1SS 可微辅助损失 - SplitResult 对象包含 probs 和 hilbert_indices
+    splitter_outputs: Optional[SplitResult] = None  # 分裂器输出，用于辅助损失计算
 
     # === 向后兼容字段 (I112) ===
     aux_infos: Optional[List[Dict[str, Any]]] = None  # 评估层期望的 aux_infos 格式
@@ -340,8 +344,8 @@ class FractalCurveViT(nn.Module):
         # I145-H1SS: HilbertOptimalSplitter 特定参数
         jump_loss_weight: Optional[float] = None,  # H1SS Jump Loss 权重
         density_field_hidden_dim: Optional[int] = None,  # H1SS Density Field 隐藏层维度
-        # I130-3: Splitter 类型选择 (I145: 新增 semantic_redundancy 支持)
-        splitter_type: str = 'gumbel_topk',  # 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy', 'hilbert_optimal'
+        # I130-3: Splitter 类型选择 (I145: 新增 semantic_redundancy, I164: 默认hilbert_optimal)
+        splitter_type: str = 'hilbert_optimal',  # 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy', 'hilbert_optimal'
         # I170-NEW: Hilbert 平滑参数 (I165-1: 解决空间碎片化)
         enable_hilbert_smoothness: bool = False,  # 是否启用 Hilbert 感知平滑
         hilbert_smoothness_weight: float = 0.1,  # 平滑损失权重
@@ -1121,7 +1125,7 @@ class FractalCurveViT(nn.Module):
         if self._dynamic_image_size:
             actual_size = (img.shape[2], img.shape[3])  # (H, W)
             if actual_size != self._cached_image_size:
-                self.splitter._update_candidates(actual_size)
+                self.splitter.update_candidates(actual_size)
                 self._cached_image_size = actual_size
 
         # I98-1: Pipeline 架构 - 先调用 Splitter，再调用 Tokenizer
@@ -1151,6 +1155,7 @@ class FractalCurveViT(nn.Module):
                 features,
                 image_size=(img.shape[2], img.shape[3]),
                 hard=use_hard,
+                epoch=getattr(self, '_current_epoch', 0),
             )
             # Tokenizer 使用 Splitter 的结果进行 embedding
             token_output = self.tokenizer.tokenize(img, split_result)
@@ -1435,7 +1440,7 @@ class FractalCurveViT(nn.Module):
                     valid_mask = torch.arange(max_len, device=split_probs.device).unsqueeze(0) < lengths.unsqueeze(1)
                     # 掩码概率，填充为 1.0 (log(1)=0，不影响求和)
                     probs_masked = torch.where(valid_mask, split_probs, torch.ones_like(split_probs))
-                    probs_safe = probs_masked + (probs_masked == 0).float() * PROB_EPSILON
+                    probs_safe = probs_masked + (probs_masked == 0).to(probs_masked.dtype) * PROB_EPSILON
                     # 计算每个样本的熵 [B]
                     entropies_gpu = -(probs_safe * torch.log(probs_safe)).sum(dim=1)
                     # 最后一次性转换为 Python float
@@ -1745,6 +1750,7 @@ class FractalCurveViT(nn.Module):
             redundancy=redundancy,  # I170: 语义分裂器的冗余性分数
             child_features=child_features,  # I170: 语义分裂器的子节点特征
             mean_abs_logits=mean_abs_logits,  # I150-3 NEW: Splitter Logits 平均绝对值
+            splitter_outputs=split_result,  # I-NAN: H1SS 辅助损失
         )
 
         return stats
@@ -1852,6 +1858,7 @@ class FractalCurveViT(nn.Module):
                 features,
                 image_size=(img.shape[2], img.shape[3]),
                 hard=True,
+                epoch=getattr(self, '_current_epoch', 0),
             )
             token_output = self.tokenizer.tokenize(img, split_result)
             legacy_output = token_output.to_legacy()
