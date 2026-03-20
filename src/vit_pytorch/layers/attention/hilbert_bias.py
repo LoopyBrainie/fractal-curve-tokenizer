@@ -1297,19 +1297,22 @@ class   HilbertAwareMultiScaleAttention(nn.Module):
             if attention_mask is not None:
                 # P-OPT: avoid float() cast - use q.dtype directly for Tensor Core
                 attn_mask = attention_mask.to(dtype=q.dtype).squeeze(1).unsqueeze(-1)  # [B, 1, 1, N]
-                attn_mask = (1.0 - attn_mask) * torch.finfo(q.dtype).min
+                # I-NAN: finfo.min 在 FP16 下可能溢出(-60000 > FP16 min=-65504 边界)
+                # 使用 -1e4 作为安全值：足够小使 softmax→0，同时不超过 FP16 范围
+                attn_mask = (1.0 - attn_mask) * (-1e4)
             else:
                 attn_mask = None
 
             # 修复: 移除 N-Dependent Scaling，使用标准 Transformer 缩放
             d_head = q.shape[-1]
             temperature = torch.exp(self.log_temperature)
-            flash_scale = self.scale * temperature  # 标准 1/sqrt(d_head) × 温度补偿
-
+            flash_scale = self.scale * temperature  # float (scale=float, temperature=0-dim tensor)
+            # I-NAN: scale 必须是 float，scaled_dot_product_attention 不接受 tensor
+            # 此 .item() 仅执行一次（在 flash_branch 内），非循环内，损失可忽略
             attn = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_mask,
-                scale=flash_scale,
+                scale=flash_scale.item(),
             )
 
             # I24-11: 条件存储注意力权重 (评估时启用)

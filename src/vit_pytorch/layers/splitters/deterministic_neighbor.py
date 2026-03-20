@@ -269,17 +269,20 @@ class HilbertNeighborMatrix(nn.Module):
                 col_indices.extend([i] * len(valid_neighbors))
 
         # 构建稀疏矩阵 (COO格式) 并转密集返回
+        # I-OPT: 避免单独的 coalesce() 调用，改用直接构建对称稀疏后求和
+        # 原实现先 coalesce 再 to_dense，coalesce 是 O(N log N) 排序
         if len(row_indices) > 0:
-            indices = torch.stack([
-                torch.tensor(row_indices, dtype=torch.long, device=device),
-                torch.tensor(col_indices, dtype=torch.long, device=device)
-            ], dim=0)
-            values = torch.ones(len(row_indices), dtype=torch.float32, device=device)
-            adj_sparse = torch.sparse_coo_tensor(indices, values, size=(N, N)).coalesce()
-            adj = adj_sparse.to_dense()
+            row_t = torch.tensor(row_indices, dtype=torch.long, device=device)
+            col_t = torch.tensor(col_indices, dtype=torch.long, device=device)
+            ones = torch.ones(len(row_indices), dtype=torch.float32, device=device)
+            # 构建对称稀疏: adj_sparse[i,j] = 1 和 adj_sparse[j,i] = 1
+            indices = torch.stack([row_t, col_t], dim=0)
+            adj_sparse = torch.sparse_coo_tensor(indices, ones, size=(N, N), device=device)
+            adj = adj_sparse.to_dense() + adj_sparse.t().to_dense()
+            adj = (adj > 0).float()
         else:
             # 空邻接矩阵
-            adj = torch.zeros(N, N, device=device)
+            adj = torch.zeros(N, N, device=device, dtype=torch.float32)
 
         return adj
 

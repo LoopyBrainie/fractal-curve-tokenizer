@@ -69,9 +69,11 @@ def poincare_distance(
     torch.Tensor
         双曲距离矩阵，形状 [B, N, N] 或 [N, N]
     """
-    # I-NAN: 强制 FP32 计算，防止精度下溢
+    # I-NAN: 保持 AMP 兼容 - 使用 to(dtype) 而非 float()
+    # coords.to(torch.float32) 在 AMP 下会转换为 FP32 进行计算
+    # 同时避免 float() 强制转换破坏 AMP 上下文
     orig_dtype = coords.dtype
-    coords_fp32 = coords.float()
+    coords_fp32 = coords.to(torch.float32)
 
     was_2d = coords_fp32.dim() == 2
     if was_2d:
@@ -131,8 +133,27 @@ def poincare_distance(
 
     distance = torch.acosh(x)
 
-    # I-NAN: 裁剪输出距离，防止梯度爆炸
-    distance = distance.clamp(max=10.0)
+    # ========== Soft Clamp (梯度保持) ==========
+    # 原: distance = distance.clamp(max=10.0)
+    # 硬截断问题: 当 distance > 10 时，∂distance/∂x = 0，梯度消失
+    #
+    # 软截断数学:
+    #   d_soft = x * σ((x - x_max) / γ) + x_max * (1 - σ((x - x_max) / γ))
+    #          = x_max - (x_max - x) * σ((x_max - x) / γ)
+    #
+    # 性质:
+    #   - x < x_max: d_soft ≈ x (恒等映射)
+    #   - x = x_max: 连续可微，导数 = 0.5
+    #   - x > x_max: 平滑趋向 x_max，导数 > 0 (vs 硬截断 = 0)
+    #
+    # Hilbert locality: 完全保留，只在远距离时起作用
+    # ===========================================
+    MAX_DIST = 10.0
+    GAMMA = 0.5  # 软化系数
+
+    x_above_max = (distance - MAX_DIST).clamp(min=0)  # (x - x_max)^+
+    soft_scale = torch.sigmoid(x_above_max / GAMMA)
+    distance = distance * soft_scale + MAX_DIST * (1 - soft_scale)
 
     if was_2d:
         distance = distance.squeeze(0)

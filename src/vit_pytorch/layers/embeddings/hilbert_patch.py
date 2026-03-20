@@ -488,7 +488,8 @@ class HilbertNativePatchEmbed(nn.Module):
         for i in range(len(depth_bins) - 1):
             low, high = depth_bins[i], depth_bins[i + 1]
             mask = (depths >= low) & (depths < high)
-            if not mask.any():
+            # I-OPT: 使用 .sum() 避免 .any() 的隐式 CPU-GPU 同步
+            if mask.sum() == 0:
                 continue
 
             indices = mask.nonzero(as_tuple=True)[0]
@@ -514,7 +515,7 @@ class HilbertNativePatchEmbed(nn.Module):
             return torch.zeros(0, features.shape[1], device=features.device, dtype=features.dtype)
 
         # 按原始顺序合并
-        all_pooled = torch.zeros(len(depths), features.shape[1], device=features.device, dtype=features.dtype)
+        all_pooled = torch.zeros(depths.shape[0], features.shape[1], device=features.device, dtype=features.dtype)
         for pooled, indices in zip(pooled_list, indices_list):
             all_pooled[indices] = pooled
 
@@ -571,14 +572,6 @@ class HilbertNativePatchEmbed(nn.Module):
         x2 = boxes[:, 3]
         y2 = boxes[:, 4]
 
-        # 计算中心点坐标 (在 [0, 1] 范围内)
-        cx = ((x1 + x2) / 2) / W  # 归一化到 [0, 1]
-        cy = ((y1 + y2) / 2) / H
-
-        # 计算 box 宽高 (用于动态采样密度)
-        box_w = (x2 - x1) / W
-        box_h = (y2 - y1) / H
-
         # 根据深度调整采样密度
         # 浅层 (大区域): 2x2 采样
         # 中层: 3x3 采样
@@ -586,89 +579,79 @@ class HilbertNativePatchEmbed(nn.Module):
         depth_bins = [0, 2, 4, self.max_level + 1]
         sample_sizes = [2, 3, 4]
 
-        # 创建采样网格
-        # 对于每个 box，在 [-1, 1] 坐标空间创建均匀网格
-        grids = []
-        sample_size = 3  # 默认使用 3x3 采样
+        # I-OPT: 向量化深度→sample_size 映射，替代逐个 .item()
+        # 使用 searchsorted 批量计算所有 box 的采样大小
+        depth_bins_t = torch.tensor(depth_bins, device=depths.device, dtype=torch.float32)
+        bin_indices = torch.searchsorted(depth_bins_t, depths.float()) - 1
+        bin_indices = bin_indices.clamp(0, len(sample_sizes) - 1)
+        sample_sizes_t = torch.tensor(sample_sizes, device=depths.device, dtype=torch.long)[bin_indices]
 
-        for i in range(N):
-            d = depths[i].item()
-            # 确定采样大小
-            for j in range(len(depth_bins) - 1):
-                if depth_bins[j] <= d < depth_bins[j + 1]:
-                    sample_size = sample_sizes[j]
-                    break
+        # I-OPT: 按 sample_size 分组，每组批量处理所有 boxes
+        # 替代逐 box 的 F.grid_sample 调用 (N×B 次 → 最多 3 次)
+        pooled_results = {}
 
-            # 创建当前 box 的采样网格
-            # 将 [cx-box_w/2, cx+box_w/2] 映射到 [-1, 1]
-            x_start = cx[i] - box_w[i] / 2
-            x_end = cx[i] + box_w[i] / 2
-            y_start = cy[i] - box_h[i] / 2
-            y_end = cy[i] + box_h[i] / 2
-
-            # 创建均匀网格并归一化到 [-1, 1]
-            x_grid = torch.linspace(x_start, x_end, sample_size, device=features.device)
-            y_grid = torch.linspace(y_start, y_end, sample_size, device=features.device)
-
-            # 创建网格坐标 [sample_size, sample_size, 2]
-            yy, xx = torch.meshgrid(y_grid, x_grid, indexing='ij')
-            grid = torch.stack([xx, yy], dim=-1)  # [sample_size, sample_size, 2]
-
-            # 归一化到 [-1, 1] (grid_sample 格式)
-            grid = grid * 2 - 1
-
-            grids.append(grid)
-
-        # 收集每个 batch 的特征并分别采样
-        pooled_list = []
-
-        for b in range(B):
-            # 找到当前 batch 的所有 boxes
-            batch_mask = batch_indices == b
-            if not batch_mask.any():
+        for ss in sample_sizes:
+            ss_mask = sample_sizes_t == ss
+            if ss_mask.sum() == 0:
                 continue
+            ss_indices = ss_mask.nonzero(as_tuple=True)[0]  # box indices for this sample_size
+            N_ss = len(ss_indices)
 
-            batch_grids = torch.stack([grids[i] for i in range(N) if batch_indices[i] == b])
+            # 获取该组所有 box 的坐标 (在 [0, 1] 范围)
+            x1_ss = x1[ss_indices]
+            y1_ss = y1[ss_indices]
+            x2_ss = x2[ss_indices]
+            y2_ss = y2[ss_indices]
+            batch_idx_ss = batch_indices[ss_indices]
 
-            # 获取当前 batch 的特征
-            feat = features[b]  # [D, H, W]
+            # 计算归一化中心点和尺寸 (boxes 在 feature map 坐标 [0, W), [0, H))
+            cx_ss = ((x1_ss + x2_ss) / 2) / W  # 归一化到 [0, 1]
+            cy_ss = ((y1_ss + y2_ss) / 2) / H
+            bw_ss = (x2_ss - x1_ss) / W  # 归一化到 [0, 1]
+            bh_ss = (y2_ss - y1_ss) / H
 
-            # 为每个 box 创建采样网格
-            # grid_sample 需要 [N, H, W, 2] 或 [N, 2, H, W]
-            N_batch = batch_grids.shape[0]
+            # 采样点坐标 (在 [0, 1] 范围)
+            x_coords = (cx_ss - bw_ss / 2).unsqueeze(1) + (bw_ss / (ss - 1)).unsqueeze(1) * torch.arange(ss, device=features.device, dtype=torch.float32)
+            y_coords = (cy_ss - bh_ss / 2).unsqueeze(1) + (bh_ss / (ss - 1)).unsqueeze(1) * torch.arange(ss, device=features.device, dtype=torch.float32)
 
-            # 对每个 box 分别采样
-            batch_pooled = []
-            for i in range(N_batch):
-                grid = batch_grids[i]  # [sample_size, sample_size, 2]
-                # grid_sample 需要 [1, 2, H, W] 或 [N, H, W, 2]
-                grid = grid.unsqueeze(0)  # [1, H, W, 2]
+            # 创建批量网格 [N_ss, ss, ss, 2]
+            yy = y_coords.unsqueeze(2).expand(N_ss, ss, ss)  # [N_ss, 1, ss] -> [N_ss, ss, ss]
+            xx = x_coords.unsqueeze(1).expand(N_ss, ss, ss)
+            grids = torch.stack([xx, yy], dim=-1)  # [N_ss, ss, ss, 2]
+            grids = grids * 2 - 1  # 映射到 [-1, 1]
 
-                # 双线性插值采样
+            # 批量 grid_sample: 按 batch 分组处理
+            for b in range(B):
+                b_mask = batch_idx_ss == b
+                if b_mask.sum() == 0:
+                    continue
+                b_grids = grids[b_mask]  # [N_b, ss, ss, 2]
+                feat = features[b]  # [D, H, W]
+
+                # 批量采样 (单次 kernel launch)
+                # [N_b, D, ss, ss]
                 sampled = F.grid_sample(
-                    feat.unsqueeze(0),  # [1, D, H, W]
-                    grid,
+                    feat.unsqueeze(0).expand(b_grids.shape[0], -1, -1, -1),
+                    b_grids,
                     mode='bilinear',
                     padding_mode='zeros',
                     align_corners=True
-                )  # [1, D, H, W]
+                )  # [N_b, D, ss, ss]
 
                 # 全局平均池化
-                pooled = sampled.squeeze(0).mean(dim=(1, 2))  # [D]
-                batch_pooled.append(pooled)
+                pooled = sampled.mean(dim=(2, 3))  # [N_b, D]
 
-            if batch_pooled:
-                pooled_list.append(torch.stack(batch_pooled))
+                # 记录结果
+                for j, idx in enumerate(ss_indices[b_mask].tolist()):
+                    pooled_results[idx] = pooled[j]
 
-        # 合并所有 batch 的结果
-        if pooled_list:
-            all_pooled = torch.cat(pooled_list, dim=0)  # [N, D]
+        # 组装最终结果 (按原始顺序)
+        if pooled_results:
+            all_pooled = torch.stack([pooled_results[i] for i in range(N) if i in pooled_results])
         else:
             all_pooled = torch.zeros(N, D, device=features.device, dtype=features.dtype)
 
-        # 按原始顺序重排
-        result = torch.zeros(N, D, device=features.device, dtype=features.dtype)
-        result[batch_indices] = all_pooled
+        result = all_pooled
 
         return result
 

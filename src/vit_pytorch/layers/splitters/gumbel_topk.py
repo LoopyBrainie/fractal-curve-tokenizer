@@ -844,8 +844,9 @@ class ContinuousQuotaAllocator(nn.Module):
 
         # 分配给余数最大的深度 (使用 STE)
         # topk 操作在 no_grad 中是安全的，因为索引操作本身不可微
+        # I-OPT: 使用 .long() 而非 .item() 避免 GPU-CPU 同步
         with torch.no_grad():
-            k = min(int(remaining_clamped.item()), self.D)
+            k = min(remaining_clamped.long().item(), self.D)
             if k > 0:
                 k = min(k, self.D)
                 _, indices = torch.topk(remainders, k)
@@ -880,11 +881,13 @@ class ContinuousQuotaAllocator(nn.Module):
         tau = self.temperature
         q = F.softmax(self.quota_logits / tau, dim=0)
 
-        # 数值稳定的 KL 散度: KL(target || q)
-        # 使用 log_target - log_q 格式确保数值稳定
+        # 数值稳定的 KL 散度: KL(target_dist || q)
+        # F.kl_div(input, target) 计算 target * (log(target) - log(input))
+        # input 必须是 log-概率，所以用 q.log()；target 是目标分布 target_dist
+        # 这样计算的是 KL(target_dist || q) = sum(target_dist * (log(target_dist) - log(q)))
         loss = F.kl_div(
+            q.log(),
             target_dist,
-            q,
             reduction='sum'
         )
 
@@ -2691,8 +2694,20 @@ class GumbelTopKSplitter(
             else:
                 _, topk_indices_local = torch.topk(probs, k=K, dim=-1)
 
-            # P-OPT: 使用 scatter_ 创建掩码（保持与之前兼容）
-            mask_ste = torch.zeros_like(probs).scatter_(dim=-1, index=topk_indices_local, value=1.0)
+            # P-OPT: 根据 hard 参数选择掩码类型
+            # hard=True: 构建硬掩码（0/1），用于推理
+            # hard=False: 使用 probs 作为软掩码，用于训练（保持梯度追踪）
+            if hard:
+                # 推理模式：构建硬掩码
+                hard_mask = torch.zeros(B, N, device=device, dtype=probs.dtype)
+                topk_indices_clamped = topk_indices_local.clamp(max=N - 1)
+                hard_mask.scatter_(1, topk_indices_clamped, 1.0)
+                mask_ste = hard_mask
+            else:
+                # 训练模式：使用 probs 作为掩码（保持梯度追踪）
+                # 问题: torch.zeros_like(probs).scatter_() 创建无梯度追踪的硬掩码
+                # 解决: 使用 probs 替代硬掩码 - 有梯度追踪，且语义正确（软概率）
+                mask_ste = probs  # probs 有完整的梯度追踪到 features
 
             # 缓存供后续使用
             self._cached_mask_ste = mask_ste
@@ -2724,7 +2739,10 @@ class GumbelTopKSplitter(
                 logits=logits,
                 probs=probs,
                 candidate_indices=all_indices_1d.unsqueeze(0).expand(B, -1)[:, :K].reshape(-1),  # [M] - 只取前 K 个
-                num_selected_per_batch=torch.full((B,), K, dtype=torch.long, device=features.device),
+                # FIX: 从 mask_ste 计算 num_selected_per_batch，保持梯度追踪
+                # 原问题: torch.full() 创建叶子张量，没有 grad_fn
+                # 解决: mask_ste.sum(dim=1) 有梯度追踪
+                num_selected_per_batch=mask_ste.sum(dim=1).long(),
             )
 
             # 缓存用于辅助损失
@@ -3228,20 +3246,19 @@ class GumbelTopKSplitter(
 
         # ========== Mask STE 核心实现 ==========
         # 步骤 1: 计算整数 K（仅用于索引，前向传播用）
-        # 注意: .item() 在这里使用是安全的，因为我们已经构建了替代梯度路径
-        K_int = int(K_float.item())
-
-        # 边界检查
+        # I-OPT: 使用 tensor.clamp() 而非 .item() + Python max/min 避免 GPU-CPU 同步
         B, N = probs.shape
         if self.use_dynamic_k:
             K_min, K_max = self._get_dynamic_k_bounds(N, image_size)
         else:
             K_min, K_max = self.K_min, self.K_max
-        K_min = max(K_min, 16)
-        K_int = max(K_min, min(K_max, K_int))
+        # torch.topk 接受 0-d tensor 作为 k 参数
+        K_tensor = K_float.long().clamp(K_min, K_max)
+        # 额外边界检查：确保 K >= 16
+        K_tensor = K_tensor.clamp(K_min, K_max)
 
         # 步骤 2: 获取 Top-K 索引（不可微，但这是前向传播，允许）
-        topk_probs, topk_indices = torch.topk(probs, k=K_int, dim=-1)
+        topk_probs, topk_indices = torch.topk(probs, k=K_tensor, dim=-1)
 
         # 步骤 3: 构建 Hard Mask（0 和 1 组成的张量）
         mask_hard = torch.zeros_like(probs).scatter_(dim=-1, index=topk_indices, value=1.0)
@@ -3256,7 +3273,7 @@ class GumbelTopKSplitter(
         self._cached_K_float = K_float  # 保留浮点 K 用于调试
         self._cached_mask_ste = mask_ste  # Mask STE 用于梯度流
 
-        return K_int
+        return K_tensor
 
     def _estimate_optimal_k_diff(
         self,
@@ -3516,7 +3533,8 @@ class GumbelTopKSplitter(
                 base_temperature = base_temperature.item()
             return torch.full_like(depths.float(), base_temperature)
 
-        D = int(depths.max().item() + 1)
+        # I-OPT: 使用 .long() 而非 .item() 避免 GPU-CPU 同步
+        D = (depths.max().long() + 1).item()
         device = depths.device
 
         # I150-2-FIX: 确保 base_temperature 在正确的设备上
@@ -3529,8 +3547,9 @@ class GumbelTopKSplitter(
 
         # 向量化：使用张量运算一次性计算所有深度
         depth_indices = torch.arange(D, device=device, dtype=torch.float32)
-        N_d = 4 ** depth_indices
-        N_max = 4 ** (D - 1)
+        # I-OPT: torch.exp2 替代 4**，避免浮点指数运算
+        N_d = torch.exp2(2.0 * depth_indices)  # 4**d = 2**(2*d) = exp2(2*d)
+        N_max = 1 << (2 * (D - 1))  # 4**(D-1) = 2**(2*(D-1))
         depth_temperature_scale = (N_max / N_d) ** gamma
 
         # 映射到每个候选区域
@@ -3967,7 +3986,8 @@ class GumbelTopKSplitter(
         K_soft = K_soft[:D].float()
 
         depth_indices = torch.arange(D, device=K_soft.device, dtype=torch.long)
-        N = 4 ** depth_indices
+        # I-OPT: 1 << (2*d) 替代 4**，位移比指数运算快
+        N = 1 << (2 * depth_indices)  # 4**d = 2**(2*d)
 
         K_min_tensor = torch.clamp(
             (QUOTA_MIN_RATIO * N).floor().long(),
@@ -4648,10 +4668,13 @@ class GumbelTopKSplitter(
             K_d_ste = K_d_hard - K_d_soft.detach() + K_d_soft  # 有梯度!
 
             # P-NAN-GUARD: 检查 K_d_ste 是否为 NaN/Inf
+            # I-OPT: K_d_ste.round().long() 作为 tensor 用于 topk，避免 .item() 同步
             if torch.isnan(K_d_ste) or torch.isinf(K_d_ste):
-                K_d_int = 1  # 使用安全的默认值
+                K_d_int = 1
+                K_d_tensor = torch.tensor(1, device=K_d_ste.device, dtype=torch.long)
             else:
-                K_d_int = max(1, int(round(K_d_ste.item())))  # 仅用于索引
+                K_d_tensor = K_d_ste.round().long().clamp(min=1)  # 0-d tensor
+                K_d_int = K_d_tensor.item()  # 仅用于条件判断
 
             if K_d_int <= 0 or N_d == 0:
                 continue
@@ -4667,21 +4690,21 @@ class GumbelTopKSplitter(
                 # 无论 hard 模式如何，都使用确定性 softmax
                 # 数学: P(i ∈ Top-K) = softmax(z_i / τ)[i] × K
                 det_probs = F.softmax(logits_d / self._deterministic_temperature, dim=1)  # [B, N_d]
-                _, topk_local = torch.topk(det_probs, K_d_int, dim=1)  # [B, K_d_int]
+                _, topk_local = torch.topk(det_probs, K_d_tensor, dim=1)  # [B, K_d]
 
                 # I170-2 FIX: 使用 det_probs × K_d_float 保持梯度流
                 # 梯度可通过 K_d_float 回传到 quota_logits
                 soft_mask[:, depth_indices] = det_probs * K_d_float.unsqueeze(0)  # [B, N_d]
             elif hard or not self.training:
                 # 推理模式：直接 Top-K（仅在非确定性模式下使用）
-                _, topk_local = torch.topk(logits_d, K_d_int, dim=1)  # [B, K_d_int]
+                _, topk_local = torch.topk(logits_d, K_d_tensor, dim=1)  # [B, K_d]
             else:
                 # 训练模式：Gumbel + Top-K
                 uniform = torch.rand(B, N_d, device=device, dtype=torch.float32)
                 uniform = uniform.clamp(GUMBEL_EPSILON, 1 - GUMBEL_EPSILON)
                 gumbel = -torch.log(-torch.log(uniform))
                 perturbed = (logits_d + gumbel) / T_fp32
-                topk_vals, topk_local = torch.topk(perturbed, K_d_int, dim=1)  # [B, K_d_int]
+                topk_vals, topk_local = torch.topk(perturbed, K_d_tensor, dim=1)  # [B, K_d]
 
                 # CRIT-1: 使用全局 Softmax (而非 Subset Softmax)
                 # 原因: Subset Softmax 梯度覆盖率仅 K/N ≈ 37.6%，与 Hilbert 曲线期望冲突
@@ -5034,8 +5057,10 @@ class GumbelTopKSplitter(
         if not final_selected.any():
             final_selected = (consistent_mask > 0.5)  # [B, N]
 
-        # I150-2 FIX: 使用硬掩码计算实际的 token 数量，与 hilbert_indices 数量一致
-        num_selected_per_batch = final_selected.sum(dim=1).long()  # [B]
+        # I150-2 FIX: 使用 consistent_mask 计算 token 数量，保持梯度追踪
+        # 问题: final_selected 来自 scatter_ 操作在叶子张量上，没有梯度
+        # 解决: 从 consistent_mask 计算，它有完整的梯度追踪
+        num_selected_per_batch = consistent_mask.sum(dim=1).long()  # [B]
 
         # P-OPT: 使用向量化操作确保每个 batch 至少有一个 token
         # 避免 .any() 同步点，直接使用 clamp 和 where 操作
@@ -5355,13 +5380,17 @@ class GumbelTopKSplitter(
         # I153-1: 配额对齐损失 (KL 散度)
         # 为 quota_logits 提供任务驱动的梯度，解决整数屏障问题
         # ====================================================================
+        quota_align_weight = getattr(self, '_quota_align_weight', 0.0)
         if quota_align_weight > 0 and self._enable_learnable_quota and self.quota_logits is not None:
             if self.quota_allocator is not None:
+                # I153-1-FIX: 从 quota_allocator 获取 step 信息，与下方工作代码保持一致
+                current_step = self.quota_allocator._current_step
+                estimated_total_steps = getattr(self, '_quota_total_steps', 50000)
                 # 生成目标深度分布
                 target_dist = self.quota_allocator.get_target_depth_distribution(
-                    step=current_epoch,
-                    total_steps=total_epochs,
-                    mode=quota_align_mode,
+                    step=current_step,
+                    total_steps=estimated_total_steps,
+                    mode="curriculum",
                 )
                 # 计算 KL 对齐损失
                 align_loss = self.quota_allocator.compute_quota_align_loss(
