@@ -165,6 +165,7 @@ class TestStratifiedTopK:
             K_max=48,
         )
         splitter.train()
+        splitter.set_epoch(3)  # Enable Stage 2 for dynamic depth selection
 
         B, C, H, W = 2, 256, 16, 16
         features = torch.randn(B, C, H, W)

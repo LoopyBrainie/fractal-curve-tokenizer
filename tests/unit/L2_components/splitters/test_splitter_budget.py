@@ -173,21 +173,34 @@ class TestContinuousQuotaAllocator:
         """测试温度warmup"""
         from vit_pytorch.layers.splitters.gumbel_topk import ContinuousQuotaAllocator
 
+        # tau_warmup_steps=100: warmup 从 1.0 线性增加到 2.0
+        # tau_decay_steps=100: warmup 完成后开始 cosine 衰减到 tau_min=0.1
         allocator = ContinuousQuotaAllocator(
-            D=8, tau=1.0, tau_warmup_steps=100, enable_warmup=True
+            D=8, tau=1.0, tau_warmup_steps=100, tau_decay_steps=100,
+            tau_min=0.1, tau_max=2.0, enable_warmup=True
         )
 
-        # 初始温度 (应该 >= 目标值)
+        # 初始温度 (step 0: warmup 起点)
         initial_tau = allocator.temperature.item()
-        assert initial_tau >= 1.0  # 初始温度应该 >= 目标值
+        assert initial_tau >= 1.0, f"初始温度 {initial_tau} 应该 >= 1.0"
 
-        # 多次调用 step
-        for _ in range(100):
+        # step 50: warmup 中间点 (温度应该 > 1.0 但 < 2.0)
+        for _ in range(50):
             allocator.step()
+        mid_tau = allocator.temperature.item()
+        assert mid_tau > 1.0, f"warmup 中间温度 {mid_tau} 应该 > 1.0"
 
+        # step 100: warmup 结束 (温度应该 = tau_max = 2.0)
+        for _ in range(50):
+            allocator.step()
         final_tau = allocator.temperature.item()
-        # 验证温度逐渐降低到目标值
-        assert final_tau == 1.0
+        assert final_tau == 2.0, f"warmup 结束时温度 {final_tau} 应该 = tau_max = 2.0"
+
+        # step 150: decay 开始 (温度应该开始下降)
+        for _ in range(50):
+            allocator.step()
+        decay_tau = allocator.temperature.item()
+        assert decay_tau < 2.0, f"decay 开始后温度 {decay_tau} 应该 < 2.0"
 
     def test_multi_step_training(self):
         """模拟多步训练"""

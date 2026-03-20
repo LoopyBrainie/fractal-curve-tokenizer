@@ -210,7 +210,7 @@ class TestSplitterIntegration:
         return GumbelTopKSplitter(
             feature_dim=256,
             min_patch_size=4,
-            max_level_limit=8,
+            max_level_limit=6,  # D = 7, matches _current_max_depth + 1
             hidden_dim=64,
             image_size=(224, 224),
         )
