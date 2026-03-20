@@ -159,23 +159,15 @@ class HilbertPathCache:
         # 使用 PseudoHilbertCurve 获取扫描序列
         scan_points = PseudoHilbertCurve.scan(grid_h, grid_w)
         
-        # 转换为光栅索引
-        hilbert_to_raster = []
-        x_coords = []
-        y_coords = []
-        
-        for x, y in scan_points:
-            raster_idx = y * grid_w + x
-            hilbert_to_raster.append(raster_idx)
-            x_coords.append(x)
-            y_coords.append(y)
-        
-        num_tokens = len(hilbert_to_raster)
-        hilbert_to_raster = torch.tensor(hilbert_to_raster, dtype=torch.long)
-        
-        # 计算四叉树路径 (向量化)
-        x_tensor = torch.tensor(x_coords, dtype=torch.long)
-        y_tensor = torch.tensor(y_coords, dtype=torch.long)
+        # I-OPT: 向量化展开 - zip(*) 将 scan_points 元组展开为 x/y 坐标序列
+        # 替代逐个 append 的 for 循环，兼容 torch.compile
+        x_unpacked, y_unpacked = zip(*scan_points)
+        num_tokens = len(x_unpacked)
+
+        # I-OPT: 完全向量化 - y*x + x 在 GPU 上批量计算
+        x_tensor = torch.tensor(x_unpacked, dtype=torch.long)
+        y_tensor = torch.tensor(y_unpacked, dtype=torch.long)
+        hilbert_to_raster = y_tensor * grid_w + x_tensor
         
         n = _next_power_of_2(max(grid_h, grid_w))
         # I109-7: 使用 bit_length() 替代 int(math.log2(...)) 避免浮点精度问题
@@ -231,9 +223,11 @@ class HilbertIndexer:
             return torch.tensor([], dtype=torch.long)
         
         scan_points = PseudoHilbertCurve.scan(grid_size, grid_size)
-        positions = [y * grid_size + x for x, y in scan_points]
-        
-        return torch.tensor(positions, dtype=torch.long)
+        # I-OPT: 向量化展开替代列表推导，兼容 torch.compile
+        x_unpacked, y_unpacked = zip(*scan_points)
+        x_tensor = torch.tensor(x_unpacked, dtype=torch.long)
+        y_tensor = torch.tensor(y_unpacked, dtype=torch.long)
+        return y_tensor * grid_size + x_tensor
     
     @classmethod
     def get_hilbert_order_on_device(cls, grid_size: int, device: torch.device) -> torch.Tensor:
@@ -259,9 +253,11 @@ class HilbertIndexer:
             return torch.tensor([], dtype=torch.long)
         
         scan_points = PseudoHilbertCurve.scan(grid_h, grid_w)
-        positions = [y * grid_w + x for x, y in scan_points]
-        
-        return torch.tensor(positions, dtype=torch.long)
+        # I-OPT: 向量化展开替代列表推导，兼容 torch.compile
+        x_unpacked, y_unpacked = zip(*scan_points)
+        x_tensor = torch.tensor(x_unpacked, dtype=torch.long)
+        y_tensor = torch.tensor(y_unpacked, dtype=torch.long)
+        return y_tensor * grid_w + x_tensor
     
     @classmethod
     def get_hilbert_order_rect_on_device(
