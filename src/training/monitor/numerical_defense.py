@@ -12,11 +12,14 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Callable
+from typing import TYPE_CHECKING, Optional, Dict, Any, List, Callable
 from collections import OrderedDict
 import torch
 import torch.nn as nn
 from contextlib import contextmanager
+
+if TYPE_CHECKING:
+    from ..metrics.collector import MetricsCollector
 
 
 class AnomalyDetectionContext:
@@ -67,10 +70,12 @@ class GradientValidator:
         model: Optional[nn.Module] = None,
         skip_on_issue: bool = True,
         log_warnings: bool = True,
+        collector: Optional["MetricsCollector"] = None,
     ):
         self.model = model
         self.skip_on_issue = skip_on_issue
         self.log_warnings = log_warnings
+        self.collector = collector
 
         self.issue_count = 0
         self.nan_count = 0
@@ -112,6 +117,12 @@ class GradientValidator:
 
             if self.log_warnings:
                 self._log_warning(has_nan, has_inf)
+
+        # Emit to MetricsCollector if available
+        if self.collector is not None:
+            self.collector.record("nan_count", self.nan_count)
+            self.collector.record("inf_count", self.inf_count)
+            self.collector.record("issue_count", self.issue_count)
 
         # Return True if valid (proceed), False if skip
         return not (self.skip_on_issue and has_issue)
@@ -194,13 +205,15 @@ class NumericalDefender:
         detect_anomaly: bool = False,
         skip_on_nan: bool = True,
         check_frequency: int = 1,
+        collector: Optional["MetricsCollector"] = None,
     ):
         self.model = model
         self.detect_anomaly = detect_anomaly
         self.skip_on_nan = skip_on_nan
         self.check_frequency = check_frequency
+        self.collector = collector
 
-        self.validator = GradientValidator(model, skip_on_issue=skip_on_nan)
+        self.validator = GradientValidator(model, skip_on_issue=skip_on_nan, collector=collector)
         self.anomaly_context = AnomalyDetectionContext(enabled=detect_anomaly)
 
         self.step_count = 0
@@ -291,15 +304,22 @@ def check_tensor_numerical_health(
 class ActivationStatsCollector:
     """使用 forward hooks 记录关键节点的激活值统计"""
 
-    def __init__(self, model: nn.Module, target_modules: Optional[List[str]] = None):
+    def __init__(
+        self,
+        model: nn.Module,
+        target_modules: Optional[List[str]] = None,
+        collector: Optional["MetricsCollector"] = None,
+    ):
         """初始化激活值收集器
 
         Args:
             model: 要监控的模型
             target_modules: 要监控的模块名称子串列表（如 ["splitter", "manifold", "decoder"]）
+            collector: Optional MetricsCollector for unified metrics pipeline
         """
         self.model = model
         self.target_modules = target_modules or ["splitter", "manifold", "decoder", "entmax", "density", "mlp_head", "head", "classifier"]
+        self.collector = collector
         self.hooks: List[Callable] = []
         self.stats: Dict[str, Dict[str, float]] = {}
         self._register_hooks()
@@ -339,20 +359,35 @@ class ActivationStatsCollector:
         else:
             t_flat = t.unsqueeze(0)
 
-        # 计算统计
+        # 计算统计（延迟 .item() 调用以避免同步）
+        # 在 get_stats() 时再转换为 Python scalars
         self.stats[name] = {
-            "mean": t_flat.mean().item(),
-            "std": t_flat.std().item(),
-            "min": t_flat.min().item(),
-            "max": t_flat.max().item(),
-            "norm": t_flat.norm().item(),
-            "has_nan": torch.isnan(t_flat).any().item(),
-            "has_inf": torch.isinf(t_flat).any().item(),
+            "mean": t_flat.mean(),
+            "std": t_flat.std(),
+            "min": t_flat.min(),
+            "max": t_flat.max(),
+            "norm": t_flat.norm(),
+            "has_nan": torch.isnan(t_flat).any(),
+            "has_inf": torch.isinf(t_flat).any(),
         }
 
+        # Emit to MetricsCollector if available
+        if self.collector is not None:
+            mean_val = t_flat.mean().item()
+            std_val = t_flat.std().item()
+            self.collector.record(f"activation_{name}_mean", mean_val)
+            self.collector.record(f"activation_{name}_std", std_val)
+
     def get_stats(self) -> Dict[str, Dict[str, float]]:
-        """获取收集的统计信息"""
-        return self.stats.copy()
+        """获取收集的统计信息（延迟转换避免同步）"""
+        # 延迟转换所有 tensor 为 Python scalars
+        result = {}
+        for name, stat in self.stats.items():
+            result[name] = {
+                k: v.item() if isinstance(v, torch.Tensor) else v
+                for k, v in stat.items()
+            }
+        return result
 
     def clear(self):
         """清除统计信息"""
@@ -400,7 +435,7 @@ class NaNAutoInvestigation:
         loss_value: float,
         pre_clip_grad_norm: float,
         input_stats: Optional[Dict[str, float]] = None,
-        splitter_logits_stats: Optional[Dict[str, float]] = None,
+        classification_logits_stats: Optional[Dict[str, float]] = None,
         feature_stats: Optional[Dict[str, float]] = None,
         amp_loss_scale: Optional[float] = None,
         learning_rate: Optional[float] = None,
@@ -414,7 +449,7 @@ class NaNAutoInvestigation:
             loss_value: 损失值
             pre_clip_grad_norm: 裁剪前的梯度范数
             input_stats: 输入数据统计（可选）
-            splitter_logits_stats: Splitter logits 统计（可选）
+            classification_logits_stats: 分类 logits 统计（可选），注意：这是 outputs.logits 而非 splitter 内部 logits
             feature_stats: 特征模长统计（可选），mlp_head 前的激活值
             amp_loss_scale: AMP 损失缩放因子（可选）
             learning_rate: 学习率（可选）
@@ -436,7 +471,7 @@ class NaNAutoInvestigation:
                 "investigation_count": self.investigation_count,
             },
             "input_data_summary": input_stats or {},
-            "splitter_logits_stats": splitter_logits_stats or {},
+            "classification_logits_stats": classification_logits_stats or {},
             "training_env": {
                 "amp_loss_scale": amp_loss_scale,
                 "learning_rate": learning_rate,
@@ -448,7 +483,7 @@ class NaNAutoInvestigation:
         # 自动诊断结论
         report["diagnosis"] = self._diagnose_nan(
             input_stats=input_stats,
-            splitter_logits_stats=splitter_logits_stats,
+            classification_logits_stats=classification_logits_stats,
             feature_stats=feature_stats,
             loss_components=loss_components,
             amp_loss_scale=amp_loss_scale,
@@ -530,7 +565,7 @@ class NaNAutoInvestigation:
     def _diagnose_nan(
         self,
         input_stats: Optional[Dict[str, float]] = None,
-        splitter_logits_stats: Optional[Dict[str, float]] = None,
+        classification_logits_stats: Optional[Dict[str, float]] = None,
         feature_stats: Optional[Dict[str, float]] = None,
         loss_components: Optional[Dict[str, float]] = None,
         amp_loss_scale: Optional[float] = None,
@@ -555,23 +590,18 @@ class NaNAutoInvestigation:
             diagnosis.append("[R1] INPUT_NAN: 输入数据包含 NaN，可能是数据清洗问题或坏图")
             root_cause = "input_data"
 
-        # R2: Splitter Logits 溢出
-        if splitter_logits_stats:
-            max_logit = splitter_logits_stats.get("logits_max", 0)
-            min_logit = splitter_logits_stats.get("logits_min", 0)
-            if max_logit > 100:
-                diagnosis.append(f"[R2a] SPLITTER_OVERFLOW: Logits max={max_logit:.2f} > 100，Entmax 溢出")
-                root_cause = "splitter_overflow"
-            if min_logit < -100:
-                diagnosis.append(f"[R2b] SPLITTER_UNDERFLOW: Logits min={min_logit:.2f} < -100")
-                if root_cause == "unknown":
-                    root_cause = "splitter_overflow"
-            if splitter_logits_stats.get("logits_has_nan"):
-                diagnosis.append("[R2c] SPLITTER_NAN: Splitter 输出包含 NaN")
-                root_cause = "splitter_nan"
-            if splitter_logits_stats.get("logits_has_inf"):
-                diagnosis.append("[R2d] SPLITTER_INF: Splitter 输出包含 Inf")
-                root_cause = "splitter_inf"
+        # R2: 分类 Logits 异常 (注意：这是 outputs.logits，不是 splitter 内部 logits)
+        if classification_logits_stats:
+            max_logit = classification_logits_stats.get("logits_max", 0)
+            min_logit = classification_logits_stats.get("logits_min", 0)
+            # I-AUDIT: 分类 logits 较大是正常的（尤其是类别多时），不再诊断为溢出
+            # 但 NaN/Inf 仍然是异常的
+            if classification_logits_stats.get("logits_has_nan"):
+                diagnosis.append("[R2a] CLASS_LOGITS_NAN: 分类 logits 包含 NaN")
+                root_cause = "classification_logits_nan"
+            if classification_logits_stats.get("logits_has_inf"):
+                diagnosis.append("[R2b] CLASS_LOGITS_INF: 分类 logits 包含 Inf")
+                root_cause = "classification_logits_inf"
 
         # R3: 特征模长异常 (Feature Norm)
         if feature_stats:
@@ -628,7 +658,7 @@ def dump_debug_info(
     pre_clip_grad_norm: float,
     debug_dir: str = "experiments/debug",
     input_stats: Optional[Dict[str, float]] = None,
-    splitter_logits_stats: Optional[Dict[str, float]] = None,
+    classification_logits_stats: Optional[Dict[str, float]] = None,
     feature_stats: Optional[Dict[str, float]] = None,
     amp_loss_scale: Optional[float] = None,
     learning_rate: Optional[float] = None,
@@ -645,7 +675,7 @@ def dump_debug_info(
         pre_clip_grad_norm: Gradient norm before clipping
         debug_dir: Directory to save debug info
         input_stats: Input data statistics
-        splitter_logits_stats: Splitter logits statistics
+        classification_logits_stats: Splitter logits statistics
         feature_stats: Feature norm statistics before mlp_head
         amp_loss_scale: AMP loss scale
         learning_rate: Learning rate
@@ -665,7 +695,7 @@ def dump_debug_info(
         loss_value=loss_value,
         pre_clip_grad_norm=pre_clip_grad_norm,
         input_stats=input_stats,
-        splitter_logits_stats=splitter_logits_stats,
+        classification_logits_stats=classification_logits_stats,
         feature_stats=feature_stats,
         amp_loss_scale=amp_loss_scale,
         learning_rate=learning_rate,

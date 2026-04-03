@@ -64,7 +64,7 @@ from .checkpoint import (
     find_best_checkpoint,
 )
 
-from .logging import (
+from .training_logs import (
     EpochLogger,
     MetricsTracker,
     compute_accuracy,

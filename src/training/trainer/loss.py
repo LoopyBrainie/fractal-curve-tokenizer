@@ -7,7 +7,8 @@ Layer 3 (hyperparameters) for loss computation.
 
 from __future__ import annotations
 
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
+from torch import Tensor
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -183,17 +184,21 @@ def compute_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
     reduction: str = "mean",
+    aux_losses: Optional[Dict[str, Tensor]] = None,
+    aux_weight: float = 0.08,  # I107-OPT: 从 0.02 增到 0.08，增加预算损失梯度影响
 ) -> Tuple[torch.Tensor, dict]:
-    """Compute cross-entropy loss with optional components tracking
+    """Compute cross-entropy loss with optional auxiliary losses
 
     Args:
         logits: [B, C] or [B, num_classes] model outputs
         targets: [B, C] (one-hot) or [B] (class indices)
         reduction: Loss reduction method
+        aux_losses: Optional dict of auxiliary losses from splitter
+        aux_weight: Base weight for auxiliary losses (default: 0.02)
 
     Returns:
-        loss: Scalar loss tensor
-        components: Dict of loss components
+        loss: Scalar loss tensor (main + weighted aux)
+        components: Dict of loss components (cross_entropy + individual aux losses)
     """
 
     # Handle one-hot targets (from Mixup/Cutmix)
@@ -212,6 +217,27 @@ def compute_loss(
 
     # Track components
     components = {"cross_entropy": loss.item() if loss.dim() == 0 else loss.mean().item()}
+
+    # Integrate auxiliary losses with dynamic weighting
+    if aux_losses is not None:
+        ce_mag = loss.abs().detach().mean() if loss.dim() == 0 else loss.abs().mean()
+
+        for name, aux_loss in aux_losses.items():
+            if aux_loss is not None:
+                aux_mag = aux_loss.abs().detach().mean()
+
+                # I-OPT: 动态权重 - 保持 aux loss 在 CE 的 2-20% 范围
+                # dynamic_weight = aux_weight * (ce_mag / aux_mag).clamp(0.02, 1.0)
+                if aux_mag > 1e-8:
+                    ratio = (ce_mag / aux_mag).clamp(0.02, 1.0)
+                    dynamic_w = aux_weight * ratio
+                else:
+                    dynamic_w = aux_weight
+
+                # I-OPT: 不再 .detach()，让梯度流过 aux_loss（特别是 budget loss）
+                loss = loss + dynamic_w * aux_loss
+                components[f"aux_{name}"] = aux_loss.item()
+                components[f"aux_weight_{name}"] = dynamic_w
 
     return loss, components
 
