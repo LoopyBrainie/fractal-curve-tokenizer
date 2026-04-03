@@ -1,113 +1,113 @@
-# Chapter 4: Positional Embedding
+# 第四章：位置编码
 
-## 4.1 Overview
+## 4.1 概述
 
-The `FractalPositionEmbedding` encodes token positions using both **depth** and **quadtree path** information, providing a hierarchical position encoding tailored for variable-depth tokenization. It supports **Area-Enhanced** encoding (I31-3) for area-aware position representation.
+`FractalPositionEmbedding` 使用**深度**和**四叉树路径**信息对 token 位置进行编码，提供针对变深度分词量身定制的层次位置编码。它支持**面积增强**编码（I31-3）以实现面积感知的位置表示。
 
 ---
 
-## 4.2 Mathematical Formulation
+## 4.2 数学形式化
 
-### 4.2.1 Position Encoding Definition
+### 4.2.1 位置编码定义
 
 $$E_{pos}(i) = \text{Fusion}(E_{depth}(d_i) + E_{path}(p_i))$$
 
-where:
-- $d_i \in [0, d_{max}]$: Depth of token $i$
-- $p_i = [q_1, \ldots, q_d]$: Quadtree path of token $i$
-- $E_{depth}: \mathbb{Z} \to \mathbb{R}^D$: Depth embedding
-- $E_{path}: [0,3]^{d_{max}} \to \mathbb{R}^D$: Path embedding
-- $\text{Fusion}: \mathbb{R}^D \to \mathbb{R}^D$: Fusion network
+其中：
+- $d_i \in [0, d_{max}]$：token $i$ 的深度
+- $p_i = [q_1, \ldots, q_d]$：token $i$ 的四叉树路径
+- $E_{depth}: \mathbb{Z} \to \mathbb{R}^D$：深度嵌入
+- $E_{path}: [0,3]^{d_{max}} \to \mathbb{R}^D$：路径嵌入
+- $\text{Fusion}: \mathbb{R}^D \to \mathbb{R}^D$：融合网络
 
-### 4.2.2 Depth Embedding
+### 4.2.2 深度嵌入
 
-Learnable embedding indexed by depth:
+按深度索引的可学习嵌入：
 
 $$E_{depth}(d) = W_{depth}[d], \quad W_{depth} \in \mathbb{R}^{(d_{max}+1) \times D}$$
 
-### 4.2.3 Path Embedding (STAB-4 Fix)
+### 4.2.3 路径嵌入（STAB-4 修复）
 
-Aggregated quadrant embeddings along the path with depth normalization:
+沿路径聚合象限嵌入，并进行深度归一化：
 
-**Original (Unstable)**:
+**原始（不稳定）**：
 
 $$E_{path}(p) = \sum_{i=1}^{d} W_{quad}[L_i \cdot 4 + q_i]$$
 
-This leads to $\|E_{path}\| \propto \sqrt{d}$, causing variance imbalance across depths.
+这导致 $\|E_{path}\| \propto \sqrt{d}$，造成跨深度的方差失衡。
 
-**Normalized (STAB-4)**:
+**归一化（STAB-4）**：
 
 $$E_{path}(p) = \frac{1}{\sqrt{d}} \sum_{i=1}^{d} W_{quad}[L_i \cdot 4 + q_i]$$
 
-where:
-- $W_{quad} \in \mathbb{R}^{(d_{max} \cdot 4) \times D}$: Flattened level-quadrant embeddings
-- $L_i$: Level index of the $i$-th step
-- $q_i$: Quadrant index of the $i$-th step
-- $\frac{1}{\sqrt{d}}$: Normalization factor maintaining constant variance across depths
+其中：
+- $W_{quad} \in \mathbb{R}^{(d_{max} \cdot 4) \times D}$：扁平化的级别-象限嵌入
+- $L_i$：第 $i$ 步的级别索引
+- $q_i$：第 $i$ 步的象限索引
+- $\frac{1}{\sqrt{d}}$：保持跨深度恒定方差的归一化因子
 
-**Masking for Variable Depths**:
+**可变深度的掩码**：
 
-Only valid path steps contribute to the sum:
+只有有效的路径步骤贡献到总和：
 
 $$\text{mask}[j] = \begin{cases} 1 & \text{if } j < d_i \\ 0 & \text{otherwise} \end{cases}$$
 $$E_{path}(p) = \frac{1}{\sqrt{\sum_j \text{mask}[j]}} \sum_j \text{mask}[j] \cdot W_{quad}[j]$$
 
-### 4.2.4 Fusion Network
+### 4.2.4 融合网络
 
-Two-layer MLP with residual connection:
+带残差连接的双层 MLP：
 
 $$\text{Fusion}(x) = x + \text{MLP}(x)$$
 
-where $\text{MLP}(x) = W_2 \cdot \text{GELU}(W_1 \cdot x)$.
+其中 $\text{MLP}(x) = W_2 \cdot \text{GELU}(W_1 \cdot x)$。
 
 ---
 
-## 4.3 Area-Enhanced Position Embedding (I31-3)
+## 4.3 面积增强位置编码（I31-3）
 
-The `AreaEnhancedPositionEmbedding` extends the base encoding with area information.
+`AreaEnhancedPositionEmbedding` 扩展了基础编码，添加了面积信息。
 
-### 4.3.1 Mathematical Formulation
+### 4.3.1 数学形式
 
 $$E_{pos}(i) = \text{Fusion}(E_{depth}(d_i) + E_{path}(p_i) + \lambda \cdot E_{area}(R_i))$$
 
-where:
-- $E_{area}(R_i)$: Area embedding from `AreaEncoder`
-- $\lambda$: Learnable scale parameter (zero-initialized)
+其中：
+- $E_{area}(R_i)$：来自 `AreaEncoder` 的面积嵌入
+- $\lambda$：可学习的缩放参数（初始化为零）
 
-### 4.3.2 AreaEncoder (Shared with Attention)
+### 4.3.2 AreaEncoder（与注意力共享）
 
-The same `AreaEncoder` is used for both position embedding and attention bias:
+相同的 `AreaEncoder` 用于位置编码和注意力偏置：
 
-**Area Score**:
+**面积分数**：
 
 $$f_{area} = \frac{\log(s_{patch} + 1)}{\log(S_{total} + 1)}$$
 
-**Fourier Features**:
+**傅里叶特征**：
 
 $$\gamma(f) = [\sin(2^k \pi f), \cos(2^k \pi f)]_{k=0}^{L-1}$$
 
-**MLP Projection**:
+**MLP 投影**：
 
 $$E_{area}(R) = \text{MLP}(\gamma(f_{area}))$$
 
-### 4.3.3 Residual Injection
+### 4.3.3 残差注入
 
-Area embedding is injected via residual connection:
+面积嵌入通过残差连接注入：
 
 $$E_{pos} = E_{base} + \lambda \cdot E_{area}$$
 
-With $\lambda$ initialized to 0, the model can gradually learn to use area information.
+$\lambda$ 初始化为 0，模型可以逐渐学习使用面积信息。
 
 ---
 
-## 4.4 Geometric Interpretation
+## 4.4 几何解释
 
-### 4.4.1 Quadrant Encoding
+### 4.4.1 象限编码
 
-The quadrant indices encode spatial position within each level:
+象限索引编码每个级别内的空间位置：
 
 ```
-Level 0 (root):     Level 1:              Level 2:
+级别 0（根）:     级别 1:              级别 2:
 ┌─────────────┐     ┌──────┬──────┐       ┌───┬───┬───┬───┐
 │             │     │  2   │  3   │       │ 2 │ 3 │ 2 │ 3 │
 │      0      │  →  ├──────┼──────┤   →   ├───┼───┼───┼───┤
@@ -119,23 +119,23 @@ Level 0 (root):     Level 1:              Level 2:
                                           └───┴───┴───┴───┘
 ```
 
-### 4.4.2 Path Uniqueness
+### 4.4.2 路径唯一性
 
-Each quadtree path uniquely identifies a spatial region:
+每个四叉树路径唯一标识一个空间区域：
 
 $$\text{Region}([q_1, \ldots, q_d]) = \bigcap_{i=1}^{d} \text{Quadrant}(q_i, i)$$
 
-### 4.4.3 Hilbert Compatibility
+### 4.4.3 Hilbert 兼容性
 
-The path encoding preserves Hilbert curve locality:
+路径编码保持 Hilbert 曲线局部性：
 
 $$|H^{-1}(p_i) - H^{-1}(p_j)| \propto \|E_{path}(p_i) - E_{path}(p_j)\|_2$$
 
 ---
 
-## 4.5 Implementation
+## 4.5 实现
 
-### Class: FractalPositionEmbedding
+### 类：FractalPositionEmbedding
 
 ```python
 class FractalPositionEmbedding(nn.Module):
@@ -149,17 +149,17 @@ class FractalPositionEmbedding(nn.Module):
         dropout: float = 0.1,
     ):
         """
-        Args:
-            dim: Embedding dimension
-            max_level: Maximum quadtree depth (P11-2: should match tokenizer.max_depth)
-            max_seq_len: Maximum sequence length
-            use_hilbert_encoding: Enable Hilbert path encoding
-            use_spatial_encoding: Enable spatial encoding
-            dropout: Dropout rate for position embedding (I27-2)
+        参数:
+            dim: 嵌入维度
+            max_level: 最大四叉树深度（P11-2：应与 tokenizer.max_depth 匹配）
+            max_seq_len: 最大序列长度
+            use_hilbert_encoding: 启用 Hilbert 路径编码
+            use_spatial_encoding: 启用空间编码
+            dropout: 位置编码的 dropout 率（I27-2）
         """
 ```
 
-### Class: AreaEnhancedPositionEmbedding
+### 类：AreaEnhancedPositionEmbedding
 
 ```python
 class AreaEnhancedPositionEmbedding(nn.Module):
@@ -173,17 +173,17 @@ class AreaEnhancedPositionEmbedding(nn.Module):
         dropout: float = 0.1,
     ):
         """
-        Args:
-            dim: Embedding dimension
-            max_level: Maximum quadtree depth
-            fourier_levels: Number of Fourier frequency levels
-            use_hilbert_encoding: Enable Hilbert encoding
-            use_spatial_encoding: Enable spatial encoding
-            dropout: Dropout rate
+        参数:
+            dim: 嵌入维度
+            max_level: 最大四叉树深度
+            fourier_levels: 傅里叶频率级别数
+            use_hilbert_encoding: 启用 Hilbert 编码
+            use_spatial_encoding: 启用空间编码
+            dropout: dropout 率
         """
 ```
 
-### Forward Pass (Base)
+### 前向传播（基础）
 
 ```python
 def forward(
@@ -193,37 +193,37 @@ def forward(
     image_size: Optional[int] = None,
 ) -> torch.Tensor:
     """
-    Args:
+    参数:
         levels_info: (B, N, max_depth+1) - [depth, q_1, q_2, ..., q_d]
-        regions: (B, N, 4) - Region boundaries [x1, y1, x2, y2]
-        image_size: int or (W, H) - Image dimensions
+        regions: (B, N, 4) - 区域边界 [x1, y1, x2, y2]
+        image_size: int 或 (W, H) - 图像维度
 
-    Returns:
+    返回:
         position_embedding: (B, N, D)
     """
     depths = levels_info[..., 0].clamp(0, self.max_level).long()
     paths = levels_info[..., 1:].long()
 
-    # Depth embedding
+    # 深度嵌入
     depth_emb = self.depth_embedding(depths)
 
-    # Path embedding with normalization (STAB-4)
+    # 带归一化的路径嵌入（STAB-4）
     level_offsets = torch.arange(paths.shape[-1], device=levels_info.device) * 4
     flat_indices = (paths + level_offsets).clamp(0, self.max_level * 4 - 1)
     path_embs = self.quadrant_embedding(flat_indices)
 
-    # Mask and normalize
+    # 掩码和归一化
     seq_indices = torch.arange(paths.shape[-1], device=levels_info.device)
     mask = seq_indices < depths.unsqueeze(-1)
     path_count = mask.sum(dim=-1, keepdim=True).clamp(min=1).float()
     path_final = (path_embs * mask.unsqueeze(-1)).sum(dim=-2) / torch.sqrt(path_count)
 
-    # Fusion
+    # 融合
     combined = depth_emb + path_final
     return self.fusion_network(combined)
 ```
 
-### Forward Pass (Area-Enhanced)
+### 前向传播（面积增强）
 
 ```python
 def forward(
@@ -232,18 +232,18 @@ def forward(
     regions: Optional[torch.Tensor] = None,
     image_size: Optional[int] = None,
 ) -> torch.Tensor:
-    # Base position encoding
+    # 基础位置编码
     pos_emb = self.base_embedding(levels_info)
 
-    # Area encoding (if regions provided)
+    # 面积编码（如果提供了区域）
     if regions is not None and image_size is not None:
         area_emb = self.area_encoder(regions, image_size)
 
-        # Handle CLS token alignment
+        # 处理 CLS token 对齐
         if area_emb.shape[1] == pos_emb.shape[1] + 1:
             area_emb = area_emb[:, 1:, :]
 
-        # Residual injection
+        # 残差注入
         pos_emb = pos_emb + self.area_scale * area_emb
 
     return pos_emb
@@ -251,43 +251,43 @@ def forward(
 
 ---
 
-## 4.6 Comparison with Standard Position Embeddings
+## 4.6 与标准位置编码的比较
 
-| Method | Encoding | Hierarchical | Adaptive | Area-Aware |
+| 方法 | 编码 | 层次化 | 自适应 | 面积感知 |
 |:-------|:---------|:-------------|:---------|:-----------|
-| Sinusoidal | $\sin(pos / 10000^{2i/d})$ | No | No | No |
-| Learned 1D | $W[pos]$ | No | No | No |
-| Learned 2D | $W_x[x] + W_y[y]$ | No | No | No |
-| RoPE | Rotation matrices | No | No | No |
-| **Fractal** | $E_{depth}(d) + E_{path}(p)$ | Yes | Yes | No |
-| **Fractal+Area** | $E_{depth} + E_{path} + \lambda \cdot E_{area}$ | Yes | Yes | Yes |
+| 正弦 | $\sin(pos / 10000^{2i/d})$ | 否 | 否 | 否 |
+| 可学习 1D | $W[pos]$ | 否 | 否 | 否 |
+| 可学习 2D | $W_x[x] + W_y[y]$ | 否 | 否 | 否 |
+| RoPE | 旋转矩阵 | 否 | 否 | 否 |
+| **分形** | $E_{depth}(d) + E_{path}(p)$ | 是 | 是 | 否 |
+| **分形+面积** | $E_{depth} + E_{path} + \lambda \cdot E_{area}$ | 是 | 是 | 是 |
 
 ---
 
-## 4.7 Dropout in Position Embedding (I27-2)
+## 4.7 位置编码中的 Dropout（I27-2）
 
-Position embedding acts as an **information bottleneck**, so dropout should be conservative:
+位置编码充当**信息瓶颈**，因此 dropout 应保持保守：
 
-**Recommended Configuration**:
+**推荐配置**：
 
-| Parameter | Value | Rationale |
+| 参数 | 值 | 原理 |
 |:----------|:------|:----------|
-| `dropout` | 0.1 | ~0.5 × main transformer dropout |
-| Maximum | 0.2 | Higher values risk position information loss |
+| `dropout` | 0.1 | ~0.5 × 主 transformer dropout |
+| 最大值 | 0.2 | 更高的值有位置信息丢失的风险 |
 
-**Analysis**:
-- $p_{pos} > 0.2$: Position information degradation → model cannot learn spatial relationships
-- $p_{pos} < 0.05$: Insufficient regularization → overfitting to specific positions
+**分析**：
+- $p_{pos} > 0.2$：位置信息退化 → 模型无法学习空间关系
+- $p_{pos} < 0.05$：正则化不足 → 过拟合到特定位置
 
-**Empirical Formula**:
+**经验公式**：
 
 $$p_{pos} \approx 0.5 \times p_{transformer}$$
 
 ---
 
-## 4.8 Usage Example
+## 4.8 使用示例
 
-### Basic Configuration
+### 基本配置
 
 ```python
 from vit_pytorch import FractalPositionEmbedding
@@ -301,15 +301,15 @@ pos_embedding = FractalPositionEmbedding(
 )
 
 # levels_info: (B, N, max_depth+1)
-# Format: [depth, q_1, q_2, ..., q_{max_depth}]
+# 格式: [depth, q_1, q_2, ..., q_{max_depth}]
 levels_info = torch.zeros(2, 100, 9, dtype=torch.long)
-levels_info[:, :, 0] = 2  # All tokens at depth 2
+levels_info[:, :, 0] = 2  # 所有 token 在深度 2
 
 tokens = torch.randn(2, 100, 384)
 tokens_with_pos = tokens + pos_embedding(levels_info)
 ```
 
-### With Area Enhancement (I31-3)
+### 带面积增强（I31-3）
 
 ```python
 from vit_pytorch import AreaEnhancedPositionEmbedding
@@ -321,7 +321,7 @@ pos_embedding = AreaEnhancedPositionEmbedding(
     dropout=0.1,
 )
 
-# With regions for area encoding
+# 带区域用于面积编码
 regions = torch.rand(2, 100, 4)  # [B, N, 4] - [x1, y1, x2, y2]
 image_size = 224
 
@@ -330,23 +330,23 @@ tokens_with_pos = tokens + pos_embedding(levels_info, regions=regions, image_siz
 
 ---
 
-## 4.9 Attention Bias Integration
+## 4.9 注意力偏置集成
 
-The position embedding and attention bias share the same `AreaEncoder`:
+位置编码和注意力偏置共享相同的 `AreaEncoder`：
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Position Embedding                        │
+│                    位置编码                                  │
 │  ┌─────────────┐    ┌─────────────┐    ┌─────────────────┐  │
-│  │  Depth Emb  │ +  │  Path Emb   │ +  │ Area Emb (opt)  │  │
+│  │  深度嵌入    │ +  │  路径嵌入    │ +  │ 面积嵌入 (opt)    │  │
 │  │  [0, D]     │    │  (norm)     │    │ [I31-3]         │  │
 │  └─────────────┘    └─────────────┘    └─────────────────┘  │
-│                         │                                      │
-│                         ▼                                      │
-│                   ┌───────────┐                                │
-│                   │  Fusion   │                                │
-│                   │  Network  │                                │
-│                   └───────────┘                                │
+│                         │                                   │
+│                         ▼                                   │
+│                   ┌───────────┐                             │
+│                   │  融合     │                              │
+│                   │  网络     │                              │
+│                   └───────────┘                             │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -355,28 +355,28 @@ The position embedding and attention bias share the same `AreaEncoder`:
                     └─────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
-│                    Attention Bias                            │
+│                    注意力偏置                                │
 │  ┌─────────────┐    ┌─────────────┐    ┌─────────────────┐  │
-│  │ LCA Embed   │ +  │ Level Bias  │ +  │ Area Mod (opt)  │  │
+│  │  LCA 嵌入    │ +  │  级别偏置    │ +  │ 面积调制 (opt)   │  │
 │  │ [B,H,N,N]   │    │ [B,H,N,N]   │    │ [I31-3]         │  │
 │  └─────────────┘    └─────────────┘    └─────────────────┘  │
-│                         │                                      │
-│                         ▼                                      │
-│                   ┌───────────┐                                │
-│                   │   Scale   │                                │
-│                   │  Factors  │                                │
-│                   └───────────┘                                │
+│                         │                                   │
+│                         ▼                                   │
+│                   ┌───────────┐                             │
+│                   │   缩放    │                             │
+│                   │   因子    │                             │
+│                   └───────────┘                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 4.10 Constants Reference
+## 4.10 常量参考
 
-| Constant | Value | Purpose |
+| 常量 | 值 | 用途 |
 |:---------|:------|:--------|
-| `EMBEDDING_INIT_STD` | 0.02 | Embedding weight initialization std |
-| `HILBERT_BIAS_SCALE` | 1.0 | Attention bias scale |
-| `LEVEL_BIAS_SCALE` | 1.0 | Level bias scale |
+| `EMBEDDING_INIT_STD` | 0.02 | 嵌入权重初始化标准差 |
+| `HILBERT_BIAS_SCALE` | 1.0 | 注意力偏置缩放 |
+| `LEVEL_BIAS_SCALE` | 1.0 | 级别偏置缩放 |
 
-> **Next**: [05_attention_mechanism.md](05_attention_mechanism.md) - Hilbert-Aware Attention
+> **下一章**: [05_attention_mechanism.md](05_attention_mechanism.md) - Hilbert 感知注意力

@@ -2,11 +2,11 @@
 
 ## 3.1 Overview
 
-The `StreamingFractalTokenizerV3` implements **Variable Depth Tokenization** via adaptive quadtree splitting and Hilbert curve reordering. It adopts the **Gumbel-Top-K (Scheme D)** mechanism with **Learnable Quota Allocation (Scheme E)** for ~K/N gradient coverage (~37.6%) and parallel execution, replacing earlier BFS-based approaches.
+The `StreamingFractalTokenizerV3` implements **Variable Depth Tokenization** via adaptive quadtree splitting and Hilbert curve reordering. The recommended splitter is **H1SS (Hilbert Splitter with Stable Selection)** using Entmax sparse activation, providing full gradient flow and stable train/eval consistency.
 
 **Efficiency Note**: The ~40× computational reduction comes from token count reduction ($N_{V3} \approx 32$ vs $N_{ViT} \approx 307K$), not from asymptotic complexity change. Attention remains $O(N^2 \cdot D)$, but with $N$ reduced by ~40×.
 
-**Architecture**: Token depth is determined by the Gumbel-Top-K selection mechanism. Transformer effective depth is fixed at `depth // 2`.
+**Architecture**: Token depth is determined by the H1SS selection mechanism with Entmax sparse activation. Transformer effective depth is fixed at `num_layers // 2`.
 
 ---
 
@@ -14,182 +14,170 @@ The `StreamingFractalTokenizerV3` implements **Variable Depth Tokenization** via
 
 ### 3.2.1 Tokenization Pipeline
 
-$$I \xrightarrow{\text{SharedConv}} F \xrightarrow{\text{ParallelEval}} \{S_i, \text{logits}_i\}_{i=1}^{N_{cand}} \xrightarrow{\text{TopK}} \{R_j\}_{j=1}^{K} \xrightarrow{\text{Consist}} \{T_k\} \xrightarrow{\text{Sort}}$$
+$$I \xrightarrow{\text{Splitter}} \text{split\_result} \xrightarrow{\text{Embedding}} \{T_i, L_i\} \xrightarrow{\text{HilbertSort}} \{T_i', L_i'\}$$
 
 where:
-- $I \in \mathbb{R}^{C \times H \times W}$: Input image
-- $N_{cand}$: Total number of candidate quadtree regions ($\sum_{d=0}^{D} 4^d$) (e.g., 85 for D=3)
-- $R_j$: Selected regions
-- $T_k$: Final consistent set of tokens (no overlaps)
+- $I \in \mathbb{R}^{B \times C \times H \times W}$: Input batch
+- $\text{split\_result}$: Selected regions from H1SS/H-entmax
+- $T_i$: Token embeddings
+- $L_i$: Level (depth) information
 
-### 3.2.2 Gumbel-Top-K Decision (Scheme D)
+### 3.2.2 H1SS: Hilbert Splitter with Stable Selection
 
-Instead of making threshold decisions per region, we evaluate all candidates in parallel and select the Top-K with the highest scores.
+H1SS is based on six axioms (A1-A6) for optimal token selection:
 
-**Decision Logits** (I30-4 Updated, I131-1 Revised):
+| Axiom | Description |
+|:------|:------------|
+| A1 | 1D Hilbert manifold convolution |
+| A2 | No Gumbel perturbation |
+| A3 | Entmax sparse activation |
+| A4 | Tree consistency soft constraint |
+| A5 | Single Entmax projection |
+| A6 | < 10K parameters |
 
-$$\text{logits}_i = \text{MLP}(\text{ROI}(F, R_i)) + b_{explore} - \tau_{d_i}$$
+**α-Entmax Definition**:
 
-where:
-- $\text{MLP}(\text{ROI}(F, R_i))$: Learnable complexity score (I30-4)
-- $\tau_{d_i}$: Learnable per-depth threshold.
-- $b_{explore}$: Annealed exploration bias.
+$$\text{entmax}_\alpha(z) = \arg\max_{p \in \Delta^{n-1}} (p^T z + H_\alpha(p))$$
 
-> **Note (I131-1)**: The depth penalty term $\beta \cdot \gamma^{d_i}$ has been removed. Depth distribution is now fully controlled by the learnable quota mechanism (Scheme E), eliminating the conflict between fixed depth bias and learnable quotas.
+where $H_\alpha(p) = \frac{1}{1-\alpha} \log \sum_i p_i^\alpha$ is the Rényi entropy.
 
-> **Note (I30-4)**: The Log-Compensation Bias $b_{log}(d_i) = \log(N_{total} / N_{d_i})$ has been removed in favor of the learnable quota mechanism (Scheme E).
+**Properties**:
+- $\alpha \to 1$: Degrades to Softmax
+- $\alpha > 1$: Produces sparse distributions
+- $\alpha = 1.5$: May cause hard truncation (I107), reducing gradient flow
 
-**Stochastic Selection**:
+**Alpha Warmup Strategy (I107)**:
 
-$$z_i = \text{logits}_i + g_i, \quad g_i \sim \text{Gumbel}(0, 1)$$
-$$\text{selected\_indices} = \text{TopK}(\{z_i/\tau\}_{i=1}^{N_{cand}}, K)$$
+H1SS uses an alpha warmup schedule to prevent hard truncation during early training:
 
-This formulation provides gradients for **selected** candidates via the Straight-Through Estimator (STE), while unselected candidates receive attenuated gradients (~20x reduction).
+$$\alpha(t) = \begin{cases} 1.2 + 0.3 \cdot \frac{t}{T_{warmup}} & t < T_{warmup} \\ \min(2.0, 1.5 + 0.5 \cdot \frac{t - T_{warmup}}{T_{schedule} - T_{warmup}}) & t \geq T_{warmup} \end{cases}$$
 
-### 3.2.3 Learnable Quota Allocation (Scheme E)
+Default schedule: $T_{warmup} = 10$, $T_{schedule} = 20$
 
-When `LEARNABLE_QUOTA_ENABLED=True`, the model learns an optimal token quota distribution across depths.
+This ensures:
+- Early training ($\alpha \approx 1.2$): Soft selection, full gradient flow
+- Late training ($\alpha \to 1.5-2.0$): Sparse selection, improved efficiency
 
-**Quota Calculation**:
+**Selection (I122-1 Updated)**:
 
-$$\pi_d = \text{softmax}(\phi_d), \quad \phi \in \mathbb{R}^{D+1}$$
-$$K_d = \text{round}(\pi_d \cdot K_{total})$$
-$$K_d = \max(K_d, K_{min})$$
+The original STE formulation:
 
-where:
-- $\phi_d$: Learnable logit for depth $d$
-- $\pi_d$: Learned probability distribution over depths
-- $K_d$: Quota allocated to depth $d$
-- $K_{min}$: Minimum quota per depth (default: 2)
+$$\text{st\_mask} = \text{hard\_mask} - \text{soft\_mask.detach()} + \alpha \cdot \text{soft\_mask}$$
 
-**Hierarchical Top-K Selection**:
+Has been replaced with **entmax sparse selection** for stability:
 
-For each depth $d$, select exactly $K_d$ tokens from regions at that depth, then merge results across depths.
+$$\text{selected\_mask} = \text{entmax}_\alpha(z) \cdot K$$
+
+where $K$ is the target token count, and $\alpha$ is the entmax parameter. For $\alpha < 1.9$, entmax degrades to softmax, providing direct gradient flow without STE approximation.
+
+### 3.2.3 H-entmax: Hilbert-Ordered Entmax (Alternative)
+
+**Hilbert-Ordered Entmax Splitter** uses α-Entmax (α=1.5) for exact sparsity with full gradient flow:
+
+| Feature | Description |
+|:--------|:------------|
+| **Parallelism** | 100% |
+| **Gradient Flow** | **100%** (full, no STE) |
+| **Hilbert Locality** | 100% |
+| **Sparsity** | Exact α-Entmax |
 
 ### 3.2.4 Tree Consistency
 
-The raw Top-K selection may violate the tree structure (e.g., selecting both a parent and its child). We enforce consistency via a vectorized operation:
+The tree consistency constraint prevents selecting both a parent and its child:
 
-$$\text{consistent}(i) \iff i \in \text{TopK} \land \forall c \in \text{children}(i), c \notin \text{TopK}$$
+$$\text{consistent}(i) \iff i \in \text{Selected} \land \forall c \in \text{children}(i), c \notin \text{Selected}$$
 
-This insures that if a parent is selected, its children are ignored, maintaining a valid partition (or subset thereof).
+**Tree Constraint Loss** (H1SS):
 
-### 3.2.5 Shape-Scale Encoder (I31)
+$$\mathcal{L}_{tree} = \sum_{i} \sum_{c \in \text{children}(i)} \max(0, p_i - p_c + \epsilon)$$
 
-For enhanced token representation, a shape-scale encoder captures region geometry:
+where $p_i$ is the selection probability.
 
-**Aspect Ratio**:
-$$r = \log(w/h) \quad \text{(log-transformed for symmetry)}$$
+**Jump Loss** (Hilbert Continuity):
 
-**Normalized Area**:
-$$s = \frac{w \cdot W_{patch}}{W_{total} \cdot H_{total}}$$
+The Jump Loss encourages selection of spatially contiguous regions by penalizing large Hilbert distance jumps:
 
-**Gated Combination**:
-$$g = \sigma(\text{MLP}([r; s]))$$
-$$E_{shape}(R) = \text{MLP}([r \cdot g; s \cdot (1-g)])$$
+$$\mathcal{L}_{jump} = \mathbb{E}[(\Delta h - 1)^2_+]$$
 
----
+where:
 
-## 3.3 Splitting Schemes
+- $\Delta h = |h_{i+1} - h_i|$: Absolute difference in Hilbert indices between adjacent selected tokens
+- $(\cdot)_+ = \max(0, \cdot)$: ReLU activation
 
-### 3.3.1 Scheme D: Gumbel-Top-K (Base)
+**Why ReLU over exponential (I107)**:
 
-| Feature | Description |
-|:--------|:------------|
-| **Parallelism** | 100% (All regions evaluated in one batch) |
-| **Gradient Flow** | ~37.6% (K/N) - STE provides gradients to selected tokens, attenuated for unselected |
-| **Hilbert Locality** | 100% (Strict adherence to Hilbert curve ordering) |
-| **Complexity** | $O(N_{cand})$ parallel evaluation |
+| Form | $\Delta h = 1$ | $\Delta h \to \infty$ | Behavior |
+|:-----|:----------------|:---------------------|:---------|
+| $\exp(-\gamma \Delta h)$ | $0.37$ (high penalty) | $0$ (no penalty) | Incorrect: Large jumps go unpunished |
+| $(\Delta h - 1)^2_+$ | $0$ (no penalty) | $\infty$ (quadratic growth) | Correct: Penalizes large jumps proportionally |
 
-### 3.3.2 Scheme E: Learnable Quota (Extension)
+The ReLU form correctly implements the intuition that small Hilbert jumps ($\Delta h \leq 1$, which corresponds to adjacent regions) should be allowed, while large jumps should be quadratically penalized.
 
-| Feature | Description |
-|:--------|:------------|
-| **Adaptive Budget** | Learns optimal token distribution across depths |
-| **Depth Balance** | Prevents over-allocation to shallow or deep tokens |
-| **Interpretability** | $\pi_d$ reveals model's preferred depth distribution |
+## 3.3 Splitter Comparison
 
-### 3.3.3 Scheme Comparison
+| Splitter | Gradient | Sparsity | Parameters | Status |
+|:---------|:---------|:---------|:-----------|:-------|
+| GumbelTopK | ~37% (STE) | Soft | Medium | Legacy |
+| DeterministicNeighbor | 100% | Soft | Medium | Legacy |
+| **H1SS (HilbertOptimal)** | **100%** | **Sparse** | **< 10K** | ✓ **Recommended** |
+| **H-entmax (HilbertOrderedEntmax)** | **100%** | **Sparse** | **Medium** | ✓ **Alternative** |
 
-| Scheme | Parallelism | Gradient | Quota | Status |
-|:-------|:------------|:---------|:------|:-------|
-| A (BFS) | ~30% | Partial | Fixed | Deprecated |
-| B (Relaxation) | ~60% | Partial | Fixed | Deprecated |
-| C (Fixed Budget) | 100% | STE | Fixed | Deprecated |
-| **D (Gumbel-Top-K)** | **100%** | **STE** | **Fixed** | Legacy |
-| **E (Learnable Quota)** | **100%** | **STE** | **Learned** | Legacy |
-| **F (DeterministicNeighbor)** | **100%** | **100% Direct** | **Learned** | ✓ **Recommended** |
-
----
-
-## 3.4 DeterministicNeighborSplitter (I160-1)
-
-> **Recommended**: This scheme represents the optimal implementation for Hilbert Curve ViT
-
-### 3.4.1 Overview
-
-`DeterministicNeighborSplitter` is a deterministic alternative to GumbelTopKSplitter, addressing the train/eval inconsistency and gradient sparsity issues caused by Gumbel randomness.
-
-### 3.4.2 Comparison with GumbelTopK
-
-| Dimension | GumbelTopK | DeterministicNeighbor |
-|:---------|:------------|:---------------------|
-| **Randomness Source** | $g \sim Gumbel(0,1)$ | None (deterministic) |
-| **Gradient Coverage** | ~100% (STE) | **100%** (direct) |
-| **Hilbert Locality** | 100% | 100% |
-| **Redundancy Removal** | None | ✓ Neighbor propagation |
-| **train/eval Consistency** | Needs DeterministicTopK | **Inherently consistent** |
-| **Numerical Stability** | Gumbel overflow risk | Stable |
-
-### 3.4.3 Mathematical Formulation
-
-**Hilbert Adjacency Matrix**:
-
-$$A_{ij} = \mathbb{1}[\text{LCA}(i,j) \geq \ell]$$
-
-where $\ell$ is the adjacency threshold (default $\ell=2$).
-
-**Neighbor-Aware Propagation (NAP-style)**:
-
-$$s'_i = s_i + \alpha \cdot \frac{1}{|\mathcal{N}_\ell(i)|} \sum_{j \in \mathcal{N}_\ell(i)} \text{sim}(f_i, f_j) \cdot s_j$$
-
-**Deterministic Selection**:
-
-$$p_i = \text{softmax}(s'_i / \tau)_i$$
-
-**Locality Consistency Loss**:
-
-$$\mathcal{L}_{local} = \sum_{(i,j) \in \mathcal{E}} |\sigma(s_i) - \sigma(s_j)|$$
-
-### 3.4.4 Configuration Parameters
+### H1SS Parameters
 
 ```python
-from vit_pytorch.layers.splitters.deterministic_neighbor import DeterministicNeighborSplitterConfig
-
-config = DeterministicNeighborSplitterConfig(
-    max_level_limit=4,
+HilbertOptimalSplitter(
     feature_dim=256,
     hidden_dim=64,
-    neighbor_threshold=2,      # ℓ threshold
-    enable_neighbor_aware=True,
-    alpha_init=0.5,          # Neighbor weight initialization
+    max_level_limit=8,
+    K_min=8,
+    K_max=64,
+    entmax_alpha=1.2,  # α-Entmax alpha
+    tree_constraint_weight=0.1,
     temperature_init=1.0,
-    enable_learnable_quota=True,
-    locality_weight=0.1,      # Locality consistency loss weight
+    temperature_min=0.3,
+    jump_loss_weight=0.1,
+    density_field_hidden_dim=32,
 )
 ```
 
-### 3.4.5 Usage Example
+### H-entmax Parameters
+
+The H-entmax functionality is provided by `HilbertOptimalSplitter` with α-Entmax activation:
 
 ```python
-from vit_pytorch import StreamingFractalTokenizerV3
-
-tokenizer = StreamingFractalTokenizerV3(
-    image_size=224,
-    d_model=384,
-    splitter_type='deterministic_neighbor',  # Use DeterministicNeighbor
+# Use HilbertOptimalSplitter with entmax_alpha for H-entmax behavior
+HilbertOptimalSplitter(
+    feature_dim=256,
+    hidden_dim=64,
+    max_level_limit=8,
+    K_min=8,
+    K_max=64,
+    entmax_alpha=1.5,  # α for α-Entmax (full sparse selection)
+    tree_constraint_weight=0.1,
+    temperature_init=1.0,
+    temperature_min=0.3,
 )
 ```
+
+---
+
+## 3.4 DeterministicNeighborSplitter (Legacy)
+
+> **Note**: This splitter is **Legacy**. Use **H1SS (HilbertOptimalSplitter)** instead.
+
+### Overview
+
+`DeterministicNeighborSplitter` was previously recommended for its deterministic behavior and 100% gradient coverage, but has been superseded by H1SS which offers better parameter efficiency (< 10K parameters) and sparse activation.
+
+### Comparison
+
+| Dimension | GumbelTopK | DeterministicNeighbor | H1SS |
+|:---------|:------------|:---------------------|:-----|
+| **Randomness Source** | $g \sim Gumbel(0,1)$ | None | None |
+| **Gradient Coverage** | ~37% (STE) | 100% (direct) | **100%** |
+| **Parameters** | Medium | Medium | **< 10K** |
+| **Sparsity** | Soft | Soft | **Sparse** |
+| **Status** | Legacy | Legacy | ✓ **Recommended** |
 
 ---
 
@@ -253,7 +241,21 @@ For accurate attention bias, LCA is computed directly from region boundaries:
 $$\text{Path}(R) = \text{bit}(cx, D-d) + 2 \cdot \text{bit}(cy, D-d)$$
 $$\text{LCA}(i, j) = \text{Length}(\text{CommonPrefix}(\text{Path}(i), \text{Path}(j)))$$
 
----
+### I161-1: Depth-Root Normalized Hilbert Index
+
+The raw Hilbert index $H \in [0, 4^d)$ varies across depths, making direct comparison problematic. The **depth-root normalization** addresses this:
+
+$$H_{norm} = \left(\frac{H}{4^d}\right)^{\frac{1}{d}}$$
+
+**Properties**:
+
+- $H_{norm} \in [0, 1]$ for all depths $d$
+- $H_{norm}$ at depth $d$ naturally aligns with $H_{norm}$ at depth $d-1$ (parent level)
+- Preserves Hilbert curve self-similarity across scales
+
+**Why This Matters**:
+
+Without normalization, a depth-0 token with $H=100$ would appear "farther" than a depth-3 token with $H=10$, despite the depth-3 token covering a smaller, more specific region. Normalization ensures scale-invariant comparison while preserving spatial locality ordering.
 
 ## 3.6 Implementation
 
@@ -263,42 +265,46 @@ $$\text{LCA}(i, j) = \text{Length}(\text{CommonPrefix}(\text{Path}(i), \text{Pat
 class StreamingFractalTokenizerV3(BaseTokenizer):
     def __init__(
         self,
-        image_size: int = 224,
-        d_model: int = 384,
+        image_size: Union[int, Tuple[int, int]] = 224,
+        channels: int = 3,
+        d_model: int = 256,
         base_patch_size: int = 4,
-        min_patch_size: int = 4,
-        max_depth: Optional[int] = None,
-        K_min: int = 8,
-        K_max: int = 64,
-        splitter_dropout: float = 0.15,
+        min_patch_size: Union[int, Tuple[int, int]] = 4,
+        max_level: Optional[int] = None,
+        use_hilbert_order: bool = True,
+        depth_scale_range: Optional[Tuple[float, float]] = (0.5, 2.0),
+        use_interpolated_pooling: bool = False,
+        use_dynamic_weight: bool = False,
     ):
         """
         Args:
-            image_size: Input image size
+            image_size: Input image size (int or (W, H) tuple)
+            channels: Number of input channels
             d_model: Model dimension
             base_patch_size: Base patch size for level 0
             min_patch_size: Target minimum patch size
-            max_depth: Maximum quadtree depth (auto-computed if None)
-            K_min: Minimum token count (I23-2)
-            K_max: Maximum token count
-            splitter_dropout: Dropout for splitter MLP
+            max_level: Maximum quadtree level (auto-computed if None, I30-17)
+            use_hilbert_order: Enable Hilbert curve ordering
+            depth_scale_range: P6-1 depth scale range for sigmoid parameterization
+            use_interpolated_pooling: Enable interpolated pooling (I-PHASE4)
+            use_dynamic_weight: Enable dynamic weight (C3 scale equivariance)
         """
         ...
 ```
 
-### Core Logic: GumbelTopKSplitter
+### Core Logic: HilbertOptimalSplitter (H1SS)
 
 ```python
-class GumbelTopKSplitter(nn.Module):
-    def forward(self, features: Tensor) -> GumbelTopKResult:
+class HilbertOptimalSplitter(nn.Module):
+    def forward(self, features: Tensor) -> TensorSplitResult:
         """
         Returns:
-            GumbelTopKResult with:
+            TensorSplitResult with:
             - regions: [M, 4] Selected region coordinates
             - depths: [M] Region depths
             - batch_indices: [M] Batch indices
             - hilbert_indices: [M] Hilbert curve indices
-            - selected_mask: [B, N] STE gradient mask
+            - selected_mask: [B, N] Entmax sparse selection mask
             - logits: [B, N] Raw logits
             - probs: [B, N] Split probabilities
             - num_selected_per_batch: [B] Token count per sample
@@ -315,15 +321,18 @@ class GumbelTopKSplitter(nn.Module):
 
 ## 3.7 Usage Example
 
+### Basic Usage with H1SS (Recommended)
+
 ```python
 from vit_pytorch import StreamingFractalTokenizerV3
 
+# H1SS (Hilbert Splitter with Stable Selection)
+# Note: Splitter is now a separate component passed to tokenize()
 tokenizer = StreamingFractalTokenizerV3(
     image_size=224,
-    d_model=384,
+    d_model=256,
     base_patch_size=4,
-    K_min=8,
-    K_max=64,
+    depth_scale_range=(0.5, 2.0),  # P6-1: sigmoid parameterization
 )
 
 # Returns TokenizerOutput with aligned tokens and level info
@@ -331,43 +340,41 @@ output = tokenizer.tokenize(images)
 
 # Access results
 tokens = output.tokens          # [B, N, D]
-levels_info = output.levels     # [B, N, max_depth+1]
+levels_info = output.levels     # [B, N, max_level+1]
 regions = output.regions        # [B, N, 4] - region boundaries
 split_probs = output.split_probs  # [B, N] - selection confidence
 ```
 
-### Advanced: Scheme E with Learnable Quota
+### Direct Splitter Usage
 
 ```python
-from vit_pytorch import GumbelTopKSplitter
+from vit_pytorch.layers.splitters.hilbert_optimal_splitter import HilbertOptimalSplitter
 
-splitter = GumbelTopKSplitter(
-    dim=384,
-    max_depth=6,
-    K_total=32,
-    learnable_quota=True,    # Enable Scheme E
-    quota_init_logits=None,  # Auto-initialization
+splitter = HilbertOptimalSplitter(
+    feature_dim=256,
+    hidden_dim=64,
+    max_level_limit=8,
+    K_min=8,
+    K_max=64,
+    entmax_alpha=1.2,
+    tree_constraint_weight=0.1,
 )
-
-# After training, inspect learned quota distribution
-quota_probs = F.softmax(splitter.quota_logits, dim=0)
-# quota_probs[d] = probability of allocating tokens to depth d
 ```
 
 ---
 
 ## 3.8 Temperature Annealing
 
-The Gumbel-Softmax temperature controls exploration vs. exploitation:
+Temperature annealing controls exploration vs. exploitation for H1SS and H-entmax:
 
 $$\tau(t) = \tau_{start} \cdot \left(\frac{\tau_{end}}{\tau_{start}}\right)^{t / T_{total}}$$
 
-**Default Schedule**:
+**Default Schedule (H1SS)**:
 
 | Parameter | Value |
 |:----------|:------|
 | $\tau_{start}$ | 1.0 |
-| $\tau_{end}$ | 0.5 |
+| $\tau_{end}$ | 0.3 |
 | Schedule | Exponential decay |
 
 ---
@@ -378,13 +385,19 @@ All numerical stability constants are centralized in `constants.py`:
 
 | Constant | Value | Mathematical Basis |
 |:---------|:------|:-------------------|
-| `GUMBEL_EPSILON` | $1e-8$ | FP16 safe lower bound |
-| `LOG_EPSILON` | $1e-8$ | Logarithm stability |
-| `DIVISION_EPSILON` | $1e-8$ | Division stability |
-| `PROB_EPSILON` | $1e-5$ | Probability clamping |
-| `LOGIT_CLAMP_BOUND` | $50.0$ | $\text{softmax}(x > 50) \approx \text{one-hot}$ |
-| `GRAD_CLAMP_BOUND` | $20.0$ | $P(\|grad\| > 20) \approx 10^{-6}$ |
-| `TEMPERATURE_MIN` | $0.3$ | Prevents gradient saturation |
+| `EPS` | $1e-6$ | General FP stability |
+| `FP16_SAFE_EPSILON` | $1e-6$ | FP16 safe lower bound |
+| `TEMPERATURE_MIN` | $0.3$ | Prevents gradient saturation (I113-10: τ=0.3 时梯度强度 ≈ 3.3) |
+| `LOGIT_CLAMP_BOUND` | $10.0$ | $\text{softmax}(x > 10) \approx 0.99995$ |
+| `GRAD_CLAMP_BOUND` | $20.0$ | Gradient magnitude bound |
+| `SCALE_CLAMP_BOUND` | $15.0$ | Depth scale clamp bound |
+| `SPLITTER_TEMP_START` | $1.0$ | Initial temperature |
+| `SPLITTER_TEMP_END` | $0.3$ | Final temperature |
+| `LEARNABLE_QUOTA_ENABLED` | `True` | Enable Scheme E quota |
+| `QUOTA_MIN_PER_DEPTH` | $2$ | Minimum tokens per depth |
+| `QUOTA_MIN_RATIO` | $0.02$ | Minimum quota ratio |
+| `K_COVERAGE_BASE` | $0.25$ | Base token coverage |
+| `K_MIN_HARD_LIMIT` | $8$ | Minimum absolute K |
 
 ### Mathematical Formulation of Key Constants
 
