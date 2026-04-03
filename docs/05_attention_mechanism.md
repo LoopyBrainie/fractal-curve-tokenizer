@@ -6,10 +6,7 @@ The `HilbertAwareMultiScaleAttention` extends standard multi-head attention with
 
 **Complexity Note**: Attention complexity remains $O(N^2 \cdot D)$. The ~40× efficiency gain comes from token count reduction ($N \approx 32$ vs $307K$), not asymptotic complexity change.
 
-**Temperature Selection**: The default $\tau_h \approx 1.5$ is chosen to:
-1. Provide meaningful bias magnitude (not too small to be ignored)
-2. Allow gradient flow through the Softplus parameterization
-3. Balance spatial locality prior strength
+**Bias Scaling**: The Hilbert bias is scaled by `hilbert_bias_scale × √d_k` (I122-2 simplification), eliminating the need for per-head temperature τ_h.
 
 ---
 
@@ -37,7 +34,7 @@ To ensure proper gradient magnitudes, bias terms are scaled by constants:
 | Constant | Value | Purpose |
 |:---------|:------|:--------|
 | `HILBERT_BIAS_SCALE` | 1.0 | Scale for LCA-based spatial bias |
-| `LEVEL_BIAS_SCALE` | 0.1 | Scale for relative level bias |
+| `LEVEL_BIAS_SCALE` | 1.0 | Scale for relative level bias |
 
 The scaled attention formula:
 
@@ -53,20 +50,15 @@ This bias encodes the tree distance between two tokens using their Lowest Common
 
 **Mathematical definition**:
 
-$$B[i,j] = \tau_h \cdot \text{LCAEmbed}(\text{LCA}(i, j))$$
+$$B[i,j] = \text{LCAEmbed}(\text{LCA}(i, j))$$
 
 where:
+
 - $\text{LCA}(i, j) \in \{0, \dots, d_{max}\}$: Depth of the smallest quadtree region containing both $R_i$ and $R_j$.
 - $\text{LCAEmbed}: \mathbb{Z} \to \mathbb{R}^H$: Learnable embedding table.
-- $\tau_h \in \mathbb{R}^H$: Per-head temperature parameter.
+- Bias scaling is handled by `hilbert_bias_scale × √d_k` (I122-2 simplification).
 
-**Temperature Parameter ($\tau_h$)**:
-
-To ensure the bias strength is positive and adaptive, we use a Softplus parameterization:
-
-$$\tau_h = \text{Softplus}(\gamma_h)$$
-
-Initialized such that $\tau \approx 1.5$, enhancing the prior for spatial locality.
+**Note (I122-2)**: The original τ_h temperature parameter has been removed. The bias strength is now controlled by the `HILBERT_BIAS_SCALE` constant multiplied by √d_k, providing unified scaling across heads.
 
 **P11-3: Region-Based LCA Computation**:
 
@@ -307,10 +299,11 @@ class HilbertAwareMultiScaleAttention(nn.Module):
         max_level: int = 8,
         use_hilbert_bias: bool = True,
         use_level_scaling: bool = True,
-        lca_temperature: Optional[float] = 1.5,
-        learnable_temperature: bool = True,
-        use_affine_modulation: bool = False,
+        use_affine_modulation: bool = True,
         fourier_levels: int = 4,
+        use_hierarchical_attention: bool = False,
+        encoder_config: Optional[AttentionEncoderConfig] = None,
+        use_fp16: bool = False,
     ):
         """
         Args:
@@ -318,30 +311,32 @@ class HilbertAwareMultiScaleAttention(nn.Module):
             heads: Number of attention heads
             dim_head: Dimension per head
             dropout: Dropout rate
-            max_level: Maximum quadtree depth
+            max_level: Maximum quadtree depth (I122-2: uses max_level)
             use_hilbert_bias: Enable LCA-based Hilbert bias
             use_level_scaling: Enable depth-dependent scaling
-            lca_temperature: Initial temperature for LCA bias
-            learnable_temperature: Whether temperature is learnable
             use_affine_modulation: Enable I31-3 area-aware bias
             fourier_levels: Number of Fourier frequency levels
+            use_hierarchical_attention: Enable depth-wise independent attention
+            encoder_config: Protocol-driven attention configuration
+            use_fp16: Use FP16 storage for bias
         """
 ```
 
 ### Class: LCAHilbertBias
 
 ```python
-class LCAHilbertBias(HilbertBiasBase):
+class LCAHilbertBias(nn.Module):
     def __init__(
         self,
         max_depth: int,
         heads: int,
-        lca_temperature: Optional[float] = 1.5,
-        learnable_temperature: bool = True,
+        lca_temperature: Optional[float] = None,  # I122-2: removed
+        learnable_temperature: bool = False,  # I122-2: removed
     ):
         """
-        Uses P6-2 learnable temperature with Softplus parameterization.
-        Supports both levels_info and region-based LCA computation.
+        LCA-based Hilbert bias computation.
+        Note: lca_temperature and learnable_temperature removed in I122-2,
+        bias strength now controlled by hilbert_bias_scale × √d_k.
         """
 ```
 
@@ -372,17 +367,17 @@ class AffineModulatedBias(nn.Module):
 ### Basic Configuration
 
 ```python
-from vit_pytorch import HilbertAwareMultiScaleAttention
+from vit_pytorch.layers.attention.hilbert_bias import HilbertAwareMultiScaleAttention
 
 attn = HilbertAwareMultiScaleAttention(
-    dim=384,
-    heads=6,
+    dim=512,
+    heads=8,
     dim_head=64,
     max_level=8,
     use_hilbert_bias=True,
     use_level_scaling=True,
-    lca_temperature=1.5,
-    learnable_temperature=True,
+    use_affine_modulation=True,
+    fourier_levels=4,
 )
 ```
 
@@ -390,15 +385,15 @@ attn = HilbertAwareMultiScaleAttention(
 
 ```python
 attn = HilbertAwareMultiScaleAttention(
-    dim=384,
-    heads=6,
+    dim=512,
+    heads=8,
     max_level=8,
     use_affine_modulation=True,
     fourier_levels=4,
 )
 
 # During forward pass, provide regions and image_size
-x = torch.randn(2, 100, 384)
+x = torch.randn(2, 100, 512)
 regions = torch.zeros(2, 100, 4)  # Region boundaries
 image_size = 224
 
@@ -408,12 +403,12 @@ out = attn(x, regions=regions, image_size=image_size)
 ### Direct LCA Computation from Regions
 
 ```python
-from vit_pytorch.attn_hilbert_bias import LCAHilbertBias
+from vit_pytorch.layers.attention.hilbert_bias import LCAHilbertBias
 
 lca_bias = LCAHilbertBias(
     max_depth=8,
-    heads=6,
-    lca_temperature=1.5,
+    heads=8,
+    # Note: lca_temperature removed in I122-2
 )
 
 # Compute bias directly from regions (P11-3 recommended)
@@ -433,13 +428,14 @@ For efficiency, LCA depth computation is cached across transformer layers:
 **Cache Key**: `data_ptr` + `torch_version`
 
 **Benefits**:
+
 - Eliminates redundant LCA computation per layer
 - ~6x speedup for 6-layer transformers
 - Automatic invalidation on tensor modification
 
 ```python
 # Cache is automatically managed
-lca_bias = LCAHilbertBias(max_depth=8, heads=6)
+lca_bias = LCAHilbertBias(max_depth=8, heads=8)
 
 # Manually clear cache if needed
 lca_bias.clear_cache()
@@ -455,10 +451,17 @@ Layer normalization uses $\epsilon = 10^{-5}$ for variance stability:
 
 $$\hat{x} = \frac{x - \mu}{\sqrt{\sigma^2 + \epsilon}}$$
 
-### Softplus Temperature
+### Bias Scale Constants
 
-Temperature parameterization ensures positivity:
+To ensure proper gradient magnitudes, bias terms are scaled by constants:
 
-$$\tau_h = \text{Softplus}(\gamma_h) = \log(1 + e^{\gamma_h})$$
+| Constant | Value | Purpose |
+|:---------|:------|:--------|
+| `HILBERT_BIAS_SCALE` | 1.0 | Scale for LCA-based spatial bias |
+| `LEVEL_BIAS_SCALE` | 1.0 | Scale for relative level bias |
+
+The scaled attention formula:
+
+$$\text{scores} = \frac{QK^T}{\sqrt{d_k}} + HILBERT\_BIAS\_SCALE \cdot B_{hilbert} + LEVEL\_BIAS\_SCALE \cdot B_{level}$$
 
 > **Next**: [06_feedforward_network.md](06_feedforward_network.md) - Feed-Forward Networks

@@ -1,71 +1,71 @@
-# Chapter 7: Transformer Encoder
+# 第七章：Transformer 编码器
 
-## 7.1 Overview
+## 7.1 概述
 
-The `FractalTransformer` stacks multiple `FractalTransformerBlock` layers with **level-aware normalization**, **Hilbert-aware attention**, and **level aggregation**. It features **depth-aware residual gating** (STAB-5) for adaptive information flow.
+`FractalTransformer` 堆叠多个 `FractalTransformerBlock` 层，具有**级别感知归一化**、**Hilbert 感知注意力**和**级别聚合**。它具有**深度感知残差门控**（STAB-5）以实现自适应信息流。
 
 ---
 
-## 7.2 Mathematical Formulation
+## 7.2 数学形式化
 
-### 7.2.1 Transformer Block
+### 7.2.1 Transformer 块
 
 $$x' = x + \text{DropPath}(\text{Attn}(\text{LN}_1(x)))$$
 $$x'' = x' + \text{DropPath}(\text{FFN}(\text{LN}_2(x')))$$
 
-### 7.2.2 Layer Norm
+### 7.2.2 层归一化
 
-The implementation uses standard `nn.LayerNorm` for both attention and FFN sub-layers (I106-2):
+实现对注意力和 FFN 子层都使用标准 `nn.LayerNorm`（I106-2）：
 
 $$\text{LayerNorm}(x) = \gamma \cdot \frac{x - \mu}{\sigma} + \beta$$
 
-Hilbert bias handles scale calibration across different token depths, eliminating the need for depth-dependent normalization parameters.
+Hilbert 偏置处理跨不同 token 深度的尺度校准，消除了对深度相关归一化参数的需求。
 
-### 7.2.3 Residual Gate (STAB-5, I34-10 / Task 3 重构)
+### 7.2.3 残差门控（STAB-5, I34-10 / Task 3 重构）
 
-The residual gate modulates the contribution of attention and FFN outputs using **sigmoid** activation:
+残差门控使用 **sigmoid** 激活调制注意力和 FFN 输出的贡献：
 
 $$g_{raw} \in \mathbb{R}, \quad g = \sigma(g_{raw}) \in [0, 1]$$
 $$x' = x + g \cdot \text{DropPath}(\text{Attn}(\text{LN}(x)))$$
 $$x'' = x' + g \cdot \text{DropPath}(\text{FFN}(\text{LN}(x')))$$
 
-where:
-- Gate range: $[0, 1]$ (sigmoid ensures bounded contribution)
-- $g$ directly scales the attention/FFN output
+其中：
+- 门控范围：$[0, 1]$（sigmoid 确保有界贡献）
+- $g$ 直接缩放注意力/FFN 输出
 
-**Rationale (Task 3 重构)**: Using $\sigma$ directly instead of $\tanh$ provides cleaner gradient flow with values in $[0, 1]$ instead of $[-1, 1]$, and the direct scaling $g \cdot \text{Attn}$ ensures gradients are always positive and well-behaved.
+**原理（Task 3 重构）**：直接使用 $\sigma$ 而非 $\tanh$ 提供更清晰的梯度流，值在 $[0, 1]$ 而非 $[-1, 1]$，且直接缩放 $g \cdot \text{Attn}$ 确保梯度始终为正且表现良好。
 
-**V-Shaped Gate Pattern (I24-6)**:
+**V 形门控模式（I24-6）**：
 
-Based on training observations:
-- $d=0$ (global): $g \approx 0.7$ - Suppress global information
-- $d=1$: $g \approx 1.0$ - Keep original
-- $d=2$: $g \approx 0.85$ - Slight suppression
-- $d=3$ (fine-grained): $g \approx 0.65$ - Suppress details
+基于训练观察：
+- $d=0$（全局）：$g \approx 0.7$ - 抑制全局信息
+- $d=1$：$g \approx 1.0$ - 保持原样
+- $d=2$：$g \approx 0.85$ - 轻微抑制
+- $d=3$（细粒度）：$g \approx 0.65$ - 抑制细节
 
-**Initialization**:
+**初始化**：
 
-Using small random initialization (std=0.01) centered near zero:
+使用以零为中心的小随机初始化（std=0.01）：
 
 $$g = \sigma(\mathcal{N}(0, 0.01)) \approx 0.5$$
 
-This ensures initial gate values around 0.5, allowing gradient flow during early training.
+这确保初始门控值约为 0.5，允许早期训练中的梯度流。
 
-### 7.2.4 Level Aggregation
+### 7.2.4 级别聚合
 
 $$s_d = \sigma(\text{Embed}_{level}(d)) \in (0, 1)^D$$
 $$r = W_2 \cdot \text{ReLU}(W_1 \cdot x)$$
 $$x' = x + \lambda \cdot (r \odot s_d)$$
 
-where:
-- $\lambda$: Learnable scaling factor (initialized to 0.2)
-- $\odot$: Element-wise multiplication
+其中：
+- $\lambda$：可学习缩放因子（初始化为 0.2）
+- $\odot$：逐元素乘法
 
 ---
 
 ## 7.3 FractalTransformer
 
-### Class Definition
+### 类定义
 
 ```python
 class FractalTransformer(nn.Module):
@@ -88,70 +88,70 @@ class FractalTransformer(nn.Module):
         fourier_levels: int = 4,
     ):
         """
-        Args:
-            dim: Model dimension
-            depth: Number of transformer layers
-            heads: Number of attention heads
-            dim_head: Dimension per head
-            mlp_dim: MLP hidden dimension
-            dropout: Dropout rate
-            drop_path: DropPath rate
-            max_level: Maximum quadtree depth (P11-2: should match tokenizer.max_depth)
-            drop_path_rate: Maximum DropPath rate (linearly increased)
-            ffn_type: FFN type ('gelu', 'swiglu', 'swiglu_level')
-            use_checkpoint: Gradient checkpointing for memory efficiency
-            lca_temperature: LCA bias temperature
-            learnable_temperature: Whether temperature is learnable
-            use_affine_modulation: Enable I31-3 area-aware bias
-            fourier_levels: Fourier frequency levels for area encoding
+        参数:
+            dim: 模型维度
+            depth: Transformer 层数
+            heads: 注意力头数
+            dim_head: 每头维度
+            mlp_dim: MLP 隐藏维度
+            dropout: dropout 率
+            drop_path: DropPath 率
+            max_level: 最大四叉树深度（P11-2：应与 tokenizer.max_depth 匹配）
+            drop_path_rate: 最大 DropPath 率（线性增加）
+            ffn_type: FFN 类型（'gelu', 'swiglu', 'swiglu_level'）
+            use_checkpoint: 梯度检查点以提高内存效率
+            lca_temperature: LCA 偏置温度
+            learnable_temperature: 温度是否可学习
+            use_affine_modulation: 启用 I31-3 面积感知偏置
+            fourier_levels: 面积编码的傅里叶频率级别数
         """
 ```
 
-### Parameters
+### 参数
 
-| Parameter | Type | Default | Description |
+| 参数 | 类型 | 默认值 | 描述 |
 |:----------|:-----|:--------|:------------|
-| `dim` | int | - | Model dimension |
-| `depth` | int | - | Number of transformer layers |
-| `heads` | int | 8 | Number of attention heads |
-| `dim_head` | int | 64 | Dimension per head |
-| `mlp_dim` | int | dim × 4 | FFN hidden dimension |
-| `dropout` | float | 0.0 | Dropout rate |
-| `drop_path` | float | 0.0 | DropPath rate |
-| `max_level` | int | 8 | Maximum quadtree depth |
-| `ffn_type` | str | 'swiglu_level' | FFN type |
-| `use_checkpoint` | bool | False | Gradient checkpointing |
-| `lca_temperature` | float | 1.5 | LCA bias temperature |
-| `learnable_temperature` | bool | True | Learnable temperature |
-| `use_affine_modulation` | bool | False | Area-aware bias (I31-3) |
-| `fourier_levels` | int | 4 | Fourier frequency levels |
+| `dim` | int | - | 模型维度 |
+| `depth` | int | - | Transformer 层数 |
+| `heads` | int | 8 | 注意力头数 |
+| `dim_head` | int | 64 | 每头维度 |
+| `mlp_dim` | int | dim × 4 | FFN 隐藏维度 |
+| `dropout` | float | 0.0 | dropout 率 |
+| `drop_path` | float | 0.0 | DropPath 率 |
+| `max_level` | int | 8 | 最大四叉树深度 |
+| `ffn_type` | str | 'swiglu_level' | FFN 类型 |
+| `use_checkpoint` | bool | False | 梯度检查点 |
+| `lca_temperature` | float | 1.5 | LCA 偏置温度 |
+| `learnable_temperature` | bool | True | 可学习温度 |
+| `use_affine_modulation` | bool | False | 面积感知偏置（I31-3） |
+| `fourier_levels` | int | 4 | 傅里叶频率级别数 |
 
 ---
 
 ## 7.4 FractalTransformerBlock
 
-### Block Structure
+### 块结构
 
 ```
-Input x [B, N, D]
+输入 x [B, N, D]
       │
       ▼
 ┌─────────────────────────────────┐
-│  Level-Aware LayerNorm 1        │
-│  γ_1(d), β_1(d) per depth       │
+│  级别感知 LayerNorm 1           │
+│  γ_1(d), β_1(d) 每深度          │
 └─────────────────────────────────┘
       │
       ▼
 ┌─────────────────────────────────┐
 │ HilbertAwareMultiScaleAttention │
-│ + LCA Bias                      │
-│ + Level Bias                    │
-│ + Affine Modulation (optional)  │
+│ + LCA 偏置                      │
+│ + 级别偏置                      │
+│ + 仿射调制（可选）              │
 └─────────────────────────────────┘
       │
       ▼
 ┌─────────────────────────────────┐
-│   Residual Gate (STAB-5)        │
+│   残差门控（STAB-5）             │
 │   w_1(d) = 2·σ(g_1[d]) ∈ [0,2] │
 └─────────────────────────────────┘
       │
@@ -163,19 +163,19 @@ Input x [B, N, D]
       │
       ▼
 ┌─────────────────────────────────┐
-│  Level-Aware LayerNorm 2        │
-│  γ_2(d), β_2(d) per depth       │
+│  级别感知 LayerNorm 2           │
+│  γ_2(d), β_2(d) 每深度          │
 └─────────────────────────────────┘
       │
       ▼
 ┌─────────────────────────────────┐
 │ AdaptiveFractalFeedForward      │
-│ (SwiGLU + Level Adaptation)     │
+│ (SwiGLU + 级别自适应)           │
 └─────────────────────────────────┘
       │
       ▼
 ┌─────────────────────────────────┐
-│   Residual Gate (STAB-5)        │
+│   残差门控（STAB-5）             │
 │   w_2(d) = 2·σ(g_2[d]) ∈ [0,2] │
 └─────────────────────────────────┘
       │
@@ -186,10 +186,10 @@ Input x [B, N, D]
 └─────────────────────────────────┘
       │
       ▼
-Output x [B, N, D]
+输出 x [B, N, D]
 ```
 
-### Implementation
+### 实现
 
 ```python
 class FractalTransformerBlock(nn.Module):
@@ -212,7 +212,7 @@ class FractalTransformerBlock(nn.Module):
         self.dim = dim
         self.max_level = max_level
 
-        # Attention
+        # 注意力
         self.attention = HilbertAwareMultiScaleAttention(
             dim=dim,
             heads=heads,
@@ -234,10 +234,10 @@ class FractalTransformerBlock(nn.Module):
             ffn_type=ffn_type,
         )
 
-        # STAB-5: Residual Gate (level-aware)
+        # STAB-5：残差门控（级别感知）
         self._residual_gate = nn.Embedding(max_level + 1, 2)
 
-        # Level-aware LayerNorm
+        # 级别感知 LayerNorm
         self.norm1_gamma = nn.Embedding(max_level + 1, dim)
         self.norm1_beta = nn.Embedding(max_level + 1, dim)
         self.norm2_gamma = nn.Embedding(max_level + 1, dim)
@@ -247,7 +247,7 @@ class FractalTransformerBlock(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 ```
 
-### Forward Pass
+### 前向传播
 
 ```python
 def forward(
@@ -259,17 +259,17 @@ def forward(
     image_size: Optional[int] = None,
 ) -> torch.Tensor:
     """
-    Args:
-        x: (B, N, D) - Input sequence
-        levels_info: (B, N, max_depth+1) - Level information
-        attention_mask: (B, 1, 1, N) - Attention mask
-        regions: (B, N, 4) - Region boundaries for LCA computation
-        image_size: int - Image size for region-based LCA
+    参数:
+        x: (B, N, D) - 输入序列
+        levels_info: (B, N, max_depth+1) - 级别信息
+        attention_mask: (B, 1, 1, N) - 注意力掩码
+        regions: (B, N, 4) - 用于 LCA 计算的区域边界
+        image_size: int - 用于基于区域的 LCA 的图像大小
 
-    Returns:
-        x: (B, N, D) - Encoded sequence
+    返回:
+        x: (B, N, D) - 编码序列
     """
-    # Extract depths for level-aware operations
+    # 提取深度以进行级别感知操作
     if levels_info is not None and levels_info.numel() > 0:
         depths = extract_depths(levels_info, self.max_level)
         gate_raw = self._residual_gate(depths)
@@ -277,17 +277,17 @@ def forward(
         w1 = gate[:, :, 0].unsqueeze(-1)
         w2 = gate[:, :, 1].unsqueeze(-1)
     else:
-        # Default gate for CLS token
+        # CLS token 的默认门控
         default_gate = torch.sigmoid(self._residual_gate.weight[0]) * 2
         w1 = default_gate[0]
         w2 = default_gate[1]
 
-    # Level-aware LayerNorm 1
+    # 级别感知 LayerNorm 1
     norm1_x = self._apply_level_aware_norm(
         x, levels_info, self.norm1_gamma, self.norm1_beta, self.default_norm1
     )
 
-    # Attention
+    # 注意力
     attn_out = self.attention(
         norm1_x,
         levels_info=levels_info,
@@ -296,10 +296,10 @@ def forward(
         image_size=image_size,
     )
 
-    # Residual with gate
+    # 带门控的残差
     x = x + self.drop_path(attn_out * w1)
 
-    # Level-aware LayerNorm 2
+    # 级别感知 LayerNorm 2
     norm2_x = self._apply_level_aware_norm(
         x, levels_info, self.norm2_gamma, self.norm2_beta, self.default_norm2
     )
@@ -307,7 +307,7 @@ def forward(
     # FFN
     ff_out = self.ff(norm2_x, levels_info)
 
-    # Residual with gate
+    # 带门控的残差
     x = x + self.drop_path(ff_out * w2)
 
     return x
@@ -315,9 +315,9 @@ def forward(
 
 ---
 
-## 7.5 Level-Aware Layer Normalization
+## 7.5 级别感知层归一化
 
-### Implementation
+### 实现
 
 ```python
 def _apply_level_aware_norm(
@@ -329,16 +329,16 @@ def _apply_level_aware_norm(
     default_norm: nn.LayerNorm,
 ) -> torch.Tensor:
     """
-    Apply depth-dependent layer normalization.
+    应用深度相关层归一化。
 
-    Each depth level has its own scale (γ) and shift (β) parameters.
+    每个深度级别有自己的缩放（γ）和移位（β）参数。
 
-    P11-16: When levels_info is None, use depth 0 as default.
+    P11-16：当 levels_info 为 None 时，使用深度 0 作为默认值。
     """
     if x.dim() != 3:
-        raise ValueError(f"Expected x to be 3D [B, S, D], got {x.dim()}D")
+        raise ValueError(f"期望 x 为 3D [B, S, D]，得到 {x.dim()}D")
 
-    # Handle None levels_info (P11-16)
+    # 处理 None levels_info（P11-16）
     if levels_info is None or levels_info.numel() == 0:
         depths = torch.zeros(x.shape[0], x.shape[1], dtype=torch.long, device=x.device)
     elif levels_info.dim() == 2:
@@ -350,7 +350,7 @@ def _apply_level_aware_norm(
         gamma = gamma_emb(depths)
         beta = beta_emb(depths)
 
-    # Manual LayerNorm
+    # 手动 LayerNorm
     mean = x.mean(dim=-1, keepdim=True)
     var = x.var(dim=-1, keepdim=True, unbiased=False)
     x_norm = (x - mean) / torch.sqrt(var + 1e-5)
@@ -358,36 +358,36 @@ def _apply_level_aware_norm(
     return x_norm * gamma + beta
 ```
 
-### Purpose
+### 目的
 
-Different resolution tokens (depths) have different statistical properties:
-- **Shallow tokens** (large regions): Higher variance, more global information
-- **Deep tokens** (small regions): Lower variance, more local details
+不同分辨率 token（深度）具有不同的统计特性：
+- **浅层 token**（大区域）：更高的方差，更多全局信息
+- **深层 token**（小区域）：更低的方差，更多局部细节
 
-Level-aware normalization allows the model to learn depth-specific transformations.
+级别感知归一化允许模型学习深度特定的变换。
 
 ---
 
-## 7.6 DropPath (Stochastic Depth)
+## 7.6 DropPath（随机深度）
 
-### Mathematical Definition
+### 数学定义
 
-**Training**:
+**训练**：
 
-$$\text{DropPath}(x) = \begin{cases} 0 & \text{with probability } p \\ \frac{x}{1-p} & \text{otherwise} \end{cases}$$
+$$\text{DropPath}(x) = \begin{cases} 0 & \text{以概率 } p \\ \frac{x}{1-p} & \text{否则} \end{cases}$$
 
-**Inference**:
+**推理**：
 
 $$\text{DropPath}(x) = x$$
 
-### Purpose
+### 目的
 
-1. Regularization via random layer dropping
-2. Reduces effective network depth during training
-3. Acts as implicit ensemble of networks of varying depth
-4. Linearly increasing drop rate: $p_l = \frac{l}{L} \cdot p_{max}$
+1. 通过随机丢弃层进行正则化
+2. 减少训练时的有效网络深度
+3. 作为不同深度网络集合的隐式集成
+4. 线性增加的丢弃率：$p_l = \frac{l}{L} \cdot p_{max}$
 
-### Implementation
+### 实现
 
 ```python
 class DropPath(nn.Module):
@@ -412,25 +412,25 @@ class DropPath(nn.Module):
 
 ---
 
-## 7.7 Level Aggregation
+## 7.7 级别聚合
 
-After the layer stack, a learnable aggregator combines information across depths:
+在层堆叠之后，学习聚合器跨深度组合信息：
 
-### Mathematical Formulation
+### 数学形式
 
 $$s_d = \sigma(\text{Embed}_{level}(d)) \in (0, 1)^D$$
 $$r = W_2 \cdot \text{ReLU}(W_1 \cdot x)$$
 $$x' = x + \lambda \cdot (r \odot s_d)$$
 
-### Implementation
+### 实现
 
 ```python
 class FractalTransformer(nn.Module):
     def _apply_level_aggregation(self, x: torch.Tensor, levels_info: torch.Tensor) -> torch.Tensor:
         """
-        Level-aware aggregation (ARCH-R2).
+        级别感知聚合（ARCH-R2）。
 
-        Formula:
+        公式:
             s_d = σ(Embed_level(d))
             r = W_2 · ReLU(W_1 · x)
             x' = x + λ · (r ⊙ s_d)
@@ -438,7 +438,7 @@ class FractalTransformer(nn.Module):
         depths = extract_depths(levels_info, self.max_level)
         scale = torch.sigmoid(self._level_aggregator_scale(depths))
 
-        # Adjust shape for broadcasting
+        # 调整形状以进行广播
         if scale.dim() == 2:
             scale = scale.unsqueeze(0)
 
@@ -450,9 +450,9 @@ class FractalTransformer(nn.Module):
 
 ---
 
-## 7.8 Gradient Checkpointing
+## 7.8 梯度检查点
 
-For memory-efficient training on long sequences:
+对于长序列的内存高效训练：
 
 ```python
 def forward(
@@ -467,7 +467,7 @@ def forward(
 
     for layer in self.layers:
         if self.use_checkpoint and self.training:
-            # Recompute activations to save memory
+            # 重新计算激活以节省内存
             x = checkpoint(
                 layer,
                 x,
@@ -486,7 +486,7 @@ def forward(
                 image_size=image_size,
             )
 
-    # Level aggregation
+    # 级别聚合
     if levels_info is not None and levels_info.numel() > 0:
         x = self._apply_level_aggregation(x, levels_info)
 
@@ -496,7 +496,7 @@ def forward(
 
 ---
 
-## 7.9 Usage Example
+## 7.9 使用示例
 
 ```python
 from vit_pytorch import FractalTransformer
@@ -522,52 +522,50 @@ regions = torch.rand(2, 100, 4)
 image_size = 224
 
 output = transformer(x, levels_info, mask, regions=regions, image_size=image_size)
-# Output: (2, 100, 384)
+# 输出: (2, 100, 384)
 ```
 
 ---
 
-## 7.10 Numerical Stability Constants
+## 7.10 数值稳定性常量
 
-All constants are centralized in `constants.py`:
+所有常量都集中在 `constants.py` 中：
 
-| Constant | Value | Purpose |
+| 常量 | 值 | 用途 |
 |:---------|:------|:--------|
-| `GUMBEL_EPSILON` | 1e-8 | Gumbel noise stability |
-| `LOG_EPSILON` | 1e-8 | Logarithm stability |
-| `DIVISION_EPSILON` | 1e-8 | Division stability |
-| `PROB_EPSILON` | 1e-5 | Probability clamping |
-| `LAYER_NORM_EPS` | 1e-5 | LayerNorm variance |
-| `SPLITTER_TEMP_START` | 1.0 | Initial Gumbel temperature |
-| `SPLITTER_TEMP_END` | 0.3 | Final Gumbel temperature |
-| `TEMPERATURE_MIN` | 0.3 | Minimum temperature (gradient explosion below) |
-| `DEPTH_KL_WEIGHT` | 0.5 | Depth balance KL weight |
-| `DEPTH_QUOTA_TARGET` | - | Quota target distribution |
-| `LEARNABLE_QUOTA_ENABLED` | True | Scheme E quota allocation |
-| `QUOTA_MIN_PER_DEPTH` | 2 | Minimum quota per depth |
-| `THRESHOLD_VAR_REG_WEIGHT` | 0.3 | Threshold variance regularization |
+| `GUMBEL_EPSILON` | 1e-8 | Gumbel 噪声稳定性 |
+| `LOG_EPSILON` | 1e-8 | 对数稳定性 |
+| `DIVISION_EPSILON` | 1e-8 | 除法稳定性 |
+| `PROB_EPSILON` | 1e-5 | 概率钳位 |
+| `LAYER_NORM_EPS` | 1e-5 | LayerNorm 方差 |
+| `SPLITTER_TEMP_START` | 1.0 | 初始 Gumbel 温度 |
+| `SPLITTER_TEMP_END` | 0.3 | 最终 Gumbel 温度 |
+| `TEMPERATURE_MIN` | 0.3 | 最小温度（低于此梯度爆炸） |
+| `DEPTH_KL_WEIGHT` | 0.5 | 深度平衡 KL 权重 |
+| `DEPTH_QUOTA_TARGET` | - | 配额目标分布 |
+| `LEARNABLE_QUOTA_ENABLED` | True | 方案 E 配额分配 |
+| `QUOTA_MIN_PER_DEPTH` | 2 | 每深度最小配额 |
+| `THRESHOLD_VAR_REG_WEIGHT` | 0.3 | 阈值方差正则化 |
 
 ---
 
-## 7.11 Complexity Analysis
+## 7.11 复杂度分析
 
-### Per Block
+### 每块
 
-| Operation | Time | Space |
+| 操作 | 时间 | 空间 |
 |:----------|:-----|:------|
-| Attention | $O(B \cdot H \cdot N^2 \cdot d)$ | $O(B \cdot H \cdot N^2)$ |
+| 注意力 | $O(B \cdot H \cdot N^2 \cdot d)$ | $O(B \cdot H \cdot N^2)$ |
 | FFN | $O(B \cdot N \cdot D \cdot D_{ff})$ | $O(B \cdot N \cdot D_{ff})$ |
-| Level Norm | $O(B \cdot N \cdot D)$ | $O(B \cdot N \cdot D)$ |
-| Residual Gate | $O(B \cdot N)$ | $O(1)$ |
+| 级别 Norm | $O(B \cdot N \cdot D)$ | $O(B \cdot N \cdot D)$ |
+| 残差门控 | $O(B \cdot N)$ | $O(1)$ |
 
-### Full Transformer (L layers)
+### 完整 Transformer（L 层）
 
-| Metric | Value |
+| 指标 | 值 |
 |:-------|:------|
-| Time | $O(L \cdot B \cdot H \cdot N^2 \cdot d)$ |
-| Space (no checkpointing) | $O(L \cdot B \cdot H \cdot N^2)$ |
-| Space (with checkpointing) | $O(B \cdot H \cdot N^2 + L \cdot B \cdot N \cdot D)$ |
+| 时间 | $O(L \cdot B \cdot H \cdot N^2 \cdot d)$ |
+| 空间（无检查点） | $O(L \cdot B \cdot H \cdot N^2)$ |
+| 空间（带检查点） | $O(B \cdot H \cdot N^2 + L \cdot B \cdot N \cdot D)$ |
 
----
-
-> **Next**: [08_fractal_vit_model.md](08_fractal_vit_model.md) - Complete Model
+> **下一章**: [08_fractal_vit_model.md](08_fractal_vit_model.md) - 完整模型
