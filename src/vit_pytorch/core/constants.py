@@ -55,11 +55,11 @@ SPLITTER_TEMP_START: float = 1.0
 
 #: Gumbel-Softmax 终止温度 T_end
 #: I121-3 修复: 从 0.5 降低到 0.3，提升梯度强度和深度多样性
-#: I121-8 修复: 从 0.3 提升到 0.4，与 TEMPERATURE_MIN 保持一致
-#: 数学: τ=0.4 时梯度强度 ≈ 2.5 (vs τ=0.5 时 2.0)，提升 25%
+#: I121-8 修复: 保持 0.3 (与 TEMPERATURE_MIN 和 splitter 实现一致)
+#: 数学: τ=0.3 时梯度强度 ≈ 3.3 (有效梯度)
 #:       配合曲率感知调度，防止低曲率时温度过低导致梯度饱和
-#: 验证: τ ∈ [0.4, 1.0] 确保梯度有效且训练稳定
-SPLITTER_TEMP_END: float = 0.4
+#: I113-10 验证: τ ∈ [0.3, 1.0] 确保梯度有效且训练稳定
+SPLITTER_TEMP_END: float = 0.3
 
 #: 温度退火调度策略
 #: 可选值: 'exponential', 'linear'
@@ -112,10 +112,10 @@ FP16_SAFE_EPSILON: float = 1e-6  # I122-? 修复: 统一使用 1e-6
 #: 温度参数下界 (Gumbel-Softmax/Top-K)
 #: 数学分析: T < 0.1 时 softmax 梯度趋近于 0
 #: I35 改进: 从 0.1 提升到 0.3，保持更健康的梯度流
-#: I121-8 修复: 从 0.3 提升到 0.4，防止低温度时梯度饱和
-#: 数学: T=0.4 时 softmax 梯度 ≈ 1/τ = 2.5 (有效梯度)
-#: 验证: T=0.4 时 softmax 梯度仍有效 (∂p/∂z ≈ 1/τ = 2.5)
-TEMPERATURE_MIN: float = 0.4
+#: I121-8 修复: 保持 0.3 (与 hilbert_optimal_splitter.py 实际值一致)
+#: I113-10 验证: T=0.3 时 softmax 梯度 ≈ 1/τ = 3.3 (有效梯度)
+#: 注意: SPLITTER_TEMP_END 也应保持 0.3 以与 TEMPERATURE_MIN 一致
+TEMPERATURE_MIN: float = 0.3
 
 # ==================== I108-6: FP16 Clamp 边界常量 ====================
 # 数学分析见: workspace/fp16_clamp_analysis.md

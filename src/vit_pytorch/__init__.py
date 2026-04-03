@@ -11,8 +11,8 @@ Layer 3 (管道层):
     modules/        StreamingFractalTokenizer, FractalTransformer
 
 Layer 2 (组件层):
-    layers/attention/       HilbertAwareMultiScaleAttention
-    layers/splitters/       GumbelTopKSplitter, DeterministicNeighborSplitter
+    layers/attention/       ManifoldNativeAttention
+    layers/splitters/       HilbertOptimalSplitter, HilbertOrderedEntmaxSplitter
     layers/ffn/             SwiGLUFFN
     layers/embeddings/      FractalPositionEmbedding, FractalPathEmbedding
 
@@ -44,15 +44,13 @@ from .modules import (
 
 # === L2: Layers ===
 from .layers import (
-    HilbertAwareMultiScaleAttention,
-    HilbertBiasBase,
-    LCAHilbertBias,
-    GumbelTopKSplitter,
-    TensorSplitResult,
-    GumbelTopKResult,
-    DeterministicNeighborSplitter,
-    DeterministicNeighborSplitterConfig,
-    SemanticRedundancySplitter,
+    ManifoldNativeAttention,
+    HilbertOptimalSplitter,
+    HilbertOptimalSplitterConfig,
+    HilbertOrderedEntmaxSplitter,
+    HilbertLocalComplexity,
+    entmax_1_5,
+    entmax,
     SwiGLUFFN,
     AdaptiveFractalFeedForward,
     FFNType,
@@ -70,8 +68,10 @@ from .modules import (
     AnnealingSplitter,
     MetricsSplitter,
     SplitResult,
-    SemanticRedundancyLoss,
 )
+
+# === L1: Core additional exports ===
+from .core.splitter_protocol import TensorSplitResult
 
 # === L1: Core ===
 from .core import (
@@ -148,16 +148,13 @@ __all__ = [
     "FractalTransformer",
     "FractalTransformerBlock",
     # === L2: Layers ===
-    "HilbertAwareMultiScaleAttention",
-    "HilbertBiasBase",
-    "LCAHilbertBias",
-    "GumbelTopKSplitter",
-    "TensorSplitResult",
-    "GumbelTopKResult",
-    "DeterministicNeighborSplitter",
-    "DeterministicNeighborSplitterConfig",
-    "SemanticRedundancySplitter",
-    "SemanticRedundancyLoss",
+    "ManifoldNativeAttention",
+    "HilbertOptimalSplitter",
+    "HilbertOptimalSplitterConfig",
+    "HilbertOrderedEntmaxSplitter",
+    "HilbertLocalComplexity",
+    "entmax_1_5",
+    "entmax",
     "SwiGLUFFN",
     "AdaptiveFractalFeedForward",
     "FFNType",

@@ -584,14 +584,14 @@ class GradientMonitor:
 
 def create_gradient_monitor(
     model: nn.Module,
-    splitter_type: str = 'gumbel_topk',
+    splitter_type: str = 'hilbert_optimal',
     **kwargs
 ) -> GradientMonitor:
     """创建梯度监控器（工厂函数）
 
     Args:
         model: 模型
-        splitter_type: splitter 类型 ('gumbel_topk' 或 'deterministic_neighbor')
+        splitter_type: splitter 类型 ('hilbert_optimal')
         **kwargs: 其他参数
 
     Returns:

@@ -21,6 +21,7 @@ Hilbert Curve ViT 的 Splitter 组件负责决策哪些区域需要进一步细�
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Protocol, Dict, Any, Tuple, Optional, Literal
 from torch import Tensor
 
@@ -342,6 +343,7 @@ class SplitResult:
         - batch_indices: 每个区域的 batch 索引 [M]
         - hilbert_indices: Hilbert 曲线排序索引 [M]
         - selected_mask: 选中掩码 [B, N]
+        - K_soft: 可微分的软 K 值（STE 直通估计）用于 aux_budget 损失
 
     数学形式化:
         M = |{i : selected_mask[i] = 1}| (选中的 token 数量)
@@ -355,6 +357,7 @@ class SplitResult:
     selected_mask: Optional[Tensor] = None  # [B, N] 选中掩码
     logits: Optional[Tensor] = None         # [B, N] 原始 logits
     probs: Optional[Tensor] = None          # [B, N] 分割概率
+    K_soft: Optional[Tensor] = None         # [1] or [B] 可微分 K 值 (STE)
 
     def __init__(
         self,
@@ -365,6 +368,7 @@ class SplitResult:
         selected_mask: Optional[Tensor] = None,
         logits: Optional[Tensor] = None,
         probs: Optional[Tensor] = None,
+        K_soft: Optional[Tensor] = None,
     ):
         """
         初始化 SplitResult。
@@ -377,6 +381,7 @@ class SplitResult:
             selected_mask: [B, N] 二值选中掩码
             logits: [B, N] 原始 logits（可选）
             probs: [B, N] 分割概率（可选）
+            K_soft: 可微分 K 值（STE 直通估计）（可选）
         """
         import torch
 
@@ -387,6 +392,7 @@ class SplitResult:
         self.selected_mask = selected_mask
         self.logits = logits
         self.probs = probs
+        self.K_soft = K_soft
 
         # I: 添加 split_decision 别名以兼容 tokenizer
         # split_decision 用于语义分裂器，selected_mask 用于 H1SS
@@ -429,6 +435,155 @@ class SplitResult:
         return torch.bincount(
             batch_indices_clamped,
             minlength=B
+        )
+
+    @property
+    def splitter_output(self) -> Dict[str, Any]:
+        """返回 Splitter 层的诊断包裹
+
+        关键原则：只包含该 Splitter 实际产生的数据。
+        废弃的 TopK 特有字段（top_k, temperature, gumbel_hard）不出现。
+
+        诊断字段说明:
+            - 基础指标: 所有 Splitter 都有的通用指标
+            - H1SS 特有: entropy, budget_loss, tree_consistency, locality_score,
+                         jump_loss, iou_mean, iou_std, alpha
+            - H-Entmax 特有: grad_coverage
+
+        Returns:
+            Dict[str, Any]: 诊断指标字典
+        """
+        output: Dict[str, Any] = {}
+
+        # === 所有 Splitter 都有的基础指标 ===
+        if self.selected_mask is not None:
+            total = self.selected_mask.numel()
+            active = self.selected_mask.sum().item()
+            output["active_ratio"] = active / total if total > 0 else 0.0
+            output["active_count"] = int(active)
+
+        if self.logits is not None:
+            output["logits_mean"] = float(self.logits.mean().item())
+            output["logits_std"] = float(self.logits.std().item())
+            output["logits_abs_mean"] = float(self.logits.abs().mean().item())
+
+        if self.probs is not None:
+            import torch
+            eps = 1e-8
+            output["probs_max"] = float(self.probs.max().item())
+            output["probs_entropy"] = float(
+                -(self.probs * torch.log(self.probs + eps)).sum().item()
+            )
+
+        # === H1SS / HilbertOptimalSplitter 特有的辅助损失 ===
+        # 这些字段来自 get_auxiliary_losses()，由 HilbertOptimalSplitter 调用时填充
+        if hasattr(self, "entropy") and self.entropy is not None:
+            entropy_val = self.entropy
+            output["entropy"] = float(entropy_val.item()) if hasattr(entropy_val, "item") else float(entropy_val)
+
+        if hasattr(self, "budget_loss") and self.budget_loss is not None:
+            budget_val = self.budget_loss
+            output["budget_loss"] = float(budget_val.item()) if hasattr(budget_val, "item") else float(budget_val)
+
+        if hasattr(self, "tree_consistency") and self.tree_consistency is not None:
+            tree_val = self.tree_consistency
+            output["tree_consistency"] = float(tree_val.item()) if hasattr(tree_val, "item") else float(tree_val)
+
+        if hasattr(self, "locality_score") and self.locality_score is not None:
+            output["locality_score"] = float(self.locality_score)
+
+        if hasattr(self, "jump_loss") and self.jump_loss is not None:
+            output["jump_loss"] = float(self.jump_loss)
+
+        if hasattr(self, "iou_mean") and self.iou_mean is not None:
+            output["iou_mean"] = float(self.iou_mean)
+
+        if hasattr(self, "iou_std") and self.iou_std is not None:
+            output["iou_std"] = float(self.iou_std)
+
+        # === Alpha 参数（所有 Splitter 都暴露，包括 H1SS 固定 alpha） ===
+        if hasattr(self, "alpha") and self.alpha is not None:
+            alpha_val = self.alpha
+            output["alpha"] = float(alpha_val.item()) if hasattr(alpha_val, "item") else float(alpha_val)
+
+        return output
+
+
+# =============================================================================
+# TensorSplitResult: Tokenizer内部使用的数据结构
+# =============================================================================
+
+@dataclass
+class TensorSplitResult:
+    """
+    Tokenizer 内部使用的分割结果数据结构。
+
+    这是 H1SS SplitResult 到 tokenizer 内部格式的适配器。
+
+    字段说明:
+        - regions: 选中区域的边界坐标 [M, 4]
+        - depths: 每个区域的深度 [M]
+        - batch_indices: 每个区域的 batch 索引 [M]
+        - hilbert_indices: Hilbert 曲线排序索引 [M]
+        - token_indices: token 索引 [M]
+        - complexities: 复杂度分数 [M]
+    """
+    regions: Tensor           # [M, 4] 坐标 (x0, y0, x1, y1)
+    depths: Tensor            # [M] 深度值
+    batch_indices: Tensor     # [M] batch 索引
+    hilbert_indices: Tensor   # [M] Hilbert 索引
+    token_indices: Tensor     # [M] token 索引
+    complexities: Tensor      # [M] 复杂度分数
+
+    @property
+    def num_tokens(self) -> int:
+        """获取 token 总数"""
+        return self.regions.shape[0]
+
+    @classmethod
+    def from_split_result(cls, split_result: SplitResult) -> "TensorSplitResult":
+        """
+        从 SplitResult 创建 TensorSplitResult。
+
+        Args:
+            split_result: H1SS 返回的 SplitResult
+
+        Returns:
+            TensorSplitResult
+        """
+        import torch
+
+        regions = split_result.regions
+        depths = split_result.depths
+        batch_indices = split_result.batch_indices
+        hilbert_indices = split_result.hilbert_indices
+
+        # 创建 token_indices
+        token_indices = torch.arange(
+            len(regions),
+            dtype=torch.long,
+            device=regions.device
+        )
+
+        # 从 probs 或 logits 计算 complexities
+        if split_result.probs is not None and split_result.probs.numel() > 0:
+            complexities = split_result.probs.view(-1)
+        elif split_result.logits is not None and split_result.logits.numel() > 0:
+            complexities = split_result.logits.view(-1)
+        else:
+            complexities = torch.zeros(
+                len(regions),
+                dtype=torch.float32,
+                device=regions.device
+            )
+
+        return cls(
+            regions=regions.long(),
+            depths=depths,
+            batch_indices=batch_indices,
+            hilbert_indices=hilbert_indices,
+            token_indices=token_indices,
+            complexities=complexities,
         )
 
 

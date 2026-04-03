@@ -29,11 +29,12 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch._dynamo
 import torch.nn as nn
+import math
 
 from vit_pytorch.core.config import FractalConfig  # I97-5: 合并 config_fractal.py
 from vit_pytorch.core.curve_hilbert import HilbertCurve
@@ -387,6 +388,9 @@ class BitFlippedPositionEncoder(nn.Module):
         # v6.0: 几何嵌入投影 (保持 dim 维度，Attention 中处理维度匹配)
         self.geometry_projection = nn.Linear(dim, dim)
 
+        # I-NAN: 统一诊断缓存
+        self._diagnostic_cache: Dict[str, Any] = {}
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -485,6 +489,13 @@ class BitFlippedPositionEncoder(nn.Module):
 
         geometry_emb = self.geometry_projection(path_emb)  # [B, N, dim]
         geometry_emb = geometry_emb * token_scales  # 应用深度衰减
+
+        # I-NAN: 更新统一诊断缓存
+        gate_values = torch.sigmoid(self.rotation_gate).detach()
+        self._diagnostic_cache = {
+            "params/rotation_gate_mean": gate_values.mean().item(),
+            "params/depth_gamma": gamma.item(),  # γ = σ(depth_decay_scale)
+        }
 
         return pos_emb, geometry_emb
 
@@ -595,6 +606,48 @@ class BitFlippedPositionEncoder(nn.Module):
 
         return enc
 
+    @property
+    def embed_output(self) -> Dict[str, Any]:
+        """BitFlippedPositionEncoder 诊断输出
+
+        命名空间:
+            embed/params/*: 可学习参数统计
+            embed/health/*: 数值健康度
+        """
+        output: Dict[str, Any] = {}
+
+        # embed/params/* - rotation_gate 参数
+        if hasattr(self, 'rotation_gate') and self.rotation_gate is not None:
+            gate_values = torch.sigmoid(self.rotation_gate)  # [max_level]
+            for d in range(gate_values.numel()):
+                output[f"params/rotation_gate_lvl_{d}"] = float(gate_values[d].item())
+            output["params/rotation_gate_mean"] = float(gate_values.mean().item())
+
+        # embed/params/* - depth_decay_scale 参数 (gamma)
+        if hasattr(self, 'depth_decay_scale') and self.depth_decay_scale is not None:
+            gamma = torch.sigmoid(self.depth_decay_scale).item()
+            output["params/depth_gamma"] = gamma  # γ ∈ (0,1)
+
+        # embed/params/* - 嵌入权重统计
+        if hasattr(self, 'depth_embedding') and self.depth_embedding is not None:
+            w = self.depth_embedding.weight
+            output["params/depth_emb_norm"] = float(w.norm().item())
+            output["params/depth_emb_mean"] = float(w.mean().item())
+
+        if hasattr(self, 'quadrant_embedding') and self.quadrant_embedding is not None:
+            w = self.quadrant_embedding.weight
+            output["params/quadrant_emb_norm"] = float(w.norm().item())
+
+        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标
+        if self._diagnostic_cache:
+            output.update(self._diagnostic_cache)
+
+        # embed/health/* - nan_grad_hooks 注册数
+        if hasattr(self, '_nan_grad_hooks') and self._nan_grad_hooks:
+            output["health/nan_grad_hooks_registered"] = len(self._nan_grad_hooks)
+
+        return output
+
 
 class FractalPathEmbedding(nn.Module):
     """基于四叉树路径的位置编码.
@@ -650,7 +703,10 @@ class FractalPathEmbedding(nn.Module):
             x_coords, y_coords, config.max_level
         )
         self.register_buffer('base_paths', paths)
-        
+
+        # I-NAN: 统一诊断缓存
+        self._diagnostic_cache: Dict[str, Any] = {}
+
         self._init_weights()
     
     def _init_weights(self) -> None:
@@ -733,10 +789,84 @@ class FractalPathEmbedding(nn.Module):
         depths = depths.clamp(min=1, max=self.max_level)
         
         path_emb = self._encode_paths(paths, depths)  # [B, N, dim]
-        
+
+        # I-NAN: 计算路径熵 (path entropy)
+        # 将每条路径展平为一个哈希值，然后计算分布熵
+        self._compute_and_cache_path_entropy(paths, depths)
+
         # 3. 融合
         combined = torch.cat([scale_emb, path_emb], dim=-1)  # [B, N, dim*2]
         return self.fusion(combined)
+
+    def _compute_and_cache_path_entropy(
+        self,
+        paths: torch.Tensor,
+        depths: torch.Tensor,
+    ) -> None:
+        """计算并缓存路径分布的信息熵
+
+        数学形式:
+            H(P) = -∑p_i·log(p_i)
+            其中 p_i 是第 i 条唯一路径的概率
+
+        Args:
+            paths: [B, N, max_level] 路径张量
+            depths: [B, N] 有效深度
+        """
+        B, N, max_level = paths.shape
+
+        # 获取有效路径部分
+        level_indices = torch.arange(max_level, device=paths.device)
+        valid_mask = (level_indices.unsqueeze(0).unsqueeze(0) < depths.unsqueeze(-1))  # [B, N, max_level]
+
+        # 只保留有效路径部分
+        valid_paths = torch.where(valid_mask, paths, torch.zeros_like(paths))
+
+        # 将路径转换为哈希值（用于唯一性检测）
+        # 使用位置编码确保不同位置的不同路径被区分
+        # path_hash = Σ valid_paths[i] * 4^i
+        powers = 4 ** torch.arange(max_level, device=paths.device)
+        path_hash = (valid_paths * powers.unsqueeze(0).unsqueeze(0)).sum(dim=-1)  # [B, N]
+
+        # 计算每个 batch 的熵并取平均
+        entropies = []
+        for b in range(B):
+            hashes = path_hash[b]  # [N]
+            # 使用直方图估计概率分布
+            unique_hashes, counts = torch.unique(hashes, return_counts=True)
+            probs = counts.float() / counts.sum()
+            # 计算熵 H(P) = -∑p_i·log(p_i)
+            entropy = -(probs * torch.log(probs + 1e-8)).sum()
+            entropies.append(entropy.item())
+
+        self._diagnostic_cache["distribution/path_entropy"] = sum(entropies) / len(entropies) if entropies else 0.0
+
+    @property
+    def embed_output(self) -> Dict[str, Any]:
+        """FractalPathEmbedding 诊断输出
+
+        命名空间:
+            embed/params/*: 可学习参数统计
+            embed/distribution/*: 路径分布统计
+        """
+        output: Dict[str, Any] = {}
+
+        # embed/params/* - 嵌入权重统计
+        if hasattr(self, 'scale_embedding') and self.scale_embedding is not None:
+            w = self.scale_embedding.weight
+            output["params/scale_emb_norm"] = float(w.norm().item())
+            output["params/scale_emb_mean"] = float(w.mean().item())
+
+        if hasattr(self, 'quadrant_embedding') and self.quadrant_embedding is not None:
+            w = self.quadrant_embedding.weight
+            output["params/quadrant_emb_norm"] = float(w.norm().item())
+            output["params/quadrant_emb_std"] = float(w.std().item())
+
+        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标
+        if self._diagnostic_cache:
+            output.update(self._diagnostic_cache)
+
+        return output
 
 
 class HierarchicalAttentionBias(nn.Module):
@@ -1046,6 +1176,9 @@ class FourierPathEncoder(nn.Module):
         # 层归一化
         self.layer_norm = nn.LayerNorm(dim)
 
+        # I-NAN: 统一诊断缓存
+        self._diagnostic_cache: Dict[str, Any] = {}
+
         self._init_weights()
 
     def _init_weights(self):
@@ -1135,7 +1268,35 @@ class FourierPathEncoder(nn.Module):
 
         # 6. 融合并归一化
         combined = path_emb + depth_emb
-        return self.layer_norm(combined)
+        output = self.layer_norm(combined)
+
+        # I-NAN: 计算并缓存边界相似度
+        self._compute_boundary_similarity(combined.detach())
+
+        return output
+
+    def _compute_boundary_similarity(self, embeddings: torch.Tensor) -> None:
+        """计算并缓存 Fourier 路径编码的边界平滑度
+
+        使用已计算的 embeddings 计算相邻路径的余弦相似度均值
+
+        Args:
+            embeddings: [B, N, dim] 已在 forward 中计算的嵌入
+        """
+        import torch.nn.functional as F
+
+        # 展平并计算相邻路径的余弦相似度
+        emb_flat = embeddings.view(-1, self.dim)  # [B*N, dim]
+        emb_normalized = F.normalize(emb_flat, dim=-1)
+
+        # 计算相邻的余弦相似度（跨 batch 和 sequence）
+        similarities = (emb_normalized[:-1] * emb_normalized[1:]).sum(dim=-1)
+
+        # 计算均值并缓存到统一诊断缓存
+        if similarities.numel() > 0:
+            self._diagnostic_cache["health/fourier_boundary_sim"] = float(similarities.mean().item())
+        else:
+            self._diagnostic_cache["health/fourier_boundary_sim"] = 0.0
 
     def compute_boundary_similarity(
         self,
@@ -1181,5 +1342,34 @@ class FourierPathEncoder(nn.Module):
 
         return similarities if not was_2d else similarities.view(B, -1)
 
+    @property
+    def embed_output(self) -> Dict[str, Any]:
+        """FourierPathEncoder 诊断输出
 
-import math  # 需要用于 pi 常数
+        命名空间:
+            embed/params/*: 可学习参数统计
+            embed/health/*: Fourier 边界平滑度
+
+        物理意义:
+            边界平滑度衡量 Hilbert 曲线首尾交界处（θ ≈ 0 与 θ ≈ 2π）的嵌入连续性。
+            Sim_boundary = cosine_sim(E(path), E(path + Δ))
+            低值表示频率编码在跨越不连续点时有剧烈相位突变。
+        """
+        output: Dict[str, Any] = {}
+
+        # embed/params/* - 投影层参数统计
+        if hasattr(self, 'projection') and self.projection is not None:
+            w = self.projection.weight
+            output["params/projection_norm"] = float(w.norm().item())
+            output["params/projection_mean"] = float(w.mean().item())
+            output["params/projection_std"] = float(w.std().item())
+
+        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标
+        if self._diagnostic_cache:
+            output.update(self._diagnostic_cache)
+
+        # embed/health/* - nan_grad_hooks 注册数
+        if hasattr(self, '_nan_grad_hooks') and self._nan_grad_hooks:
+            output["health/nan_grad_hooks_registered"] = len(self._nan_grad_hooks)
+
+        return output

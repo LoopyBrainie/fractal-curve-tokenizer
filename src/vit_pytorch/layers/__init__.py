@@ -3,18 +3,15 @@
 This module re-exports component layer functionality from subdirectories.
 """
 from .attention import (
-    HilbertAwareMultiScaleAttention,
-    HilbertBiasBase,
-    LCAHilbertBias,
+    ManifoldNativeAttention,
 )
 from .splitters import (
-    GumbelTopKSplitter,
-    TensorSplitResult,
-    GumbelTopKResult,
-    DepthMonitor,  # I111-6: 深度分布监控
-    DeterministicNeighborSplitter,
-    DeterministicNeighborSplitterConfig,
-    SemanticRedundancySplitter,
+    HilbertOptimalSplitter,
+    HilbertOptimalSplitterConfig,
+    HilbertOrderedEntmaxSplitter,
+    HilbertLocalComplexity,
+    entmax_1_5,
+    entmax,
 )
 from .ffn import (
     SwiGLUFFN,
@@ -34,17 +31,14 @@ from .embeddings import (
 
 __all__ = [
     # Attention
-    "HilbertAwareMultiScaleAttention",
-    "HilbertBiasBase",
-    "LCAHilbertBias",
+    "ManifoldNativeAttention",
     # Splitters
-    "GumbelTopKSplitter",
-    "TensorSplitResult",
-    "GumbelTopKResult",
-    "DepthMonitor",  # I111-6: 深度分布监控
-    "DeterministicNeighborSplitter",
-    "DeterministicNeighborSplitterConfig",
-    "SemanticRedundancySplitter",
+    "HilbertOptimalSplitter",
+    "HilbertOptimalSplitterConfig",
+    "HilbertOrderedEntmaxSplitter",
+    "HilbertLocalComplexity",
+    "entmax_1_5",
+    "entmax",
     # FFN
     "SwiGLUFFN",
     "AdaptiveFractalFeedForward",

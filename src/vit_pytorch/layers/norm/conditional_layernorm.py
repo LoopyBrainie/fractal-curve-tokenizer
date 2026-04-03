@@ -19,9 +19,54 @@ Conditional LayerNorm:
     1. 浅层 token (大面积) 和深层 token (小面积) 可以有不同的归一化策略
     2. 深层 token 梯度流得以改善
     3. 模型可以学习不同尺度下的最优激活分布
+
+================================================================================
+【重要】模块状态声明 (2026-04-02)
+================================================================================
+
+⚠️  本模块包含的三个归一化类为 I-PHASE4 早期消融实验产物，
+    目前【未集成】到 FractalViT 主模型流程中。
+
+分析结论（详见 docs/12_norm_module_analysis.md）：
+
+    ┌──────────────────────┬───────────┬─────────────────────────────────────┐
+    │ 模块                  │ 评分      │ 主要问题                            │
+    ├──────────────────────┼───────────┼─────────────────────────────────────┤
+    │ ConditionalLayerNorm │ 3/10      │ 整数索引断梯度（d→γ[d]路径不可微）  │
+    │ AdaptiveLayerNorm    │ 2/10      │ mean(dim=1) 信息瓶颈，违背细粒度控制│
+    │ ScaleAwareNorm       │ 1/10      │ 4^(-d) 指数衰减导致深层梯度消失     │
+    └──────────────────────┴───────────┴─────────────────────────────────────┘
+
+数学缺陷详解：
+
+1. ConditionalLayerNorm — 整数索引断梯度
+   condition_weight[cond_long] 中的 .long() 索引操作使得
+   深度值 d → 选择 γ[d]/β[d] 的路径梯度为 0。
+   模型无法学习"应该在哪个深度边界切换参数"。
+
+2. AdaptiveLayerNorm — 序列统计量信息瓶颈
+   seq_stats = x.mean(dim=1) 将 [B,S,D] 压缩为 [B,D]，
+   完全丢弃了 token 分布多样性信息。
+   这与分形 ViT 细粒度控制的设计哲学相悖。
+
+3. ScaleAwareNorm — 4^(-d) 灾难性衰减
+   4^(-8) = 1/65536，深层 token 的信号被压缩至接近消失。
+   在残差连接中，即使 SubLayer 学到有意义特征，
+   也几乎无法回传到深层 token 的输入端。
+
+决策：维持现状，不将本模块集成到主模型。
+      现有 Hilbert Bias（Attention）和 FFN depth norm 已实现等价格式。
+
+未来方向：如需真正的深度感知归一化，应采用连续深度建模：
+    γ(d) = γ_0 + γ_slope · d  (d 归一化到 [0,1])
+    而非离散查表 γ[d]。
+
+================================================================================
 """
 
 from __future__ import annotations
+
+from typing import Any, Dict
 
 import torch
 import torch.nn as nn
@@ -125,6 +170,37 @@ class ConditionalLayerNorm(nn.Module):
 
         return output
 
+    @property
+    def norm_output(self) -> Dict[str, Any]:
+        """ConditionalLayerNorm 诊断输出
+
+        返回条件权重和全局缩放参数的统计信息。
+
+        Returns:
+            包含以下键的字典:
+            - params/condition_gamma_mean/std: 条件 gamma 统计
+            - params/condition_beta_mean/std: 条件 beta 统计
+            - params/gamma_scale: 全局 gamma 缩放参数
+            - params/beta_scale: 全局 beta 偏移参数
+        """
+        output: Dict[str, Any] = {}
+
+        # params/ - condition_weight 统计 [C, D, 2]
+        if self.condition_weight is not None:
+            w = self.condition_weight
+            gamma = w[..., 0]
+            beta = w[..., 1]
+            output["params/condition_gamma_mean"] = float(gamma.mean().item())
+            output["params/condition_gamma_std"] = float(gamma.std().item())
+            output["params/condition_beta_mean"] = float(beta.mean().item())
+            output["params/condition_beta_std"] = float(beta.std().item())
+
+        # params/ - 全局缩放参数
+        output["params/gamma_scale"] = float(self.gamma_scale.item())
+        output["params/beta_scale"] = float(self.beta_scale.item())
+
+        return output
+
 
 class AdaptiveLayerNorm(nn.Module):
     """自适应层归一化 - 基于输入特征动态生成归一化参数
@@ -199,6 +275,32 @@ class AdaptiveLayerNorm(nn.Module):
 
         return output
 
+    @property
+    def norm_output(self) -> Dict[str, Any]:
+        """AdaptiveLayerNorm 诊断输出
+
+        返回自适应参数生成网络 (adaptor) 的权重统计。
+
+        Returns:
+            包含以下键的字典:
+            - params/adaptor_layer{i}_weight_norm: adaptor 第 i 层权重的范数
+            - params/default_gamma_norm: 默认 gamma 的范数
+            - params/default_beta_norm: 默认 beta 的范数
+        """
+        output: Dict[str, Any] = {}
+
+        # adaptor 权重统计 (MLP 层)
+        if hasattr(self, 'adaptor'):
+            for i, layer in enumerate(self.adaptor):
+                if isinstance(layer, nn.Linear) and hasattr(layer, 'weight'):
+                    output[f"params/adaptor_layer{i}_weight_norm"] = float(layer.weight.norm().item())
+
+        # default 参数范数
+        output["params/default_gamma_norm"] = float(self.default_gamma.norm().item())
+        output["params/default_beta_norm"] = float(self.default_beta.norm().item())
+
+        return output
+
 
 class ScaleAwareNorm(nn.Module):
     """尺度感知归一化 - 结合面积信息的综合归一化
@@ -269,5 +371,42 @@ class ScaleAwareNorm(nn.Module):
         # 组合: base_normed * depth_gamma + depth_beta
         # 面积权重用于调整不同尺度 token 的激活强度
         output = x_normed * (gamma * area_scale) + beta
+
+        return output
+
+    @property
+    def norm_output(self) -> Dict[str, Any]:
+        """ScaleAwareNorm 诊断输出
+
+        返回深度感知调制参数和面积权重的统计信息。
+
+        Returns:
+            包含以下键的字典:
+            - params/depth_gamma_mean/std: 深度 gamma 统计
+            - params/depth_beta_mean/std: 深度 beta 统计
+            - distribution/area_weights_mean/min/max: 面积权重分布
+            - ln/bias_norm: LayerNorm bias 范数
+        """
+        output: Dict[str, Any] = {}
+
+        # params/ - depth_gamma / depth_beta
+        if self.depth_gamma is not None:
+            g = self.depth_gamma.weight
+            output["params/depth_gamma_mean"] = float(g.mean().item())
+            output["params/depth_gamma_std"] = float(g.std().item())
+        if self.depth_beta is not None:
+            b = self.depth_beta.weight
+            output["params/depth_beta_mean"] = float(b.mean().item())
+            output["params/depth_beta_std"] = float(b.std().item())
+
+        # distribution/ - area_weights
+        aw = self.area_weights
+        output["distribution/area_weights_mean"] = float(aw.mean().item())
+        output["distribution/area_weights_min"] = float(aw.min().item())
+        output["distribution/area_weights_max"] = float(aw.max().item())
+
+        # ln/ - LayerNorm bias 范数
+        if hasattr(self.ln, 'bias') and self.ln.bias is not None:
+            output["ln/bias_norm"] = float(self.ln.bias.norm().item())
 
         return output
