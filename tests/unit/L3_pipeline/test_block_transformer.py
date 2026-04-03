@@ -327,7 +327,7 @@ class TestFractalTransformer:
 
         assert output.shape == (2, 16, 64)
         assert 'effective_depth' in extra_info
-        assert extra_info['effective_depth'] == 2  # depth // 2 = 4 // 2
+        assert extra_info['effective_depth'] == 4  # depth = num_layers
 
     def test_drop_path_rate(self):
         """DropPath 率"""
