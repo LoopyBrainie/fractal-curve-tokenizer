@@ -9,8 +9,10 @@ from .numerical_defense import (
     AnomalyDetectionContext,
     GradientValidator,
     NumericalDefender,
+    ActivationStatsCollector,
     check_tensor_numerical_health,
 )
+from .unified import UnifiedMonitor
 
 __all__ = [
     "GradientMonitor",
@@ -21,5 +23,7 @@ __all__ = [
     "AnomalyDetectionContext",
     "GradientValidator",
     "NumericalDefender",
+    "ActivationStatsCollector",
     "check_tensor_numerical_health",
+    "UnifiedMonitor",
 ]

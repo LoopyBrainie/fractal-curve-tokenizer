@@ -288,6 +288,70 @@ class EpochMetrics:
 
         return result
 
+    @classmethod
+    def from_collector(cls, collector: Any, **base_fields) -> "EpochMetrics":
+        """从 MetricsCollector 创建 EpochMetrics（向后兼容）
+
+        将 MetricsCollector 中聚合的指标映射到 EpochMetrics 字段。
+
+        Args:
+            collector: MetricsCollector 实例
+            **base_fields: 基础字段（从原始 train_one_epoch 计算得到的值）
+
+        Returns:
+            填充好的 EpochMetrics 实例
+        """
+        summary = collector.get_summary()
+
+        # 创建实例
+        metrics = cls()
+
+        # 基础字段（优先使用传入的值）
+        metrics.loss = base_fields.get("loss", summary.get("loss", 0.0))
+        metrics.accuracy = base_fields.get("accuracy", 0.0)
+        metrics.top5_accuracy = base_fields.get("top5_accuracy")
+        metrics.learning_rate = base_fields.get("learning_rate", summary.get("learning_rate", 0.0))
+        metrics.grad_norm = base_fields.get("grad_norm", summary.get("grad_norm", 0.0))
+        metrics.epoch_time = base_fields.get("epoch_time", 0.0)
+        metrics.samples_per_second = base_fields.get("samples_per_second", 0.0)
+        metrics.nan_count = base_fields.get("nan_count", int(summary.get("nan_count", 0.0)))
+        metrics.inf_count = base_fields.get("inf_count", int(summary.get("inf_count", 0.0)))
+        metrics.skipped_steps = base_fields.get("skipped_steps", int(summary.get("issue_count", 0.0)))
+
+        # Token 统计
+        if "num_tokens" in summary:
+            metrics.avg_tokens = summary.get("num_tokens", 0.0)
+        if "num_tokens_std" in summary:
+            metrics.token_std = summary.get("num_tokens_std", 0.0)
+
+        # Splitter 统计
+        metrics.splitter_logits_mean = summary.get("splitter_logits_mean", 0.0)
+        metrics.splitter_logits_std = summary.get("splitter_logits_std", 0.0)
+        metrics.active_ratio = summary.get("active_ratio", 0.0)
+        metrics.mean_abs_logits = summary.get("mean_abs_logits", 0.0)
+
+        # 流形统计
+        metrics.manifold_bias_max = summary.get("manifold_bias_max", 0.0)
+        metrics.manifold_bias_mean = summary.get("manifold_bias_mean", 0.0)
+        metrics.manifold_bias_std = summary.get("manifold_bias_std", 0.0)
+
+        # Poincaré 距离
+        metrics.poincare_dist_mean = summary.get("poincare_dist_mean", 0.0)
+        metrics.poincare_dist_std = summary.get("poincare_dist_std", 0.0)
+
+        # 梯度统计
+        metrics.backbone_grad_norm = summary.get("backbone_grad_norm", 0.0)
+        metrics.splitter_grad_norm = summary.get("splitter_grad_norm", 0.0)
+        metrics.entmax_grad_norm = summary.get("entmax_grad_norm", 0.0)
+        metrics.manifold_decoder_grad_norm = summary.get("manifold_decoder_grad_norm", 0.0)
+        metrics.backbone_vs_splitter_grad_ratio = summary.get("backbone_vs_splitter_grad_ratio", 0.0)
+
+        # 损失项
+        metrics.budget_loss = summary.get("loss_budget_loss", 0.0)
+        metrics.density_regularization = summary.get("loss_density_regularization", 0.0)
+
+        return metrics
+
 
 @dataclass
 class EvaluationMetrics:
@@ -313,6 +377,9 @@ class EvaluationMetrics:
             result["ece"] = self.ece
         if self.per_class_accuracy:
             result["per_class_accuracy"] = self.per_class_accuracy
+        # I-AUDIT: 输出 confusion_matrix（如果已计算）
+        if self.confusion_matrix is not None:
+            result["confusion_matrix"] = self.confusion_matrix.tolist()
         return result
 
 

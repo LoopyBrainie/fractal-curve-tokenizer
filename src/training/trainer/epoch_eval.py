@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 from ..config import Config
 from .state import EvaluationMetrics
 from .loss import compute_loss
+from ..training_logs.metrics import compute_confusion_matrix
 
 
 def evaluate(
@@ -55,6 +56,10 @@ def evaluate(
     # For ECE calculation
     all_confidences: List[float] = []
     all_correct: List[bool] = []
+
+    # For confusion matrix
+    all_predictions: List[torch.Tensor] = []
+    all_targets: List[torch.Tensor] = []
 
     # For per-class accuracy
     class_correct = torch.zeros(num_classes)
@@ -116,6 +121,10 @@ def evaluate(
                     all_confidences.extend(confidences.cpu().tolist())
                     all_correct.extend((pred == labels).cpu().tolist())
 
+                    # Collect for confusion matrix
+                    all_predictions.append(pred.cpu())
+                    all_targets.append(labels.cpu())
+
                 total_samples += batch_size
 
             num_batches += 1
@@ -140,12 +149,20 @@ def evaluate(
         if class_total[c] > 0:
             per_class_acc[c] = (class_correct[c] / class_total[c]).item()
 
+    # Compute confusion matrix
+    confusion_matrix = None
+    if all_predictions and all_targets:
+        all_pred = torch.cat(all_predictions)
+        all_target = torch.cat(all_targets)
+        confusion_matrix = compute_confusion_matrix(all_pred, all_target, num_classes)
+
     return EvaluationMetrics(
         loss=avg_loss,
         accuracy=accuracy,
         top5_accuracy=top5_accuracy,
         ece=ece,
         per_class_accuracy=per_class_acc if per_class_acc else None,
+        confusion_matrix=confusion_matrix,
         num_samples=total_samples,
     )
 
