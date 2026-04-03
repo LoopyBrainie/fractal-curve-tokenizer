@@ -45,15 +45,158 @@ P11-5 修复: 删除了未使用的 level_attention_bias 参数和 get_attention
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+import warnings
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from vit_pytorch.core.constants import EMBEDDING_INIT_STD, HILBERT_BIAS_SCALE
-# AreaEncoder is imported lazily in the __init__ method to avoid circular imports
+from vit_pytorch.core.constants import EMBEDDING_INIT_STD, HILBERT_BIAS_SCALE, EPS
 from vit_pytorch.core.config import AreaEncoderConfig  # I98-3: 协议驱动配置
 from vit_pytorch.core.levels_info import LevelsInfo  # I98-4
+from vit_pytorch.core.depth_utils import compute_normalized_area
+from vit_pytorch.layers.embeddings.fractal_path import OrientationExtractor  # Scheme C
+
+
+# =============================================================================
+# AreaEncoder (moved from hilbert_bias.py)
+# =============================================================================
+
+
+class AreaEncoder(nn.Module):
+    """面积编码器 (I31-3, I32-7, I98-3: 协议驱动配置化)"""
+
+    def __init__(
+        self,
+        dim: int,
+        config: Optional[AreaEncoderConfig] = None,
+    ):
+        super().__init__()
+
+        if config is None:
+            config = AreaEncoderConfig()
+
+        self.config = config
+        self.dim = dim
+        self.fourier_levels = config.fourier_levels
+        self.freq_base = config.freq_base
+        self.fourier_dim = config.fourier_levels * 2  # sin + cos
+        self.cutoff_ratio = config.cutoff_ratio
+
+        if config.fourier_levels > 0:
+            self.fourier_proj = nn.Linear(self.fourier_dim, config.hidden_dim)
+            self.mlp = nn.Sequential(
+                nn.GELU(),
+                nn.Linear(config.hidden_dim, config.hidden_dim),
+                nn.GELU(),
+                nn.Linear(config.hidden_dim, dim)
+            )
+        else:
+            self.fourier_proj = None
+            self.mlp = None
+
+        self.area_weight = nn.Parameter(torch.zeros(1))
+        self._init_weights()
+
+    def get_config(self) -> AreaEncoderConfig:
+        return AreaEncoderConfig(
+            fourier_levels=self.fourier_levels,
+            freq_base=self.freq_base,
+            hidden_dim=self.config.hidden_dim,
+            output_dim=self.dim,
+            cutoff_ratio=self.cutoff_ratio,
+        )
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def _compute_nyquist_normalized_size(
+        self,
+        regions: torch.Tensor,
+        image_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        B, N, _ = regions.shape
+        W, H = image_size
+
+        widths = torch.abs(regions[..., 2] - regions[..., 0])
+        heights = torch.abs(regions[..., 3] - regions[..., 1])
+
+        L_patch = torch.sqrt(widths * heights + EPS)
+        L_image = math.sqrt(W * H)
+        L_norm = L_patch / L_image
+
+        return L_norm
+
+    def _compute_dynamic_fourier_features(
+        self,
+        area_scores: torch.Tensor,
+        L_norm: torch.Tensor,
+    ) -> torch.Tensor:
+        B, N = area_scores.shape
+
+        omega_nyquist = (math.pi / (L_norm + EPS)).unsqueeze(-1)
+        omega_cutoff = omega_nyquist * self.cutoff_ratio
+
+        base_freqs = torch.tensor(
+            [math.pi * (self.freq_base ** k) for k in range(self.fourier_levels)],
+            device=area_scores.device,
+            dtype=area_scores.dtype,
+        ).view(1, 1, self.fourier_levels)
+
+        denom = omega_nyquist - omega_cutoff
+        denom_safe = denom.clamp(min=1e-6)
+
+        gate_full = torch.where(
+            base_freqs <= omega_cutoff,
+            torch.ones(1, device=area_scores.device, dtype=area_scores.dtype),
+            torch.where(
+                base_freqs < omega_nyquist,
+                0.5 * (1 + torch.cos(
+                    math.pi * (base_freqs - omega_cutoff) / denom_safe
+                )),
+                torch.zeros(1, device=area_scores.device, dtype=area_scores.dtype)
+            )
+        )
+
+        area_expanded = area_scores.unsqueeze(-1)
+        freq_times_area = base_freqs * area_expanded
+
+        sin_all = torch.sin(freq_times_area) * gate_full
+        cos_all = torch.cos(freq_times_area) * gate_full
+
+        gamma = torch.stack([sin_all, cos_all], dim=-1).view(B, N, 2 * self.fourier_levels)
+
+        return gamma
+
+    def forward(
+        self,
+        regions: torch.Tensor,
+        image_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        B, N, _ = regions.shape
+
+        if self.fourier_levels == 0:
+            return torch.zeros(B, N, self.dim, device=regions.device)
+
+        if isinstance(image_size, int):
+            image_size_tuple = (image_size, image_size)
+        else:
+            image_size_tuple = image_size
+        W, H = image_size_tuple
+
+        area_scores = compute_normalized_area(regions, image_size, epsilon=EPS)
+        L_norm = self._compute_nyquist_normalized_size(regions, image_size_tuple)
+        gamma = self._compute_dynamic_fourier_features(area_scores, L_norm)
+        area_emb = self.mlp(self.fourier_proj(gamma))
+        area_emb = area_emb * self.area_weight
+        area_emb = F.normalize(area_emb, p=2, dim=-1)
+
+        return area_emb
 
 
 class FractalPositionEmbedding(nn.Module):
@@ -123,6 +266,9 @@ class FractalPositionEmbedding(nn.Module):
         )
 
         # P11-5: 删除了 level_attention_bias，注意力偏置由 LCAHilbertBias 统一提供
+
+        # I-NAN: 统一诊断缓存
+        self._diagnostic_cache: Dict[str, Any] = {}
 
         self._init_parameters()
 
@@ -218,7 +364,9 @@ class FractalPositionEmbedding(nn.Module):
         # path_final 已经包含了 depth_emb (作为 x_0)，直接返回
         return self.fusion_network(path_final)
 
-    def check_scale_consistency(self, levels_info: LevelsInfo, epsilon: float = 0.1) -> None:
+    def check_scale_consistency(
+        self, levels_info: LevelsInfo, epsilon: float = 0.1
+    ) -> Optional[torch.Tensor]:
         """I106-4: 验证尺度一致性约束 C3
 
         检查 Level-0（全图）Embedding 与四个子象限 Level-1 Embedding 均值的距离
@@ -230,11 +378,11 @@ class FractalPositionEmbedding(nn.Module):
             levels_info: LevelsInfo 实例
             epsilon: 距离阈值（默认 0.1）
 
-        Raises:
-            AssertionError: 当距离超过阈值时
+        Returns:
+            cos_dist: 余弦距离，供日志系统记录。None 表示跳过检查。
         """
         if not self.training:
-            return
+            return None
 
         device = levels_info.data.device
 
@@ -276,14 +424,49 @@ class FractalPositionEmbedding(nn.Module):
             level_1_mean.unsqueeze(0)
         ).abs()
 
-        # 断言检查
-        assert cos_dist.item() < epsilon, (
-            f"Scale consistency check failed: "
-            f"cos_dist={cos_dist.item():.4f} >= epsilon={epsilon}"
-        )
+        # I184: 记录但不中断训练（尺度一致性作为日志指标）
+        if cos_dist > epsilon:
+            warnings.warn(
+                f"Scale consistency violation: {cos_dist.item():.4f} > {epsilon}"
+            )
 
+        # I-NAN: 缓存结果供 embed_output 使用
+        self._diagnostic_cache["health/scale_consistency_dist"] = float(cos_dist.item())
 
-from vit_pytorch.core.constants import EMBEDDING_INIT_STD, HILBERT_BIAS_SCALE
+        return cos_dist  # 返回供日志系统记录
+
+    @property
+    def embed_output(self) -> Dict[str, Any]:
+        """FractalPositionEmbedding 诊断输出
+
+        命名空间:
+            embed/params/*: 可学习参数统计
+            embed/health/*: 数值健康度
+        """
+        output: Dict[str, Any] = {}
+
+        # embed/params/* - 嵌入权重统计
+        if hasattr(self, 'depth_embedding') and self.depth_embedding is not None:
+            w = self.depth_embedding.weight
+            output["params/depth_emb_norm"] = float(w.norm().item())
+            output["params/depth_emb_mean"] = float(w.mean().item())
+            output["params/depth_emb_std"] = float(w.std().item())
+
+        if hasattr(self, 'quadrant_embedding') and self.quadrant_embedding is not None:
+            w = self.quadrant_embedding.weight
+            output["params/quadrant_emb_norm"] = float(w.norm().item())
+            output["params/quadrant_emb_mean"] = float(w.mean().item())
+            output["params/quadrant_emb_std"] = float(w.std().item())
+
+        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标
+        if self._diagnostic_cache:
+            output.update(self._diagnostic_cache)
+
+        # embed/health/* - nan_grad_hooks 注册数
+        if hasattr(self, '_nan_grad_hooks') and self._nan_grad_hooks:
+            output["health/nan_grad_hooks_registered"] = len(self._nan_grad_hooks)
+
+        return output
 
 
 class AreaEnhancedPositionEmbedding(nn.Module):
@@ -362,7 +545,6 @@ class AreaEnhancedPositionEmbedding(nn.Module):
         )
 
         # 面积编码器 (I31-3, I98-3: 使用配置类)
-        from vit_pytorch.layers.attention.hilbert_bias import AreaEncoder
         self.area_encoder = AreaEncoder(
             dim=dim,
             config=area_config
@@ -435,6 +617,26 @@ class AreaEnhancedPositionEmbedding(nn.Module):
 
         return pos_emb
 
+    @property
+    def embed_output(self) -> Dict[str, Any]:
+        """AreaEnhancedPositionEmbedding 诊断输出
+
+        命名空间:
+            embed/params/*: 可学习参数统计
+        """
+        output: Dict[str, Any] = {}
+
+        # embed/params/* - 面积增强尺度参数
+        if hasattr(self, 'area_scale') and self.area_scale is not None:
+            output["params/area_scale"] = float(self.area_scale.item())
+
+        # 合并 base_embedding 的诊断输出
+        if hasattr(self, 'base_embedding') and self.base_embedding is not None:
+            base_output = self.base_embedding.embed_output
+            output.update(base_output)
+
+        return output
+
 
 # P11-5: 删除了 get_attention_bias 方法
 # 注意力偏置功能已由 LCAHilbertBias (attn_hilbert_bias.py) 统一提供
@@ -497,8 +699,7 @@ class GeometryField(nn.Module):
         # 1. 面积编码器: 深度 → 面积 (指数衰减)
         self.area_embedding = nn.Embedding(max_level + 1, dim)
 
-        # 2. 旋转感知编码器
-        from vit_pytorch.layers.embeddings.fractal_path import OrientationExtractor
+        # 2. 旋转感知编码器 (OrientationExtractor 已从顶部导入)
         self.orientation_extractor = OrientationExtractor(
             max_level=max_level,
             embedding_dim=dim
@@ -509,12 +710,15 @@ class GeometryField(nn.Module):
         # Low-Rank: O(dim * 3 * rank + rank * dim) 参数
         # 压缩比: ~3*dim / (3*rank + rank) = ~dim/rank
         # 当 dim=256, rank=16 时，压缩约 16x
+        #
+        # 注意: 移除 LayerNorm(rank) 因为它会将 manifold 信息归一化到单位球面，
+        # 导致 ||manifold_emb|| ≈ 恒定 (约 0.99)，使 Poincaré 距离失去诊断意义。
+        # 改用直接 GELU 激活，保留manifold嵌入的原始尺度变化。
         input_dim = dim * 3
         self.manifold_fusion_lowrank = nn.Sequential(
             nn.Linear(input_dim, rank),  # 压缩到低秩
-            nn.LayerNorm(rank),
-            nn.GELU(),
-            nn.Linear(rank, dim),       # 解压回原始维度
+            nn.GELU(),                    # 直接激活，不归一化
+            nn.Linear(rank, dim),        # 解压回原始维度
         )
 
         # 原始融合网络 (当 rank=dim 时退化为完整版本)
@@ -629,6 +833,26 @@ class GeometryField(nn.Module):
 
         return layer_bias
 
+    @property
+    def embed_output(self) -> Dict[str, Any]:
+        """GeometryField 诊断输出
+
+        命名空间:
+            embed/params/*: 可学习尺度参数
+        """
+        from typing import Dict, Any
+
+        output: Dict[str, Any] = {}
+
+        # embed/params/* - 几何缩放参数
+        if hasattr(self, 'area_scale') and self.area_scale is not None:
+            output["params/area_scale"] = float(self.area_scale.item())
+
+        if hasattr(self, 'orientation_scale') and self.orientation_scale is not None:
+            output["params/orientation_scale"] = float(self.orientation_scale.item())
+
+        return output
+
 
 class MultiLayerGeometryField(nn.Module):
     """多层几何流形场 (解决 Signal Washout)
@@ -687,6 +911,23 @@ class MultiLayerGeometryField(nn.Module):
 
         return layer_biases
 
+    @property
+    def embed_output(self) -> Dict[str, Any]:
+        """MultiLayerGeometryField 诊断输出
 
-# 类型别名用于前向引用
-from typing import List
+        命名空间:
+            embed/params/*: 每层的几何缩放参数
+        """
+        from typing import Dict, Any
+
+        output: Dict[str, Any] = {}
+
+        # embed/params/* - 层缩放参数
+        if hasattr(self, 'layer_scales') and self.layer_scales is not None:
+            ls = self.layer_scales  # [num_layers]
+            for d in range(ls.numel()):
+                output[f"params/layer_scale_lvl_{d}"] = float(ls[d].item())
+            output["params/layer_scale_mean"] = float(ls.mean().item())
+            output["params/layer_scale_std"] = float(ls.std().item())
+
+        return output

@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -90,5 +90,33 @@ class MultiScalePatchEncoder(nn.Module):
                 feat = feat + scale_emb.view(1, -1, 1, 1)
                 
                 features_dict[ps] = (feat, (grid_h, grid_w))
-        
+
         return features_dict
+
+    @property
+    def embed_output(self) -> Dict[str, Any]:
+        """MultiScalePatchEncoder 诊断输出
+
+        命名空间:
+            embed/params/*: 可学习参数统计
+        """
+        output: Dict[str, Any] = {}
+
+        # embed/params/* - 尺度嵌入统计
+        if hasattr(self, 'scale_embedding') and self.scale_embedding is not None:
+            w = self.scale_embedding.weight
+            output["params/scale_emb_norm"] = float(w.norm().item())
+            output["params/scale_emb_mean"] = float(w.mean().item())
+            output["params/scale_emb_std"] = float(w.std().item())
+
+        # embed/params/* - 各尺度编码器参数统计
+        if hasattr(self, 'encoders') and self.encoders is not None:
+            for ps in self.patch_sizes:
+                key = f"scale_{ps}"
+                if key in self.encoders:
+                    encoder = self.encoders[key]
+                    # 统计第一个 Conv 层的权重范数
+                    first_conv = encoder[0]  # Conv2d
+                    output[f"params/scale_{ps}_conv_norm"] = float(first_conv.weight.norm().item())
+
+        return output

@@ -157,6 +157,47 @@ def entmax_beta_joint(
 
 
 # =============================================================================
+# Differentiable K Selection (STE Straight-Through Estimator)
+# =============================================================================
+
+class DifferentiableK(nn.Module):
+    """Straight-Through Estimator for differentiable K selection.
+
+    数学形式:
+        前向: K_hard = round(clamp(K_float, K_min, K_max))
+        反向: dK_soft/dK_float = 1 (STE, 恒等梯度)
+
+    用途:
+        1. K_soft 用于 aux_budget 损失计算（保持梯度流）
+        2. K_hard 用于实际 token 选择（离散决策）
+
+    解决的核心问题:
+        原代码 K = K_float.long().clamp(...).item() 使用 .item() 断裂梯度,
+        导致 density_field 的输出无法通过 K 误差信号更新。
+    """
+
+    def __init__(self, K_min: int, K_max: int):
+        super().__init__()
+        self.K_min = K_min
+        self.K_max = K_max
+
+    def forward(self, K_float: Tensor) -> Tuple[Tensor, Tensor]:
+        """返回 (K_hard, K_soft)
+
+        Args:
+            K_float: 来自 density_field 的连续 K 值 [1] 或 [B]
+
+        Returns:
+            K_hard: 四舍五入的整数用于实际选择
+            K_soft: clamp 后的连续值用于损失计算（保持梯度）
+        """
+        K_soft = K_float.clamp(self.K_min, self.K_max)
+        # STE: 前向使用 round（离散），反向使用恒等梯度
+        K_hard = K_soft.round().long()
+        return K_hard, K_soft
+
+
+# =============================================================================
 # Hilbert-Optimal Splitter
 # =============================================================================
 
@@ -379,6 +420,10 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # 这解决了 avg_tokens 死锁在 5 个的问题
         self._init_density_field_bias()
 
+        # I-OPT: Differentiable K 选择器 (STE 直通估计)
+        # 用于恢复 K 值的梯度流，解决原 .item() 断裂梯度的问题
+        self.K_estimator = DifferentiableK(K_min=K_min, K_max=K_max)
+
         # 候选区域缓存
         self.register_buffer('candidate_regions', torch.zeros(0, 4))
         self.register_buffer('candidate_depths', torch.zeros(0, dtype=torch.long))
@@ -407,8 +452,10 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # 重置权重为较小的值
         nn.init.xavier_uniform_(last_linear.weight, gain=0.1)
 
-        # I-NAN: 关键 - 偏置设为 -1.1，使初始 sigmoid 输出 ≈ 0.25
-        nn.init.constant_(last_linear.bias, -1.1)
+        # I-NAN: 关键 - 偏置设为 -2.27，使初始 sigmoid 输出 ≈ 0.094
+        # 修复 K 公式后: K_float = sum(density_i) ∈ [0, 85]
+        # 初始 density ≈ 0.094 => 初始 K ≈ 0.094 * 85 ≈ 8 = K_min
+        nn.init.constant_(last_linear.bias, -2.27)
 
     def reset_density_field(self) -> None:
         """
@@ -431,6 +478,11 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
     @property
     def num_candidates(self) -> int:
         return self.candidate_regions.shape[0]
+
+    @property
+    def is_training(self) -> bool:
+        """获取当前训练/评估模式"""
+        return self.training
 
     def update_candidates(self, image_size: Tuple[int, int]) -> None:
         """根据输入尺寸动态更新候选区域"""
@@ -902,22 +954,30 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         curve_features = roi_features[0].mean(dim=0, keepdim=True)  # [1, hidden_dim]
         density_per_region = self.density_field(roi_features[0])  # [N, 1]
 
-        # 精确积分: K = Σ ρ_i * w_i
-        # w_i = 4^(-depth_i) 是 Hilbert 曲线下的面积权重
-        hilbert_weights = self._area_encoding[self.candidate_depths]  # [N]
-        K_float = (density_per_region.squeeze(-1) * hilbert_weights).sum()
-        # K 课程学习：使用 _current_K 作为实际上限（从 K_min 逐渐增大到 K_max 向上取整）
-        K = K_float.long().clamp(self.K_min, self._current_K).item()
+        # I-NAN FIX: 直接求和，K_float 范围 [0, N]
+        # 原公式 K = Σ(density_i × 4^(-depth_i)) 范围仅为 [0, 4]
+        # 新公式 K = Σ(density_i) 范围为 [0, N=85]
+        K_float = density_per_region.squeeze(-1).sum()  # [N] -> scalar
 
-        # 稀疏选择
-        selected_mask, probs = self._sparse_select(logits, K, hard=hard)
+        # I-OPT: 使用 STE 直通估计器获取可微分 K
+        # K_soft: 用于 aux_budget 损失计算，min=1 防止零损失
+        # K_hard: 用于实际 token 选择
+        N = density_per_region.shape[0]  # 候选区域数
+        K_soft = K_float.clamp(min=1)  # 用于损失计算
+        # I-NAN FIX v2: 先 round 再 clamp，确保 K_hard 在 [1, N] 范围内
+        # clamp(round(x)) vs round(clamp(x)) - 前者可能在 round 后超出
+        K_hard = K_float.round().long()  # STE: forward=hard
+        K_hard = K_hard.clamp(min=1, max=N)  # 显式 clamp 到有效范围
+
+        # 稀疏选择使用硬 K（离散整数）
+        selected_mask, probs = self._sparse_select(logits, int(K_hard.item()), hard=hard)
 
         # 构建结果
         selected_indices = (selected_mask > 0.5).nonzero(as_tuple=True)
 
         if len(selected_indices[1]) == 0:
             # 至少选择一个 - 使用 top-k
-            _, topk_idx = torch.topk(probs[0], min(K, probs.shape[1]), dim=-1)
+            _, topk_idx = torch.topk(probs[0], min(int(K_hard.item()), probs.shape[1]), dim=-1)
             # 使用 batch 0
             batch_idx = torch.zeros(topk_idx.shape[0], dtype=torch.long, device=logits.device)
             selected_indices = (batch_idx, topk_idx)
@@ -945,6 +1005,7 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             selected_mask=selected_mask,
             logits=logits,
             probs=probs,
+            K_soft=K_soft,  # I-OPT: 可微分 K 值用于 aux_budget 损失
         )
 
         # I150-3: 记录 token 选择历史用于稳定性监控
@@ -1027,6 +1088,66 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             f"entmax_alpha={self.entmax_alpha:.2f}, "
             f"tree_weight={self.tree_constraint_weight})"
         )
+
+    def get_auxiliary_losses(
+        self,
+        split_result: SplitResult,
+        target_ratio: float = 0.25,  # I107-OPT: 从 0.1 增到 0.25
+    ) -> Dict[str, Tensor]:
+        """
+        计算 H1SS 辅助损失（用于端到端训练）。
+
+        数学形式:
+            1. 熵损失: L_entropy = -Σ_d π_d × log(π_d + ε)
+               鼓励配额分布多样性
+
+            2. Budget损失: L_budget = MSE(actual_K, target_K)
+               控制选中的 token 数量
+
+            3. 树一致性损失: L_tree = -std(logits)
+               避免 logits 过度集中
+
+        Args:
+            split_result: H1SS 返回的 SplitResult
+            target_ratio: 目标 token 比例 (default: 0.1)
+
+        Returns:
+            Dict[str, Tensor]: 辅助损失字典
+        """
+        losses = {}
+
+        # 1. 熵损失 - 促进稀疏选择
+        if split_result.probs is not None:
+            probs = split_result.probs  # [B, N]
+            # 展平计算熵
+            probs_flat = probs.view(-1)
+            # 避免 log(0)
+            entropy = -(probs_flat * torch.log(probs_flat + EPS)).sum() / (probs.numel() + EPS)
+            losses['entropy'] = entropy
+
+        # 2. Budget损失 - 控制 token 数量
+        # I-OPT: 使用 K_soft (STE) 替代 selected_mask.sum()
+        # 这样梯度可以流过 K 值到 density_field
+        if split_result.selected_mask is not None:
+            B, N = split_result.selected_mask.shape
+            # 优先使用 K_soft（梯度可流），否则 fallback 到实际选择数（无梯度）
+            if hasattr(split_result, 'K_soft') and split_result.K_soft is not None:
+                K_loss = split_result.K_soft.squeeze()  # [1] or [B] -> []
+                # 确保 K_loss 是标量用于 MSE
+                if K_loss.dim() > 0:
+                    K_loss = K_loss.mean()
+            else:
+                # Fallback: 使用实际选择的 token 数（无梯度）
+                K_loss = split_result.selected_mask.sum(dim=1).float().mean()
+            target_K = N * target_ratio
+            losses['budget'] = F.mse_loss(K_loss, target_K * torch.ones_like(K_loss))
+
+        # 3. 树一致性损失 - logits 方差
+        if split_result.logits is not None:
+            logits_std = split_result.logits.std()
+            losses['tree'] = -logits_std  # 负号因为我们要最大化 std
+
+        return losses
 
 
 # =============================================================================

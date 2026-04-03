@@ -1,58 +1,33 @@
-"""Splitter modules - Adaptive token splitting strategies
+"""Splitter modules - 只保留 H1SS 和 H-Entmax
 
-This module exports various splitter components for token selection.
+H1SS (Hilbert-Optimal Splitter):
+    - 基于6条数学公理的最优实现
+    - Entmax 稀疏激活
+    - Conv1D Hilbert 流形卷积
+    - 支持辅助损失接口
+
+H-Entmax (Hilbert-Ordered Entmax Splitter):
+    - α-Entmax (α=1.5) 稀疏激活
+    - 100% 梯度覆盖率
+    - Hilbert 邻域复杂度提取
 """
-from .gumbel_topk import (
-    GumbelTopKSplitter,
-    TensorSplitResult,
-    GumbelTopKResult,
-    create_gumbel_topk_from_config,
-    DepthMonitor,  # I111-6: 深度分布监控
-)
-from .deterministic_neighbor import (
-    DeterministicNeighborSplitter,
-    DeterministicNeighborSplitterConfig,
-    HilbertNeighborMatrix,
-    HilbertAwareSimilarity,
-    create_deterministic_neighbor_splitter,
-)
-from .semantic_redundancy import SemanticRedundancySplitter
+
 from .hilbert_optimal_splitter import (
     HilbertOptimalSplitter,
     HilbertOptimalSplitterConfig,
-    compute_locality_score,
-    compute_determinism_score,
-    compute_gradient_coverage as hilbert_gradient_coverage,
-    compute_tree_consistency,
-    compute_consistency_stats,
 )
+
 from .hilbert_entmax import (
     HilbertOrderedEntmaxSplitter,
     HilbertLocalComplexity,
     entmax_1_5,
     entmax,
-    compute_gradient_coverage,
 )
 
 __all__ = [
-    "GumbelTopKSplitter",
-    "TensorSplitResult",
-    "GumbelTopKResult",
-    "create_gumbel_topk_from_config",
-    "DepthMonitor",  # I111-6: 深度分布监控
-    "DeterministicNeighborSplitter",
-    "DeterministicNeighborSplitterConfig",
-    "HilbertNeighborMatrix",
-    "HilbertAwareSimilarity",
-    "create_deterministic_neighbor_splitter",
-    "SemanticRedundancySplitter",
+    # H1SS
     "HilbertOptimalSplitter",
     "HilbertOptimalSplitterConfig",
-    "compute_locality_score",
-    "compute_determinism_score",
-    "compute_gradient_coverage",
-    "compute_tree_consistency",
-    "compute_consistency_stats",
     # H-Entmax
     "HilbertOrderedEntmaxSplitter",
     "HilbertLocalComplexity",

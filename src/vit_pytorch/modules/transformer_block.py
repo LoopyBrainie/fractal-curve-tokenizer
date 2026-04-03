@@ -71,11 +71,9 @@ from torch.utils.checkpoint import checkpoint
 
 logger = logging.getLogger(__name__)
 
-from vit_pytorch.layers.attention.hilbert_bias import HilbertAwareMultiScaleAttention
 from vit_pytorch.layers.attention.manifold_attention import ManifoldNativeAttention
 from vit_pytorch.layers.ffn.swiglu import AdaptiveFractalFeedForward, FFNType
-from vit_pytorch.core.config import AttentionEncoderConfig  # I98-3
-from vit_pytorch.core.levels_info import LevelsInfo  # I98-4
+from vit_pytorch.core.levels_info import LevelsInfo
 
 
 class DropPath(nn.Module):
@@ -106,33 +104,9 @@ class DropPath(nn.Module):
 
 
 class FractalTransformerBlock(nn.Module):
-    """Hierarchically aware transformer block extracted for reuse (I98-3: 协议驱动配置化).
+    """Manifold-Native Transformer Block.
 
-    This block combines Hilbert-aware attention with adaptive feed-forward,
-    using level-dependent normalization for depth-aware processing.
-
-    P11-2 修复: 参数 max_level 现在应传入与 tokenizer.max_level 一致的值，
-    而非硬编码的 50。这确保 Embedding 表大小与实际使用的深度范围匹配，
-    减少约 90% 的参数浪费。
-
-    P11-8 简化: 移除 hilbert_bias_mode 和 low_rank_r 参数，仅保留 LCA 模式。
-
-    I98-3: 新增 encoder_config 参数，支持协议驱动的编码器配置。
-
-    Args:
-        dim: Input/output dimension.
-        heads: Number of attention heads.
-        dim_head: Dimension per head.
-        mlp_dim: Feed-forward hidden dimension.
-        dropout: Dropout rate.
-        max_level: Maximum hierarchical level (P11-2: should match tokenizer.max_level).
-        drop_path: DropPath rate for stochastic depth.
-        ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
-        use_affine_modulation: (向后兼容) 是否使用仿射调制偏置。
-        fourier_levels: (向后兼容) 傅里叶频率级别数。
-        encoder_config: (I98-3) AttentionEncoderConfig，协议驱动配置。
-
-    I122-2: 移除 lca_temperature，由 hilbert_bias_scale × √d_k 统一缩放
+    使用 ManifoldNativeAttention 实现 Hilbert 带宽稀疏注意力。
     """
 
     def __init__(
@@ -142,48 +116,27 @@ class FractalTransformerBlock(nn.Module):
         dim_head: int,
         mlp_dim: int,
         dropout: float = 0.0,
-        max_level: int = 8,  # P11-2: 默认改为 8，应由上层传入实际 max_level
+        max_level: int = 8,
         drop_path: float = 0.0,
         ffn_type: FFNType = 'swiglu_level',
-        use_affine_modulation: bool = True,  # A17: 启用 ShapeScaleEncoder
-        fourier_levels: int = 4,
-        encoder_config: Optional["AttentionEncoderConfig"] = None,  # I98-3
-        use_fp16: bool = False,  # I104-3: FP16 存储 LCA embedding
-        use_manifold_native: bool = False,  # 新: 使用 Manifold-Native 注意力
-        manifold_beta: float = 4.0,  # 新: Hilbert 带宽系数
+        manifold_beta: float = 4.0,
     ):
         super().__init__()
         self.dim = dim
         self.max_level = max_level
-        self.use_manifold_native = use_manifold_native
-        self.manifold_beta = manifold_beta  # I-MANIFOLD: Hilbert 带宽系数
+        self.manifold_beta = manifold_beta
 
-        # 选择注意力模块
-        if use_manifold_native:
-            # 新: Manifold-Native 注意力 (整合所有最佳实现)
-            self.attention = ManifoldNativeAttention(
-                dim=dim,
-                heads=heads,
-                dim_head=dim_head,
-                max_level=max_level,
-                beta=manifold_beta,
-                dropout=dropout,
-                use_banded=True,
-                use_fractal_residual=True,
-            )
-        else:
-            # 原有: HilbertAwareMultiScaleAttention
-            self.attention = HilbertAwareMultiScaleAttention(
-                dim=dim,
-                heads=heads,
-                dim_head=dim_head,
-                dropout=dropout,
-                max_level=max_level,
-                use_affine_modulation=use_affine_modulation,
-                fourier_levels=fourier_levels,
-                encoder_config=encoder_config,
-                use_fp16=use_fp16,
-            )
+        # Manifold-Native 注意力
+        self.attention = ManifoldNativeAttention(
+            dim=dim,
+            heads=heads,
+            dim_head=dim_head,
+            max_level=max_level,
+            beta=manifold_beta,
+            dropout=dropout,
+            use_banded=True,
+            use_fractal_residual=True,
+        )
 
         self.ff = AdaptiveFractalFeedForward(
             dim=dim,
@@ -303,70 +256,34 @@ class FractalTransformerBlock(nn.Module):
 
 
 class FractalTransformer(nn.Module):
-    """High-level transformer stack coordinating block execution (I98-3: 协议驱动配置化).
+    """Manifold-Native Transformer Stack.
 
-    This module stacks multiple FractalTransformerBlock layers,
-    adding global context attention and level aggregation for enhanced
-    hierarchical processing.
-
-    Supports gradient checkpointing for memory-efficient training.
-
-    P11-2 修复: 参数 max_level 现在应传入与 tokenizer.max_level 一致的值，
-    而非硬编码的 50。这确保所有子模块的 Embedding 表大小与实际使用的深度范围匹配。
-
-    P11-8 简化: 移除 hilbert_bias_mode 和 low_rank_r 参数，仅保留 LCA 模式。
-
-    I98-3: 新增 encoder_config 参数，支持协议驱动的编码器配置。
-
-    I122-2: 移除 lca_temperature，由 hilbert_bias_scale × √d_k 统一缩放
-
-    Args:
-        dim: Input/output dimension.
-        num_layers: Number of transformer blocks.
-        heads: Number of attention heads.
-        dim_head: Dimension per head.
-        mlp_dim: Feed-forward hidden dimension.
-        dropout: Dropout rate.
-        max_level: Maximum hierarchical level (P11-2: should match tokenizer.max_level).
-        drop_path_rate: Maximum DropPath rate (linearly increased).
-        ffn_type: FFN variant ('gelu', 'swiglu', 'swiglu_level').
-        use_checkpoint: Whether to use gradient checkpointing (saves memory).
-        use_affine_modulation: (向后兼容) 是否使用仿射调制偏置。
-        fourier_levels: (向后兼容) 傅里叶频率级别数。
-        encoder_config: (I98-3) AttentionEncoderConfig，协议驱动配置。
+    使用 ManifoldNativeAttention 实现 Hilbert 带宽稀疏注意力。
     """
 
     def __init__(
         self,
         dim: int,
-        depth: int,  # 保持 depth 作为参数名以保持 API 兼容
+        depth: int,
         heads: int,
         dim_head: int,
         mlp_dim: int,
         dropout: float = 0.0,
-        max_level: int = 8,  # P11-2: 默认改为 8，应由上层传入实际 max_level
+        max_level: int = 8,
         drop_path_rate: float = 0.1,
         ffn_type: FFNType = 'swiglu_level',
         use_checkpoint: bool = False,
-        use_affine_modulation: bool = True,  # A17: 启用 ShapeScaleEncoder
-        fourier_levels: int = 4,
-        encoder_config: Optional[AttentionEncoderConfig] = None,  # I98-3
-        use_fp16: bool = False,  # I104-3: FP16 存储 LCA embedding
-        use_manifold_native: bool = True,  # I-MANIFOLD: Manifold-Native 注意力
-        manifold_beta: float = 4.0,  # I-MANIFOLD: Hilbert 带宽系数
+        manifold_beta: float = 4.0,
     ):
         super().__init__()
         self.dim = dim
-        self.num_layers = depth  # 使用 num_layers 作为属性名
+        self.num_layers = depth
         self.max_level = max_level
         self.ffn_type = ffn_type
         self.use_checkpoint = use_checkpoint
-        self.use_fp16 = use_fp16  # I104-3
-        self.use_manifold_native = use_manifold_native  # I-MANIFOLD: Manifold-Native 注意力
-        self.manifold_beta = manifold_beta  # I-MANIFOLD: Hilbert 带宽系数
+        self.manifold_beta = manifold_beta
 
         # P-OPT: Stochastic depth decay rule
-        # 使用 torch.linspace 预计算，避免 numpy 依赖和 .tolist() 转换
         self.register_buffer('_drop_path_rates', torch.linspace(0, drop_path_rate, depth))
 
         self.layers = nn.ModuleList(
@@ -380,12 +297,7 @@ class FractalTransformer(nn.Module):
                     max_level=max_level,
                     drop_path=self._drop_path_rates[i].item(),
                     ffn_type=ffn_type,
-                    use_affine_modulation=use_affine_modulation,
-                    fourier_levels=fourier_levels,
-                    encoder_config=encoder_config,  # I98-3
-                    use_fp16=use_fp16,  # I104-3
-                    use_manifold_native=use_manifold_native,  # I-MANIFOLD
-                    manifold_beta=manifold_beta,  # I-MANIFOLD
+                    manifold_beta=manifold_beta,
                 )
                 for i in range(depth)
             ]
@@ -463,8 +375,11 @@ class FractalTransformer(nn.Module):
 
         batch_size, seq_len, dim = x.shape
 
-        # I100-6: 使用固定有效深度 num_layers // 2
-        effective_depth = self.num_layers // 2
+        # I100-6: 使用完整深度 num_layers (BUG FIX)
+        # 原始设计 effective_depth = num_layers // 2 导致一半的 transformer 层
+        # 从未被执行，这些层的参数永远不会收到梯度。
+        # 这是一个严重的 bug，修复后所有创建的层都会被使用。
+        effective_depth = self.num_layers
         extra_info = {'effective_depth': effective_depth}
 
         # 执行 transformer 层

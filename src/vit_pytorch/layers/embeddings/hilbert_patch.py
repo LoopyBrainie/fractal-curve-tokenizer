@@ -34,7 +34,6 @@ Variable Depth Token 的 Patch Embedding 必须满足 4 个约束:
         boxes = [(b, x1/p, y1/p, x2/p, y2/p) for all regions]
         pooled = roi_align(F, boxes, output_size=(1,1))  # [N_total, dim, 1, 1]
         T = pooled · σ_d + E_d  # 批量深度编码
-    
     复杂度:
         - 时间: O(1) GPU kernel 调用 (vs O(N) for Python loop)
         - 空间: O(N × dim) 
@@ -66,7 +65,7 @@ Variable Depth Token 的 Patch Embedding 必须满足 4 个约束:
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -77,19 +76,15 @@ from torch import Tensor
 # 移除 _fallback_roi_pool 回退实现，统一使用 torchvision.ops.roi_align
 from torchvision.ops import roi_align  # 强制依赖，无回退
 
-# I97-9: SplitResult 和 SplitToken 已从 split_adaptive.py 移除
-# 仅保留类型注解用于文档，实际使用 TensorSplitResult
-from typing import List, Protocol, Any
+# Note: SplitResult 仅用作类型注解。运行时 split_results 的实际类型是
+# TensorSplitResult (from vit_pytorch.core.splitter_protocol)，其接口不同。
+# 此 stub 类与类型注解配合使用，不应在运行时被实例化。
 
-class SplitToken:
-    """Legacy type - 仅用于类型注解，实际使用 GumbelTopKSplitter."""
-    def __init__(self, **kwargs):
-        pass
 
 class SplitResult:
-    """Legacy type - 仅用于类型注解，实际使用 TensorSplitResult."""
-    def __init__(self, **kwargs):
-        pass
+    """Stub type for type hints only. Runtime type is TensorSplitResult."""
+    num_tokens: int
+    tokens: list
 
 
 class SafeSoftplus(torch.autograd.Function):
@@ -136,6 +131,9 @@ class SafeSoftplus(torch.autograd.Function):
                 grad_input,
                 grad_sign * eps  # 用小值替换
             )
+            # 记录修复次数
+            from vit_pytorch.core.numerical_stability import increment_nan_fix
+            increment_nan_fix("safe_softplus")
 
         return grad_input, None
 
@@ -315,8 +313,10 @@ class HilbertNativePatchEmbed(nn.Module):
         for name, param in self.named_parameters():
             if param.requires_grad:
                 hook = param.register_hook(
-                    lambda grad, n=name: torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
-                    if torch.isnan(grad).any() or torch.isinf(grad).any() else grad
+                    lambda grad, n=name: (
+                        torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
+                        if torch.isnan(grad).any() or torch.isinf(grad).any() else grad
+                    )
                 )
                 self._nan_grad_hooks.append(hook)
 
@@ -409,8 +409,6 @@ class HilbertNativePatchEmbed(nn.Module):
         Returns:
             fpn_features: [FPN_levels] 特征金字塔列表
         """
-        import torch.nn.functional as F
-
         fpn_features = [features]
 
         # 从最细到最粗构建金字塔
@@ -475,8 +473,6 @@ class HilbertNativePatchEmbed(nn.Module):
         Returns:
             pooled: [N, D] 池化后的特征
         """
-        import torch.nn.functional as F
-
         # 定义深度区间和对应的 sampling_ratio
         depth_bins = [0, 2, 4, self.max_level + 1]
         sampling_ratios = [1, 2, 4]
@@ -556,8 +552,6 @@ class HilbertNativePatchEmbed(nn.Module):
         Returns:
             pooled: [N, D] 池化后的特征
         """
-        import torch.nn.functional as F
-
         B, D, H, W = features.shape
         N = boxes.shape[0]
 
@@ -868,6 +862,35 @@ class HilbertNativePatchEmbed(nn.Module):
         levels_info[:, :actual_n, 1:path_len+1] = quadtree_paths[:actual_n, :path_len]
         
         return tokens, levels_info
+
+    @property
+    def embed_output(self) -> Dict[str, Any]:
+        """HilbertNativePatchEmbed 诊断输出
+
+        命名空间:
+            embed/params/*: 可学习尺度参数
+            embed/health/*: 数值健康度
+
+        注意:
+            使用 self.depth_scale (动态计算属性) 而非 self._depth_scale_raw，
+            因为 depth_scale 包含 SafeSoftplus 变换后的实际物理尺度值。
+        """
+        output: Dict[str, Any] = {}
+
+        # embed/params/* - depth_scale 实际使用值
+        if hasattr(self, 'depth_scale'):
+            ds = self.depth_scale  # [max_level+1] 动态计算后的 scale
+            if isinstance(ds, torch.Tensor):
+                for d in range(ds.numel()):
+                    output[f"params/depth_scale_lvl_{d}"] = float(ds[d].item())
+                output["params/depth_scale_mean"] = float(ds.mean().item())
+                output["params/depth_scale_std"] = float(ds.std().item())
+
+        # embed/health/* - nan_grad_hooks 注册数
+        if hasattr(self, '_nan_grad_hooks') and self._nan_grad_hooks:
+            output["health/nan_grad_hooks_registered"] = len(self._nan_grad_hooks)
+
+        return output
 
 
 class DepthAwarePositionalEncoding(nn.Module):
