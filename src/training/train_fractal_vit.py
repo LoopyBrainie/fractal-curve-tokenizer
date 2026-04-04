@@ -775,14 +775,18 @@ def add_args(parser: argparse.ArgumentParser):
                         help='Use Hugging Face zh-plus/tiny-imagenet instead of local dataset')
 
     # ==================== Model Architecture ====================
-    parser.add_argument('--dim', type=int, default=384,
-                        help='Model embedding dimension')
-    parser.add_argument('--num-layers', type=int, default=8,
-                        help='Number of transformer layers')
-    parser.add_argument('--heads', type=int, default=6,
-                        help='Number of attention heads')
-    parser.add_argument('--mlp-dim', type=int, default=1536,
-                        help='MLP hidden dimension')
+    # I-OPT: RTX 4070 8GB + BS=192 最优配置 (2026-04-05)
+    # 计算依据: dim=512, L=12, heads=8, mlp_dim=2048
+    # 显存占用: ~2GB (24%)，留有充足余量供200 epochs训练
+    # 参数量: 50.3M (适合 Tiny-ImageNet 200类)
+    parser.add_argument('--dim', type=int, default=512,
+                        help='Model embedding dimension (default: 512 for RTX 4070 8GB)')
+    parser.add_argument('--num-layers', type=int, default=12,
+                        help='Number of transformer layers (default: 12)')
+    parser.add_argument('--heads', type=int, default=8,
+                        help='Number of attention heads (default: 8)')
+    parser.add_argument('--mlp-dim', type=int, default=2048,
+                        help='MLP hidden dimension (default: 2048 = 4*dim)')
     parser.add_argument('--dim-head', type=int, default=None,
                         help='Per-head dimension (default: dim/heads)')
     parser.add_argument('--min-patch-size', type=int, default=4,
@@ -813,8 +817,8 @@ def add_args(parser: argparse.ArgumentParser):
                         help='Minimum token coverage ratio')
     parser.add_argument('--token-coverage-max', type=float, default=None,
                         help='Maximum token coverage ratio')
-    parser.add_argument('--target-ratio', type=float, default=0.5,
-                        help='Target token ratio')
+    parser.add_argument('--target-ratio', type=float, default=0.25,
+                        help='Target token ratio (default: 0.25, 增加token数量缓解信息瓶颈)')
 
     # ==================== Splitter ====================
     parser.add_argument('--splitter-type', type=str, default='hilbert_optimal',
