@@ -598,11 +598,19 @@ class FractalCurveViT(nn.Module):
             self.splitter = splitter
         else:
             # I98-1: 确定 max_level_limit (根据 tokenizer 或默认值)
-            # I164-1: 使用 max_level_limit=8 (已通过分块处理优化)
-            max_level_limit = 8
-            if tokenizer is not None:
-                if hasattr(tokenizer, 'max_level'):
-                    max_level_limit = tokenizer.max_level
+            # I164-1: 修复：当 tokenizer 为 None 时，从 image_size 动态计算 max_level
+            # 避免 Tiny-ImageNet (64x64) 使用 max_level=8 导致的 index out of bounds
+            if tokenizer is not None and hasattr(tokenizer, 'max_level'):
+                max_level_limit = tokenizer.max_level
+            else:
+                # 动态计算正确的 max_level
+                from vit_pytorch.core.depth_utils import compute_max_depth
+                img_h, img_w = self.image_size
+                max_level_limit = compute_max_depth(
+                    image_size=(img_h, img_w),
+                    min_patch_size=effective_min_patch_size,
+                    hard_limit=8  # 上限 8
+                )
 
             # 仅支持 HilbertOptimalSplitter (H1SS)
             # 基于6条公理的最优实现:
