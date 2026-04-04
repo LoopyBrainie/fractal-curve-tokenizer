@@ -456,6 +456,21 @@ def train_one_epoch(
     # Get layer gradient norms
     layer_grad_norms = grad_monitor.get_layer_statistics()
 
+    # P4-A FIX: 从 layer_grad_norms（累积的hook数据）计算 manifold_decoder 梯度范数
+    # 问题根源: compute_grad_norms() 返回的 param.grad.norm() 与 hooks 累积的数据不一致
+    # 解决: 直接从 layer_grad_norms 的均值统计计算，确保与 stats 文件中的 layer_grad_norms 一致
+    manifold_decoder_grad_sq = 0.0
+    for param_name, stats in layer_grad_norms.items():
+        if isinstance(stats, dict) and "mean" in stats:
+            mean_norm = stats["mean"]
+        elif isinstance(stats, (int, float)):
+            mean_norm = stats  # 有些可能是直接的值
+        else:
+            continue
+        if "geo_decoder" in param_name.lower() or "manifold_decoder" in param_name.lower():
+            manifold_decoder_grad_sq += mean_norm ** 2
+    avg_manifold_decoder_grad_norm = manifold_decoder_grad_sq ** 0.5 if manifold_decoder_grad_sq > 0 else 0.0
+
     # 新增: 计算平均指标
     # I-AUDIT: 使用 None 检查，只有在有数据时才计算平均值
     def safe_avg(total, num_batches):
@@ -477,7 +492,11 @@ def train_one_epoch(
     avg_backbone_grad_norm = safe_avg(total_backbone_grad_norm, _backbone_grad_count)
     avg_splitter_grad_norm = safe_avg(total_splitter_grad_norm, _splitter_grad_count)
     avg_entmax_grad_norm = safe_avg(total_entmax_grad_norm, _entmax_grad_count)  # I150-3 NEW
-    avg_manifold_decoder_grad_norm = safe_avg(total_manifold_decoder_grad_norm, _manifold_decoder_grad_count)  # I150-3 NEW
+    # P4-A FIX: 使用 epoch 级别从 layer_grad_norms（hooks 累积数据）计算的 manifold_decoder 梯度范数
+    # 注意: per-step compute_grad_norms() 与 hooks 累积数据不一致，改用 get_layer_statistics() 的数据
+    # avg_manifold_decoder_grad_norm 已在 line 472 从 layer_grad_norms 计算，直接使用
+    # (line 495 被注释，不再用 per-step 的污染数据覆盖正确值)
+    # avg_manifold_decoder_grad_norm = safe_avg(total_manifold_decoder_grad_norm, _manifold_decoder_grad_count)
     avg_budget_penalty = safe_avg(total_budget_penalty, _budget_penalty_count)
     avg_consistency_loss = safe_avg(total_consistency_loss, _consistency_loss_count)
     avg_entropy_loss = safe_avg(total_entropy_loss, _entropy_loss_count)
