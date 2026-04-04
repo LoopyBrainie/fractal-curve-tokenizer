@@ -131,7 +131,6 @@ set -e
 
 uv run python -m src.training.train_fractal_vit \
   --dataset tiny-imagenet \
-  --num-classes 200 \
   --epochs 200 \
   --batch-size 192 \
   --lr 5e-4 \
