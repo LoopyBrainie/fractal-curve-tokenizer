@@ -199,7 +199,7 @@ def create_model(args, device: torch.device) -> nn.Module:
     # Add optional parameters if provided
     if hasattr(args, 'use_area_encoding') and args.use_area_encoding:
         model_kwargs['use_area_encoding'] = True
-        model_kwargs['fourier_levels'] = getattr(args, 'fourier_levels', 4)
+        # Note: fourier_levels is not a FractalCurveViT parameter
 
     if hasattr(args, 'use_pattern_encoder') and args.use_pattern_encoder:
         model_kwargs['use_pattern_encoder'] = True
