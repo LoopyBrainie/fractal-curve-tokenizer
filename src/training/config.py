@@ -227,6 +227,26 @@ def create_config(
     return config
 
 
+# I147: Additional config classes expected by tests
+@dataclass
+class ModelArchitectureConfig:
+    """Model architecture configuration (I147)"""
+    focal_gamma: float = 0.0
+    use_focal_loss: bool = False
+
+
+@dataclass
+class OptimizerConfig:
+    """Optimizer configuration (I147)"""
+    lr: float = 5e-4
+
+
+@dataclass
+class LossConfig:
+    """Loss configuration (I147)"""
+    type: str = "cross_entropy"
+
+
 __all__ = [
     "Config",
     "TrainingHyperparams",
@@ -235,4 +255,7 @@ __all__ = [
     "DataConfig",
     "MixedPrecisionConfig",
     "create_config",
+    "ModelArchitectureConfig",
+    "OptimizerConfig",
+    "LossConfig",
 ]
