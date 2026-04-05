@@ -341,19 +341,25 @@ class SplitResult:
         - regions: 选中区域的边界坐标 [M, 4]
         - depths: 每个区域的深度 [M]
         - batch_indices: 每个区域的 batch 索引 [M]
-        - hilbert_indices: Hilbert 曲线排序索引 [M]
+        - hilbert_indices: Hilbert 曲线排序索引 [M]（选中子集的 Hilbert 排序）
         - selected_mask: 选中掩码 [B, N]
         - K_soft: 可微分的软 K 值（STE 直通估计）用于 aux_budget 损失
 
     数学形式化:
         M = |{i : selected_mask[i] = 1}| (选中的 token 数量)
-        HilbertOrder: HilbertCurve(R_selected) → [0, M-1]
+        N = 所有候选区域数量
+        HilbertOrder: HilbertCurve(R_selected) → [0, M-1]（用于 TensorSplitResult 兼容）
+
+    注意:
+        - probs/logits/selected_mask: [B, N]（所有候选区域）
+        - hilbert_indices: [M]（仅选中子集，用于 tokenizer 排序）
+        - 若需 TV Loss 在全量空间计算，使用 splitter.hilbert_indices [N]
     """
 
     regions: Tensor           # [M, 4] 坐标 (x0, y0, x1, y1)
     depths: Tensor            # [M] 深度值
     batch_indices: Tensor     # [M] batch 索引
-    hilbert_indices: Tensor   # [M] Hilbert 索引
+    hilbert_indices: Tensor   # [M] Hilbert 索引（选中子集的 Hilbert 排序）
     selected_mask: Optional[Tensor] = None  # [B, N] 选中掩码
     logits: Optional[Tensor] = None         # [B, N] 原始 logits
     probs: Optional[Tensor] = None          # [B, N] 分割概率
@@ -377,7 +383,7 @@ class SplitResult:
             regions: [M, 4] 选中区域坐标
             depths: [M] 区域深度
             batch_indices: [M] batch 索引
-            hilbert_indices: [M] Hilbert 曲线索引
+            hilbert_indices: [M] Hilbert 曲线索引（选中子集的 Hilbert 排序）
             selected_mask: [B, N] 二值选中掩码
             logits: [B, N] 原始 logits（可选）
             probs: [B, N] 分割概率（可选）
@@ -402,7 +408,7 @@ class SplitResult:
         M = regions.shape[0]
         assert depths.shape[0] == M, f"depths 形状不匹配: {depths.shape[0]} vs {M}"
         assert batch_indices.shape[0] == M, f"batch_indices 形状不匹配"
-        assert hilbert_indices.shape[0] == M, f"hilbert_indices 形状不匹配"
+        # 注意: hilbert_indices 现在是 [N]（所有候选区域），不再等于 M
 
     @property
     def num_selected(self) -> int:
