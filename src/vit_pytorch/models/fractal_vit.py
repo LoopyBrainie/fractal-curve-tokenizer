@@ -1808,24 +1808,22 @@ class FractalCurveViT(nn.Module):
                 auxiliary_outputs["splitter"] = splitter_out
 
         # Attention 和 FFN 输出（遍历每个 transformer block）
-        # I<fix>: transformer 有 layers 属性，不是 blocks
         # I-COMPILE-FIX: hasattr(block.ff, 'ffn_output') 在 torch.compile 追踪时会触发
         # InternalTorchDynamoError (FakeRootModule 无法处理 property getter 内部的
-        # self._diagnostic_cache 访问)。使用 torch._dynamo.disable 上下文管理器
-        # 创建 graph break，在 eager 模式执行诊断收集。
-        if hasattr(self.transformer, 'layers'):
-            with torch._dynamo.disable():
-                for i, block in enumerate(self.transformer.layers):
-                    # Attention 输出 (I<issue>: block.attention not block.attn)
-                    if hasattr(block, 'attention') and hasattr(block.attention, 'attn_output'):
-                        attn_out = block.attention.attn_output
-                        if attn_out:  # 非空才记录
-                            auxiliary_outputs[f"attn_{i}"] = attn_out
-                    # FFN 输出（block.ff 是 AdaptiveFractalFeedForward 实例）
-                    if hasattr(block, 'ff') and hasattr(block.ff, 'ffn_output'):
-                        ffn_out = block.ff.ffn_output
-                        if ffn_out:  # 非空才记录
-                            auxiliary_outputs[f"ffn_{i}"] = ffn_out
+        # self._diagnostic_cache 访问)。torch.compiler.is_compiling() 在追踪时返回 True，
+        # 因此直接跳过此块以避免触发 property。
+        if hasattr(self.transformer, 'layers') and not torch.compiler.is_compiling():
+            for i, block in enumerate(self.transformer.layers):
+                # Attention 输出 (I<issue>: block.attention not block.attn)
+                if hasattr(block, 'attention') and hasattr(block.attention, 'attn_output'):
+                    attn_out = block.attention.attn_output
+                    if attn_out:  # 非空才记录
+                        auxiliary_outputs[f"attn_{i}"] = attn_out
+                # FFN 输出（block.ff 是 AdaptiveFractalFeedForward 实例）
+                if hasattr(block, 'ff') and hasattr(block.ff, 'ffn_output'):
+                    ffn_out = block.ff.ffn_output
+                    if ffn_out:  # 非空才记录
+                        auxiliary_outputs[f"ffn_{i}"] = ffn_out
 
         # === Embeddings 诊断收集 ===
         # 1. 递归收集所有 embed_output
