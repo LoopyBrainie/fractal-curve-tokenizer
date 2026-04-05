@@ -1809,9 +1809,10 @@ class FractalCurveViT(nn.Module):
 
         # Attention 和 FFN 输出（遍历每个 transformer block）
         # I-COMPILE-FIX: hasattr(block.ff, 'ffn_output') 在 torch.compile 追踪时会触发
-        # InternalTorchDynamoError。诊断数据在编译时不需要，直接跳过。
-        # torch.compiler.is_compiling() 在图构建阶段返回 True，使整个块被短路。
-        if not torch.compiler.is_compiling():
+        # InternalTorchDynamoError。torch.compiler.is_compiling() 在 dynamo resume
+        # point 追踪时可能返回 False，导致 guard 失效。使用 try/except 安全地捕获
+        # FakeRootModule 属性错误，避免编译错误。
+        try:
             if hasattr(self.transformer, 'layers'):
                 for i, block in enumerate(self.transformer.layers):
                     # Attention 输出
@@ -1824,6 +1825,9 @@ class FractalCurveViT(nn.Module):
                         ffn_out = block.ff.ffn_output
                         if ffn_out:  # 非空才记录
                             auxiliary_outputs[f"ffn_{i}"] = ffn_out
+        except (AttributeError, RuntimeError, Exception):
+            # torch.compile 追踪期间的 FakeRootModule 属性错误，安全跳过
+            pass
 
         # === Embeddings 诊断收集 ===
         # 1. 递归收集所有 embed_output
