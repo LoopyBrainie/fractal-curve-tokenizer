@@ -41,6 +41,8 @@ from vit_pytorch.layers.embeddings.fractal_path import (
     VectorizedPathEncoder,
     OrientationExtractor,
 )
+# I164-1: 导入LookAheadHead (从废弃的SemanticRedundancy迁移)
+from vit_pytorch.layers.splitters.semantic_redundancy import LookAheadHead
 
 logger = logging.getLogger(__name__)
 
@@ -338,8 +340,15 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         self.entmax_warmup_epochs = 10     # 预热 epoch 数
         self.entmax_schedule_epochs = 20  # 总调度 epoch 数
 
-        # 树约束
+        # 树约束 - I164-1: 动态λ调整
+        # 使用log(lambda)确保λ>0，通过课程学习逐步增强约束
         self.tree_constraint_weight = tree_constraint_weight
+        self._log_lambda = nn.Parameter(torch.tensor(0.0))  # 可学习的log(λ)
+        self._lambda_schedule_epochs = 20  # λ课程学习持续20个epoch
+
+        # λ的初始值和目标值（课程学习）
+        self._lambda_init = 0.05
+        self._lambda_max = 0.3
 
         # 温度
         self.temperature = temperature_init
@@ -368,6 +377,13 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         # 1. 特征投影
         self.feature_proj = nn.Linear(feature_dim, hidden_dim)
+
+        # I164-1: LookAheadHead - 预测子节点特征以增强分裂决策
+        # 迁移自废弃的SemanticRedundancySplitter
+        self.look_ahead_head = LookAheadHead(
+            feature_dim=hidden_dim,
+            hidden_dim=hidden_dim
+        )
 
         # 2. 深度嵌入 (A1: 与 Embed 层一致)
         self.depth_embedding = nn.Embedding(max_level_limit + 1, hidden_dim)
@@ -512,7 +528,7 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         depth_start_idx = [0]
 
         for depth in range(max_level + 1):
-            grid_size = 2 ** depth
+            grid_size = 1 << depth  # I-OPT: 位移替代 2**depth
             region_h = H_img / grid_size
             region_w = W_img / grid_size
 
@@ -577,16 +593,17 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             for i in range(depth_start, depth_end):
                 # 找到对应的父节点
                 grid_idx = i - depth_start
-                grid_size = 2 ** depth
-                gi = grid_idx // grid_size
-                gj = grid_idx % grid_size
-                parent_idx = parent_start + gi // 2 * (grid_size // 2) + gj // 2
+                grid_size = 1 << depth  # I-OPT: 位移替代 2**depth
+                gi = grid_idx >> depth  # gi = grid_idx // grid_size
+                gj = grid_idx & (grid_size - 1)  # gj = grid_idx % grid_size
+                # I-OPT: 位移替代除法 gi >> 1 = gi // 2
+                parent_idx = parent_start + (gi >> 1) * (grid_size >> 1) + (gj >> 1)
                 new_parent_indices[i] = parent_idx
 
         # 子节点矩阵
         children_matrix = torch.full((N, 4), -1, dtype=torch.long, device=device)
         for i in range(N):
-            parent = new_parent_indices[i].item()
+            parent = new_parent_indices[i]  # I-OPT: 直接用 0-d tensor 索引，无 .item()
             if parent >= 0:
                 # 找到父节点的下一个可用槽位
                 for slot in range(4):
@@ -765,16 +782,24 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         数学:
             z_parent -= λ × max(z_children)
+
+        I164-1: 动态λ调整
+            - 课程学习: λ从_init逐步增加到_max
+            - 可学习残差: log_lambda提供额外的学习信号
         """
         if self.tree_constraint_weight <= 0:
             return logits
+
+        # 计算动态λ (课程学习 + 可学习残差)
+        lambda_cur = self._compute_dynamic_lambda()
 
         N = logits.shape[1]
         constrained_logits = logits.clone()
 
         # 对每个父节点，降低其分数如果子节点分数更高
+        # I-OPT: 直接用 0-d tensor 索引替代 .item()，避免 GPU-CPU 同步
         for i in range(N):
-            parent_idx = self.parent_indices[i].item()
+            parent_idx = self.parent_indices[i]  # 0-d tensor，兼容索引
             if parent_idx >= 0:
                 # 检查所有子节点
                 children = self.children_matrix[parent_idx]
@@ -782,36 +807,83 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
                 if len(children_valid) > 0:
                     max_child_logit = logits[:, children_valid].max(dim=1)[0]
-                    # 降低父节点分数
-                    constrained_logits[:, parent_idx] -= self.tree_constraint_weight * max_child_logit
+                    # 降低父节点分数 (使用动态λ)
+                    constrained_logits[:, parent_idx] -= lambda_cur * max_child_logit
 
         return constrained_logits
+
+    def _compute_dynamic_lambda(self) -> float:
+        """计算动态λ (课程学习)
+
+        λ(t) = λ_init + (λ_max - λ_init) × min(1, t / T_schedule) + σ(log_lambda)
+
+        其中 t 是当前epoch，T_schedule 是课程学习持续时间
+        """
+        # 课程学习组件
+        progress = min(1.0, self._current_epoch / max(1, self._lambda_schedule_epochs))
+        lambda_scheduled = self._lambda_init + (self._lambda_max - self._lambda_init) * progress
+
+        # 可学习残差 (sigmoid确保正值)
+        lambda_learnable = torch.sigmoid(self._log_lambda).item() * 0.2  # 缩放到合理范围
+
+        # 组合
+        return lambda_scheduled + lambda_learnable
+
+    def get_adaptive_alpha(self, epoch: int) -> float:
+        """自适应 α 调度器 - 保证早期全梯度流
+
+        数学:
+            α*(t) = 1.2 + 0.3 * sigmoid(0.3 * (t - 10))
+
+        调度策略:
+            - epoch < 10:  α = 1.2 (早期保证梯度覆盖率)
+            - 10 <= epoch < 30: α = 1.5 (中期标准 entmax)
+            - epoch >= 30: α → 1.7 (后期适度稀疏，通过 sigmoid 平滑过渡)
+        """
+        if epoch < 10:
+            return 1.2
+        elif epoch < 30:
+            return 1.5
+        else:
+            # sigmoid 平滑过渡到 1.7（不达到 2.0）
+            progress = (epoch - 30) / 50
+            # 使用 torch.sigmoid 确保数值稳定
+            return 1.5 + 0.2 * torch.sigmoid(
+                torch.tensor(0.3 * (progress - 0.5) * 10, dtype=torch.float32)
+            ).item()
 
     def _sparse_select(
         self,
         logits: Tensor,
-        K_target: int,
+        K_target,  # I-OPT: 接受 int 或 Tensor，避免 .item() 同步
         hard: bool = False,
+        epoch: int = 0,
     ) -> Tuple[Tensor, Tensor]:
         """稀疏选择
 
         数学:
             s = softmax(z / τ) × K (用于更好的梯度流)
             s = Entmax_{α}(z / τ) × K (用于稀疏)
+
+        参数:
+            epoch: 训练轮次，用于自适应调整 α
         """
         B, N = logits.shape
 
         # 温度调度
         tau = max(self.temperature, TEMPERATURE_MIN)
 
-        # 使用 softmax (alpha=2) 以获得更好的梯度流
-        # 或者使用 entmax 稀疏激活
-        if self.entmax_alpha < 1.9:
+        # 自适应 α 调度
+        alpha = self.get_adaptive_alpha(epoch)
+
+        # 使用 softmax (alpha < 1.9) 以获得更好的梯度流
+        # 或者使用 entmax 稀疏激活 (alpha >= 1.9)
+        if alpha < 1.9:
             # 接近 softmax，使用 soft selection
             probs = F.softmax(logits / tau, dim=-1)
         else:
             # 稀疏激活
-            probs = entmax(logits / tau, alpha=self.entmax_alpha, dim=-1)
+            probs = entmax(logits / tau, alpha=alpha, dim=-1)
 
         # 缩放使期望和等于 K
         probs_scaled = probs * K_target
@@ -894,11 +966,16 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         features: Tensor,
         image_size: Optional[Tuple[int, int]] = None,
         hard: bool = False,
+        epoch: int = 0,
     ) -> SplitResult:
         """
         前向传播
 
         Args:
+            features: [B, C, H, W] 输入特征
+            image_size: (H, W) 原始图像尺寸
+            hard: 是否使用硬选择
+            epoch: 训练轮次，用于自适应 α 调度
             features: [B, C, H, W] 输入特征
             image_size: (H, W) 原始图像尺寸
             hard: 是否使用硬选择
@@ -954,7 +1031,7 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         curve_features = roi_features[0].mean(dim=0, keepdim=True)  # [1, hidden_dim]
         density_per_region = self.density_field(roi_features[0])  # [N, 1]
 
-        # I-NAN FIX: 直接求和，K_float 范围 [0, N]
+# I-NAN FIX: 直接求和，K_float 范围 [0, N]
         # 原公式 K = Σ(density_i × 4^(-depth_i)) 范围仅为 [0, 4]
         # 新公式 K = Σ(density_i) 范围为 [0, N=85]
         K_float = density_per_region.squeeze(-1).sum()  # [N] -> scalar
@@ -988,20 +1065,21 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # 提取选中区域
         selected_regions = self.candidate_regions[region_idx]
         selected_depths = self.candidate_depths[region_idx]
-        selected_hilbert = self.hilbert_indices[region_idx]
 
-        # 按 Hilbert 索引排序
+        # 按 Hilbert 索引排序（仅对选中区域）
+        selected_hilbert = self.hilbert_indices[region_idx]
         sort_idx = selected_hilbert.argsort()
         selected_regions = selected_regions[sort_idx]
         selected_depths = selected_depths[sort_idx]
         batch_idx = batch_idx[sort_idx]
-        selected_hilbert = selected_hilbert[sort_idx]
 
         result = SplitResult(
             regions=selected_regions,
             depths=selected_depths,
             batch_indices=batch_idx,
-            hilbert_indices=selected_hilbert,
+            hilbert_indices=selected_hilbert,  # [M] 选中区域的 Hilbert 索引
+            # 注意: 全局 Hilbert 排序 self.hilbert_indices [N] 不存储在 SplitResult 中
+            # TV Loss 直接使用 split_result.probs [B,N] 和 splitter.full_hilbert_indices
             selected_mask=selected_mask,
             logits=logits,
             probs=probs,
