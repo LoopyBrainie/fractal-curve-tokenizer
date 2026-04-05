@@ -325,7 +325,18 @@ class ActivationStatsCollector:
         self._register_hooks()
 
     def _register_hooks(self):
-        """注册 forward hooks"""
+        """注册 forward hooks
+
+        注意: torch.compile 与 forward hooks 不兼容 (torch._dynamo.exc.InternalTorchDynamoError:
+        FakeRootModule 无法解析 hook closure 中捕获的 cell 变量)。
+        如果模型已被 torch.compile 包装 (OptimizedModule)，则跳过 hook 注册。
+        """
+        # 检测模型是否已被 torch.compile 包装
+        # torch.compile 返回 torch._dynamo.eval_frame.OptimizedModule
+        if hasattr(self.model, '_orig_mod'):
+            # 模型已被 torch.compile 包装，hook 会导致 FakeRootModule 错误
+            return
+
         def create_hook(name: str):
             def hook(module, input, output):
                 # 处理输出
