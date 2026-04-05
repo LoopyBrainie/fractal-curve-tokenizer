@@ -1,0 +1,46 @@
+# 资源高效训练配置
+# ==================
+# 激进的 FLOPS 预算约束，追求推理效率
+#
+# 目标: 在保持 85%+ 准确率的前提下，实现 0.5x FLOPS
+#
+# 数学形式化:
+# - FLOPS: L · (12ND² + 2N²D) 
+# - 深度权重: w(d) = e^{0.75·d} (激进惩罚深层)
+# - 预算调度: Cosine 从 1.0x 到 0.5x
+
+base: base.yaml
+
+name: resource_efficient
+description: "Resource-efficient training with aggressive FLOPS constraint"
+
+# 渐进采样 (逐渐增强平衡)
+data:
+  sampler_type: progressive
+  sampler_beta: 0.9      # 最终 beta
+  sampler_beta_min: 0.3  # 初始 beta
+
+# 标准 Focal Loss
+loss:
+  type: focal
+  focal_gamma: 2.0
+
+# 激进的深度加权预算
+budget:
+  enabled: true
+  type: depth_weighted
+  flops_budget: 2500000000    # 0.5x 基准 (2.5G)
+  flops_lambda: 0.2      # 更强约束
+  depth_alpha: 0.75      # 激进深度惩罚
+  schedule: cosine
+  budget_max_ratio: 2.0  # 初始非常宽松
+  budget_min_ratio: 1.0  # 最终强制满足
+
+# 更长训练适应强约束
+training:
+  num_epochs: 150
+  patience: 30
+
+# 更高学习率补偿强约束
+optimizer:
+  lr: 2.0e-4
