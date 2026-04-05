@@ -21,8 +21,6 @@ from datetime import datetime
 
 import numpy as np
 import torch
-# I-COMPILE: 捕获标量输出，避免 .item() 导致 graph break
-os.environ.setdefault('TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS', '1')
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
