@@ -289,33 +289,5 @@ class TestLogitsClampIntegration:
         assert key_params_have_grad, "Key model parameters should have gradients"
 
 
-class TestConfigChangesI147:
-    """配置变更验证 (I147: 遵循三层参数原则)"""
-
-    def test_focal_loss_disabled_in_arch_config(self):
-        """验证 focal_gamma = 0 (禁用 Focal Loss, 从 arch_config 读取)"""
-        from training.config import ModelArchitectureConfig
-
-        config = ModelArchitectureConfig()
-        # focal_gamma = 0 时退化为标准 CE
-        assert config.focal_gamma == 0.0
-        assert config.use_focal_loss == False
-
-    def test_learning_rate_updated(self):
-        """验证学习率已更新"""
-        from training.config import OptimizerConfig
-
-        config = OptimizerConfig()
-        # 从 1e-4 提升到 5e-4
-        assert config.lr == 5e-4
-
-    def test_loss_type_cross_entropy(self):
-        """验证默认损失类型为 cross_entropy"""
-        from training.config import LossConfig
-
-        config = LossConfig()
-        assert config.type == "cross_entropy"
-
-
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

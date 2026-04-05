@@ -377,6 +377,6 @@ The position embedding and attention bias share the same `AreaEncoder`:
 |:---------|:------|:--------|
 | `EMBEDDING_INIT_STD` | 0.02 | Embedding weight initialization std |
 | `HILBERT_BIAS_SCALE` | 1.0 | Attention bias scale |
-| `LEVEL_BIAS_SCALE` | 0.1 | Level bias scale |
+| `LEVEL_BIAS_SCALE` | 1.0 | Level bias scale |
 
 > **Next**: [05_attention_mechanism.md](05_attention_mechanism.md) - Hilbert-Aware Attention

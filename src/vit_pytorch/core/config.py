@@ -431,7 +431,7 @@ SplitterConfig = HilbertSplitterConfig
 
 # I130-3: NeighborAwareSplitter 的配置类
 # I160-1: 重命名为 DeterministicNeighborSplitter，使用确定性选择
-# 注意：原配置类已合并到 deterministic_neighbor.py，此处保留完整实现以避免循环导入
+# 注意：DeterministicNeighborSplitter 已废弃（2026-03-23），现使用 HilbertOptimalSplitter
 
 @dataclass
 class NeighborAwareSplitterConfig:

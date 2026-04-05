@@ -47,7 +47,7 @@ from .checkpoint import (
     load_checkpoint,
     find_latest_checkpoint,
 )
-from .logging import EpochLogger
+from .training_logs import EpochLogger
 
 
 def set_seed(seed: int):

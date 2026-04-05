@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Optional, Dict, Any, List
 import torch
+from tqdm import tqdm
 import torch.nn as nn
 from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader
@@ -16,6 +17,7 @@ from torch.utils.data import DataLoader
 from ..config import Config
 from .state import EvaluationMetrics
 from .loss import compute_loss
+from ..training_logs.metrics import compute_confusion_matrix
 
 
 def evaluate(
@@ -56,12 +58,18 @@ def evaluate(
     all_confidences: List[float] = []
     all_correct: List[bool] = []
 
+    # For confusion matrix
+    all_predictions: List[torch.Tensor] = []
+    all_targets: List[torch.Tensor] = []
+
     # For per-class accuracy
     class_correct = torch.zeros(num_classes)
     class_total = torch.zeros(num_classes)
 
+    total_batches = len(dataloader)
+
     with torch.no_grad():
-        for batch in dataloader:
+        for batch_idx, batch in tqdm(enumerate(dataloader), total=total_batches, desc="Evaluating", leave=False):
             # Handle different batch formats
             if isinstance(batch, (list, tuple)):
                 images = batch[0].to(device, non_blocking=True)
@@ -116,9 +124,18 @@ def evaluate(
                     all_confidences.extend(confidences.cpu().tolist())
                     all_correct.extend((pred == labels).cpu().tolist())
 
+                    # Collect for confusion matrix
+                    all_predictions.append(pred.cpu())
+                    all_targets.append(labels.cpu())
+
                 total_samples += batch_size
 
             num_batches += 1
+
+            # Batch 进度日志 (每 10 个 batch 打印一次)
+            if batch_idx > 0 and batch_idx % 10 == 0 and labels is not None:
+                batch_acc = correct / batch_size if batch_size > 0 else 0.0
+                print(f"  Eval batch {batch_idx}/{total_batches} | Loss: {loss.item():.4f} | Acc: {batch_acc:.2%}")
 
     # Compute final metrics
     avg_loss = total_loss / max(num_batches, 1)
@@ -140,12 +157,20 @@ def evaluate(
         if class_total[c] > 0:
             per_class_acc[c] = (class_correct[c] / class_total[c]).item()
 
+    # Compute confusion matrix
+    confusion_matrix = None
+    if all_predictions and all_targets:
+        all_pred = torch.cat(all_predictions)
+        all_target = torch.cat(all_targets)
+        confusion_matrix = compute_confusion_matrix(all_pred, all_target, num_classes)
+
     return EvaluationMetrics(
         loss=avg_loss,
         accuracy=accuracy,
         top5_accuracy=top5_accuracy,
         ece=ece,
         per_class_accuracy=per_class_acc if per_class_acc else None,
+        confusion_matrix=confusion_matrix,
         num_samples=total_samples,
     )
 
@@ -227,8 +252,10 @@ def evaluate_simple(
     total_top5_correct = 0
     total_samples = 0
 
+    total_batches = len(dataloader)
+
     with torch.no_grad():
-        for batch in dataloader:
+        for batch_idx, batch in tqdm(enumerate(dataloader), total=total_batches, desc="Evaluating", leave=False):
             images = batch[0].to(device)
             labels = batch[1].to(device)
 

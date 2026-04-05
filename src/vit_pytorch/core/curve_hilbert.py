@@ -107,21 +107,20 @@ class HilbertCurve:
                            f"Use _next_power_of_2({n}) = {_next_power_of_2(n)} if auto-adjustment is needed.")
 
         d = 0
-        s = n // 2
-        
-        while s > 0:
+        # I-OPT: 用有限 for 循环替代 while s > 0，兼容 torch.compile
+        # n >> i 生成序列: n//2, n//4, ..., 1 (精确 log2(n) 次迭代)
+        for s in (n >> i for i in range(1, n.bit_length())):
             rx = 1 if (x & s) > 0 else 0
             ry = 1 if (y & s) > 0 else 0
             d += s * s * ((3 * rx) ^ ry)
-            
+
             # 旋转坐标
             if ry == 0:
                 if rx == 1:
                     x = s - 1 - x
                     y = s - 1 - y
                 x, y = y, x
-            s //= 2
-            
+
         return d
 
     @staticmethod
@@ -144,23 +143,25 @@ class HilbertCurve:
 
         x = y = 0
         s = 1
-        
-        while s < n:
-            rx = 1 & (d // 2)
+
+        # I-OPT: 用有限 for 循环替代 while s < n，兼容 torch.compile
+        # s *= 2 生成序列: 1, 2, 4, ..., n//2 (精确 log2(n) 次迭代)
+        for _ in range((n // 2).bit_length()):
+            rx = 1 & (d >> 1)
             ry = 1 & (d ^ rx)
-            
+
             # 旋转坐标
             if ry == 0:
                 if rx == 1:
                     x = s - 1 - x
                     y = s - 1 - y
                 x, y = y, x
-            
+
             x += s * rx
             y += s * ry
-            d //= 4
-            s *= 2
-            
+            d >>= 2
+            s <<= 1
+
         return x, y
 
     @staticmethod
@@ -431,9 +432,8 @@ class HilbertCurve:
 
         # 计算 Hilbert 曲线阶数
         max_dim = max(h, w, 2)
-        n = 1
-        while n < max_dim:
-            n *= 2
+        # I-OPT: 直接用 bit_length 计算下一个 2 的幂，替代 while n < max_dim: n *= 2
+        n = 1 << ((max_dim - 1).bit_length())
 
         # I109-5: 统一归一化公式 (处理 w=1 或 h=1 的情况)
         w_safe = max(w - 1, 1)  # 防止除零
@@ -775,10 +775,8 @@ def _next_power_of_2(n: int) -> int:
         return 1
     if _is_power_of_2(n):
         return n
-    p = 1
-    while p < n:
-        p *= 2
-    return p
+    # I-OPT: 直接用 bit_length 计算，替代 while p < n: p *= 2
+    return 1 << ((n - 1).bit_length())
 
 
 class PseudoHilbertCurve:
@@ -1384,7 +1382,8 @@ class RectHilbertIndex:
             Hilbert 索引 (Tensor, [M])
         """
         # 深度 d 对应的网格大小
-        grid_size = 2 ** depth
+        # I-OPT: 使用位移替代指数运算，语义更清晰
+        grid_size = 1 << depth
 
         # I113-8 修复核心：使用统一缩放因子
         # 修复前: grid_x = cx / W * grid_size, grid_y = cy / H * grid_size

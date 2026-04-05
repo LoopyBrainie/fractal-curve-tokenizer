@@ -21,35 +21,35 @@ $$\text{LayerNorm}(x) = \gamma \cdot \frac{x - \mu}{\sigma} + \beta$$
 
 Hilbert bias handles scale calibration across different token depths, eliminating the need for depth-dependent normalization parameters.
 
-### 7.2.3 Residual Gate (STAB-5, I34-10)
+### 7.2.3 Residual Gate (STAB-5, I34-10 / Task 3 重构)
 
-The residual gate modulates the contribution of attention and FFN outputs using **tanh** activation:
+The residual gate modulates the contribution of attention and FFN outputs using **sigmoid** activation:
 
-$$g_{raw} \in \mathbb{R}, \quad g = \tanh(g_{raw}) \in [-1, 1]$$
-$$x' = x + (1 + g) \cdot \text{DropPath}(\text{Attn}(\text{LN}(x)))$$
-$$x'' = x' + (1 + g) \cdot \text{DropPath}(\text{FFN}(\text{LN}(x')))$$
+$$g_{raw} \in \mathbb{R}, \quad g = \sigma(g_{raw}) \in [0, 1]$$
+$$x' = x + g \cdot \text{DropPath}(\text{Attn}(\text{LN}(x)))$$
+$$x'' = x' + g \cdot \text{DropPath}(\text{FFN}(\text{LN}(x')))$$
 
 where:
-- Gate range: $[0, 2]$ (values $>1$ amplify, $<1$ attenuate)
-- $1 + g$ ensures residual connection is always open (avoiding dead paths)
+- Gate range: $[0, 1]$ (sigmoid ensures bounded contribution)
+- $g$ directly scales the attention/FFN output
 
-**Rationale**: Using $\tanh$ directly instead of $2 \cdot \sigma$ provides more stable gradient flow for values near 0, and the additive form $(1 + g)$ guarantees non-zero residual paths.
+**Rationale (Task 3 重构)**: Using $\sigma$ directly instead of $\tanh$ provides cleaner gradient flow with values in $[0, 1]$ instead of $[-1, 1]$, and the direct scaling $g \cdot \text{Attn}$ ensures gradients are always positive and well-behaved.
 
 **V-Shaped Gate Pattern (I24-6)**:
 
 Based on training observations:
-- $d=0$ (global): $w \approx 0.7$ - Suppress global information
-- $d=1$: $w \approx 1.0$ - Keep original
-- $d=2$: $w \approx 0.85$ - Slight suppression
-- $d=3$ (fine-grained): $w \approx 0.65$ - Suppress details
+- $d=0$ (global): $g \approx 0.7$ - Suppress global information
+- $d=1$: $g \approx 1.0$ - Keep original
+- $d=2$: $g \approx 0.85$ - Slight suppression
+- $d=3$ (fine-grained): $g \approx 0.65$ - Suppress details
 
 **Initialization**:
 
-Using inverse sigmoid to achieve target values:
+Using small random initialization (std=0.01) centered near zero:
 
-$$g = \log\left(\frac{w/2}{1 - w/2}\right)$$
+$$g = \sigma(\mathcal{N}(0, 0.01)) \approx 0.5$$
 
-For $w=0.7$: $g \approx -0.36$
+This ensures initial gate values around 0.5, allowing gradient flow during early training.
 
 ### 7.2.4 Level Aggregation
 
@@ -539,7 +539,7 @@ All constants are centralized in `constants.py`:
 | `PROB_EPSILON` | 1e-5 | Probability clamping |
 | `LAYER_NORM_EPS` | 1e-5 | LayerNorm variance |
 | `SPLITTER_TEMP_START` | 1.0 | Initial Gumbel temperature |
-| `SPLITTER_TEMP_END` | 0.5 | Final Gumbel temperature |
+| `SPLITTER_TEMP_END` | 0.3 | Final Gumbel temperature |
 | `TEMPERATURE_MIN` | 0.3 | Minimum temperature (gradient explosion below) |
 | `DEPTH_KL_WEIGHT` | 0.5 | Depth balance KL weight |
 | `DEPTH_QUOTA_TARGET` | - | Quota target distribution |

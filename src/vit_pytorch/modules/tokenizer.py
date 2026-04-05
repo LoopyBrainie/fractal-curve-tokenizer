@@ -348,7 +348,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         Returns:
             修正后的 TensorSplitResult
         """
-        from vit_pytorch.layers.splitters.gumbel_topk import TensorSplitResult
+        from vit_pytorch.core.splitter_protocol import TensorSplitResult
 
         device = tensor_result.batch_indices.device
         dtype = tensor_result.batch_indices.dtype
@@ -372,8 +372,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             # 回退到 arange（仅当 token_indices 不存在或大小不匹配时）
             token_indices = torch.arange(num_tokens, dtype=torch.long, device=device)
 
-        tokens_per_batch = getattr(tensor_result, 'tokens_per_batch', None)
-
         return TensorSplitResult(
             regions=tensor_result.regions,  # regions 通常已经在正确设备上
             depths=depths,
@@ -381,59 +379,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             hilbert_indices=hilbert_indices,
             token_indices=token_indices,
             complexities=tensor_result.complexities,
-            tokens_per_batch=tokens_per_batch,
         )
 
     # =====================================================================
-    # I110-6: 语义冗余分裂器配置方法
-    # =====================================================================
-    def use_semantic_splitter(
-        self,
-        config: Optional[SemanticSplitterConfig] = None,
-        loss_fn: Optional[nn.Module] = None,
-    ) -> None:
-        """配置使用语义冗余分裂器 (I110-6)
-
-        Args:
-            config: SemanticSplitterConfig 配置（默认使用参数）
-            loss_fn: 语义损失函数（默认使用配置中的权重创建）
-        """
-        from vit_pytorch.layers.splitters.semantic_redundancy import SemanticRedundancySplitter
-        from vit_pytorch.modules.semantic_losses import SemanticRedundancyLoss
-
-        self._use_semantic_splitter = True
-        self._semantic_config = config if config is not None else SemanticSplitterConfig()
-        self._semantic_config.validate()
-
-        # 创建损失函数
-        if loss_fn is not None:
-            self._semantic_loss_fn = loss_fn
-        else:
-            self._semantic_loss_fn = SemanticRedundancyLoss(
-                diversity_weight=self._semantic_config.diversity_weight,
-                reconstruction_weight=self._semantic_config.reconstruction_weight,
-            )
-
-    def get_semantic_splitter(self) -> Optional["SemanticRedundancySplitter"]:
-        """获取语义分裂器实例（用于模型前向）"""
-        if not self._use_semantic_splitter or self._semantic_config is None:
-            return None
-
-        from vit_pytorch.layers.splitters.semantic_redundancy import SemanticRedundancySplitter
-
-        return SemanticRedundancySplitter(
-            feature_dim=self.d_model,
-            hidden_dim=self._semantic_config.hidden_dim,
-            max_level_limit=self.max_level,
-            gumbel_temp_start=self._semantic_config.gumbel_temp_start,
-            gumbel_temp_end=self._semantic_config.gumbel_temp_end,
-            learnable_temperature=self._semantic_config.learnable_temperature,
-        )
-
-    def get_semantic_loss_fn(self) -> Optional[nn.Module]:
-        """获取语义损失函数"""
-        return self._semantic_loss_fn
-
     def _get_initial_region_bounds(self, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         """获取初始区域边界（全图）[4]
 
@@ -472,7 +420,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         Returns:
             TensorSplitResult: 兼容 TensorSplitResult 格式的分割结果
         """
-        from vit_pytorch.layers.splitters.gumbel_topk import TensorSplitResult
+        from vit_pytorch.core.splitter_protocol import TensorSplitResult
 
         B, C, H, W = features.shape
         device = features.device
@@ -607,7 +555,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
     def tokenize(
         self,
         images: torch.Tensor,
-        split_result: "GumbelTopKResult",
+        split_result: "SplitResult",
     ) -> TokenizerOutput:
         """Variable Depth tokenization (P9-1 方案 D: 完全向量化).
 
@@ -631,8 +579,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
         I35: 支持 channels_last 内存格式以优化卷积性能
         """
-        from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKResult
-        from vit_pytorch.layers.splitters.gumbel_topk import TensorSplitResult
+        from vit_pytorch.core.splitter_protocol import SplitResult, TensorSplitResult
 
         if images.dim() != 4:
             raise ValueError(
@@ -654,43 +601,13 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 调试可视化可通过回调钩子实现，不应在核心代码中持有引用
 
         # 2. I98-1: 使用外部传入的 split_result
-        # GumbelTopKResult → TensorSplitResult 转换
-        if isinstance(split_result, GumbelTopKResult):
-            tensor_result = split_result.to_tensor_split_result()
-        elif isinstance(split_result, TensorSplitResult):
+        # H1SS 返回 SplitResult → TensorSplitResult
+        if isinstance(split_result, TensorSplitResult):
             tensor_result = split_result
         elif split_result is not None:
-            # I130-4: 支持 SemanticRedundancySplitter 的 SplitResult 类型
-            # H1SS (hilbert_optimal): 也返回 SplitResult 类型
-            from vit_pytorch.layers.splitters.semantic_redundancy import SplitResult
-            from vit_pytorch.core.splitter_protocol import SplitResult as CoreSplitResult
-
-            if isinstance(split_result, CoreSplitResult):
-                # H1SS 已经返回了 regions/depths/batch_indices/hilbert_indices
-                # 直接构建 TensorSplitResult
-                if (hasattr(split_result, 'regions') and hasattr(split_result, 'depths') and
-                    hasattr(split_result, 'batch_indices') and split_result.regions is not None):
-                    regions = split_result.regions
-                    depths = split_result.depths
-                    batch_indices = split_result.batch_indices
-                    hilbert_indices = split_result.hilbert_indices
-
-                    token_indices = torch.arange(len(regions), dtype=torch.long, device=regions.device)
-                    complexities = split_result.probs.view(-1) if split_result.probs is not None and split_result.probs.numel() > 0 else \
-                                  torch.zeros(len(regions), dtype=torch.float32, device=regions.device)
-
-                    tensor_result = TensorSplitResult(
-                        regions=regions.long(),
-                        depths=depths,
-                        batch_indices=batch_indices,
-                        hilbert_indices=hilbert_indices,
-                        token_indices=token_indices,
-                        complexities=complexities,
-                    )
-                else:
-                    tensor_result = self.convert_split_result_to_tensor(split_result, images)
-            elif isinstance(split_result, SplitResult):
-                tensor_result = self.convert_split_result_to_tensor(split_result, images)
+            # H1SS 返回 SplitResult 类型
+            if isinstance(split_result, SplitResult):
+                tensor_result = TensorSplitResult.from_split_result(split_result)
             else:
                 raise ValueError(f"Unexpected split result type: {type(split_result)}")
 
@@ -763,8 +680,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # 3. 纯张量嵌入
         # I30-11: 传递 raw_probs 用于构建 padded_split_probs
         # I78-2: 传递 selected_mask 用于替换 threshold 机制
-        raw_probs = split_result.probs if isinstance(split_result, GumbelTopKResult) else None
-        selected_mask = split_result.selected_mask if isinstance(split_result, GumbelTopKResult) else None
+        raw_probs = split_result.probs
+        selected_mask = split_result.selected_mask
         tokens, levels_info, padded_regions, padded_split_probs = self._embed_with_tensor_result(
             features, tensor_result, raw_probs, max_tokens=max_tokens_int,  # P0-FIX: 传入 Python int
             selected_mask=selected_mask
@@ -962,7 +879,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             - levels_info: [B, MaxN, max_level+1] 层级信息
             - padded_regions: [B, MaxN, 4] 区域边界 (P11-3 新增)
         """
-        from vit_pytorch.layers.splitters.gumbel_topk import TensorSplitResult
+        from vit_pytorch.core.splitter_protocol import TensorSplitResult
 
         B = features.shape[0]
         B_int = _safe_scalar_to_int(B, "B")
@@ -1357,7 +1274,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
     def compute_scale_distribution(
         self,
         images: torch.Tensor,
-        split_result: Optional["GumbelTopKResult"] = None,
+        split_result: Optional["SplitResult"] = None,
     ) -> Dict[str, Any]:
         """计算深度分布统计信息.
 
@@ -1371,8 +1288,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         Returns:
             Dict[str, Any]: 深度分布统计信息
         """
-        from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKResult
-
         # I98-1: 如果未提供 split_result，尝试从外部获取
         if split_result is None:
             # 尝试从 model.splitter 获取 (使用 weakref 避免循环引用)
@@ -1383,12 +1298,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                     # 获取特征图
                     features = self.shared_conv(images)  # [B, C, H, W]
 
-                    # I131-2: SemanticRedundancySplitter 需要 3D 输入 [B, N, D]
-                    from vit_pytorch.layers.splitters.semantic_redundancy import SemanticRedundancySplitter
-                    if isinstance(model.splitter, SemanticRedundancySplitter):
-                        B, C, H_feat, W_feat = features.shape
-                        features = features.view(B, C, H_feat * W_feat).transpose(1, 2)  # [B, N, C]
-
+                    # H1SS 使用 4D 输入 [B, C, H, W]
                     # 调用 splitter
                     split_result = model.splitter(features, image_size=(images.shape[2], images.shape[3]))
 

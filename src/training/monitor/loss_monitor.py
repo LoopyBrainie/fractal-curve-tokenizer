@@ -6,8 +6,11 @@ Provides breakdown of total loss into individual components.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 import torch
+
+if TYPE_CHECKING:
+    from ..metrics.collector import MetricsCollector
 
 
 class LossMonitor:
@@ -49,15 +52,21 @@ class LossMonitor:
         "manifold_regularization",
     ]
 
-    def __init__(self, force_track_all: bool = True):
+    def __init__(
+        self,
+        force_track_all: bool = True,
+        collector: Optional["MetricsCollector"] = None,
+    ):
         """Initialize LossMonitor
 
         Args:
             force_track_all: 如果为 True，初始化时创建所有默认损失项的容器
+            collector: Optional MetricsCollector for unified metrics pipeline
         """
         self.losses: Dict[str, List[float]] = {}
         self.step_losses: List[Dict[str, float]] = []
         self.force_track_all = force_track_all
+        self.collector = collector
 
         # I150-3: 预初始化所有可能的损失项，确保即使权重为 0 也能追踪
         if self.force_track_all:
@@ -82,6 +91,11 @@ class LossMonitor:
             if name not in self.losses:
                 self.losses[name] = []
             self.losses[name].append(value)
+
+        # Emit to MetricsCollector if available
+        if self.collector is not None:
+            for name, value in loss_dict.items():
+                self.collector.record(f"loss_{name}", float(value))
 
     def get_last_components(self) -> Dict[str, float]:
         """Get the most recent loss components

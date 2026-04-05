@@ -2,647 +2,574 @@
 
 ## 9.1 Overview
 
-This chapter describes the modular training infrastructure for `FractalCurveViT`, including the new `training` module that provides class-balanced sampling, focal loss, FLOPS budgeting, and a fully decoupled trainer architecture.
+This chapter describes the modular training infrastructure for `FractalCurveViT`, including gradient monitoring, numerical stability defense, mixed-precision training, and a fully decoupled trainer architecture.
 
 ### Key Design Principles
 
-1. **Model-Agnostic**: Trainer does not depend on specific model implementation
-2. **Pluggable Components**: Sampler, Loss, Metrics, Callbacks are independently replaceable
-3. **Configuration-Driven**: All hyperparameters via dataclass configs and YAML files
+1. **Model-Agnostic**: Trainer functions do not depend on specific model implementation
+2. **Numerical Safety First**: Comprehensive NaN/Inf detection and gradient validation
+3. **Configuration-Driven**: All hyperparameters via dataclass configs
 4. **Mathematically Verifiable**: All components have formal definitions with unit tests
 
 ### Module Structure
 
 ```
-examples/training/
-├── samplers/      # ClassBalancedSampler, ProgressiveSampler
-├── losses/        # FocalLoss, ClassBalancedCE, CompositeLoss
-├── metrics/       # ClassificationMetrics (MCA, per-class, head/tail)
-├── schedulers/    # FLOPSBudgetLoss, BudgetScheduler
-├── trainer/       # ModularTrainer, Callbacks
-└── config/        # ExperimentConfig, ConfigLoader
+src/training/
+├── config.py           # Config, TrainingHyperparams, NumericalConfig, etc.
+├── train_fractal_vit.py # Main training entry point
+├── trainer/
+│   ├── epoch_train.py  # train_one_epoch, train_one_epoch_simple
+│   ├── epoch_eval.py   # evaluate, evaluate_simple
+│   ├── loss.py         # MixupCutmixLoss, compute_loss
+│   └── state.py       # TrainingState, EpochMetrics
+├── scheduler/
+│   └── lr_scheduler.py # WarmupCosineScheduler, create_scheduler
+├── monitor/
+│   ├── gradient_monitor.py   # GradientMonitor, GradientStatisticsTracker
+│   ├── loss_monitor.py        # LossMonitor, LossTracker
+│   └── numerical_defense.py   # NumericalDefender, GradientValidator
+├── checkpoint/
+│   ├── saver.py        # save_checkpoint, save_epoch_stats
+│   └── loader.py       # load_checkpoint, find_latest_checkpoint
+└── training_logs/
+    ├── epoch_logger.py  # EpochLogger
+    └── metrics.py       # MetricsTracker, compute_* functions
 ```
 
 ---
 
-## 9.2 Dataset Support
+## 9.2 Training Entry Point
 
-### Supported Datasets
+### Main Script
 
-| Dataset | Classes | Size | Auto-Download |
-|:--------|:--------|:-----|:--------------|
-| MNIST | 10 | 28×28 | ✓ |
-| CIFAR-10 | 10 | 32×32 | ✓ |
-| CIFAR-100 | 100 | 32×32 | ✓ |
-| Tiny-ImageNet | 200 | 64×64 | ✓ |
-| ImageNet | 1000 | 224×224 | ✗ |
-
-### Class-Balanced Sampling
-
-For imbalanced datasets (e.g., Tiny-ImageNet), use `ClassBalancedSampler`:
-
-```python
-from training import ClassBalancedSampler
-
-# Get labels from dataset
-labels = [label for _, label in train_dataset]
-
-# Create sampler with β=0.9 (near inverse-frequency)
-sampler = ClassBalancedSampler(labels, beta=0.9)
-
-# Use in DataLoader
-train_loader = DataLoader(train_dataset, batch_size=128, sampler=sampler)
+```bash
+python -m src.training.train_fractal_vit [arguments]
 ```
 
-**Mathematical Formulation**:
-$$P(\text{sample } i) = \frac{w_i}{\sum_j w_j}, \quad w_i = \frac{1}{n_{c_i}^\beta}$$
+Or directly:
 
-Where:
-- $n_{c_i}$: Number of samples in class $c_i$
-- $\beta \in [0, 1]$: Balance strength (0=uniform, 1=inverse frequency)
+```bash
+python src/training/train_fractal_vit.py [arguments]
+```
+
+### Quick Test
+
+```bash
+python src/training/train_fractal_vit.py --quick-test --use-amp
+```
+
+### Key CLI Arguments
+
+| Argument | Default | Description |
+|:---------|:--------|:------------|
+| `--splitter-type` | `gumbel_topk` | Splitter type: `hilbert_optimal` (H1SS), `hilbert_entmax`, `gumbel_topk` |
+| `--dim` | 384 | Model embedding dimension |
+| `--num-layers` | 8 | Number of transformer layers |
+| `--heads` | 6 | Number of attention heads |
+| `--mlp-dim` | 1536 | FFN hidden dimension |
+| `--lr` | 8e-5 | Learning rate |
+| `--weight-decay` | 0.1 | Weight decay |
+| `--batch-size` | 128 | Batch size |
+| `--num-epochs` | 100 | Number of training epochs |
+| `--use-amp` | False | Use automatic mixed precision |
+| `--compile` | False | Use torch.compile |
+| `--dataset` | `cub200` | Dataset name |
+
+> **Note**: Use `--splitter-type hilbert_optimal` for H1SS (recommended) or `hilbert_entmax` for H-entmax.
 
 ---
 
-## 9.3 Loss Functions
+## 9.3 Configuration System
 
-### Focal Loss
-
-For hard sample mining:
+### Config Dataclasses
 
 ```python
-from training import FocalLoss
+from src.training import (
+    Config,
+    TrainingHyperparams,
+    NumericalConfig,
+    MixedPrecisionConfig,
+    create_config,
+)
 
-loss_fn = FocalLoss(gamma=2.0, alpha=None)  # alpha=None for auto-compute
+# Create default config
+config = create_config(
+    num_epochs=100,
+    batch_size=128,
+    base_lr=8e-5,
+    weight_decay=0.1,
+)
+
+# Access hyperparameters
+print(config.hyperparams.num_epochs)
+print(config.numerical.detect_anomaly)
 ```
 
-**Mathematical Formulation**:
-$$\mathcal{L}_{focal} = -\alpha_c (1 - p_c)^\gamma \log(p_c)$$
+### TrainingHyperparams
 
-### Class-Balanced Cross-Entropy
+Core training hyperparameters:
 
-Based on effective number of samples (Cui et al., CVPR 2019):
+| Parameter | Default | Description |
+|:----------|:--------|:------------|
+| `num_epochs` | 100 | Total training epochs |
+| `batch_size` | 128 | Batch size per iteration |
+| `accumulation_steps` | 1 | Gradient accumulation steps |
+| `gradient_clip_norm` | 1.0 | Gradient clipping threshold |
+| `base_lr` | 5e-4 | Base learning rate |
+| `warmup_epochs` | 5 | LR warmup epochs |
+| `min_lr` | 1e-6 | Minimum learning rate |
+| `warmup_start_lr` | 1e-7 | Starting LR during warmup |
+| `weight_decay` | 0.05 | Weight decay coefficient |
+| `label_smoothing` | 0.0 | Label smoothing factor |
+| `mixup_alpha` | 0.8 | Mixup alpha parameter |
+| `cutmix_alpha` | 1.0 | CutMix alpha parameter |
+| `mixup_cutmix_prob` | 0.5 | Probability of applying Mixup/Cutmix |
+| `log_interval` | 50 | Logging interval |
+| `eval_interval` | 1 | Evaluation interval |
+| `checkpoint_interval` | 10 | Checkpoint save interval |
+
+### NumericalConfig
+
+Numerical stability configuration:
+
+| Parameter | Default | Description |
+|:----------|:--------|:------------|
+| `detect_anomaly` | False | Enable PyTorch anomaly detection |
+| `check_gradients` | True | Check gradients for NaN/Inf |
+| `skip_on_nan_grad` | True | Skip optimizer step on NaN/Inf gradient |
+| `record_grad_norms` | True | Record gradient norms |
+| `record_layer_grad_norms` | True | Record per-layer gradient norms |
+| `record_loss_components` | True | Record loss component breakdown |
+
+---
+
+## 9.4 Training Functions
+
+### Basic Training Loop
 
 ```python
-from training import ClassBalancedCE
+from src.training import (
+    train_one_epoch,
+    evaluate,
+    TrainingState,
+    create_scheduler,
+    save_checkpoint,
+)
 
-loss_fn = ClassBalancedCE(class_counts=class_counts, beta=0.9999)
+# Create model, optimizer, dataloaders
+model = FractalCurveViT(...)
+optimizer = torch.optim.AdamW(model.parameters(), lr=8e-5)
+scheduler = create_scheduler(optimizer, config)
+scaler = torch.cuda.amp.GradScaler()
+
+# Training state
+state = TrainingState(
+    epoch=0,
+    global_step=0,
+    best_metric=0.0,
+)
+
+# Train for one epoch
+for epoch in range(config.hyperparams.num_epochs):
+    state.epoch = epoch
+
+    # Train
+    metrics = train_one_epoch(
+        model=model,
+        train_loader=train_loader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        state=state,
+        config=config,
+        device=device,
+    )
+
+    # Evaluate
+    eval_metrics = evaluate(
+        model=model,
+        val_loader=val_loader,
+        device=device,
+    )
+
+    # Save checkpoint
+    if epoch % 10 == 0:
+        save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            metrics=metrics,
+            epoch=epoch,
+            is_best=(eval_metrics['top1'] > state.best_metric),
+        )
 ```
 
-**Mathematical Formulation**:
-$$E_c = \frac{1 - \beta^{n_c}}{1 - \beta}, \quad w_c = \frac{1}{E_c}$$
-
-### Combined Focal + Class-Balanced
+### TrainingState
 
 ```python
-from training import FocalClassBalancedLoss
+from src.training import TrainingState
 
-loss_fn = FocalClassBalancedLoss(
+state = TrainingState(
+    epoch=0,
+    global_step=0,
+    best_metric=0.0,
+    is_best=False,
+    optimizer_state=None,
+    scheduler_state=None,
+    scaler_state=None,
+    sampler_state=None,
+    metrics_history={},
+    warning_count=0,
+    nan_skip_count=0,
+)
+```
+
+---
+
+## 9.5 Loss Functions
+
+### MixupCutmixLoss
+
+Combines Mixup and CutMix augmentation:
+
+```python
+from src.training.trainer.loss import MixupCutmixLoss
+
+loss_fn = MixupCutmixLoss(
+    mixup_alpha=0.8,
+    cutmix_alpha=1.0,
+    mixup_prob=0.5,  # Probability of applying augmentation
     num_classes=200,
-    class_counts=class_counts,
-    gamma=2.0,
-    cb_beta=0.9999,
 )
+
+# In training loop
+for images, labels in train_loader:
+    # Apply Mixup/Cutmix automatically
+    mixed_images, mixed_labels = loss_fn(images, labels)
+
+    outputs = model(mixed_images)
+    loss = compute_loss(outputs, mixed_labels, loss_fn)
+```
+
+**Mixup Mathematical Formulation**:
+
+$$x̃ = \lambda \cdot x_i + (1 - \lambda) \cdot x_j$$
+$$ỹ = \lambda \cdot y_i + (1 - \lambda) \cdot y_j$$
+$$\lambda \sim \text{Beta}(\alpha, \alpha)$$
+
+**CutMix Mathematical Formulation**:
+
+$$x̃ = \text{Mix}(x_i, x_j, \text{region})$$
+$$\lambda = 1 - \frac{\text{region\_area}}{\text{total\_area}}$$
+
+### compute_loss
+
+```python
+from src.training.trainer.loss import compute_loss
+
+# For integer labels
+loss = compute_loss(logits, labels, None)
+
+# For soft labels (Mixup/Cutmix)
+loss = compute_loss(logits, mixed_labels, loss_fn)
 ```
 
 ---
 
-## 9.4 Model Configuration
+## 9.6 Numerical Defense System
 
-### Recommended Hyperparameters
+### GradientValidator
 
-| Parameter | CIFAR-10 | ImageNet | Notes |
-|:----------|:---------|:---------|:------|
-| `dim` | 192 | 512 | Embedding dimension |
-| `depth` | 9 | 12 | Transformer layers |
-| `heads` | 6 | 8 | Attention heads |
-| `mlp_dim` | 384 | 2048 | FFN hidden dim |
-| `patch_size` | 4 | 16 | Base patch size |
-| `dropout` | 0.1 | 0.1 | Dropout rate |
-| `drop_path` | 0.1 | 0.1 | DropPath rate |
-
----
-
-## 9.5 Modular Trainer
-
-### Basic Usage
+Checks gradients for numerical issues:
 
 ```python
-from training import (
-    ModularTrainer,
-    TrainerConfig,
-    FocalLoss,
-    ClassificationMetrics,
-    EarlyStoppingCallback,
-    CheckpointCallback,
-)
+from src.training.monitor import GradientValidator
 
-# Create trainer
-trainer = ModularTrainer(
+validator = GradientValidator(
     model=model,
-    train_loader=train_loader,
-    val_loader=val_loader,
+    skip_on_issue=True,
+    log_warnings=True,
+)
+
+# After backward
+should_skip = validator.check_gradients()
+if not should_skip:
+    optimizer.step()
+```
+
+### NumericalDefender
+
+Comprehensive numerical stability protection:
+
+```python
+from src.training.monitor import NumericalDefender
+
+defender = NumericalDefender(
+    model=model,
+    skip_on_nan=True,
+    detect_anomaly=False,
+)
+
+# In training loop
+with defender:
+    outputs = model(images)
+    loss = criterion(outputs, labels)
+    scaler.scale(loss).backward()
+```
+
+### GradientMonitor
+
+Per-layer gradient monitoring:
+
+```python
+from src.training.monitor import GradientMonitor
+
+monitor = GradientMonitor(
+    model=model,
+    log_interval=100,
+)
+
+# In training loop
+monitor.record_gradients()
+if state.global_step % 100 == 0:
+    stats = monitor.get_statistics()
+    print(stats)
+```
+
+---
+
+## 9.7 Learning Rate Scheduling
+
+### WarmupCosineScheduler
+
+```python
+from src.training.scheduler import create_scheduler
+
+scheduler = create_scheduler(
+    optimizer,
+    schedule_type='warmup_cosine',
+    num_epochs=100,
+    warmup_epochs=15,
+    base_lr=8e-5,
+    min_lr=1e-6,
+)
+
+# In training loop
+scheduler.step()
+```
+
+**Mathematical Formulation**:
+
+**Warmup** ($t \leq T_{warmup}$):
+$$lr(t) = lr_{base} \cdot \frac{t}{T_{warmup}}$$
+
+**Cosine Decay** ($t > T_{warmup}$):
+$$lr(t) = lr_{min} + (lr_{base} - lr_{min}) \cdot \frac{1}{2}(1 + \cos(\pi \cdot \frac{t - T_{warmup}}{T_{total} - T_{warmup}}))$$
+
+---
+
+## 9.8 Checkpoint Management
+
+### Save Checkpoint
+
+```python
+from src.training.checkpoint import save_checkpoint
+
+save_checkpoint(
+    model=model,
     optimizer=optimizer,
-    loss_fn=FocalLoss(gamma=2.0),
-    metrics=ClassificationMetrics(num_classes=200),
-    callbacks=[
-        EarlyStoppingCallback(patience=20),
-        CheckpointCallback(checkpoint_dir="./checkpoints"),
-    ],
-    config=TrainerConfig(
-        num_epochs=100,
-        gradient_clip_norm=1.0,
-        use_amp=True,
-    ),
+    scheduler=scheduler,
+    scaler=scaler,
+    metrics=metrics,
+    epoch=epoch,
+    checkpoint_dir='./checkpoints',
+    is_best=True,
+)
+```
+
+### Load Checkpoint
+
+```python
+from src.training.checkpoint import load_checkpoint
+
+checkpoint = load_checkpoint(
+    checkpoint_path='./checkpoints/best.pth',
+    model=model,
+    optimizer=optimizer,
+    scheduler=scheduler,
+    scaler=scaler,
 )
 
-# Train
-history = trainer.fit()
+start_epoch = checkpoint['epoch'] + 1
 ```
 
-### Training Loop
-
-The `ModularTrainer` implements:
+### Find Latest/Best Checkpoint
 
 ```python
-def train_epoch(self):
-    self.model.train()
-    for batch_idx, (inputs, targets) in enumerate(self.train_loader):
-        # Forward with AMP
-        with torch.amp.autocast('cuda', enabled=self.config.use_amp):
-            outputs = self.model(inputs)
-            loss = self.loss_fn(outputs, targets)
-        
-        # Backward with gradient clipping
-        self.scaler.scale(loss).backward()
-        self.scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip_norm)
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-        
-        # Callbacks
-        self.callbacks.on_batch_end(self, ctx)
+from src.training.checkpoint import find_latest_checkpoint, find_best_checkpoint
+
+latest = find_latest_checkpoint('./checkpoints')
+best = find_best_checkpoint('./checkpoints')
 ```
 
 ---
 
-## 9.6 FLOPS Budget Constraint
+## 9.9 Metrics and Logging
 
-### FLOPS Computation
-
-```python
-from training import FLOPSConfig, compute_transformer_flops
-
-config = FLOPSConfig(embed_dim=384, num_layers=12, num_heads=8)
-flops = compute_transformer_flops(n_tokens=197, config=config)
-# 4.54 GFLOPS
-```
-
-**Mathematical Formulation**:
-$$\text{FLOPS} = L \cdot (12ND^2 + 2N^2D)$$
-
-Where:
-- $L$: Number of layers
-- $N$: Number of tokens  
-- $D$: Embedding dimension
-
-### FLOPS Budget Loss
+### MetricsTracker
 
 ```python
-from training import FLOPSBudgetLoss
+from src.training.training_logs import MetricsTracker, compute_accuracy
 
-budget_loss = FLOPSBudgetLoss(
-    budget=5e9,  # 5 GFLOPS
-    lambda_weight=0.1,
-)
-
-loss = budget_loss(actual_flops)
-```
-
-**Mathematical Formulation**:
-$$\mathcal{L}_{FLOPS} = \lambda \cdot \text{ReLU}\left(\frac{\text{FLOPS}_{actual}}{\text{Budget}} - 1\right)^2$$
-
-### Budget Scheduler
-
-Dynamic budget annealing (cosine or linear):
-
-```python
-from training import BudgetScheduler
-
-scheduler = BudgetScheduler(
-    budget_max=7.5e9,  # Initial relaxed
-    budget_min=5.0e9,  # Final strict
-    total_epochs=100,
-    schedule="cosine",
-)
-
-for epoch in range(100):
-    current_budget = scheduler.step(epoch)
-```
-
----
-
-## 9.7 Learning Rate Schedule
-
-### Warmup + Cosine Annealing
-
-```python
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-
-# Warmup for first 5 epochs
-warmup = LinearLR(optimizer, start_factor=0.1, total_iters=5)
-
-# Cosine annealing for remaining epochs
-cosine = CosineAnnealingLR(optimizer, T_max=epochs - 5)
-
-# Combine schedulers
-scheduler = SequentialLR(optimizer, [warmup, cosine], milestones=[5])
-```
-
-### Schedule Visualization
-
-```
-LR
- │
- │     ╱‾‾‾‾‾‾‾‾╲
- │    ╱          ╲
- │   ╱            ╲
- │  ╱              ╲
- │ ╱                ╲
- │╱                  ╲
- └────────────────────── Epoch
-   5    Warmup   Cosine
-```
-
----
-
-## 9.8 YAML Configuration System
-
-### Configuration Files
-
-```yaml
-# configs/base.yaml
-name: base
-data:
-  batch_size: 128
-  sampler_type: default
-model:
-  embed_dim: 384
-  depth: 10
-loss:
-  type: cross_entropy
-budget:
-  enabled: false
-optimizer:
-  type: adamw
-  lr: 0.0001
-training:
-  num_epochs: 100
-```
-
-### Configuration Inheritance
-
-```yaml
-# configs/tiny_imagenet_balanced.yaml
-base: base.yaml  # Inherit from base
-
-name: tiny_imagenet_class_balanced
-data:
-  sampler_type: class_balanced
-  sampler_beta: 0.9
-loss:
-  type: focal_cb
-  focal_gamma: 2.0
-budget:
-  enabled: true
-  flops_budget: 5000000000
-```
-
-### Loading Configuration
-
-```python
-from training import ConfigLoader
-
-loader = ConfigLoader(config_dir='configs')
-config = loader.load('tiny_imagenet_balanced.yaml')
-
-# Command-line overrides
-config = loader.load('base.yaml', overrides={
-    'training.num_epochs': 50,
-    'optimizer.lr': 5e-5,
-})
-```
-
----
-
-## 9.9 Metrics
-
-### Classification Metrics
-
-```python
-from training import ClassificationMetrics
-
-metrics = ClassificationMetrics(num_classes=200, topk=(1, 5))
+tracker = MetricsTracker()
 
 # During training
 for outputs, targets in dataloader:
-    metrics.update(outputs, targets)
+    tracker.update(outputs=outputs, targets=targets)
 
-# Compute results
-result = metrics.compute()
-print(f"Top-1: {result.top1_accuracy:.2%}")
-print(f"MCA: {result.mean_class_accuracy:.2%}")
-print(f"Head Acc: {result.head_accuracy:.2%}")
-print(f"Tail Acc: {result.tail_accuracy:.2%}")
+# Compute metrics
+metrics = tracker.compute()
+# {
+#     'top1_accuracy': 0.85,
+#     'top5_accuracy': 0.98,
+#     'num_samples': 1000,
+# }
 ```
 
-**Mean Class Accuracy (MCA)**:
-$$\text{MCA} = \frac{1}{C} \sum_{c=1}^C \frac{\text{TP}_c}{n_c}$$
+### compute_accuracy
+
+```python
+from src.training.training_logs import compute_accuracy
+
+top1, top5 = compute_accuracy(logits, targets, topk=(1, 5))
+```
+
+### EpochLogger
+
+```python
+from src.training.training_logs import EpochLogger
+
+logger = EpochLogger(
+    log_dir='./logs',
+    experiment_name='fractal_vit_exp',
+)
+
+logger.log_epoch(epoch, metrics, lr=scheduler.get_last_lr()[0])
+```
 
 ---
 
-## 9.10 V3 Training Characteristics
+## 9.10 H1SS Training Characteristics
 
-### Variable Depth Tokens
+### Hilbert Splitter with Stable Selection (H1SS)
 
-V3 uses content-adaptive quadtree splitting without temperature annealing:
+H1SS is the recommended splitter type, based on six axioms:
 
-```python
-for epoch in range(epochs):
-    for images, labels in dataloader:
-        output = model(images)
-        loss = criterion(output, labels)
-        
-        # Optional: Monitor split statistics
-        if epoch % 10 == 0:
-            stats = model.tokenizer.get_split_stats()
-            print(f"Mean tokens: {np.mean(stats['num_tokens']):.1f}")
-            print(f"Depth entropy: {model.tokenizer.get_scale_entropy():.3f}")
-        
-        loss.backward()
-        optimizer.step()
+| Axiom | Description |
+|:------|:------------|
+| A1 | 1D Hilbert manifold convolution |
+| A2 | No Gumbel perturbation |
+| A3 | Entmax sparse activation |
+| A4 | Tree consistency soft constraint |
+| A5 | Single Entmax projection |
+| A6 | < 10K parameters |
+
+### Training with H1SS
+
+```bash
+python -m src.training.train_fractal_vit \
+    --splitter-type hilbert_optimal \
+    --dataset cub200 \
+    --image-size 224 \
+    --dim 384 \
+    --num-layers 8 \
+    --heads 6 \
+    --use-amp \
+    --compile
 ```
 
 ### Diagnostics
 
 ```python
-# Split statistics
-stats = tokenizer.get_split_stats()
-# {
-#     'num_tokens': [48, 52, 64, ...],      # Tokens per image
-#     'depth_distributions': [
-#         {0: 1, 1: 4, 2: 16, 3: 27},       # Per-image depth counts
-#         ...
-#     ],
-#     'mean_complexity': 0.42,
-# }
-
-# Depth diversity (higher is better)
-entropy = tokenizer.get_scale_entropy()  # Target: > 1.5
+# Get model diagnostics
+if hasattr(model, 'get_diagnostics'):
+    diagnostics = model.get_diagnostics()
+    print(f"Splitter type: {diagnostics.get('splitter_type')}")
+    print(f"Gradient coverage: {diagnostics.get('gradient_coverage')}")
 ```
 
 ---
 
-## 9.11 Experiment Management
+## 9.11 Mixed Precision Training
 
-### Directory Structure
-
-```
-experiments/
-└── fractal_vit_simple_20251214_123456/
-    ├── checkpoints/
-    │   ├── best.pth
-    │   └── last.pth
-    ├── logs/
-    │   └── training.log
-    ├── visualizations/
-    │   ├── training_curves.png
-    │   └── attention_maps.png
-    └── training_history.json
-```
-
-### Checkpoint Format
-
-```python
-checkpoint = {
-    'epoch': epoch,
-    'model_state_dict': model.state_dict(),
-    'optimizer_state_dict': optimizer.state_dict(),
-    'scheduler_state_dict': scheduler.state_dict(),
-    'best_accuracy': best_acc,
-    'config': config.__dict__,
-}
-torch.save(checkpoint, 'best.pth')
-```
-
-### Loading Checkpoint
-
-```python
-checkpoint = torch.load('best.pth')
-model.load_state_dict(checkpoint['model_state_dict'])
-optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-start_epoch = checkpoint['epoch'] + 1
-```
-
----
-
-## 9.12 Training Script
-
-### Command Line Interface
+### Enable AMP
 
 ```bash
-python examples/training/train_fractal_vit.py \
-    --dataset cifar10 \
-    --image-size 32 \
-    --dim 192 \
-    --depth 9 \
-    --heads 6 \
-    --mlp-dim 384 \
-    --tokenizer-type streaming_v3 \
-    --bias-mode lca \
-    --ffn-type swiglu_level \
-    --epochs 100 \
-    --batch-size 128 \
-    --lr 5e-4 \
-    --weight-decay 0.03
+python -m src.training.train_fractal_vit --use-amp
 ```
 
-### Key Arguments
+### Manual AMP
 
-| Argument | Default | Description |
-|:---------|:--------|:------------|
-| `--tokenizer-type` | `streaming_v3` | Tokenizer type (V3 only) |
-| `--bias-mode` | `lca` | Hilbert bias mode |
-| `--ffn-type` | `swiglu_level` | FFN type |
-| `--dim` | 384 | Model dimension |
-| `--depth` | 6 | Transformer layers |
-| `--heads` | 6 | Attention heads |
-| `--lr` | 5e-4 | Learning rate |
-| `--weight-decay` | 0.03 | Weight decay |
+```python
+scaler = torch.cuda.amp.GradScaler()
+
+for images, labels in train_loader:
+    with torch.cuda.amp.autocast():
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad()
+```
 
 ---
 
-## 9.13 Best Practices
+## 9.12 Best Practices
 
 ### Memory Optimization
 
 1. **Clear tokenizer cache**: Call `model.clear_tokenizer_cache()` after each batch
-2. **Mixed precision**: Use `torch.cuda.amp` for 2× memory reduction
-3. **Gradient checkpointing**: Enable for large models
+2. **Mixed precision**: Use `--use-amp` for 2× memory reduction
+3. **Gradient checkpointing**: Use `--gradient-checkpoint` for large models
+4. **Channels last**: Use `--channels-last` for faster convolution
 
 ### Training Stability
 
-1. **Gradient clipping**: `max_norm=1.0`
-2. **Learning rate warmup**: 5-10 epochs
-3. **Weight decay**: 0.03 for most configurations
-
-### Class Imbalance
-
-1. **Use ClassBalancedSampler**: `beta=0.9` for strong balance
-2. **Use FocalLoss**: `gamma=2.0` for hard sample focus
-3. **Monitor MCA**: Not just Top-1 accuracy
+1. **Gradient clipping**: `gradient_clip_norm=1.0`
+2. **Learning rate warmup**: 15 epochs
+3. **Weight decay**: 0.1 for most configurations
+4. **Numerical defense**: Enable `skip_on_nan=True` to handle NaN gradients
 
 ### Monitoring
 
-1. **Depth distribution entropy**: Should be > 1.5
-2. **Token count variance**: Some variation is healthy
-3. **Gradient norms**: Watch for explosions
-4. **Per-class accuracy**: Check head vs tail classes
+1. **Gradient norms**: Watch for explosions using `GradientMonitor`
+2. **Loss trends**: Use `LossMonitor` to track loss components
+3. **Token count variance**: Some variation is healthy for adaptive tokenization
 
 ---
 
-## 9.14 Implementation Status
+## 9.13 Implementation Status
 
 | Component | Status | Location |
 |:----------|:-------|:---------|
-| ClassBalancedSampler | ✅ Complete | `training.samplers` |
-| ProgressiveSampler | ✅ Complete | `training.samplers` |
-| FocalLoss | ✅ Complete | `training.losses` |
-| ClassBalancedCE | ✅ Complete | `training.losses` |
-| ClassificationMetrics | ✅ Complete | `training.metrics` |
-| FLOPSBudgetLoss | ✅ Complete | `training.schedulers` |
-| BudgetScheduler | ✅ Complete | `training.schedulers` |
-| ModularTrainer | ✅ Complete | `training.trainer` |
-| ConfigLoader | ✅ Complete | `training.config` |
-| NumericalConfig | ✅ Complete | `training.config` |
-| MixedPrecisionConfig | ✅ Complete | `training.config` |
-| CheckpointConfig | ✅ Complete | `training.config` |
-| DataConfig | ✅ Complete | `training.config` |
-| W&B Integration | ⏳ Pending | - |
-| Visualization Panel | ⏳ Pending | - |
-
-**Tests**: 31/31 passing
+| `train_one_epoch` | ✅ Complete | `src/training/trainer/epoch_train.py` |
+| `evaluate` | ✅ Complete | `src/training/trainer/epoch_eval.py` |
+| `MixupCutmixLoss` | ✅ Complete | `src/training/trainer/loss.py` |
+| `TrainingState` | ✅ Complete | `src/training/trainer/state.py` |
+| `NumericalDefender` | ✅ Complete | `src/training/monitor/numerical_defense.py` |
+| `GradientMonitor` | ✅ Complete | `src/training/monitor/gradient_monitor.py` |
+| `LossMonitor` | ✅ Complete | `src/training/monitor/loss_monitor.py` |
+| `WarmupCosineScheduler` | ✅ Complete | `src/training/scheduler/lr_scheduler.py` |
+| `save_checkpoint` | ✅ Complete | `src/training/checkpoint/saver.py` |
+| `load_checkpoint` | ✅ Complete | `src/training/checkpoint/loader.py` |
+| `EpochLogger` | ✅ Complete | `src/training/logging/epoch_logger.py` |
+| `MetricsTracker` | ✅ Complete | `src/training/logging/metrics.py` |
 
 ---
-
-## 9.15 Configuration Classes
-
-### 9.15.1 NumericalConfig
-
-Controls numerical stability and gradient monitoring:
-
-```python
-from training.config import NumericalConfig
-
-config = NumericalConfig(
-    detect_anomaly=False,       # Enable torch.autograd.set_detect_anomaly
-    check_gradients=True,      # Check for NaN/Inf gradients
-    skip_on_nan_grad=True,    # Skip batch on NaN gradient
-    record_grad_norms=True,   # Record gradient norms
-    record_layer_grad_norms=True,  # Record per-layer gradients
-    record_loss_components=True,   # Record loss component breakdown
-)
-```
-
-### 9.15.2 MixedPrecisionConfig
-
-Controls automatic mixed precision (AMP) training:
-
-```python
-from training.config import MixedPrecisionConfig
-
-config = MixedPrecisionConfig(
-    enabled=True,           # Enable AMP
-    opt_level="O1",         # O1 or O2
-    loss_scale=None,        # None for dynamic, or fixed float
-)
-```
-
-### 9.15.3 CheckpointConfig
-
-Controls checkpoint saving behavior:
-
-```python
-from training.config import CheckpointConfig
-
-config = CheckpointConfig(
-    checkpoint_dir="./checkpoints",
-    save_best=True,         # Save best model
-    save_last=True,         # Save last checkpoint
-    save_interval=10,       # Save every N epochs
-    monitor_metric="val_accuracy",  # Metric to monitor
-    monitor_mode="max",    # "max" or "min"
-)
-```
-
-### 9.15.4 DataConfig
-
-Controls data loading and augmentation:
-
-```python
-from training.config import DataConfig
-
-config = DataConfig(
-    dataset="tiny-imagenet",
-    data_dir="./data",
-    num_workers=4,
-    pin_memory=True,
-    prefetch_factor=2,
-    persistent_workers=True,
-    image_size=64,
-    augment=True,
-    auto_augment="rand-m9-mstd0.5",  # RandAugment policy
-)
-```
-
-### 9.15.5 Complete Config Usage
-
-```python
-from training.config import (
-    Config,
-    TrainingHyperparams,
-    NumericalConfig,
-    MixedPrecisionConfig,
-    CheckpointConfig,
-    DataConfig,
-)
-
-config = Config(
-    training=TrainingHyperparams(
-        num_epochs=100,
-        batch_size=128,
-        base_lr=5e-4,
-        weight_decay=0.05,
-    ),
-    numerical=NumericalConfig(
-        detect_anomaly=False,
-        check_gradients=True,
-    ),
-    amp=MixedPrecisionConfig(
-        enabled=True,
-        opt_level="O1",
-    ),
-    checkpoint=CheckpointConfig(
-        save_best=True,
-        monitor_metric="val_accuracy",
-    ),
-    data=DataConfig(
-        dataset="tiny-imagenet",
-        augment=True,
-    ),
-    seed=42,
-    output_dir="./outputs",
-)
-```
 
 > **Next**: [10_testing_qa.md](10_testing_qa.md) - Testing and QA

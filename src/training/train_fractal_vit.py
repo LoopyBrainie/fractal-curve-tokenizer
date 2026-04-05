@@ -51,7 +51,7 @@ from .checkpoint import (
     load_checkpoint,
     find_latest_checkpoint,
 )
-from .logging import EpochLogger
+from .training_logs import EpochLogger
 
 
 def set_seed(seed: int):
@@ -127,7 +127,7 @@ def create_model(args, device: torch.device) -> nn.Module:
     channels_last = getattr(args, 'channels_last', False)
 
     # Parse splitter type
-    splitter_type = getattr(args, 'splitter_type', 'gumbel_topk')
+    splitter_type = getattr(args, 'splitter_type', 'hilbert_optimal')
 
     # Parse quota learnable
     quota_learnable = getattr(args, 'quota_learnable', 'disable')
@@ -199,7 +199,7 @@ def create_model(args, device: torch.device) -> nn.Module:
     # Add optional parameters if provided
     if hasattr(args, 'use_area_encoding') and args.use_area_encoding:
         model_kwargs['use_area_encoding'] = True
-        model_kwargs['fourier_levels'] = getattr(args, 'fourier_levels', 4)
+        # Note: fourier_levels is not a FractalCurveViT parameter
 
     if hasattr(args, 'use_pattern_encoder') and args.use_pattern_encoder:
         model_kwargs['use_pattern_encoder'] = True
@@ -216,7 +216,10 @@ def create_model(args, device: torch.device) -> nn.Module:
     # Apply optimizations
     if compile_model:
         print("Compiling model with torch.compile...")
-        model = torch.compile(model, mode='reduce-overhead')
+        # I164-1: 使用 mode='default' 替代 'reduce-overhead'
+        # 'reduce-overhead' 启用 CUDA Graphs，与 gradient_checkpointing 不兼容
+        # 'default' 禁用 CUDA Graphs，避免动态形状导致的 index out of bounds
+        model = torch.compile(model, mode='default')
 
     if channels_last:
         print("Converting to channels_last memory format...")
@@ -252,43 +255,76 @@ def create_dataloader(args, split: str = 'train') -> DataLoader:
             }
         return create_dummy_dataloader(args, split, _dummy_dataset_cache[cache_key])
 
-    # Import dataset loaders
-    try:
-        from .data import create_dataset, get_transforms
-    except ImportError:
-        print("Warning: Dataset loading not available, using dummy data")
-        return create_dummy_dataloader(args, split)
+    # Hugging Face dataset: use --use-hf-dataset flag to enable HF loading
+    # When enabled, loads 'zh-plus/tiny-imagenet' from Hugging Face Hub
+    use_hf = getattr(args, 'use_hf_dataset', False)
 
-    # Get transforms
+    # Get image size from args (auto-set by get_dataset_info) or handle dynamic resolution
     image_size = args.image_size
-    if image_size is not None and str(image_size).lower() == 'none':
-        image_size = 224  # Default for dynamic resolution
+    if hasattr(image_size, 'lower') and str(image_size).lower() == 'none':
+        image_size = 224  # Dynamic resolution fallback
     elif image_size is not None:
-        image_size = int(image_size)  # Convert string to int
+        image_size = int(image_size)
 
-    transforms = get_transforms(
-        dataset=dataset_name,
-        split=split,
-        image_size=image_size,
-        augment=split == 'train' and not getattr(args, 'no_augment', False),
-    )
+    # Hugging Face dataset path
+    hf_path = None
+    if use_hf:
+        try:
+            from .data import create_hf_dataset, get_hf_path
+            hf_path = get_hf_path(dataset_name)
+            if hf_path is None:
+                print(f"Warning: {dataset_name} does not support HF loading, using local data")
+                use_hf = False
+        except ImportError:
+            print("Warning: HF datasets not available, falling back to local data")
+            use_hf = False
 
-    # Create dataset
-    dataset = create_dataset(
-        name=dataset_name,
-        split=split,
-        transform=transforms,
-        root=getattr(args, 'data_root', './data'),
-    )
+    if use_hf and hf_path:
+        # HF dataset: loads from Hugging Face Hub using the mapped hf_path
+        dataset = create_hf_dataset(
+            name=hf_path,
+            split=split,
+            image_size=image_size,
+            augment=split == 'train' and not getattr(args, 'no_augment', False),
+            shuffle=(split == 'train'),  # Shuffle only for training
+            seed=args.seed,
+        )
+    else:
+        # Import dataset loaders
+        try:
+            from .data import create_dataset, get_transforms
+        except ImportError:
+            print("Warning: Dataset loading not available, using dummy data")
+            return create_dummy_dataloader(args, split)
+
+        transforms = get_transforms(
+            dataset=dataset_name,
+            split=split,
+            image_size=image_size,
+            augment=split == 'train' and not getattr(args, 'no_augment', False),
+        )
+
+        # Create dataset
+        dataset = create_dataset(
+            name=dataset_name,
+            split=split,
+            transform=transforms,
+            root=getattr(args, 'data_root', './data'),
+        )
 
     # Create dataloader
     batch_size = args.batch_size
     num_workers = getattr(args, 'num_workers', 4)
 
+    # Streaming datasets (HF in streaming mode) don't support multi-processing
+    # because they can't be randomly accessed by index
+    if use_hf and hf_path:
+        num_workers = 0
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=(split == 'train'),
+        shuffle=False,  # HF datasets already handle shuffling internally
         num_workers=num_workers,
         pin_memory=True,
         drop_last=(split == 'train'),
@@ -423,6 +459,7 @@ def train(
     config.output_dir = str(output_dir)
     config.checkpoint.checkpoint_dir = str(checkpoints_dir)
     config.amp.enabled = getattr(args, 'use_amp', False)
+    config.data.dataset = args.dataset
 
     # Save config to logs/config.json
     config.save(str(logs_dir / "config.json"))
@@ -508,6 +545,11 @@ def train(
 
     for epoch in range(state.epoch, config.training.num_epochs):
         state.epoch = epoch
+
+        # I-BUGFIX: 调用 splitter.set_epoch() 更新课程学习进度
+        # 修复 K_min 钳制 Bug：_current_K 之前从未被更新，导致 avg_tokens 永远 = K_min = 8
+        if hasattr(model, 'splitter') and hasattr(model.splitter, 'set_epoch'):
+            model.splitter.set_epoch(epoch)
 
         # Train one epoch
         train_metrics = train_one_epoch(
@@ -611,6 +653,36 @@ def train(
     }
 
 
+def _tensor_to_serializable(obj: Any) -> Any:
+    """Recursively convert Tensor objects to JSON-serializable Python types.
+
+    Args:
+        obj: Object to convert
+
+    Returns:
+        JSON-serializable version of the object
+    """
+    if isinstance(obj, torch.Tensor):
+        if obj.dim() == 0:
+            return obj.item()
+        return obj.detach().cpu().tolist()
+    elif isinstance(obj, dict):
+        return {k: _tensor_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_tensor_to_serializable(item) for item in obj]
+    elif isinstance(obj, float):
+        return obj
+    elif isinstance(obj, int):
+        return obj
+    elif obj is None:
+        return None
+    else:
+        try:
+            return float(obj)
+        except (TypeError, ValueError):
+            return str(obj)
+
+
 def _save_training_history(history: list, output_dir: Path) -> None:
     """Save training history in standard experiments format
 
@@ -630,12 +702,42 @@ def _save_training_history(history: list, output_dir: Path) -> None:
             train = stats["train"]
             entry["train_loss"] = train.get("loss", 0.0)
             entry["train_acc"] = train.get("accuracy", 0.0) * 100  # Convert to percentage
+            entry["train_grad_norm"] = train.get("grad_norm", 0.0)
+
+            # Extract loss components
+            if "loss_components" in train:
+                for k, v in train["loss_components"].items():
+                    entry[f"train_{k}"] = v
+
+            # Extract splitter logits stats
+            if "splitter_logits_stats" in train:
+                for k, v in train["splitter_logits_stats"].items():
+                    entry[f"splitter_logits_{k}"] = v
+
+            # Extract manifold bias stats
+            if "manifold_bias_stats" in train:
+                for k, v in train["manifold_bias_stats"].items():
+                    entry[f"manifold_bias_{k}"] = v
+
+            # Extract poincare dist stats
+            if "poincare_dist_stats" in train:
+                for k, v in train["poincare_dist_stats"].items():
+                    entry[f"poincare_dist_{k}"] = v
+
+            # Extract grad ratio
+            entry["backbone_vs_splitter_grad_ratio"] = train.get("backbone_vs_splitter_grad_ratio", 0.0)
+            entry["backbone_grad_norm"] = train.get("backbone_grad_norm", 0.0)
+            entry["splitter_grad_norm"] = train.get("splitter_grad_norm", 0.0)
+
+            # Extract active ratio
+            entry["train_active_ratio"] = train.get("active_ratio", 0.0)
 
         # Extract eval metrics
         if "eval" in stats:
             eval_stats = stats["eval"]
             entry["val_loss"] = eval_stats.get("loss", 0.0)
             entry["val_acc"] = eval_stats.get("accuracy", 0.0) * 100  # Convert to percentage
+            entry["val_ece"] = eval_stats.get("ece", None)  # Expected Calibration Error
 
         # Extract learning rate from extra if available
         if "extra" in stats and "lr" in stats["extra"]:
@@ -650,7 +752,9 @@ def _save_training_history(history: list, output_dir: Path) -> None:
     # Save to training_history.json
     history_path = output_dir / "training_history.json"
     with open(history_path, "w") as f:
-        json.dump(training_history, f, indent=2)
+        # Convert Tensor objects to JSON-serializable types
+        serializable_history = _tensor_to_serializable(training_history)
+        json.dump(serializable_history, f, indent=2)
 
     print(f"Training history saved to: {history_path}")
 
@@ -663,27 +767,29 @@ def add_args(parser: argparse.ArgumentParser):
     """
     # ==================== Dataset ====================
     parser.add_argument('--dataset', type=str, default='tiny-imagenet',
-                        help='Dataset name: cifar10, cifar100, tiny-imagenet, cub200, imagenet')
-    parser.add_argument('--image-size', type=str, default='64',
-                        help='Image size (integer or "none" for dynamic resolution)')
+                        help='Dataset name: cifar10, cifar100, tiny-imagenet, cub200, imagenet, or HF path like zh-plus/tiny-imagenet')
     parser.add_argument('--num-workers', type=int, default=4,
                         help='Number of data loading workers')
     parser.add_argument('--data-root', type=str, default='./data',
                         help='Root directory for datasets')
     parser.add_argument('--no-augment', action='store_true',
                         help='Disable data augmentation')
-    parser.add_argument('--num-classes', type=int, default=200,
-                        help='Number of classes')
+    parser.add_argument('--use-hf-dataset', action='store_true',
+                        help='Use Hugging Face zh-plus/tiny-imagenet instead of local dataset')
 
     # ==================== Model Architecture ====================
-    parser.add_argument('--dim', type=int, default=384,
-                        help='Model embedding dimension')
-    parser.add_argument('--num-layers', type=int, default=8,
-                        help='Number of transformer layers')
-    parser.add_argument('--heads', type=int, default=6,
-                        help='Number of attention heads')
-    parser.add_argument('--mlp-dim', type=int, default=1536,
-                        help='MLP hidden dimension')
+    # I-OPT: RTX 4070 8GB + BS=192 最优配置 (2026-04-05)
+    # 计算依据: dim=512, L=12, heads=8, mlp_dim=2048
+    # 显存占用: ~2GB (24%)，留有充足余量供200 epochs训练
+    # 参数量: 50.3M (适合 Tiny-ImageNet 200类)
+    parser.add_argument('--dim', type=int, default=512,
+                        help='Model embedding dimension (default: 512 for RTX 4070 8GB)')
+    parser.add_argument('--num-layers', type=int, default=12,
+                        help='Number of transformer layers (default: 12)')
+    parser.add_argument('--heads', type=int, default=8,
+                        help='Number of attention heads (default: 8)')
+    parser.add_argument('--mlp-dim', type=int, default=2048,
+                        help='MLP hidden dimension (default: 2048 = 4*dim)')
     parser.add_argument('--dim-head', type=int, default=None,
                         help='Per-head dimension (default: dim/heads)')
     parser.add_argument('--min-patch-size', type=int, default=4,
@@ -714,12 +820,12 @@ def add_args(parser: argparse.ArgumentParser):
                         help='Minimum token coverage ratio')
     parser.add_argument('--token-coverage-max', type=float, default=None,
                         help='Maximum token coverage ratio')
-    parser.add_argument('--target-ratio', type=float, default=0.5,
-                        help='Target token ratio')
+    parser.add_argument('--target-ratio', type=float, default=0.25,
+                        help='Target token ratio (default: 0.25, 增加token数量缓解信息瓶颈)')
 
     # ==================== Splitter ====================
-    parser.add_argument('--splitter-type', type=str, default='gumbel_topk',
-                        help='Splitter type: gumbel_topk, deterministic_neighbor, hilbert_optimal')
+    parser.add_argument('--splitter-type', type=str, default='hilbert_optimal',
+                        help='Splitter type: hilbert_optimal (其他类型已废弃)')
     parser.add_argument('--K-min-abs', type=int, default=8,
                         help='Absolute minimum token count')
     parser.add_argument('--K-max', type=int, default=None,
@@ -880,6 +986,31 @@ def main():
     if torch.cuda.is_available():
         print(f"CUDA device: {torch.cuda.get_device_name(0)}")
 
+    # Auto-detect dataset info (image_size, num_classes) from dataset
+    # If --use-hf-dataset is set, we use the HF path for metadata
+    try:
+        from .data import get_dataset_info, get_hf_path
+        # Determine which dataset name to query for metadata
+        if getattr(args, 'use_hf_dataset', False):
+            hf_path = get_hf_path(args.dataset)
+            if hf_path:
+                dataset_for_info = hf_path
+            else:
+                print(f"Warning: {args.dataset} does not support HF loading, using local data")
+                dataset_for_info = args.dataset
+        else:
+            dataset_for_info = args.dataset
+        dataset_info = get_dataset_info(dataset_for_info)
+        args.image_size = dataset_info['image_size']
+        args.num_classes = dataset_info['num_classes']
+        print(f"\nDataset: {dataset_for_info}")
+        print(f"Image size: {args.image_size}, Num classes: {args.num_classes}")
+    except Exception as e:
+        print(f"Warning: Could not auto-detect dataset info: {e}")
+        print("Using defaults: image_size=64, num_classes=200")
+        args.image_size = 64
+        args.num_classes = 200
+
     # Quick test mode: override with smaller model parameters
     if getattr(args, 'quick_test', False):
         args.dim = 128
@@ -889,7 +1020,8 @@ def main():
         args.num_train_samples = 100
         args.num_val_samples = 50
         args.batch_size = 4
-        print(f"\n[Quick Test Mode] Using small model: dim={args.dim}, layers={args.num_layers}")
+        args.epochs = 10  # Significantly reduced for quick testing
+        print(f"\n[Quick Test Mode] Using small model: dim={args.dim}, layers={args.num_layers}, epochs={args.epochs}")
 
     # Create model
     print("\nCreating model...")

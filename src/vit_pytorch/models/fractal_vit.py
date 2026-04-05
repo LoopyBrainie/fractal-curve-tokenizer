@@ -53,7 +53,7 @@ from vit_pytorch.core.constants import (
     SPLITTER_TEMP_START, SPLITTER_TEMP_END,
     LOGIT_CLAMP_BOUND,  # I147: 添加钳制边界导入
 )
-from vit_pytorch.core.config import AttentionEncoderConfig, SemanticSplitterConfig  # I98-3, I110-5
+from vit_pytorch.core.config import SemanticSplitterConfig  # I110-5
 from vit_pytorch.core.pattern_encoder import (
     HilbertPatternEncoder,
     HilbertPatternEncoderLight,
@@ -166,52 +166,60 @@ class TrainingStats:
     child_features: Optional[torch.Tensor] = None  # 预测的子节点特征 [B, N, 4, D]
     redundancy: Optional[torch.Tensor] = None  # 冗余性分数 [B, N]
 
+    # Splitter 辅助损失 (H1SS)
+    auxiliary_losses: Optional[Dict[str, torch.Tensor]] = None  # {entropy, budget, tree, ...}
+
     # === 向后兼容字段 (I112) ===
     aux_infos: Optional[List[Dict[str, Any]]] = None  # 评估层期望的 aux_infos 格式
     ema_stats: Optional[torch.Tensor] = None           # I99-1: EMA buffer 统计信息
     split_info: Dict[str, Any] = field(default_factory=dict)  # 分割决策详情
 
     # === 新增: 实验详细日志记录指标 ===
+    # I-AUDIT: 这些字段改为 Optional[float] = None，区分"未计算"和"计算结果为0"
 
     # Splitter 统计
-    splitter_logits_mean: float = 0.0
-    splitter_logits_std: float = 0.0
+    splitter_logits_mean: Optional[float] = None
+    splitter_logits_std: Optional[float] = None
 
     # 覆盖率
-    active_ratio: float = 0.0  # 实际参与计算的区域覆盖率
+    active_ratio: Optional[float] = None  # 实际参与计算的区域覆盖率
 
     # 流形统计
-    manifold_bias_max: float = 0.0
-    manifold_bias_min: float = 0.0
-    manifold_bias_mean: float = 0.0
-    manifold_bias_std: float = 0.0
+    manifold_bias_max: Optional[float] = None
+    manifold_bias_min: Optional[float] = None
+    manifold_bias_mean: Optional[float] = None
+    manifold_bias_std: Optional[float] = None
 
     # Poincaré 距离统计
-    poincare_dist_mean: float = 0.0
-    poincare_dist_std: float = 0.0
+    poincare_dist_mean: Optional[float] = None
+    poincare_dist_std: Optional[float] = None
 
     # 梯度比值 (backward 时记录)
-    backbone_grad_norm: float = 0.0
-    splitter_grad_norm: float = 0.0
-    backbone_vs_splitter_grad_ratio: float = 0.0
+    backbone_grad_norm: Optional[float] = None
+    splitter_grad_norm: Optional[float] = None
+    backbone_vs_splitter_grad_ratio: Optional[float] = None
 
     # Bottleneck 层梯度
-    entmax_grad_norm: float = 0.0
-    manifold_decoder_grad_norm: float = 0.0
+    entmax_grad_norm: Optional[float] = None
+    manifold_decoder_grad_norm: Optional[float] = None
 
     # 损失项
-    budget_penalty: float = 0.0
-    consistency_loss: float = 0.0
-    entropy_loss: float = 0.0
+    budget_penalty: Optional[float] = None
+    consistency_loss: Optional[float] = None
+    entropy_loss: Optional[float] = None
     # I150-3 NEW: 额外的损失项监控
-    budget_loss: float = 0.0  # Elastic Budget 损失
-    density_regularization: float = 0.0  # 密度正则化损失
+    budget_loss: Optional[float] = None  # Elastic Budget 损失
+    density_regularization: Optional[float] = None  # 密度正则化损失
 
     # FLOPs 理论节省
-    theoretical_flops_reduction: float = 0.0
+    theoretical_flops_reduction: Optional[float] = None
 
     # I150-3 NEW: Splitter Logits 统计 Hook
-    mean_abs_logits: float = 0.0  # Logits 的平均绝对值
+    mean_abs_logits: Optional[float] = None  # Logits 的平均绝对值
+
+    # === 新增: 各层包裹的诊断输出 ===
+    # 用于 layer-packaged → trainer-unpacked 架构
+    auxiliary_outputs: Optional[Dict[str, Any]] = None  # {"splitter": {...}, "attn_0": {...}, "ffn_0": {...}}
 
     def validate(self) -> None:
         """数学约束验证"""
@@ -240,6 +248,44 @@ class TrainingStats:
         if self.depth_distribution:
             total = sum(self.depth_distribution.values())
             assert abs(total - 1.0) < 1e-5, f"分布未归一化: {total}"
+
+
+def collect_auxiliary_diagnostics(
+    model: nn.Module, prefix: str = "embed"
+) -> Dict[str, Any]:
+    """自动收集所有对齐了 LayerOutputProtocol 的子模块指标
+
+    递归遍历所有子模块，收集具有 embed_output 或 norm_output 属性的模块诊断。
+
+    Args:
+        model: 父模块（如 FractalCurveViT）
+        prefix: 日志键名前缀
+
+    Returns:
+        {submodule_name: {metric: value}}
+    """
+    logs: Dict[str, Any] = {}
+    for name, module in model.named_modules():
+        # 收集 embed_output
+        if hasattr(module, 'embed_output'):
+            try:
+                output = module.embed_output
+                if output:
+                    # 按命名空间组织
+                    for k, v in output.items():
+                        logs[f"{name}/{k}"] = v
+            except Exception:
+                pass  # 不中断训练
+        # 收集 norm_output
+        elif hasattr(module, 'norm_output'):
+            try:
+                output = module.norm_output
+                if output:
+                    for k, v in output.items():
+                        logs[f"{name}/{k}"] = v
+            except Exception:
+                pass  # 不中断训练
+    return logs
 
 
 class FractalCurveViT(nn.Module):
@@ -285,7 +331,9 @@ class FractalCurveViT(nn.Module):
         image_size: Optional[Union[int, Tuple[int, int]]] = None,
         num_classes: int = 1000,
         dim: int = 512,
-        num_layers: int = 6,  # Transformer 层数
+        # I-OPT: 增加到 12 层（原 6），与 ViT-Tiny 标准对齐
+        # TinyImageNet (200 classes) 需要足够的模型容量
+        num_layers: int = 12,  # Transformer 层数
         heads: int = 8,
         mlp_dim: int = 1024,
         pool: str = "weighted",
@@ -316,15 +364,12 @@ class FractalCurveViT(nn.Module):
         # I113-2: token_coverage_max 已废弃，保留仅用于向后兼容
         token_coverage_max: Optional[float] = None,
         # I113-2: target_ratio - L1 相对参数，由外部配置传递
-        target_ratio: float = 0.5,
+        # I-OPT: 改为 0.1（原 0.5），与 K_min/K_max (8-64) 对应的 ratio (0.023-0.188) 对齐
+        target_ratio: float = 0.25,  # I107-OPT: 从 0.1 增到 0.25，增加 token 数量缓解信息瓶颈
         pos_dropout: Optional[float] = None,
         use_area_encoding: bool = False,
-        use_affine_modulation: bool = True,
-        fourier_levels: int = 4,
-        encoder_config: Optional[AttentionEncoderConfig] = None,
         quota_learnable: Optional[bool] = None,
         quota_entropy_weight: float = 0.5,  # I165-1: 增加熵权重以驱动深度分布变化 (原0.01)
-        lca_fp16: bool = False,  # I104-3: 使用 FP16 存储 LCA embedding
         # I140: Splitter 架构参数
         splitter_hidden_dim: Optional[int] = None,
         splitter_feature_dim: Optional[int] = None,
@@ -340,17 +385,17 @@ class FractalCurveViT(nn.Module):
         # I145-H1SS: HilbertOptimalSplitter 特定参数
         jump_loss_weight: Optional[float] = None,  # H1SS Jump Loss 权重
         density_field_hidden_dim: Optional[int] = None,  # H1SS Density Field 隐藏层维度
-        # I130-3: Splitter 类型选择 (I145: 新增 semantic_redundancy 支持)
-        splitter_type: str = 'gumbel_topk',  # 'gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy', 'hilbert_optimal'
+        # I130-3: Splitter 类型选择（已固定为 HilbertOptimalSplitter）
+        splitter_type: str = 'hilbert_optimal',  # 'hilbert_optimal'（其他类型已废弃）
         # I170-NEW: Hilbert 平滑参数 (I165-1: 解决空间碎片化)
         enable_hilbert_smoothness: bool = False,  # 是否启用 Hilbert 感知平滑
         hilbert_smoothness_weight: float = 0.1,  # 平滑损失权重
         # I170-NEW: Meta-DVN 参数 (I165-1: 学习深度方差期望)
         enable_meta_dvn: bool = False,  # 是否启用元感知深度方差网络
         meta_dvn_hidden_dim: int = 64,  # Meta-DVN MLP 隐藏层维度
-        # I110-7: 语义分裂器配置
-        use_semantic_splitter: bool = False,
-        semantic_splitter_config: Optional[SemanticSplitterConfig] = None,
+        # I110-7: 语义分裂器配置（已废弃 - 2026-03-23）
+        use_semantic_splitter: bool = False,  # DEPRECATED
+        semantic_splitter_config: Optional[SemanticSplitterConfig] = None,  # DEPRECATED
         # P6-1: 深度缩放参数 (传递给 HilbertPatchEmbed)
         depth_scale_range: Optional[Tuple[float, float]] = None,
         # I-PHASE4: 池化方法选择 (传递给 HilbertPatchEmbed)
@@ -368,11 +413,10 @@ class FractalCurveViT(nn.Module):
         pattern_plugin_config: Optional[dict] = None,  # 插件配置字典
 
         # Scheme C: Structured Manifold Bias 参数
-        use_geometry_field: bool = False,  # 是否启用几何流形场
+        # I107-OPT: 启用几何流形场以激活Manifold Attention核心创新
+        use_geometry_field: bool = True,  # 是否启用几何流形场
         geometry_field_dim: Optional[int] = None,  # 几何流形场维度 (默认等于 dim)
         manifold_bias_scale: float = 1.0,  # 流形偏置缩放因子
-        # I-MANIFOLD: Manifold-Native 注意力参数 (使用新版几何流形框架)
-        use_manifold_native: bool = True,  # 默认启用 Manifold-Native 注意力
         manifold_beta: float = 4.0,  # Hilbert 带宽系数
     ) -> None:
         """初始化 FractalCurveViT。
@@ -458,9 +502,6 @@ class FractalCurveViT(nn.Module):
         self.splitter_feature_dim = splitter_feature_dim
         self.splitter_pool_size = splitter_pool_size
 
-        # I122-2: 移除 lca_temperature，由 hilbert_bias_scale 统一缩放
-        self.lca_fp16 = lca_fp16  # I104-3
-
         # P6-1: 深度缩放参数
         self.depth_scale_range = depth_scale_range
         # I-PHASE4: 新参数
@@ -525,8 +566,6 @@ class FractalCurveViT(nn.Module):
         self.use_hilbert_encoding = use_hilbert_encoding
         self.use_spatial_encoding = use_spatial_encoding
         self.use_area_encoding = use_area_encoding
-        self.use_affine_modulation = use_affine_modulation
-        self.fourier_levels = fourier_levels
         # I120-2: 分离 dropout 配置
         self.tokenizer_dropout = tokenizer_dropout
         self.transformer_dropout = transformer_dropout
@@ -559,145 +598,65 @@ class FractalCurveViT(nn.Module):
             self.splitter = splitter
         else:
             # I98-1: 确定 max_level_limit (根据 tokenizer 或默认值)
-            # I164-1: 使用 max_level_limit=8 (已通过分块处理优化)
-            max_level_limit = 8
-            if tokenizer is not None:
-                if hasattr(tokenizer, 'max_level'):
-                    max_level_limit = tokenizer.max_level
-
-            # I130-3: 根据 splitter_type 创建不同的 Splitter (I145: 添加 semantic_redundancy)
-            if splitter_type == 'deterministic_neighbor':
-                # DeterministicNeighborSplitter: 100%梯度覆盖率，完整邻居传播
-                from vit_pytorch.layers.splitters.deterministic_neighbor import (
-                    DeterministicNeighborSplitter,
-                    DeterministicNeighborSplitterConfig,
-                )
-
-                splitter_config = DeterministicNeighborSplitterConfig(
-                    feature_dim=splitter_feature_dim or dim,
-                    max_level_limit=max_level_limit,
-                    hidden_dim=splitter_hidden_dim or 64,
-                    # 覆盖率参数
-                    coverage_min=token_coverage_min,
-                    coverage_base=token_coverage_max if token_coverage_max else K_COVERAGE_MAX_HARD,
-                    # 温度参数
-                    temperature_init=splitter_temp_start if splitter_temp_start is not None else SPLITTER_TEMP_START,
-                    temperature_min=splitter_temp_end if splitter_temp_end is not None else SPLITTER_TEMP_END,
-                    # 配额参数
-                    enable_learnable_quota=quota_learnable if quota_learnable is not None else True,
-                    locality_weight=0.1,
-                    entropy_weight=0.01,
-                )
-                self.splitter = DeterministicNeighborSplitter(
-                    config=splitter_config,
-                    image_size=self.image_size,
-                    feature_dim=splitter_feature_dim or dim,
-                )
-            elif splitter_type == 'semantic_redundancy':
-                # SemanticRedundancySplitter: 语义冗余性感知分裂
-                from vit_pytorch.layers.splitters.semantic_redundancy import (
-                    SemanticRedundancySplitter,
-                )
-
-                self.splitter = SemanticRedundancySplitter(
-                    feature_dim=splitter_feature_dim or dim,
-                    hidden_dim=splitter_hidden_dim or 128,
-                    max_level_limit=max_level_limit,
-                    gumbel_temp_start=splitter_temp_start if splitter_temp_start is not None else SPLITTER_TEMP_START,
-                    gumbel_temp_end=splitter_temp_end if splitter_temp_end is not None else SPLITTER_TEMP_END,
-                    learnable_temperature=True,
-                )
-            elif splitter_type == 'hilbert_optimal':
-                # HilbertOptimalSplitter (H1SS): 基于6条公理的最优实现
-                # A1: 1D Hilbert 流形卷积
-                # A2: 无 Gumbel 扰动
-                # A3: Entmax 稀疏激活
-                # A4: 树一致性软约束
-                # A5: 单次 Entmax 投影
-                # A6: < 10K 参数
-                from vit_pytorch.layers.splitters.hilbert_optimal_splitter import (
-                    HilbertOptimalSplitter,
-                )
-
-                # I145-H1SS: 动态计算 K 范围（变参数）
-                # 根据 image_size 和 token_ratio 动态计算，而非暴露固定数值
-                # K = (H * W / min_patch_size^2) * ratio
-                img_h, img_w = self.image_size
-                max_possible_tokens = (img_h // effective_min_patch_size) * (img_w // effective_min_patch_size)
-                computed_k_min = max(1, int(max_possible_tokens * splitter_token_ratio_min))
-                computed_k_max = max(computed_k_min + 1, int(max_possible_tokens * splitter_token_ratio_max))
-
-                # I-NAN: 使用 K_min_abs 硬下限保护，确保不会因动态计算导致 K 过小
-                effective_k_min = max(K_min_abs, computed_k_min)
-
-                # H1SS: 三层参数配置
-                # 参数 (Parameters): feature_dim, hidden_dim, max_level_limit, min_patch_size
-                # 变参数 (Variable): K_min, K_max, sampling_ratio_schedule (由 image_size 动态计算)
-                # 超参数 (Hyper): entmax_alpha, tree_constraint_weight, temperature, jump_loss_weight
-                self.splitter = HilbertOptimalSplitter(
-                    feature_dim=splitter_feature_dim or dim,
-                    hidden_dim=splitter_hidden_dim or 64,
-                    max_level_limit=max_level_limit,
-                    min_patch_size=effective_min_patch_size,
-                    K_min=effective_k_min,  # I-NAN: 使用受保护的 K_min
-                    K_max=computed_k_max,
-                    sampling_ratio_schedule=(2, 4),  # 动态 sampling_ratio
-                    # I107: 改为 1.2 (不再用 2.0)，防止 Entmax 硬截断导致梯度消失
-                    entmax_alpha=1.2,
-                    tree_constraint_weight=0.1,
-                    temperature_init=splitter_temp_start if splitter_temp_start is not None else 1.0,
-                    temperature_min=splitter_temp_end if splitter_temp_end is not None else 0.3,
-                    jump_loss_weight=jump_loss_weight if jump_loss_weight is not None else 0.1,
-                    density_field_hidden_dim=density_field_hidden_dim if density_field_hidden_dim is not None else 32,
-                )
+            # I164-1: 修复：当 tokenizer 为 None 时，从 image_size 动态计算 max_level
+            # 避免 Tiny-ImageNet (64x64) 使用 max_level=8 导致的 index out of bounds
+            if tokenizer is not None and hasattr(tokenizer, 'max_level'):
+                max_level_limit = tokenizer.max_level
             else:
-                # 默认使用 GumbelTopKSplitter
-                from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
-                from vit_pytorch.core.config import SplitterConfig
-
-                splitter_config = SplitterConfig(
-                    feature_dim=splitter_feature_dim or dim,
+                # 动态计算正确的 max_level
+                from vit_pytorch.core.depth_utils import compute_max_depth
+                img_h, img_w = self.image_size
+                max_level_limit = compute_max_depth(
+                    image_size=(img_h, img_w),
                     min_patch_size=effective_min_patch_size,
-                    max_level_limit=max_level_limit,
-                    hidden_dim=splitter_hidden_dim or 64,
-                    intermediate_dim=(splitter_hidden_dim or 64) // 2,
-                    pool_size=splitter_pool_size or 4,
-                    # I113-2: K 边界由 config 内部根据 coverage_min/coverage_max_hard 自动计算
-                    use_dynamic_k=True,
-                    # I120-2: dropout 始终为 0.0 (Tokenizer 确定性)
-                    dropout=0.0,
-                    enable_learnable_quota=quota_learnable if quota_learnable is not None else True,
-                    quota_entropy_weight=quota_entropy_weight,
-                    # I33: 传递覆盖率参数
-                    coverage_min=token_coverage_min,
-                    coverage_max_hard=token_coverage_max if token_coverage_max else K_COVERAGE_MAX_HARD,
-                    # I120-3: 选中率均衡配额 (解决深度分布单一化)
-                    # I165-1: 禁用 rate_balanced 以启用可学习的 ContinuousQuotaAllocator
-                    enable_rate_balanced_quota=False,
-                    # I165-1: 启用分层自适应配额 (根据图像内容动态调整深度分布)
-                    enable_hierarchical_quota=True,
-                    # I145: 传递温度参数
-                    temperature_init=splitter_temp_start if splitter_temp_start is not None else SPLITTER_TEMP_START,
-                    temperature_min=splitter_temp_end if splitter_temp_end is not None else SPLITTER_TEMP_END,
-                    # v6.1: Soft-Threshold 课程学习配置
-                    enable_soft_threshold=True,
-                    soft_threshold_max=0.5,
-                    soft_threshold_schedule='linear',
-                    # I170-NEW: Hilbert 平滑参数 (I165-1: 解决空间碎片化)
-                    enable_hilbert_smoothness=enable_hilbert_smoothness,
-                    hilbert_smoothness_weight=hilbert_smoothness_weight,
-                    # I170-NEW: Meta-DVN 参数 (I165-1: 学习深度方差期望)
-                    enable_meta_dvn=enable_meta_dvn,
-                    meta_dvn_hidden_dim=meta_dvn_hidden_dim,
-                )
-                self.splitter = GumbelTopKSplitter(
-                    config=splitter_config,
-                    image_size=self.image_size,
+                    hard_limit=8  # 上限 8
                 )
 
-        # P-OPT: 缓存是否为 SemanticRedundancySplitter，避免每次 forward 都做 isinstance 检查
-        from vit_pytorch.layers.splitters.semantic_redundancy import SemanticRedundancySplitter
-        self._is_semantic_splitter = isinstance(self.splitter, SemanticRedundancySplitter)
+            # 仅支持 HilbertOptimalSplitter (H1SS)
+            # 基于6条公理的最优实现:
+            # A1: 1D Hilbert 流形卷积
+            # A2: 无 Gumbel 扰动
+            # A3: Entmax 稀疏激活
+            # A4: 树一致性软约束
+            # A5: 单次 Entmax 投影
+            # A6: < 10K 参数
+            from vit_pytorch.layers.splitters.hilbert_optimal_splitter import (
+                HilbertOptimalSplitter,
+            )
+
+            # I145-H1SS: 动态计算 K 范围（变参数）
+            # 根据 image_size 和 token_ratio 动态计算，而非暴露固定数值
+            # K = (H * W / min_patch_size^2) * ratio
+            img_h, img_w = self.image_size
+            max_possible_tokens = (img_h // effective_min_patch_size) * (img_w // effective_min_patch_size)
+            computed_k_min = max(1, int(max_possible_tokens * splitter_token_ratio_min))
+            computed_k_max = max(computed_k_min + 1, int(max_possible_tokens * splitter_token_ratio_max))
+
+            # I-NAN: 使用 K_min_abs 硬下限保护，确保不会因动态计算导致 K 过小
+            effective_k_min = max(K_min_abs, computed_k_min)
+
+            # H1SS: 三层参数配置
+            # 参数 (Parameters): feature_dim, hidden_dim, max_level_limit, min_patch_size
+            # 变参数 (Variable): K_min, K_max, sampling_ratio_schedule (由 image_size 动态计算)
+            # 超参数 (Hyper): entmax_alpha, tree_constraint_weight, temperature, jump_loss_weight
+            self.splitter = HilbertOptimalSplitter(
+                feature_dim=splitter_feature_dim or dim,
+                hidden_dim=splitter_hidden_dim or 64,
+                max_level_limit=max_level_limit,
+                min_patch_size=effective_min_patch_size,
+                K_min=effective_k_min,  # I-NAN: 使用受保护的 K_min
+                K_max=computed_k_max,
+                sampling_ratio_schedule=(2, 4),  # 动态 sampling_ratio
+                # I107: 改为 1.2 (不再用 2.0)，防止 Entmax 硬截断导致梯度消失
+                entmax_alpha=1.2,
+                tree_constraint_weight=0.1,
+                temperature_init=splitter_temp_start if splitter_temp_start is not None else 1.0,
+                temperature_min=splitter_temp_end if splitter_temp_end is not None else 0.3,
+                jump_loss_weight=jump_loss_weight if jump_loss_weight is not None else 0.1,
+                density_field_hidden_dim=density_field_hidden_dim if density_field_hidden_dim is not None else 32,
+            )
+
+        # H1SS 不需要 SemanticRedundancySplitter 检查
 
         # === HilbertTopologyCache (Step 3 优化) ===
         # O(1) Tensor Lookup for Hilbert 坐标转换
@@ -722,18 +681,11 @@ class FractalCurveViT(nn.Module):
                 hilbert_cache=self.hilbert_cache,  # Step 3: O(1) Hilbert lookup
             )
 
-        # I110-7: 配置语义分裂器（必须在 tokenizer 赋值之前）
-        self._use_semantic_splitter = use_semantic_splitter
-        self._semantic_splitter_config = semantic_splitter_config
+        # I110-7: 语义分裂器已废弃（2026-03-23）
+        # 保留参数以避免接口变更，但完全忽略
+        self._semantic_splitter_config = None
         self._semantic_splitter: Optional[nn.Module] = None
         self._semantic_loss_fn: Optional[nn.Module] = None
-
-        if use_semantic_splitter and semantic_splitter_config is not None:
-            # 配置 tokenizer 使用语义分裂器
-            tokenizer.use_semantic_splitter(config=semantic_splitter_config)
-            # 创建语义分裂器实例
-            self._semantic_splitter = tokenizer.get_semantic_splitter()
-            self._semantic_loss_fn = tokenizer.get_semantic_loss_fn()
 
         self.tokenizer = tokenizer
 
@@ -811,12 +763,7 @@ class FractalCurveViT(nn.Module):
                 drop_path_rate=drop_path_rate,
                 ffn_type=ffn_type,
                 use_checkpoint=use_checkpoint,
-                use_affine_modulation=use_affine_modulation,
-                fourier_levels=fourier_levels,
-                encoder_config=encoder_config,
-                use_fp16=lca_fp16,  # I104-3
-                use_manifold_native=use_manifold_native,  # I-MANIFOLD: Manifold-Native 注意力
-                manifold_beta=manifold_beta,  # I-MANIFOLD: Hilbert 带宽系数
+                manifold_beta=manifold_beta,
             )
 
         # === 一致性检查：确保 tokenizer 和 transformer 使用相同的 max_level ===
@@ -964,8 +911,6 @@ class FractalCurveViT(nn.Module):
             'use_hilbert_encoding': self.use_hilbert_encoding,
             'use_spatial_encoding': self.use_spatial_encoding,
             'use_area_encoding': self.use_area_encoding,
-            'use_affine_modulation': self.use_affine_modulation,
-            'fourier_levels': self.fourier_levels,
             # I120-2: 分离 dropout 配置
             'tokenizer_dropout': self.tokenizer_dropout,
             'transformer_dropout': self.transformer_dropout,
@@ -1121,7 +1066,7 @@ class FractalCurveViT(nn.Module):
         if self._dynamic_image_size:
             actual_size = (img.shape[2], img.shape[3])  # (H, W)
             if actual_size != self._cached_image_size:
-                self.splitter._update_candidates(actual_size)
+                self.splitter.update_candidates(actual_size)
                 self._cached_image_size = actual_size
 
         # I98-1: Pipeline 架构 - 先调用 Splitter，再调用 Tokenizer
@@ -1139,13 +1084,6 @@ class FractalCurveViT(nn.Module):
             # 关键修复: 对于确定性模式，hard 参数不影响选择逻辑
             # DeterminativeTopK 模式下，硬掩码和软掩码基于相同的确定性概率
             use_hard = True  # 始终使用硬选择以确保确定性
-
-            # I130-3: SemanticRedundancySplitter 需要 3D 输入 [B, N, D]
-            # P-OPT: 使用缓存的 _is_semantic_splitter 避免 isinstance 检查
-            if self._is_semantic_splitter:
-                # features: [B, d_model, H_feat, W_feat] -> [B, N, d_model]
-                B, C, H_feat, W_feat = features.shape
-                features = features.view(B, C, H_feat * W_feat).transpose(1, 2)  # [B, N, C]
 
             split_result = self.splitter(
                 features,
@@ -1532,12 +1470,9 @@ class FractalCurveViT(nn.Module):
         # I170: _prepare_tokens 返回 split_result 用于提取语义分裂器信息
         padded_tokens, padded_levels, lengths, levels_list, token_output, features, split_result = self._prepare_tokens(img)
 
-        # I170: 提取语义分裂器的 redundancy 和 child_features
+        # I170: 提取语义分裂器的 redundancy 和 child_features（已废弃）
         redundancy = None
         child_features = None
-        if self._is_semantic_splitter and split_result is not None:
-            redundancy = split_result.redundancy  # [B, N]
-            child_features = split_result.child_features  # [B, N, 4, D]
 
         # P11-3: 获取 regions 和 image_size 用于正确的 LCA 偏置计算
         regions, image_size = token_output.get_padded_regions()
@@ -1562,13 +1497,60 @@ class FractalCurveViT(nn.Module):
 
         # Scheme C: 如果启用 GeometryField，计算流形场偏置并与现有 geometry_emb 融合
         # 注意: levels_info 已经包含 CLS，所以 manifold_emb 形状已经是 [B, N+1, dim]
+        # I-AUDIT: manifold_bias_* 和 poincare_dist_* 需要在融合前计算（使用原始 manifold_emb）
+        manifold_emb_for_stats = None
         if self.use_geometry_field and self.geometry_field is not None:
             # 计算几何流形场编码 (levels_info 已包含 CLS)
             manifold_emb = self.geometry_field(levels_info)  # [B, N+1, dim]
 
+            # I-AUDIT: 保存原始 manifold_emb 用于统计计算（在融合前）
+            manifold_emb_for_stats = manifold_emb.detach()
+
             # 缩放并融合到现有的 geometry_emb
             # geometry_emb_with_cls 形状: [B, N+1, dim]
             geometry_emb_with_cls = geometry_emb_with_cls + self.manifold_bias_scale * manifold_emb
+
+        # I-AUDIT: 计算 manifold_bias_* 统计（在融合后仍有 geometry_emb_with_cls 可用）
+        manifold_bias_max = None
+        manifold_bias_min = None
+        manifold_bias_mean = None
+        manifold_bias_std = None
+        poincare_dist_mean = None
+        poincare_dist_std = None
+        if self.use_geometry_field and manifold_emb_for_stats is not None:
+            # manifold_bias 统计：使用融合后的 geometry_emb_with_cls（因为这是实际使用的值）
+            # geometry_emb_with_cls 形状: [B, N+1, dim]，排除 CLS token
+            manifold_bias = geometry_emb_with_cls[:, 1:, :]  # [B, N, dim] 排除 CLS
+
+            manifold_bias_max = float(manifold_bias.max().item())
+            manifold_bias_min = float(manifold_bias.min().item())
+            manifold_bias_mean = float(manifold_bias.mean().item())
+            manifold_bias_std = float(manifold_bias.std().item())
+
+            # P2-B 修复: 使用 Hilbert 距离统计替代 atanh(||manifold_emb||)
+            # 原实现问题: atanh(||manifold_emb||) 测量的是 embedding 范数饱和度，
+            # 不是 token-to-token 距离。当所有 manifold_emb 范数饱和在 0.99 时，
+            # atanh(0.99) = 2.6467，所有 token 得到相同值，std ≈ 0
+            # 新实现: 使用 Hilbert 索引差异作为距离代理
+            if levels_info is not None and hasattr(levels_info, 'get_hilbert_indices'):
+                hilbert_indices = levels_info.get_hilbert_indices()  # [B, N]
+                # 计算 Hilbert 距离矩阵 |h_i - h_j|
+                h_i = hilbert_indices.unsqueeze(2).float()  # [B, N, 1]
+                h_j = hilbert_indices.unsqueeze(1).float()  # [B, 1, N]
+                hilbert_dist = torch.abs(h_i - h_j)  # [B, N, N]
+                # 排除对角线（self-distance = 0）
+                mask = ~torch.eye(hilbert_indices.shape[1], dtype=torch.bool, device=hilbert_indices.device)
+                mask = mask.unsqueeze(0).expand(hilbert_dist.shape[0], -1, -1)
+                hilbert_dist_flat = hilbert_dist[mask].view(hilbert_indices.shape[0], -1)
+                poincare_dist_mean = float(hilbert_dist_flat.mean().item())
+                poincare_dist_std = float(hilbert_dist_flat.std().item())
+            else:
+                # 回退：如果无法获取 Hilbert 索引，使用 manifold_emb 范数（不推荐）
+                manifold_raw = manifold_emb_for_stats[:, 1:, :]  # [B, N, dim], 排除 CLS
+                norm_x = manifold_raw.norm(dim=-1)  # [B, N]
+                poincare_dist = torch.atanh(torch.clamp(norm_x, max=0.99))
+                poincare_dist_mean = float(poincare_dist.mean().item())
+                poincare_dist_std = float(poincare_dist.std().item())
 
         # P11-3: 为 regions 添加 CLS 对应的零填充
         if regions is not None:
@@ -1727,12 +1709,172 @@ class FractalCurveViT(nn.Module):
         # I141: num_tokens 直接使用 GPU tensor，训练器负责转换
         # 保持原始 tensor 格式，避免 .cpu() 调用
 
-        # I150-3 NEW: 从 split_result 提取 mean_abs_logits
-        mean_abs_logits = 0.0
-        if split_result is not None and hasattr(split_result, 'mean_abs_logits'):
-            mean_abs_logits = split_result.mean_abs_logits
+        # I-AUDIT: 从 split_result 提取统计数据
+        # I150-3 NEW: mean_abs_logits
+        # I-AUDIT: 新增 splitter_logits_mean/std, active_ratio
+        mean_abs_logits = None
+        splitter_logits_mean = None
+        splitter_logits_std = None
+        active_ratio = None
+        if split_result is not None:
+            if hasattr(split_result, 'mean_abs_logits') and split_result.mean_abs_logits is not None:
+                mean_abs_logits = split_result.mean_abs_logits
+            # I-AUDIT: 从 split_result.logits 提取 splitter logits 统计
+            if hasattr(split_result, 'logits') and split_result.logits is not None:
+                splitter_logits_mean = float(split_result.logits.mean().item())
+                splitter_logits_std = float(split_result.logits.std().item())
+            # I-AUDIT: 从 split_result.selected_mask 计算 active_ratio
+            if hasattr(split_result, 'selected_mask') and split_result.selected_mask is not None:
+                total_tokens = split_result.selected_mask.numel()
+                selected_tokens = split_result.selected_mask.sum().item()
+                active_ratio = selected_tokens / total_tokens if total_tokens > 0 else None
+
+        # I-AUDIT: 计算 budget_loss (Elastic Budget 损失)
+        # 基于实际 token 数与目标 ratio 的差异
+        budget_loss = None
+        if num_tokens_tensor is not None and self.target_ratio is not None:
+            # target_ratio 是 L1 相对参数
+            # 目标 token 数 = 总 patch 数 * target_ratio
+            total_patches = lengths.sum().item() if isinstance(lengths, torch.Tensor) else int(lengths.sum()) if hasattr(lengths, 'sum') else int(lengths)
+            target_tokens = total_patches * self.target_ratio
+            actual_tokens = num_tokens_tensor.sum().item() if isinstance(num_tokens_tensor, torch.Tensor) else int(num_tokens_tensor)
+            if target_tokens > 0:
+                budget_loss = float(abs(actual_tokens - target_tokens) / target_tokens)
+
+        # I-AUDIT: 计算 density_regularization (密度正则化)
+        # 基于选中 token 分布的均匀性
+        density_regularization = None
+        if split_result is not None and hasattr(split_result, 'selected_mask') and split_result.selected_mask is not None:
+            # 计算每个样本的选中比例，然后计算方差（方差越小越均匀）
+            selected_per_sample = split_result.selected_mask.sum(dim=1).float()  # [B]
+            total_per_sample = split_result.selected_mask.shape[1]
+            ratios = selected_per_sample / total_per_sample  # [B]
+            # 方差越小表示分布越均匀
+            density_regularization = float(ratios.var().item()) if ratios.numel() > 1 else 0.0
+
+        # I-AUDIT: 计算 H1SS 辅助损失 (可微分的真实损失)
+        # 这些是真正的 tensor 损失，会影响梯度
+        auxiliary_losses = None
+        if self.training and split_result is not None:
+            if hasattr(self.splitter, 'get_auxiliary_losses'):
+                try:
+                    auxiliary_losses = self.splitter.get_auxiliary_losses(
+                        split_result=split_result,
+                        target_ratio=self.target_ratio if hasattr(self, 'target_ratio') else 0.1,
+                    )
+                except Exception:
+                    # 如果辅助损失计算失败，跳过（不中断训练）
+                    auxiliary_losses = None
+
+        # I-AUDIT: 计算 theoretical_flops_reduction
+        # 分形 ViT: O(K^2) attention，标准 ViT: O(N^2) attention
+        theoretical_flops_reduction = None
+        if num_tokens_tensor is not None and lengths is not None:
+            actual_tokens = num_tokens_tensor.sum().item() if isinstance(num_tokens_tensor, torch.Tensor) else int(num_tokens_tensor)
+            # 估算标准 ViT 的 patch 数 (基于 min_patch_size)
+            h, w = 224, 224  # 默认值
+            if image_size is not None:
+                if isinstance(image_size, tuple):
+                    h, w = image_size
+                elif isinstance(image_size, int):
+                    h, w = image_size, image_size
+                elif isinstance(image_size, torch.Tensor):
+                    h, w = int(image_size[0].item()), int(image_size[1].item())
+            min_ps = self.min_patch_size if hasattr(self, 'min_patch_size') else 4
+            total_patches = (h // min_ps) * (w // min_ps)
+            if total_patches > 0 and actual_tokens > 0:
+                standard_flops = float(total_patches ** 2)
+                fractal_flops = float(actual_tokens ** 2)
+                theoretical_flops_reduction = 1.0 - (fractal_flops / standard_flops)
 
         # I170: 添加 redundancy 和 child_features 到 TrainingStats
+        # I-AUDIT: 添加 splitter_logits_mean/std, active_ratio, manifold_bias_*, poincare_dist_*,
+        #           budget_loss, density_regularization, theoretical_flops_reduction
+
+        # === 收集 auxiliary_outputs（layer-packaged → trainer-unpacked 架构） ===
+        auxiliary_outputs: Dict[str, Any] = {}
+
+        # Splitter 输出
+        if split_result is not None and hasattr(split_result, 'splitter_output'):
+            splitter_out = split_result.splitter_output
+            if splitter_out:  # 非空才记录
+                auxiliary_outputs["splitter"] = splitter_out
+
+        # Attention 和 FFN 输出（遍历每个 transformer block）
+        # I<fix>: transformer 有 layers 属性，不是 blocks
+        if hasattr(self.transformer, 'layers'):
+            for i, block in enumerate(self.transformer.layers):
+                # Attention 输出 (I<issue>: block.attention not block.attn)
+                if hasattr(block, 'attention') and hasattr(block.attention, 'attn_output'):
+                    attn_out = block.attention.attn_output
+                    if attn_out:  # 非空才记录
+                        auxiliary_outputs[f"attn_{i}"] = attn_out
+                # FFN 输出（block.ff 是 AdaptiveFractalFeedForward 实例）
+                if hasattr(block, 'ff') and hasattr(block.ff, 'ffn_output'):
+                    ffn_out = block.ff.ffn_output
+                    if ffn_out:  # 非空才记录
+                        auxiliary_outputs[f"ffn_{i}"] = ffn_out
+
+        # === Embeddings 诊断收集 ===
+        # 1. 递归收集所有 embed_output
+        embed_diagnostics = collect_auxiliary_diagnostics(self)
+        if embed_diagnostics:
+            auxiliary_outputs["embed"] = embed_diagnostics
+
+        # 2. levels_info 诊断（需 forward 上下文）
+        levels_diag: Dict[str, Any] = {}
+        if 'levels_info' in dir() and levels_info is not None:
+            # embed/distribution/*
+            if hasattr(levels_info, 'depths'):
+                depths = levels_info.depths
+                max_d = int(depths.max()) + 1
+                total = depths.numel()
+                for d in range(max_d):
+                    ratio = (depths == d).float().sum().item() / max(total, 1)
+                    levels_diag[f"distribution/depth_ratio_lvl_{d}"] = ratio
+                levels_diag["distribution/mean_depth"] = float(depths.float().mean().item())
+
+            # path_diversity_ratio（避免 torch.unique 开销）
+            if hasattr(levels_info, 'paths') and levels_info.paths is not None:
+                paths = levels_info.paths  # [B, N, max_level]
+                total_tokens = paths.shape[1]
+                for lvl in range(paths.shape[-1]):
+                    lvl_paths = paths[..., lvl]  # [B, N]
+                    unique_count = torch.unique(lvl_paths).numel()
+                    max_possible = 2 ** paths.shape[-1]
+                    diversity_ratio = unique_count / max_possible if max_possible > 0 else 0.0
+                    levels_diag[f"distribution/path_diversity_ratio_lvl_{lvl}"] = float(diversity_ratio)
+
+            # geo_emb_norm（使用 manifold_emb_for_stats）
+            if manifold_emb_for_stats is not None:
+                # manifold_emb_for_stats 形状: [B, N+1, dim]，排除 CLS
+                geo_emb = manifold_emb_for_stats[:, 1:, :].reshape(-1, manifold_emb_for_stats.shape[-1])
+                norms = geo_emb.norm(dim=-1)
+                levels_diag["distribution/geo_emb_norm_mean"] = float(norms.mean().item())
+                levels_diag["distribution/geo_emb_norm_std"] = float(norms.std().item())
+
+            # scale_consistency_dist（C3 约束）
+            if hasattr(self.pos_embedding, 'check_scale_consistency'):
+                try:
+                    scale_dist = self.pos_embedding.check_scale_consistency(levels_info)
+                    if scale_dist is not None:
+                        levels_diag["health/scale_consistency_dist"] = float(scale_dist.item())
+                except Exception:
+                    pass
+
+        if levels_diag:
+            auxiliary_outputs["levels"] = levels_diag
+
+        # 3. 全局 NaN/Inf 统计
+        try:
+            from vit_pytorch.core.numerical_stability import get_nan_fix_count
+            nan_counts = get_nan_fix_count()
+            if nan_counts:
+                auxiliary_outputs["nan_safe_softplus"] = {"fix_count": nan_counts.get("safe_softplus", 0)}
+                auxiliary_outputs["nan_grad_hooks"] = {"fix_count": nan_counts.get("nan_grad_hooks", 0)}
+        except ImportError:
+            pass
+
         stats = TrainingStats(
             logits=final_output,
             num_tokens=num_tokens_tensor,  # GPU tensor，避免 CPU 同步
@@ -1745,6 +1887,20 @@ class FractalCurveViT(nn.Module):
             redundancy=redundancy,  # I170: 语义分裂器的冗余性分数
             child_features=child_features,  # I170: 语义分裂器的子节点特征
             mean_abs_logits=mean_abs_logits,  # I150-3 NEW: Splitter Logits 平均绝对值
+            splitter_logits_mean=splitter_logits_mean,  # I-AUDIT: Splitter logits 均值
+            splitter_logits_std=splitter_logits_std,  # I-AUDIT: Splitter logits 标准差
+            active_ratio=active_ratio,  # I-AUDIT: 活跃 token 比例
+            manifold_bias_max=manifold_bias_max,  # I-AUDIT: 流形偏置最大值
+            manifold_bias_min=manifold_bias_min,  # I-AUDIT: 流形偏置最小值
+            manifold_bias_mean=manifold_bias_mean,  # I-AUDIT: 流形偏置均值
+            manifold_bias_std=manifold_bias_std,  # I-AUDIT: 流形偏置标准差
+            poincare_dist_mean=poincare_dist_mean,  # I-AUDIT: Poincaré 距离均值
+            poincare_dist_std=poincare_dist_std,  # I-AUDIT: Poincaré 距离标准差
+            budget_loss=budget_loss,  # I-AUDIT: Elastic Budget 损失
+            density_regularization=density_regularization,  # I-AUDIT: 密度正则化
+            theoretical_flops_reduction=theoretical_flops_reduction,  # I-AUDIT: FLOPs 减少量
+            auxiliary_losses=auxiliary_losses,  # I-AUDIT: H1SS 辅助损失
+            auxiliary_outputs=auxiliary_outputs if auxiliary_outputs else None,  # 新增: 各层诊断包裹
         )
 
         return stats
@@ -1793,20 +1949,15 @@ class FractalCurveViT(nn.Module):
             pass
 
     # =====================================================================
-    # I110-7: 语义分裂器接口
+    # I110-7: 语义分裂器接口（已废弃 - 2026-03-23）
     # =====================================================================
-    @property
-    def use_semantic_splitter(self) -> bool:
-        """是否使用语义分裂器"""
-        return self._use_semantic_splitter
-
     def get_semantic_splitter(self) -> Optional[nn.Module]:
-        """获取语义分裂器实例"""
-        return self._semantic_splitter
+        """获取语义分裂器实例（已废弃，总返回 None）"""
+        return None
 
     def get_semantic_loss_fn(self) -> Optional[nn.Module]:
-        """获取语义损失函数"""
-        return self._semantic_loss_fn
+        """获取语义损失函数（已废弃，总返回 None）"""
+        return None
 
     def compute_semantic_loss(
         self,
@@ -1814,20 +1965,14 @@ class FractalCurveViT(nn.Module):
         child_features: torch.Tensor,
         split_decision: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """计算语义冗余损失 (I110-7)
-
-        Args:
-            parent_features: [B, N, D] 父节点特征
-            child_features: [B, N, 4, D] 子节点特征
-            split_decision: [B, N] 分裂决策
+        """计算语义冗余损失 (I110-7 - 已废弃)
 
         Returns:
-            包含 loss, diversity_loss, reconstruction_loss 的字典
+            总返回零损失（语义分裂器已废弃 - 2026-03-23）
         """
-        if self._semantic_loss_fn is None:
-            return {'loss': torch.tensor(0.0, device=parent_features.device)}
-
-        return self._semantic_loss_fn(parent_features, child_features, split_decision)
+        # 参数保留但未使用（避免接口变更）
+        _ = parent_features, child_features, split_decision
+        return {'loss': torch.tensor(0.0, device=parent_features.device)}
 
     def analyze_tokenization(self, img: torch.Tensor) -> Dict[str, Any]:
         """分析 tokenization 过程，返回详细统计信息。
@@ -1844,10 +1989,6 @@ class FractalCurveViT(nn.Module):
         with torch.no_grad():
             # I98-2 Bug 修复: 使用完整 pipeline，需要 split_result 参数
             features = self._feature_extractor(img)
-            # P-OPT: SemanticRedundancySplitter 需要 3D 输入
-            if self._is_semantic_splitter:
-                B, C, H_feat, W_feat = features.shape
-                features = features.view(B, C, H_feat * W_feat).transpose(1, 2)
             split_result = self.splitter(
                 features,
                 image_size=(img.shape[2], img.shape[3]),

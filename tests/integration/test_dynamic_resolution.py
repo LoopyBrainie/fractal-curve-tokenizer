@@ -132,7 +132,7 @@ class TestTokenizerDynamicResolution:
     def test_tokenizer_dynamic_size(self):
         """Verify tokenizer handles dynamic input sizes."""
         from vit_pytorch import StreamingFractalTokenizerV3
-        from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
+        from vit_pytorch.layers.splitters.hilbert_optimal_splitter import HilbertOptimalSplitter
 
         # Note: tokenizer requires image_size at init, but supports variable input
         tokenizer = StreamingFractalTokenizerV3(
@@ -141,7 +141,7 @@ class TestTokenizerDynamicResolution:
             max_level=8,
         )
 
-        splitter = GumbelTopKSplitter(
+        splitter = HilbertOptimalSplitter(
             feature_dim=256,
             min_patch_size=4,
             max_level_limit=8,

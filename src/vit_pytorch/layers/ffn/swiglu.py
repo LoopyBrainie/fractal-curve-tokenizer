@@ -70,7 +70,7 @@ FFN 变体选项 (ffn_type):
 from __future__ import annotations
 
 import warnings
-from typing import Literal, Optional
+from typing import Dict, Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -239,6 +239,13 @@ class AdaptiveFractalFeedForward(nn.Module):
             self.level_embedding = None
             self.shared_level_adapter = None
             self.level_mixing_weights = None
+
+        # === 诊断数据记录器（Layer-Packaged -> Trainer-Unpacked 架构）===
+        # 使用统一缓存替代散落的 _last_xxx 变量，避免 DDP 不同步问题
+        self._diagnostic_cache: Dict[str, float] = {}
+        # 保留旧变量以兼容现有逻辑（将在 ffn_output 中整合）
+        self._last_adapter_norm: Optional[torch.Tensor] = None
+        self._last_level_mixing_weights: Optional[torch.Tensor] = None
     
     def _apply_level_adaptation(
         self, 
@@ -274,7 +281,24 @@ class AdaptiveFractalFeedForward(nn.Module):
 
         adapter_input = torch.cat([x_norm, level_embs], dim=-1)
         level_adapted = self.shared_level_adapter(adapter_input)
-        
+
+        # 记录诊断数据
+        self._last_adapter_norm = level_adapted.norm().detach()
+        self._last_level_mixing_weights = mixing_weights.detach()
+
+        # === P1: 增强诊断缓存 ===
+        adapter_norm_val = float(level_adapted.norm().item())
+        self._diagnostic_cache["adapter_norm"] = adapter_norm_val
+        # 混合权重分布统计
+        self._diagnostic_cache["level_mixing_min"] = float(mixing_weights.min().item())
+        self._diagnostic_cache["adapter_dominance"] = float((mixing_weights > 0.5).float().mean().item())
+        # === P1: 计算贡献比率（带数值安全 clamp）===
+        # I-NAN: 训练初期 main_ffn_norm 因 gamma=0.01 可能极小，
+        # adapter_norm / tiny_value 会产生极大离群点，clamp 防止 WandB 图表缩放被破坏
+        main_norm = self._diagnostic_cache.get("main_ffn_norm", 0.0)
+        if main_norm > 1e-6:  # 更严格的阈值避免极小值
+            self._diagnostic_cache["contribution_ratio"] = min(adapter_norm_val / main_norm, 100.0)
+
         return main_out * (1 - mixing_weights) + level_adapted * mixing_weights
 
     def forward(self, x: torch.Tensor, levels_info: Optional[LevelsInfo] = None) -> torch.Tensor:
@@ -316,6 +340,12 @@ class AdaptiveFractalFeedForward(nn.Module):
         beta = self.ffn_beta(depths)    # [B, S, D]
         x_norm = x_norm * gamma + beta
 
+        # === P0: 捕获 gamma/beta 运行时统计 ===
+        self._diagnostic_cache["ffn_gamma_mean"] = float(gamma.mean().item())
+        self._diagnostic_cache["ffn_gamma_std"] = float(gamma.std().item())
+        self._diagnostic_cache["ffn_beta_mean"] = float(beta.mean().item())
+        self._diagnostic_cache["ffn_beta_std"] = float(beta.std().item())
+
         # ========== FFN 主网络 ==========
         if self.ffn_type in ('swiglu', 'swiglu_level'):
             assert self.swiglu is not None
@@ -324,8 +354,52 @@ class AdaptiveFractalFeedForward(nn.Module):
             assert self.main_net is not None
             main_out = self.main_net(x_norm)
 
+        # === P0: 捕获主 FFN 输出范数 ===
+        self._diagnostic_cache["main_ffn_norm"] = float(main_out.norm().item())
+
         # ========== Level Adaptation ==========
         if self.use_level_adaptation and levels_info is not None and levels_info.data.numel() > 0:
             main_out = self._apply_level_adaptation(x_norm, main_out, levels_info, batch, seq_len)
 
         return main_out
+
+    @property
+    def ffn_output(self) -> dict:
+        """FFN 层的增强诊断包裹
+
+        遵循 Layer-Packaged -> Trainer-Unpacked 哲学。
+        使用扁平键名格式（展平后变为 train/ffn_0/{key}）。
+
+        诊断字段:
+            - ffn_gamma_mean/std, ffn_beta_mean/std: 层级感知归一化参数
+            - level_mixing_mean/std/min/max: 层级混合权重分布
+            - adapter_dominance: 混合权重 > 0.5 的 Token 比例
+            - main_ffn_norm: 主 FFN 输出范数
+            - adapter_norm: Adapter 输出范数
+            - contribution_ratio: Adapter 相对于 FFN 的贡献率
+            - ffn_type: FFN 类型标志
+        """
+        output = {}
+
+        # 1. 层级感知归一化参数（来自 ffn_gamma/ffn_beta Embedding 权重）
+        if hasattr(self, 'ffn_gamma'):
+            output["ffn_gamma_mean"] = float(self.ffn_gamma.weight.mean().item())
+            output["ffn_gamma_std"] = float(self.ffn_gamma.weight.std().item())
+        if hasattr(self, 'ffn_beta'):
+            output["ffn_beta_mean"] = float(self.ffn_beta.weight.mean().item())
+            output["ffn_beta_std"] = float(self.ffn_beta.weight.std().item())
+
+        # 2. 运行时诊断缓存（forward 中捕获）
+        output.update(self._diagnostic_cache)
+
+        # 3. 兼容旧版 _last_xxx 变量（level_mixing 统计）
+        if self._last_level_mixing_weights is not None:
+            w = self._last_level_mixing_weights
+            output["level_mixing_mean"] = float(w.mean().item())
+            output["level_mixing_std"] = float(w.std().item())
+            output["level_mixing_max"] = float(w.max().item())
+
+        # 4. FFN 类型标志
+        output["ffn_type"] = self.ffn_type
+
+        return output

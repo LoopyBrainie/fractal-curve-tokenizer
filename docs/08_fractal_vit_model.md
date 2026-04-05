@@ -4,7 +4,13 @@
 
 `FractalCurveViT` is the complete Vision Transformer model that integrates all components: tokenization, position encoding, transformer encoder, and classification head.
 
-**Architecture Note**: The model uses configurable splitter (`splitter_type`) for token selection. Supported splitters include `GumbelTopKSplitter`, `DeterministicNeighborSplitter`, `SemanticRedundancySplitter`, and `HilbertOptimalSplitter`. The tokenizer expects split results from the splitter, following the I98-1 pipeline architecture.
+**Architecture Note**: The model uses a configurable splitter for token selection:
+
+- **H1SS (Hilbert Splitter with Stable Selection)** - `HilbertOptimalSplitter` - **Recommended**
+- **H-entmax** - `HilbertOrderedEntmaxSplitter` - Alternative with full gradient flow
+- **GumbelTopKSplitter** - Legacy option with STE approximation
+
+The tokenizer expects split results from the splitter, following the I98-1 pipeline architecture.
 
 ---
 
@@ -39,23 +45,38 @@ class FractalCurveViT(nn.Module):
     def __init__(
         self,
         *,
-        image_size: int,
-        num_classes: int,
+        image_size: Optional[Union[int, Tuple[int, int]]] = None,
+        num_classes: int = 1000,
         dim: int = 512,
-        depth: int = 6,
+        num_layers: int = 6,
         heads: int = 8,
-        mlp_dim: int = None,  # Default: dim × 4
-        pool: str = 'cls',
+        mlp_dim: int = 1024,
+        pool: str = 'weighted',
         channels: int = 3,
         dim_head: int = 64,
-        dropout: float = 0.1,
+        min_patch_size: int = 4,
+        tokenizer_dropout: float = 0.0,
+        transformer_dropout: float = 0.0,
         emb_dropout: float = 0.0,
-        tokenizer_type: str = 'streaming_v3',
-        hilbert_bias_mode: str = 'lca',
+        drop_path_rate: float = 0.0,
+        # Splitter configuration
+        splitter_type: str = 'gumbel_topk',
+        splitter_token_ratio_min: float = 0.02,
+        splitter_token_ratio_max: float = 0.15,
+        splitter_temp_start: float = 1.0,
+        splitter_temp_end: float = 0.5,
+        K_min_abs: int = 8,
+        quota_learnable: bool = True,
+        quota_entropy_weight: float = 0.5,
+        # H1SS specific
+        entmax_alpha: float = 1.2,
+        tree_constraint_weight: float = 0.1,
+        density_field_hidden_dim: int = 32,
+        # Model configuration
         ffn_type: str = 'swiglu_level',
-        low_rank_r: int = 32,
-        lca_temperature: float = 1.5,
-        learnable_temperature: bool = True,
+        use_checkpoint: bool = False,
+        depth_scale_range: Tuple[float, float] = (0.5, 2.0),
+        **kwargs,
     ):
         ...
 ```
@@ -64,28 +85,24 @@ class FractalCurveViT(nn.Module):
 
 | Parameter | Type | Default | Description |
 |:----------|:-----|:--------|:------------|
-| `image_size` | int | - | Input image size (None for dynamic) |
-| `num_classes` | int | - | Number of output classes |
+| `image_size` | int / Tuple | None | Input image size (supports dynamic resolution) |
+| `num_classes` | int | 1000 | Number of output classes |
 | `dim` | int | 512 | Model embedding dimension |
-| `depth` | int | 6 | Number of transformer layers |
+| `num_layers` | int | 6 | Number of transformer layers |
 | `heads` | int | 8 | Number of attention heads |
-| `mlp_dim` | int | dim × 4 | FFN hidden dimension |
-| `pool` | str | 'weighted' | Pooling strategy ('cls', 'mean', or 'weighted') |
-| `tokenizer_dropout` | float | 0.0 | Tokenizer dropout (must be 0.0 for determinism) |
-| `transformer_dropout` | float | 0.0 | Transformer dropout rate |
-| `emb_dropout` | float | 0.0 | Embedding dropout rate |
-| `drop_path_rate` | float | 0.0 | Drop path rate |
-| `splitter_type` | str | 'gumbel_topk' | Splitter type ('gumbel_topk', 'deterministic_neighbor', 'semantic_redundancy', 'hilbert_optimal') |
-| `splitter_token_ratio_min` | float | 0.02 | Minimum token ratio (2%) |
-| `splitter_token_ratio_max` | float | 0.15 | Maximum token ratio (15%) |
-| `K_min_abs` | int | 8 | Absolute minimum token count |
-| `use_manifold_native` | bool | True | Use manifold-native attention |
-| `manifold_beta` | float | 4.0 | Hilbert bandwidth coefficient |
-| `enable_hilbert_smoothness` | bool | False | Enable Hilbert-aware smoothness regularization |
-| `enable_meta_dvn` | bool | False | Enable meta-aware depth variance network |
-| `use_pattern_encoder` | bool | False | Enable Hilbert pattern encoder |
-| `use_pattern_plugin` | bool | False | Enable dual-path pattern plugin |
-| `ffn_type` | str | 'swiglu_level' | FFN type ('gelu', 'swiglu', 'swiglu_level') |
+| `mlp_dim` | int | 1024 | FFN hidden dimension |
+| `pool` | str | 'weighted' | Pooling strategy ('cls', 'mean', 'weighted') |
+| `min_patch_size` | int | 4 | Minimum patch size |
+| `drop_path_rate` | float | 0.0 | DropPath rate |
+| `splitter_type` | str | 'gumbel_topk' | Splitter: `hilbert_optimal` (H1SS), `hilbert_entmax`, `gumbel_topk` |
+| `K_min_abs` | int | 8 | Minimum absolute token count |
+| `splitter_token_ratio_min` | float | 0.02 | Minimum token ratio |
+| `splitter_token_ratio_max` | float | 0.15 | Maximum token ratio |
+| `depth_scale_range` | tuple | (0.5, 2.0) | P6-1 depth scale range for sigmoid parameterization |
+| `ffn_type` | str | 'swiglu_level' | FFN type |
+| `quota_learnable` | bool | True | Enable learnable quota allocation |
+| `entmax_alpha` | float | 1.2 | H1SS Entmax alpha parameter |
+| `tree_constraint_weight` | float | 0.1 | Tree consistency constraint weight |
 
 ---
 
@@ -94,17 +111,19 @@ class FractalCurveViT(nn.Module):
 ### Step-by-Step Data Flow
 
 ```python
-def forward(self, img: Tensor) -> TrainingStats:
+def forward(self, img: Tensor) -> Union[Tensor, TrainingStats]:
     """
     Args:
         img: (B, C, H, W) - Input images
 
     Returns:
-        TrainingStats containing:
+        TrainingStats with:
         - logits: (B, num_classes) - Classification logits
-        - num_tokens: int or List[int] - Number of valid tokens
+        - num_tokens: int - Number of valid tokens
         - depth_used: int - Maximum depth actually used
-        - depth_distribution: Dict[int, int] - Token count per depth level
+        - depth_distribution: Tensor - Token count per depth level
+        - features: Tensor - Transformer output features
+        - transformer_tokens: Tensor - Token embeddings after transformer
     """
 ```
 
@@ -219,6 +238,17 @@ Input Image (B, C, H, W)
         │
         ▼
 ┌─────────────────────────────────┐
+│     HilbertOptimalSplitter      │
+│     (H1SS - Recommended)       │
+│  ┌────────────────────────────┐ │
+│  │ HilbertConv1D Complexity   │ │
+│  │ Entmax Sparse Selection      │ │
+│  │ Tree Consistency Constraint │ │
+│  └────────────────────────────┘ │
+└─────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────┐
 │  StreamingFractalTokenizerV3    │
 │  ├── Complexity Estimation      │
 │  ├── Adaptive Quadtree Split    │
@@ -274,55 +304,36 @@ Input Image (B, C, H, W)
 
 ## 8.7 Usage Examples
 
-### Basic Usage
+### Basic Usage with H1SS (Recommended)
 
 ```python
-from vit_pytorch import FractalCurveViT, TrainingStats
+from vit_pytorch import FractalCurveViT
 
+# H1SS (Hilbert Splitter with Stable Selection)
 model = FractalCurveViT(
     image_size=224,
     num_classes=1000,
-    dim=384,
-    depth=6,
-    heads=6,
-    mlp_dim=768,
-    pool='weighted',
-    splitter_type='gumbel_topk',
-    use_manifold_native=True,
-    manifold_beta=4.0,
+    dim=512,
+    num_layers=6,
+    heads=8,
+    mlp_dim=1024,
+    splitter_type='hilbert_optimal',  # H1SS - Recommended
     ffn_type='swiglu_level',
+    depth_scale_range=(0.5, 2.0),  # P6-1: sigmoid parameterization
 )
 
 images = torch.randn(4, 3, 224, 224)
-result = model(images)  # Returns TrainingStats
-logits = result.logits  # (4, 1000)
-print(f"Tokens: {result.num_tokens}, Depth: {result.depth_used}")
+logits = model(images)  # Returns TrainingStats with logits
 ```
 
-### With Different Splitter Types
+### With H-entmax (Full Gradient Flow)
 
 ```python
-# Hilbert Optimal Splitter (V4 - deterministic)
+# H-entmax provides 100% gradient coverage
 model = FractalCurveViT(
     image_size=224,
     num_classes=1000,
-    splitter_type='hilbert_optimal',
-    splitter_token_ratio_min=0.05,
-    splitter_token_ratio_max=0.20,
-)
-
-# Deterministic Neighbor Splitter
-model = FractalCurveViT(
-    image_size=224,
-    num_classes=1000,
-    splitter_type='deterministic_neighbor',
-)
-
-# Semantic Redundancy Splitter
-model = FractalCurveViT(
-    image_size=224,
-    num_classes=1000,
-    splitter_type='semantic_redundancy',
+    splitter_type='hilbert_entmax',  # Full gradient flow
 )
 ```
 
@@ -332,10 +343,9 @@ model = FractalCurveViT(
 from vit_pytorch import FractalConfig, FractalCurveViT
 
 config = FractalConfig(
-    d_model=384,
-    num_heads=6,
-    hilbert_bias_mode='lca',
-    max_depth=4,
+    d_model=512,
+    num_heads=8,
+    max_level=8,
 )
 
 model = FractalCurveViT(
@@ -354,12 +364,12 @@ for images, labels in dataloader:
     with torch.cuda.amp.autocast():
         logits = model(images)
         loss = criterion(logits, labels)
-    
+
     optimizer.zero_grad()
     scaler.scale(loss).backward()
     scaler.step(optimizer)
     scaler.update()
-    
+
     # Clear cache to prevent memory accumulation
     model.clear_tokenizer_cache()
 ```

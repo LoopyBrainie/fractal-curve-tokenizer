@@ -6,10 +6,13 @@ Tracks gradient norms for analysis and debugging.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
 import torch
 import torch.nn as nn
 from collections import defaultdict
+
+if TYPE_CHECKING:
+    from ..metrics.collector import MetricsCollector
 
 
 class GradientMonitor:
@@ -30,21 +33,13 @@ class GradientMonitor:
         monitor.reset()
     """
 
-    # I150-3: 关键组件名称关键字（用于识别特定模块的梯度）
-    KEY_COMPONENT_KEYWORDS = {
-        "manifold_decoder": ["manifold", "decoder", "poincare", "hyperbolic"],
-        "entmax": ["entmax", "sparsemax", "alpha_entmax"],
-        "splitter": ["splitter", "gumbel", "tokenizer", "selector"],
-        "backbone": ["transformer", "encoder", "blocks", "attn", "mlp"],
-        "embedding": ["embed", "patch_embed", "cls_token", "pos_embed"],
-    }
-
     def __init__(
         self,
         model: Optional[nn.Module] = None,
         record_layer_norms: bool = True,
         hooks_enabled: bool = True,
         track_key_components: bool = True,
+        collector: Optional["MetricsCollector"] = None,
     ):
         """Initialize GradientMonitor
 
@@ -53,11 +48,13 @@ class GradientMonitor:
             record_layer_norms: Whether to record per-layer norms
             hooks_enabled: Whether to register backward hooks
             track_key_components: I150-3: 是否追踪关键组件（ManifoldDecoder等）
+            collector: Optional MetricsCollector for unified metrics pipeline
         """
         self.model = model
         self.record_layer_norms = record_layer_norms
         self.hooks_enabled = hooks_enabled
         self.track_key_components = track_key_components
+        self.collector = collector
 
         # Storage
         self.layer_norms: Dict[str, List[float]] = defaultdict(list)
@@ -107,6 +104,11 @@ class GradientMonitor:
             if param.grad is not None:
                 norms[name] = param.grad.norm().item()
 
+        # Emit to MetricsCollector if available
+        if self.collector is not None:
+            for name, norm in norms.items():
+                self.collector.record(f"layer_grad_norm_{name}", norm)
+
         return norms
 
     def compute_total_grad_norm(self) -> float:
@@ -143,54 +145,13 @@ class GradientMonitor:
     def compute_component_grad_norms(self) -> Dict[str, float]:
         """I150-3: 计算关键组件的梯度范数
 
-        特别追踪:
-        - ManifoldDecoder (流形解码器)
-        - Entmax (稀疏注意力)
-        - Splitter (分形分割器)
-        - Backbone (Transformer主干)
-        - Embedding (嵌入层)
+        Deprecated: 使用 layer-packaged 架构后，组件梯度通过 auxiliary_outputs
+        直接从各层获取，不再使用 KEY_COMPONENT_KEYWORDS 进行字符串匹配。
 
         Returns:
-            Dictionary of component name -> gradient norm
+            空字典（保持接口兼容）
         """
-        if self.model is None:
-            return {}
-
-        # 初始化组件梯度
-        component_norms: Dict[str, float] = {
-            "manifold_decoder": 0.0,
-            "entmax": 0.0,
-            "splitter": 0.0,
-            "backbone": 0.0,
-            "embedding": 0.0,
-            "other": 0.0,
-        }
-
-        for name, param in self.model.named_parameters():
-            if param.grad is not None:
-                norm = param.grad.norm().item()
-                matched = False
-
-                # 根据关键字匹配组件
-                name_lower = name.lower()
-                for comp_name, keywords in self.KEY_COMPONENT_KEYWORDS.items():
-                    if any(kw in name_lower for kw in keywords):
-                        component_norms[comp_name] += norm
-                        matched = True
-                        break
-
-                if not matched:
-                    component_norms["other"] += norm
-
-        # 记录到统计中
-        if self.track_key_components:
-            for comp_name, norm in component_norms.items():
-                if norm > 0:
-                    self.component_grad_norms[comp_name].append(norm)
-
-        return component_norms
-
-    def get_component_grad_statistics(self) -> Dict[str, Dict[str, float]]:
+        return {}
         """I150-3: 获取关键组件的梯度统计
 
         Returns:

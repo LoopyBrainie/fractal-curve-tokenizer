@@ -34,6 +34,7 @@ def train_one_epoch(
     scheduler: Optional[Any] = None,
     mixup_cutmix: Optional[MixupCutmixLoss] = None,
     debug_dir: Optional[str] = None,
+    collector: Optional[Any] = None,  # NEW: Optional MetricsCollector
 ) -> EpochMetrics:
     """Train for one epoch
 
@@ -56,17 +57,22 @@ def train_one_epoch(
     """
     model.train()
 
-    # Initialize monitors
+    # Initialize monitors (use collector if provided)
     grad_monitor = GradientMonitor(
         model=model,
         record_layer_norms=config.numerical.record_layer_grad_norms,
         hooks_enabled=config.numerical.record_grad_norms,
+        collector=collector,
     )
-    loss_monitor = LossMonitor()
+    # I-NAN: 注册梯度 hooks 以启用 layer_norms 追踪
+    if config.numerical.record_grad_norms:
+        grad_monitor.register_hooks(model)
+    loss_monitor = LossMonitor(collector=collector)
     defender = NumericalDefender(
         model=model,
         detect_anomaly=config.numerical.detect_anomaly,
         skip_on_nan=config.numerical.skip_on_nan_grad,
+        collector=collector,
     )
 
     # I-NAN: 初始化 NaN 自动取证器
@@ -91,26 +97,42 @@ def train_one_epoch(
     skipped_steps = 0
 
     # 新增: 实验详细日志指标 accumulators
-    total_splitter_logits_mean = 0.0
-    total_splitter_logits_std = 0.0
-    total_active_ratio = 0.0
-    total_manifold_bias_max = 0.0
-    total_manifold_bias_min = 0.0
-    total_manifold_bias_mean = 0.0
-    total_manifold_bias_std = 0.0
-    total_poincare_dist_mean = 0.0
-    total_poincare_dist_std = 0.0
-    total_backbone_grad_norm = 0.0
-    total_splitter_grad_norm = 0.0
-    total_entmax_grad_norm = 0.0
-    total_manifold_decoder_grad_norm = 0.0
-    total_budget_penalty = 0.0
-    total_consistency_loss = 0.0
-    total_entropy_loss = 0.0
-    total_theoretical_flops_reduction = 0.0
-    total_mean_abs_logits = 0.0  # I150-3 NEW: Splitter Logits 平均绝对值
-    total_budget_loss = 0.0  # I150-3 NEW: Elastic Budget 损失
-    total_density_regularization = 0.0  # I150-3 NEW: 密度正则化损失
+    # I-AUDIT: 使用 None 初始值，只有在收到有效数据时才累加
+    total_splitter_logits_mean: Optional[float] = None
+    total_splitter_logits_std: Optional[float] = None
+    _splitter_logits_count: int = 0  # I-AUDIT: 跟踪有效值数量
+    total_active_ratio: Optional[float] = None
+    _active_ratio_count: int = 0
+    total_manifold_bias_max: Optional[float] = None
+    total_manifold_bias_min: Optional[float] = None
+    total_manifold_bias_mean: Optional[float] = None
+    total_manifold_bias_std: Optional[float] = None
+    _manifold_bias_count: int = 0
+    total_poincare_dist_mean: Optional[float] = None
+    total_poincare_dist_std: Optional[float] = None
+    _poincare_dist_count: int = 0
+    total_backbone_grad_norm: Optional[float] = None
+    _backbone_grad_count: int = 0
+    total_splitter_grad_norm: Optional[float] = None
+    _splitter_grad_count: int = 0
+    total_entmax_grad_norm: Optional[float] = None
+    _entmax_grad_count: int = 0
+    total_manifold_decoder_grad_norm: Optional[float] = None
+    _manifold_decoder_grad_count: int = 0
+    total_budget_penalty: Optional[float] = None
+    _budget_penalty_count: int = 0
+    total_consistency_loss: Optional[float] = None
+    _consistency_loss_count: int = 0
+    total_entropy_loss: Optional[float] = None
+    _entropy_loss_count: int = 0
+    total_theoretical_flops_reduction: Optional[float] = None
+    _theoretical_flops_count: int = 0
+    total_mean_abs_logits: Optional[float] = None  # I150-3 NEW: Splitter Logits 平均绝对值
+    _mean_abs_logits_count: int = 0
+    total_budget_loss: Optional[float] = None  # I150-3 NEW: Elastic Budget 损失
+    _budget_loss_count: int = 0
+    total_density_regularization: Optional[float] = None  # I150-3 NEW: 密度正则化损失
+    _density_reg_count: int = 0
 
     # 显存峰值
     peak_memory_mb = 0.0
@@ -170,46 +192,70 @@ def train_one_epoch(
                     total_tokens += batch_tokens
 
                 # 新增: 提取实验详细日志指标
-                if hasattr(outputs, 'splitter_logits_mean'):
-                    total_splitter_logits_mean += outputs.splitter_logits_mean
-                    total_splitter_logits_std += outputs.splitter_logits_std
-                if hasattr(outputs, 'active_ratio'):
-                    total_active_ratio += outputs.active_ratio
-                if hasattr(outputs, 'manifold_bias_max'):
-                    total_manifold_bias_max += outputs.manifold_bias_max
-                    total_manifold_bias_min += outputs.manifold_bias_min
-                    total_manifold_bias_mean += outputs.manifold_bias_mean
-                    total_manifold_bias_std += outputs.manifold_bias_std
-                if hasattr(outputs, 'poincare_dist_mean'):
-                    total_poincare_dist_mean += outputs.poincare_dist_mean
-                    total_poincare_dist_std += outputs.poincare_dist_std
-                if hasattr(outputs, 'budget_penalty'):
-                    total_budget_penalty += abs(outputs.budget_penalty)
-                if hasattr(outputs, 'consistency_loss'):
-                    total_consistency_loss += outputs.consistency_loss
-                if hasattr(outputs, 'entropy_loss'):
-                    total_entropy_loss += outputs.entropy_loss
-                if hasattr(outputs, 'theoretical_flops_reduction'):
-                    total_theoretical_flops_reduction += outputs.theoretical_flops_reduction
-                if hasattr(outputs, 'mean_abs_logits'):
-                    total_mean_abs_logits += outputs.mean_abs_logits
-                if hasattr(outputs, 'budget_loss'):
-                    total_budget_loss += outputs.budget_loss
-                if hasattr(outputs, 'density_regularization'):
-                    total_density_regularization += outputs.density_regularization
+                # I-AUDIT: 使用计数器跟踪有效值数量，避免平均值计算时除以错误分母
+                if outputs.splitter_logits_mean is not None:
+                    total_splitter_logits_mean = (total_splitter_logits_mean or 0.0) + outputs.splitter_logits_mean
+                    total_splitter_logits_std = (total_splitter_logits_std or 0.0) + (outputs.splitter_logits_std or 0.0)
+                    _splitter_logits_count += 1
+                if outputs.active_ratio is not None:
+                    total_active_ratio = (total_active_ratio or 0.0) + outputs.active_ratio
+                    _active_ratio_count += 1
+                if outputs.manifold_bias_max is not None:
+                    total_manifold_bias_max = (total_manifold_bias_max or 0.0) + outputs.manifold_bias_max
+                    total_manifold_bias_min = (total_manifold_bias_min or 0.0) + (outputs.manifold_bias_min or 0.0)
+                    total_manifold_bias_mean = (total_manifold_bias_mean or 0.0) + (outputs.manifold_bias_mean or 0.0)
+                    total_manifold_bias_std = (total_manifold_bias_std or 0.0) + (outputs.manifold_bias_std or 0.0)
+                    _manifold_bias_count += 1
+                if outputs.poincare_dist_mean is not None:
+                    total_poincare_dist_mean = (total_poincare_dist_mean or 0.0) + outputs.poincare_dist_mean
+                    total_poincare_dist_std = (total_poincare_dist_std or 0.0) + (outputs.poincare_dist_std or 0.0)
+                    _poincare_dist_count += 1
+                if outputs.budget_penalty is not None:
+                    total_budget_penalty = (total_budget_penalty or 0.0) + abs(outputs.budget_penalty)
+                    _budget_penalty_count += 1
+                if outputs.consistency_loss is not None:
+                    total_consistency_loss = (total_consistency_loss or 0.0) + outputs.consistency_loss
+                    _consistency_loss_count += 1
+                if outputs.entropy_loss is not None:
+                    total_entropy_loss = (total_entropy_loss or 0.0) + outputs.entropy_loss
+                    _entropy_loss_count += 1
+                if outputs.theoretical_flops_reduction is not None:
+                    total_theoretical_flops_reduction = (total_theoretical_flops_reduction or 0.0) + outputs.theoretical_flops_reduction
+                    _theoretical_flops_count += 1
+                if outputs.mean_abs_logits is not None:
+                    total_mean_abs_logits = (total_mean_abs_logits or 0.0) + outputs.mean_abs_logits
+                    _mean_abs_logits_count += 1
+                if outputs.budget_loss is not None:
+                    total_budget_loss = (total_budget_loss or 0.0) + outputs.budget_loss
+                    _budget_loss_count += 1
+                if outputs.density_regularization is not None:
+                    total_density_regularization = (total_density_regularization or 0.0) + outputs.density_regularization
+                    _density_reg_count += 1
             else:
                 logits = outputs
 
             # Compute loss
             if targets is not None:
-                loss, loss_components = compute_loss(logits, targets)
+                # I-AUDIT: 传递 H1SS 辅助损失给 compute_loss
+                aux_losses = outputs.auxiliary_losses if hasattr(outputs, 'auxiliary_losses') else None
+                loss, loss_components = compute_loss(logits, targets, aux_losses=aux_losses)
             else:
                 # Fallback if no targets
                 loss = torch.tensor(0.0, device=device)
+                loss_components = {}
 
         # Record loss components
         if config.numerical.record_loss_components:
             loss_components["total"] = loss.item()
+            # I-AUDIT: 使用 is not None 检查，TrainingStats 字段现在是 Optional[float] = None
+            if outputs.budget_loss is not None:
+                loss_components["budget_loss"] = outputs.budget_loss
+            if outputs.density_regularization is not None:
+                loss_components["density_regularization"] = outputs.density_regularization
+            if outputs.consistency_loss is not None:
+                loss_components["consistency_loss"] = outputs.consistency_loss
+            if outputs.entropy_loss is not None:
+                loss_components["entropy_loss"] = outputs.entropy_loss
             loss_monitor.record(loss_components)
 
         # Backward
@@ -223,26 +269,48 @@ def train_one_epoch(
             grad_norm = grad_monitor.compute_total_grad_norm()
             total_grad_norm += grad_norm
 
-            # 新增: 计算 backbone vs splitter 梯度比值
+            # I150-3 FIX: 计算 backbone 和 splitter 的梯度范数（按参数名前缀分类）
+            # 按照日志系统规范: backbone_grad_norm 和 splitter_grad_norm 是 TrainingStats 直接字段
             layer_norms = grad_monitor.compute_grad_norms()
-            backbone_norm = 0.0
-            splitter_norm = 0.0
-            for name, norm in layer_norms.items():
-                # Splitter 参数通常包含 "splitter" 或 "tokenizer" 在名称中
-                if 'splitter' in name.lower() or 'tokenizer' in name.lower() or 'gumbel' in name.lower():
-                    splitter_norm += norm
+            if layer_norms:
+                backbone_grad_sq = 0.0
+                splitter_grad_sq = 0.0
+                entmax_grad_sq = 0.0
+                manifold_decoder_grad_sq = 0.0
+                for param_name, norm in layer_norms.items():
+                    if param_name.startswith("splitter."):
+                        splitter_grad_sq += norm ** 2
+                    elif "entmax" in param_name.lower() or "bottleneck" in param_name.lower():
+                        # I150-3: 追踪 entmax 和 bottleneck 梯度
+                        entmax_grad_sq += norm ** 2
+                    elif "geo_decoder" in param_name.lower() or "manifold_decoder" in param_name.lower():
+                        # I150-3: 追踪 manifold_decoder 梯度
+                        manifold_decoder_grad_sq += norm ** 2
+                    else:
+                        backbone_grad_sq += norm ** 2
+                backbone_grad_norm = backbone_grad_sq ** 0.5
+                splitter_grad_norm = splitter_grad_sq ** 0.5
+                entmax_grad_norm = entmax_grad_sq ** 0.5 if entmax_grad_sq > 0 else 0.0
+                manifold_decoder_grad_norm = manifold_decoder_grad_sq ** 0.5 if manifold_decoder_grad_sq > 0 else 0.0
+                # 累加到 epoch 统计
+                if total_backbone_grad_norm is None:
+                    total_backbone_grad_norm = backbone_grad_norm
+                    total_splitter_grad_norm = splitter_grad_norm
+                    total_entmax_grad_norm = entmax_grad_norm
+                    total_manifold_decoder_grad_norm = manifold_decoder_grad_norm
+                    _backbone_grad_count = 1
+                    _splitter_grad_count = 1
+                    _entmax_grad_count = 1
+                    _manifold_decoder_grad_count = 1
                 else:
-                    backbone_norm += norm
-            total_backbone_grad_norm += backbone_norm
-            total_splitter_grad_norm += splitter_norm
-
-            # I150-3 NEW: 计算关键组件（ManifoldDecoder等）的梯度
-            component_norms = grad_monitor.compute_component_grad_norms()
-            for comp_name, norm in component_norms.items():
-                if comp_name == 'manifold_decoder':
-                    total_manifold_decoder_grad_norm += norm
-                elif comp_name == 'entmax':
-                    total_entmax_grad_norm += norm
+                    total_backbone_grad_norm += backbone_grad_norm
+                    total_splitter_grad_norm += splitter_grad_norm
+                    total_entmax_grad_norm += entmax_grad_norm
+                    total_manifold_decoder_grad_norm += manifold_decoder_grad_norm
+                    _backbone_grad_count += 1
+                    _splitter_grad_count += 1
+                    _entmax_grad_count += 1
+                    _manifold_decoder_grad_count += 1
 
         # 显存峰值监控
         if torch.cuda.is_available():
@@ -287,11 +355,11 @@ def train_one_epoch(
             optimizer.zero_grad()
         else:
             # I-NAN: 检测到 NaN！触发自动取证
-            # 收集 Splitter logits 统计（如果有）
-            splitter_logits_stats: Dict[str, float] = {}
+            # 收集 Classification logits 统计（outputs.logits 是分类 logits，不是 splitter 内部 logits）
+            classification_logits_stats: Dict[str, float] = {}
             if hasattr(outputs, 'logits') and outputs.logits is not None:
                 lgt = outputs.logits.detach()
-                splitter_logits_stats = {
+                classification_logits_stats = {
                     "logits_mean": float(lgt.mean()),
                     "logits_std": float(lgt.std()),
                     "logits_min": float(lgt.min()),
@@ -328,7 +396,7 @@ def train_one_epoch(
                 loss_value=loss.item(),
                 pre_clip_grad_norm=pre_clip_grad_norm,
                 input_stats=_input_stats,
-                splitter_logits_stats=splitter_logits_stats,
+                classification_logits_stats=classification_logits_stats,
                 feature_stats=feature_stats,
                 amp_loss_scale=amp_loss_scale,
                 learning_rate=current_lr,
@@ -389,31 +457,58 @@ def train_one_epoch(
     # Get layer gradient norms
     layer_grad_norms = grad_monitor.get_layer_statistics()
 
+    # P4-A FIX: 从 layer_grad_norms（累积的hook数据）计算 manifold_decoder 梯度范数
+    # 问题根源: compute_grad_norms() 返回的 param.grad.norm() 与 hooks 累积的数据不一致
+    # 解决: 直接从 layer_grad_norms 的均值统计计算，确保与 stats 文件中的 layer_grad_norms 一致
+    manifold_decoder_grad_sq = 0.0
+    for param_name, stats in layer_grad_norms.items():
+        if isinstance(stats, dict) and "mean" in stats:
+            mean_norm = stats["mean"]
+        elif isinstance(stats, (int, float)):
+            mean_norm = stats  # 有些可能是直接的值
+        else:
+            continue
+        if "geo_decoder" in param_name.lower() or "manifold_decoder" in param_name.lower():
+            manifold_decoder_grad_sq += mean_norm ** 2
+    avg_manifold_decoder_grad_norm = manifold_decoder_grad_sq ** 0.5 if manifold_decoder_grad_sq > 0 else 0.0
+
     # 新增: 计算平均指标
-    avg_splitter_logits_mean = total_splitter_logits_mean / max(num_batches, 1)
-    avg_splitter_logits_std = total_splitter_logits_std / max(num_batches, 1)
-    avg_active_ratio = total_active_ratio / max(num_batches, 1)
-    avg_manifold_bias_max = total_manifold_bias_max / max(num_batches, 1)
-    avg_manifold_bias_min = total_manifold_bias_min / max(num_batches, 1)
-    avg_manifold_bias_mean = total_manifold_bias_mean / max(num_batches, 1)
-    avg_manifold_bias_std = total_manifold_bias_std / max(num_batches, 1)
-    avg_poincare_dist_mean = total_poincare_dist_mean / max(num_batches, 1)
-    avg_poincare_dist_std = total_poincare_dist_std / max(num_batches, 1)
-    avg_backbone_grad_norm = total_backbone_grad_norm / max(num_batches, 1)
-    avg_splitter_grad_norm = total_splitter_grad_norm / max(num_batches, 1)
-    avg_entmax_grad_norm = total_entmax_grad_norm / max(num_batches, 1)  # I150-3 NEW
-    avg_manifold_decoder_grad_norm = total_manifold_decoder_grad_norm / max(num_batches, 1)  # I150-3 NEW
-    avg_budget_penalty = total_budget_penalty / max(num_batches, 1)
-    avg_consistency_loss = total_consistency_loss / max(num_batches, 1)
-    avg_entropy_loss = total_entropy_loss / max(num_batches, 1)
-    avg_theoretical_flops_reduction = total_theoretical_flops_reduction / max(num_batches, 1)
-    avg_mean_abs_logits = total_mean_abs_logits / max(num_batches, 1)  # I150-3 NEW
-    avg_budget_loss = total_budget_loss / max(num_batches, 1)  # I150-3 NEW
-    avg_density_regularization = total_density_regularization / max(num_batches, 1)  # I150-3 NEW
+    # I-AUDIT: 使用 None 检查，只有在有数据时才计算平均值
+    def safe_avg(total, num_batches):
+        """安全计算平均值，如果 total 为 None 则返回 None"""
+        if total is None or num_batches == 0:
+            return None
+        return total / num_batches
+
+    # I-AUDIT: 使用各自的计数器计算平均值，避免除以错误分母
+    avg_splitter_logits_mean = safe_avg(total_splitter_logits_mean, _splitter_logits_count)
+    avg_splitter_logits_std = safe_avg(total_splitter_logits_std, _splitter_logits_count)
+    avg_active_ratio = safe_avg(total_active_ratio, _active_ratio_count)
+    avg_manifold_bias_max = safe_avg(total_manifold_bias_max, _manifold_bias_count)
+    avg_manifold_bias_min = safe_avg(total_manifold_bias_min, _manifold_bias_count)
+    avg_manifold_bias_mean = safe_avg(total_manifold_bias_mean, _manifold_bias_count)
+    avg_manifold_bias_std = safe_avg(total_manifold_bias_std, _manifold_bias_count)
+    avg_poincare_dist_mean = safe_avg(total_poincare_dist_mean, _poincare_dist_count)
+    avg_poincare_dist_std = safe_avg(total_poincare_dist_std, _poincare_dist_count)
+    avg_backbone_grad_norm = safe_avg(total_backbone_grad_norm, _backbone_grad_count)
+    avg_splitter_grad_norm = safe_avg(total_splitter_grad_norm, _splitter_grad_count)
+    avg_entmax_grad_norm = safe_avg(total_entmax_grad_norm, _entmax_grad_count)  # I150-3 NEW
+    # P4-A FIX: 使用 epoch 级别从 layer_grad_norms（hooks 累积数据）计算的 manifold_decoder 梯度范数
+    # 注意: per-step compute_grad_norms() 与 hooks 累积数据不一致，改用 get_layer_statistics() 的数据
+    # avg_manifold_decoder_grad_norm 已在 line 472 从 layer_grad_norms 计算，直接使用
+    # (line 495 被注释，不再用 per-step 的污染数据覆盖正确值)
+    # avg_manifold_decoder_grad_norm = safe_avg(total_manifold_decoder_grad_norm, _manifold_decoder_grad_count)
+    avg_budget_penalty = safe_avg(total_budget_penalty, _budget_penalty_count)
+    avg_consistency_loss = safe_avg(total_consistency_loss, _consistency_loss_count)
+    avg_entropy_loss = safe_avg(total_entropy_loss, _entropy_loss_count)
+    avg_theoretical_flops_reduction = safe_avg(total_theoretical_flops_reduction, _theoretical_flops_count)
+    avg_mean_abs_logits = safe_avg(total_mean_abs_logits, _mean_abs_logits_count)  # I150-3 NEW
+    avg_budget_loss = safe_avg(total_budget_loss, _budget_loss_count)  # I150-3 NEW
+    avg_density_regularization = safe_avg(total_density_regularization, _density_reg_count)  # I150-3 NEW
 
     # 计算梯度比值
-    backbone_vs_splitter_ratio = 0.0
-    if avg_splitter_grad_norm > 0:
+    backbone_vs_splitter_ratio = None
+    if avg_splitter_grad_norm is not None and avg_splitter_grad_norm > 0:
         backbone_vs_splitter_ratio = avg_backbone_grad_norm / avg_splitter_grad_norm
 
     # Create metrics
