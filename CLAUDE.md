@@ -29,7 +29,7 @@ uv run python src/training/train_fractal_vit.py --quick-test --use-amp
 |-------|---------|-----------|
 | L4 Application | Main model | `models/fractal_vit.py` |
 | L3 Pipeline | Tokenization & Transformer | `modules/tokenizer.py`, `modules/transformer_block.py` |
-| L2 Components | Splitter, Attention, FFN | `layers/splitters/gumbel_topk.py`, `layers/attention/hilbert_bias.py`, `layers/ffn/swiglu.py` |
+| L2 Components | Splitter, Attention, FFN | `layers/splitters/hilbert_optimal_splitter.py`, `layers/attention/manifold_attention.py`, `layers/ffn/swiglu.py` |
 | L1 Foundation | Hilbert curves, config | `core/curve_hilbert.py`, `core/config.py` |
 
 ## Import Rules
@@ -73,6 +73,7 @@ uv run python src/training/train_fractal_vit.py --dataset cub200 --image-size No
 **Rule**: Use `arch_config` params, NEVER CLI overrides.
 
 **Save/Load**:
+
 ```python
 # Save: gene = ModelGene.from_config(arch_config=arch_config, model_state=model.state_dict())
 # Load: model = FractalCurveViT(**gene.arch_config.to_dict()); model.load_state_dict(gene.model_state)
@@ -81,8 +82,7 @@ uv run python src/training/train_fractal_vit.py --dataset cub200 --image-size No
 ## Conventions
 
 - Constants: `from vit_pytorch.core.constants import EPS, TEMPERATURE_MIN`
-- Default splitter: `GumbelTopKSplitter`
-- Issue comments: `# I<issue_id>` (e.g., `# I109-6:`)
+- Default splitter: `HilbertOptimalSplitter` (H1SS)
 
 ## Logging System Design
 
@@ -171,7 +171,3 @@ uv run python src/training/train_fractal_vit.py --dataset cub200 --image-size No
 - [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md): Issue tracker
 - [docs/](docs): Architecture deep-dives
 - [pyproject.toml](pyproject.toml): pytest markers
-
-## Efficiency
-
-N ≈ 32 tokens (224×224): Fractal ViT ~8K vs Standard ViT ~307K attention elements (**~40× reduction**)
