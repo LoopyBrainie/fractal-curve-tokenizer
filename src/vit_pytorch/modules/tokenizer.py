@@ -1037,9 +1037,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                         f"I99-1 CRITICAL: {name}.shape[0]={tensor.shape[0]} != N_total={expected_len}"
                     )
 
-            # 获取 hilbert_indices 用于排序，token_indices 用于正确的概率索引
+            # 获取 hilbert_indices 用于排序
             hilbert_idx_for_sort = tensor_result.hilbert_indices
-            token_idx_for_index = tensor_result.token_indices
 
             # I99-1 FIX: torch.lexsort 可能不可用，使用 torch.argsort 替代
             # lexsort 的语义是: 先按最后一列排序，再按倒数第二列排序...
@@ -1069,13 +1068,24 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             all_tokens_sorted = all_tokens[sort_indices]
             depths_sorted = depths[sort_indices]
             regions_sorted = tensor_result.regions[sort_indices]
-            # token_indices 也需要排序，用于后续的概率索引
-            token_idx_sorted = token_idx_for_index[sort_indices]
 
-            # 如果有 raw_probs 和 token_indices，使用 token_indices 进行正确的概率索引
-            # I113-18 修复: 使用 token_indices 而非 hilbert_indices 索引 raw_probs
+            # I113-18 修复: 在排序后立即计算 token_positions
+            # 排序后 batch_indices_sorted 分组为 [0,0,...,0,1,1,...,1,...]
+            # 每个 token 在其 batch 内的位置用 bincount+cumsum 计算
+            if N_total_int > 0:
+                batch_counts = torch.bincount(batch_indices_sorted, minlength=B_int)
+                batch_offsets = torch.cat([
+                    torch.zeros(1, device=device, dtype=torch.long),
+                    batch_counts.cumsum(0)[:-1]
+                ])
+                token_positions_sorted = torch.arange(N_total_int, device=device, dtype=torch.long)
+                token_positions = token_positions_sorted - batch_offsets[batch_indices_sorted]
+            else:
+                token_positions = torch.zeros(0, dtype=torch.long, device=device)
+
+            # 如果有 raw_probs，使用 token_positions 进行正确的概率索引
             if raw_probs is not None:
-                raw_probs_sorted = raw_probs[batch_indices_sorted, token_idx_sorted]
+                raw_probs_sorted = raw_probs[batch_indices_sorted, token_positions]
             else:
                 raw_probs_sorted = None
 
