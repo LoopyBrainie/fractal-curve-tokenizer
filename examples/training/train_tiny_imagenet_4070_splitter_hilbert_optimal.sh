@@ -159,8 +159,8 @@ uv run python -m src.training.train_fractal_vit \
   --token-coverage-min 0.02 \
   --token-coverage-max 0.15 \
   --target-ratio 0.25 \
-#  --gradient-checkpoint \
-#  --compile \
+  --gradient-checkpoint \
+  --compile \
   --channels-last \
   --use-area-encoding \
   --fourier-levels 4 \
