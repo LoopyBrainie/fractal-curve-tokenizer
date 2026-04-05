@@ -264,6 +264,20 @@ def train_one_epoch(
         else:
             loss.backward()
 
+        # MEMORY DIAGNOSTIC: 每10步监控显存，定位暴涨时刻
+        if torch.cuda.is_available() and (batch_idx + 1) % 10 == 0:
+            allocated_mb = torch.cuda.memory_allocated() / 1024**2
+            reserved_mb = torch.cuda.memory_reserved() / 1024**2
+            max_allocated_mb = torch.cuda.max_memory_allocated() / 1024**2
+            # 获取 num_tokens (从 forward 时获取的 outputs)
+            num_tokens_info = ""
+            if hasattr(outputs, 'num_tokens') and outputs.num_tokens is not None:
+                ntok = outputs.num_tokens
+                if isinstance(ntok, torch.Tensor):
+                    ntok = ntok.float().mean().item()
+                num_tokens_info = f", tokens={ntok:.0f}"
+            print(f"  [MEM] Step {batch_idx+1}: alloc={allocated_mb:.1f}MB, reserved={reserved_mb:.1f}MB, peak={max_allocated_mb:.1f}MB{num_tokens_info}")
+
         # Gradient monitoring
         if config.numerical.record_grad_norms:
             grad_norm = grad_monitor.compute_total_grad_norm()

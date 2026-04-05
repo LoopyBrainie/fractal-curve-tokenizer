@@ -134,10 +134,9 @@ $$\text{Output} = (1 - \alpha_d) \cdot \text{FFN}(x) + \alpha_d \cdot \text{Adap
 from vit_pytorch import FractalConfig
 
 config = FractalConfig(
-    d_model=384,
-    num_heads=6,
-    hilbert_bias_mode='lca',  # 'lca', 'low_rank', 'hierarchical'
-    max_depth=4,
+    image_size=224,
+    min_patch_size=4,
+    tokenizer_type='streaming_v3',
 )
 ```
 
@@ -150,11 +149,9 @@ model = FractalCurveViT(
     image_size=224,
     num_classes=1000,
     dim=384,
-    depth=6,
+    num_layers=12,
     heads=6,
     mlp_dim=768,
-    tokenizer_type='streaming_v3',
-    bias_mode='lca',
     ffn_type='swiglu_level',
 )
 ```

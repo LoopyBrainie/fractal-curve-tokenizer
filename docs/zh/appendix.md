@@ -139,22 +139,19 @@ model = FractalCurveViT(
     image_size=224,
     num_classes=1000,
     dim=384,
-    depth=6,
+    num_layers=12,
     heads=6,
     mlp_dim=768,
-    tokenizer_type='streaming_v3',
-    hilbert_bias_mode='lca',
     ffn_type='swiglu_level',
 )
 
 # 方法 2: 使用 FractalConfig
-config = FractalConfig(d_model=384, num_heads=6)
+config = FractalConfig(image_size=224, min_patch_size=4)
 model = FractalCurveViT(
     image_size=224,
     num_classes=1000,
-    dim=config.d_model,
-    heads=config.num_heads,
-    config=config,
+    dim=384,
+    heads=6,
 )
 ```
 
@@ -191,15 +188,15 @@ for seq in output.sequences:
 
 ```python
 from vit_pytorch import (
-    HilbertAwareMultiScaleAttention,
+    ManifoldNativeAttention,
     SwiGLUFFN,
     FractalPositionEmbedding,
-    LCAHilbertBias,
+    HierarchicalAttentionBias,
 )
 
 # 注意力
-attn = HilbertAwareMultiScaleAttention(
-    dim=384, heads=6, bias_mode='lca'
+attn = ManifoldNativeAttention(
+    dim=384, heads=6, max_level=8, beta=4.0
 )
 
 # FFN
@@ -208,8 +205,10 @@ ffn = SwiGLUFFN(dim=384, hidden_dim=512)
 # 位置嵌入
 pos_emb = FractalPositionEmbedding(dim=384, max_level=50)
 
-# LCA 偏置
-lca_bias = LCAHilbertBias(num_heads=6, max_lca_depth=10)
+# 层级注意力偏置
+from vit_pytorch import FractalConfig
+config = FractalConfig(image_size=224)
+hier_bias = HierarchicalAttentionBias(config=config, heads=6)
 ```
 
 ---

@@ -149,11 +149,9 @@ model = FractalCurveViT(
     image_size=224,
     num_classes=1000,
     dim=384,
-    depth=6,
+    num_layers=12,
     heads=6,
     min_patch_size=4,
-    K_min=8,
-    K_max=64,
 )
 
 img = torch.randn(1, 3, 224, 224)
@@ -167,7 +165,7 @@ model = FractalCurveViT(
     image_size=None,  # Dynamic resolution
     num_classes=1000,
     dim=384,
-    depth=6,
+    num_layers=12,
     heads=6,
 )
 
