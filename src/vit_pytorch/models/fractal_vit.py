@@ -166,7 +166,7 @@ class TrainingStats:
     child_features: Optional[torch.Tensor] = None  # 预测的子节点特征 [B, N, 4, D]
     redundancy: Optional[torch.Tensor] = None  # 冗余性分数 [B, N]
 
-    # Splitter 辅助损失 (H1SS)
+# Splitter 辅助损失 (H1SS)
     auxiliary_losses: Optional[Dict[str, torch.Tensor]] = None  # {entropy, budget, tree, ...}
 
     # === 向后兼容字段 (I112) ===
@@ -385,7 +385,7 @@ class FractalCurveViT(nn.Module):
         # I145-H1SS: HilbertOptimalSplitter 特定参数
         jump_loss_weight: Optional[float] = None,  # H1SS Jump Loss 权重
         density_field_hidden_dim: Optional[int] = None,  # H1SS Density Field 隐藏层维度
-        # I130-3: Splitter 类型选择（已固定为 HilbertOptimalSplitter）
+# I130-3: Splitter 类型选择（已固定为 HilbertOptimalSplitter）
         splitter_type: str = 'hilbert_optimal',  # 'hilbert_optimal'（其他类型已废弃）
         # I170-NEW: Hilbert 平滑参数 (I165-1: 解决空间碎片化)
         enable_hilbert_smoothness: bool = False,  # 是否启用 Hilbert 感知平滑
@@ -1089,6 +1089,7 @@ class FractalCurveViT(nn.Module):
                 features,
                 image_size=(img.shape[2], img.shape[3]),
                 hard=use_hard,
+                epoch=getattr(self, '_current_epoch', 0),
             )
             # Tokenizer 使用 Splitter 的结果进行 embedding
             token_output = self.tokenizer.tokenize(img, split_result)
@@ -1373,7 +1374,7 @@ class FractalCurveViT(nn.Module):
                     valid_mask = torch.arange(max_len, device=split_probs.device).unsqueeze(0) < lengths.unsqueeze(1)
                     # 掩码概率，填充为 1.0 (log(1)=0，不影响求和)
                     probs_masked = torch.where(valid_mask, split_probs, torch.ones_like(split_probs))
-                    probs_safe = probs_masked + (probs_masked == 0).float() * PROB_EPSILON
+                    probs_safe = probs_masked + (probs_masked == 0).to(probs_masked.dtype) * PROB_EPSILON
                     # 计算每个样本的熵 [B]
                     entropies_gpu = -(probs_safe * torch.log(probs_safe)).sum(dim=1)
                     # 最后一次性转换为 Python float
@@ -1993,6 +1994,7 @@ class FractalCurveViT(nn.Module):
                 features,
                 image_size=(img.shape[2], img.shape[3]),
                 hard=True,
+                epoch=getattr(self, '_current_epoch', 0),
             )
             token_output = self.tokenizer.tokenize(img, split_result)
             legacy_output = token_output.to_legacy()
