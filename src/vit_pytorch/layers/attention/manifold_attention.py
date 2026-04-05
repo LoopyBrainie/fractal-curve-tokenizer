@@ -77,8 +77,9 @@ def coords_from_paths(
         quadrant = paths[:, :, level]  # [B, N]
 
         # 象限解码: 0=(0,0), 1=(1,0), 2=(0,1), 3=(1,1)
-        qx = (quadrant // 2) % 2  # x 位
-        qy = quadrant % 2          # y 位
+        # D4-AUDIT FIX: //2 → >>1, %2 → &1，位运算更快
+        qx = (quadrant >> 1) & 1  # x 位
+        qy = quadrant & 1          # y 位
 
         # 有效掩码: 当前 token 在该深度有有效路径
         valid = (level < depths).long()  # [B, N]
@@ -308,10 +309,11 @@ def compute_geometric_features(
     # 1. Δh_ij / N^2 (归一化 Hilbert 距离)
     h_i = hilbert_indices.unsqueeze(2)  # [B, N, 1]
     h_j = hilbert_indices.unsqueeze(1)  # [B, 1, N]
-    delta_h = torch.abs(h_i - h_j).float() / (N ** 2)  # [B, N, N]
+    delta_h = torch.abs(h_i - h_j).float() / (N ** 2)  # [B, N, N] - 保持 float 避免整数除法
 
     # 2. 2^{d_LCA} (LCA 深度指数)
-    lca_exp = torch.pow(2, lca_depths.float()).clamp(max=1e3)
+    # D4-AUDIT FIX: pow(2,x) → exp2(x)
+    lca_exp = torch.exp2(lca_depths.float()).clamp(max=1e3)
 
     # 3. d_H(i,j) (Poincaré 双曲距离)
     # 恢复 Poincaré 距离计算，提供有信息量的几何特征
@@ -515,10 +517,10 @@ def compute_hilbert_bandwidth(
     d_safe = depths.float().clamp(min=0, max=12)
 
     # 第一步：W = ceil(β × 2^d)
-    bandwidths = torch.ceil(beta * torch.pow(2, d_safe)).long()
+    bandwidths = torch.ceil(beta * torch.exp2(d_safe)).long()  # D4-AUDIT FIX: pow(2,x) → exp2(x)
 
     # 第二步：约束 W ≤ 4^d（该深度可用 token 数）
-    four_pow_d = torch.pow(4, d_safe).long()
+    four_pow_d = torch.exp2(d_safe * 2.0).long()  # D4-AUDIT FIX: pow(4,x) → exp2(x*2)
     bandwidths = torch.min(bandwidths, four_pow_d)
 
     if was_2d:
@@ -1011,14 +1013,17 @@ class ManifoldNativeAttention(nn.Module):
 
         return out
 
+    @torch.no_grad()
     def get_stats(self) -> dict:
-        """
-        获取诊断统计信息。
+        """获取诊断统计信息（延迟求值，GPU tensor 直接返回）
+
+        D1-AUDIT FIX: 所有 .item() 调用移至 post_forward() 阶段，
+        由 flatten_layer_outputs() 统一处理。forward 热路径零同步。
 
         返回
         ----
         dict
-            包含以下键:
+            包含以下 GPU tensor 键值:
             - geometric_bias_mean/std/max: 几何偏置统计
             - bandwidth_mean/min/max: 带宽统计
             - poincare_dist_mean/std: Poincaré 距离统计
@@ -1037,15 +1042,16 @@ class ManifoldNativeAttention(nn.Module):
             P1 强烈推荐:
             - true_avg_jump_distance: 加权跳跃距离（带宽倒数代理）
             - entmax_sparsity: entmax 激活后的稀疏度
+            - lipschitz_compliance: Hilbert Lipschitz 合规性
         """
         stats = {}
 
         # 几何偏置统计
         if self._last_geo_bias is not None:
             bias = self._last_geo_bias.detach()
-            stats["geometric_bias_mean"] = bias.mean().item()
-            stats["geometric_bias_std"] = bias.std().item()
-            stats["geometric_bias_max"] = bias.max().item()
+            stats["geometric_bias_mean"] = bias.mean()
+            stats["geometric_bias_std"] = bias.std()
+            stats["geometric_bias_max"] = bias.max()
 
         # === P0: geo_decoder.layer_scale (流形偏置强度) ===
         # layer_scale 是 GeometricLatentDecoder 中唯一可学习的缩放参数
@@ -1053,94 +1059,83 @@ class ManifoldNativeAttention(nn.Module):
         # 数学意义: layer_scale 是否激活是流形偏置是否生效的最直接信号
         if hasattr(self, 'geo_decoder') and self.geo_decoder is not None:
             ls = self.geo_decoder.layer_scale.detach()
-            stats["layer_scale_mean"] = ls.mean().item()
-            stats["layer_scale_max"] = ls.max().item()
-            stats["layer_scale_min"] = ls.min().item()
-            stats["layer_scale_std"] = ls.std().item()
+            stats["layer_scale_mean"] = ls.mean()
+            stats["layer_scale_max"] = ls.max()
+            stats["layer_scale_min"] = ls.min()
+            stats["layer_scale_std"] = ls.std()
 
         # 带宽统计
         if self._last_bandwidths is not None:
             bw = self._last_bandwidths.detach().float()
-            stats["bandwidth_mean"] = bw.mean().item()
-            stats["bandwidth_min"] = bw.min().item()
-            stats["bandwidth_max"] = bw.max().item()
+            stats["bandwidth_mean"] = bw.mean()
+            stats["bandwidth_min"] = bw.min()
+            stats["bandwidth_max"] = bw.max()
 
             # === P0: band_saturation_ratio (带宽饱和比例) ===
-            # 修复：比较 bandwidth >= 4^depth（可attend到该深度所有token）
-            # 修复前错误地比较 bw >= max_level（比较 Hilbert 指数与深度）
+            # 比较 bandwidth >= 4^depth（可attend到该深度所有token）
             if self._last_depths is not None:
-                # depths 和 bw 都是 [B, N]，直接逐元素比较
                 d = self._last_depths.detach().float()
-                four_pow_depths = torch.pow(4, d)  # [B, N]
+                four_pow_depths = torch.exp2(d * 2.0)  # D4-AUDIT FIX: pow(4,x) → exp2(x*2)
                 saturated = (bw >= four_pow_depths).float()
-                stats["band_saturation_ratio"] = saturated.mean().item()
+                stats["band_saturation_ratio"] = saturated.mean()
 
-                # === 新增：Hilbert Lipschitz 合规性 ===
+                # === Hilbert Lipschitz 合规性 ===
                 # 理论最优带宽 = 2^d（来自 Lipschitz: 邻域 ∝ √(4^d) = 2^d）
                 # 合规性 = 实际带宽 / 理论最优带宽，应接近 1.0
-                theoretical_optimal = torch.pow(2, d)  # d 是 [B, N] float tensor
+                theoretical_optimal = torch.exp2(d)  # D4-AUDIT FIX: pow(2,x) → exp2(x)
                 compliance = (bw / theoretical_optimal.clamp(min=1)).mean()
-                stats["lipschitz_compliance"] = compliance.item()
+                stats["lipschitz_compliance"] = compliance
 
         # Poincaré 距离统计
         if self._last_manifold_coords is not None:
             coords = self._last_manifold_coords.detach()
-            stats["poincare_dist_mean"] = coords.mean().item()
-            stats["poincare_dist_std"] = coords.std().item()
+            stats["poincare_dist_mean"] = coords.mean()
+            stats["poincare_dist_std"] = coords.std()
 
         # 残差门控统计
         if self._last_residual_scale is not None:
             scale = self._last_residual_scale.detach()
-            stats["residual_scale_mean"] = scale.mean().item()
+            stats["residual_scale_mean"] = scale.mean()
 
         # attention_compression_ratio = 1 - sum(bandwidths) / N^2
         if self._last_bandwidths is not None:
             bw = self._last_bandwidths.detach().float()
             B, N = bw.shape
-            total_bandwidth = bw.sum().item()
+            total_bandwidth = bw.sum()  # GPU tensor → flatten_layer_outputs .item()
             compression = 1.0 - total_bandwidth / (B * N * N)
             stats["attention_compression_ratio"] = compression
 
         # geometric_boundary_proximity = mean of poincare_norm
         if self._last_poincare_norm is not None:
             norm = self._last_poincare_norm.detach()
-            stats["geometric_boundary_proximity"] = norm.mean().item()
+            stats["geometric_boundary_proximity"] = norm.mean()
 
         # fractal_residual_energy_ratio = ||residual|| / ||x||
         if self._last_input_x is not None and self._last_residual_scale is not None:
             x_norm = self._last_input_x.detach().norm(p=2)
-            # 估算残差范数为门控值乘以输入范数
             residual_est = self._last_residual_scale.mean().detach() * x_norm
             if x_norm > 0:
-                stats["fractal_residual_energy_ratio"] = (residual_est / x_norm).item()
+                stats["fractal_residual_energy_ratio"] = residual_est / x_norm
 
         # poincare_norm_max
         if self._last_poincare_norm is not None:
-            stats["poincare_norm_max"] = self._last_poincare_norm.detach().max().item()
+            stats["poincare_norm_max"] = self._last_poincare_norm.detach().max()
 
         # === P1: true_avg_jump_distance (真实跳跃距离) ===
         # 使用注意力权重和带宽倒数作为跳越距离的加权计算
-        # 注意: 当前实现是带宽倒数的加权平均，真正的跳越距离需要 Hilbert 距离矩阵
         if self._last_attn_weights is not None and self._last_bandwidths is not None:
             attn = self._last_attn_weights.detach()  # [B, H, N, N]
             bw = self._last_bandwidths.detach().float()  # [B, N]
-            # 使用带宽倒数作为跳越距离代理（带宽越小 = 局部性越强 = 跳越距离越小）
             jump_proxy = 1.0 / (bw.unsqueeze(1).unsqueeze(-1) + 1e-6)  # [B, 1, N, 1]
-            # 加权平均: sum(attn * jump_proxy) / sum(attn)
             weighted_jump = (attn * jump_proxy).sum(dim=[2, 3]) / (attn.sum(dim=[2, 3]) + 1e-6)  # [B, H]
-            stats["true_avg_jump_distance"] = weighted_jump.mean().item()
+            stats["true_avg_jump_distance"] = weighted_jump.mean()
 
         # === P1: entmax_sparsity (entmax 稀疏度) ===
-        # 记录 entmax_1_5 激活后的实际稀疏程度
-        # 使用 Gini 系数类似的稀疏度: 1 - (2 * sum(pos * sorted_attn) / (n * sum(attn)))
         if self._last_attn_weights is not None:
             attn = self._last_attn_weights.detach()
-            # 简化的稀疏度: sum(attn^2) / sum(attn)^2
-            # 当完全稀疏(one-hot)时 = 1/n, 当完全均匀时 = 1/n
-            # 用这个比值来衡量相对稀疏度
             attn_sum = attn.sum(dim=-1, keepdim=True)  # [B, H, N, 1]
             l2_norm_sq = (attn ** 2).sum(dim=-1, keepdim=True)  # [B, H, N, 1]
-            stats["entmax_sparsity"] = (l2_norm_sq / (attn_sum ** 2 + 1e-8)).mean().item()
+            stats["entmax_sparsity"] = (l2_norm_sq / (attn_sum ** 2 + 1e-8)).mean()
 
         # nan_rate
         if self._total_count > 0:

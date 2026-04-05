@@ -149,7 +149,7 @@ class VectorizedPathEncoder:
         qy = (y_exp >> shifts_exp) & 1  # [N, D]
         
         # 组合象限: 0=左上, 1=右上, 2=左下, 3=右下
-        paths = qx + 2 * qy  # [N, D]
+        paths = qx + (qy << 1)  # D4-AUDIT FIX: 2*qy → qy<<1
         
         return paths.long()
     
@@ -242,7 +242,7 @@ class VectorizedPathEncoder:
         qy = (gy_exp >> shifts_exp) & 1  # [B, N, D]
         
         # 组合象限
-        paths = (qx + 2 * qy).long()  # [B, N, D]
+        paths = (qx + (qy << 1)).long()  # [B, N, D]
         
         return paths.squeeze(0) if was_2d else paths
 
@@ -490,11 +490,11 @@ class BitFlippedPositionEncoder(nn.Module):
         geometry_emb = self.geometry_projection(path_emb)  # [B, N, dim]
         geometry_emb = geometry_emb * token_scales  # 应用深度衰减
 
-        # I-NAN: 更新统一诊断缓存
+        # I-NAN: 更新统一诊断缓存（D1-AUDIT FIX: GPU tensor 存储）
         gate_values = torch.sigmoid(self.rotation_gate).detach()
         self._diagnostic_cache = {
-            "params/rotation_gate_mean": gate_values.mean().item(),
-            "params/depth_gamma": gamma.item(),  # γ = σ(depth_decay_scale)
+            "params/rotation_gate_mean": gate_values.mean(),
+            "params/depth_gamma": gamma,  # γ = σ(depth_decay_scale)，GPU tensor
         }
 
         return pos_emb, geometry_emb
@@ -591,8 +591,8 @@ class BitFlippedPositionEncoder(nn.Module):
             enc: [N, dim//2] 编码向量
         """
         pos_dim = self.dim // 2
-        freqs = torch.pow(2.0, torch.arange(0, pos_dim, 2, device='cpu') / pos_dim) * 3.141592653589793
-        freqs = freqs.to(morton_norm.device)
+        # D4-AUDIT FIX: 移除 device='cpu'（GPU→CPU→GPU 传输），改用 exp2 优化
+        freqs = torch.exp2(torch.arange(0, pos_dim, 2, device=morton_norm.device, dtype=torch.float32) / pos_dim) * 3.141592653589793
 
         # 角度: morton_norm * freqs
         angles = morton_norm.unsqueeze(-1) * freqs  # [N, dim//4]
@@ -613,32 +613,37 @@ class BitFlippedPositionEncoder(nn.Module):
         命名空间:
             embed/params/*: 可学习参数统计
             embed/health/*: 数值健康度
+
+        D1-AUDIT FIX: 所有值现在为 GPU tensor，
+        由 flatten_layer_outputs() 在 post_forward() 统一调用 .item()。
         """
         output: Dict[str, Any] = {}
 
         # embed/params/* - rotation_gate 参数
+        # D1-AUDIT FIX: 存储整个 tensor，由 flatten_layer_outputs 处理
         if hasattr(self, 'rotation_gate') and self.rotation_gate is not None:
             gate_values = torch.sigmoid(self.rotation_gate)  # [max_level]
+            # D1-AUDIT FIX: 直接存储 tensor，用 key 中的索引标记各层级
             for d in range(gate_values.numel()):
-                output[f"params/rotation_gate_lvl_{d}"] = float(gate_values[d].item())
-            output["params/rotation_gate_mean"] = float(gate_values.mean().item())
+                output[f"params/rotation_gate_lvl_{d}"] = gate_values[d]
+            output["params/rotation_gate_mean"] = gate_values.mean()
 
         # embed/params/* - depth_decay_scale 参数 (gamma)
         if hasattr(self, 'depth_decay_scale') and self.depth_decay_scale is not None:
-            gamma = torch.sigmoid(self.depth_decay_scale).item()
+            gamma = torch.sigmoid(self.depth_decay_scale)  # GPU tensor
             output["params/depth_gamma"] = gamma  # γ ∈ (0,1)
 
-        # embed/params/* - 嵌入权重统计
+        # embed/params/* - 嵌入权重统计（D1-AUDIT FIX: GPU tensor））
         if hasattr(self, 'depth_embedding') and self.depth_embedding is not None:
             w = self.depth_embedding.weight
-            output["params/depth_emb_norm"] = float(w.norm().item())
-            output["params/depth_emb_mean"] = float(w.mean().item())
+            output["params/depth_emb_norm"] = w.norm()
+            output["params/depth_emb_mean"] = w.mean()
 
         if hasattr(self, 'quadrant_embedding') and self.quadrant_embedding is not None:
             w = self.quadrant_embedding.weight
-            output["params/quadrant_emb_norm"] = float(w.norm().item())
+            output["params/quadrant_emb_norm"] = w.norm()
 
-        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标
+        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标（现在都是 GPU tensor）
         if self._diagnostic_cache:
             output.update(self._diagnostic_cache)
 
@@ -825,10 +830,11 @@ class FractalPathEmbedding(nn.Module):
         # 将路径转换为哈希值（用于唯一性检测）
         # 使用位置编码确保不同位置的不同路径被区分
         # path_hash = Σ valid_paths[i] * 4^i
-        powers = 4 ** torch.arange(max_level, device=paths.device)
+        powers = torch.exp2(torch.arange(max_level, device=paths.device, dtype=torch.float32) * 2.0)  # D4-AUDIT FIX: 4**x → exp2(x*2)
         path_hash = (valid_paths * powers.unsqueeze(0).unsqueeze(0)).sum(dim=-1)  # [B, N]
 
         # 计算每个 batch 的熵并取平均
+        # D1-AUDIT FIX: 使用 GPU tensor 累积，避免 forward 内 .item()
         entropies = []
         for b in range(B):
             hashes = path_hash[b]  # [N]
@@ -837,9 +843,14 @@ class FractalPathEmbedding(nn.Module):
             probs = counts.float() / counts.sum()
             # 计算熵 H(P) = -∑p_i·log(p_i)
             entropy = -(probs * torch.log(probs + 1e-8)).sum()
-            entropies.append(entropy.item())
+            entropies.append(entropy)
 
-        self._diagnostic_cache["distribution/path_entropy"] = sum(entropies) / len(entropies) if entropies else 0.0
+        # D1-AUDIT FIX: 保持 GPU tensor，由 flatten_layer_outputs 处理 .item()
+        if entropies:
+            entropy_stack = torch.stack(entropies)  # [B] tensor
+            self._diagnostic_cache["distribution/path_entropy"] = entropy_stack.mean()
+        else:
+            self._diagnostic_cache["distribution/path_entropy"] = torch.tensor(0.0)
 
     @property
     def embed_output(self) -> Dict[str, Any]:
@@ -848,21 +859,24 @@ class FractalPathEmbedding(nn.Module):
         命名空间:
             embed/params/*: 可学习参数统计
             embed/distribution/*: 路径分布统计
+
+        D1-AUDIT FIX: 所有值现在为 GPU tensor，
+        由 flatten_layer_outputs() 在 post_forward() 统一调用 .item()。
         """
         output: Dict[str, Any] = {}
 
-        # embed/params/* - 嵌入权重统计
+        # embed/params/* - 嵌入权重统计（D1-AUDIT FIX: GPU tensor））
         if hasattr(self, 'scale_embedding') and self.scale_embedding is not None:
             w = self.scale_embedding.weight
-            output["params/scale_emb_norm"] = float(w.norm().item())
-            output["params/scale_emb_mean"] = float(w.mean().item())
+            output["params/scale_emb_norm"] = w.norm()
+            output["params/scale_emb_mean"] = w.mean()
 
         if hasattr(self, 'quadrant_embedding') and self.quadrant_embedding is not None:
             w = self.quadrant_embedding.weight
-            output["params/quadrant_emb_norm"] = float(w.norm().item())
-            output["params/quadrant_emb_std"] = float(w.std().item())
+            output["params/quadrant_emb_norm"] = w.norm()
+            output["params/quadrant_emb_std"] = w.std()
 
-        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标
+        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标（现在都是 GPU tensor）
         if self._diagnostic_cache:
             output.update(self._diagnostic_cache)
 
@@ -1203,7 +1217,7 @@ class FourierPathEncoder(nn.Module):
 
         # 计算 4^{L-1}, 4^{L-2}, ..., 4^0
         powers = torch.arange(L, device=device).flip(0)  # [L]
-        bases = 4 ** powers  # [L]
+        bases = torch.exp2(powers.float() * 2.0)  # D4-AUDIT FIX: 4**x → exp2(x*2)
 
         # 广播乘法并求和: [B, N, L] * [L] -> [B, N]
         indices = (paths * bases.unsqueeze(0).unsqueeze(0)).sum(dim=-1)
@@ -1292,11 +1306,11 @@ class FourierPathEncoder(nn.Module):
         # 计算相邻的余弦相似度（跨 batch 和 sequence）
         similarities = (emb_normalized[:-1] * emb_normalized[1:]).sum(dim=-1)
 
-        # 计算均值并缓存到统一诊断缓存
+        # 计算均值并缓存到统一诊断缓存（D1-AUDIT FIX: GPU tensor）
         if similarities.numel() > 0:
-            self._diagnostic_cache["health/fourier_boundary_sim"] = float(similarities.mean().item())
+            self._diagnostic_cache["health/fourier_boundary_sim"] = similarities.mean()
         else:
-            self._diagnostic_cache["health/fourier_boundary_sim"] = 0.0
+            self._diagnostic_cache["health/fourier_boundary_sim"] = torch.tensor(0.0)
 
     def compute_boundary_similarity(
         self,
@@ -1354,17 +1368,20 @@ class FourierPathEncoder(nn.Module):
             边界平滑度衡量 Hilbert 曲线首尾交界处（θ ≈ 0 与 θ ≈ 2π）的嵌入连续性。
             Sim_boundary = cosine_sim(E(path), E(path + Δ))
             低值表示频率编码在跨越不连续点时有剧烈相位突变。
+
+        D1-AUDIT FIX: 所有值现在为 GPU tensor，
+        由 flatten_layer_outputs() 在 post_forward() 统一调用 .item()。
         """
         output: Dict[str, Any] = {}
 
-        # embed/params/* - 投影层参数统计
+        # embed/params/* - 投影层参数统计（D1-AUDIT FIX: GPU tensor））
         if hasattr(self, 'projection') and self.projection is not None:
             w = self.projection.weight
-            output["params/projection_norm"] = float(w.norm().item())
-            output["params/projection_mean"] = float(w.mean().item())
-            output["params/projection_std"] = float(w.std().item())
+            output["params/projection_norm"] = w.norm()
+            output["params/projection_mean"] = w.mean()
+            output["params/projection_std"] = w.std()
 
-        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标
+        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标（现在都是 GPU tensor）
         if self._diagnostic_cache:
             output.update(self._diagnostic_cache)
 

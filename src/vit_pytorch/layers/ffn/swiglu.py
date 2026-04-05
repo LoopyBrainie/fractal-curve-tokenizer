@@ -70,7 +70,7 @@ FFN 变体选项 (ffn_type):
 from __future__ import annotations
 
 import warnings
-from typing import Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -242,7 +242,8 @@ class AdaptiveFractalFeedForward(nn.Module):
 
         # === 诊断数据记录器（Layer-Packaged -> Trainer-Unpacked 架构）===
         # 使用统一缓存替代散落的 _last_xxx 变量，避免 DDP 不同步问题
-        self._diagnostic_cache: Dict[str, float] = {}
+        # D1-AUDIT FIX: 类型改为 Dict[str, Any]，存储 GPU tensor 以避免 forward 内 .item()
+        self._diagnostic_cache: Dict[str, Any] = {}
         # 保留旧变量以兼容现有逻辑（将在 ffn_output 中整合）
         self._last_adapter_norm: Optional[torch.Tensor] = None
         self._last_level_mixing_weights: Optional[torch.Tensor] = None
@@ -286,18 +287,23 @@ class AdaptiveFractalFeedForward(nn.Module):
         self._last_adapter_norm = level_adapted.norm().detach()
         self._last_level_mixing_weights = mixing_weights.detach()
 
-        # === P1: 增强诊断缓存 ===
-        adapter_norm_val = float(level_adapted.norm().item())
+        # === P1: 增强诊断缓存（D1-AUDIT FIX: 保持 GPU tensor）===
+        adapter_norm_val = level_adapted.norm()  # GPU tensor
         self._diagnostic_cache["adapter_norm"] = adapter_norm_val
         # 混合权重分布统计
-        self._diagnostic_cache["level_mixing_min"] = float(mixing_weights.min().item())
-        self._diagnostic_cache["adapter_dominance"] = float((mixing_weights > 0.5).float().mean().item())
+        self._diagnostic_cache["level_mixing_min"] = mixing_weights.min()  # GPU tensor
+        self._diagnostic_cache["adapter_dominance"] = (mixing_weights > 0.5).float().mean()  # GPU tensor
         # === P1: 计算贡献比率（带数值安全 clamp）===
         # I-NAN: 训练初期 main_ffn_norm 因 gamma=0.01 可能极小，
-        # adapter_norm / tiny_value 会产生极大离群点，clamp 防止 WandB 图表缩放被破坏
-        main_norm = self._diagnostic_cache.get("main_ffn_norm", 0.0)
-        if main_norm > 1e-6:  # 更严格的阈值避免极小值
-            self._diagnostic_cache["contribution_ratio"] = min(adapter_norm_val / main_norm, 100.0)
+        # adapter_norm / tiny_value 会产生极大离群点，clamp 防止离群值
+        # D1-AUDIT FIX: main_norm 现在是 tensor，torch.where 处理条件
+        main_norm = self._diagnostic_cache.get("main_ffn_norm", torch.tensor(0.0))
+        contribution = torch.where(
+            main_norm > 1e-6,
+            (adapter_norm_val / main_norm.clamp(min=1e-6)).clamp(max=100.0),
+            torch.tensor(0.0, device=adapter_norm_val.device)
+        )
+        self._diagnostic_cache["contribution_ratio"] = contribution
 
         return main_out * (1 - mixing_weights) + level_adapted * mixing_weights
 
@@ -340,11 +346,11 @@ class AdaptiveFractalFeedForward(nn.Module):
         beta = self.ffn_beta(depths)    # [B, S, D]
         x_norm = x_norm * gamma + beta
 
-        # === P0: 捕获 gamma/beta 运行时统计 ===
-        self._diagnostic_cache["ffn_gamma_mean"] = float(gamma.mean().item())
-        self._diagnostic_cache["ffn_gamma_std"] = float(gamma.std().item())
-        self._diagnostic_cache["ffn_beta_mean"] = float(beta.mean().item())
-        self._diagnostic_cache["ffn_beta_std"] = float(beta.std().item())
+        # === P0: 捕获 gamma/beta 运行时统计（D1-AUDIT FIX: GPU tensor）===
+        self._diagnostic_cache["ffn_gamma_mean"] = gamma.mean()
+        self._diagnostic_cache["ffn_gamma_std"] = gamma.std()
+        self._diagnostic_cache["ffn_beta_mean"] = beta.mean()
+        self._diagnostic_cache["ffn_beta_std"] = beta.std()
 
         # ========== FFN 主网络 ==========
         if self.ffn_type in ('swiglu', 'swiglu_level'):
@@ -354,8 +360,8 @@ class AdaptiveFractalFeedForward(nn.Module):
             assert self.main_net is not None
             main_out = self.main_net(x_norm)
 
-        # === P0: 捕获主 FFN 输出范数 ===
-        self._diagnostic_cache["main_ffn_norm"] = float(main_out.norm().item())
+        # === P0: 捕获主 FFN 输出范数（D1-AUDIT FIX: GPU tensor）===
+        self._diagnostic_cache["main_ffn_norm"] = main_out.norm()
 
         # ========== Level Adaptation ==========
         if self.use_level_adaptation and levels_info is not None and levels_info.data.numel() > 0:
@@ -370,6 +376,9 @@ class AdaptiveFractalFeedForward(nn.Module):
         遵循 Layer-Packaged -> Trainer-Unpacked 哲学。
         使用扁平键名格式（展平后变为 train/ffn_0/{key}）。
 
+        D1-AUDIT FIX: 所有值现在为 GPU tensor，
+        由 flatten_layer_outputs() 在 post_forward() 统一调用 .item()。
+
         诊断字段:
             - ffn_gamma_mean/std, ffn_beta_mean/std: 层级感知归一化参数
             - level_mixing_mean/std/min/max: 层级混合权重分布
@@ -382,22 +391,24 @@ class AdaptiveFractalFeedForward(nn.Module):
         output = {}
 
         # 1. 层级感知归一化参数（来自 ffn_gamma/ffn_beta Embedding 权重）
+        # D1-AUDIT FIX: GPU tensor 直接返回，flatten_layer_outputs 处理 .item()
         if hasattr(self, 'ffn_gamma'):
-            output["ffn_gamma_mean"] = float(self.ffn_gamma.weight.mean().item())
-            output["ffn_gamma_std"] = float(self.ffn_gamma.weight.std().item())
+            output["ffn_gamma_mean"] = self.ffn_gamma.weight.mean()
+            output["ffn_gamma_std"] = self.ffn_gamma.weight.std()
         if hasattr(self, 'ffn_beta'):
-            output["ffn_beta_mean"] = float(self.ffn_beta.weight.mean().item())
-            output["ffn_beta_std"] = float(self.ffn_beta.weight.std().item())
+            output["ffn_beta_mean"] = self.ffn_beta.weight.mean()
+            output["ffn_beta_std"] = self.ffn_beta.weight.std()
 
-        # 2. 运行时诊断缓存（forward 中捕获）
+        # 2. 运行时诊断缓存（forward 中捕获，现在都是 GPU tensor）
         output.update(self._diagnostic_cache)
 
         # 3. 兼容旧版 _last_xxx 变量（level_mixing 统计）
+        # D1-AUDIT FIX: GPU tensor 直接返回
         if self._last_level_mixing_weights is not None:
             w = self._last_level_mixing_weights
-            output["level_mixing_mean"] = float(w.mean().item())
-            output["level_mixing_std"] = float(w.std().item())
-            output["level_mixing_max"] = float(w.max().item())
+            output["level_mixing_mean"] = w.mean()
+            output["level_mixing_std"] = w.std()
+            output["level_mixing_max"] = w.max()
 
         # 4. FFN 类型标志
         output["ffn_type"] = self.ffn_type

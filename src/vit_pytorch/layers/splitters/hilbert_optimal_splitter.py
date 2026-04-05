@@ -91,7 +91,7 @@ def entmax_beta(
 
     # 使用更稳定的实现
     # 基于 Alpha-Entmax 的迭代算法 (Peters et al., 2019)
-    scores = scores.float()
+    # D4-AUDIT FIX: 移除不必要的 .float()，保留原始 dtype
 
     # 初始化
     max_score = scores.max(dim=dim, keepdim=True)[0]
@@ -549,7 +549,7 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
             # 父节点索引
             if depth > 0:
-                parent_grid_size = 2 ** (depth - 1)
+                parent_grid_size = 1 << (depth - 1)  # D4-AUDIT FIX: 2**(d-1) → 1<<(d-1)
                 parent_idx_grid = (grid_i // 2) * parent_grid_size + (grid_j // 2)
                 parent_idx = depth_start_idx[depth - 1] + parent_idx_grid.view(-1)
             else:
@@ -575,21 +575,22 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         N = candidate_regions.shape[0]
         new_parent_indices = torch.full((N,), -1, dtype=torch.long, device=device)
 
+        # D2-AUDIT FIX: 向量化 depth 层父节点计算 (外层循环保留，内层 i 循环向量化)
         for depth in range(1, max_level + 1):
             depth_start = depth_start_idx[depth]
             depth_end = depth_start_idx[depth + 1]
+            if depth_end <= depth_start:
+                continue
             parent_start = depth_start_idx[depth - 1]
 
-            # 计算当前层每个区域的父节点在新排序中的索引
-            for i in range(depth_start, depth_end):
-                # 找到对应的父节点
-                grid_idx = i - depth_start
-                grid_size = 1 << depth  # I-OPT: 位移替代 2**depth
-                gi = grid_idx >> depth  # gi = grid_idx // grid_size
-                gj = grid_idx & (grid_size - 1)  # gj = grid_idx % grid_size
-                # I-OPT: 位移替代除法 gi >> 1 = gi // 2
-                parent_idx = parent_start + (gi >> 1) * (grid_size >> 1) + (gj >> 1)
-                new_parent_indices[i] = parent_idx
+            # 向量化计算该层所有节点的父节点索引
+            grid_size = 1 << depth
+            i_range = torch.arange(depth_start, depth_end, device=device, dtype=torch.long)
+            grid_idx = i_range - depth_start
+            gi = grid_idx >> depth
+            gj = grid_idx & (grid_size - 1)
+            parent_offsets = (gi >> 1) * (grid_size >> 1) + (gj >> 1)
+            new_parent_indices[depth_start:depth_end] = parent_start + parent_offsets
 
         # 子节点矩阵
         children_matrix = torch.full((N, 4), -1, dtype=torch.long, device=device)
@@ -644,7 +645,7 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             if not mask.any():
                 continue
 
-            indices = mask.nonzero(as_tuple=True)[0]
+            indices = mask.nonzero(as_tuple=False).squeeze(-1)  # D3-AUDIT FIX: as_tuple=False 避免 Graph Break
             group_boxes = boxes[indices]
 
             # 调用 ROIAlign，使用对应的 sampling_ratio
@@ -787,37 +788,43 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         N = logits.shape[1]
         constrained_logits = logits.clone()
 
+        # D2-AUDIT FIX: 向量化 parent-child penalty 避免 Python for 循环
         # 对每个父节点，降低其分数如果子节点分数更高
-        # I-OPT: 直接用 0-d tensor 索引替代 .item()，避免 GPU-CPU 同步
-        for i in range(N):
-            parent_idx = self.parent_indices[i]  # 0-d tensor，兼容索引
-            if parent_idx >= 0:
-                # 检查所有子节点
-                children = self.children_matrix[parent_idx]
-                children_valid = children[children >= 0]
-
-                if len(children_valid) > 0:
-                    max_child_logit = logits[:, children_valid].max(dim=1)[0]
-                    # 降低父节点分数 (使用动态λ)
-                    constrained_logits[:, parent_idx] -= lambda_cur * max_child_logit
+        valid_mask = self.parent_indices >= 0
+        if valid_mask.any():
+            valid_parents = torch.masked_select(self.parent_indices, valid_mask)  # [P]
+            children_all = self.children_matrix[valid_parents]  # [P, 4]
+            child_mask = children_all >= 0  # [P, 4]
+            # gather child logits: clamp to 0 for invalid indices, they'll be masked anyway
+            children_clamped = children_all.masked_fill(~child_mask, 0)
+            gathered = logits.gather(1, children_clamped.view(-1).unsqueeze(0).expand(logits.shape[0], -1))  # [B, P*4]
+            gathered = gathered.view(-1, *children_clamped.shape)  # [B, P, 4]
+            # mask invalid child positions with -inf
+            gathered = gathered.masked_fill(~child_mask.unsqueeze(0), float('-inf'))
+            max_child_logits = gathered.max(dim=2)[0]  # [B, P]
+            constrained_logits[:, valid_parents] -= lambda_cur * max_child_logits
 
         return constrained_logits
 
-    def _compute_dynamic_lambda(self) -> float:
+    def _compute_dynamic_lambda(self) -> Tensor:
         """计算动态λ (课程学习)
 
         λ(t) = λ_init + (λ_max - λ_init) × min(1, t / T_schedule) + σ(log_lambda)
 
         其中 t 是当前epoch，T_schedule 是课程学习持续时间
+
+        Returns:
+            GPU tensor (与 logits 等设备兼容)，避免 forward 内 .item() 同步
         """
         # 课程学习组件
         progress = min(1.0, self._current_epoch / max(1, self._lambda_schedule_epochs))
         lambda_scheduled = self._lambda_init + (self._lambda_max - self._lambda_init) * progress
 
         # 可学习残差 (sigmoid确保正值)
-        lambda_learnable = torch.sigmoid(self._log_lambda).item() * 0.2  # 缩放到合理范围
+        # D1-AUDIT FIX: 返回 GPU tensor，整体计算图保持 GPU
+        lambda_learnable = torch.sigmoid(self._log_lambda) * 0.2  # 缩放到合理范围
 
-        # 组合
+        # 组合: lambda_scheduled (float) + tensor → tensor
         return lambda_scheduled + lambda_learnable
 
     def get_adaptive_alpha(self, epoch: int) -> float:
@@ -840,7 +847,8 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             progress = (epoch - 30) / 50
             # 使用 torch.sigmoid 确保数值稳定
             return 1.5 + 0.2 * torch.sigmoid(
-                torch.tensor(0.3 * (progress - 0.5) * 10, dtype=torch.float32)
+                # D4-AUDIT FIX: 移除显式 dtype=torch.float32，利用 PyTorch 自动 dtype
+                torch.tensor(0.3 * (progress - 0.5) * 10)
             ).item()
 
     def _sparse_select(
@@ -1038,20 +1046,20 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         K_hard = K_hard.clamp(min=1, max=N)  # 显式 clamp 到有效范围
 
         # 稀疏选择使用硬 K（离散整数）
-        selected_mask, probs = self._sparse_select(logits, int(K_hard.item()), hard=hard)
+        # D1-AUDIT FIX: 直接传 K_hard tensor，_sparse_select 内部处理
+        selected_mask, probs = self._sparse_select(logits, K_hard, hard=hard)
 
         # 构建结果
-        selected_indices = (selected_mask > 0.5).nonzero(as_tuple=True)
+        # D3-AUDIT FIX: torch.where 替代 nonzero(as_tuple=True) 避免 Graph Break
+        # nonzero(as_tuple=True) 会返回动态数量的张量，torch.compile 无法处理
+        batch_idx, region_idx = torch.where(selected_mask > 0.5)
 
-        if len(selected_indices[1]) == 0:
+        if region_idx.numel() == 0:
             # 至少选择一个 - 使用 top-k
-            _, topk_idx = torch.topk(probs[0], min(int(K_hard.item()), probs.shape[1]), dim=-1)
+            _, topk_idx = torch.topk(probs[0], min(K_hard.item(), probs.shape[1]), dim=-1)
             # 使用 batch 0
             batch_idx = torch.zeros(topk_idx.shape[0], dtype=torch.long, device=logits.device)
-            selected_indices = (batch_idx, topk_idx)
-
-        batch_idx = selected_indices[0]
-        region_idx = selected_indices[1]
+            region_idx = topk_idx
 
         # 提取选中区域
         selected_regions = self.candidate_regions[region_idx]
@@ -1142,7 +1150,7 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             → 返回 64
         """
         for level in range(max_level + 1):
-            regions = 4 ** level
+            regions = 1 << (2 * level)  # D4-AUDIT FIX: 4**level → 1<<(2*level)
             if regions >= K_target:
                 return regions
         # 如果所有 level 都不满足，返回最大 level 的区域数

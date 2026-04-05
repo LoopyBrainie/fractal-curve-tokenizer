@@ -180,19 +180,49 @@ class UnifiedMonitor:
 
         # Splitter 统计 → 已迁移至 auxiliary_outputs (train/splitter/logits_mean, active_ratio)
 
+        # === D1-AUDIT FIX: 支持 GPU tensor 延迟回传 ===
+        # 所有 float/tensor 字段统一通过 .item() if hasattr 判断处理
+        def _to_float(v):
+            """将 GPU tensor 或 CPU float 统一转为 Python float"""
+            if v is None:
+                return None
+            if hasattr(v, 'item'):
+                return v.item()
+            return float(v)
+
         # 流形偏置统计
         if stats.manifold_bias_max is not None:
-            self.collector.record("manifold_bias_max", float(stats.manifold_bias_max))
+            self.collector.record("manifold_bias_max", _to_float(stats.manifold_bias_max))
+        if stats.manifold_bias_min is not None:
+            self.collector.record("manifold_bias_min", _to_float(stats.manifold_bias_min))
         if stats.manifold_bias_mean is not None:
-            self.collector.record("manifold_bias_mean", float(stats.manifold_bias_mean))
-        if hasattr(stats, 'manifold_bias_std') and stats.manifold_bias_std is not None:
-            self.collector.record("manifold_bias_std", float(stats.manifold_bias_std))
+            self.collector.record("manifold_bias_mean", _to_float(stats.manifold_bias_mean))
+        if getattr(stats, 'manifold_bias_std', None) is not None:
+            self.collector.record("manifold_bias_std", _to_float(stats.manifold_bias_std))
 
         # Poincare 距离统计
         if stats.poincare_dist_mean is not None:
-            self.collector.record("poincare_dist_mean", float(stats.poincare_dist_mean))
-        if hasattr(stats, 'poincare_dist_std') and stats.poincare_dist_std is not None:
-            self.collector.record("poincare_dist_std", float(stats.poincare_dist_std))
+            self.collector.record("poincare_dist_mean", _to_float(stats.poincare_dist_mean))
+        if getattr(stats, 'poincare_dist_std', None) is not None:
+            self.collector.record("poincare_dist_std", _to_float(stats.poincare_dist_std))
+
+        # Splitter logits 统计
+        if getattr(stats, 'splitter_logits_mean', None) is not None:
+            self.collector.record("splitter_logits_mean", _to_float(stats.splitter_logits_mean))
+        if getattr(stats, 'splitter_logits_std', None) is not None:
+            self.collector.record("splitter_logits_std", _to_float(stats.splitter_logits_std))
+
+        # 覆盖率
+        if getattr(stats, 'active_ratio', None) is not None:
+            self.collector.record("active_ratio", _to_float(stats.active_ratio))
+
+        # Budget loss 和密度正则化
+        if getattr(stats, 'budget_loss', None) is not None:
+            self.collector.record("budget_loss", _to_float(stats.budget_loss))
+        if getattr(stats, 'density_regularization', None) is not None:
+            self.collector.record("density_regularization", _to_float(stats.density_regularization))
+        if getattr(stats, 'theoretical_flops_reduction', None) is not None:
+            self.collector.record("theoretical_flops_reduction", _to_float(stats.theoretical_flops_reduction))
 
         # 辅助损失
         if hasattr(stats, 'auxiliary_losses') and stats.auxiliary_losses:

@@ -215,7 +215,9 @@ class FractalTransformerBlock(nn.Module):
 
         # Task 3 重构: 使用 Sigmoid 门控
         # gate ∈ [0, 1] 确保梯度方向始终正确
-        if levels_info is not None and levels_info.data.numel() > 0:
+        # D3-AUDIT FIX: 物化 tensor 条件为 Python bool，消除 Graph Break
+        has_levels = levels_info is not None and levels_info.data.numel() > 0
+        if has_levels:
             depths = levels_info.depths  # (B, S)
             # I98-4: clamp depths to [0, max_level] to handle padding sentinel (-1)
             depths_clamped = depths.clamp(min=0, max=self.max_level)
@@ -223,7 +225,9 @@ class FractalTransformerBlock(nn.Module):
             gate = torch.sigmoid(gate_raw)  # (..., 1) ∈ [0, 1]
 
             # 调整形状以便广播: (B, S, 1) for element-wise multiplication
-            if gate.dim() == 2:
+            # D3-AUDIT FIX: 物化 dim() 比较为 Python bool，消除 Graph Break
+            is_2d = gate.dim() == 2
+            if is_2d:
                 # (S, 1) -> (1, S, 1)
                 gate = gate.view(1, -1, 1)
             # gate 现在是 (B, S, 1) 或 (1, S, 1)
@@ -284,7 +288,8 @@ class FractalTransformer(nn.Module):
         self.manifold_beta = manifold_beta
 
         # P-OPT: Stochastic depth decay rule
-        self.register_buffer('_drop_path_rates', torch.linspace(0, drop_path_rate, depth))
+        # D1-AUDIT FIX: 使用 .tolist() 避免 .item() 同步（__init__ 中调用，非 forward 热路径但仍需修复）
+        self._drop_path_rates = torch.linspace(0, drop_path_rate, depth).tolist()
 
         self.layers = nn.ModuleList(
             [
@@ -295,7 +300,7 @@ class FractalTransformer(nn.Module):
                     mlp_dim=mlp_dim,
                     dropout=dropout,
                     max_level=max_level,
-                    drop_path=self._drop_path_rates[i].item(),
+                    drop_path=self._drop_path_rates[i],
                     ffn_type=ffn_type,
                     manifold_beta=manifold_beta,
                 )
@@ -409,14 +414,18 @@ class FractalTransformer(nn.Module):
         # HilbertAwareMultiScaleAttention 已经充分保留全局信息流
 
         # ARCH-R2 方案 B: 层级感知的特征聚合
-        if levels_info is not None and levels_info.data.numel() > 0:
+        # D3-AUDIT FIX: 物化 tensor 条件为 Python bool，消除 Graph Break
+        has_levels = levels_info is not None and levels_info.data.numel() > 0
+        if has_levels:
             depths = levels_info.depths  # (B, S)
             # I98-4: clamp depths to [0, max_level] to handle padding sentinel (-1)
             depths_clamped = depths.clamp(min=0, max=self.max_level)
             scale = torch.sigmoid(self._level_aggregator_scale(depths_clamped))  # (..., D)
             
             # 调整形状以匹配 x: [B, S, D]
-            if scale.dim() == 2:
+            # D3-AUDIT FIX: 物化 dim() 比较为 Python bool，消除 Graph Break
+            is_2d_scale = scale.dim() == 2
+            if is_2d_scale:
                 # (S, D) -> (1, S, D) for broadcasting
                 scale = scale.unsqueeze(0)
             

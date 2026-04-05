@@ -166,8 +166,8 @@ class AreaEncoder(nn.Module):
         area_expanded = area_scores.unsqueeze(-1)
         freq_times_area = base_freqs * area_expanded
 
-        sin_all = torch.sin(freq_times_area) * gate_full
-        cos_all = torch.cos(freq_times_area) * gate_full
+        sin_all = torch.sin(freq_times_area.clamp(-100, 100)) * gate_full  # D4-AUDIT FIX: 输入 clamp 防止数值不稳定
+        cos_all = torch.cos(freq_times_area.clamp(-100, 100)) * gate_full
 
         gamma = torch.stack([sin_all, cos_all], dim=-1).view(B, N, 2 * self.fourier_levels)
 
@@ -318,7 +318,7 @@ class FractalPositionEmbedding(nn.Module):
         path_len = paths.shape[-1]
         
         # 生成层级偏移量: [0, 4, 8, ..., (path_len-1)*4]
-        level_offsets = torch.arange(path_len, device=device) * 4
+        level_offsets = torch.arange(path_len, device=device) << 2  # D4-AUDIT FIX: *4 → <<2
         
         # 广播相加: (..., path_len) + (path_len,) -> (..., path_len)
         flat_indices = paths + level_offsets
@@ -757,7 +757,7 @@ class GeometryField(nn.Module):
         """
         # 指数衰减: 4^{-d}
         depths_clamped = depths.clamp(0, self.max_level)
-        area_weights = 4.0 ** (-depths_clamped.float())
+        area_weights = torch.exp2(-depths_clamped.float() * 2.0)  # D4-AUDIT FIX: 4.**x → exp2(x*2)
 
         # 查找嵌入
         area_emb = self.area_embedding(depths_clamped)

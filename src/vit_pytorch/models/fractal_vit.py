@@ -1389,7 +1389,7 @@ class FractalCurveViT(nn.Module):
                 levels_used_list = []
                 for i in range(B):
                     if has_tokens_mask[i]:
-                        nonzero = depth_counts_sliced[i].nonzero(as_tuple=True)[0]
+                        nonzero = depth_counts_sliced[i].nonzero(as_tuple=False).squeeze(-1)  # D3-AUDIT FIX: as_tuple=False 避免 Graph Break
                         levels_used_list.append(nonzero.tolist())
                     else:
                         levels_used_list.append([])
@@ -1523,10 +1523,11 @@ class FractalCurveViT(nn.Module):
             # geometry_emb_with_cls 形状: [B, N+1, dim]，排除 CLS token
             manifold_bias = geometry_emb_with_cls[:, 1:, :]  # [B, N, dim] 排除 CLS
 
-            manifold_bias_max = float(manifold_bias.max().item())
-            manifold_bias_min = float(manifold_bias.min().item())
-            manifold_bias_mean = float(manifold_bias.mean().item())
-            manifold_bias_std = float(manifold_bias.std().item())
+            # D1-AUDIT FIX: 保持 GPU tensor，延迟到 post_forward 统一 .item()
+            manifold_bias_max = manifold_bias.max()
+            manifold_bias_min = manifold_bias.min()
+            manifold_bias_mean = manifold_bias.mean()
+            manifold_bias_std = manifold_bias.std()
 
             # P2-B 修复: 使用 Hilbert 距离统计替代 atanh(||manifold_emb||)
             # 原实现问题: atanh(||manifold_emb||) 测量的是 embedding 范数饱和度，
@@ -1543,15 +1544,15 @@ class FractalCurveViT(nn.Module):
                 mask = ~torch.eye(hilbert_indices.shape[1], dtype=torch.bool, device=hilbert_indices.device)
                 mask = mask.unsqueeze(0).expand(hilbert_dist.shape[0], -1, -1)
                 hilbert_dist_flat = hilbert_dist[mask].view(hilbert_indices.shape[0], -1)
-                poincare_dist_mean = float(hilbert_dist_flat.mean().item())
-                poincare_dist_std = float(hilbert_dist_flat.std().item())
+                poincare_dist_mean = hilbert_dist_flat.mean()
+                poincare_dist_std = hilbert_dist_flat.std()
             else:
                 # 回退：如果无法获取 Hilbert 索引，使用 manifold_emb 范数（不推荐）
                 manifold_raw = manifold_emb_for_stats[:, 1:, :]  # [B, N, dim], 排除 CLS
                 norm_x = manifold_raw.norm(dim=-1)  # [B, N]
                 poincare_dist = torch.atanh(torch.clamp(norm_x, max=0.99))
-                poincare_dist_mean = float(poincare_dist.mean().item())
-                poincare_dist_std = float(poincare_dist.std().item())
+                poincare_dist_mean = poincare_dist.mean()
+                poincare_dist_std = poincare_dist.std()
 
         # P11-3: 为 regions 添加 CLS 对应的零填充
         if regions is not None:
@@ -1722,13 +1723,14 @@ class FractalCurveViT(nn.Module):
                 mean_abs_logits = split_result.mean_abs_logits
             # I-AUDIT: 从 split_result.logits 提取 splitter logits 统计
             if hasattr(split_result, 'logits') and split_result.logits is not None:
-                splitter_logits_mean = float(split_result.logits.mean().item())
-                splitter_logits_std = float(split_result.logits.std().item())
+                # D1-AUDIT FIX: 保持 GPU tensor，延迟到 post_forward 统一 .item()
+                splitter_logits_mean = split_result.logits.mean()
+                splitter_logits_std = split_result.logits.std()
             # I-AUDIT: 从 split_result.selected_mask 计算 active_ratio
             if hasattr(split_result, 'selected_mask') and split_result.selected_mask is not None:
                 total_tokens = split_result.selected_mask.numel()
-                selected_tokens = split_result.selected_mask.sum().item()
-                active_ratio = selected_tokens / total_tokens if total_tokens > 0 else None
+                selected_tokens = split_result.selected_mask.sum()  # D1-AUDIT: GPU tensor
+                active_ratio = (selected_tokens / total_tokens) if total_tokens > 0 else None
 
         # I-AUDIT: 计算 budget_loss (Elastic Budget 损失)
         # 基于实际 token 数与目标 ratio 的差异
@@ -1736,11 +1738,11 @@ class FractalCurveViT(nn.Module):
         if num_tokens_tensor is not None and self.target_ratio is not None:
             # target_ratio 是 L1 相对参数
             # 目标 token 数 = 总 patch 数 * target_ratio
-            total_patches = lengths.sum().item() if isinstance(lengths, torch.Tensor) else int(lengths.sum()) if hasattr(lengths, 'sum') else int(lengths)
-            target_tokens = total_patches * self.target_ratio
-            actual_tokens = num_tokens_tensor.sum().item() if isinstance(num_tokens_tensor, torch.Tensor) else int(num_tokens_tensor)
+            total_patches = lengths.sum()  # D1-AUDIT: GPU tensor
+            target_tokens = total_patches.float() * self.target_ratio  # float for ratio multiplication
+            actual_tokens = num_tokens_tensor.sum()  # D1-AUDIT: GPU tensor
             if target_tokens > 0:
-                budget_loss = float(abs(actual_tokens - target_tokens) / target_tokens)
+                budget_loss = torch.abs(actual_tokens.float() - target_tokens) / target_tokens  # D1-AUDIT: GPU tensor
 
         # I-AUDIT: 计算 density_regularization (密度正则化)
         # 基于选中 token 分布的均匀性
@@ -1751,7 +1753,8 @@ class FractalCurveViT(nn.Module):
             total_per_sample = split_result.selected_mask.shape[1]
             ratios = selected_per_sample / total_per_sample  # [B]
             # 方差越小表示分布越均匀
-            density_regularization = float(ratios.var().item()) if ratios.numel() > 1 else 0.0
+            # D1-AUDIT FIX: 保持 GPU tensor，延迟到 post_forward
+            density_regularization = ratios.var() if ratios.numel() > 1 else None
 
         # I-AUDIT: 计算 H1SS 辅助损失 (可微分的真实损失)
         # 这些是真正的 tensor 损失，会影响梯度
@@ -1771,7 +1774,8 @@ class FractalCurveViT(nn.Module):
         # 分形 ViT: O(K^2) attention，标准 ViT: O(N^2) attention
         theoretical_flops_reduction = None
         if num_tokens_tensor is not None and lengths is not None:
-            actual_tokens = num_tokens_tensor.sum().item() if isinstance(num_tokens_tensor, torch.Tensor) else int(num_tokens_tensor)
+            # D1-AUDIT: GPU tensor，用于 FLOPs 估算
+            actual_tokens_tensor = num_tokens_tensor.sum()
             # 估算标准 ViT 的 patch 数 (基于 min_patch_size)
             h, w = 224, 224  # 默认值
             if image_size is not None:
@@ -1780,12 +1784,14 @@ class FractalCurveViT(nn.Module):
                 elif isinstance(image_size, int):
                     h, w = image_size, image_size
                 elif isinstance(image_size, torch.Tensor):
-                    h, w = int(image_size[0].item()), int(image_size[1].item())
+                    h, w = int(image_size[0].item()), int(image_size[1].item())  # unavoidable sync
             min_ps = self.min_patch_size if hasattr(self, 'min_patch_size') else 4
             total_patches = (h // min_ps) * (w // min_ps)
-            if total_patches > 0 and actual_tokens > 0:
+            if total_patches > 0:
+                # D1-AUDIT FIX: 保持 GPU tensor，unified.py _to_float 处理
+                actual_tokens = actual_tokens_tensor.float()
                 standard_flops = float(total_patches ** 2)
-                fractal_flops = float(actual_tokens ** 2)
+                fractal_flops = (actual_tokens ** 2).float()
                 theoretical_flops_reduction = 1.0 - (fractal_flops / standard_flops)
 
         # I170: 添加 redundancy 和 child_features 到 TrainingStats
@@ -1833,7 +1839,8 @@ class FractalCurveViT(nn.Module):
                 for d in range(max_d):
                     ratio = (depths == d).float().sum().item() / max(total, 1)
                     levels_diag[f"distribution/depth_ratio_lvl_{d}"] = ratio
-                levels_diag["distribution/mean_depth"] = float(depths.float().mean().item())
+                # D1-AUDIT FIX: 保持 GPU tensor，flatten_layer_outputs 处理 .item()
+                levels_diag["distribution/mean_depth"] = depths.float().mean()
 
             # path_diversity_ratio（避免 torch.unique 开销）
             if hasattr(levels_info, 'paths') and levels_info.paths is not None:
@@ -1851,15 +1858,17 @@ class FractalCurveViT(nn.Module):
                 # manifold_emb_for_stats 形状: [B, N+1, dim]，排除 CLS
                 geo_emb = manifold_emb_for_stats[:, 1:, :].reshape(-1, manifold_emb_for_stats.shape[-1])
                 norms = geo_emb.norm(dim=-1)
-                levels_diag["distribution/geo_emb_norm_mean"] = float(norms.mean().item())
-                levels_diag["distribution/geo_emb_norm_std"] = float(norms.std().item())
+                # D1-AUDIT FIX: 保持 GPU tensor
+                levels_diag["distribution/geo_emb_norm_mean"] = norms.mean()
+                levels_diag["distribution/geo_emb_norm_std"] = norms.std()
 
             # scale_consistency_dist（C3 约束）
             if hasattr(self.pos_embedding, 'check_scale_consistency'):
                 try:
                     scale_dist = self.pos_embedding.check_scale_consistency(levels_info)
                     if scale_dist is not None:
-                        levels_diag["health/scale_consistency_dist"] = float(scale_dist.item())
+                        # D1-AUDIT FIX: 保持 GPU tensor
+                        levels_diag["health/scale_consistency_dist"] = scale_dist
                 except Exception:
                     pass
 

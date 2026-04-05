@@ -70,7 +70,10 @@ def flatten_layer_outputs(
                 _flatten(value, full_key)
             elif isinstance(value, (int, float)):
                 result[full_key] = float(value)
-            # 跳过 None, Tensor, str, list 等其他类型
+            elif hasattr(value, 'item'):
+                # D1-AUDIT FIX: 支持 GPU tensor 延迟回传
+                result[full_key] = value.item()
+            # 跳过 None, str, list 等其他类型
 
     for layer_name, layer_output in auxiliary_outputs.items():
         if layer_output is None:

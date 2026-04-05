@@ -119,8 +119,9 @@ class FastBitwiseHilbert:
             M: [B] Morton 码 Tensor
         """
         # 转换为长整型并取模
-        xv = x.long() % n
-        yv = y.long() % n
+        # D4-AUDIT FIX: %n → &(n-1)，n 是 2 的幂，& 比 % 快
+        xv = x.long() & (n - 1)
+        yv = y.long() & (n - 1)
 
         # 计算实际位宽
         max_bits = n.bit_length() - 1
@@ -210,8 +211,9 @@ class FastBitwiseHilbert:
             B = FastBitwiseHilbert.infer_bit_width(dtype)
 
             # 2^k 正方形：直接使用坐标
-            xv = x.long() % H
-            yv = y.long() % H
+            # D4-AUDIT FIX: %H → &(H-1)，H 是 2 的幂
+            xv = x.long() & (H - 1)
+            yv = y.long() & (H - 1)
             n = H
 
             # Gray 码变换
@@ -252,8 +254,9 @@ class FastBitwiseHilbert:
             xv, yv = FastBitwiseHilbert._inverse_gray_code_transform(d, n)
 
             # 2^k 正方形：直接使用坐标
-            x = xv % H
-            y = yv % H
+            # D4-AUDIT FIX: %H → &(H-1)，H 是 2 的幂
+            x = xv & (H - 1)
+            y = yv & (H - 1)
 
             return x, y
         else:
@@ -306,7 +309,8 @@ class FastBitwiseHilbert:
             ry = (y & mask) >> k
 
             # d += s² × ((3 × rx) ^ ry)
-            d = d + (s * s) * ((3 * rx) ^ ry)
+            # D4-AUDIT FIX: s*s → s<<k (2^k * 2^k = 2^(2k))，避免乘法
+            d = d + (s << k) * ((3 * rx) ^ ry)
 
             # 旋转条件: ry == 0
             rot_mask = (ry == 0)
@@ -369,7 +373,8 @@ class FastBitwiseHilbert:
             y = y + s * ry
 
             # 移位
-            d_batch = d_batch // 4
+            # D4-AUDIT FIX: //4 → >>2，整数除法优化
+            d_batch = d_batch >> 2
 
         return x, y
 

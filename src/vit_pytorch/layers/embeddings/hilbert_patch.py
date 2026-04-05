@@ -488,7 +488,7 @@ class HilbertNativePatchEmbed(nn.Module):
             if mask.sum() == 0:
                 continue
 
-            indices = mask.nonzero(as_tuple=True)[0]
+            indices = mask.nonzero(as_tuple=False).squeeze(-1)  # D3-AUDIT FIX: as_tuple=False 避免 Graph Break
             group_boxes = boxes[indices]
 
             # 调用 ROI-Align，使用对应的 sampling_ratio
@@ -588,7 +588,7 @@ class HilbertNativePatchEmbed(nn.Module):
             ss_mask = sample_sizes_t == ss
             if ss_mask.sum() == 0:
                 continue
-            ss_indices = ss_mask.nonzero(as_tuple=True)[0]  # box indices for this sample_size
+            ss_indices = ss_mask.nonzero(as_tuple=False).squeeze(-1)  # D3-AUDIT FIX: as_tuple=False 避免 Graph Break
             N_ss = len(ss_indices)
 
             # 获取该组所有 box 的坐标 (在 [0, 1] 范围)
@@ -898,10 +898,11 @@ class DepthAwarePositionalEncoding(nn.Module):
         self.max_tokens = max_tokens
         
         # 正弦位置编码 (预计算)
-        pe = torch.zeros(max_tokens, dim)
-        position = torch.arange(0, max_tokens, dtype=torch.float).unsqueeze(1)
+        # D4-AUDIT FIX: 显式 dtype + exp clamp 防止 AMP 数值溢出
+        pe = torch.zeros(max_tokens, dim, dtype=torch.float32)
+        position = torch.arange(0, max_tokens, dtype=torch.float32).unsqueeze(1)
         div_term = torch.exp(
-            torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim)
+            (torch.arange(0, dim, 2, dtype=torch.float32) * (-math.log(10000.0) / dim)).clamp(min=-50, max=50)
         )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)

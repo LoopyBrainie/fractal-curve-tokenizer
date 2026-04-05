@@ -752,8 +752,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 batch_indices.append(b)
                 token_indices.append(i)
         
-        boxes_tensor = torch.tensor(all_boxes, device=device, dtype=dtype)
-        depths_tensor = torch.tensor(all_depths, device=device, dtype=torch.long)
+        # D1-AUDIT FIX: 使用 torch.as_tensor 避免不必要的数据拷贝
+        # torch.tensor 会创建新拷贝，torch.as_tensor 尽可能复用已有内存
+        boxes_tensor = torch.as_tensor(all_boxes, device=device, dtype=dtype)
+        depths_tensor = torch.as_tensor(all_depths, device=device, dtype=torch.long)
 
         # P-OPT: 直接替换 NaN/Inf，移除 .any() 同步检查
         # 批量操作保持 GPU 利用率，避免 GPU-CPU 同步
