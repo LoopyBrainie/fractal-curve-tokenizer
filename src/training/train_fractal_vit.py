@@ -216,7 +216,10 @@ def create_model(args, device: torch.device) -> nn.Module:
     # Apply optimizations
     if compile_model:
         print("Compiling model with torch.compile...")
-        model = torch.compile(model, mode='reduce-overhead')
+        # I164-1: 使用 mode='default' 替代 'reduce-overhead'
+        # 'reduce-overhead' 启用 CUDA Graphs，与 gradient_checkpointing 不兼容
+        # 'default' 禁用 CUDA Graphs，避免动态形状导致的 index out of bounds
+        model = torch.compile(model, mode='default')
 
     if channels_last:
         print("Converting to channels_last memory format...")
