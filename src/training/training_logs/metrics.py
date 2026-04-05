@@ -1,6 +1,6 @@
-"""Metrics Computation Module
+r"""Metrics Computation Module
 
-Provides metric computation utilities.
+Provides metric computation utilities for model evaluation.
 """
 
 from __future__ import annotations
@@ -15,15 +15,25 @@ def compute_accuracy(
     targets: torch.Tensor,
     top_k: int = 1,
 ) -> float:
-    """Compute top-k accuracy
+    r"""
+    Compute top-k accuracy.
 
     Args:
-        predictions: [N, C] prediction logits
-        targets: [N] ground truth labels
-        top_k: Compute top-k accuracy
+        predictions (Tensor): Prediction logits of shape :math:`(N, C)` where N is batch size
+            and C is number of classes
+        targets (Tensor): Ground truth labels of shape :math:`(N,)`
+        top_k (int): Compute top-k accuracy. Default: ``1``
 
     Returns:
-        Accuracy percentage
+        float: Accuracy percentage in range [0, 1]
+
+    Examples::
+
+        >>> predictions = torch.randn(32, 10)
+        >>> targets = torch.randint(0, 10, (32,))
+        >>> accuracy = compute_accuracy(predictions, targets, top_k=1)
+        >>> accuracy
+        0.3125
     """
     batch_size = targets.size(0)
     num_classes = predictions.size(-1)
@@ -43,15 +53,26 @@ def compute_confusion_matrix(
     targets: torch.Tensor,
     num_classes: int,
 ) -> torch.Tensor:
-    """Compute confusion matrix
+    r"""
+    Compute confusion matrix.
 
     Args:
-        predictions: [N] predicted class indices
-        targets: [N] ground truth class indices
-        num_classes: Number of classes
+        predictions (Tensor): Predicted class indices of shape :math:`(N,)`
+        targets (Tensor): Ground truth class indices of shape :math:`(N,)`
+        num_classes (int): Number of classes
 
     Returns:
-        [num_classes, num_classes] confusion matrix
+        Tensor: Confusion matrix of shape :math:`(num\_classes, num\_classes)` where
+            element [i, j] is the count of samples with true label i predicted as j
+
+    Examples::
+
+        >>> predictions = torch.tensor([0, 1, 2, 0, 1])
+        >>> targets = torch.tensor([0, 1, 1, 0, 2])
+        >>> compute_confusion_matrix(predictions, targets, num_classes=3)
+        tensor([[2, 0, 0],
+                [0, 1, 1],
+                [0, 1, 0]])
     """
     confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
 
@@ -66,15 +87,23 @@ def compute_per_class_accuracy(
     targets: torch.Tensor,
     num_classes: int,
 ) -> Dict[int, float]:
-    """Compute per-class accuracy
+    r"""
+    Compute per-class accuracy.
 
     Args:
-        predictions: [N] predicted class indices
-        targets: [N] ground truth class indices
-        num_classes: Number of classes
+        predictions (Tensor): Predicted class indices of shape :math:`(N,)`
+        targets (Tensor): Ground truth class indices of shape :math:`(N,)`
+        num_classes (int): Number of classes
 
     Returns:
-        Dictionary mapping class index to accuracy
+        Dict[int, float]: Dictionary mapping class index to accuracy in range [0, 1]
+
+    Examples::
+
+        >>> predictions = torch.tensor([0, 1, 2, 0, 1])
+        >>> targets = torch.tensor([0, 1, 1, 0, 2])
+        >>> compute_per_class_accuracy(predictions, targets, num_classes=3)
+        {0: 1.0, 1: 0.5, 2: 0.0}
     """
     per_class_correct = torch.zeros(num_classes)
     per_class_total = torch.zeros(num_classes)
@@ -99,15 +128,31 @@ def compute_ece(
     targets: torch.Tensor,
     num_bins: int = 15,
 ) -> float:
-    """Compute Expected Calibration Error
+    r"""
+    Compute Expected Calibration Error (ECE).
+
+    ECE measures the difference between confidence and accuracy across bins:
+
+    .. math::
+        ECE = \sum_{b=1}^{B} \frac{|B_b|}{N} |acc(B_b) - conf(B_b)|
+
+    See `On Calibration of Modern Neural Networks <https://arxiv.org/abs/1706.04599>`_ for details.
 
     Args:
-        confidences: [N] prediction confidences [0, 1]
-        targets: [N] ground truth correctness (bool)
-        num_bins: Number of bins for ECE
+        confidences (Tensor): Prediction confidences (max probability) of shape :math:`(N,)`
+            with values in range [0, 1]
+        targets (Tensor): Ground truth correctness (bool) of shape :math:`(N,)`
+        num_bins (int): Number of bins for ECE computation. Default: ``15``
 
     Returns:
-        ECE score
+        float: ECE score in range [0, 1]
+
+    Examples::
+
+        >>> confidences = torch.tensor([0.9, 0.3, 0.8, 0.6])
+        >>> targets = torch.tensor([True, False, True, False])
+        >>> compute_ece(confidences, targets, num_bins=10)
+        0.125
     """
     if confidences.numel() == 0:
         return 0.0
@@ -143,14 +188,22 @@ def compute_nll(
     log_probs: torch.Tensor,
     targets: torch.Tensor,
 ) -> float:
-    """Compute Negative Log Likelihood
+    r"""
+    Compute Negative Log Likelihood (NLL).
 
     Args:
-        log_probs: [N, C] log probabilities
-        targets: [N] ground truth class indices
+        log_probs (Tensor): Log probabilities of shape :math:`(N, C)`
+        targets (Tensor): Ground truth class indices of shape :math:`(N,)`
 
     Returns:
-        NLL score
+        float: NLL score
+
+    Examples::
+
+        >>> log_probs = torch.randn(32, 10).log_softmax(dim=-1)
+        >>> targets = torch.randint(0, 10, (32,))
+        >>> compute_nll(log_probs, targets)
+        2.345
     """
     nll = torch.nn.functional.nll_loss(log_probs, targets)
     return nll.item()
@@ -160,18 +213,31 @@ def compute_brier_score(
     probs: torch.Tensor,
     targets: torch.Tensor,
 ) -> float:
-    """Compute Brier Score
+    r"""
+    Compute Brier Score.
 
-    BS = (1/N) * Σ ||p(y) - o(y)||²
+    Measures the mean squared difference between predicted probabilities and one-hot ground truth:
 
-    where p(y) is predicted probability and o(y) is one-hot ground truth.
+    .. math::
+        BS = \frac{1}{N} \sum_{i=1}^{N} \sum_{c=1}^{C} (p_c(y_i) - o_c(y_i))^2
+
+    where :math:`p_c(y_i)` is the predicted probability and :math:`o_c(y_i)` is the one-hot ground truth.
+
+    See `Stochastic Gradient Estimation Using Single Sample Partially Descent Neural Networks <https://arxiv.org/abs/1807.01118>`_ for details.
 
     Args:
-        probs: [N, C] predicted probabilities
-        targets: [N] ground truth class indices
+        probs (Tensor): Predicted probabilities of shape :math:`(N, C)`
+        targets (Tensor): Ground truth class indices of shape :math:`(N,)`
 
     Returns:
-        Brier score
+        float: Brier score in range [0, 2]
+
+    Examples::
+
+        >>> probs = torch.softmax(torch.randn(32, 10), dim=-1)
+        >>> targets = torch.randint(0, 10, (32,))
+        >>> compute_brier_score(probs, targets)
+        1.456
     """
     batch_size = probs.size(0)
     num_classes = probs.size(-1)
@@ -192,16 +258,37 @@ def compute_all_metrics(
     probs: Optional[torch.Tensor] = None,
     num_classes: int = 200,
 ) -> Dict[str, float]:
-    """Compute all available metrics
+    r"""
+    Compute all available metrics.
+
+    Computes accuracy (top-1 and top-5), per-class accuracy, confusion matrix,
+    and optionally ECE, NLL, and Brier score if probabilities are provided.
 
     Args:
-        predictions: [N] predicted class indices
-        targets: [N] ground truth class indices
-        probs: [N, C] predicted probabilities (optional)
-        num_classes: Number of classes
+        predictions (Tensor): Predicted class indices of shape :math:`(N,)`
+        targets (Tensor): Ground truth class indices of shape :math:`(N,)`
+        probs (Tensor, optional): Predicted probabilities of shape :math:`(N, C)`.
+            If provided, computes calibration metrics. Default: ``None``
+        num_classes (int): Number of classes. Default: ``200``
 
     Returns:
-        Dictionary of metric names to values
+        Dict[str, float]: Dictionary of metric names to values:
+            - ``"accuracy"``: Top-1 accuracy
+            - ``"top5_accuracy"``: Top-5 accuracy (if num_classes > 1)
+            - ``"avg_class_accuracy"``: Average per-class accuracy
+            - ``"confusion"``: Confusion matrix as list
+            - ``"ece"``: Expected Calibration Error (if probs provided)
+            - ``"nll"``: Negative Log Likelihood (if probs provided)
+            - ``"brier_score"``: Brier Score (if probs provided)
+
+    Examples::
+
+        >>> predictions = torch.randint(0, 10, (32,))
+        >>> targets = torch.randint(0, 10, (32,))
+        >>> probs = torch.softmax(torch.randn(32, 10), dim=-1)
+        >>> metrics = compute_all_metrics(predictions, targets, probs, num_classes=10)
+        >>> list(metrics.keys())
+        ['accuracy', 'top5_accuracy', 'avg_class_accuracy', 'confusion', 'ece', 'nll', 'brier_score']
     """
     metrics = {}
 

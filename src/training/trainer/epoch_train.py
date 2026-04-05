@@ -242,6 +242,7 @@ def train_one_epoch(
             else:
                 # Fallback if no targets
                 loss = torch.tensor(0.0, device=device)
+                loss_components = {}
 
         # Record loss components
         if config.numerical.record_loss_components:

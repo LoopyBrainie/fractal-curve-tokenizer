@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Optional, Dict, Any, List
 import torch
+from tqdm import tqdm
 import torch.nn as nn
 from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader
@@ -65,8 +66,10 @@ def evaluate(
     class_correct = torch.zeros(num_classes)
     class_total = torch.zeros(num_classes)
 
+    total_batches = len(dataloader)
+
     with torch.no_grad():
-        for batch in dataloader:
+        for batch_idx, batch in tqdm(enumerate(dataloader), total=total_batches, desc="Evaluating", leave=False):
             # Handle different batch formats
             if isinstance(batch, (list, tuple)):
                 images = batch[0].to(device, non_blocking=True)
@@ -128,6 +131,11 @@ def evaluate(
                 total_samples += batch_size
 
             num_batches += 1
+
+            # Batch 进度日志 (每 10 个 batch 打印一次)
+            if batch_idx > 0 and batch_idx % 10 == 0 and labels is not None:
+                batch_acc = correct / batch_size if batch_size > 0 else 0.0
+                print(f"  Eval batch {batch_idx}/{total_batches} | Loss: {loss.item():.4f} | Acc: {batch_acc:.2%}")
 
     # Compute final metrics
     avg_loss = total_loss / max(num_batches, 1)
@@ -244,8 +252,10 @@ def evaluate_simple(
     total_top5_correct = 0
     total_samples = 0
 
+    total_batches = len(dataloader)
+
     with torch.no_grad():
-        for batch in dataloader:
+        for batch_idx, batch in tqdm(enumerate(dataloader), total=total_batches, desc="Evaluating", leave=False):
             images = batch[0].to(device)
             labels = batch[1].to(device)
 
