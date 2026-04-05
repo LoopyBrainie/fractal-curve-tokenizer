@@ -41,8 +41,6 @@ from vit_pytorch.layers.embeddings.fractal_path import (
     VectorizedPathEncoder,
     OrientationExtractor,
 )
-# I164-1: 导入LookAheadHead (从废弃的SemanticRedundancy迁移)
-from vit_pytorch.layers.splitters.semantic_redundancy import LookAheadHead
 
 logger = logging.getLogger(__name__)
 
@@ -377,13 +375,6 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         # 1. 特征投影
         self.feature_proj = nn.Linear(feature_dim, hidden_dim)
-
-        # I164-1: LookAheadHead - 预测子节点特征以增强分裂决策
-        # 迁移自废弃的SemanticRedundancySplitter
-        self.look_ahead_head = LookAheadHead(
-            feature_dim=hidden_dim,
-            hidden_dim=hidden_dim
-        )
 
         # 2. 深度嵌入 (A1: 与 Embed 层一致)
         self.depth_embedding = nn.Embedding(max_level_limit + 1, hidden_dim)
