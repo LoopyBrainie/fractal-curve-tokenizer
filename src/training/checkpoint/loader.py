@@ -46,7 +46,7 @@ def load_checkpoint(
 
     print(f"[CHECKPOINT] Loading: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
 
     # Extract components
     result = {
@@ -93,7 +93,7 @@ def load_model_weights(
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
 
     # Get model state
     model_state = checkpoint.get("model_state_dict", checkpoint)

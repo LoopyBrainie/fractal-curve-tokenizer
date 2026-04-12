@@ -2108,7 +2108,7 @@ def main():
     )
 
     if args.pretrained:
-        checkpoint = torch.load(args.pretrained, map_location=args.device)
+        checkpoint = torch.load(args.pretrained, map_location=args.device, weights_only=True)
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])
         else:
