@@ -81,7 +81,11 @@ class DummyPositional(nn.Module):
 
 
 def test_vit_uses_custom_components() -> None:
-    """测试 FractalCurveViT 使用自定义组件."""
+    """测试 FractalCurveViT 使用自定义组件.
+
+    v6.0+: position_embedding 参数已被 2D RoPE 替代，不再在 forward 中调用。
+    仅保留 tokenizer 的自定义组件测试。
+    """
     dim = 16
     batch_size = 2
 
@@ -97,7 +101,7 @@ def test_vit_uses_custom_components() -> None:
         mlp_dim=32,
         min_patch_size=4,
         tokenizer=tokenizer,
-        position_embedding=positional,
+        position_embedding=positional,  # v6.0+: 被接受但不再使用
     )
 
     images = torch.randn(batch_size, 3, 32, 32)
@@ -106,7 +110,7 @@ def test_vit_uses_custom_components() -> None:
 
     assert outputs.shape == (batch_size, 4)
     assert tokenizer.called
-    assert positional.called
+    # v6.0+: position_embedding 已由 Cartesian2DRoPE 替代，不再调用
 
 
 def test_next_gen_vit_single_training_step_updates_parameters() -> None:

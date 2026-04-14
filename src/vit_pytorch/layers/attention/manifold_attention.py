@@ -743,6 +743,149 @@ class ScaleAwareResidual(nn.Module):
         return self.dropout(residual)
 
 
+class Cartesian2DRoPE(nn.Module):
+    """
+    基于物理坐标的 Cartesian 2D Rotary Position Embedding。
+
+    数学形式化
+    ==========
+    给定位置 i 的物理坐标 p_i = (x_i, y_i)，
+    计算绝对角度 θ_i = atan2(y_i, x_i)
+
+    利用三角恒等式进行高效实现:
+    - 存储: 每个位置只需 (cos θ_i, sin θ_i)，O(N) 空间
+    - 相对角度: θ_ij = θ_j - θ_i
+    - cos(θ_ij) = cos(θ_i)cos(θ_j) + sin(θ_i)sin(θ_j)
+    - sin(θ_ij) = sin(θ_j)cos(θ_i) - cos(θ_j)sin(θ_i)
+
+    旋转矩阵作用于每对维度 (2d, 2d+1):
+        R(θ) = [[cos(θ), -sin(θ)],
+                [sin(θ),  cos(θ)]]
+
+    特性
+    ----
+    - 相对位置编码，不依赖绝对位置
+    - O(N) 空间复杂度（无需存储 N² 角度矩阵）
+    - 与 Manifold Bias 正交，可叠加
+
+    参数
+    ----
+    dim : int
+        向量维度 D（必须为偶数）
+    theta : float
+        基础频率，默认 10000.0
+    """
+
+    def __init__(self, dim: int, theta: float = 10000.0):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"dim must be even, got {dim}")
+        self.dim = dim
+        self.theta = theta
+
+        # 预计算频率（用于高效计算）
+        # freqs[i] = theta^(-2i/dim)
+        freqs = theta ** (-2 * torch.arange(0, dim // 2, 2).float() / dim)
+        self.register_buffer("freqs", freqs, persistent=False)
+
+    def forward(
+        self,
+        coords: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        计算每个位置的 (cos θ, sin θ) 用于后续注意力计算。
+
+        参数
+        ----
+        coords : torch.Tensor
+            物理坐标 [B, N, 2]，格式 (x, y)，归一化到 [0, 1)
+
+        返回
+        ----
+        Tuple[torch.Tensor, torch.Tensor]
+            (cos_θ, sin_θ)，每个 [B, N]
+        """
+        # 计算每个位置的绝对角度 θ_i = atan2(y_i, x_i)
+        angles = torch.atan2(coords[..., 1], coords[..., 0])  # [B, N]
+
+        # 预计算 cos 和 sin
+        cos_θ = torch.cos(angles)  # [B, N]
+        sin_θ = torch.sin(angles)  # [B, N]
+
+        # 存储用于后续应用
+        self._last_cos = cos_θ.detach()
+        self._last_sin = sin_θ.detach()
+        self._last_coords = coords.detach()
+
+        return cos_θ, sin_θ
+
+    def apply_rotation(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cos_θ: torch.Tensor,
+        sin_θ: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        将 2D RoPE 旋转应用到 Q 和 K。
+
+        公式（应用于每对维度）:
+            x' = cos(φ) * x_{2d} - sin(φ) * x_{2d+1}
+            x'' = sin(φ) * x_{2d} + cos(φ) * x_{2d+1}
+
+        其中 φ = θ * freq，θ 是位置角度，freq 是频率。
+
+        参数
+        ----
+        q : torch.Tensor
+            Query 向量 [B, H, N, d]
+        k : torch.Tensor
+            Key 向量 [B, H, N, d]
+        cos_θ : torch.Tensor
+            每个位置的 cos(θ_i), [B, N]
+        sin_θ : torch.Tensor
+            每个位置的 sin(θ_i), [B, N]
+
+        返回
+        ----
+        Tuple[torch.Tensor, torch.Tensor]
+            旋转后的 (q, k)
+        """
+        B, H, N, D = q.shape
+        dim_pairs = D // 2
+
+        # 计算相位 φ = θ * freq
+        # 标准 RoPE: 每对维度 (2i, 2i+1) 应用角度 θ_i = theta^(-2i/D)
+        # cos_θ: [B, N] -> [B, 1, N, 1]
+        # freqs: [dim_pairs] 频率序列
+        cos_θ = cos_θ.unsqueeze(1).unsqueeze(-1)  # [B, 1, N, 1]
+        sin_θ = sin_θ.unsqueeze(1).unsqueeze(-1)  # [B, 1, N, 1]
+        # 正确公式: theta^(-2i/D) for i = 0, 1, ..., dim_pairs-1
+        freqs = self.theta ** (-2 * torch.arange(dim_pairs, device=q.device, dtype=q.dtype).float() / D)
+        freqs = freqs.view(1, 1, 1, dim_pairs)  # [1, 1, 1, dim_pairs]
+
+        cos_phi = cos_θ * freqs
+        sin_phi = sin_θ * freqs
+
+        # 重塑 q 和 k 为维度对
+        q_pairs = q.reshape(B, H, N, dim_pairs, 2)  # [B, H, N, d//2, 2]
+        k_pairs = k.reshape(B, H, N, dim_pairs, 2)
+
+        # 应用旋转到 q
+        # q' = cos(φ) * q_{even} - sin(φ) * q_{odd}
+        # q'' = sin(φ) * q_{even} + cos(φ) * q_{odd}
+        q_rot = torch.empty_like(q)
+        q_rot[..., 0::2] = cos_phi * q_pairs[..., 0] - sin_phi * q_pairs[..., 1]
+        q_rot[..., 1::2] = sin_phi * q_pairs[..., 0] + cos_phi * q_pairs[..., 1]
+
+        # 应用旋转到 k
+        k_rot = torch.empty_like(k)
+        k_rot[..., 0::2] = cos_phi * k_pairs[..., 0] - sin_phi * k_pairs[..., 1]
+        k_rot[..., 1::2] = sin_phi * k_pairs[..., 0] + cos_phi * k_pairs[..., 1]
+
+        return q_rot, k_rot
+
+
 # ==================== 主模块 ====================
 
 
@@ -816,6 +959,9 @@ class ManifoldNativeAttention(nn.Module):
         else:
             self.residual_proj = nn.Identity()
 
+        # Cartesian 2D RoPE（基于物理坐标的旋转位置编码）
+        self.rope_2d = Cartesian2DRoPE(dim=self.inner_dim)
+
         # 诊断缓冲区
         self._last_geo_bias: Optional[torch.Tensor] = None
         self._last_manifold_coords: Optional[torch.Tensor] = None
@@ -862,6 +1008,7 @@ class ManifoldNativeAttention(nn.Module):
         depths = None
         hilbert_indices = None
         raw_paths = None  # 原始 paths 用于坐标重建
+        coords = None  # 物理坐标，用于 2D RoPE
         if levels_info is not None:
             if hasattr(levels_info, 'depths'):
                 depths = levels_info.depths
@@ -892,6 +1039,21 @@ class ManifoldNativeAttention(nn.Module):
 
         B, N, D = x.shape
 
+        # 早期坐标重建（用于 2D RoPE）
+        # 如果有 raw_paths，可以提前计算 coords
+        if raw_paths is not None and depths is not None:
+            # 使用实际的 paths 大小而非 self.max_level
+            actual_max_level = raw_paths.shape[-1]
+            coords = coords_from_paths(
+                paths=raw_paths,
+                depths=depths,
+                max_level=actual_max_level,
+            )  # [B, N, 2] 归一化到 [0, 1)
+        elif hilbert_indices is not None:
+            # 回退：使用基于 hilbert_indices 的简化坐标
+            h_norm = hilbert_indices.float() / (hilbert_indices.max().float() + 1e-8)
+            coords = torch.stack([h_norm, h_norm], dim=-1)  # [B, N, 2]
+
         # 存储输入用于诊断
         self._last_input_x = x.detach()
 
@@ -902,6 +1064,11 @@ class ManifoldNativeAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         # 计算注意力分数
+        # 应用 Cartesian 2D RoPE（在 QKV 投影后、注意力计算前）
+        if coords is not None:
+            cos_θ, sin_θ = self.rope_2d(coords)
+            q, k = self.rope_2d.apply_rotation(q, k, cos_θ, sin_θ)
+
         attn = (q @ k.transpose(-2, -1)) * self.scale
 
         # B2 修复: 无条件执行（仅依赖 levels_info，不再需要 regions/image_size）
@@ -920,19 +1087,7 @@ class ManifoldNativeAttention(nn.Module):
             hilbert_quadrants = (hilbert_indices / (256 // 4)).long() % 4  # [B, N]
             paths = hilbert_quadrants.unsqueeze(2).expand(-1, -1, self.max_level)  # [B, N, max_level]
 
-            # 从真实 paths 重建坐标（使用 Hilbert 四叉树结构）
-            # 修复: 使用 coords_from_paths 而非 torch.zeros
-            if raw_paths is not None:
-                # raw_paths: [B, N, max_level]， depths: [B, N]
-                coords = coords_from_paths(
-                    paths=raw_paths,
-                    depths=depths,
-                    max_level=self.max_level,
-                )  # [B, N, 2] 归一化到 [0, 1)
-            else:
-                # 回退：使用基于 hilbert_indices 的简化坐标
-                h_norm = hilbert_indices.float() / (hilbert_indices.max().float() + 1e-8)
-                coords = torch.stack([h_norm, h_norm], dim=-1)  # [B, N, 2]
+            # coords 已在前面提前计算，无需重复
 
             # 计算几何特征（纯 Hilbert 驱动）
             geo_features = compute_geometric_features(
