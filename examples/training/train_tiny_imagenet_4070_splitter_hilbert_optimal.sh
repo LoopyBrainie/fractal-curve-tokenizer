@@ -187,10 +187,8 @@ uv run python -m src.training.train_fractal_vit \
   --save-interval 10 \
   --patience 25 \
   \
-  --experiments-dir ./experiments \
   --seed 42 \
   --num-workers 4 \
-  --data-root ./data
 
 # ============================================================================
 # Parameter Summary (for quick reference)

@@ -22,7 +22,12 @@ from .loss import MixupCutmixLoss, compute_loss
 from ..monitor.gradient_monitor import GradientMonitor
 from ..monitor.loss_monitor import LossMonitor
 from ..monitor.numerical_defense import NumericalDefender, NaNAutoInvestigation, dump_debug_info
-from vit_pytorch.core.layer_output import flatten_layer_outputs
+
+
+def _get_flatten_layer_outputs():
+    """Lazy import to avoid module resolution order issues in containers."""
+    from vit_pytorch.core.layer_output import flatten_layer_outputs
+    return flatten_layer_outputs
 
 
 class GradBalancer:
@@ -334,7 +339,7 @@ def train_one_epoch(
 
                 # auxiliary_outputs flattening (layer-packaged → trainer-unpacked)
                 if hasattr(outputs, 'auxiliary_outputs') and outputs.auxiliary_outputs:
-                    _flat = flatten_layer_outputs(outputs.auxiliary_outputs, prefix="train")
+                    _flat = _get_flatten_layer_outputs()(outputs.auxiliary_outputs, prefix="train")
                     for _k, _v in _flat.items():
                         if _k not in _aux_flat_accum:
                             _aux_flat_accum[_k] = []
