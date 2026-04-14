@@ -68,6 +68,11 @@ def evaluate(
 
     total_batches = len(dataloader)
 
+    # P1 诊断: 验证样本数量
+    estimated_samples = total_batches * dataloader.batch_size
+    actual_samples = len(dataloader.dataset)
+    print(f"  [P0诊断] Validation: {actual_samples} samples, {total_batches} batches (batch_size={dataloader.batch_size})")
+
     with torch.no_grad():
         for batch_idx, batch in tqdm(enumerate(dataloader), total=total_batches, desc="Evaluating", leave=False):
             # Handle different batch formats

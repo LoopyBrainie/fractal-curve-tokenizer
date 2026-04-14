@@ -7,8 +7,9 @@ handles Layer 3 (hyperparameters) for training loop.
 
 from __future__ import annotations
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import time
+import math
 import torch
 import torch.nn as nn
 from torch.amp import autocast as amp_autocast
@@ -21,6 +22,90 @@ from .loss import MixupCutmixLoss, compute_loss
 from ..monitor.gradient_monitor import GradientMonitor
 from ..monitor.loss_monitor import LossMonitor
 from ..monitor.numerical_defense import NumericalDefender, NaNAutoInvestigation, dump_debug_info
+from vit_pytorch.core.layer_output import flatten_layer_outputs
+
+
+class GradBalancer:
+    """动态梯度平衡器 - 使用 EMA 平滑避免抖动
+
+    V3 核心组件，解决 "双重退火坍缩" 问题。
+
+    数学形式:
+        G_CE_EMA ← β·G_CE_EMA + (1-β)·||∇CE||
+        G_Budget_EMA ← β·G_Budget_EMA + (1-β)·||∇Budget||
+
+        W_adaptive = η · G_CE_EMA / (G_Budget_EMA + ε)
+        W_final = clamp(W_adaptive, min=min_weight, max=budget_weight_target)
+
+    使用场景:
+        - 监测到 splitter_grad_norm < backbone_grad_norm / 15 时自动提升 W_budget
+        - 防止 Budget Loss 在低梯度阶段过度主导训练
+
+    Args:
+        beta: EMA 平滑系数 (default: 0.95)
+        eta: 目标梯度比例 (default: 0.1, Budget ≈ 10% × CE)
+        budget_weight_target: Budget weight 上限
+        min_weight: Budget weight 下限 (default: 0.01)
+    """
+
+    def __init__(
+        self,
+        beta: float = 0.95,
+        eta: float = 0.1,
+        budget_weight_target: float = 0.2,
+        min_weight: float = 0.01,
+    ):
+        self.beta = beta
+        self.eta = eta
+        self.budget_weight_target = budget_weight_target
+        self.min_weight = min_weight
+
+        self.g_ce_ema: Optional[float] = None
+        self.g_budget_ema: Optional[float] = None
+        self.step_count: int = 0
+
+    def compute(self, grad_ce_norm: float, grad_budget_norm: float) -> float:
+        """计算自适应 budget weight
+
+        Args:
+            grad_ce_norm: CE loss 的梯度范数 (backbone_grad_norm)
+            grad_budget_norm: Budget loss 的梯度范数 (splitter_grad_norm)
+
+        Returns:
+            自适应计算的 budget_weight
+        """
+        self.step_count += 1
+
+        # 初始化 EMA (使用第一个有效值)
+        if self.g_ce_ema is None:
+            self.g_ce_ema = grad_ce_norm
+            self.g_budget_ema = grad_budget_norm if grad_budget_norm > 0 else 1e-8
+
+        # EMA 更新
+        self.g_ce_ema = self.beta * self.g_ce_ema + (1 - self.beta) * grad_ce_norm
+        self.g_budget_ema = self.beta * self.g_budget_ema + (1 - self.beta) * max(grad_budget_norm, 1e-8)
+
+        # 计算自适应权重: W = η · G_CE / G_Budget
+        adaptive = self.eta * self.g_ce_ema / self.g_budget_ema
+
+        # Clamp 并返回
+        clamped = max(self.min_weight, min(adaptive, self.budget_weight_target))
+        return clamped
+
+    def get_status(self) -> Dict[str, float]:
+        """返回当前 EMA 状态 (用于调试)"""
+        return {
+            "g_ce_ema": self.g_ce_ema or 0.0,
+            "g_budget_ema": self.g_budget_ema or 0.0,
+            "step_count": self.step_count,
+        }
+
+    def get_adaptive_budget_weight(self) -> float:
+        """获取当前 EMA 计算的自适应 budget_weight (不更新状态)"""
+        if self.g_ce_ema is None or self.g_budget_ema is None:
+            return self.budget_weight_target  # fallback to target
+        adaptive = self.eta * self.g_ce_ema / self.g_budget_ema
+        return max(self.min_weight, min(adaptive, self.budget_weight_target))
 
 
 def train_one_epoch(
@@ -32,9 +117,12 @@ def train_one_epoch(
     config: Config,
     device: torch.device,
     scheduler: Optional[Any] = None,
+    splitter_scheduler: Optional[Any] = None,  # V4: Splitter 独立 LR scheduler
     mixup_cutmix: Optional[MixupCutmixLoss] = None,
     debug_dir: Optional[str] = None,
     collector: Optional[Any] = None,  # NEW: Optional MetricsCollector
+    warmup_params: Optional[dict] = None,  # NEW: BPE-style warmup params
+    grad_balancer: Optional[GradBalancer] = None,  # V3: 动态梯度平衡器
 ) -> EpochMetrics:
     """Train for one epoch
 
@@ -55,6 +143,8 @@ def train_one_epoch(
     Returns:
         EpochMetrics with training statistics
     """
+    from tqdm import tqdm
+
     model.train()
 
     # Initialize monitors (use collector if provided)
@@ -129,10 +219,19 @@ def train_one_epoch(
     _theoretical_flops_count: int = 0
     total_mean_abs_logits: Optional[float] = None  # I150-3 NEW: Splitter Logits 平均绝对值
     _mean_abs_logits_count: int = 0
-    total_budget_loss: Optional[float] = None  # I150-3 NEW: Elastic Budget 损失
-    _budget_loss_count: int = 0
+    total_raw_budget_error: Optional[float] = None  # D162: 重命名 (原 budget_loss)
+    _raw_budget_error_count: int = 0
     total_density_regularization: Optional[float] = None  # I150-3 NEW: 密度正则化损失
     _density_reg_count: int = 0
+
+    # V3: GradBalancer 梯度跟踪
+    _total_grad_ce_norm: float = 0.0  # CE (backbone) 梯度范数累加
+    _total_grad_budget_norm: float = 0.0  # Budget (splitter) 梯度范数累加
+    _grad_balancer_count: int = 0
+
+    # Auxiliary outputs accumulator: maps flat key → list of per-batch values.
+    # Populated by flatten_layer_outputs() on each forward pass.
+    _aux_flat_accum: Dict[str, List[float]] = {}
 
     # 显存峰值
     peak_memory_mb = 0.0
@@ -140,7 +239,8 @@ def train_one_epoch(
     epoch_start_time = time.time()
 
     # Training loop
-    for batch_idx, batch in enumerate(dataloader):
+    pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {state.epoch}", leave=False)
+    for batch_idx, batch in pbar:
         # Handle different batch formats
         if isinstance(batch, (list, tuple)):
             images = batch[0].to(device, non_blocking=True)
@@ -225,12 +325,20 @@ def train_one_epoch(
                 if outputs.mean_abs_logits is not None:
                     total_mean_abs_logits = (total_mean_abs_logits or 0.0) + outputs.mean_abs_logits
                     _mean_abs_logits_count += 1
-                if outputs.budget_loss is not None:
-                    total_budget_loss = (total_budget_loss or 0.0) + outputs.budget_loss
-                    _budget_loss_count += 1
+                if outputs.raw_budget_error is not None:
+                    total_raw_budget_error = (total_raw_budget_error or 0.0) + outputs.raw_budget_error
+                    _raw_budget_error_count += 1
                 if outputs.density_regularization is not None:
                     total_density_regularization = (total_density_regularization or 0.0) + outputs.density_regularization
                     _density_reg_count += 1
+
+                # auxiliary_outputs flattening (layer-packaged → trainer-unpacked)
+                if hasattr(outputs, 'auxiliary_outputs') and outputs.auxiliary_outputs:
+                    _flat = flatten_layer_outputs(outputs.auxiliary_outputs, prefix="train")
+                    for _k, _v in _flat.items():
+                        if _k not in _aux_flat_accum:
+                            _aux_flat_accum[_k] = []
+                        _aux_flat_accum[_k].append(_v)
             else:
                 logits = outputs
 
@@ -247,9 +355,11 @@ def train_one_epoch(
         # Record loss components
         if config.numerical.record_loss_components:
             loss_components["total"] = loss.item()
+            # Update progress bar with current loss
+            pbar.set_postfix_str(f"loss: {loss.item():.4f}")
             # I-AUDIT: 使用 is not None 检查，TrainingStats 字段现在是 Optional[float] = None
-            if outputs.budget_loss is not None:
-                loss_components["budget_loss"] = outputs.budget_loss
+            if outputs.raw_budget_error is not None:
+                loss_components["raw_budget_error"] = outputs.raw_budget_error
             if outputs.density_regularization is not None:
                 loss_components["density_regularization"] = outputs.density_regularization
             if outputs.consistency_loss is not None:
@@ -326,6 +436,11 @@ def train_one_epoch(
                     _entmax_grad_count += 1
                     _manifold_decoder_grad_count += 1
 
+                # V3: GradBalancer 梯度跟踪
+                # 在每个 step 后更新 EMA 梯度范数
+                if grad_balancer is not None and backbone_grad_norm > 0 and splitter_grad_norm > 0:
+                    grad_balancer.compute(backbone_grad_norm, splitter_grad_norm)
+
         # 显存峰值监控
         if torch.cuda.is_available():
             current_memory_mb = torch.cuda.max_memory_allocated() / 1024**2
@@ -347,6 +462,17 @@ def train_one_epoch(
         should_skip = defender.post_backward()
 
         if should_skip:
+            # P1-1 FIX: Splitter 梯度裁剪（独立于主梯度裁剪）
+            # 理论: 当 splitter_grad_norm >> backbone_grad_norm 时，
+            # AdamW 动量会将大量步长分配给 Splitter，导致 Backbone 被"漂移"
+            # clip_grad_norm_ 按向量范数缩放，保留梯度方向（优于 clamp_ 的逐元素截断）
+            if hasattr(model, 'splitter') and model.splitter is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    model.splitter.parameters(),
+                    max_norm=5.0,
+                    norm_type=2.0,
+                )
+
             # Gradient clipping
             if config.training.gradient_clip_norm > 0:
                 if scaler is not None:
@@ -359,6 +485,9 @@ def train_one_epoch(
             # Update scheduler BEFORE optimizer step
             if scheduler is not None:
                 scheduler.step(state.global_step)
+            # V4: Splitter 独立 LR scheduler 也同步 step
+            if splitter_scheduler is not None:
+                splitter_scheduler.step(state.global_step)
 
             # Optimizer step
             if scaler is not None:
@@ -423,6 +552,9 @@ def train_one_epoch(
             # Still need to update scheduler even when skipping
             if scheduler is not None:
                 scheduler.step(state.global_step)
+            # V4: Splitter 独立 LR scheduler 也同步 step
+            if splitter_scheduler is not None:
+                splitter_scheduler.step(state.global_step)
             optimizer.zero_grad()
             skipped_steps += 1
             state.nan_skip_count += 1
@@ -517,8 +649,13 @@ def train_one_epoch(
     avg_entropy_loss = safe_avg(total_entropy_loss, _entropy_loss_count)
     avg_theoretical_flops_reduction = safe_avg(total_theoretical_flops_reduction, _theoretical_flops_count)
     avg_mean_abs_logits = safe_avg(total_mean_abs_logits, _mean_abs_logits_count)  # I150-3 NEW
-    avg_budget_loss = safe_avg(total_budget_loss, _budget_loss_count)  # I150-3 NEW
+    avg_raw_budget_error = safe_avg(total_raw_budget_error, _raw_budget_error_count)  # D162: 重命名
     avg_density_regularization = safe_avg(total_density_regularization, _density_reg_count)  # I150-3 NEW
+
+    # Average auxiliary flat metrics across all batches.
+    auxiliary_flat_metrics: Dict[str, float] = {
+        k: sum(vs) / len(vs) for k, vs in _aux_flat_accum.items() if vs
+    }
 
     # 计算梯度比值
     backbone_vs_splitter_ratio = None
@@ -557,8 +694,9 @@ def train_one_epoch(
         entropy_loss=avg_entropy_loss,
         theoretical_flops_reduction=avg_theoretical_flops_reduction,
         mean_abs_logits=avg_mean_abs_logits,  # I150-3 NEW
-        budget_loss=avg_budget_loss,  # I150-3 NEW
+        raw_budget_error=avg_raw_budget_error,  # D162: 重命名
         density_regularization=avg_density_regularization,  # I150-3 NEW
+        auxiliary_flat_metrics=auxiliary_flat_metrics,
     )
 
     # Memory stats
@@ -567,6 +705,28 @@ def train_one_epoch(
         metrics.memory_reserved_mb = torch.cuda.memory_reserved() / 1024**2
         # Reset peak memory for next epoch
         torch.cuda.reset_peak_memory_stats()
+
+    # BPE-style warmup params（附加到 metrics 用于日志）
+    if warmup_params:
+        metrics.warmup_stage = warmup_params.get('stage', 0)
+        metrics.current_tau = warmup_params.get('tau', 1.0)
+        metrics.current_target_ratio = warmup_params.get('target_ratio', 0.25)
+        metrics.current_budget_weight = warmup_params.get('budget_weight', 0.0)
+        # V2: active_ratio 警告检查（Stage 2 结束时仍高于 30% 视为异常）
+        active_ratio = getattr(metrics, 'active_ratio', 0.0)
+        stage = warmup_params.get('stage', 0)
+        if stage == 2 and warmup_params.get('target_ratio', 0.25) < 0.15 and active_ratio > 0.30:
+            print(f"[WARNING] V2: active_ratio={active_ratio:.3f} still above 30% at Stage 2 target_ratio={warmup_params.get('target_ratio', 0):.3f}")
+
+    # V3: GradBalancer 状态
+    if grad_balancer is not None:
+        balancer_status = grad_balancer.get_status()
+        # 计算当前自适应 budget_weight
+        if balancer_status["g_ce_ema"] > 0 and balancer_status["g_budget_ema"] > 0:
+            metrics.adaptive_budget_weight = grad_balancer.compute(
+                balancer_status["g_ce_ema"],
+                balancer_status["g_budget_ema"]
+            )
 
     return metrics
 
@@ -635,4 +795,5 @@ def train_one_epoch_simple(
 __all__ = [
     "train_one_epoch",
     "train_one_epoch_simple",
+    "GradBalancer",
 ]

@@ -278,6 +278,9 @@ def train(
         # Check if best
         is_best = False
         if eval_metrics and config.checkpoint.save_best:
+            # Initialize best_metric if first epoch (0.0 is ambiguous for accuracy)
+            if state.best_metric == 0.0 and config.checkpoint.monitor_mode == "max":
+                state.best_metric = float('-inf')
             metric_value = eval_metrics.get(config.checkpoint.monitor_metric, 0.0)
             if config.checkpoint.monitor_mode == "max":
                 is_best = metric_value > state.best_metric
@@ -287,8 +290,14 @@ def train(
             if is_best:
                 state.best_metric = metric_value
 
-        # Save checkpoint
-        if (epoch + 1) % config.checkpoint.save_interval == 0 or is_best:
+        # Save checkpoint: separate concerns
+        # 1. Save epoch checkpoint every N epochs (controlled by save_interval)
+        # 2. Save best.pth only when is_best=True (handled in save_checkpoint)
+        # 3. Save last.pth every time (handled in save_checkpoint)
+        save_interval = config.checkpoint.save_interval
+        should_save_epoch = (epoch + 1) % save_interval == 0 or (epoch + 1) >= config.training.num_epochs
+
+        if should_save_epoch:
             checkpoint_path = save_checkpoint(
                 checkpoint_dir=config.checkpoint.checkpoint_dir,
                 model=model,
@@ -299,6 +308,21 @@ def train(
                 scaler_state=state.scaler_state,
                 training_state=state.to_dict(),
                 is_best=is_best,
+                save_epoch_checkpoint=True,
+            )
+        elif is_best:
+            # Not on save interval, but new best → only update best.pth and last.pth
+            checkpoint_path = save_checkpoint(
+                checkpoint_dir=config.checkpoint.checkpoint_dir,
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch + 1,
+                metrics={"train": train_metrics.to_dict(), "eval": eval_metrics or {}},
+                scheduler_state=state.scheduler_state,
+                scaler_state=state.scaler_state,
+                training_state=state.to_dict(),
+                is_best=True,
+                save_epoch_checkpoint=False,
             )
 
     print(f"\n{'='*60}")

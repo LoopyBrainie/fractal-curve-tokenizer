@@ -187,7 +187,7 @@ class MetricRegistry:
         # 损失组件指标
         loss_component_specs = [
             ("loss_cross_entropy", "", "交叉熵损失"),
-            ("loss_budget_loss", "", "预算损失"),
+            ("loss_raw_budget_error", "", "原始预算误差"),  # D162: 重命名 (原 loss_budget_loss)
             ("loss_density_regularization", "", "密度正则化"),
             ("loss_consistency_loss", "", "一致性损失"),
             ("loss_entropy_loss", "", "熵损失"),

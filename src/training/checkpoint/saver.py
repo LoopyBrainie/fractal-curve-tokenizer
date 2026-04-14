@@ -24,6 +24,7 @@ def save_checkpoint(
     training_state: Optional[Dict[str, Any]] = None,
     is_best: bool = False,
     filename: Optional[str] = None,
+    save_epoch_checkpoint: bool = True,
 ) -> str:
     """Save training checkpoint
 
@@ -45,6 +46,8 @@ def save_checkpoint(
         training_state: Optional full training state
         is_best: Whether this is the best checkpoint
         filename: Optional custom filename
+        save_epoch_checkpoint: Whether to save epoch checkpoint (default True)
+            Set to False when only updating best.pth/last.pth without epoch checkpoint
 
     Returns:
         Path to saved checkpoint
@@ -70,13 +73,14 @@ def save_checkpoint(
     if training_state is not None:
         checkpoint["training_state"] = training_state
 
-    # Save regular checkpoint
-    if filename is None:
-        filename = f"checkpoint_epoch_{epoch}.pth"
-    checkpoint_path = checkpoint_dir / filename
-
-    torch.save(checkpoint, checkpoint_path)
-    print(f"[CHECKPOINT] Saved: {checkpoint_path}")
+    # Save regular checkpoint (epoch checkpoint)
+    checkpoint_path = None
+    if save_epoch_checkpoint:
+        if filename is None:
+            filename = f"checkpoint_epoch_{epoch}.pth"
+        checkpoint_path = checkpoint_dir / filename
+        torch.save(checkpoint, checkpoint_path)
+        print(f"[CHECKPOINT] Saved: {checkpoint_path}")
 
     # Save best checkpoint
     if is_best:
@@ -89,7 +93,7 @@ def save_checkpoint(
     torch.save(checkpoint, last_path)
     print(f"[CHECKPOINT] Saved last: {last_path}")
 
-    return str(checkpoint_path)
+    return str(checkpoint_path) if checkpoint_path else str(last_path)
 
 
 def save_epoch_stats(

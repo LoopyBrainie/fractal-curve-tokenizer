@@ -37,7 +37,7 @@ class LossMonitor:
     DEFAULT_LOSS_COMPONENTS = [
         "cross_entropy",
         "total",
-        "budget_loss",
+        "raw_budget_error",  # D162: 重命名 (原 budget_loss)
         "density_regularization",
         "elastic_budget",
         "sparsity_penalty",

@@ -40,13 +40,21 @@ class TrainingHyperparams:
     num_epochs: int = 100
     batch_size: int = 128
     accumulation_steps: int = 1
-    gradient_clip_norm: float = 1.0
+    gradient_clip_norm: float = 5.0
 
     # Learning rate
     base_lr: float = 5e-4
     warmup_epochs: int = 5
     min_lr: float = 1e-6
     warmup_start_lr: float = 1e-7
+
+    # V4: Splitter 独立学习率倍数
+    # Splitter 使用 base_lr * splitter_lr_multiplier 以保持足够的路径选择能力
+    splitter_lr_multiplier: float = 5.0
+
+    # V2: Budget loss weight for BPE regularization (梯度平衡)
+    # 目标: 使 Budget 梯度达到 CE 梯度的 10-15% (约 0.5-0.8 梯度范数)
+    budget_loss_weight: float = 0.05
 
     # Regularization
     weight_decay: float = 0.05

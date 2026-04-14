@@ -40,6 +40,7 @@ class TrainingState:
     optimizer_state: Optional[Dict[str, Any]] = None
     scaler_state: Optional[Dict[str, Any]] = None
     scheduler_state: Optional[Dict[str, Any]] = None
+    splitter_scheduler_state: Optional[Dict[str, Any]] = None  # V4: Splitter 独立 LR scheduler
     sampler_state: Optional[Dict[str, Any]] = None
 
     # Metrics history
@@ -81,6 +82,7 @@ class TrainingState:
             "optimizer_state": self.optimizer_state,
             "scaler_state": self.scaler_state,
             "scheduler_state": self.scheduler_state,
+            "splitter_scheduler_state": self.splitter_scheduler_state,  # V4
             "sampler_state": self.sampler_state,
             "metrics_history": self.metrics_history,
             "warning_count": self.warning_count,
@@ -97,6 +99,7 @@ class TrainingState:
         state.optimizer_state = d.get("optimizer_state")
         state.scaler_state = d.get("scaler_state")
         state.scheduler_state = d.get("scheduler_state")
+        state.splitter_scheduler_state = d.get("splitter_scheduler_state")  # V4
         state.sampler_state = d.get("sampler_state")
         state.metrics_history = d.get("metrics_history", {})
         state.warning_count = d.get("warning_count", 0)
@@ -204,8 +207,16 @@ class EpochMetrics:
 
     # I150-3 NEW: Splitter Logits 统计
     mean_abs_logits: float = 0.0
-    budget_loss: float = 0.0  # I150-3 NEW: Elastic Budget 损失
+    raw_budget_error: float = 0.0  # D162: 重命名 (原 budget_loss)
     density_regularization: float = 0.0  # I150-3 NEW: 密度正则化损失
+
+    # V3: GradBalancer 状态
+    adaptive_budget_weight: float = 0.0  # GradBalancer 计算的自适应 budget_weight
+
+    # Layer-packaged auxiliary outputs (flattened).
+    # Keys follow the convention "train/{layer}/{metric}",
+    # e.g. "train/splitter/entropy", "train/attn_0/geometric_bias_mean".
+    auxiliary_flat_metrics: Dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for logging
@@ -237,7 +248,7 @@ class EpochMetrics:
             result["loss_components"] = self.loss_components
 
         # 强制记录所有损失项（即使为 0）
-        result["budget_loss"] = self.budget_loss
+        result["raw_budget_error"] = self.raw_budget_error  # D162: 重命名
         result["density_regularization"] = self.density_regularization
         result["budget_penalty"] = self.budget_penalty
         result["consistency_loss"] = self.consistency_loss
@@ -285,6 +296,15 @@ class EpochMetrics:
         # FLOPs 理论节省
         if self.theoretical_flops_reduction > 0:
             result["theoretical_flops_reduction"] = self.theoretical_flops_reduction
+
+        # Merge layer-packaged diagnostics (flattened auxiliary_outputs).
+        # Keys are slash-namespaced so they cannot collide with existing fields.
+        if self.auxiliary_flat_metrics:
+            result.update(self.auxiliary_flat_metrics)
+
+        # V3: GradBalancer 状态
+        if self.adaptive_budget_weight > 0:
+            result["adaptive_budget_weight"] = self.adaptive_budget_weight
 
         return result
 
@@ -347,7 +367,7 @@ class EpochMetrics:
         metrics.backbone_vs_splitter_grad_ratio = summary.get("backbone_vs_splitter_grad_ratio", 0.0)
 
         # 损失项
-        metrics.budget_loss = summary.get("loss_budget_loss", 0.0)
+        metrics.raw_budget_error = summary.get("loss_raw_budget_error", 0.0)  # D162: 重命名
         metrics.density_regularization = summary.get("loss_density_regularization", 0.0)
 
         return metrics

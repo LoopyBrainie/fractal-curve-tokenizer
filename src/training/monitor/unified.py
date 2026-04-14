@@ -216,9 +216,9 @@ class UnifiedMonitor:
         if getattr(stats, 'active_ratio', None) is not None:
             self.collector.record("active_ratio", _to_float(stats.active_ratio))
 
-        # Budget loss 和密度正则化
-        if getattr(stats, 'budget_loss', None) is not None:
-            self.collector.record("budget_loss", _to_float(stats.budget_loss))
+        # Budget loss (raw relative error) 和密度正则化
+        if getattr(stats, 'raw_budget_error', None) is not None:
+            self.collector.record("raw_budget_error", _to_float(stats.raw_budget_error))
         if getattr(stats, 'density_regularization', None) is not None:
             self.collector.record("density_regularization", _to_float(stats.density_regularization))
         if getattr(stats, 'theoretical_flops_reduction', None) is not None:
@@ -236,6 +236,17 @@ class UnifiedMonitor:
             self.collector.record("backbone_grad_norm", float(stats.backbone_grad_norm))
         if hasattr(stats, 'splitter_grad_norm') and stats.splitter_grad_norm is not None:
             self.collector.record("splitter_grad_norm", float(stats.splitter_grad_norm))
+
+        # BPE-style warmup 阶段参数
+        if getattr(stats, 'warmup_stage', None) is not None:
+            self.collector.record("warmup_stage", float(stats.warmup_stage))
+        if getattr(stats, 'current_tau', None) is not None:
+            self.collector.record("current_tau", float(stats.current_tau))
+        if getattr(stats, 'current_target_ratio', None) is not None:
+            self.collector.record("current_target_ratio", float(stats.current_target_ratio))
+        # V2: budget_weight 追踪
+        if getattr(stats, 'current_budget_weight', None) is not None:
+            self.collector.record("current_budget_weight", float(stats.current_budget_weight))
 
     def reset(self) -> None:
         """重置所有监控器状态"""

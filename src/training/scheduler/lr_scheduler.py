@@ -37,6 +37,8 @@ class WarmupCosineScheduler:
     - Cosine decay (t > warmup_epochs):
         lr(t) = min_lr + (base_lr - min_lr) * 0.5 * (1 + cos(π * (t - warmup_epochs) / (total_epochs - warmup_epochs)))
 
+    V4: 支持按 param_group_name 为特定参数组设置 LR
+
     Args:
         optimizer: PyTorch optimizer
         warmup_epochs: Number of warmup epochs
@@ -45,6 +47,7 @@ class WarmupCosineScheduler:
         min_lr: Minimum LR after decay
         total_epochs: Total training epochs
         decay_epochs: Optional list of milestone epochs for step decay
+        param_group_name: Optional name to target specific param group (via custom 'name' key)
     """
 
     def __init__(
@@ -57,6 +60,7 @@ class WarmupCosineScheduler:
         total_epochs: int = 100,
         decay_epochs: Optional[List[int]] = None,
         decay_mult: float = 0.1,
+        param_group_name: Optional[str] = None,
     ):
         self.optimizer = optimizer
         self.warmup_epochs = warmup_epochs
@@ -66,17 +70,38 @@ class WarmupCosineScheduler:
         self.total_epochs = total_epochs
         self.decay_epochs = decay_epochs or []
         self.decay_mult = decay_mult
+        self.param_group_name = param_group_name
 
-        # Initialize LR
-        self._set_lr(warmup_start_lr)
+        # V4: 初始化时只设置目标参数组
+        if param_group_name is None:
+            self._set_lr(warmup_start_lr)
+        else:
+            self._set_lr(warmup_start_lr, param_group_name)
 
         # History
         self.lr_history: List[float] = []
 
-    def _set_lr(self, lr: float):
-        """Set LR for all param groups"""
+    def _find_param_group(self, name: str) -> Optional[Dict[str, Any]]:
+        """V4: 查找指定名称的参数组"""
         for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
+            if param_group.get("name") == name:
+                return param_group
+        return None
+
+    def _set_lr(self, lr: float, param_group_name: Optional[str] = None):
+        """Set LR for param groups
+
+        V4: 如果 param_group_name 指定，则只更新该参数组
+        """
+        if param_group_name is not None:
+            # V4: 只更新指定参数组
+            target_group = self._find_param_group(param_group_name)
+            if target_group is not None:
+                target_group["lr"] = lr
+        else:
+            # 默认: 更新所有参数组
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = lr
 
     def get_lr(self, epoch: int) -> float:
         """Get LR for given epoch
@@ -140,14 +165,16 @@ class WarmupCosineScheduler:
             "total_epochs": self.total_epochs,
             "decay_epochs": self.decay_epochs,
             "decay_mult": self.decay_mult,
+            "param_group_name": self.param_group_name,
         }
 
     def load_state_dict(self, state_dict: Dict[str, Any]):
         """Load scheduler state from checkpoint"""
         self.lr_history = state_dict.get("lr_history", [])
+        self.param_group_name = state_dict.get("param_group_name", None)
         # Restore current LR
         if self.lr_history:
-            self._set_lr(self.lr_history[-1])
+            self._set_lr(self.lr_history[-1], self.param_group_name)
 
     def get_last_lr(self) -> float:
         """Get last learning rate"""

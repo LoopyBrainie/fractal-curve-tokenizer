@@ -409,21 +409,31 @@ class FractalViTLoss(nn.Module):
         )
 
     def get_scheduled_weights(self, epoch: int) -> Dict[str, float]:
-        """Dynamic weight scheduler (linear warmup + exponential decay)
+        """Dynamic weight scheduler with auxiliary loss decay
 
         Mathematical form:
             λ(t) = λ_max * min(1, t / t_warmup) * γ^epoch
+
+        Key insight (I165-1): After epoch 5, aux_budget has converged.
+        entropy/tree losses become "noise" that drives Splitter暴走.
+        → Exponential decay迫使 Splitter 中后期听从 CE 梯度信号
         """
         warmup_factor = min(1.0, epoch / max(1, self.warmup_epochs))
         decay_factor = self.decay_rate ** max(0, epoch - self.warmup_epochs)
         factor = warmup_factor * decay_factor
 
+        # 辅助损失指数衰减：Epoch > 5 时，每 5 epochs 减半
+        # Epoch 0-5:  full weight（迫使 Splitter 快速学会几何划分）
+        # Epoch 5-10: decay to 50%
+        # Epoch 10-15: decay to 25%
+        aux_decay = 0.5 ** max(0, (epoch - 5) / 5)
+
         return {
             'depth': self.depth_loss_weight * factor,
-            'budget': self.budget_loss_weight * factor,
+            'budget': self.budget_loss_weight * factor,  # 保持稳定（已收敛）
             'manifold': self.manifold_loss_weight * factor,
             'residual': self.residual_loss_weight * factor,
-            'entropy': self.entropy_loss_weight * factor,
+            'entropy': self.entropy_loss_weight * aux_decay * factor,  # 衰减
         }
 
     def compute_ce_loss(
@@ -503,7 +513,7 @@ class FractalViTLoss(nn.Module):
 
         return loss.clamp(max=10.0)
 
-    def compute_budget_loss(
+    def compute_raw_budget_error(
         self,
         split_probs: torch.Tensor,
     ) -> torch.Tensor:
@@ -519,7 +529,7 @@ class FractalViTLoss(nn.Module):
         Key improvements:
         - Softplus replaces ReLU for smooth gradient
         - Added clamp(max=20.0) for NaN stability
-        - 修复：严重超标时使用平方惩罚，防止 Token 爆炸
+        - D162: 重命名为 compute_raw_budget_error 以区分损失值与损失权重
         """
         expected_tokens = split_probs.sum(dim=-1).mean()
 
@@ -697,9 +707,9 @@ class FractalViTLoss(nn.Module):
 
         # Budget loss (using expected value of split probabilities)
         if split_probs is not None:
-            budget_loss = self.compute_budget_loss(split_probs)
+            budget_loss = self.compute_raw_budget_error(split_probs)  # D162: 重命名
             total_loss = total_loss + scheduled_weights['budget'] * budget_loss
-            loss_dict['budget_loss'] = budget_loss.item()
+            loss_dict['raw_budget_error'] = budget_loss.item()  # D162: 重命名 key
 
         # Manifold loss
         manifold_loss = self.compute_manifold_loss(attention_bias, poincare_distances)
