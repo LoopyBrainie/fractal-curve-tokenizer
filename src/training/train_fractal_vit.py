@@ -186,6 +186,12 @@ def create_model(args, device: torch.device) -> nn.Module:
         'quota_learnable': quota_learnable,
         'quota_entropy_weight': getattr(args, 'quota_entropy_weight', 0.01),
 
+        # I167-1: Distance Decay Convolution
+        'use_distance_decay_conv': not getattr(args, 'no_distance_decay_conv', False),
+        # I167-4: SDS Regularization
+        'use_sds_regularization': getattr(args, 'use_sds_regularization', False),
+        'sds_lambda': getattr(args, 'sds_lambda', 0.1),
+
         # P6-1: depth_scale_range - 使用 sigmoid 参数化防止 CUDA 梯度爆炸
         'depth_scale_range': (0.5, 2.0),
 
@@ -854,6 +860,18 @@ def add_args(parser: argparse.ArgumentParser):
                         help='Weight for quota alignment loss')
     parser.add_argument('--quota-align-mode', type=str, default='fixed',
                         help='Quota alignment mode: fixed, curriculum')
+
+    # ==================== I167-1: Distance Decay Convolution ====================
+    parser.add_argument('--use-distance-decay-conv', action='store_true',
+                        help='Enable distance decay convolution (I167-1)')
+    parser.add_argument('--no-distance-decay-conv', action='store_true',
+                        help='Disable distance decay convolution, use standard Conv1D')
+
+    # ==================== I167-4: SDS Regularization ====================
+    parser.add_argument('--use-sds-regularization', action='store_true',
+                        help='Enable SDS regularization (I167-4)')
+    parser.add_argument('--sds-lambda', type=float, default=0.1,
+                        help='SDS regularization strength (I167-4)')
 
     # ==================== Encoders ====================
     parser.add_argument('--use-area-encoding', action='store_true',

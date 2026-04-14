@@ -247,6 +247,17 @@ class HilbertOptimalSplitterConfig:
     # Density Field 参数
     density_field_hidden_dim: int = 32
 
+    # I167-1: 距离衰减卷积
+    # True: 使用解耦版 - 空间混合(固定) + 通道混合(可学习)
+    # False: 回退到标准 Conv1D (向后兼容)
+    use_distance_decay_conv: bool = True
+
+    # I167-4: SDS 正则化
+    # True: 启用 SDS 正则化，惩罚高 SDS（空间局部性破坏）的位置
+    # SDS 正则化: z = z - λ * SDS_penalty
+    use_sds_regularization: bool = False
+    sds_lambda: float = 0.1  # SDS 正则化强度
+
 
 class HilbertOptimalSplitter(nn.Module, CoreSplitter):
     """
@@ -295,6 +306,9 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         temperature_min: float = 0.3,
         jump_loss_weight: float = 0.1,
         density_field_hidden_dim: int = 32,
+        use_distance_decay_conv: bool = True,  # I167-1: 距离衰减卷积
+        use_sds_regularization: bool = False,  # I167-4: SDS 正则化
+        sds_lambda: float = 0.1,  # I167-4: SDS 正则化强度
     ):
         super().__init__()
 
@@ -315,6 +329,15 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             temperature_min = config.temperature_min
             jump_loss_weight = config.jump_loss_weight
             density_field_hidden_dim = config.density_field_hidden_dim
+            # I167-1: 安全读取 config 中的字段（兼容旧 config）
+            use_distance_decay_conv = getattr(
+                config, 'use_distance_decay_conv', True
+            )
+            # I167-4: SDS 正则化
+            use_sds_regularization = getattr(
+                config, 'use_sds_regularization', False
+            )
+            sds_lambda = getattr(config, 'sds_lambda', 0.1)
 
         self.feature_dim = feature_dim
         self.min_patch_size = min_patch_size
@@ -359,6 +382,10 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # Density Field 隐藏层维度
         self.density_field_hidden_dim = density_field_hidden_dim
 
+        # I167-4: SDS 正则化
+        self.use_sds_regularization = use_sds_regularization
+        self.sds_lambda = sds_lambda
+
         # 当前状态
         self._current_image_size: Optional[Tuple[int, int]] = None
         self._epoch = 0
@@ -402,13 +429,23 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # 输入: [B, N, hidden_dim * 4] (feat + path + rot + area)
         # 输出: [B, N, 1]
         conv_input_dim = hidden_dim * 4
-        self.conv1d_hilbert = nn.Conv1d(
-            conv_input_dim,
-            1,
-            kernel_size=5,
-            padding=2,
-            groups=1,
-        )
+
+        # I167-1: 根据配置选择卷积实现
+        if use_distance_decay_conv:
+            # 解耦版: 空间混合(固定距离衰减) + 通道混合(可学习)
+            # 数学: z = Pointwise(Depthwise(x, w_decay))
+            # 参数: D × 1 (比标准 Conv1D 减少约 90%)
+            from .hilbert_distance_decay_conv import HilbertDistanceDecayConv1D
+            self.conv1d_hilbert = HilbertDistanceDecayConv1D(conv_input_dim)
+        else:
+            # 标准版: 向后兼容
+            self.conv1d_hilbert = nn.Conv1d(
+                conv_input_dim,
+                1,
+                kernel_size=5,
+                padding=2,
+                groups=1,
+            )
 
         # 6. 深度配额学习 (可选，用于 A5)
         self.depth_quota = nn.Parameter(torch.ones(max_level_limit + 1))
@@ -750,6 +787,133 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         return path_emb, rot_emb, area_enc
 
+    def _compute_sds_penalty(
+        self,
+        logits: Tensor,
+        image_size: Tuple[int, int],
+        k: int = 4,
+    ) -> Tensor:
+        """计算 SDS 正则化惩罚
+
+        数学:
+            SDS(i) = Σ_{j∈N_k(i)} ||p_i - p_j||²_2 / (2k)
+            Penalty(i) = λ * SDS(i)
+
+        其中:
+            - N_k(i) 是 Hilbert 序中位置 i 的 k 个最近邻
+            - p_i 是位置 i 在网格上的 2D 中心坐标
+            - λ 是正则化强度
+
+        实现:
+            1. 从 Hilbert 索引重建 2D 坐标（考虑深度缩放）
+            2. 按 Hilbert 序排序
+            3. 计算 k 近邻欧氏距离平方
+            4. 返回惩罚值（与 logits 形状相同 [B, N]）
+
+        Args:
+            logits: [B, N] 原始 logits
+            image_size: (H, W) 原始图像尺寸
+            k: 考虑的最近邻数量
+
+        Returns:
+            sds_penalty: [B, N] SDS 惩罚，可直接从 logits 减去
+        """
+        B = logits.shape[0]
+        N = logits.shape[1]
+        device = logits.device
+
+        # 获取候选区域的 Hilbert 索引和深度
+        hilbert_indices = self.hilbert_indices  # [N]
+        depths = self.candidate_depths  # [N]
+
+        # Step 1: 从 Hilbert 索引重建 2D 坐标
+        # 注意: 每个深度的 Hilbert 索引在其自己的网格分辨率下
+        # 需要缩放到 max_level 以便统一比较
+        coordinates_list = []
+        max_level = self.max_level_limit
+        grid_size_max = 1 << max_level  # 2^max_level
+
+        for depth in range(max_level + 1):
+            depth_mask = (depths == depth)
+            if not depth_mask.any():
+                continue
+
+            depth_indices = hilbert_indices[depth_mask]  # 该深度的 Hilbert 索引
+            n_grid = 1 << depth  # 该深度的网格大小
+
+            # 转换 Hilbert 距离到 2D 坐标
+            x_coords, y_coords = HilbertCurve.d_to_xy_batch(n_grid, depth_indices)
+
+            # 缩放到 max_level 分辨率
+            scale = 1 << (max_level - depth)  # 2^(max_level - depth)
+            x_coords = x_coords.float() * scale
+            y_coords = y_coords.float() * scale
+
+            # 合并坐标
+            coords_depth = torch.stack([x_coords, y_coords], dim=1)  # [N_depth, 2]
+            coordinates_list.append(coords_depth)
+
+        # 合并所有深度的坐标
+        all_coordinates = torch.zeros(N, 2, device=device)
+        depth_mask_flat = torch.zeros(N, dtype=torch.long, device=device)
+        pos = 0
+        for depth in range(max_level + 1):
+            depth_mask = (depths == depth)
+            if depth_mask.any():
+                n_depth = depth_mask.sum().item()
+                all_coordinates[depth_mask] = coordinates_list[pos]
+                depth_mask_flat[depth_mask] = depth
+                pos += 1
+
+        # Step 2: 按 Hilbert 索引排序
+        sort_idx = hilbert_indices.argsort()
+        sorted_coords = all_coordinates[sort_idx]  # [N, 2]
+        sorted_hilbert = hilbert_indices[sort_idx]  # [N]
+
+        # Step 3: 计算 k 近邻欧氏距离平方（向量化）
+        neighbor_dists_sq = []
+        valid_counts = []
+
+        for offset in range(1, k + 1):
+            # 前向邻居
+            fwd_idx = torch.arange(N, device=device) - offset
+            fwd_valid = (fwd_idx >= 0)
+            fwd_idx_clamped = fwd_idx.masked_fill(~fwd_valid, 0)
+
+            # 后向邻居
+            bwd_idx = torch.arange(N, device=device) + offset
+            bwd_valid = (bwd_idx < N)
+            bwd_idx_clamped = bwd_idx.masked_fill(~bwd_valid, N - 1)
+
+            # 计算距离
+            fwd_coords = sorted_coords[fwd_idx_clamped]  # [N, 2]
+            bwd_coords = sorted_coords[bwd_idx_clamped]  # [N, 2]
+
+            fwd_dist_sq = ((sorted_coords - fwd_coords) ** 2).sum(dim=1)  # [N]
+            bwd_dist_sq = ((sorted_coords - bwd_coords) ** 2).sum(dim=1)  # [N]
+
+            neighbor_dists_sq.extend([fwd_dist_sq, bwd_dist_sq])
+            valid_counts.extend([fwd_valid.float(), bwd_valid.float()])
+
+        # 合并所有邻居距离
+        neighbor_dists_sq = torch.stack(neighbor_dists_sq, dim=1)  # [N, 2k]
+        valid_mask = torch.stack(valid_counts, dim=1)  # [N, 2k]
+
+        # 归一化
+        valid_count = valid_mask.sum(dim=1).clamp(min=1)  # [N]
+        sds_values = (neighbor_dists_sq * valid_mask).sum(dim=1) / valid_count  # [N]
+
+        # Step 4: 扩展到 batch 维度并返回惩罚
+        # sds_values: [N] -> [B, N]
+        sds_penalty = sds_values.unsqueeze(0).expand(B, -1) * self.sds_lambda  # [B, N]
+
+        # 取消排序，恢复原始顺序
+        # 需要将 penalty 放回原始位置
+        unsort_idx = sort_idx.argsort()
+        sds_penalty = sds_penalty[:, unsort_idx]  # [B, N]
+
+        return sds_penalty
+
     def _manifold_convolution(self, features: Tensor) -> Tensor:
         """1D Hilbert 流形卷积
 
@@ -762,10 +926,14 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         x = features.transpose(1, 2)
 
         # 1D 卷积
-        z = self.conv1d_hilbert(x)  # [B, 1, N]
+        z = self.conv1d_hilbert(x)  # [B, 1, N] 或 [B, N]
 
-        # 转置回来: [B, 1, N] -> [B, N, 1]
-        z = z.transpose(1, 2).squeeze(-1)
+        # I167-1: 兼容处理不同卷积输出的形状
+        # 标准 Conv1D 返回 [B, 1, N], 需要 transpose + squeeze
+        # HilbertDistanceDecayConv1D 返回 [B, N], 直接使用
+        if z.dim() == 3:
+            # [B, 1, N] -> [B, N]
+            z = z.transpose(1, 2).squeeze(-1)
 
         return z
 
@@ -1013,6 +1181,12 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         # 1D Hilbert 流形卷积
         logits = self._manifold_convolution(combined)  # [B, N]
+
+        # I167-4: SDS 正则化 - 惩罚高 SDS（空间局部性破坏）的位置
+        # SDS 衡量 Hilbert 曲线上邻居的空间距离，值越高表示局部性保持越差
+        if self.use_sds_regularization and image_size is not None:
+            sds_penalty = self._compute_sds_penalty(logits, image_size)  # [B, N]
+            logits = logits - sds_penalty  # 抑制高 SDS 位置
 
         # 树约束
         logits = self._apply_tree_constraint(logits, self.candidate_depths)
