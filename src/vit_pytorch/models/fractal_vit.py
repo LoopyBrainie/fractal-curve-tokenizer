@@ -41,7 +41,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vit_pytorch.layers.embeddings.fractal_path import BitFlippedPositionEncoder
+# v6.0+: 2D RoPE 已集成到 ManifoldNativeAttention，不再需要 Learned PE
 from vit_pytorch.modules.tokenizer import StreamingFractalTokenizerV3
 from vit_pytorch.modules.base_tokenizer import BaseTokenizer, TokenizerOutput
 from vit_pytorch.modules.transformer_block import FractalTransformer, FFNType
@@ -322,7 +322,8 @@ class FractalCurveViT(nn.Module):
         splitter: Optional[Any] = None,
         tokenizer: Optional[BaseTokenizer] = None,
         transformer: Optional[Any] = None,
-        position_embedding: Optional[BitFlippedPositionEncoder] = None,
+        # v6.0+: position_embedding 已废弃，由 2D RoPE 替代
+        position_embedding: Optional[Any] = None,
         mlp_head: Optional[nn.Sequential] = None,
         cls_token: Optional[nn.Parameter] = None,
         # I98-2: 内部状态标记（由工厂函数设置）
@@ -385,6 +386,11 @@ class FractalCurveViT(nn.Module):
         # I145-H1SS: HilbertOptimalSplitter 特定参数
         jump_loss_weight: Optional[float] = None,  # H1SS Jump Loss 权重
         density_field_hidden_dim: Optional[int] = None,  # H1SS Density Field 隐藏层维度
+        # I167-1: 距离衰减卷积 (解耦版: 固定距离衰减 + 可学习点wise)
+        use_distance_decay_conv: bool = True,  # True: 使用解耦版, False: 标准 Conv1D
+        # I167-4: SDS 正则化
+        use_sds_regularization: bool = False,  # True: 启用 SDS 正则化惩罚高 SDS 位置
+        sds_lambda: float = 0.1,  # SDS 正则化强度
 # I130-3: Splitter 类型选择（已固定为 HilbertOptimalSplitter）
         splitter_type: str = 'hilbert_optimal',  # 'hilbert_optimal'（其他类型已废弃）
         # I170-NEW: Hilbert 平滑参数 (I165-1: 解决空间碎片化)
@@ -654,6 +660,11 @@ class FractalCurveViT(nn.Module):
                 temperature_min=splitter_temp_end if splitter_temp_end is not None else 0.3,
                 jump_loss_weight=jump_loss_weight if jump_loss_weight is not None else 0.1,
                 density_field_hidden_dim=density_field_hidden_dim if density_field_hidden_dim is not None else 32,
+                # I167-1: 距离衰减卷积
+                use_distance_decay_conv=use_distance_decay_conv,
+                # I167-4: SDS 正则化
+                use_sds_regularization=use_sds_regularization,
+                sds_lambda=sds_lambda,
             )
 
         # H1SS 不需要 SemanticRedundancySplitter 检查
@@ -705,16 +716,10 @@ class FractalCurveViT(nn.Module):
 
         self.token_processor = None
 
-        # === Position Embedding (v6.0: 使用 BitFlippedPositionEncoder) ===
-        if position_embedding is None:
-            position_embedding = BitFlippedPositionEncoder(
-                dim=dim,
-                max_level=self.max_level,
-                grid_size=256,
-            )
-
-        self.pos_embedding = position_embedding
-        self.position_embedding = position_embedding
+        # v6.0+: Position Embedding 已移除，由 Cartesian2DRoPE 替代
+        # （保持 self.pos_embedding 引用以兼容 check_scale_consistency 检查）
+        self.pos_embedding = None  # type: ignore
+        self.position_embedding = None  # type: ignore
 
         # === Scheme C: GeometryField ===
         self.use_geometry_field = use_geometry_field
@@ -1143,13 +1148,16 @@ class FractalCurveViT(nn.Module):
         from vit_pytorch.core.levels_info import LevelsInfo
         levels_info = LevelsInfo(data=padded_levels, max_level=self.max_level)
 
-        # v6.0: BitFlippedPositionEncoder 返回 pos_emb 和 geometry_emb
-        pos_emb, geometry_emb = self.pos_embedding(levels_info)
-        x = padded_tokens + pos_emb
+        # v6.0+: 2D RoPE 已集成到 ManifoldNativeAttention 内部
+        # 移除 Learned PE (BitFlippedPositionEncoder)，不再添加绝对位置编码
+        x = padded_tokens  # 2D RoPE 在 attention 内部提供位置信息
 
-        # v6.0: 为 CLS 添加零几何嵌入
+        # 为 CLS 添加零几何嵌入（保持接口兼容）
+        # 注意: geometry_emb 旧版本从未被 ManifoldNativeAttention 使用
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
         cls_geometry = torch.zeros(batch_size, 1, self.dim, device=x.device)
+        # geometry_emb 形状: [B, N, D]，全零（2D RoPE 替代了它的功能）
+        geometry_emb = torch.zeros(batch_size, padded_tokens.shape[1], self.dim, device=x.device)
         geometry_emb_with_cls = torch.cat([cls_geometry, geometry_emb], dim=1)  # [B, N+1, D]
 
         x = torch.cat((cls_tokens, x), dim=1)
