@@ -2239,6 +2239,188 @@ class HilbertProbabilityMetrics:
 
 
 # =============================================================================
+# I167-2: SDS (Structure Distortion Score) 量化指标
+# =============================================================================
+
+class SDSMetric:
+    """Structure Distortion Score 计算器
+
+    数学定义:
+        SDS(i) = Σ_{j∈N_k(i)} ||p_i - p_j||²_2 / (2k)
+
+    其中:
+        - N_k(i) = {i-k, ..., i-1, i+1, ..., i+k}（Hilbert最近邻）
+        - p_i 是位置 i 在网格上的 2D 坐标
+        - 2k 是归一化因子（k个前邻 + k个后邻）
+
+    设计决策（用户确认）:
+        - k=4: 跨越四叉树子象限边界，检验 Hilbert 旋转连续性
+        - 欧氏距离平方: 二次惩罚离群点 + 避免 sqrt
+
+    参考: FractalMamba++ 论文
+    """
+
+    @staticmethod
+    def compute(
+        coordinates: torch.Tensor,
+        hilbert_indices: torch.Tensor,
+        k: int = 4,
+        threshold: float = 1.5,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """向量化 SDS 计算
+
+        时间复杂度: O(N) vs Python循环 O(N·k)
+
+        算法:
+            Step 1: 按 Hilbert 索引排序坐标
+            Step 2: 使用 torch.roll 构建 k 近邻（向量化）
+            Step 3: 批量计算欧氏距离平方
+            Step 4: 求和取平均
+
+        Args:
+            coordinates: [N, 2] 网格坐标 (x, y)
+            hilbert_indices: [N] 每个位置的 Hilbert 索引
+            k: 考虑的最近邻数量（前后各 k 个）
+            threshold: SDS 阈值，用于计算 below_threshold
+
+        Returns:
+            sds_values: [N] 逐位置 SDS 值
+            stats: {
+                'sds_mean': float,
+                'sds_std': float,
+                'sds_min': float,
+                'sds_max': float,
+                'sds_p25': float,
+                'sds_p75': float,
+                'sds_below_threshold': float  # SDS < threshold 的比例
+            }
+        """
+        N = coordinates.shape[0]
+        device = coordinates.device
+
+        # Step 1: 按 Hilbert 索引排序坐标
+        sorted_indices = torch.argsort(hilbert_indices)
+        sorted_coords = coordinates[sorted_indices]  # [N, 2]
+
+        # Step 2: 构建 k 近邻索引（处理边界，不使用 roll）
+        # 对于位置 i，邻居是 i-k, ..., i-1, i+1, ..., i+k
+        # 边界处理：超出范围的邻居被忽略，不参与平均计算
+        neighbor_indices_list = []
+        valid_mask_list = []
+
+        for offset in range(1, k + 1):
+            # 前向邻居: i - offset
+            forward_idx = torch.arange(N, device=device) - offset  # [N]
+            forward_valid = (forward_idx >= 0)  # [N]
+            forward_idx = forward_idx.masked_fill(~forward_valid, 0)  # invalid -> 0 (won't be used)
+            neighbor_indices_list.append(forward_idx)
+            valid_mask_list.append(forward_valid)
+
+            # 后向邻居: i + offset
+            backward_idx = torch.arange(N, device=device) + offset  # [N]
+            backward_valid = (backward_idx < N)  # [N]
+            backward_idx = backward_idx.masked_fill(~backward_valid, N - 1)  # invalid -> N-1 (won't be used)
+            neighbor_indices_list.append(backward_idx)
+            valid_mask_list.append(backward_valid)
+
+        neighbor_indices = torch.stack(neighbor_indices_list, dim=1)  # [N, 2k]
+        valid_mask = torch.stack(valid_mask_list, dim=1).float()  # [N, 2k]
+
+        # Step 3: 批量查询邻居坐标
+        all_neighbors = sorted_coords[neighbor_indices]  # [N, 2k, 2]
+
+        # Step 4: 计算欧氏距离平方（向量化）
+        diff = sorted_coords.unsqueeze(1) - all_neighbors  # [N, 2k, 2]
+        dists_sq = (diff ** 2).sum(dim=2)  # [N, 2k]
+
+        # Step 5: 使用有效邻居数量归一化
+        valid_count = valid_mask.sum(dim=1)  # [N]
+        # 避免除以零
+        valid_count = valid_count.masked_fill(valid_count == 0, 1.0)
+        sds_values = (dists_sq * valid_mask).sum(dim=1) / valid_count  # [N]
+
+        # Step 5: 计算统计量
+        stats = SDSMetric._compute_stats(sds_values, threshold)
+
+        return sds_values, stats
+
+    @staticmethod
+    def _compute_stats(sds_values: torch.Tensor, threshold: float) -> Dict[str, float]:
+        """计算 SDS 统计量"""
+        # 使用 torch.stack 而不是分离变量（更高效）
+        sds_sorted, _ = torch.sort(sds_values)
+
+        n = sds_values.shape[0]
+        mean = sds_values.mean().item()
+        std = sds_values.std().item()
+        min_val = sds_values.min().item()
+        max_val = sds_values.max().item()
+
+        # Percentiles using sort (O(N log N) but exact)
+        p25_idx = n // 4
+        p75_idx = 3 * n // 4
+        p25 = sds_sorted[p25_idx].item()
+        p75 = sds_sorted[p75_idx].item()
+
+        # Below threshold ratio (使用 <= 包含恰好等于阈值的情况)
+        below_threshold = (sds_values <= threshold).float().mean().item() * 100
+
+        return {
+            'sds_mean': mean,
+            'sds_std': std,
+            'sds_min': min_val,
+            'sds_max': max_val,
+            'sds_p25': p25,
+            'sds_p75': p75,
+            'sds_below_threshold': below_threshold,
+        }
+
+    @classmethod
+    def compare_schemes(
+        cls,
+        H: int,
+        W: int,
+        k: int = 4,
+        threshold: float = 1.5,
+    ) -> Dict[str, Dict[str, float]]:
+        """对比三种扫描方案的 SDS 指标
+
+        用于验证 Hilbert 曲线的局部性保持能力
+
+        Args:
+            H: 高度
+            W: 宽度
+            k: 最近邻数量
+            threshold: SDS 阈值
+
+        Returns:
+            各方案的统计指标字典
+        """
+        results = {}
+
+        # Hilbert 曲线坐标
+        hilbert_points = HilbertScanner.scan(H, W)
+        hilbert_coords = torch.tensor(hilbert_points, dtype=torch.float32)
+        hilbert_indices = torch.arange(H * W)
+
+        # 计算 Hilbert SDS
+        _, hilbert_stats = cls.compute(hilbert_coords, hilbert_indices, k, threshold)
+        results['hilbert'] = hilbert_stats
+
+        # Linear 扫描坐标（基准）
+        linear_coords = torch.tensor(
+            [(x, y) for y in range(H) for x in range(W)],
+            dtype=torch.float32
+        )
+        linear_indices = torch.arange(H * W)  # 已经是按顺序的
+
+        _, linear_stats = cls.compute(linear_coords, linear_indices, k, threshold)
+        results['linear'] = linear_stats
+
+        return results
+
+
+# =============================================================================
 # I113-18: HilbertScanner - 统一 Hilbert 扫描器
 # =============================================================================
 #
