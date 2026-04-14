@@ -452,7 +452,7 @@ class SplitResult:
 
         诊断字段说明:
             - 基础指标: 所有 Splitter 都有的通用指标
-            - H1SS 特有: entropy, budget_loss, tree_consistency, locality_score,
+            - H1SS 特有: entropy, raw_budget_error, tree_consistency, locality_score,
                          jump_loss, iou_mean, iou_std, alpha
             - H-Entmax 特有: grad_coverage
 
@@ -487,9 +487,9 @@ class SplitResult:
             entropy_val = self.entropy
             output["entropy"] = float(entropy_val.item()) if hasattr(entropy_val, "item") else float(entropy_val)
 
-        if hasattr(self, "budget_loss") and self.budget_loss is not None:
-            budget_val = self.budget_loss
-            output["budget_loss"] = float(budget_val.item()) if hasattr(budget_val, "item") else float(budget_val)
+        if hasattr(self, "raw_budget_error") and self.raw_budget_error is not None:
+            budget_val = self.raw_budget_error
+            output["raw_budget_error"] = float(budget_val.item()) if hasattr(budget_val, "item") else float(budget_val)
 
         if hasattr(self, "tree_consistency") and self.tree_consistency is not None:
             tree_val = self.tree_consistency

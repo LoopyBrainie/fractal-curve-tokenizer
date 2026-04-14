@@ -208,7 +208,7 @@ class TrainingStats:
     consistency_loss: Optional[float] = None
     entropy_loss: Optional[float] = None
     # I150-3 NEW: 额外的损失项监控
-    budget_loss: Optional[float] = None  # Elastic Budget 损失
+    raw_budget_error: Optional[float] = None  # Elastic Budget 损失 (D162: 重命名以区分损失值与损失权重)
     density_regularization: Optional[float] = None  # 密度正则化损失
 
     # FLOPs 理论节省
@@ -1740,9 +1740,9 @@ class FractalCurveViT(nn.Module):
                 selected_tokens = split_result.selected_mask.sum()  # D1-AUDIT: GPU tensor
                 active_ratio = (selected_tokens / total_tokens) if total_tokens > 0 else None
 
-        # I-AUDIT: 计算 budget_loss (Elastic Budget 损失)
+        # I-AUDIT: 计算 raw_budget_error (Elastic Budget 损失)
         # 基于实际 token 数与目标 ratio 的差异
-        budget_loss = None
+        raw_budget_error = None
         if num_tokens_tensor is not None and self.target_ratio is not None:
             # target_ratio 是 L1 相对参数
             # 目标 token 数 = 总 patch 数 * target_ratio
@@ -1750,7 +1750,7 @@ class FractalCurveViT(nn.Module):
             target_tokens = total_patches.float() * self.target_ratio  # float for ratio multiplication
             actual_tokens = num_tokens_tensor.sum()  # D1-AUDIT: GPU tensor
             if target_tokens > 0:
-                budget_loss = torch.abs(actual_tokens.float() - target_tokens) / target_tokens  # D1-AUDIT: GPU tensor
+                raw_budget_error = torch.abs(actual_tokens.float() - target_tokens) / target_tokens  # D1-AUDIT: GPU tensor
 
         # I-AUDIT: 计算 density_regularization (密度正则化)
         # 基于选中 token 分布的均匀性
@@ -1814,6 +1814,13 @@ class FractalCurveViT(nn.Module):
             splitter_out = split_result.splitter_output
             if splitter_out:  # 非空才记录
                 auxiliary_outputs["splitter"] = splitter_out
+
+        # I167-1: Decay Conv 输出（验证距离衰减公理）
+        # decay_weights_center 应接近 1.0，若偏离说明先验被破坏
+        if hasattr(self.splitter, 'conv1d_hilbert'):
+            conv = self.splitter.conv1d_hilbert
+            if hasattr(conv, 'output_dict'):
+                auxiliary_outputs["decay_conv"] = conv.output_dict
 
         # Attention 和 FFN 输出（遍历每个 transformer block）
         # I-COMPILE-FIX: hasattr(block.ff, 'ffn_output') 在 torch.compile 追踪时会触发
@@ -1921,7 +1928,7 @@ class FractalCurveViT(nn.Module):
             manifold_bias_std=manifold_bias_std,  # I-AUDIT: 流形偏置标准差
             poincare_dist_mean=poincare_dist_mean,  # I-AUDIT: Poincaré 距离均值
             poincare_dist_std=poincare_dist_std,  # I-AUDIT: Poincaré 距离标准差
-            budget_loss=budget_loss,  # I-AUDIT: Elastic Budget 损失
+            raw_budget_error=raw_budget_error,  # I-AUDIT: Elastic Budget 损失 (D162: 重命名)
             density_regularization=density_regularization,  # I-AUDIT: 密度正则化
             theoretical_flops_reduction=theoretical_flops_reduction,  # I-AUDIT: FLOPs 减少量
             auxiliary_losses=auxiliary_losses,  # I-AUDIT: H1SS 辅助损失
