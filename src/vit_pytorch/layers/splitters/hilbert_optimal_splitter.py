@@ -229,10 +229,11 @@ class HilbertOptimalSplitterConfig:
     # 测试结果: alpha=1.5 产生 0% 非零输出，梯度无法回传
     # I107: 添加 alpha 预热策略
     entmax_alpha_init: float = 1.2      # 起始值 (保证梯度流动)
-    entmax_alpha_warmup: float = 1.5    # 预热目标值
+    entmax_alpha_warmup: float = 1.49   # V4: 1.49 而非 1.5，永远保持轻微梯度流
     entmax_alpha_max: float = 2.0       # 最终稀疏度
     entmax_warmup_epochs: int = 10       # 预热 epoch 数
-    entmax_schedule_epochs: int = 20     # 总调度 epoch 数
+    # V3: α 延迟调度 (20→25) 防止双重退火坍缩
+    entmax_schedule_epochs: int = 25     # 总调度 epoch 数
 
     # 树约束参数
     tree_constraint_weight: float = 0.1
@@ -353,13 +354,14 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         self._K_max_rounded = self._compute_min_level_regions(K_max, max_level_limit)
         self.sampling_ratio_schedule = sampling_ratio_schedule
 
-        # Entmax 参数 (I107: 添加预热策略)
+        # Entmax 参数 (I107: 添加预热策略 + 修复课程学习)
         self.entmax_alpha = entmax_alpha
-        self.entmax_alpha_init = 1.2      # 起始值
-        self.entmax_alpha_warmup = 1.5     # 预热目标
-        self.entmax_alpha_max = 2.0       # 最终稀疏度
-        self.entmax_warmup_epochs = 10     # 预热 epoch 数
-        self.entmax_schedule_epochs = 20  # 总调度 epoch 数
+        self.entmax_alpha_init = 1.2      # 起始值 (softmax 模式)
+        self.entmax_alpha_warmup = 1.49    # V4: 1.49 而非 1.5，永远保持轻微梯度流
+        self.entmax_alpha_max = 1.5       # 稳定值 (不再继续增加到 2.0)
+        self.entmax_warmup_epochs = 5      # 预热 epoch 数 (0-5: α=1.2)
+        # V3: α 延迟调度 (15→25) 防止双重退火坍缩
+        self.entmax_schedule_epochs = 25   # 总调度 epoch 数 (5-25: α 线性增长到 1.5)
 
         # 树约束 - I164-1: 动态λ调整
         # 使用log(lambda)确保λ>0，通过课程学习逐步增强约束
@@ -375,6 +377,14 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         self.temperature = temperature_init
         self.temperature_init = temperature_init
         self.temperature_min = temperature_min
+
+        # =====================================================================
+        # BPE-style 三阶段 Warmup 动态参数
+        # 初始化默认值，由外部调度器通过 setter 更新
+        # =====================================================================
+        self._target_ratio = 0.25        # 目标 token 比例
+        self._budget_weight = None       # None 表示使用 get_auxiliary_losses 内的默认值
+        self._logits_diversity_enabled = True  # 是否启用 logits 多样性惩罚
 
         # Jump Loss 权重
         self.jump_loss_weight = jump_loss_weight
@@ -395,6 +405,13 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # =====================================================================
         self._monitor_token_stability = False
         self._token_history: List[Tensor] = []
+
+        # =====================================================================
+        # Phase 2: 中间变量安全缓冲区 (DDP 训练安全)
+        # 必须在 forward 内立即转为标量 + detach()，避免显存泄漏
+        # =====================================================================
+        self._last_sds_stats: Optional[Dict[str, float]] = None
+        self._last_tree_delta_z: Optional[float] = None
 
         # =====================================================================
         # 核心组件
@@ -424,6 +441,15 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             '_area_encoding',
             torch.tensor([4.0 ** (-d) for d in range(max_level_limit + 1)], dtype=torch.float32)
         )
+
+        # 4.5. 面积投影（消除 expand 导致的秩塌陷，赋予模型学习最优面积表示的能力）
+        self.area_proj = nn.Linear(1, hidden_dim)
+
+        # 4.6. 分组特征归一化（解决 roi_features 范数 >> 几何嵌入范数导致的几何信息被压制问题）
+        # 语义组：[B, N, 64] — roi_features 来自 backbone，初始范数 O(2-8)
+        # 几何组：[N, 192] — path_emb + rot_emb + area_proj 输出，初始范数 O(0.16)
+        self.roi_norm = nn.LayerNorm(hidden_dim)          # 语义特征归一化
+        self.geo_norm = nn.LayerNorm(hidden_dim * 3)       # 几何特征归一化（path + rot + area）
 
         # 5. 1D Hilbert 流形卷积 (A1: 核心创新)
         # 输入: [B, N, hidden_dim * 4] (feat + path + rot + area)
@@ -464,6 +490,9 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # 这解决了 avg_tokens 死锁在 5 个的问题
         self._init_density_field_bias()
 
+        # 初始化 conv1d_hilbert 偏置为 +0.5，强制初期尝试更多分裂
+        self._init_logits_bias()
+
         # I-OPT: Differentiable K 选择器 (STE 直通估计)
         # 用于恢复 K 值的梯度流，解决原 .item() 断裂梯度的问题
         self.K_estimator = DifferentiableK(K_min=K_min, K_max=K_max)
@@ -496,10 +525,24 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # 重置权重为较小的值
         nn.init.xavier_uniform_(last_linear.weight, gain=0.1)
 
-        # I-NAN: 关键 - 偏置设为 -2.27，使初始 sigmoid 输出 ≈ 0.094
-        # 修复 K 公式后: K_float = sum(density_i) ∈ [0, 85]
-        # 初始 density ≈ 0.094 => 初始 K ≈ 0.094 * 85 ≈ 8 = K_min
-        nn.init.constant_(last_linear.bias, -2.27)
+        # P1 修复: 偏置设为 0.0，使初始 sigmoid 输出 = 0.5
+        # sigmoid(0) = 0.5，赋予模型充足的信息带宽探索视觉特征
+        # Budget_Loss（目标 25%）在后续缓慢剪枝，避免开局"极度贫血"
+        nn.init.constant_(last_linear.bias, 0.0)
+
+    def _init_logits_bias(self) -> None:
+        """
+        初始化 conv1d_hilbert 偏置为 +0.5，强制初期多分裂
+
+        问题：初始 logits 全负，模型倾向"不分裂"，导致 active_ratio 停滞
+        解决：添加 +0.5 偏置，使初期 logits 更正值，尝试更多分裂
+
+        效果：
+            - 训练初期：更多分裂尝试 → active_ratio 上升
+            - 训练后期：模型自动调整偏置以平衡分裂/不分裂
+        """
+        if hasattr(self.conv1d_hilbert, 'bias') and self.conv1d_hilbert.bias is not None:
+            nn.init.constant_(self.conv1d_hilbert.bias, 0.5)
 
     def reset_density_field(self) -> None:
         """
@@ -781,9 +824,9 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # 使用 direction_embedding
         rot_emb = self.orientation_extractor.direction_embedding(final_rot_dir)  # [N, hidden_dim]
 
-        # 面积编码 - 4^(-depth)
+        # 面积编码 - 4^(-depth) → Linear 投影（消除 expand 导致的秩塌陷）
         area_enc = self._area_encoding[depths]  # [N]
-        area_enc = area_enc.unsqueeze(-1).expand(-1, self.hidden_dim)  # [N, hidden_dim]
+        area_enc = self.area_proj(area_enc.unsqueeze(-1))  # [N] → [N, 1] → [N, hidden_dim]
 
         return path_emb, rot_emb, area_enc
 
@@ -1040,16 +1083,15 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # 温度调度
         tau = max(self.temperature, TEMPERATURE_MIN)
 
-        # 自适应 α 调度
-        alpha = self.get_adaptive_alpha(epoch)
+        # 使用 set_epoch 管理的 entmax_alpha（课程学习调度至 2.0）
+        # get_adaptive_alpha 最大返回 ~1.7，永远低于 1.9 阈值，导致 entmax 死代码
+        alpha = self.entmax_alpha
 
-        # 使用 softmax (alpha < 1.9) 以获得更好的梯度流
-        # 或者使用 entmax 稀疏激活 (alpha >= 1.9)
-        if alpha < 1.9:
-            # 接近 softmax，使用 soft selection
+        # alpha < 1.5: Softmax（早期训练，全梯度流）
+        # alpha >= 1.5: Entmax（逐渐稀疏，晚期稀疏性选择）
+        if alpha < 1.5:
             probs = F.softmax(logits / tau, dim=-1)
         else:
-            # 稀疏激活
             probs = entmax(logits / tau, alpha=alpha, dim=-1)
 
         # 缩放使期望和等于 K
@@ -1128,6 +1170,59 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             "iou_max": float(np.max(ious)),
         }
 
+    def _compute_locality_efficiency(
+        self,
+        selected_mask: Tensor,
+        num_selected: int,
+    ) -> float:
+        """
+        计算 Locality Efficiency (Selection/Oracle 对比)
+
+        Selection Locality: J(S) = mean(|h(s_i) - h(s_{i+1})|)
+        Oracle Locality: 连续采样能达到的最高聚合度 (理想情况下跳距 = 1)
+
+        Locality Efficiency = Selection Locality / Oracle Locality ∈ [0, 1]
+        值越高表示越接近理想的连续采样
+
+        Args:
+            selected_mask: [B, N] 选中掩码
+            num_selected: 选中的 token 数量
+
+        Returns:
+            Locality efficiency 值
+        """
+        if num_selected < 2:
+            return 1.0
+
+        # 处理批量掩码 [B, N]
+        if selected_mask.dim() == 2:
+            efficiencies = []
+            for i in range(selected_mask.shape[0]):
+                mask_1d = selected_mask[i] > 0.5
+                selected_h = self.hilbert_indices[mask_1d].float().sort()[0]
+                if len(selected_h) < 2:
+                    efficiencies.append(1.0)
+                    continue
+                selection_jumps = (selected_h[1:] - selected_h[:-1]).abs()
+                selection_locality = selection_jumps.mean().item()
+                # Oracle Locality = 1.0 (连续采样的理想跳距)
+                efficiencies.append(selection_locality / 1.0 if 1.0 > 0 else 1.0)
+            return sum(efficiencies) / len(efficiencies) if efficiencies else 1.0
+
+        # 处理 1D 掩码 [N]
+        selected_h = self.hilbert_indices[selected_mask > 0.5].float().sort()[0]
+        if len(selected_h) < 2:
+            return 1.0
+
+        # Selection Locality: 实际跳距
+        selection_jumps = (selected_h[1:] - selected_h[:-1]).abs()
+        selection_locality = selection_jumps.mean().item()
+
+        # Oracle Locality: 理想情况下连续采样跳距 = 1
+        oracle_locality = 1.0
+
+        return selection_locality / oracle_locality if oracle_locality > 0 else 1.0
+
     def forward(
         self,
         features: Tensor,
@@ -1172,12 +1267,14 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         # 拼接所有特征 (roi + path + rot + area = 4 * hidden_dim)
         # 注意: conv1d 输入调整为 hidden_dim * 4
-        combined = torch.cat([
-            roi_features,
+        # 分组归一化：将语义组与几何组分别归一化到单位超球面，强制信息博弈
+        roi_features_norm = self.roi_norm(roi_features)  # [B, N, 64] — 语义归一化
+        geo_embs = self.geo_norm(torch.cat([
             path_emb.unsqueeze(0).expand(B, -1, -1),
             rot_emb.unsqueeze(0).expand(B, -1, -1),
             area_enc.unsqueeze(0).expand(B, -1, -1),
-        ], dim=-1)  # [B, N, hidden_dim * 4]
+        ], dim=-1))  # [B, N, 192] — 几何归一化
+        combined = torch.cat([roi_features_norm, geo_embs], dim=-1)  # [B, N, 256]
 
         # 1D Hilbert 流形卷积
         logits = self._manifold_convolution(combined)  # [B, N]
@@ -1186,10 +1283,21 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # SDS 衡量 Hilbert 曲线上邻居的空间距离，值越高表示局部性保持越差
         if self.use_sds_regularization and image_size is not None:
             sds_penalty = self._compute_sds_penalty(logits, image_size)  # [B, N]
+            # Phase 2: 立即转为标量并 detach，避免 DDP 训练显存泄漏
+            self._last_sds_stats = {
+                "mean": sds_penalty.mean().detach().item(),
+                "max": sds_penalty.max().detach().item()
+            }
             logits = logits - sds_penalty  # 抑制高 SDS 位置
+
+        # Phase 2: 保存 logits_pre_tree 并计算树约束修正量 Δz
+        logits_pre_tree = logits.clone().detach()  # 断开梯度链用于记录
 
         # 树约束
         logits = self._apply_tree_constraint(logits, self.candidate_depths)
+
+        # 计算树约束修正量: Δz = ||logits_pre - logits_post||₁
+        self._last_tree_delta_z = (logits_pre_tree - logits).abs().sum().item()
 
         # 深度配额
         depth_quota = F.softmax(self.depth_quota, dim=0)
@@ -1259,6 +1367,52 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             K_soft=K_soft,  # I-OPT: 可微分 K 值用于 aux_budget 损失
         )
 
+        # === Phase 1: 填充诊断属性到 result（供 splitter_output 使用）===
+        # 计算完备性原则: SplitResult 离开 forward 作用域前必须包含所有诊断数据
+
+        # 1. 调用 get_auxiliary_losses() 并设置到 result 属性
+        losses = self.get_auxiliary_losses(result, target_ratio=0.25)
+        result.entropy = losses.get('entropy')
+        result.raw_budget_error = losses.get('budget')  # D162: 重命名以区分误差值与损失权重
+        result.tree_consistency = losses.get('tree')
+
+        # 2. 计算 locality_score (A1 公理) - O(N) 复杂度
+        result.locality_score = compute_locality_score(
+            self.hilbert_indices, result.selected_mask
+        )
+
+        # 3. 计算 Locality Efficiency (Selection/Oracle 对比)
+        result.locality_efficiency = self._compute_locality_efficiency(
+            result.selected_mask, result.selected_mask.sum()
+        )
+
+        # 4. 计算 jump_loss
+        result.jump_loss = compute_jump_loss(
+            self.hilbert_indices, result.selected_mask
+        )
+
+        # 5. 计算 iou 稳定性
+        iou = self.compute_token_iou()
+        if iou is not None:
+            result.iou_mean = iou
+            result.iou_std = 0.0  # 单值无法计算 std
+
+        # 6. 设置 alpha
+        result.alpha = self.entmax_alpha
+
+        # === Phase 2: 中间变量统计（SDS 惩罚 + 树约束修正量）===
+
+        # SDS 惩罚统计 (I167-4)
+        if hasattr(self, '_last_sds_stats') and self._last_sds_stats is not None:
+            result.sds_penalty_mean = self._last_sds_stats["mean"]
+            result.sds_penalty_max = self._last_sds_stats["max"]
+
+        # 树约束透明化：动态 lambda + 修正量 Δz
+        lambda_cur = self._compute_dynamic_lambda()
+        result.tree_lambda = lambda_cur.item() if hasattr(lambda_cur, 'item') else lambda_cur
+        if hasattr(self, '_last_tree_delta_z') and self._last_tree_delta_z is not None:
+            result.tree_constraint_delta_z = self._last_tree_delta_z
+
         # I150-3: 记录 token 选择历史用于稳定性监控
         if self._monitor_token_stability and hard:
             # 记录 batch 0 的选择（用于统计）
@@ -1275,32 +1429,42 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         """设置温度（用于训练脚本兼容性）"""
         self.temperature = temperature
 
+    def set_target_ratio(self, target_ratio: float) -> None:
+        """设置目标 token 比例（用于 warmup 调度）"""
+        self._target_ratio = target_ratio
+
+    def set_budget_weight(self, budget_weight: float) -> None:
+        """设置 budget loss 权重（用于 warmup 调度）"""
+        self._budget_weight = budget_weight
+
+    def set_logits_diversity(self, enabled: bool) -> None:
+        """设置是否启用 logits 多样性惩罚"""
+        self._logits_diversity_enabled = enabled
+
     def set_epoch(self, epoch: int):
         """设置当前 epoch"""
         self._current_epoch = epoch
 
-        # I107: Entmax Alpha 预热策略
-        # α(t) = min(1.5, 1.2 + 0.3 × epoch / T_warmup) for t < T_warmup
-        # α(t) = min(2.0, α(t)) for t >= T_warmup
+        # V4: Entmax Alpha Sigmoid 平滑着陆
+        # Epoch 0-5:   α=1.2 (softmax 模式, 全梯度流)
+        # Epoch 5-25:  α sigmoid 平滑增长到 1.49  (V4: 代替线性插值)
+        # Epoch > 25: α=1.49 (永远保持轻微梯度流，不撞击 1.5 奇点)
         if epoch < self.entmax_warmup_epochs:
-            # 预热阶段: 1.2 → 1.5
-            self.entmax_alpha = min(
-                self.entmax_alpha_warmup,
-                self.entmax_alpha_init + (self.entmax_alpha_warmup - self.entmax_alpha_init) * epoch / self.entmax_warmup_epochs
-            )
+            # 预热阶段: α=1.2 (softmax 模式)
+            self.entmax_alpha = self.entmax_alpha_init
         elif epoch < self.entmax_schedule_epochs:
-            # 过渡阶段: 1.5 → 2.0
-            warmup_progress = (epoch - self.entmax_warmup_epochs) / (self.entmax_schedule_epochs - self.entmax_warmup_epochs)
-            self.entmax_alpha = self.entmax_alpha_warmup + (self.entmax_alpha_max - self.entmax_alpha_warmup) * warmup_progress
+            # 过渡阶段: 使用 sigmoid 平滑曲线，防止 α 在后期突越 1.5
+            progress = (epoch - self.entmax_warmup_epochs) / max(1, self.entmax_schedule_epochs - self.entmax_warmup_epochs)
+            # Sigmoid 平滑: 输出范围 [0, 1]，映射到 [1.2, 1.49]
+            # 中点在 70% 进度处，提前减速避免撞击 1.5 奇点
+            sigmoid = 1 / (1 + math.exp(-10 * (progress - 0.7)))
+            self.entmax_alpha = 1.2 + 0.29 * sigmoid
         else:
-            # 稳定阶段: 保持 2.0
-            self.entmax_alpha = self.entmax_alpha_max
+            # V4: alpha_max = 1.49 而非 1.5，永远保持轻微梯度流
+            self.entmax_alpha = self.entmax_alpha_warmup
 
-        # 温度退火
-        self.temperature = max(
-            self.temperature_min,
-            self.temperature_init * 0.5 ** (epoch / 20)
-        )
+        # 温度由 BPE 三阶段调度器在 train_fractal_vit._update_fractal_hyperparams()
+        # 中通过 set_temperature() 管理，此处不再内部退火，避免梯度冲突。
 
         # K 课程学习：从 K_min 逐渐增大到 K_max（向上取整）
         # 符合课程学习原则：先学简单（少 token），后学复杂（多 token）
@@ -1355,12 +1519,11 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             2. Budget损失: L_budget = MSE(actual_K, target_K)
                控制选中的 token 数量
 
-            3. 树一致性损失: L_tree = -std(logits)
-               避免 logits 过度集中
+            3. 树一致性损失: L_tree = -std(logits)（当 _logits_diversity_enabled=True 时启用）
 
         Args:
             split_result: H1SS 返回的 SplitResult
-            target_ratio: 目标 token 比例 (default: 0.1)
+            target_ratio: 目标 token 比例 (default: 0.1)，仅当未设置 _target_ratio 时使用
 
         Returns:
             Dict[str, Tensor]: 辅助损失字典
@@ -1379,6 +1542,7 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # 2. Budget损失 - 控制 token 数量
         # I-OPT: 使用 K_soft (STE) 替代 selected_mask.sum()
         # 这样梯度可以流过 K 值到 density_field
+        # BUG-FIX: 归一化到 [0,1] 范围，使损失值与分辨率无关
         if split_result.selected_mask is not None:
             B, N = split_result.selected_mask.shape
             # 优先使用 K_soft（梯度可流），否则 fallback 到实际选择数（无梯度）
@@ -1390,13 +1554,28 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             else:
                 # Fallback: 使用实际选择的 token 数（无梯度）
                 K_loss = split_result.selected_mask.sum(dim=1).float().mean()
-            target_K = N * target_ratio
-            losses['budget'] = F.mse_loss(K_loss, target_K * torch.ones_like(K_loss))
+            # 归一化到 [0,1]：K_loss/N ∈ [0, 1], target_ratio ∈ [0, 1]
+            # 同时 clamp target_ratio 确保可达（不能超过 K_max/N）
+            # 优先使用实例属性 _target_ratio（外部调度），fallback 到参数
+            effective_target_ratio = getattr(self, '_target_ratio', target_ratio)
+            target_ratio_clamped = min(effective_target_ratio, self.K_max / N)
+            budget_loss = F.mse_loss(K_loss / N, target_ratio_clamped * torch.ones_like(K_loss))
+            # 应用外部 budget_weight（由 BPE 三阶段调度器设置）
+            # - None:  无调度器，沿用旧行为（compute_loss 动态权重）
+            # - 0.0:   Stage 1，完全排除 budget（纯 CE 梯度，零 budget 影响）
+            # - > 0:   Stage 2/3，预乘权重后加入损失字典
+            budget_weight = getattr(self, '_budget_weight', None)
+            if budget_weight is None:
+                # 原始行为：compute_loss 的 dynamic_w 负责权重
+                losses['budget'] = budget_loss
+            elif budget_weight > 0:
+                # BPE Stage 2/3：预乘 warmup 权重
+                losses['budget'] = budget_weight * budget_loss
+            # else budget_weight == 0.0 → BPE Stage 1：彻底排除，保证纯 CE 梯度
 
-        # 3. 树一致性损失 - logits 方差
-        if split_result.logits is not None:
-            logits_std = split_result.logits.std()
-            losses['tree'] = -logits_std  # 负号因为我们要最大化 std
+        # H1SS 公理 A4 (Tree): 树一致性通过局部层级软约束实现
+        # z_parent -= λ × max(z_children)
+        # 全局 logits 方差惩罚已被移除（无数学依据，干扰局部决策）
 
         return losses
 
@@ -1413,7 +1592,33 @@ def compute_locality_score(
     计算 A1: Locality Score
 
     J(S) = mean(|h(s_i) - h(s_{i+1})|)
+
+    Args:
+        hilbert_indices: [N] Hilbert 索引
+        selected_mask: [N] 或 [B, N] 选中掩码
+
+    Returns:
+        locality_score: 标量
     """
+    # 处理批量掩码 [B, N]
+    if selected_mask.dim() == 2:
+        # 逐个样本计算后取平均
+        scores = []
+        for i in range(selected_mask.shape[0]):
+            mask_1d = selected_mask[i]
+            if mask_1d.sum() < 2:
+                scores.append(0.0)
+                continue
+            selected_h = hilbert_indices[mask_1d > 0.5]
+            selected_h = selected_h.sort()[0]
+            if len(selected_h) < 2:
+                scores.append(0.0)
+                continue
+            jumps = (selected_h[1:].float() - selected_h[:-1].float()).abs()
+            scores.append(jumps.mean().item())
+        return sum(scores) / len(scores) if scores else 0.0
+
+    # 处理 1D 掩码 [N]
     if selected_mask.sum() < 2:
         return 0.0
 
@@ -1444,12 +1649,27 @@ def compute_jump_loss(
 
     Args:
         hilbert_indices: [N] Hilbert 索引
-        selected_mask: [N] 选中掩码
+        selected_mask: [N] 或 [B, N] 选中掩码
         gamma: 缩放因子
 
     Returns:
         loss: 标量损失
     """
+    # 处理批量掩码 [B, N]
+    if selected_mask.dim() == 2:
+        losses = []
+        for i in range(selected_mask.shape[0]):
+            mask_1d = selected_mask[i] > 0.5
+            selected_h = hilbert_indices[mask_1d].float().sort()[0]
+            if len(selected_h) < 2:
+                losses.append(torch.tensor(0.0, device=hilbert_indices.device))
+                continue
+            diffs = selected_h[1:] - selected_h[:-1]
+            jump_loss = F.relu(diffs - 1.0) ** 2
+            losses.append(jump_loss.mean())
+        return sum(losses) / len(losses) if losses else torch.tensor(0.0, device=hilbert_indices.device)
+
+    # 处理 1D 掩码 [N]
     selected_h = hilbert_indices[selected_mask > 0.5].float()
     selected_h = selected_h.sort()[0]
 

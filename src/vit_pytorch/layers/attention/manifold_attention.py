@@ -1052,7 +1052,9 @@ class ManifoldNativeAttention(nn.Module):
         elif hilbert_indices is not None:
             # 回退：使用基于 hilbert_indices 的简化坐标
             h_norm = hilbert_indices.float() / (hilbert_indices.max().float() + 1e-8)
-            coords = torch.stack([h_norm, h_norm], dim=-1)  # [B, N, 2]
+            # P2 修复: 使用 [h_norm, 1-h_norm] 恢复二维流形张力
+            # 原 [h_norm, h_norm] 导致所有点落在 y=x 对角线，双曲几何完全退化
+            coords = torch.stack([h_norm, 1 - h_norm], dim=-1)  # [B, N, 2]
 
         # 存储输入用于诊断
         self._last_input_x = x.detach()
@@ -1079,12 +1081,15 @@ class ManifoldNativeAttention(nn.Module):
             normalized_areas = area_from_depth / (area_from_depth.sum(dim=-1, keepdim=True) + 1e-8)
 
             # 计算 LCA depths（对称矩阵）
-            lca_depths = depths.unsqueeze(2) + depths.unsqueeze(1)  # [B, N, N]
+            lca_depths = torch.min(depths.unsqueeze(2), depths.unsqueeze(1))  # [B, N, N]
             lca_depths = lca_depths.clamp(0, self.max_level)
 
             # 使用 hilbert_indices 构造模拟 paths（用于旋转相同性）
-            # 基于 Hilbert 索引的象限划分
-            hilbert_quadrants = (hilbert_indices / (256 // 4)).long() % 4  # [B, N]
+            # P2 修复: 动态计算象限划分，替代硬编码的 256
+            # 原 256 // 4 假设固定分辨率，与 Budget 归一化（跨分辨率）背道而驰
+            max_idx = max(hilbert_indices.max().item(), 1)
+            quadrant_size = max_idx // 4 + 1  # 动态象限大小
+            hilbert_quadrants = (hilbert_indices / quadrant_size).long() % 4  # [B, N]
             paths = hilbert_quadrants.unsqueeze(2).expand(-1, -1, self.max_level)  # [B, N, max_level]
 
             # coords 已在前面提前计算，无需重复

@@ -16,7 +16,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
+from typing import Dict, Any, Tuple
 
 
 class HilbertDistanceDecayConv1D(nn.Module):
@@ -107,6 +107,22 @@ class HilbertDistanceDecayConv1D(nn.Module):
             f"kernel_size={self.kernel_size}, "
             f"decay=fixed(w_d=1/(|d|+1))"
         )
+
+    @property
+    def output_dict(self) -> Dict[str, Any]:
+        """返回 Decay Conv 层诊断指标（用于日志系统）
+
+        I167-1 公理验证:
+            - decay_weights_center 应接近 1.0
+            - 若偏离说明距离衰减先验被破坏
+        """
+        return {
+            "decay_weights_mean": self._decay_weights.mean().item(),
+            "decay_weights_min": self._decay_weights.min().item(),
+            "decay_weights_max": self._decay_weights.max().item(),
+            # I167-1: center 权重应为 1.0，偏离说明公理被破坏
+            "decay_weights_center": self._decay_weights[0, 0, self.padding].item(),
+        }
 
 
 class HilbertDistanceDecayConv1DWithSkip(nn.Module):
