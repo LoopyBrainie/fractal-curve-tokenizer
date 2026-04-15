@@ -230,7 +230,7 @@ class DeadNodeDetector:
             (死节点索引, 死节点比例)
         """
         dead_mask = self.selection_counts <= threshold
-        dead_indices = dead_mask.nonzero(as_tuple=True)[0]
+        dead_indices = dead_mask.nonzero(as_tuple=False).squeeze(-1)  # D3-AUDIT FIX: as_tuple=False 避免 Graph Break
         dead_ratio = dead_mask.float().mean().item()
         return dead_indices, dead_ratio
 

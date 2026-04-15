@@ -77,6 +77,18 @@ for d in range(1, _MAX_HILBERT_DEPTH + 1):
         # 计算 Hilbert 距离
         _HILBERT_LUT[d][path_int] = xy_to_hilbert_distance(1 << d, x, y)
 
+# I103-3: 预计算 3D LUT 张量用于向量化查找
+# 形状: [D+1, 4^max_depth] - 避免 Python 循环内的 dict 查找
+_MAX_LUT_SIZE = 4 ** _MAX_HILBERT_DEPTH  # 65536 for D=8
+_HILBERT_LUT_TENSOR = torch.zeros(
+    _MAX_HILBERT_DEPTH + 1,
+    _MAX_LUT_SIZE,
+    dtype=torch.long,
+)
+for d in range(1, _MAX_HILBERT_DEPTH + 1):
+    for path_int, hilbert_dist in _HILBERT_LUT[d].items():
+        _HILBERT_LUT_TENSOR[d, path_int] = hilbert_dist
+
 # I103-2: Hilbert 索引权重缓存 (类级缓存)
 # 避免在 get_hilbert_indices() 中重复创建权重张量
 # 内存: D_max=8 时仅需存储 36 个整数 (< 1KB)
@@ -272,6 +284,40 @@ class LevelsInfo:
     # ========== 工厂方法 ==========
 
     @staticmethod
+    def ensure(
+        info: "LevelsInfo | torch.Tensor | None",
+        default_max_level: int = 0,
+    ) -> "LevelsInfo | None":
+        """统一入口：确保返回标准 LevelsInfo 对象或 None。
+
+        这是唯一的"护城河"——所有其他位置的类型检查都必须移除。
+        torch.compile 模式下，将类型检查集中在此处可以避免多处 Graph Break。
+
+        Args:
+            info: LevelsInfo 对象、torch.Tensor 或 None
+            default_max_level: 当 info 为 Tensor 时使用的最大深度
+
+        Returns:
+            LevelsInfo 实例或 None
+
+        Raises:
+            TypeError: 当 info 不是期望的类型时
+        """
+        if info is None:
+            return None
+        if isinstance(info, LevelsInfo):
+            return info
+        if isinstance(info, torch.Tensor):
+            if info.dtype != torch.long:
+                info = info.long()
+            info_dim = info.shape[-1]
+            inferred_max_level = info_dim - 1
+            return LevelsInfo(data=info, max_level=inferred_max_level)
+        raise TypeError(
+            f"levels_info 期望 LevelsInfo 或 torch.Tensor，实际 {type(info)}"
+        )
+
+    @staticmethod
     def from_tokenizer_output(
         output: "TokenizerOutput",
         max_level: int,
@@ -427,6 +473,7 @@ class LevelsInfo:
         I102-8 修复: 使用查找表实现正确的向量化
         I103-2 优化: 使用类级权重缓存避免重复创建张量
         I161-1 修复: 添加归一化选项保持跨尺度一致性
+        I103-3 优化: 向量化 LUT 查找，移除 Python 循环内的 dict 查找
 
         数学:
             H_raw = Σ q_k × 4^{d-k}  (原始Hilbert距离)
@@ -452,25 +499,24 @@ class LevelsInfo:
                 "请考虑使用动态回退方案。"
             )
 
+        # 批量 LUT 查找: LUT_TENSOR[depth, path_int] -> hilbert_dist
+        # _HILBERT_LUT_TENSOR: [D+1, 4^D]
+        lut_tensor = _HILBERT_LUT_TENSOR.to(self.data.device)
+
+        # 对于每个 depth d，从 LUT_TENSOR[d] 查找 path_ints
+        # 有效 depth 范围 [1, D]，depth=0 位置保持 0
         results = torch.zeros(B, N, dtype=torch.long, device=self.data.device)
 
         for d in range(1, D + 1):
             mask = (depths == d)
             if not mask.any():
                 continue
-
-            # 路径编码: [B, N] → [B, N]
-            # I103-2 优化: 使用类级缓存避免重复创建权重张量
+            # 路径编码
             weights = self._get_hilbert_weights_for_depth(d, self.data.device)
             path_ints = (paths[:, :, :d] * weights).sum(dim=-1)
-
-            # LUT 查找
-            valid_path_ints = path_ints[mask]
-            results[mask] = torch.tensor(
-                [_HILBERT_LUT[d][int(p)] for p in valid_path_ints],
-                dtype=torch.long,
-                device=self.data.device
-            )
+            # I103-3: 使用 LUT tensor 的单行 index_select（向量化的替代 gather）
+            lut_row = lut_tensor[d]  # [4^d]
+            results[mask] = lut_row.gather(dim=0, index=path_ints[mask].clamp(max=lut_row.numel() - 1))
 
         # I161-1 修复: 深度根归一化
         if normalize:
