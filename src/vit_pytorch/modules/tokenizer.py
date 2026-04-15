@@ -436,19 +436,32 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         depths_buffer = torch.zeros(max_total_nodes, dtype=torch.long, device=device)
         batch_buffer = torch.zeros(max_total_nodes, dtype=torch.long, device=device)
 
-        # BFS 构建四叉树
-        queue = deque()  # (bounds, depth, batch_idx)
+        # P-OPT: BFS 使用数组 + 索引替代 Python deque，避免对象创建开销
+        # 队列使用 CPU 列表存储 (queue_bounds, depth, b_idx)，避免 GPU-CPU 同步
+        # bounds_queue 仅存储 bounds tensor 引用，不做同步操作
+        bounds_queue: List[torch.Tensor] = []
+        depth_queue: List[int] = []
+        batch_queue: List[int] = []
+
         initial_bounds = self._get_initial_region_bounds(device, dtype=features.dtype)
 
-        # 使用计数器追踪每个 batch 的区域索引
-        batch_region_counters = {b: 0 for b in range(B)}
+        # 使用 Python list 追踪每个 batch 的区域索引
+        batch_region_counters = [0] * B
         count = 0  # 实际使用的节点数
 
+        # 初始化队列: B 个根节点
         for b in range(B):
-            queue.append((initial_bounds, 0, b))
+            bounds_queue.append(initial_bounds)
+            depth_queue.append(0)
+            batch_queue.append(b)
 
-        while queue:
-            bounds, depth, b_idx = queue.popleft()
+        # BFS 构建四叉树 - 使用列表索引替代 deque.popleft()
+        queue_start = 0
+        while queue_start < len(bounds_queue):
+            bounds = bounds_queue[queue_start]
+            depth = depth_queue[queue_start]
+            b_idx = batch_queue[queue_start]
+            queue_start += 1
 
             # 获取当前 batch 的区域索引
             region_idx_in_batch = batch_region_counters[b_idx]
@@ -465,8 +478,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             # 检查是否应该分裂
             if region_idx_in_batch < split_decision.shape[1]:
                 should_split = split_decision[b_idx, region_idx_in_batch] > 0.5
+                # should_split 是 GPU tensor，在 Python if 中使用需要转换为 CPU tensor
+                should_split = should_split.cpu()
             else:
-                should_split = False
+                should_split = torch.tensor(False, device=device)
 
             if should_split and count + 4 < max_total_nodes:
                 # 计算子边界
@@ -480,10 +495,22 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 child3 = torch.stack([x0, cy, cx, y1], dim=0)
                 child4 = torch.stack([cx, cy, x1, y1], dim=0)
 
-                queue.append((child1, depth + 1, b_idx))
-                queue.append((child2, depth + 1, b_idx))
-                queue.append((child3, depth + 1, b_idx))
-                queue.append((child4, depth + 1, b_idx))
+                # 入队 4 个子节点
+                bounds_queue.append(child1)
+                depth_queue.append(depth + 1)
+                batch_queue.append(b_idx)
+
+                bounds_queue.append(child2)
+                depth_queue.append(depth + 1)
+                batch_queue.append(b_idx)
+
+                bounds_queue.append(child3)
+                depth_queue.append(depth + 1)
+                batch_queue.append(b_idx)
+
+                bounds_queue.append(child4)
+                depth_queue.append(depth + 1)
+                batch_queue.append(b_idx)
             else:
                 # 添加为叶子节点
                 regions_buffer[count] = bounds
