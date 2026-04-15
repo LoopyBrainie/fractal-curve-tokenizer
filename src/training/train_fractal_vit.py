@@ -103,6 +103,15 @@ def configure_cuda():
     if not torch.cuda.is_available():
         return
 
+    # MEM-OOM FIX (Suspect 2): 开启可扩展段分配器，缓解动态 Token 长度导致的显存碎片化
+    # PyTorch CUDA 分配器在不断申请/释放不同大小的张量后会产生碎片，
+    # expandable_segments:True 让分配器使用可扩展段，减少碎片化
+    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    if "expandable_segments" not in alloc_conf:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+            "expandable_segments:True" + ("," + alloc_conf if alloc_conf else "")
+        )
+
     # TF32 for Ampere+ GPUs
     if hasattr(torch.backends.cuda, 'matmul'):
         torch.backends.cuda.matmul.allow_tf32 = True

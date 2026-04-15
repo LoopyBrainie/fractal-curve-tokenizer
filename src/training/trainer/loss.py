@@ -224,8 +224,8 @@ def compute_loss(
         # Standard targets
         loss = F.cross_entropy(logits, targets, reduction=reduction)
 
-    # Track components
-    components = {"cross_entropy": loss.item() if loss.dim() == 0 else loss.mean().item()}
+    # Track components - return GPU tensors, caller handles .item()
+    components = {"cross_entropy": loss if loss.dim() == 0 else loss.mean()}
 
     # Integrate auxiliary losses with dynamic weighting
     if aux_losses is not None:
@@ -245,7 +245,7 @@ def compute_loss(
 
                 # I-OPT: 不再 .detach()，让梯度流过 aux_loss（特别是 budget loss）
                 loss = loss + dynamic_w * aux_loss
-                components[f"aux_{name}"] = aux_loss.item()
+                components[f"aux_{name}"] = aux_loss
                 components[f"aux_weight_{name}"] = dynamic_w
 
     return loss, components
@@ -687,47 +687,47 @@ class FractalViTLoss(nn.Module):
         # Main loss
         ce_loss = self.compute_ce_loss(logits, targets)
         total_loss = ce_loss
-        loss_dict = {'ce_loss': ce_loss.item()}
+        loss_dict = {'ce_loss': ce_loss}
 
-        # P2: Closed-loop weight adaptation
+        # P2: Closed-loop weight adaptation (GPU-based, no sync)
         # 如果 CE 突然变大，减少辅助权重以防止辅助损失主导
-        if hasattr(self, '_last_ce_loss') and self._last_ce_loss > 0:
-            ce_ratio = ce_loss.item() / (self._last_ce_loss + 1e-8)
+        if hasattr(self, '_last_ce_loss_tensor') and self._last_ce_loss_tensor > 0:
+            ce_ratio = ce_loss / (self._last_ce_loss_tensor + 1e-8)
             # 如果 CE 变大超过 1.2x，减少辅助权重
             if ce_ratio > 1.2:
                 factor = 1.0 / (1.0 + 0.3 * (ce_ratio - 1.0))
                 scheduled_weights = {k: v * factor for k, v in scheduled_weights.items()}
-        self._last_ce_loss = ce_loss.item()
+        self._last_ce_loss_tensor = ce_loss.detach()
 
         # Depth distribution loss (using probability distribution with curriculum learning)
         if depth_probs is not None:
             depth_loss = self.compute_depth_loss(depth_probs, epoch=epoch)
             total_loss = total_loss + scheduled_weights['depth'] * depth_loss
-            loss_dict['depth_loss'] = depth_loss.item()
+            loss_dict['depth_loss'] = depth_loss
 
         # Budget loss (using expected value of split probabilities)
         if split_probs is not None:
             budget_loss = self.compute_raw_budget_error(split_probs)  # D162: 重命名
             total_loss = total_loss + scheduled_weights['budget'] * budget_loss
-            loss_dict['raw_budget_error'] = budget_loss.item()  # D162: 重命名 key
+            loss_dict['raw_budget_error'] = budget_loss  # D162: 重命名 key
 
         # Manifold loss
         manifold_loss = self.compute_manifold_loss(attention_bias, poincare_distances)
         total_loss = total_loss + scheduled_weights['manifold'] * manifold_loss
-        loss_dict['manifold_loss'] = manifold_loss.item()
+        loss_dict['manifold_loss'] = manifold_loss
 
         # Residual loss (using detach)
         residual_loss = self.compute_residual_loss(parent_features, child_features)
         total_loss = total_loss + scheduled_weights['residual'] * residual_loss
-        loss_dict['residual_loss'] = residual_loss.item()
+        loss_dict['residual_loss'] = residual_loss
 
         # Entropy loss
         if splitter_probs is not None:
             entropy_loss = self.compute_entropy_loss(splitter_probs)
             total_loss = total_loss + scheduled_weights['entropy'] * entropy_loss
-            loss_dict['entropy_loss'] = entropy_loss.item()
+            loss_dict['entropy_loss'] = entropy_loss
 
-        loss_dict['total_loss'] = total_loss.item()
+        loss_dict['total_loss'] = total_loss
 
         # Don't use nan_to_num! Let NaN propagate for outer-layer catching
         return total_loss, loss_dict
