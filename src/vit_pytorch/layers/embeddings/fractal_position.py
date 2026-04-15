@@ -284,16 +284,8 @@ class FractalPositionEmbedding(nn.Module):
         regions: Optional[torch.Tensor] = None,
         image_size: Optional[int] = None,
     ) -> torch.Tensor:
-        # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
-        if isinstance(levels_info, torch.Tensor):
-            # 转换为 LevelsInfo，确保数据类型为 Long
-            if levels_info.dtype != torch.long:
-                levels_info = levels_info.long()
-
-            # 从数据形状推断 max_level: info_dim = max_level + 1
-            info_dim = levels_info.shape[-1]
-            inferred_max_level = info_dim - 1
-            levels_info = LevelsInfo(data=levels_info, max_level=inferred_max_level)
+        # Fix-12: 使用统一的护城河工厂方法
+        levels_info = LevelsInfo.ensure(levels_info, default_max_level=self.max_level)
 
         if levels_info.data.numel() == 0:
             return torch.zeros(0, self.dim, device=levels_info.data.device, dtype=torch.float32)
@@ -328,10 +320,7 @@ class FractalPositionEmbedding(nn.Module):
 
         # STAB-7 修复: 确保索引张量为连续格式
         # channels-last 格式与 Embedding 层不兼容，必须转换为 contiguous
-        if flat_indices.dim() > 1:
-            flat_indices = flat_indices.contiguous()
-        else:
-            flat_indices = flat_indices.contiguous()
+        flat_indices = flat_indices.contiguous()
 
         # 查找 Embedding: (..., path_len, dim)
         path_embs = self.quadrant_embedding(flat_indices)
@@ -582,16 +571,8 @@ class AreaEnhancedPositionEmbedding(nn.Module):
         torch.Tensor
             位置编码，形状 [B, N, dim]
         """
-        # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
-        if isinstance(levels_info, torch.Tensor):
-            # 转换为 LevelsInfo，确保数据类型为 Long
-            if levels_info.dtype != torch.long:
-                levels_info = levels_info.long()
-
-            # 从数据形状推断 max_level: info_dim = max_level + 1
-            info_dim = levels_info.shape[-1]
-            inferred_max_level = info_dim - 1
-            levels_info = LevelsInfo(data=levels_info, max_level=inferred_max_level)
+        # Fix-12: 使用统一的护城河工厂方法
+        levels_info = LevelsInfo.ensure(levels_info, default_max_level=self.max_level)
 
         # 1. 基础位置编码
         pos_emb = self.base_embedding(levels_info)

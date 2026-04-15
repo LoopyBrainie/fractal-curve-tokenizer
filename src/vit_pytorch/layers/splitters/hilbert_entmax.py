@@ -94,7 +94,7 @@ def entmax_1_5(
         temp = temp - temp.logsumexp(dim=-1, keepdim=True) + math.log(n)
 
         # 更新 q
-        q = p_alpha * torch.exp(temp)
+        q = p_alpha * torch.exp(temp.clamp(max=20))
         q = q / q.sum(dim=-1, keepdim=True)
 
     # 恢复原始形状
@@ -163,7 +163,7 @@ def entmax(
         denom = p_alpha.sum(dim=-1, keepdim=True).clamp(min=epsilon)
         temp = z_flat / denom
         temp = temp - temp.logsumexp(dim=-1, keepdim=True) + math.log(n)
-        q = p_alpha * torch.exp(temp)
+        q = p_alpha * torch.exp(temp.clamp(max=20))
         q = q / q.sum(dim=-1, keepdim=True)
 
     result = q.reshape(shape_before)

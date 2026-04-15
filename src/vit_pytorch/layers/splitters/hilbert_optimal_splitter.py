@@ -408,10 +408,10 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         # =====================================================================
         # Phase 2: 中间变量安全缓冲区 (DDP 训练安全)
-        # 必须在 forward 内立即转为标量 + detach()，避免显存泄漏
+        # D1-AUDIT FIX: 存储 GPU tensor，在 get_output() 中延迟 .item()
         # =====================================================================
-        self._last_sds_stats: Optional[Dict[str, float]] = None
-        self._last_tree_delta_z: Optional[float] = None
+        self._last_sds_stats_tensor: Optional[Dict[str, Tensor]] = None
+        self._last_tree_delta_z_tensor: Optional[Tensor] = None
 
         # =====================================================================
         # 核心组件
@@ -903,7 +903,8 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         for depth in range(max_level + 1):
             depth_mask = (depths == depth)
             if depth_mask.any():
-                n_depth = depth_mask.sum().item()
+                # D1-AUDIT FIX: depth_mask.sum() 返回 tensor，pos += 1 不需要 .item()
+                # n_depth = depth_mask.sum()  # n_depth 未使用
                 all_coordinates[depth_mask] = coordinates_list[pos]
                 depth_mask_flat[depth_mask] = depth
                 pos += 1
@@ -913,34 +914,31 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         sorted_coords = all_coordinates[sort_idx]  # [N, 2]
         sorted_hilbert = hilbert_indices[sort_idx]  # [N]
 
-        # Step 3: 计算 k 近邻欧氏距离平方（向量化）
-        neighbor_dists_sq = []
-        valid_counts = []
+        # Step 3: 计算 k 近邻欧氏距离平方（完全向量化）
+        # P-OPT: 一次性计算所有 2k 个邻居的距离，避免 Python 循环
+        # 创建所有偏移量: [-k, ..., -1, 1, ..., k]
+        offsets = torch.arange(-k, k + 1, device=device)
+        offsets = offsets[offsets != 0]  # 移除 0 偏移
+        num_neighbors = offsets.numel()  # 应该是 2k
 
-        for offset in range(1, k + 1):
-            # 前向邻居
-            fwd_idx = torch.arange(N, device=device) - offset
-            fwd_valid = (fwd_idx >= 0)
-            fwd_idx_clamped = fwd_idx.masked_fill(~fwd_valid, 0)
+        # 计算所有邻居索引: [N, num_neighbors]
+        neighbor_idx = torch.arange(N, device=device).unsqueeze(1) + offsets.unsqueeze(0)
+        # Clamp 到有效范围 [0, N-1]
+        neighbor_idx_clamped = neighbor_idx.clamp(min=0, max=N - 1)
 
-            # 后向邻居
-            bwd_idx = torch.arange(N, device=device) + offset
-            bwd_valid = (bwd_idx < N)
-            bwd_idx_clamped = bwd_idx.masked_fill(~bwd_valid, N - 1)
+        # 计算所有邻居的坐标: [N, num_neighbors, 2]
+        neighbor_coords = sorted_coords[neighbor_idx_clamped]  # [N, num_neighbors, 2]
 
-            # 计算距离
-            fwd_coords = sorted_coords[fwd_idx_clamped]  # [N, 2]
-            bwd_coords = sorted_coords[bwd_idx_clamped]  # [N, 2]
+        # 使用 broadcasting 一次性计算所有距离: [N, num_neighbors]
+        diff = sorted_coords.unsqueeze(1) - neighbor_coords  # [N, num_neighbors, 2]
+        all_dist_sq = (diff ** 2).sum(dim=2)  # [N, num_neighbors]
 
-            fwd_dist_sq = ((sorted_coords - fwd_coords) ** 2).sum(dim=1)  # [N]
-            bwd_dist_sq = ((sorted_coords - bwd_coords) ** 2).sum(dim=1)  # [N]
+        # 计算有效掩码（排除原始位置的 0 偏移已被移除）
+        valid_mask = (neighbor_idx >= 0) & (neighbor_idx < N)  # [N, num_neighbors]
 
-            neighbor_dists_sq.extend([fwd_dist_sq, bwd_dist_sq])
-            valid_counts.extend([fwd_valid.float(), bwd_valid.float()])
-
-        # 合并所有邻居距离
-        neighbor_dists_sq = torch.stack(neighbor_dists_sq, dim=1)  # [N, 2k]
-        valid_mask = torch.stack(valid_counts, dim=1)  # [N, 2k]
+        # 归一化: 只对有效邻居求平均
+        valid_count = valid_mask.sum(dim=1).clamp(min=1)  # [N]
+        sds_values = (all_dist_sq * valid_mask.float()).sum(dim=1) / valid_count  # [N]
 
         # 归一化
         valid_count = valid_mask.sum(dim=1).clamp(min=1)  # [N]
@@ -1283,10 +1281,10 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # SDS 衡量 Hilbert 曲线上邻居的空间距离，值越高表示局部性保持越差
         if self.use_sds_regularization and image_size is not None:
             sds_penalty = self._compute_sds_penalty(logits, image_size)  # [B, N]
-            # Phase 2: 立即转为标量并 detach，避免 DDP 训练显存泄漏
-            self._last_sds_stats = {
-                "mean": sds_penalty.mean().detach().item(),
-                "max": sds_penalty.max().detach().item()
+            # D1-AUDIT FIX: 存储 GPU tensor，在 get_output() 中延迟 .item()
+            self._last_sds_stats_tensor = {
+                "mean": sds_penalty.mean().detach(),
+                "max": sds_penalty.max().detach()
             }
             logits = logits - sds_penalty  # 抑制高 SDS 位置
 
@@ -1297,7 +1295,8 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         logits = self._apply_tree_constraint(logits, self.candidate_depths)
 
         # 计算树约束修正量: Δz = ||logits_pre - logits_post||₁
-        self._last_tree_delta_z = (logits_pre_tree - logits).abs().sum().item()
+        # D1-AUDIT FIX: 存储 GPU tensor，在 get_output() 中延迟 .item()
+        self._last_tree_delta_z_tensor = (logits_pre_tree - logits).abs().sum().detach()
 
         # 深度配额
         depth_quota = F.softmax(self.depth_quota, dim=0)
@@ -1338,7 +1337,8 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         if region_idx.numel() == 0:
             # 至少选择一个 - 使用 top-k
-            _, topk_idx = torch.topk(probs[0], min(K_hard.item(), probs.shape[1]), dim=-1)
+            # D1-AUDIT FIX: topk 支持 tensor k，直接传 K_hard 避免 .item() 同步
+            _, topk_idx = torch.topk(probs[0], K_hard.clamp(max=probs.shape[1] - 1), dim=-1)
             # 使用 batch 0
             batch_idx = torch.zeros(topk_idx.shape[0], dtype=torch.long, device=logits.device)
             region_idx = topk_idx
@@ -1403,15 +1403,16 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # === Phase 2: 中间变量统计（SDS 惩罚 + 树约束修正量）===
 
         # SDS 惩罚统计 (I167-4)
-        if hasattr(self, '_last_sds_stats') and self._last_sds_stats is not None:
-            result.sds_penalty_mean = self._last_sds_stats["mean"]
-            result.sds_penalty_max = self._last_sds_stats["max"]
+        # D1-AUDIT FIX: 延迟 .item() 到 get_output()（post-forward，非热路径）
+        if hasattr(self, '_last_sds_stats_tensor') and self._last_sds_stats_tensor is not None:
+            result.sds_penalty_mean = self._last_sds_stats_tensor["mean"].item()
+            result.sds_penalty_max = self._last_sds_stats_tensor["max"].item()
 
         # 树约束透明化：动态 lambda + 修正量 Δz
         lambda_cur = self._compute_dynamic_lambda()
         result.tree_lambda = lambda_cur.item() if hasattr(lambda_cur, 'item') else lambda_cur
-        if hasattr(self, '_last_tree_delta_z') and self._last_tree_delta_z is not None:
-            result.tree_constraint_delta_z = self._last_tree_delta_z
+        if hasattr(self, '_last_tree_delta_z_tensor') and self._last_tree_delta_z_tensor is not None:
+            result.tree_constraint_delta_z = self._last_tree_delta_z_tensor.item()
 
         # I150-3: 记录 token 选择历史用于稳定性监控
         if self._monitor_token_stability and hard:
@@ -1455,9 +1456,9 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         elif epoch < self.entmax_schedule_epochs:
             # 过渡阶段: 使用 sigmoid 平滑曲线，防止 α 在后期突越 1.5
             progress = (epoch - self.entmax_warmup_epochs) / max(1, self.entmax_schedule_epochs - self.entmax_warmup_epochs)
-            # Sigmoid 平滑: 输出范围 [0, 1]，映射到 [1.2, 1.49]
-            # 中点在 70% 进度处，提前减速避免撞击 1.5 奇点
-            sigmoid = 1 / (1 + math.exp(-10 * (progress - 0.7)))
+            # D4-SYNC FIX: 使用 torch.sigmoid 替代 math.exp，确保 AMP 兼容性
+            sigmoid_tensor = torch.sigmoid(torch.tensor(-10.0 * (progress - 0.7), dtype=torch.float32))
+            sigmoid = sigmoid_tensor.item()
             self.entmax_alpha = 1.2 + 0.29 * sigmoid
         else:
             # V4: alpha_max = 1.49 而非 1.5，永远保持轻微梯度流
@@ -1492,7 +1493,8 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             if regions >= K_target:
                 return regions
         # 如果所有 level 都不满足，返回最大 level 的区域数
-        return 4 ** max_level
+        # D4-AUDIT FIX: 4**max_level → 1 << (2 * max_level)
+        return 1 << (2 * max_level)
 
     def extra_repr(self) -> str:
         return (

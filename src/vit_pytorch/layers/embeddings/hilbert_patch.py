@@ -582,7 +582,9 @@ class HilbertNativePatchEmbed(nn.Module):
 
         # I-OPT: 按 sample_size 分组，每组批量处理所有 boxes
         # 替代逐 box 的 F.grid_sample 调用 (N×B 次 → 最多 3 次)
-        pooled_results = {}
+        # 使用 tensor 而非 dict，避免enumerate+tolist同步
+        pooled_results = torch.zeros(N, D, device=features.device, dtype=features.dtype)
+        assigned_mask = torch.zeros(N, dtype=torch.bool, device=features.device)
 
         for ss in sample_sizes:
             ss_mask = sample_sizes_t == ss
@@ -635,17 +637,17 @@ class HilbertNativePatchEmbed(nn.Module):
                 # 全局平均池化
                 pooled = sampled.mean(dim=(2, 3))  # [N_b, D]
 
-                # 记录结果
-                for j, idx in enumerate(ss_indices[b_mask].tolist()):
-                    pooled_results[idx] = pooled[j]
+                # 记录结果 - 向量化赋值替代dict+enumerate
+                pooled_results[ss_indices[b_mask]] = pooled
+                assigned_mask[ss_indices[b_mask]] = True
 
         # 组装最终结果 (按原始顺序)
-        if pooled_results:
-            all_pooled = torch.stack([pooled_results[i] for i in range(N) if i in pooled_results])
+        if assigned_mask.all():
+            result = pooled_results
         else:
-            all_pooled = torch.zeros(N, D, device=features.device, dtype=features.dtype)
-
-        result = all_pooled
+            # 极少数未分配时用零填充
+            result = torch.zeros(N, D, device=features.device, dtype=features.dtype)
+            result[assigned_mask] = pooled_results[assigned_mask]
 
         return result
 

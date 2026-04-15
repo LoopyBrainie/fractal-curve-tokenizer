@@ -63,30 +63,23 @@ def coords_from_paths(
     B, N, D = paths.shape
     device = paths.device
 
-    # 初始化坐标为零
-    x = torch.zeros(B, N, dtype=torch.long, device=device)
-    y = torch.zeros(B, N, dtype=torch.long, device=device)
+    # I103-4 向量化: 用 torch.arange(max_level) 广播替代 level 循环
+    # level_range: [max_level], half_range: [max_level]
+    level_range = torch.arange(max_level, device=device)
+    half_range = 1 << (max_level - level_range - 1)  # [2^{max_level-1}, ..., 2^0]
 
-    # 遍历每个深度层
-    for level in range(max_level):
-        # 位移量: 2^{max_level-level-1}
-        shift = max_level - level - 1
-        half = 1 << shift  # 2^shift
+    # 有效掩码: level_range < depths, broadcasting to [B, N, max_level]
+    qmask = level_range.view(1, 1, max_level) < depths.unsqueeze(-1)  # [B, N, max_level]
 
-        # 提取当前层的象限
-        quadrant = paths[:, :, level]  # [B, N]
+    # 象限解码: 0=(0,0), 1=(1,0), 2=(0,1), 3=(1,1)
+    # D4-AUDIT FIX: //2 → >>1, %2 → &1，位运算更快
+    qx_all = (paths >> 1) & 1  # [B, N, max_level]
+    qy_all = paths & 1          # [B, N, max_level]
 
-        # 象限解码: 0=(0,0), 1=(1,0), 2=(0,1), 3=(1,1)
-        # D4-AUDIT FIX: //2 → >>1, %2 → &1，位运算更快
-        qx = (quadrant >> 1) & 1  # x 位
-        qy = quadrant & 1          # y 位
-
-        # 有效掩码: 当前 token 在该深度有有效路径
-        valid = (level < depths).long()  # [B, N]
-
-        # 累加位移
-        x = x + qx * half * valid
-        y = y + qy * half * valid
+    # 广播 half 到 [1, 1, max_level] 并与掩码相乘
+    half_range = half_range.view(1, 1, max_level)
+    x = (qx_all * half_range * qmask).sum(dim=-1)  # [B, N]
+    y = (qy_all * half_range * qmask).sum(dim=-1)  # [B, N]
 
     # 转换为 float 并归一化到 [0, 1] 范围
     grid_size = 1 << max_level  # 2^max_level
@@ -630,6 +623,8 @@ class ParentTokenLookup(nn.Module):
         parent_indices = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)
         parent_mask = torch.ones(B, N, dtype=torch.bool, device=device)
 
+        # I103-5 向量化优化: 预计算所有深度的掩码，避免重复计算
+        # 使用 nonzero(as_tuple=False) 避免 Graph Break
         for d in range(1, self.max_level + 1):
             current_mask = (depths == d)
             parent_mask_d = (depths == d - 1)
@@ -637,23 +632,42 @@ class ParentTokenLookup(nn.Module):
             if not current_mask.any():
                 continue
 
-            current_indices = torch.where(current_mask)[1]
-            parent_indices_d = torch.where(parent_mask_d)[1]
+            # D3-AUDIT FIX: nonzero(as_tuple=False) 避免动态 tuple 返回
+            # nonzero 返回 [num_true, 2] 的 2D 张量，squeeze 后行为不一致:
+            # - num_true=1: [1,2] -> squeeze -> [2] (第一维被移除)
+            # - num_true>1: [N,2] -> squeeze -> [N,2] (不变)
+            # 所以需要条件处理
+            current_idx_2d = current_mask.nonzero(as_tuple=False)
+            parent_idx_2d = parent_mask_d.nonzero(as_tuple=False)
 
-            if len(parent_indices_d) == 0:
-                parent_mask[:, current_indices] = False
+            # 处理 squeeze 不一致问题：将 [2] 变回 [1,2]
+            if current_idx_2d.dim() == 1:
+                current_idx_2d = current_idx_2d.unsqueeze(0)
+            if parent_idx_2d.dim() == 1:
+                parent_idx_2d = parent_idx_2d.unsqueeze(0)
+
+            num_current = current_idx_2d.shape[0]
+            num_parents = parent_idx_2d.shape[0]
+
+            if num_parents == 0:
+                # 没有父节点时，使用 2D 索引直接更新 parent_mask
+                parent_mask[current_idx_2d[:, 0], current_idx_2d[:, 1]] = False
                 continue
 
-            h_current = hilbert_indices[:, current_indices]  # [B, num_current]
-            h_parents = hilbert_indices[:, parent_indices_d]  # [B, num_parents]
+            # 计算当前 token 与父节点的 Hilbert 距离
+            # h_current: [num_current], h_parents: [num_parents]
+            h_current = hilbert_indices[current_idx_2d[:, 0], current_idx_2d[:, 1]]
+            h_parents = hilbert_indices[parent_idx_2d[:, 0], parent_idx_2d[:, 1]]
 
-            dist = torch.abs(h_current.unsqueeze(2) - h_parents.unsqueeze(1))
+            # 计算距离矩阵 [num_current, num_parents]
+            dist = torch.abs(h_current.unsqueeze(1) - h_parents.unsqueeze(0))
             dist_safe = dist + self.eps
-            nearest = dist_safe.argmin(dim=2)
+            nearest = dist_safe.argmin(dim=1)  # [num_current]
 
-            parent_indices_clone = parent_indices.clone()
-            parent_indices_clone[:, current_indices] = parent_indices_d[nearest]
-            parent_indices = parent_indices_clone
+            # 批量更新父节点索引 (clone 避免修改原始 tensor)
+            parent_indices = parent_indices.clone()
+            # parent_indices: [B, N], current_idx_2d[:, 1] 是 token 索引
+            parent_indices[current_idx_2d[:, 0], current_idx_2d[:, 1]] = parent_idx_2d[nearest, 1]
 
         return parent_indices, parent_mask
 
@@ -973,6 +987,10 @@ class ManifoldNativeAttention(nn.Module):
         self._nan_count = 0
         self._total_count = 0
 
+        # torch.compile 缓存修复: 预分配 stats 字典，复用同一对象
+        # 避免 get_stats() 每次返回新 dict (torch.compile 按 id() 追踪缓存)
+        self._stats_cache: dict = {}
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1010,32 +1028,26 @@ class ManifoldNativeAttention(nn.Module):
         raw_paths = None  # 原始 paths 用于坐标重建
         coords = None  # 物理坐标，用于 2D RoPE
         if levels_info is not None:
-            if hasattr(levels_info, 'depths'):
-                depths = levels_info.depths
-                # 确保 depths 是 [B, N] 形状（移除冗余维度）
-                # B2 修复: 处理 depths 可能是 [B, N, N] 或更高维度的情况
-                if depths.dim() >= 3:
-                    if depths.dim() == 3 and depths.shape[1] == depths.shape[2]:
-                        # depths 是 [B, N, N]，提取对角元素得到 [B, N]
-                        depths = depths.diagonal(dim1=-2, dim2=-1)  # [B, N]
-                    else:
-                        # 其他情况：展平并取前 N 个
-                        B_tmp, N_tmp = x.shape[0], x.shape[1]
-                        depths = depths.reshape(B_tmp, -1)[:, :N_tmp]
-                if hasattr(levels_info, 'get_hilbert_indices'):
-                    hilbert_indices = levels_info.get_hilbert_indices()
-                # P1-A 修复: 强制从 levels_info.data 提取 paths
-                # 绕过 hasattr 检查，直接从 data 属性提取
-                # data 形状 [B, N, max_level+1]，paths 在第 1 到 max_level+1 列
-                if hasattr(levels_info, 'data') and levels_info.data.shape[-1] > 1:
-                    # 优先使用 paths 属性（如果有缓存）
-                    if hasattr(levels_info, 'paths'):
-                        raw_paths = levels_info.paths  # [B, N, max_level]
-                    else:
-                        # 回退：直接从 data 提取
-                        raw_paths = levels_info.data[:, :, 1:]  # [B, N, max_level]
-            elif isinstance(levels_info, torch.Tensor):
-                depths = levels_info.argmax(dim=-1)
+            # Fix-12: 直接属性访问，无 Graph Break
+            # levels_info 应该是 LevelsInfo 对象，由 LevelsInfo.ensure() 统一保证
+            depths = levels_info.depths
+
+            # 确保 depths 是 [B, N] 形状（移除冗余维度）
+            # B2 修复: 处理 depths 可能是 [B, N, N] 或更高维度的情况
+            if depths.dim() >= 3:
+                if depths.dim() == 3 and depths.shape[1] == depths.shape[2]:
+                    # depths 是 [B, N, N]，提取对角元素得到 [B, N]
+                    depths = depths.diagonal(dim1=-2, dim2=-1)  # [B, N]
+                else:
+                    # 其他情况：展平并取前 N 个
+                    B_tmp, N_tmp = x.shape[0], x.shape[1]
+                    depths = depths.reshape(B_tmp, -1)[:, :N_tmp]
+
+            # 直接调用，无条件分发
+            hilbert_indices = levels_info.get_hilbert_indices()
+
+            # 直接访问 paths 属性（LevelsInfo 保证该属性存在）
+            raw_paths = levels_info.paths
 
         B, N, D = x.shape
 
@@ -1077,7 +1089,8 @@ class ManifoldNativeAttention(nn.Module):
         if self.use_banded and hilbert_indices is not None and depths is not None:
             # 使用 depths 推断面积（面积 ∝ 4^{-d}）
             # 这是尺度不变的，不依赖图像尺寸
-            area_from_depth = torch.pow(4, -depths.float())  # [B, N]
+            # D4-AUDIT FIX: torch.pow(4, x) → torch.exp2(x * 2)，消除 pow 开销
+            area_from_depth = torch.exp2(-depths.float() * 2.0)  # [B, N]
             normalized_areas = area_from_depth / (area_from_depth.sum(dim=-1, keepdim=True) + 1e-8)
 
             # 计算 LCA depths（对称矩阵）
@@ -1087,7 +1100,8 @@ class ManifoldNativeAttention(nn.Module):
             # 使用 hilbert_indices 构造模拟 paths（用于旋转相同性）
             # P2 修复: 动态计算象限划分，替代硬编码的 256
             # 原 256 // 4 假设固定分辨率，与 Budget 归一化（跨分辨率）背道而驰
-            max_idx = max(hilbert_indices.max().item(), 1)
+            # D1-AUDIT FIX: 使用 tensor.clamp 替代 .item() 避免 GPU-CPU 同步
+            max_idx = hilbert_indices.max().clamp(min=1)  # GPU tensor, no sync
             quadrant_size = max_idx // 4 + 1  # 动态象限大小
             hilbert_quadrants = (hilbert_indices / quadrant_size).long() % 4  # [B, N]
             paths = hilbert_quadrants.unsqueeze(2).expand(-1, -1, self.max_level)  # [B, N, max_level]
@@ -1204,14 +1218,17 @@ class ManifoldNativeAttention(nn.Module):
             - entmax_sparsity: entmax 激活后的稀疏度
             - lipschitz_compliance: Hilbert Lipschitz 合规性
         """
-        stats = {}
+        # torch.compile 修复: 复用同一 dict 对象，避免每次创建新对象
+        # torch.compile 按 id() 缓存，dict 内容相同但对象不同时会触发 recompile
+        cache = self._stats_cache
+        cache.clear()
 
         # 几何偏置统计
         if self._last_geo_bias is not None:
             bias = self._last_geo_bias.detach()
-            stats["geometric_bias_mean"] = bias.mean()
-            stats["geometric_bias_std"] = bias.std()
-            stats["geometric_bias_max"] = bias.max()
+            cache["geometric_bias_mean"] = bias.mean()
+            cache["geometric_bias_std"] = bias.std()
+            cache["geometric_bias_max"] = bias.max()
 
         # === P0: geo_decoder.layer_scale (流形偏置强度) ===
         # layer_scale 是 GeometricLatentDecoder 中唯一可学习的缩放参数
@@ -1219,17 +1236,17 @@ class ManifoldNativeAttention(nn.Module):
         # 数学意义: layer_scale 是否激活是流形偏置是否生效的最直接信号
         if hasattr(self, 'geo_decoder') and self.geo_decoder is not None:
             ls = self.geo_decoder.layer_scale.detach()
-            stats["layer_scale_mean"] = ls.mean()
-            stats["layer_scale_max"] = ls.max()
-            stats["layer_scale_min"] = ls.min()
-            stats["layer_scale_std"] = ls.std()
+            cache["layer_scale_mean"] = ls.mean()
+            cache["layer_scale_max"] = ls.max()
+            cache["layer_scale_min"] = ls.min()
+            cache["layer_scale_std"] = ls.std()
 
         # 带宽统计
         if self._last_bandwidths is not None:
             bw = self._last_bandwidths.detach().float()
-            stats["bandwidth_mean"] = bw.mean()
-            stats["bandwidth_min"] = bw.min()
-            stats["bandwidth_max"] = bw.max()
+            cache["bandwidth_mean"] = bw.mean()
+            cache["bandwidth_min"] = bw.min()
+            cache["bandwidth_max"] = bw.max()
 
             # === P0: band_saturation_ratio (带宽饱和比例) ===
             # 比较 bandwidth >= 4^depth（可attend到该深度所有token）
@@ -1237,25 +1254,25 @@ class ManifoldNativeAttention(nn.Module):
                 d = self._last_depths.detach().float()
                 four_pow_depths = torch.exp2(d * 2.0)  # D4-AUDIT FIX: pow(4,x) → exp2(x*2)
                 saturated = (bw >= four_pow_depths).float()
-                stats["band_saturation_ratio"] = saturated.mean()
+                cache["band_saturation_ratio"] = saturated.mean()
 
                 # === Hilbert Lipschitz 合规性 ===
                 # 理论最优带宽 = 2^d（来自 Lipschitz: 邻域 ∝ √(4^d) = 2^d）
                 # 合规性 = 实际带宽 / 理论最优带宽，应接近 1.0
                 theoretical_optimal = torch.exp2(d)  # D4-AUDIT FIX: pow(2,x) → exp2(x)
                 compliance = (bw / theoretical_optimal.clamp(min=1)).mean()
-                stats["lipschitz_compliance"] = compliance
+                cache["lipschitz_compliance"] = compliance
 
         # Poincaré 距离统计
         if self._last_manifold_coords is not None:
             coords = self._last_manifold_coords.detach()
-            stats["poincare_dist_mean"] = coords.mean()
-            stats["poincare_dist_std"] = coords.std()
+            cache["poincare_dist_mean"] = coords.mean()
+            cache["poincare_dist_std"] = coords.std()
 
         # 残差门控统计
         if self._last_residual_scale is not None:
             scale = self._last_residual_scale.detach()
-            stats["residual_scale_mean"] = scale.mean()
+            cache["residual_scale_mean"] = scale.mean()
 
         # attention_compression_ratio = 1 - sum(bandwidths) / N^2
         if self._last_bandwidths is not None:
@@ -1263,23 +1280,23 @@ class ManifoldNativeAttention(nn.Module):
             B, N = bw.shape
             total_bandwidth = bw.sum()  # GPU tensor → flatten_layer_outputs .item()
             compression = 1.0 - total_bandwidth / (B * N * N)
-            stats["attention_compression_ratio"] = compression
+            cache["attention_compression_ratio"] = compression
 
         # geometric_boundary_proximity = mean of poincare_norm
         if self._last_poincare_norm is not None:
             norm = self._last_poincare_norm.detach()
-            stats["geometric_boundary_proximity"] = norm.mean()
+            cache["geometric_boundary_proximity"] = norm.mean()
 
         # fractal_residual_energy_ratio = ||residual|| / ||x||
         if self._last_input_x is not None and self._last_residual_scale is not None:
             x_norm = self._last_input_x.detach().norm(p=2)
             residual_est = self._last_residual_scale.mean().detach() * x_norm
             if x_norm > 0:
-                stats["fractal_residual_energy_ratio"] = residual_est / x_norm
+                cache["fractal_residual_energy_ratio"] = residual_est / x_norm
 
         # poincare_norm_max
         if self._last_poincare_norm is not None:
-            stats["poincare_norm_max"] = self._last_poincare_norm.detach().max()
+            cache["poincare_norm_max"] = self._last_poincare_norm.detach().max()
 
         # === P1: true_avg_jump_distance (真实跳跃距离) ===
         # 使用注意力权重和带宽倒数作为跳越距离的加权计算
@@ -1288,20 +1305,20 @@ class ManifoldNativeAttention(nn.Module):
             bw = self._last_bandwidths.detach().float()  # [B, N]
             jump_proxy = 1.0 / (bw.unsqueeze(1).unsqueeze(-1) + 1e-6)  # [B, 1, N, 1]
             weighted_jump = (attn * jump_proxy).sum(dim=[2, 3]) / (attn.sum(dim=[2, 3]) + 1e-6)  # [B, H]
-            stats["true_avg_jump_distance"] = weighted_jump.mean()
+            cache["true_avg_jump_distance"] = weighted_jump.mean()
 
         # === P1: entmax_sparsity (entmax 稀疏度) ===
         if self._last_attn_weights is not None:
             attn = self._last_attn_weights.detach()
             attn_sum = attn.sum(dim=-1, keepdim=True)  # [B, H, N, 1]
             l2_norm_sq = (attn ** 2).sum(dim=-1, keepdim=True)  # [B, H, N, 1]
-            stats["entmax_sparsity"] = (l2_norm_sq / (attn_sum ** 2 + 1e-8)).mean()
+            cache["entmax_sparsity"] = (l2_norm_sq / (attn_sum ** 2 + 1e-8)).mean()
 
         # nan_rate
         if self._total_count > 0:
-            stats["nan_rate"] = self._nan_count / self._total_count
+            cache["nan_rate"] = self._nan_count / self._total_count
 
-        return stats
+        return cache
 
     @property
     def attn_output(self) -> dict:

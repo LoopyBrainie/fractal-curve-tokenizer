@@ -444,15 +444,9 @@ class BitFlippedPositionEncoder(nn.Module):
             pos_emb: [B, N, dim] 位置编码
             geometry_emb: [B, N, dim] 传给 Attention 的几何嵌入
         """
-        # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
+        # Fix-12: 使用统一的护城河工厂方法
         from vit_pytorch.core.levels_info import LevelsInfo
-
-        if isinstance(levels_info, torch.Tensor):
-            if levels_info.dtype != torch.long:
-                levels_info = levels_info.long()
-            info_dim = levels_info.shape[-1]
-            inferred_max_level = info_dim - 1
-            levels_info = LevelsInfo(data=levels_info, max_level=inferred_max_level)
+        levels_info = LevelsInfo.ensure(levels_info, default_max_level=self.max_level)
 
         if levels_info.data.numel() == 0:
             return (
@@ -592,7 +586,8 @@ class BitFlippedPositionEncoder(nn.Module):
         """
         pos_dim = self.dim // 2
         # D4-AUDIT FIX: 移除 device='cpu'（GPU→CPU→GPU 传输），改用 exp2 优化
-        freqs = torch.exp2(torch.arange(0, pos_dim, 2, device=morton_norm.device, dtype=torch.float32) / pos_dim) * 3.141592653589793
+        # D4-AUDIT FIX: 移除 dtype=torch.float32，遵循 morton_norm.dtype 实现 AMP 兼容
+        freqs = torch.exp2(torch.arange(0, pos_dim, 2, device=morton_norm.device, dtype=morton_norm.dtype) / pos_dim) * 3.141592653589793
 
         # 角度: morton_norm * freqs
         angles = morton_norm.unsqueeze(-1) * freqs  # [N, dim//4]
@@ -830,7 +825,7 @@ class FractalPathEmbedding(nn.Module):
         # 将路径转换为哈希值（用于唯一性检测）
         # 使用位置编码确保不同位置的不同路径被区分
         # path_hash = Σ valid_paths[i] * 4^i
-        powers = torch.exp2(torch.arange(max_level, device=paths.device, dtype=torch.float32) * 2.0)  # D4-AUDIT FIX: 4**x → exp2(x*2)
+        powers = torch.exp2(torch.arange(max_level, device=paths.device, dtype=paths.dtype) * 2.0)  # D4-AUDIT FIX: 移除 dtype=float32 强制，遵循 paths.dtype 实现 AMP 兼容
         path_hash = (valid_paths * powers.unsqueeze(0).unsqueeze(0)).sum(dim=-1)  # [B, N]
 
         # 计算每个 batch 的熵并取平均
@@ -850,7 +845,7 @@ class FractalPathEmbedding(nn.Module):
             entropy_stack = torch.stack(entropies)  # [B] tensor
             self._diagnostic_cache["distribution/path_entropy"] = entropy_stack.mean()
         else:
-            self._diagnostic_cache["distribution/path_entropy"] = torch.tensor(0.0)
+            self._diagnostic_cache["distribution/path_entropy"] = torch.tensor(0.0, device=paths.device, dtype=torch.float32)
 
     @property
     def embed_output(self) -> Dict[str, Any]:
@@ -1236,15 +1231,9 @@ class FourierPathEncoder(nn.Module):
         Returns:
             path_emb: [B, N, dim] Fourier 路径编码
         """
+        # Fix-12: 使用统一的护城河工厂方法
         from vit_pytorch.core.levels_info import LevelsInfo
-
-        # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
-        if isinstance(levels_info, torch.Tensor):
-            if levels_info.dtype != torch.long:
-                levels_info = levels_info.long()
-            info_dim = levels_info.shape[-1]
-            inferred_max_level = info_dim - 1
-            levels_info = LevelsInfo(data=levels_info, max_level=inferred_max_level)
+        levels_info = LevelsInfo.ensure(levels_info, default_max_level=self.max_level)
 
         if levels_info.data.numel() == 0:
             device = levels_info.data.device
@@ -1310,7 +1299,7 @@ class FourierPathEncoder(nn.Module):
         if similarities.numel() > 0:
             self._diagnostic_cache["health/fourier_boundary_sim"] = similarities.mean()
         else:
-            self._diagnostic_cache["health/fourier_boundary_sim"] = torch.tensor(0.0)
+            self._diagnostic_cache["health/fourier_boundary_sim"] = torch.tensor(0.0, device=embeddings.device, dtype=torch.float32)
 
     def compute_boundary_similarity(
         self,
