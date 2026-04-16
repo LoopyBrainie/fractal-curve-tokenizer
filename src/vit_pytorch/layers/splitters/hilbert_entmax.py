@@ -92,7 +92,7 @@ def entmax_1_5(
         # 归一化确保 Σ temp_i = n
         temp = temp - temp.logsumexp(dim=-1, keepdim=True) + math.log(n)
 
-        # AMP FIX: clamp before exp to prevent overflow in fp16
+# AMP FIX: clamp before exp to prevent overflow in fp16
         # exp(10) ≈ 22026 in fp16, so clamp to 10 for safety margin
         q = p_alpha * torch.exp(temp.clamp(max=10.0))
         q = q / q.sum(dim=-1, keepdim=True)
@@ -162,7 +162,7 @@ def entmax(
         denom = p_alpha.sum(dim=-1, keepdim=True).clamp(min=epsilon)
         temp = z_flat / denom
         temp = temp - temp.logsumexp(dim=-1, keepdim=True) + math.log(n)
-        # AMP FIX: clamp before exp to prevent overflow in fp16
+# AMP FIX: clamp before exp to prevent overflow in fp16
         q = p_alpha * torch.exp(temp.clamp(max=10.0))
         q = q / q.sum(dim=-1, keepdim=True)
 

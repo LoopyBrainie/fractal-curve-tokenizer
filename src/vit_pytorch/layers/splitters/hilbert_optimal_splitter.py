@@ -403,7 +403,7 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         # =====================================================================
         # Phase 2: 中间变量安全缓冲区 (DDP 训练安全)
-        # 必须在 forward 内立即转为标量 + detach()，避免显存泄漏
+        # D1-AUDIT FIX: 存储 GPU tensor，在 get_output() 中延迟 .item()
         # =====================================================================
         self._last_sds_stats: Optional[Dict[str, float]] = None
         # D1-AUDIT FIX: 改为 Optional[Tensor] 避免 forward 内 .item() 同步
@@ -900,34 +900,31 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         sort_idx = hilbert_indices.argsort()
         sorted_coords = all_coordinates[sort_idx]  # [N, 2]
 
-        # Step 3: 计算 k 近邻欧氏距离平方（向量化）
-        neighbor_dists_sq = []
-        valid_counts = []
+        # Step 3: 计算 k 近邻欧氏距离平方（完全向量化）
+        # P-OPT: 一次性计算所有 2k 个邻居的距离，避免 Python 循环
+        # 创建所有偏移量: [-k, ..., -1, 1, ..., k]
+        offsets = torch.arange(-k, k + 1, device=device)
+        offsets = offsets[offsets != 0]  # 移除 0 偏移
+        num_neighbors = offsets.numel()  # 应该是 2k
 
-        for offset in range(1, k + 1):
-            # 前向邻居
-            fwd_idx = torch.arange(N, device=device) - offset
-            fwd_valid = (fwd_idx >= 0)
-            fwd_idx_clamped = fwd_idx.masked_fill(~fwd_valid, 0)
+        # 计算所有邻居索引: [N, num_neighbors]
+        neighbor_idx = torch.arange(N, device=device).unsqueeze(1) + offsets.unsqueeze(0)
+        # Clamp 到有效范围 [0, N-1]
+        neighbor_idx_clamped = neighbor_idx.clamp(min=0, max=N - 1)
 
-            # 后向邻居
-            bwd_idx = torch.arange(N, device=device) + offset
-            bwd_valid = (bwd_idx < N)
-            bwd_idx_clamped = bwd_idx.masked_fill(~bwd_valid, N - 1)
+        # 计算所有邻居的坐标: [N, num_neighbors, 2]
+        neighbor_coords = sorted_coords[neighbor_idx_clamped]  # [N, num_neighbors, 2]
 
-            # 计算距离
-            fwd_coords = sorted_coords[fwd_idx_clamped]  # [N, 2]
-            bwd_coords = sorted_coords[bwd_idx_clamped]  # [N, 2]
+        # 使用 broadcasting 一次性计算所有距离: [N, num_neighbors]
+        diff = sorted_coords.unsqueeze(1) - neighbor_coords  # [N, num_neighbors, 2]
+        all_dist_sq = (diff ** 2).sum(dim=2)  # [N, num_neighbors]
 
-            fwd_dist_sq = ((sorted_coords - fwd_coords) ** 2).sum(dim=1)  # [N]
-            bwd_dist_sq = ((sorted_coords - bwd_coords) ** 2).sum(dim=1)  # [N]
+        # 计算有效掩码（排除原始位置的 0 偏移已被移除）
+        valid_mask = (neighbor_idx >= 0) & (neighbor_idx < N)  # [N, num_neighbors]
 
-            neighbor_dists_sq.extend([fwd_dist_sq, bwd_dist_sq])
-            valid_counts.extend([fwd_valid.float(), bwd_valid.float()])
-
-        # 合并所有邻居距离
-        neighbor_dists_sq = torch.stack(neighbor_dists_sq, dim=1)  # [N, 2k]
-        valid_mask = torch.stack(valid_counts, dim=1)  # [N, 2k]
+        # 归一化: 只对有效邻居求平均
+        valid_count = valid_mask.sum(dim=1).clamp(min=1)  # [N]
+        sds_values = (all_dist_sq * valid_mask.float()).sum(dim=1) / valid_count  # [N]
 
         # 归一化
         valid_count = valid_mask.sum(dim=1).clamp(min=1)  # [N]
@@ -1402,6 +1399,7 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # D1-AUDIT FIX: 提取 tensor 值用于结果
         if hasattr(self, '_last_tree_delta_z_t') and self._last_tree_delta_z_t is not None:
             result.tree_constraint_delta_z = self._last_tree_delta_z_t.item()
+>>>>>>> layers-improvements
 
         # I150-3: 记录 token 选择历史用于稳定性监控
         if self._monitor_token_stability and hard:
@@ -1445,9 +1443,9 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         elif epoch < self.entmax_schedule_epochs:
             # 过渡阶段: 使用 sigmoid 平滑曲线，防止 α 在后期突越 1.5
             progress = (epoch - self.entmax_warmup_epochs) / max(1, self.entmax_schedule_epochs - self.entmax_warmup_epochs)
-            # Sigmoid 平滑: 输出范围 [0, 1]，映射到 [1.2, 1.49]
-            # 中点在 70% 进度处，提前减速避免撞击 1.5 奇点
-            sigmoid = 1 / (1 + math.exp(-10 * (progress - 0.7)))
+            # D4-SYNC FIX: 使用 torch.sigmoid 替代 math.exp，确保 AMP 兼容性
+            sigmoid_tensor = torch.sigmoid(torch.tensor(-10.0 * (progress - 0.7), dtype=torch.float32))
+            sigmoid = sigmoid_tensor.item()
             self.entmax_alpha = 1.2 + 0.29 * sigmoid
         else:
             # V4: alpha_max = 1.49 而非 1.5，永远保持轻微梯度流
