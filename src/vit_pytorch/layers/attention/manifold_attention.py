@@ -19,12 +19,15 @@ Manifold-Native 多尺度注意力 (ManifoldNativeAttention)
 
 from __future__ import annotations
 
-import math
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from vit_pytorch.core.constants import EPS
+
+if TYPE_CHECKING:
+    from vit_pytorch.core.levels_info import LevelsInfo
 
 
 # ==================== Hilbert Paths → 坐标重建 ====================
@@ -303,7 +306,6 @@ def compute_geometric_features(
     else:
         was_2d = False
 
-    B = lca_depths.shape[0]
     N = lca_depths.shape[1]
 
     # 1. Δh_ij / N^2 (归一化 Hilbert 距离)
@@ -323,7 +325,7 @@ def compute_geometric_features(
     area_i = normalized_areas.unsqueeze(2)  # [B, N, 1]
     area_j = normalized_areas.unsqueeze(1)  # [B, 1, N]
     area_ratio = torch.log(
-        (area_i / (area_j + 1e-6) + 1e-6).clamp(min=1e-6, max=1e6)
+        (area_i / (area_j + EPS) + EPS).clamp(min=EPS, max=1e6)
     )  # [B, N, N]
 
     # 5. rot_same(i,j) (旋转相同性)
@@ -719,7 +721,6 @@ class ScaleAwareResidual(nn.Module):
             残差特征 [B, N, D]
         """
         B, N, D = x.shape
-        device = x.device
 
         parent_indices, parent_mask = self.parent_lookup(depths, hilbert_indices, regions)
 
@@ -1086,9 +1087,10 @@ class ManifoldNativeAttention(nn.Module):
 
             # 使用 hilbert_indices 构造模拟 paths（用于旋转相同性）
             # P2 修复: 动态计算象限划分，替代硬编码的 256
+            # D1+D3 AUDIT FIX: 保持 GPU tensor，避免 .item() 强制同步
             # 原 256 // 4 假设固定分辨率，与 Budget 归一化（跨分辨率）背道而驰
-            max_idx = max(hilbert_indices.max().item(), 1)
-            quadrant_size = max_idx // 4 + 1  # 动态象限大小
+            max_idx = hilbert_indices.max().clamp(min=1)  # GPU tensor
+            quadrant_size = max_idx // 4 + 1  # 动态象限大小，保持 tensor
             hilbert_quadrants = (hilbert_indices / quadrant_size).long() % 4  # [B, N]
             paths = hilbert_quadrants.unsqueeze(2).expand(-1, -1, self.max_level)  # [B, N, max_level]
 
@@ -1174,6 +1176,7 @@ class ManifoldNativeAttention(nn.Module):
         return out
 
     @torch.no_grad()
+    @torch._dynamo.disable  # 排除 torch.compile 追踪，避免 _last_depths 等可变属性触发重复编译
     def get_stats(self) -> dict:
         """获取诊断统计信息（延迟求值，GPU tensor 直接返回）
 
@@ -1286,8 +1289,8 @@ class ManifoldNativeAttention(nn.Module):
         if self._last_attn_weights is not None and self._last_bandwidths is not None:
             attn = self._last_attn_weights.detach()  # [B, H, N, N]
             bw = self._last_bandwidths.detach().float()  # [B, N]
-            jump_proxy = 1.0 / (bw.unsqueeze(1).unsqueeze(-1) + 1e-6)  # [B, 1, N, 1]
-            weighted_jump = (attn * jump_proxy).sum(dim=[2, 3]) / (attn.sum(dim=[2, 3]) + 1e-6)  # [B, H]
+            jump_proxy = 1.0 / (bw.unsqueeze(1).unsqueeze(-1) + EPS)  # [B, 1, N, 1]
+            weighted_jump = (attn * jump_proxy).sum(dim=[2, 3]) / (attn.sum(dim=[2, 3]) + EPS)  # [B, H]
             stats["true_avg_jump_distance"] = weighted_jump.mean()
 
         # === P1: entmax_sparsity (entmax 稀疏度) ===

@@ -65,7 +65,7 @@ Variable Depth Token 的 Patch Embedding 必须满足 4 个约束:
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn

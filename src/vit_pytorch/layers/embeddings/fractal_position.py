@@ -52,7 +52,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vit_pytorch.core.constants import EMBEDDING_INIT_STD, HILBERT_BIAS_SCALE, EPS
+from vit_pytorch.core.constants import EMBEDDING_INIT_STD, EPS
 from vit_pytorch.core.config import AreaEncoderConfig  # I98-3: 协议驱动配置
 from vit_pytorch.core.levels_info import LevelsInfo  # I98-4
 from vit_pytorch.core.depth_utils import compute_normalized_area
@@ -384,7 +384,6 @@ class FractalPositionEmbedding(nn.Module):
         if not self.training:
             return None
 
-        device = levels_info.data.device
 
         # 计算 Level-0 嵌入 (depth=0)
         level_0_mask = levels_info.depths == 0
@@ -779,7 +778,6 @@ class GeometryField(nn.Module):
         Returns:
             manifold_bias: [B, dim] 流形场编码
         """
-        from vit_pytorch.core.levels_info import LevelsInfo
 
         # 提取深度和路径
         depths = levels_info.depths.clamp(0, self.max_level)
@@ -840,7 +838,6 @@ class GeometryField(nn.Module):
         命名空间:
             embed/params/*: 可学习尺度参数
         """
-        from typing import Dict, Any
 
         output: Dict[str, Any] = {}
 
@@ -918,7 +915,6 @@ class MultiLayerGeometryField(nn.Module):
         命名空间:
             embed/params/*: 每层的几何缩放参数
         """
-        from typing import Dict, Any
 
         output: Dict[str, Any] = {}
 

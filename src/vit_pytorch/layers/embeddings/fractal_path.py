@@ -38,6 +38,7 @@ import math
 
 from vit_pytorch.core.config import FractalConfig  # I97-5: 合并 config_fractal.py
 from vit_pytorch.core.curve_hilbert import HilbertCurve
+from vit_pytorch.core.constants import EPS
 
 
 # 创建兼容 torch.compile 的缓存装饰器
@@ -460,7 +461,6 @@ class BitFlippedPositionEncoder(nn.Module):
                 torch.zeros(0, self.dim, device=levels_info.data.device, dtype=torch.float32),
             )
 
-        device = levels_info.data.device
         B, N = levels_info.depths.shape
 
         # 提取 depths 和 paths
@@ -484,7 +484,7 @@ class BitFlippedPositionEncoder(nn.Module):
         # 使用 gamma^depth 对每个 token 进行缩放
         gamma = torch.sigmoid(self.depth_decay_scale)  # [1]
         # I-NAN: 添加 clamp 防止指数爆炸
-        token_scales = (gamma ** depths.float()).clamp(min=1e-6, max=1e6)  # [B, N]
+        token_scales = (gamma ** depths.float()).clamp(min=EPS, max=1e6)  # [B, N]
         token_scales = token_scales.unsqueeze(-1)  # [B, N, 1]
 
         geometry_emb = self.geometry_projection(path_emb)  # [B, N, dim]
@@ -532,7 +532,7 @@ class BitFlippedPositionEncoder(nn.Module):
         # scale(k) = gamma^k: [1, γ, γ², γ³, ..., γ^(max_level-1)]
         level_indices = torch.arange(max_level, device=device)  # [max_level]
         # I-NAN: 添加 clamp 防止指数爆炸
-        depth_scales = (gamma ** level_indices).clamp(min=1e-6, max=1e6).unsqueeze(0).unsqueeze(-1)  # [1, max_level, 1]
+        depth_scales = (gamma ** level_indices).clamp(min=EPS, max=1e6).unsqueeze(0).unsqueeze(-1)  # [1, max_level, 1]
 
         # 生成层级偏移量: [0, 4, 8, ..., (max_level-1)*4]
         level_offsets = torch.arange(max_level, device=device) * 4
@@ -561,10 +561,10 @@ class BitFlippedPositionEncoder(nn.Module):
             # 判断是否需要翻转: 父节点象限为 0 或 3 时翻转
             if k > 0:
                 parent_quadrants = paths[..., k - 1]  # [B, N]
-                flip_mask = ((parent_quadrants == 0) | (parent_quadrants == 3)).float()  # [B, N]
+                ((parent_quadrants == 0) | (parent_quadrants == 3)).float()  # [B, N]
             else:
                 # 第 0 层无父节点，不翻转
-                flip_mask = torch.zeros(B, N, device=device)
+                torch.zeros(B, N, device=device)
 
             # 获取当前层的门控值
             gate = gate_values[k]  # scalar
@@ -777,7 +777,6 @@ class FractalPathEmbedding(nn.Module):
                 scale_indices = scale_indices.expand(batch_size, -1)
         
         B, N = scale_indices.shape
-        device = scale_indices.device
         
         # 1. 尺度编码
         scale_emb = self.scale_embedding(scale_indices)  # [B, N, dim]
@@ -842,7 +841,7 @@ class FractalPathEmbedding(nn.Module):
             unique_hashes, counts = torch.unique(hashes, return_counts=True)
             probs = counts.float() / counts.sum()
             # 计算熵 H(P) = -∑p_i·log(p_i)
-            entropy = -(probs * torch.log(probs + 1e-8)).sum()
+            entropy = -(probs * torch.log(probs + EPS)).sum()
             entropies.append(entropy)
 
         # D1-AUDIT FIX: 保持 GPU tensor，由 flatten_layer_outputs 处理 .item()

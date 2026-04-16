@@ -21,7 +21,7 @@ Hilbert-Ordered Entmax Splitter (H-Entmax)
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -61,7 +61,6 @@ def entmax_1_5(
     alpha = 1.5
 
     # 保存原始维度信息
-    original_shape = z.shape
     if dim < 0:
         dim = dim + z.dim()
 
@@ -93,8 +92,9 @@ def entmax_1_5(
         # 归一化确保 Σ temp_i = n
         temp = temp - temp.logsumexp(dim=-1, keepdim=True) + math.log(n)
 
-        # 更新 q
-        q = p_alpha * torch.exp(temp)
+        # AMP FIX: clamp before exp to prevent overflow in fp16
+        # exp(10) ≈ 22026 in fp16, so clamp to 10 for safety margin
+        q = p_alpha * torch.exp(temp.clamp(max=10.0))
         q = q / q.sum(dim=-1, keepdim=True)
 
     # 恢复原始形状
@@ -141,7 +141,6 @@ def entmax(
         return entmax_1_5(z, dim, max_iter, epsilon)
 
     # 通用实现
-    original_shape = z.shape
     if dim < 0:
         dim = dim + z.dim()
 
@@ -163,7 +162,8 @@ def entmax(
         denom = p_alpha.sum(dim=-1, keepdim=True).clamp(min=epsilon)
         temp = z_flat / denom
         temp = temp - temp.logsumexp(dim=-1, keepdim=True) + math.log(n)
-        q = p_alpha * torch.exp(temp)
+        # AMP FIX: clamp before exp to prevent overflow in fp16
+        q = p_alpha * torch.exp(temp.clamp(max=10.0))
         q = q / q.sum(dim=-1, keepdim=True)
 
     result = q.reshape(shape_before)

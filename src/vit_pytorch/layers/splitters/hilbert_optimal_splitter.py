@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -36,7 +36,7 @@ from vit_pytorch.core.splitter_protocol import (
     CoreSplitter,
     SplitResult,
 )
-from vit_pytorch.core.curve_hilbert import HilbertCurve, HilbertScanner
+from vit_pytorch.core.curve_hilbert import HilbertCurve
 from vit_pytorch.layers.embeddings.fractal_path import (
     VectorizedPathEncoder,
     OrientationExtractor,
@@ -142,12 +142,7 @@ def entmax_beta_joint(
     """
     probs = entmax(scores, alpha=alpha, dim=dim)
 
-    # 阈值选择
-    threshold = probs.max(dim=dim, keepdim=True)[0] * 0.5
-    selected = probs > threshold
-
-    # 如果选中数量不足，使用 TopK
-    num_selected = selected.sum(dim=dim)
+    # 使用 TopK
     K_target = probs.shape[dim] // 4  # 假设 K ≈ N/4
 
     # 补足 TopK
@@ -411,7 +406,8 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # 必须在 forward 内立即转为标量 + detach()，避免显存泄漏
         # =====================================================================
         self._last_sds_stats: Optional[Dict[str, float]] = None
-        self._last_tree_delta_z: Optional[float] = None
+        # D1-AUDIT FIX: 改为 Optional[Tensor] 避免 forward 内 .item() 同步
+        self._last_tree_delta_z_t: Optional[torch.Tensor] = None
 
         # =====================================================================
         # 核心组件
@@ -437,9 +433,11 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         )
 
         # 4. 面积编码
+        # D4 AUDIT FIX: 4.0 ** (-d) -> torch.exp2(-d.float() * 2.0) (vectorized, no Python loop)
+        d_indices = torch.arange(max_level_limit + 1, dtype=torch.float32)
         self.register_buffer(
             '_area_encoding',
-            torch.tensor([4.0 ** (-d) for d in range(max_level_limit + 1)], dtype=torch.float32)
+            torch.exp2(-d_indices * 2.0)  # 4^(-d) = 2^(-2d)
         )
 
         # 4.5. 面积投影（消除 expand 导致的秩塌陷，赋予模型学习最优面积表示的能力）
@@ -783,8 +781,6 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             rot_emb: 旋转状态嵌入
             area_enc: 面积编码
         """
-        N = regions.shape[0]
-        device = regions.device
         max_level = self.max_level_limit
 
         # 计算区域的中心坐标 (转换为整数)
@@ -796,12 +792,6 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         paths = VectorizedPathEncoder.compute_quadrant_paths(
             cx, cy, max_level
         )  # [N, max_level]
-
-        # 计算旋转状态 (累积翻转)
-        # rotation_states: [N, max_level] 0=无旋转, 1=有旋转
-        rotation_states = OrientationExtractor.compute_rotation_states(
-            paths.unsqueeze(0)
-        ).squeeze(0)  # [N, max_level]
 
         # 计算旋转方向 (累积翻转次数 mod 4)
         rotation_dirs = OrientationExtractor.compute_rotation_directions(
@@ -874,7 +864,6 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # 需要缩放到 max_level 以便统一比较
         coordinates_list = []
         max_level = self.max_level_limit
-        grid_size_max = 1 << max_level  # 2^max_level
 
         for depth in range(max_level + 1):
             depth_mask = (depths == depth)
@@ -903,7 +892,6 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         for depth in range(max_level + 1):
             depth_mask = (depths == depth)
             if depth_mask.any():
-                n_depth = depth_mask.sum().item()
                 all_coordinates[depth_mask] = coordinates_list[pos]
                 depth_mask_flat[depth_mask] = depth
                 pos += 1
@@ -911,7 +899,6 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # Step 2: 按 Hilbert 索引排序
         sort_idx = hilbert_indices.argsort()
         sorted_coords = all_coordinates[sort_idx]  # [N, 2]
-        sorted_hilbert = hilbert_indices[sort_idx]  # [N]
 
         # Step 3: 计算 k 近邻欧氏距离平方（向量化）
         neighbor_dists_sq = []
@@ -996,7 +983,6 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # 计算动态λ (课程学习 + 可学习残差)
         lambda_cur = self._compute_dynamic_lambda()
 
-        N = logits.shape[1]
         constrained_logits = logits.clone()
 
         # D2-AUDIT FIX: 向量化 parent-child penalty 避免 Python for 循环
@@ -1283,10 +1269,10 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # SDS 衡量 Hilbert 曲线上邻居的空间距离，值越高表示局部性保持越差
         if self.use_sds_regularization and image_size is not None:
             sds_penalty = self._compute_sds_penalty(logits, image_size)  # [B, N]
-            # Phase 2: 立即转为标量并 detach，避免 DDP 训练显存泄漏
-            self._last_sds_stats = {
-                "mean": sds_penalty.mean().detach().item(),
-                "max": sds_penalty.max().detach().item()
+            # D1-AUDIT FIX: 保持 tensor，延迟 .item() 到后处理
+            self._last_sds_stats_t = {
+                "mean": sds_penalty.mean().detach(),
+                "max": sds_penalty.max().detach()
             }
             logits = logits - sds_penalty  # 抑制高 SDS 位置
 
@@ -1297,7 +1283,8 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         logits = self._apply_tree_constraint(logits, self.candidate_depths)
 
         # 计算树约束修正量: Δz = ||logits_pre - logits_post||₁
-        self._last_tree_delta_z = (logits_pre_tree - logits).abs().sum().item()
+        # D1-AUDIT FIX: 保持 tensor，延迟 .item() 到后处理
+        self._last_tree_delta_z_t = (logits_pre_tree - logits).abs().sum()
 
         # 深度配额
         depth_quota = F.softmax(self.depth_quota, dim=0)
@@ -1308,8 +1295,6 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # 使用密度场网络估计每个区域的"信息密度"
         # 然后积分得到总 K
 
-        # 使用 roi_features 的平均作为曲线特征 (取 batch 0)
-        curve_features = roi_features[0].mean(dim=0, keepdim=True)  # [1, hidden_dim]
         density_per_region = self.density_field(roi_features[0])  # [N, 1]
 
 # I-NAN FIX: 直接求和，K_float 范围 [0, N]
@@ -1338,7 +1323,10 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         if region_idx.numel() == 0:
             # 至少选择一个 - 使用 top-k
-            _, topk_idx = torch.topk(probs[0], min(K_hard.item(), probs.shape[1]), dim=-1)
+            # D1-AUDIT FIX: 使用 clamp 避免 .item() 同步，但 topk 需要 int
+            # 由于这是错误恢复路径（极少触发），可接受单次 .item()
+            k_val = min(K_hard.item(), probs.shape[1])
+            _, topk_idx = torch.topk(probs[0], k_val, dim=-1)
             # 使用 batch 0
             batch_idx = torch.zeros(topk_idx.shape[0], dtype=torch.long, device=logits.device)
             region_idx = topk_idx
@@ -1403,15 +1391,17 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # === Phase 2: 中间变量统计（SDS 惩罚 + 树约束修正量）===
 
         # SDS 惩罚统计 (I167-4)
-        if hasattr(self, '_last_sds_stats') and self._last_sds_stats is not None:
-            result.sds_penalty_mean = self._last_sds_stats["mean"]
-            result.sds_penalty_max = self._last_sds_stats["max"]
+        # D1-AUDIT FIX: 使用新命名的 tensor 变量，延迟 .item() 到结果赋值
+        if hasattr(self, '_last_sds_stats_t') and self._last_sds_stats_t is not None:
+            result.sds_penalty_mean = self._last_sds_stats_t["mean"].item()
+            result.sds_penalty_max = self._last_sds_stats_t["max"].item()
 
         # 树约束透明化：动态 lambda + 修正量 Δz
         lambda_cur = self._compute_dynamic_lambda()
         result.tree_lambda = lambda_cur.item() if hasattr(lambda_cur, 'item') else lambda_cur
-        if hasattr(self, '_last_tree_delta_z') and self._last_tree_delta_z is not None:
-            result.tree_constraint_delta_z = self._last_tree_delta_z
+        # D1-AUDIT FIX: 提取 tensor 值用于结果
+        if hasattr(self, '_last_tree_delta_z_t') and self._last_tree_delta_z_t is not None:
+            result.tree_constraint_delta_z = self._last_tree_delta_z_t.item()
 
         # I150-3: 记录 token 选择历史用于稳定性监控
         if self._monitor_token_stability and hard:
@@ -1466,9 +1456,8 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # 温度由 BPE 三阶段调度器在 train_fractal_vit._update_fractal_hyperparams()
         # 中通过 set_temperature() 管理，此处不再内部退火，避免梯度冲突。
 
-        # K 课程学习：从 K_min 逐渐增大到 K_max（向上取整）
+        # K 课程学习：从 K_min 逐渐增大到 K_max
         # 符合课程学习原则：先学简单（少 token），后学复杂（多 token）
-        K_max_rounded = math.ceil(self.K_max)  # 向上取整
         if epoch <= self._K_schedule_epochs:
             # 线性增长：K_min → _K_max_rounded（能囊括 K_max 的最小 level 对应区域数）
             progress = epoch / self._K_schedule_epochs
@@ -1492,7 +1481,8 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             if regions >= K_target:
                 return regions
         # 如果所有 level 都不满足，返回最大 level 的区域数
-        return 4 ** max_level
+        # D4-AUDIT FIX: 4**max_level → 1 << (2 * max_level)
+        return 1 << (2 * max_level)
 
     def extra_repr(self) -> str:
         return (

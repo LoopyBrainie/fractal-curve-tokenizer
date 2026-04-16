@@ -69,14 +69,12 @@ FFN 变体选项 (ffn_type):
 
 from __future__ import annotations
 
-import warnings
 from typing import Any, Dict, Literal, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vit_pytorch.core.constants import EPS
 from vit_pytorch.core.levels_info import LevelsInfo  # I98-4
 
 

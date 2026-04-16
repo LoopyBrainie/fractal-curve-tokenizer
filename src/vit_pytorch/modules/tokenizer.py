@@ -46,18 +46,16 @@ Note:
 
 from __future__ import annotations
 
-import dataclasses
 import math
 from collections import deque
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from .base_tokenizer import BaseTokenizer, TokenizerOutput, TokenSequence
+from .base_tokenizer import BaseTokenizer, TokenizerOutput
 from vit_pytorch.core.config import FractalConfig, SemanticSplitterConfig  # I97-5: 合并 config_fractal.py, I110-5: 语义配置
-from vit_pytorch.core.constants import LOG_EPSILON, PROB_EPSILON, LEARNABLE_QUOTA_ENABLED  # I12-7: 数值稳定性常量
+from vit_pytorch.core.constants import PROB_EPSILON  # I12-7: 数值稳定性常量
 
 # I99-1: 延迟导入 VectorizedPathEncoder 以避免循环导入
 # 使用函数内导入模式，确保在运行时正确加载
@@ -351,7 +349,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         from vit_pytorch.core.splitter_protocol import TensorSplitResult
 
         device = tensor_result.batch_indices.device
-        dtype = tensor_result.batch_indices.dtype
         num_tokens = tensor_result.num_tokens
 
         # I99-1 OPT: 直接在 GPU 上 clamp，避免多次 CPU-GPU 同步
@@ -638,7 +635,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
             # 计算 depth distribution
             # P-OPT-3: 使用向量化操作，避免 Python for 循环
-            depth_dists = []
             max_d = self.max_level + 1
             depths = tensor_result.depths
             batch_indices = tensor_result.batch_indices
@@ -674,7 +670,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # I78: 计算 max_tokens 用于 _embed_with_tensor_result
         # I99-1 FIX: 使用每个 batch 的最大 token 数，而非总 token 数
         # N_total 是实际选择的 token 总数，但 max_tokens 应该是每个 batch 的最大 token 数
-        N_total = tensor_result.num_tokens
         max_tokens_int = _safe_scalar_to_int(max_tokens_per_batch, "max_tokens_per_batch")  # P0-FIX: 提前转换
 
         # 3. 纯张量嵌入
@@ -825,7 +820,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         if count_matrix is None:
             return [{} for _ in range(B)]
 
-        max_d = count_matrix.shape[1]
+        count_matrix.shape[1]
         
         # 转换到 CPU (同步方式，确保数据完整)
         # 注意: 使用 non_blocking=True 会导致 torch.compile 下的竞态条件
@@ -881,7 +876,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             - levels_info: [B, MaxN, max_level+1] 层级信息
             - padded_regions: [B, MaxN, 4] 区域边界 (P11-3 新增)
         """
-        from vit_pytorch.core.splitter_protocol import TensorSplitResult
 
         B = features.shape[0]
         B_int = _safe_scalar_to_int(B, "B")
@@ -1010,7 +1004,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # I99-1: 防御性检查 - 确保 max_tokens 至少为 1 且足够容纳所有 token
         # I99-1 FIX: max_tokens 是 scalar tensor，需要提取 Python int
         # 计算每个 batch 需要的最小 token 数（向上取整）
-        min_required = max(1, (N_total + B_int - 1) // B_int)  # 向上取整确保足够
+        max(1, (N_total + B_int - 1) // B_int)  # 向上取整确保足够
 
         # P0-FIX: max_tokens 已经是 Python int，无需类型检查
         # 移除 isinstance 检查以支持 torch.compile + CUDA Graphs
