@@ -82,23 +82,32 @@ from vit_pytorch.core.levels_info import LevelsInfo  # I98-4
 FFNType = Literal['gelu', 'swiglu', 'swiglu_level']
 
 
+def _align_to_multiple(value: int, multiple: int = 64) -> int:
+    """对齐整数到最近的 multiple 倍数（向上取整）。
+
+    用于确保 SwiGLU 隐藏层维度是 Tensor Core 高效计算的形状。
+    NVIDIA GPU Tensor Core 在矩阵维度是 64/128 的整数倍时效率最优。
+    """
+    return ((value + multiple - 1) // multiple) * multiple
+
+
 class SwiGLUFFN(nn.Module):
     """独立的 SwiGLU 实现（参考 LLaMA/PaLM）。
-    
+
     SwiGLU(x) = (Swish(W_gate · x) ⊙ (W_value · x)) · W_out
-    
+
     优势:
     - 内置门控机制，无需额外 feature_gate
     - 梯度流动更平滑
     - 参数量与 GELU FFN 相当（通过调整 hidden_dim）
-    
+
     Args:
         dim: 输入/输出维度
         hidden_dim: 隐藏层维度（建议为原始 hidden_dim 的 2/3）
         dropout: Dropout 比率
         bias: 是否使用偏置
     """
-    
+
     def __init__(
         self,
         dim: int,
@@ -108,11 +117,13 @@ class SwiGLUFFN(nn.Module):
     ):
         super().__init__()
         self.dim = dim
-        self.hidden_dim = hidden_dim
-        
-        self.w_gate = nn.Linear(dim, hidden_dim, bias=bias)
-        self.w_value = nn.Linear(dim, hidden_dim, bias=bias)
-        self.w_out = nn.Linear(hidden_dim, dim, bias=bias)
+        # Tensor Core 对齐: 隐藏层维度向上取整到 64 的倍数
+        # 例如: dim=256, hidden_dim=682 (8/3扩展) → 对齐到 704
+        self.hidden_dim = _align_to_multiple(hidden_dim, multiple=64)
+
+        self.w_gate = nn.Linear(dim, self.hidden_dim, bias=bias)
+        self.w_value = nn.Linear(dim, self.hidden_dim, bias=bias)
+        self.w_out = nn.Linear(self.hidden_dim, dim, bias=bias)
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -286,11 +297,12 @@ class AdaptiveFractalFeedForward(nn.Module):
         self._last_level_mixing_weights = mixing_weights.detach()
 
         # === P1: 增强诊断缓存（D1-AUDIT FIX: 保持 GPU tensor）===
-        adapter_norm_val = level_adapted.norm()  # GPU tensor
+        self._diagnostic_cache.clear()  # 防止内存泄漏：每次 forward 清空
+        adapter_norm_val = level_adapted.norm().detach()
         self._diagnostic_cache["adapter_norm"] = adapter_norm_val
         # 混合权重分布统计
-        self._diagnostic_cache["level_mixing_min"] = mixing_weights.min()  # GPU tensor
-        self._diagnostic_cache["adapter_dominance"] = (mixing_weights > 0.5).float().mean()  # GPU tensor
+        self._diagnostic_cache["level_mixing_min"] = mixing_weights.min().detach()  # GPU tensor
+        self._diagnostic_cache["adapter_dominance"] = (mixing_weights > 0.5).float().mean().detach()  # GPU tensor
         # === P1: 计算贡献比率（带数值安全 clamp）===
         # I-NAN: 训练初期 main_ffn_norm 因 gamma=0.01 可能极小，
         # adapter_norm / tiny_value 会产生极大离群点，clamp 防止离群值
@@ -301,7 +313,7 @@ class AdaptiveFractalFeedForward(nn.Module):
             (adapter_norm_val / main_norm.clamp(min=1e-6)).clamp(max=100.0),
             torch.tensor(0.0, device=adapter_norm_val.device)
         )
-        self._diagnostic_cache["contribution_ratio"] = contribution
+        self._diagnostic_cache["contribution_ratio"] = contribution.detach()
 
         return main_out * (1 - mixing_weights) + level_adapted * mixing_weights
 
@@ -345,10 +357,10 @@ class AdaptiveFractalFeedForward(nn.Module):
         x_norm = x_norm * gamma + beta
 
         # === P0: 捕获 gamma/beta 运行时统计（D1-AUDIT FIX: GPU tensor）===
-        self._diagnostic_cache["ffn_gamma_mean"] = gamma.mean()
-        self._diagnostic_cache["ffn_gamma_std"] = gamma.std()
-        self._diagnostic_cache["ffn_beta_mean"] = beta.mean()
-        self._diagnostic_cache["ffn_beta_std"] = beta.std()
+        self._diagnostic_cache["ffn_gamma_mean"] = gamma.mean().detach()
+        self._diagnostic_cache["ffn_gamma_std"] = gamma.std().detach()
+        self._diagnostic_cache["ffn_beta_mean"] = beta.mean().detach()
+        self._diagnostic_cache["ffn_beta_std"] = beta.std().detach()
 
         # ========== FFN 主网络 ==========
         if self.ffn_type in ('swiglu', 'swiglu_level'):
@@ -359,7 +371,7 @@ class AdaptiveFractalFeedForward(nn.Module):
             main_out = self.main_net(x_norm)
 
         # === P0: 捕获主 FFN 输出范数（D1-AUDIT FIX: GPU tensor）===
-        self._diagnostic_cache["main_ffn_norm"] = main_out.norm()
+        self._diagnostic_cache["main_ffn_norm"] = main_out.norm().detach()
 
         # ========== Level Adaptation ==========
         if self.use_level_adaptation and levels_info is not None and levels_info.data.numel() > 0:
