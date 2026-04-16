@@ -25,7 +25,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
-from collections import defaultdict
 
 import torch
 import torch.nn as nn
@@ -324,7 +323,7 @@ class DiagnosticHook:
         if not isinstance(tensor, torch.Tensor):
             return
 
-        is_finite = torch.isfinite(tensor).all().item()
+        torch.isfinite(tensor).all().item()
         has_nan = torch.isnan(tensor).any().item()
 
         if has_nan and not self._has_nan:
