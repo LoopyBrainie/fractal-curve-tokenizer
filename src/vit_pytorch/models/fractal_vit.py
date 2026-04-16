@@ -1594,7 +1594,7 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                 # P2.1 FIX: 使用 triu_indices 直接 gather 上三角元素
                 # 原实现问题: torch.eye mask 方式创建了 [B,N,N] 矩阵 + bool mask，
                 # 仍然需要 O(B×N²) 内存和计算，新实现通过 gather 直接选取上三角坐标对
-                triu_idx = torch.triu_indices(N, k=1, device=hilbert_indices.device)  # [2, N×(N-1)/2]
+                triu_idx = torch.triu_indices(N, N, k=1, device=hilbert_indices.device)  # [2, N×(N-1)/2]
                 h_i = hilbert_indices[:, triu_idx[0]]  # [B, N_up]
                 h_j = hilbert_indices[:, triu_idx[1]]  # [B, N_up]
                 hilbert_dist_upper = torch.abs(h_i.float() - h_j.float())  # [B, N_up]
