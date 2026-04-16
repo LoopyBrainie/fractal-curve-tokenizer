@@ -34,12 +34,14 @@ Tokenizer 选项
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, overload
 import weakref
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from vit_pytorch.core.levels_info import LevelsInfo
 
 # v6.0+: 2D RoPE 已集成到 ManifoldNativeAttention，不再需要 Learned PE
 from vit_pytorch.modules.tokenizer import StreamingFractalTokenizerV3
@@ -48,19 +50,14 @@ from vit_pytorch.modules.transformer_block import FractalTransformer, FFNType
 from vit_pytorch.core.utils import pair
 from vit_pytorch.core.constants import (
     EPS, DIVISION_EPSILON, PROB_EPSILON,
-    compute_max_level, compute_num_candidates, compute_k_bounds,
-    K_COVERAGE_MAX_HARD,
-    SPLITTER_TEMP_START, SPLITTER_TEMP_END,
+    compute_num_candidates, compute_k_bounds,
     LOGIT_CLAMP_BOUND,  # I147: 添加钳制边界导入
 )
 from vit_pytorch.core.config import SemanticSplitterConfig  # I110-5
 from vit_pytorch.core.pattern_encoder import (
-    HilbertPatternEncoder,
-    HilbertPatternEncoderLight,
     create_hilbert_pattern_encoder,
 )  # I162-1
 from vit_pytorch.core.pattern_plugin import (
-    HilbertPatternPlugin,
     create_hilbert_pattern_plugin,
 )  # I162-1: 双路径插件
 
@@ -558,7 +555,6 @@ class FractalCurveViT(nn.Module):
         # 推导公式:
         #   pos_dropout = transformer_dropout * 0.5  # half of transformer dropout
         # ====================================================================
-        effective_pos_dropout = pos_dropout if pos_dropout is not None else (transformer_dropout * 0.5)
 
         # I30-17: 处理 min_patch_size 的向后兼容
         # 支持旧 API: min_patch_size=(4, 4)
@@ -1290,7 +1286,6 @@ class FractalCurveViT(nn.Module):
             - 使用 non_blocking 转移减少同步等待
         """
         aux_infos: List[Dict[str, Any]] = []
-        features_list: List[torch.Tensor] = []
 
         if return_aux_info:
             # P-OPT: 完全在 GPU 上计算，避免 CPU 同步
@@ -1303,9 +1298,9 @@ class FractalCurveViT(nn.Module):
             if levels_list and lengths.numel() == B:
                 # 获取最大 token 数量 (安全处理空列表)
                 max_tokens = 0
-                for l in levels_list:
-                    if l.numel() > 0:
-                        max_tokens = max(max_tokens, l.size(0))
+                for lvl in levels_list:
+                    if lvl.numel() > 0:
+                        max_tokens = max(max_tokens, lvl.size(0))
                 max_tokens = min(max_tokens, 256)
 
                 # 空列表保护
@@ -1334,9 +1329,9 @@ class FractalCurveViT(nn.Module):
                 # 注意: levels_list 是 Python list of tensors (各元素形状不同)
                 # 无法完全向量化，但循环体已使用张量操作，O(B) 开销可忽略
                 # B 通常 8-32，此循环开销 < 0.1ms
-                for i, l in enumerate(levels_list):
-                    if l.numel() > 0:
-                        depths = l[:, 0].long()
+                for i, lvl in enumerate(levels_list):
+                    if lvl.numel() > 0:
+                        depths = lvl[:, 0].long()
                         depths = depths[depths >= 0]
                         n = min(depths.size(0), max_tokens)
                         padded_depths[i, :n] = depths[:n]
@@ -1823,26 +1818,19 @@ class FractalCurveViT(nn.Module):
                 auxiliary_outputs["decay_conv"] = conv.output_dict
 
         # Attention 和 FFN 输出（遍历每个 transformer block）
-        # I-COMPILE-FIX: hasattr(block.ff, 'ffn_output') 在 torch.compile 追踪时会触发
-        # InternalTorchDynamoError。torch.compiler.is_compiling() 在 dynamo resume
-        # point 追踪时可能返回 False，导致 guard 失效。使用 try/except 安全地捕获
-        # FakeRootModule 属性错误，避免编译错误。
-        try:
-            if hasattr(self.transformer, 'layers'):
-                for i, block in enumerate(self.transformer.layers):
-                    # Attention 输出
-                    if hasattr(block, 'attention') and hasattr(block.attention, 'attn_output'):
-                        attn_out = block.attention.attn_output
-                        if attn_out:  # 非空才记录
-                            auxiliary_outputs[f"attn_{i}"] = attn_out
-                    # FFN 输出
-                    if hasattr(block, 'ff') and hasattr(block.ff, 'ffn_output'):
-                        ffn_out = block.ff.ffn_output
-                        if ffn_out:  # 非空才记录
-                            auxiliary_outputs[f"ffn_{i}"] = ffn_out
-        except (AttributeError, RuntimeError, Exception):
-            # torch.compile 追踪期间的 FakeRootModule 属性错误，安全跳过
-            pass
+        # D3-AUDIT FIX: 使用 getattr 替代 hasattr + try/except，避免 Graph Break
+        # getattr(module, attr, None) 返回 None 如果属性不存在，比 hasattr + try/except 更简洁
+        transformer_layers = getattr(self.transformer, 'layers', None)
+        if transformer_layers is not None:
+            for i, block in enumerate(transformer_layers):
+                # Attention 输出
+                attn_out = getattr(getattr(block, 'attention', None), 'attn_output', None)
+                if attn_out is not None:
+                    auxiliary_outputs[f"attn_{i}"] = attn_out
+                # FFN 输出
+                ffn_out = getattr(getattr(block, 'ff', None), 'ffn_output', None)
+                if ffn_out is not None:
+                    auxiliary_outputs[f"ffn_{i}"] = ffn_out
 
         # === Embeddings 诊断收集 ===
         # 1. 递归收集所有 embed_output
@@ -1856,11 +1844,14 @@ class FractalCurveViT(nn.Module):
             # embed/distribution/*
             if hasattr(levels_info, 'depths'):
                 depths = levels_info.depths
-                max_d = int(depths.max()) + 1
-                total = depths.numel()
-                for d in range(max_d):
-                    ratio = (depths == d).float().sum().item() / max(total, 1)
-                    levels_diag[f"distribution/depth_ratio_lvl_{d}"] = ratio
+                # D1+D3 AUDIT FIX: 使用 bincount 向量化，将 N 次 .item() 同步减少为 1 次
+                # 原循环: for d in range(max_d): ratio = (depths == d).float().sum().item()
+                max_d = depths.max().int().item() + 1  # 一次性同步，用于确定 minlength
+                depth_counts = depths.flatten().float().bincount(minlength=max_d)  # [max_d], fully vectorized
+                total = depth_counts.sum().clamp(min=1)  # prevent div zero
+                depth_ratios = depth_counts / total  # GPU tensor, no .item()
+                for d in range(depth_ratios.numel()):
+                    levels_diag[f"distribution/depth_ratio_lvl_{d}"] = depth_ratios[d]  # keep tensor
                 # D1-AUDIT FIX: 保持 GPU tensor，flatten_layer_outputs 处理 .item()
                 levels_diag["distribution/mean_depth"] = depths.float().mean()
 
@@ -1868,12 +1859,14 @@ class FractalCurveViT(nn.Module):
             if hasattr(levels_info, 'paths') and levels_info.paths is not None:
                 paths = levels_info.paths  # [B, N, max_level]
                 total_tokens = paths.shape[1]
+                # D1+D3 AUDIT FIX: 保持 GPU tensor，消除循环内 float() 强制同步
+                max_possible = 1 << paths.shape[-1]  # bit shift: 2 ** max_level
                 for lvl in range(paths.shape[-1]):
                     lvl_paths = paths[..., lvl]  # [B, N]
                     unique_count = torch.unique(lvl_paths).numel()
-                    max_possible = 2 ** paths.shape[-1]
-                    diversity_ratio = unique_count / max_possible if max_possible > 0 else 0.0
-                    levels_diag[f"distribution/path_diversity_ratio_lvl_{lvl}"] = float(diversity_ratio)
+                    # 保持 tensor，让 flatten_layer_outputs 处理 .item()
+                    diversity_ratio = unique_count.float() / max_possible.float() if max_possible > 0 else depths.new_zeros(1)
+                    levels_diag[f"distribution/path_diversity_ratio_lvl_{lvl}"] = diversity_ratio
 
             # geo_emb_norm（使用 manifold_emb_for_stats）
             if manifold_emb_for_stats is not None:

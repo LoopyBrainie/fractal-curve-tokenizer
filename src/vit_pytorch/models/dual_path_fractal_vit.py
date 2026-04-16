@@ -21,10 +21,6 @@ from __future__ import annotations
 
 # 向后兼容导入 - 从主模块重新导出
 from vit_pytorch.models.fractal_vit import (
-    FractalCurveViT,
-    DualPathFractalViT,
-    FractalCurveViTV2,
-    FractalCurveViT_V2,
     TrainingStats,
 )
 
@@ -33,8 +29,3 @@ TrainingStatsV2 = TrainingStats
 
 # 向后兼容导入 - Pattern Encoder 相关类
 # 这些类现在定义在 core.pattern_encoder 中
-from vit_pytorch.core.pattern_encoder import (
-    HilbertPatternEncoder,
-    HilbertPatternEncoderLight,
-    create_hilbert_pattern_encoder,
-)
