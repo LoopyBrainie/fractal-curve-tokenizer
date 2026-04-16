@@ -524,6 +524,28 @@ def compute_hilbert_bandwidth(
     return bandwidths
 
 
+# P2.2 FIX: torch.compile 融合内核
+# 使用 reduce-overhead 模式降低 Python 开销并启用 CUDA Kernel 融合
+# 将 Float32 距离矩阵与 Bool 比较融合为单一 CUDA Kernel
+@torch.compile(mode='reduce-overhead', dynamic=False)
+def _compile_hilbert_band_core(
+    h_i: torch.Tensor,
+    h_j: torch.Tensor,
+    bandwidths: torch.Tensor,
+) -> torch.Tensor:
+    """融合 Hilbert 距离比较内核。
+
+    在 torch.compile 区域内，中间 Float32 差值矩阵被融合进寄存器，
+    只在 GPU 显存中实例化最终的 [B, N, N] Bool 矩阵。
+    理论显存收益：Float32 (4 bytes) → Bool (1 byte) ≈ 75% 减少。
+    """
+    W_i = bandwidths.unsqueeze(2)  # [B, N, 1]
+    W_j = bandwidths.unsqueeze(1)  # [B, 1, N]
+    bandwidth_matrix = torch.min(W_i, W_j)  # [B, N, N]
+    # 融合: abs(-)-< 比较链在单一 Kernel 中完成
+    return torch.abs(h_i - h_j) < bandwidth_matrix
+
+
 def create_hilbert_band_mask(
     hilbert_indices: torch.Tensor,
     bandwidths: torch.Tensor,
@@ -556,23 +578,17 @@ def create_hilbert_band_mask(
     if bandwidths.dim() == 1:
         bandwidths = bandwidths.unsqueeze(0)
 
-    # 创建带宽矩阵: W[i,j] = min(W[i], W[j])
-    W_i = bandwidths.unsqueeze(2)  # [B, N, 1]
-    W_j = bandwidths.unsqueeze(1)  # [B, 1, N]
-    bandwidth_matrix = torch.min(W_i, W_j)  # [B, N, N]
+    # 准备广播形状的 Hilbert 指数
+    h_i = hilbert_indices.unsqueeze(2).float()  # [B, N, 1]
+    h_j = hilbert_indices.unsqueeze(1).float()  # [B, 1, N]
 
-    # 计算 Hilbert 距离矩阵
-    h_i = hilbert_indices.unsqueeze(2)  # [B, N, 1]
-    h_j = hilbert_indices.unsqueeze(1)  # [B, 1, N]
-    hilbert_dist = torch.abs(h_i - h_j)  # [B, N, N]
+    # P2.2: 使用 torch.compile 融合内核，消除中间 Float32 矩阵的显式实例化
+    band_mask = _compile_hilbert_band_core(h_i, h_j, bandwidths)
 
-    # 带宽掩码: |i-j| < W
-    band_mask = hilbert_dist < bandwidth_matrix
-
-    # 对角线设为 True (self-attention)
-    diag_mask = torch.eye(N, device=hilbert_indices.device, dtype=torch.bool)
-    diag_mask = diag_mask.unsqueeze(0).expand(B, -1, -1)  # [B, N, N]
-    band_mask = band_mask | diag_mask
+    # 对角线设为 True (self-attention): 使用直接索引避免 torch.eye 的图断裂
+    # torch.arange 创建简单序列，索引赋值不会触发 graph break
+    idx = torch.arange(N, device=hilbert_indices.device)
+    band_mask[:, idx, idx] = True
 
     if squeeze_output:
         band_mask = band_mask.squeeze(0)
