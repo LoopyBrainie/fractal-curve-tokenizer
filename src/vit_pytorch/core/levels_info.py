@@ -90,27 +90,38 @@ for d in range(1, _MAX_HILBERT_DEPTH + 1):
         lut[path_int] = _HILBERT_LUT[d][path_int]
     _HILBERT_LUT_TENSOR[d] = lut
 
-# P1 FIX: 2D 统一填充 LUT，支持全量向量化查表
+# P1 FIX (Eager Initialization): 2D 统一填充 LUT，支持全量向量化查表
 # 方案: 构建 [max_depth+1, 4^max_depth] 的 2D 张量，
 # 深度 d 的 LUT 放在 row d，不足部分用 0 填充
-# 内存: depth=12 时 = 13 × 16777216 × 8 bytes ≈ 1.7 GB（仅在深度≥10时显著）
-# 但通常 max_level=8，内存 = 9 × 65536 × 8 ≈ 470 KB
-_MAX_LUT_DEPTH = 12  # 与 _MAX_PREPOPULATE_DEPTH 保持一致
-_HILBERT_LUT_PADDED = None  # 惰性初始化
+# 内存: depth=8 时 = 9 × 65536 × 8 bytes ≈ 470 KB
+# I167-1: torch.compile 兼容性修复 - 移除惰性初始化，改为模块加载时立即初始化
+# 原因: torch.compile 无法正确保留跨图边界的全局状态，导致 NoneType 检查失败
+_MAX_LUT_DEPTH = _MAX_HILBERT_DEPTH  # 与 _HILBERT_LUT 填充深度保持一致
+
+
+def _init_hilbert_lut_padded() -> torch.Tensor:
+    """在模块加载时预先构建对齐的 2D 查找表（Eager Initialization）"""
+    max_size = 1 << (2 * _MAX_LUT_DEPTH)  # 4^8 = 65536
+    lut_2d = torch.zeros((_MAX_LUT_DEPTH + 1, max_size), dtype=torch.long)
+    # 注意: _HILBERT_LUT 仅填充到 _MAX_HILBERT_DEPTH (8)，因此仅遍历可用深度
+    for d in range(1, _MAX_HILBERT_DEPTH + 1):
+        size = 1 << (2 * d)  # 4^d
+        for path_int in range(size):
+            lut_2d[d, path_int] = _HILBERT_LUT[d][path_int]
+    return lut_2d
+
+
+# 关键修复: 不再使用 None 惰性初始化，而是模块加载时立即初始化
+# torch.compile 将其视为 ConstantVariable，能够安全地嵌入生成的 Kernel
+_HILBERT_LUT_PADDED: torch.Tensor = _init_hilbert_lut_padded()
+
+# I167-1 FIX: 设备缓存，避免每次 forward 都调用 .to(device)
+# 初始化为 None，在首次调用 get_hilbert_indices 时填充
+_hilbert_lut_cached: Optional[torch.Tensor] = None
 
 
 def _get_hilbert_lut_padded() -> torch.Tensor:
-    """获取填充后的 2D LUT，惰性初始化并缓存到设备。"""
-    global _HILBERT_LUT_PADDED
-    if _HILBERT_LUT_PADDED is None:
-        max_size = 1 << (2 * _MAX_LUT_DEPTH)  # 4^12 = 16777216
-        lut_2d = torch.zeros((_MAX_LUT_DEPTH + 1, max_size), dtype=torch.long)
-        # 注意: _HILBERT_LUT 仅填充到 _MAX_HILBERT_DEPTH (8)，因此仅遍历可用深度
-        for d in range(1, _MAX_HILBERT_DEPTH + 1):
-            size = 1 << (2 * d)  # 4^d
-            for path_int in range(size):
-                lut_2d[d, path_int] = _HILBERT_LUT[d][path_int]
-        _HILBERT_LUT_PADDED = lut_2d
+    """获取填充后的 2D LUT（保持接口兼容）。"""
     return _HILBERT_LUT_PADDED
 
 # I103-2: Hilbert 索引权重缓存 (类级缓存)
@@ -552,8 +563,13 @@ class LevelsInfo:
             path_ints_all, dim=2, index=depth_for_gather.unsqueeze(2)
         ).squeeze(2)  # [B, N]
 
-        # 全量查表: lut_2d[depths, path_ints] → hilbert_indices
-        lut_2d = _get_hilbert_lut_padded().to(device)
+        # I167-1 FIX: 直接使用全局 LUT 张量，torch.compile 更友好
+        # _HILBERT_LUT_PADDED 在模块加载时已初始化为 CPU 张量
+        # 仅在首次遇到不同设备时缓存设备特定版本
+        global _hilbert_lut_cached
+        if not hasattr(_hilbert_lut_cached, 'device') or _hilbert_lut_cached.device != device:
+            _hilbert_lut_cached = _HILBERT_LUT_PADDED.to(device)
+        lut_2d = _hilbert_lut_cached
         results = lut_2d[depths.long(), path_ints_per_depth]  # [B, N]
 
         # I161-1 修复: 深度根归一化
