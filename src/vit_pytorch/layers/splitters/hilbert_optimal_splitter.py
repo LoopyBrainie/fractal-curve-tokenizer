@@ -1399,7 +1399,6 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # D1-AUDIT FIX: 提取 tensor 值用于结果
         if hasattr(self, '_last_tree_delta_z_t') and self._last_tree_delta_z_t is not None:
             result.tree_constraint_delta_z = self._last_tree_delta_z_t.item()
->>>>>>> layers-improvements
 
         # I150-3: 记录 token 选择历史用于稳定性监控
         if self._monitor_token_stability and hard:
