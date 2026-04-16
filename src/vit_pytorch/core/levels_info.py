@@ -105,7 +105,8 @@ def _get_hilbert_lut_padded() -> torch.Tensor:
     if _HILBERT_LUT_PADDED is None:
         max_size = 1 << (2 * _MAX_LUT_DEPTH)  # 4^12 = 16777216
         lut_2d = torch.zeros((_MAX_LUT_DEPTH + 1, max_size), dtype=torch.long)
-        for d in range(1, _MAX_LUT_DEPTH + 1):
+        # 注意: _HILBERT_LUT 仅填充到 _MAX_HILBERT_DEPTH (8)，因此仅遍历可用深度
+        for d in range(1, _MAX_HILBERT_DEPTH + 1):
             size = 1 << (2 * d)  # 4^d
             for path_int in range(size):
                 lut_2d[d, path_int] = _HILBERT_LUT[d][path_int]
@@ -517,10 +518,10 @@ class LevelsInfo:
         paths = self.data[:, :, 1:]  # [B, N, D]
         device = self.data.device
 
-        # 验证深度约束
-        if D > _MAX_LUT_DEPTH:
+        # 验证深度约束 (实际 LUT 仅填充到 _MAX_HILBERT_DEPTH)
+        if D > _MAX_HILBERT_DEPTH:
             raise ValueError(
-                f"Hilbert 深度 {D} 超过最大允许值 {_MAX_LUT_DEPTH}。"
+                f"Hilbert 深度 {D} 超过最大允许值 {_MAX_HILBERT_DEPTH}。"
                 "请考虑使用动态回退方案。"
             )
 
