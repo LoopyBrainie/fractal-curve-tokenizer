@@ -108,10 +108,12 @@ class DiagnosticHook:
 
         # 诊断状态
         self._has_nan = False
+        self._needs_full_report = False
         self._batch_count = 0
         self._layer_hooks: List[Any] = []
         self._handles: List[Any] = []  # register_forward_hook 的句柄
-        self._diagnostics: Dict[str, LayerDiagnostics] = {}
+        self._diagnostics: Dict[str, Optional[LayerDiagnostics]] = {}
+        self._raw_diagnostics: Dict[str, Dict[str, Any]] = {}  # D1-SYNC: GPU tensors
 
         # Splitter 状态
         self._splitter_logits: Optional[torch.Tensor] = None
@@ -125,26 +127,70 @@ class DiagnosticHook:
         return self._has_nan
 
     def get_diagnostic_report(self) -> Optional[DiagnosticReport]:
-        """获取诊断报告"""
-        if not self._diagnostics:
+        """获取诊断报告 - D1-SYNC: 在此处统一做 .item()"""
+        if not self._diagnostics and not self._raw_diagnostics:
             return None
 
-        # 找到第一个出现 NaN 的层
+        # D1-SYNC: 批量转换 - 只在报告生成时同步一次
+        layers = []
         first_nan_layer = None
         first_nan_layer_name = None
-        for name, diag in self._diagnostics.items():
-            if diag.has_nan:
-                first_nan_layer = diag.layer_idx
-                first_nan_layer_name = diag.layer_name
-                break
+        splitter_logits_max = 0.0
+        splitter_logits_min = 0.0
+        splitter_probs_all_zero = False
+
+        for name, raw in self._raw_diagnostics.items():
+            if 'layer_idx' in raw:
+                # 层诊断 - LayerDiagnostics
+                diag = LayerDiagnostics(
+                    layer_idx=raw['layer_idx'],
+                    layer_name=raw['layer_name'],
+                    is_finite=raw['is_finite'].item(),
+                    has_nan=raw['has_nan'].item(),
+                    has_inf=raw['has_inf'].item(),
+                    output_mean=raw['output_mean'].item(),
+                    output_std=raw['output_std'].item(),
+                    output_min=raw['output_min'].item(),
+                    output_max=raw['output_max'].item(),
+                )
+                layers.append(diag)
+                self._diagnostics[name] = diag  # 更新缓存
+
+                if diag.has_nan and first_nan_layer is None:
+                    first_nan_layer = diag.layer_idx
+                    first_nan_layer_name = diag.layer_name
+            elif name == 'splitter_logits':
+                # Splitter logits 诊断
+                splitter_logits_max = raw['logits_max'].item()
+                splitter_logits_min = raw['logits_min'].item()
+                # 检查 probs 是否全零
+                if self._splitter_probs is not None:
+                    splitter_probs_all_zero = (self._splitter_probs.float().sum() < 1e-6).item()
+            elif name.startswith('manifold_bias_'):
+                # Manifold bias 诊断
+                if self._diagnostics.get(name) is None:
+                    self._diagnostics[name] = LayerDiagnostics(layer_idx=-1, layer_name=name)
+                self._diagnostics[name].manifold_bias_max = raw['bias_max'].item()
+                self._diagnostics[name].manifold_bias_min = raw['bias_min'].item()
+                self._diagnostics[name].manifold_bias_mean = raw['bias_mean'].item()
+            elif name.startswith('entmax_input_'):
+                # Entmax input 诊断
+                if self._diagnostics.get(name) is None:
+                    self._diagnostics[name] = LayerDiagnostics(layer_idx=-1, layer_name=name)
+                self._diagnostics[name].entmax_input_max = raw['logits_max'].item()
+                self._diagnostics[name].entmax_input_min = raw['logits_min'].item()
+                self._diagnostics[name].entmax_input_std = raw['logits_std'].item()
 
         # 构建报告
         report = DiagnosticReport(
             batch_idx=self._batch_count,
             total_layers=len(self._diagnostics),
-            layers=list(self._diagnostics.values()),
+            layers=layers,
             first_nan_layer=first_nan_layer,
             first_nan_layer_name=first_nan_layer_name,
+            splitter_logits_max=splitter_logits_max,
+            splitter_logits_min=splitter_logits_min,
+            splitter_probs_all_zero=splitter_probs_all_zero,
         )
 
         # 添加建议
@@ -260,75 +306,74 @@ class DiagnosticHook:
         name: str,
         output: torch.Tensor,
     ) -> None:
-        """诊断单层输出"""
+        """诊断单层输出 - D1-SYNC: 延迟 .item() 到 get_diagnostic_report()"""
         if not isinstance(output, torch.Tensor):
             return
 
-        is_finite = torch.isfinite(output).all().item()
-        has_nan = torch.isnan(output).any().item()
-        has_inf = torch.isinf(output).any().item()
+        # 收集 GPU tensor 统计量，不调用 .item() (避免同步)
+        # 只做快速 NaN/Inf 检查（GPU tensor 比较）
+        has_nan = torch.isnan(output).any()
+        has_inf = torch.isinf(output).any()
 
-        # 计算统计信息
-        output_mean = output.float().mean().item()
-        output_std = output.float().std().item()
-        output_min = output.float().min().item()
-        output_max = output.float().max().item()
-
-        diag = LayerDiagnostics(
-            layer_idx=idx,
-            layer_name=name,
-            is_finite=is_finite,
-            has_nan=has_nan,
-            has_inf=has_inf,
-            output_mean=output_mean,
-            output_std=output_std,
-            output_min=output_min,
-            output_max=output_max,
-        )
-
-        self._diagnostics[name] = diag
-
-        # 检测到 NaN
+        # 检测到 NaN/Inf 时立即记录（使用 GPU tensor，不等待 .item()）
         if has_nan and not self._has_nan:
             self._has_nan = True
-            logger.warning(
-                f"[DIAGNOSTIC] NaN 首次检测到: layer={name}, "
-                f"output_stats=[mean={output_mean:.4f}, std={output_std:.4f}, "
-                f"min={output_min:.4f}, max={output_max:.4f}]"
-            )
+            # 延迟到 get_diagnostic_report() 时再做 .item()
+            # 但先标记需要报告
+            self._needs_full_report = True
+
+        # 存储原始 GPU tensors，在 get_diagnostic_report() 时统一 .item()
+        self._raw_diagnostics[name] = {
+            'layer_idx': idx,
+            'layer_name': name,
+            'is_finite': torch.isfinite(output).all(),
+            'has_nan': has_nan,
+            'has_inf': has_inf,
+            'output_mean': output.float().mean(),
+            'output_std': output.float().std(),
+            'output_min': output.float().min(),
+            'output_max': output.float().max(),
+        }
+
+        # 延迟到 get_diagnostic_report()
+        if name not in self._diagnostics:
+            self._diagnostics[name] = None  # placeholder
 
     def _diagnose_splitter_output(self, result: Any) -> None:
-        """诊断 Splitter 输出"""
+        """诊断 Splitter 输出 - D1-SYNC: 延迟 .item()"""
         if hasattr(result, 'logits') and result.logits is not None:
             logits = result.logits
             self._splitter_logits = logits
 
-            logits_max = logits.float().max().item()
-            logits_min = logits.float().min().item()
+            # D1-SYNC: 存储 GPU tensor，在 get_diagnostic_report() 时 .item()
+            self._raw_diagnostics['splitter_logits'] = {
+                'logits_max': logits.float().max(),
+                'logits_min': logits.float().min(),
+            }
 
             # 检查是否有有效梯度
             if hasattr(result, 'probs') and result.probs is not None:
                 probs = result.probs
                 self._splitter_probs = probs
 
-                probs_all_zero = (probs.float().sum() < 1e-6).item()
-                if probs_all_zero:
-                    logger.warning(
-                        f"[DIAGNOSTIC] Splitter probabilities 几乎全为 0! "
-                        f"logits=[min={logits_min:.4f}, max={logits_max:.4f}]"
-                    )
+                probs_all_zero = probs.float().sum() < 1e-6
+                # 检测到零概率时标记（GPU tensor check，不等待 .item()）
+                if probs_all_zero and not self._has_nan:
+                    self._has_nan = True
+                    self._needs_full_report = True
 
     def _diagnose_tensor(self, name: str, tensor: torch.Tensor) -> None:
-        """通用张量诊断"""
+        """通用张量诊断 - D1-SYNC: 延迟 .item()"""
         if not isinstance(tensor, torch.Tensor):
             return
 
-        torch.isfinite(tensor).all().item()
-        has_nan = torch.isnan(tensor).any().item()
+        has_nan = torch.isnan(tensor).any()
+        has_inf = torch.isinf(tensor).any()
 
+        # 检测到 NaN 时标记（不立即 .item()）
         if has_nan and not self._has_nan:
             self._has_nan = True
-            logger.warning(f"[DIAGNOSTIC] NaN 检测: {name}")
+            self._needs_full_report = True
 
     def diagnose_manifold_bias(
         self,
@@ -336,7 +381,7 @@ class DiagnosticHook:
         layer_name: str = "unknown",
     ) -> None:
         """
-        诊断 ManifoldDecoder 输出的 bias
+        诊断 ManifoldDecoder 输出的 bias - D1-SYNC: 延迟 .item()
 
         参数
         ----
@@ -346,23 +391,15 @@ class DiagnosticHook:
         if bias is None or not isinstance(bias, torch.Tensor):
             return
 
-        bias_max = bias.float().max().item()
-        bias_min = bias.float().min().item()
-        bias_mean = bias.float().mean().item()
-
-        # 记录到诊断
+        # D1-SYNC: 存储 GPU tensors，在 get_diagnostic_report() 时 .item()
         key = f"manifold_bias_{layer_name}"
-        if key in self._diagnostics:
-            self._diagnostics[key].manifold_bias_max = bias_max
-            self._diagnostics[key].manifold_bias_min = bias_min
-            self._diagnostics[key].manifold_bias_mean = bias_mean
-
-        # 检查极端值
-        if bias_max > 100 or bias_min < -100:
-            logger.warning(
-                f"[DIAGNOSTIC] Manifold bias 极端值: layer={layer_name}, "
-                f"max={bias_max:.4f}, min={bias_min:.4f}, mean={bias_mean:.4f}"
-            )
+        self._raw_diagnostics[key] = {
+            'bias_max': bias.float().max(),
+            'bias_min': bias.float().min(),
+            'bias_mean': bias.float().mean(),
+        }
+        if key not in self._diagnostics:
+            self._diagnostics[key] = None  # placeholder
 
     def diagnose_entmax_input(
         self,
@@ -380,23 +417,15 @@ class DiagnosticHook:
         if logits is None or not isinstance(logits, torch.Tensor):
             return
 
-        logits_max = logits.float().max().item()
-        logits_min = logits.float().min().item()
-        logits_std = logits.float().std().item()
-
-        # 记录到诊断
+        # D1-SYNC: 存储 GPU tensors，在 get_diagnostic_report() 时 .item()
         key = f"entmax_input_{layer_name}"
-        if key in self._diagnostics:
-            self._diagnostics[key].entmax_input_max = logits_max
-            self._diagnostics[key].entmax_input_min = logits_min
-            self._diagnostics[key].entmax_input_std = logits_std
-
-        # 检查极端值（可能导致 Entmax 输出全 0）
-        if logits_max - logits_min > 1000:
-            logger.warning(
-                f"[DIAGNOSTIC] Entmax input 极端值范围: layer={layer_name}, "
-                f"max={logits_max:.4f}, min={logits_min:.4f}, std={logits_std:.4f}"
-            )
+        self._raw_diagnostics[key] = {
+            'logits_max': logits.float().max(),
+            'logits_min': logits.float().min(),
+            'logits_std': logits.float().std(),
+        }
+        if key not in self._diagnostics:
+            self._diagnostics[key] = None  # placeholder
 
     def log_statistics(self) -> None:
         """输出诊断统计信息"""
