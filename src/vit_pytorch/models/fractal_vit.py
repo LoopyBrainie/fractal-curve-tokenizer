@@ -63,6 +63,40 @@ from vit_pytorch.core.pattern_plugin import (
 
 
 # =============================================================================
+# I-OPT: Tensor Core 对齐的 SwiGLU 隐藏层维度计算
+# =============================================================================
+# I165-OOM: SwiGLU 4x 扩展率导致峰值显存过高，改为 8/3 比例 + 64x 对齐
+# 标准 FFN: 4d 投影空间; SwiGLU (2 矩阵): 2 × (8/3)d = 16/3d ≈ 5.33d
+# Tensor Core 优化: 隐藏层维度向上取整到 64 的倍数，最大化 GEMM 效率
+MLP_RATIO = 8 / 3  # ≈ 2.67，替代原来的 4.0
+TENSOR_CORE_ALIGNMENT = 64
+
+
+def _get_tensor_core_mlp_dim(dim: int) -> int:
+    """计算 Tensor Core 对齐的 SwiGLU 隐藏层维度。
+
+    数学形式化
+    ===========
+        raw_hidden = dim × (8/3)
+        aligned = ceil(raw_hidden / 64) × 64
+
+    示例
+    ----
+        dim=256: raw=682.67 → aligned=704 (64 的最小倍数)
+        dim=512: raw=1365.33 → aligned=1408
+        dim=768: raw=2048 → aligned=2048 (已是 64 倍数)
+
+    Args:
+        dim: 模型维度
+
+    Returns:
+        Tensor Core 对齐后的隐藏层维度
+    """
+    raw_hidden = int(dim * MLP_RATIO)
+    return ((raw_hidden + TENSOR_CORE_ALIGNMENT - 1) // TENSOR_CORE_ALIGNMENT) * TENSOR_CORE_ALIGNMENT
+
+
+# =============================================================================
 # I147: Logits 钳制层 - 解决训练损失异常 (~82)
 # =============================================================================
 class LogitsClamp(nn.Module):
@@ -333,7 +367,7 @@ class FractalCurveViT(nn.Module):
         # TinyImageNet (200 classes) 需要足够的模型容量
         num_layers: int = 12,  # Transformer 层数
         heads: int = 8,
-        mlp_dim: int = 1024,
+        mlp_dim: Optional[int] = None,  # I165-OOM: 改为 None，默认使用 _get_tensor_core_mlp_dim(dim)
         pool: str = "weighted",
         channels: int = 3,
         dim_head: int = 64,
@@ -441,7 +475,7 @@ class FractalCurveViT(nn.Module):
             dim: 模型嵌入维度
             depth: Transformer 层数
             heads: 注意力头数
-            mlp_dim: MLP 隐藏层维度
+mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 比例，约 2.67×dim）
             pool: 池化策略 ('weighted' 或 'mean')
             channels: 输入图像通道数
             dim_head: 每个注意力头的维度
@@ -802,7 +836,8 @@ class FractalCurveViT(nn.Module):
             self.dim = dim
             self.num_layers = num_layers
             self.heads = heads
-            self.mlp_dim = mlp_dim
+            # I165-OOM: 如果未指定 mlp_dim，使用 Tensor Core 对齐的 8/3 比例
+            self.mlp_dim = mlp_dim if mlp_dim is not None else _get_tensor_core_mlp_dim(dim)
 
         # 权重初始化 - 关键改进，防止类别偏差
         self._init_weights()
@@ -1104,7 +1139,23 @@ class FractalCurveViT(nn.Module):
         padded_tokens, lengths = token_output.get_padded_tokens()
         padded_levels = token_output.get_padded_levels(info_dim)
         levels_list = token_output.levels_list()
-        
+
+        # === OOM 熔断: 硬截断最大 Token 数 ===
+        # 防止极端样本导致 Sequence Length 暴涨，引发 SwiGLU 显存爆炸
+        # 使用确定性张量切片确保 torch.compile 图捕获兼容
+        MAX_TOKENS_PER_IMAGE = 512  # 安全上限，可根据配置调整
+        seq_len = padded_tokens.shape[1]
+        if seq_len > MAX_TOKENS_PER_IMAGE:
+            padded_tokens = padded_tokens[:, :MAX_TOKENS_PER_IMAGE, :]
+            padded_levels = padded_levels[:, :MAX_TOKENS_PER_IMAGE, :]
+            lengths = lengths.clamp(max=MAX_TOKENS_PER_IMAGE)
+            # 同步截断 token_output 内部缓存，避免下游 Shape Mismatch
+            if hasattr(token_output, 'regions_padded') and token_output.regions_padded is not None:
+                token_output.regions_padded = token_output.regions_padded[:, :MAX_TOKENS_PER_IMAGE, :]
+            if hasattr(token_output, 'split_probs_padded') and token_output.split_probs_padded is not None:
+                token_output.split_probs_padded = token_output.split_probs_padded[:, :MAX_TOKENS_PER_IMAGE]
+        # === 熔断结束 ===
+
         # I24-14: 最终防御层 - 无条件 clamp (torch.compile 安全)
         # 不使用 .item() 或数据依赖的 if，直接 clamp
         lengths = lengths.clamp(min=1)
@@ -1539,16 +1590,16 @@ class FractalCurveViT(nn.Module):
             # 新实现: 使用 Hilbert 索引差异作为距离代理
             if levels_info is not None and hasattr(levels_info, 'get_hilbert_indices'):
                 hilbert_indices = levels_info.get_hilbert_indices()  # [B, N]
-                # 计算 Hilbert 距离矩阵 |h_i - h_j|
-                h_i = hilbert_indices.unsqueeze(2).float()  # [B, N, 1]
-                h_j = hilbert_indices.unsqueeze(1).float()  # [B, 1, N]
-                hilbert_dist = torch.abs(h_i - h_j)  # [B, N, N]
-                # 排除对角线（self-distance = 0）
-                mask = ~torch.eye(hilbert_indices.shape[1], dtype=torch.bool, device=hilbert_indices.device)
-                mask = mask.unsqueeze(0).expand(hilbert_dist.shape[0], -1, -1)
-                hilbert_dist_flat = hilbert_dist[mask].view(hilbert_indices.shape[0], -1)
-                poincare_dist_mean = hilbert_dist_flat.mean()
-                poincare_dist_std = hilbert_dist_flat.std()
+                N = hilbert_indices.shape[1]
+                # P2.1 FIX: 使用 triu_indices 直接 gather 上三角元素
+                # 原实现问题: torch.eye mask 方式创建了 [B,N,N] 矩阵 + bool mask，
+                # 仍然需要 O(B×N²) 内存和计算，新实现通过 gather 直接选取上三角坐标对
+                triu_idx = torch.triu_indices(N, k=1, device=hilbert_indices.device)  # [2, N×(N-1)/2]
+                h_i = hilbert_indices[:, triu_idx[0]]  # [B, N_up]
+                h_j = hilbert_indices[:, triu_idx[1]]  # [B, N_up]
+                hilbert_dist_upper = torch.abs(h_i.float() - h_j.float())  # [B, N_up]
+                poincare_dist_mean = hilbert_dist_upper.mean()
+                poincare_dist_std = hilbert_dist_upper.std()
             else:
                 # 回退：如果无法获取 Hilbert 索引，使用 manifold_emb 范数（不推荐）
                 manifold_raw = manifold_emb_for_stats[:, 1:, :]  # [B, N, dim], 排除 CLS
