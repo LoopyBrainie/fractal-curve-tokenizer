@@ -1915,9 +1915,11 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                 max_possible = 1 << paths.shape[-1]  # bit shift: 2 ** max_level
                 for lvl in range(paths.shape[-1]):
                     lvl_paths = paths[..., lvl]  # [B, N]
-                    unique_count = torch.unique(lvl_paths).numel()
-                    # 保持 tensor，让 flatten_layer_outputs 处理 .item()
-                    diversity_ratio = unique_count.float() / max_possible.float() if max_possible > 0 else depths.new_zeros(1)
+                    unique_count = torch.unique(lvl_paths).numel()  # Python int
+                    # D1+D3 AUDIT FIX: convert to tensor before .float(); max_possible is Python int
+                    unique_t = depths.new_tensor(unique_count).float()  # → tensor
+                    max_possible_t = depths.new_tensor(max_possible).float()
+                    diversity_ratio = unique_t / max_possible_t if max_possible > 0 else depths.new_zeros(1)
                     levels_diag[f"distribution/path_diversity_ratio_lvl_{lvl}"] = diversity_ratio
 
             # geo_emb_norm（使用 manifold_emb_for_stats）
