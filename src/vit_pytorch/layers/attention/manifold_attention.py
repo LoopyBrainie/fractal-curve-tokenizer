@@ -1323,7 +1323,7 @@ class ManifoldNativeAttention(nn.Module):
             bw = self._last_bandwidths.detach().float()  # [B, N]
             jump_proxy = 1.0 / (bw.unsqueeze(1).unsqueeze(-1) + EPS)  # [B, 1, N, 1]
             weighted_jump = (attn * jump_proxy).sum(dim=[2, 3]) / (attn.sum(dim=[2, 3]) + EPS)  # [B, H]
-            stats["true_avg_jump_distance"] = weighted_jump.mean()
+            cache["true_avg_jump_distance"] = weighted_jump.mean()
 
         # === P1: entmax_sparsity (entmax 稀疏度) ===
         if self._last_attn_weights is not None:
