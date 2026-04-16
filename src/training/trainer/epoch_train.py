@@ -253,14 +253,14 @@ def train_one_epoch(
             images = batch.to(device, non_blocking=True)
             labels = None
 
-        # I-NAN: 记录输入数据统计（用于 NaN 调试）
+        # I-NAN: 记录输入数据统计（用于 NaN 调试）- D1-SYNC: 延迟 .item() 到 investigate()
         _input_stats = {
-            "images_mean": float(images.mean().detach()),
-            "images_std": float(images.std().detach()),
-            "images_min": float(images.min().detach()),
-            "images_max": float(images.max().detach()),
-            "images_has_nan": bool(torch.isnan(images).any().detach()),
-            "images_has_inf": bool(torch.isinf(images).any().detach()),
+            "images_mean": images.mean().detach(),
+            "images_std": images.std().detach(),
+            "images_min": images.min().detach(),
+            "images_max": images.max().detach(),
+            "images_has_nan": torch.isnan(images).any().detach(),
+            "images_has_inf": torch.isinf(images).any().detach(),
         }
 
         # Apply Mixup/Cutmix if enabled
@@ -277,7 +277,23 @@ def train_one_epoch(
 
         # Forward pass with AMP
         with amp_autocast('cuda', enabled=config.amp.enabled):
-            outputs = model(images)
+            # MEM-OOM FIX (Suspect 3): OOM 诊断 try-except，快速定位"罪魁祸首"
+            # 当 OOM 发生时，打印 Batch 形状和 Token 数量，帮助定位异常样本
+            try:
+                outputs = model(images)
+            except torch.cuda.OutOfMemoryError as e:
+                num_tokens_info = "unknown"
+                try:
+                    # 尝试获取异常样本的 token 数量（不稳定的额外诊断）
+                    num_tokens_info = f"tokens_after_OOM={images.shape}"
+                except Exception:
+                    pass
+                print(f"\n[FATAL OOM] images.shape={images.shape}, batch_idx={batch_idx}")
+                print(f"[FATAL OOM] 如果 images.shape[1] 异常大，说明 Splitter 产生了过多 tokens")
+                print(f"[FATAL OOM] 如果 shape 正常但仍 OOM，说明是 SwiGLU 内部维度问题或显存碎片化")
+                print(f"[FATAL OOM] 建议: (1) 降低 batch_size (2) 减小 max_tokens (3) 关闭 compile")
+                torch.cuda.empty_cache()
+                raise
 
             # Handle TrainingStats from Fractal ViT
             if hasattr(outputs, 'logits'):
@@ -358,19 +374,26 @@ def train_one_epoch(
 
         # Record loss components
         if config.numerical.record_loss_components:
-            loss_components["total"] = loss.item()
+            # D1-SYNC: 统一在此处对 loss_components 做 .item()，避免多次同步
+            loss_components_float = {}
+            for k, v in loss_components.items():
+                if isinstance(v, torch.Tensor):
+                    loss_components_float[k] = v.item()
+                else:
+                    loss_components_float[k] = v
+            loss_components_float["total"] = loss.item()
             # Update progress bar with current loss
             pbar.set_postfix_str(f"loss: {loss.item():.4f}")
             # I-AUDIT: 使用 is not None 检查，TrainingStats 字段现在是 Optional[float] = None
             if outputs.raw_budget_error is not None:
-                loss_components["raw_budget_error"] = outputs.raw_budget_error
+                loss_components_float["raw_budget_error"] = outputs.raw_budget_error.item() if isinstance(outputs.raw_budget_error, torch.Tensor) else outputs.raw_budget_error
             if outputs.density_regularization is not None:
-                loss_components["density_regularization"] = outputs.density_regularization
+                loss_components_float["density_regularization"] = outputs.density_regularization.item() if isinstance(outputs.density_regularization, torch.Tensor) else outputs.density_regularization
             if outputs.consistency_loss is not None:
-                loss_components["consistency_loss"] = outputs.consistency_loss
+                loss_components_float["consistency_loss"] = outputs.consistency_loss.item() if isinstance(outputs.consistency_loss, torch.Tensor) else outputs.consistency_loss
             if outputs.entropy_loss is not None:
-                loss_components["entropy_loss"] = outputs.entropy_loss
-            loss_monitor.record(loss_components)
+                loss_components_float["entropy_loss"] = outputs.entropy_loss.item() if isinstance(outputs.entropy_loss, torch.Tensor) else outputs.entropy_loss
+            loss_monitor.record(loss_components_float)
 
         # Backward
         if scaler is not None:
@@ -503,30 +526,30 @@ def train_one_epoch(
         else:
             # I-NAN: 检测到 NaN！触发自动取证
             # 收集 Classification logits 统计（outputs.logits 是分类 logits，不是 splitter 内部 logits）
-            classification_logits_stats: Dict[str, float] = {}
+            classification_logits_stats: Dict[str, Any] = {}
             if hasattr(outputs, 'logits') and outputs.logits is not None:
                 lgt = outputs.logits.detach()
                 classification_logits_stats = {
-                    "logits_mean": float(lgt.mean()),
-                    "logits_std": float(lgt.std()),
-                    "logits_min": float(lgt.min()),
-                    "logits_max": float(lgt.max()),
-                    "logits_has_nan": bool(torch.isnan(lgt).any()),
-                    "logits_has_inf": bool(torch.isinf(lgt).any()),
+                    "logits_mean": lgt.mean(),
+                    "logits_std": lgt.std(),
+                    "logits_min": lgt.min(),
+                    "logits_max": lgt.max(),
+                    "logits_has_nan": torch.isnan(lgt).any(),
+                    "logits_has_inf": torch.isinf(lgt).any(),
                 }
 
-            # 收集特征模长统计 (mlp_head 前的特征)
-            feature_stats: Dict[str, float] = {}
+            # 收集特征模长统计 (mlp_head 前的特征) - D1-SYNC: 延迟 .item()
+            feature_stats: Dict[str, Any] = {}
             if hasattr(outputs, 'features') and outputs.features is not None:
                 feat = outputs.features.detach()
                 feature_stats = {
-                    "mean": float(feat.mean()),
-                    "std": float(feat.std()),
-                    "min": float(feat.min()),
-                    "max": float(feat.max()),
-                    "norm": float(feat.norm()),
-                    "has_nan": bool(torch.isnan(feat).any()),
-                    "has_inf": bool(torch.isinf(feat).any()),
+                    "mean": feat.mean(),
+                    "std": feat.std(),
+                    "min": feat.min(),
+                    "max": feat.max(),
+                    "norm": feat.norm(),
+                    "has_nan": torch.isnan(feat).any(),
+                    "has_inf": torch.isinf(feat).any(),
                 }
 
             # 获取训练环境信息

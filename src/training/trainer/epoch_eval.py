@@ -11,7 +11,7 @@ from typing import Optional, Dict, List
 import torch
 from tqdm import tqdm
 import torch.nn as nn
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from torch.utils.data import DataLoader
 
 from ..config import Config
@@ -84,7 +84,7 @@ def evaluate(
 
             # Forward pass with AMP
             use_amp = config.amp.enabled if config else False
-            with autocast(enabled=use_amp):
+            with autocast('cuda', enabled=use_amp):
                 outputs = model(images)
 
                 # Handle TrainingStats from Fractal ViT

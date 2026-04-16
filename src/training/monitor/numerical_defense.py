@@ -19,6 +19,24 @@ if TYPE_CHECKING:
     from ..metrics.collector import MetricsCollector
 
 
+def _tensor_to_python(val: Any) -> Any:
+    """将 tensor 转换为 Python 标量（用于 JSON 序列化）
+
+    D1-SYNC: 在 investigate() 中统一调用，避免在训练热路径中多次 .item()
+    """
+    if isinstance(val, torch.Tensor):
+        if val.numel() == 1:
+            return val.item()
+        else:
+            return val.detach().cpu().numpy().tolist()
+    elif isinstance(val, dict):
+        return {k: _tensor_to_python(v) for k, v in val.items()}
+    elif isinstance(val, (list, tuple)):
+        return [_tensor_to_python(v) for v in val]
+    else:
+        return val
+
+
 class AnomalyDetectionContext:
     """Context manager for PyTorch anomaly detection
 
@@ -470,6 +488,7 @@ class NaNAutoInvestigation:
             return None
 
         self.investigation_count += 1
+        # D1-SYNC: 在此处统一将 GPU tensors 转换为 Python 值（只同步一次）
         report: Dict[str, Any] = {
             "meta": {
                 "epoch": epoch,
@@ -478,14 +497,14 @@ class NaNAutoInvestigation:
                 "pre_clip_grad_norm": pre_clip_grad_norm,
                 "investigation_count": self.investigation_count,
             },
-            "input_data_summary": input_stats or {},
-            "classification_logits_stats": classification_logits_stats or {},
+            "input_data_summary": _tensor_to_python(input_stats) if input_stats else {},
+            "classification_logits_stats": _tensor_to_python(classification_logits_stats) if classification_logits_stats else {},
             "training_env": {
                 "amp_loss_scale": amp_loss_scale,
                 "learning_rate": learning_rate,
             },
-            "loss_components": loss_components or {},
-            "feature_stats": feature_stats or {},
+            "loss_components": _tensor_to_python(loss_components) if loss_components else {},
+            "feature_stats": _tensor_to_python(feature_stats) if feature_stats else {},
         }
 
         # 自动诊断结论
@@ -579,7 +598,7 @@ class NaNAutoInvestigation:
         amp_loss_scale: Optional[float] = None,
     ) -> Dict[str, Any]:
         """自动诊断 NaN 根因
-        
+
         诊断规则:
         | 记录项        | 如果发现...               | 结论                    |
         |---------------|--------------------------|------------------------|
@@ -590,6 +609,12 @@ class NaNAutoInvestigation:
         | Loss Break    | 某项 > 1e6              | 该Loss项异常           |
         | Pre-clip Norm | NaN 但 Input 正常        | 梯度爆炸，需调低 LR    |
         """
+        # D1-SYNC: 转换 GPU tensors 到 Python 值
+        input_stats = _tensor_to_python(input_stats) if input_stats else {}
+        classification_logits_stats = _tensor_to_python(classification_logits_stats) if classification_logits_stats else {}
+        feature_stats = _tensor_to_python(feature_stats) if feature_stats else {}
+        loss_components = _tensor_to_python(loss_components) if loss_components else {}
+
         diagnosis = []
         root_cause = "unknown"
 
