@@ -538,8 +538,10 @@ class LevelsInfo:
         )  # [D, D]
         # paths: [B, N, D], W.T: [D, D]
         # paths_flat @ W.T → [B*N, D], reshape → [B, N, D]
-        path_ints_all = torch.bmm(
-            paths.view(B * N, D).float(), W.t().float()
+        # 使用 @ 运算符替代 torch.bmm，因为这是普通 2D 矩阵乘法
+        # torch.bmm 要求 3D 输入，但此处是 [B*N, D] @ [D, D]
+        path_ints_all = (
+            paths.view(B * N, D).float() @ W.t().float()
         ).long().view(B, N, D)  # [B, N, D]
         # path_ints_all[b, n, d] = Σ_{k=0}^{d} paths[b,n,k] × 4^(d-k)
 
