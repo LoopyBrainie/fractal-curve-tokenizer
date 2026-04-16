@@ -2477,3 +2477,7 @@ class FractalCurveViTV2(FractalCurveViT):
 
 FractalCurveViT_V2 = FractalCurveViTV2  # 别名
 
+# TrainingStatsV2 向后兼容别名 (I162-1)
+# 现在统一在 fractal_vit.py 中定义，保持与 DualPathFractalViT 一致
+TrainingStatsV2 = TrainingStats
+
