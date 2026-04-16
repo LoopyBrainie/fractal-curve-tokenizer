@@ -90,6 +90,28 @@ for d in range(1, _MAX_HILBERT_DEPTH + 1):
         lut[path_int] = _HILBERT_LUT[d][path_int]
     _HILBERT_LUT_TENSOR[d] = lut
 
+# P1 FIX: 2D 统一填充 LUT，支持全量向量化查表
+# 方案: 构建 [max_depth+1, 4^max_depth] 的 2D 张量，
+# 深度 d 的 LUT 放在 row d，不足部分用 0 填充
+# 内存: depth=12 时 = 13 × 16777216 × 8 bytes ≈ 1.7 GB（仅在深度≥10时显著）
+# 但通常 max_level=8，内存 = 9 × 65536 × 8 ≈ 470 KB
+_MAX_LUT_DEPTH = 12  # 与 _MAX_PREPOPULATE_DEPTH 保持一致
+_HILBERT_LUT_PADDED = None  # 惰性初始化
+
+
+def _get_hilbert_lut_padded() -> torch.Tensor:
+    """获取填充后的 2D LUT，惰性初始化并缓存到设备。"""
+    global _HILBERT_LUT_PADDED
+    if _HILBERT_LUT_PADDED is None:
+        max_size = 1 << (2 * _MAX_LUT_DEPTH)  # 4^12 = 16777216
+        lut_2d = torch.zeros((_MAX_LUT_DEPTH + 1, max_size), dtype=torch.long)
+        for d in range(1, _MAX_LUT_DEPTH + 1):
+            size = 1 << (2 * d)  # 4^d
+            for path_int in range(size):
+                lut_2d[d, path_int] = _HILBERT_LUT[d][path_int]
+        _HILBERT_LUT_PADDED = lut_2d
+    return _HILBERT_LUT_PADDED
+
 # I103-2: Hilbert 索引权重缓存 (类级缓存)
 # 避免在 get_hilbert_indices() 中重复创建权重张量
 # 内存: D_max=8 时仅需存储 36 个整数 (< 1KB)
@@ -493,37 +515,46 @@ class LevelsInfo:
         D = D_plus_1 - 1
         depths = self.data[:, :, 0]  # [B, N]
         paths = self.data[:, :, 1:]  # [B, N, D]
+        device = self.data.device
 
         # 验证深度约束
-        if D > _MAX_HILBERT_DEPTH:
+        if D > _MAX_LUT_DEPTH:
             raise ValueError(
-                f"Hilbert 深度 {D} 超过最大允许值 {_MAX_HILBERT_DEPTH}。"
+                f"Hilbert 深度 {D} 超过最大允许值 {_MAX_LUT_DEPTH}。"
                 "请考虑使用动态回退方案。"
             )
 
-        # 批量 LUT 查找: LUT_TENSOR[depth, path_int] -> hilbert_dist
-        # _HILBERT_LUT_TENSOR: [D+1, 4^D]
-        lut_tensor = _HILBERT_LUT_TENSOR.to(self.data.device)
+        # P1 FIX: 全量向量化查表 — 消除 per-depth loop
+        # 核心: 构建 W[d,k] = 4^(d-k) for k <= d (上三角)，然后 paths @ W.T
+        #
+        # 示例 paths=[2,3,1,0], W^T = [[1,4,16,64],[0,1,4,16],[0,0,1,4],[0,0,0,1]]
+        # paths @ W.T = [2*1, 2*4+3*1, 2*16+3*4+1*1, ...] = [2, 11, 45, 180]
+        d_idx = torch.arange(D, device=device).unsqueeze(1)  # [[0],[1],[2],[3]]
+        k_idx = torch.arange(D, device=device).unsqueeze(0)  # [[0,1,2,3]]
+        W = torch.where(
+            k_idx <= d_idx,  # 上三角(含对角): k <= d 时有效
+            torch.pow(4, (d_idx - k_idx).float()).long(),  # 4^(d-k)
+            torch.zeros(D, D, device=device, dtype=torch.long)
+        )  # [D, D]
+        # paths: [B, N, D], W.T: [D, D]
+        # paths_flat @ W.T → [B*N, D], reshape → [B, N, D]
+        path_ints_all = torch.bmm(
+            paths.view(B * N, D).float(), W.t().float()
+        ).long().view(B, N, D)  # [B, N, D]
+        # path_ints_all[b, n, d] = Σ_{k=0}^{d} paths[b,n,k] × 4^(d-k)
 
-        # 对于每个 depth d，从 LUT_TENSOR[d] 查找 path_ints
-        # 有效 depth 范围 [1, D]，depth=0 位置保持 0
-        results = torch.zeros(B, N, dtype=torch.long, device=self.data.device)
+        # torch.gather: 按 actual depth 取对应深度的路径整数
+        depth_for_gather = depths.long().clamp(min=0, max=D - 1)  # [B, N]
+        path_ints_per_depth = torch.gather(
+            path_ints_all, dim=2, index=depth_for_gather.unsqueeze(2)
+        ).squeeze(2)  # [B, N]
 
-        for d in range(1, D + 1):
-            mask = (depths == d)
-            if not mask.any():
-                continue
-            # 路径编码
-            weights = self._get_hilbert_weights_for_depth(d, self.data.device)
-            path_ints = (paths[:, :, :d] * weights).sum(dim=-1)
-
-            # D2-AUDIT FIX: 向量化 LUT 查找 - Python dict → tensor indexing
-            valid_path_ints = path_ints[mask]
-            results[mask] = _HILBERT_LUT_TENSOR[d][valid_path_ints]
+        # 全量查表: lut_2d[depths, path_ints] → hilbert_indices
+        lut_2d = _get_hilbert_lut_padded().to(device)
+        results = lut_2d[depths.long(), path_ints_per_depth]  # [B, N]
 
         # I161-1 修复: 深度根归一化
         if normalize:
-            depths = self.data[:, :, 0]  # [B, N]
             return self.normalize_hilbert_index(results, depths)
 
         return results
