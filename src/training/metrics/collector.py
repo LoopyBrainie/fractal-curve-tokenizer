@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .record import MetricRecord, MetricSource
-from .registry import MetricRegistry, MetricSpec
+from .registry import MetricRegistry
 
 
 @dataclass

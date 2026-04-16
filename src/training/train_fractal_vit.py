@@ -12,9 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import sys
-import time
 import random
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -34,7 +32,7 @@ def _setup_path():
         sys.path.insert(0, str(src_dir))
 _setup_path()
 
-from .config import Config, create_config
+from .config import create_config
 from .trainer import (
     TrainingState,
     train_one_epoch,
@@ -51,7 +49,6 @@ from .monitor import (
 from .checkpoint import (
     save_checkpoint,
     load_checkpoint,
-    find_latest_checkpoint,
 )
 from .training_logs import EpochLogger
 
@@ -215,7 +212,7 @@ def create_model(args, device: torch.device) -> nn.Module:
     if hasattr(args, 'use_geometry_field') and args.use_geometry_field:
         model_kwargs['use_geometry_field'] = True
 
-    print(f"Creating FractalCurveViT with args:")
+    print("Creating FractalCurveViT with args:")
     for k, v in model_kwargs.items():
         print(f"  {k}: {v}")
 
@@ -845,7 +842,7 @@ def train(
         record_layer_norms=config.numerical.record_layer_grad_norms,
     )
     loss_monitor = LossMonitor()
-    defender = NumericalDefender(
+    NumericalDefender(
         model=model,
         detect_anomaly=config.numerical.detect_anomaly,
         skip_on_nan=config.numerical.skip_on_nan_grad,
@@ -884,7 +881,7 @@ def train(
     print(f"\n{'='*60}")
     print(f"Starting training for {config.training.num_epochs} epochs")
     print(f"Dataset: {args.dataset}")
-    print(f"Model: FractalCurveViT")
+    print("Model: FractalCurveViT")
     print(f"{'='*60}\n")
 
     for epoch in range(state.epoch, config.training.num_epochs):
@@ -1024,7 +1021,7 @@ def train(
         if should_save_epoch:
             # Save epoch checkpoint + last.pth (always)
             # is_best determines if best.pth is also saved
-            checkpoint_path = save_checkpoint(
+            save_checkpoint(
                 checkpoint_dir=config.checkpoint.checkpoint_dir,
                 model=model,
                 optimizer=optimizer,
@@ -1038,7 +1035,7 @@ def train(
             )
         elif is_best:
             # Not on save interval, but new best → only update best.pth and last.pth
-            checkpoint_path = save_checkpoint(
+            save_checkpoint(
                 checkpoint_dir=config.checkpoint.checkpoint_dir,
                 model=model,
                 optimizer=optimizer,
@@ -1052,7 +1049,7 @@ def train(
             )
 
     print(f"\n{'='*60}")
-    print(f"Training completed!")
+    print("Training completed!")
     print(f"Best metric: {state.best_metric:.4f}")
     print(f"{'='*60}\n")
 

@@ -10,13 +10,10 @@ Provides numerical stability protection:
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Dict, Any, List, Callable
-from collections import OrderedDict
 import torch
 import torch.nn as nn
-from contextlib import contextmanager
 
 if TYPE_CHECKING:
     from ..metrics.collector import MetricsCollector
@@ -603,8 +600,8 @@ class NaNAutoInvestigation:
 
         # R2: 分类 Logits 异常 (注意：这是 outputs.logits，不是 splitter 内部 logits)
         if classification_logits_stats:
-            max_logit = classification_logits_stats.get("logits_max", 0)
-            min_logit = classification_logits_stats.get("logits_min", 0)
+            classification_logits_stats.get("logits_max", 0)
+            classification_logits_stats.get("logits_min", 0)
             # I-AUDIT: 分类 logits 较大是正常的（尤其是类别多时），不再诊断为溢出
             # 但 NaN/Inf 仍然是异常的
             if classification_logits_stats.get("logits_has_nan"):
@@ -617,7 +614,7 @@ class NaNAutoInvestigation:
         # R3: 特征模长异常 (Feature Norm)
         if feature_stats:
             max_feat = feature_stats.get("max", 0)
-            mean_feat = feature_stats.get("mean", 0)
+            feature_stats.get("mean", 0)
             if max_feat > 1e3:
                 diagnosis.append(f"[R3a] FEATURE_NORM_HIGH: 特征 max={max_feat:.2e} > 1e3，mlp_head 前需 LayerNorm 或缩放")
                 root_cause = "feature_norm_high"

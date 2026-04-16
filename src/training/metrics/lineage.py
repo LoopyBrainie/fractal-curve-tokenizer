@@ -1,5 +1,4 @@
 """血缘追踪工具 - 追踪指标派生关系"""
-from typing import Optional
 
 
 class LineageTracker:

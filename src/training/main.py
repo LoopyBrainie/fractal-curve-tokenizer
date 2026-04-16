@@ -8,9 +8,7 @@ Layer 3 (hyperparameters) for training, decoupled from model architecture.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
-import time
 import random
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -45,7 +43,6 @@ from .monitor import (
 from .checkpoint import (
     save_checkpoint,
     load_checkpoint,
-    find_latest_checkpoint,
 )
 from .training_logs import EpochLogger
 
@@ -214,7 +211,7 @@ def train(
         record_layer_norms=config.numerical.record_layer_grad_norms,
     )
     loss_monitor = LossMonitor()
-    defender = NumericalDefender(
+    NumericalDefender(
         model=model,
         detect_anomaly=config.numerical.detect_anomaly,
         skip_on_nan=config.numerical.skip_on_nan_grad,
@@ -298,7 +295,7 @@ def train(
         should_save_epoch = (epoch + 1) % save_interval == 0 or (epoch + 1) >= config.training.num_epochs
 
         if should_save_epoch:
-            checkpoint_path = save_checkpoint(
+            save_checkpoint(
                 checkpoint_dir=config.checkpoint.checkpoint_dir,
                 model=model,
                 optimizer=optimizer,
@@ -312,7 +309,7 @@ def train(
             )
         elif is_best:
             # Not on save interval, but new best → only update best.pth and last.pth
-            checkpoint_path = save_checkpoint(
+            save_checkpoint(
                 checkpoint_dir=config.checkpoint.checkpoint_dir,
                 model=model,
                 optimizer=optimizer,
@@ -326,7 +323,7 @@ def train(
             )
 
     print(f"\n{'='*60}")
-    print(f"Training completed!")
+    print("Training completed!")
     print(f"Best metric: {state.best_metric:.4f}")
     print(f"{'='*60}\n")
 

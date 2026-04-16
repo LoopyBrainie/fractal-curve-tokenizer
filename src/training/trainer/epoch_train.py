@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from typing import Optional, Dict, Any, List
 import time
-import math
 import torch
 import torch.nn as nn
 from torch.amp import autocast as amp_autocast
@@ -21,7 +20,7 @@ from .state import TrainingState, EpochMetrics
 from .loss import MixupCutmixLoss, compute_loss
 from ..monitor.gradient_monitor import GradientMonitor
 from ..monitor.loss_monitor import LossMonitor
-from ..monitor.numerical_defense import NumericalDefender, NaNAutoInvestigation, dump_debug_info
+from ..monitor.numerical_defense import NumericalDefender, NaNAutoInvestigation
 
 
 def _get_flatten_layer_outputs():

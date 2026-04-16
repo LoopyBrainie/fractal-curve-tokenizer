@@ -6,10 +6,10 @@ Supports both torchvision datasets and Hugging Face datasets library.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Any, Union, Dict
+from typing import Optional, Tuple, Dict
 from pathlib import Path
 import torch
-from torch.utils.data import DataLoader, Dataset, IterableDataset
+from torch.utils.data import Dataset, IterableDataset
 from torchvision import transforms
 from torchvision.datasets import CIFAR10, CIFAR100, ImageFolder
 

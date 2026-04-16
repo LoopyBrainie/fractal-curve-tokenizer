@@ -5,9 +5,8 @@ Provides metric computation utilities for model evaluation.
 
 from __future__ import annotations
 
-from typing import List, Tuple, Optional, Dict
+from typing import List, Optional, Dict
 import torch
-import numpy as np
 
 
 def compute_accuracy(
@@ -239,8 +238,8 @@ def compute_brier_score(
         >>> compute_brier_score(probs, targets)
         1.456
     """
-    batch_size = probs.size(0)
-    num_classes = probs.size(-1)
+    probs.size(0)
+    probs.size(-1)
 
     # Create one-hot targets
     targets_one_hot = torch.zeros_like(probs)

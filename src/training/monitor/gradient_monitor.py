@@ -6,7 +6,7 @@ Tracks gradient norms for analysis and debugging.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Dict, List, Optional
 import torch
 import torch.nn as nn
 from collections import defaultdict
@@ -348,8 +348,7 @@ class EnhancedGradientMonitor:
             warn_ratio: 梯度消失警告阈值 (grad/weight ratio)
             crit_ratio: 梯度爆炸严重阈值 (grad/weight ratio)
         """
-        import numpy as np
-        from typing import Dict, List, Any
+        from typing import Any
 
         self.model = model
         self.warn_ratio = warn_ratio

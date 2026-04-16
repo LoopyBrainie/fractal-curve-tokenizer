@@ -7,7 +7,7 @@ handles Layer 3 (hyperparameters) for evaluation.
 
 from __future__ import annotations
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, List
 import torch
 from tqdm import tqdm
 import torch.nn as nn
@@ -16,7 +16,6 @@ from torch.utils.data import DataLoader
 
 from ..config import Config
 from .state import EvaluationMetrics
-from .loss import compute_loss
 from ..training_logs.metrics import compute_confusion_matrix
 
 
@@ -69,7 +68,7 @@ def evaluate(
     total_batches = len(dataloader)
 
     # P1 诊断: 验证样本数量
-    estimated_samples = total_batches * dataloader.batch_size
+    total_batches * dataloader.batch_size
     actual_samples = len(dataloader.dataset)
     print(f"  [P0诊断] Validation: {actual_samples} samples, {total_batches} batches (batch_size={dataloader.batch_size})")
 

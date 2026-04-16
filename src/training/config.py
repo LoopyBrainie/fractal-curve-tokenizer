@@ -13,7 +13,7 @@ decoupled from model architecture.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from pathlib import Path
 import json
 
