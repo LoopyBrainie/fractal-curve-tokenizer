@@ -7,13 +7,11 @@ Architecture Design Visualization - 模型架构设计可视化
 
 import sys
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional
 
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
-import matplotlib.patheffects as path_effects
 
 # 添加项目路径
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -62,7 +60,6 @@ def plot_token_count_range(
     ax.set_title('Standard ViT\nFixed: 196 tokens', fontsize=12, fontweight='bold')
 
     # 14x14 网格展示
-    n_tokens = 196
     grid_size = 14
     step = 10 / grid_size
 
@@ -90,7 +87,6 @@ def plot_token_count_range(
 
     # 颜色映射 - 每种深度用不同颜色
     depth_colors = {0: '#e74c3c', 1: '#3498db', 2: '#27ae60', 3: '#9b59b6'}
-    depth_labels = {0: 'd=0\n64×64', 1: 'd=1\n32×32', 2: 'd=2\n16×16', 3: 'd=3\n8×8'}
 
     # 统一坐标系统（外框 0.5~9.5）
     origin = 0.5
@@ -124,7 +120,7 @@ def plot_token_count_range(
     # 具体的混合深度由“选中叶节点”高亮体现。
 
     # 标注每个层级的区域数量
-    ax.text(5, 5, f'Total Candidates: 85\n(d=0:1, d=1:4, d=2:16, d=3:64)',
+    ax.text(5, 5, 'Total Candidates: 85\n(d=0:1, d=1:4, d=2:16, d=3:64)',
            ha='center', va='center', fontsize=9,
            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.9))
 
@@ -595,9 +591,11 @@ if __name__ == "__main__":
     if args.save_dir:
         import os
         os.makedirs(args.save_dir, exist_ok=True)
-        save_path = lambda name: os.path.join(args.save_dir, name)
+        def save_path(name):
+            return os.path.join(args.save_dir, name)
     else:
-        save_path = lambda name: None
+        def save_path(name):
+            return None
 
     print("\n[1] Token Count Range...")
     plot_token_count_range(save_path=save_path("token_count_range.png"))

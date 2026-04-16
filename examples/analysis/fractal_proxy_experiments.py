@@ -43,19 +43,17 @@ if str(src_PATH) not in sys.path:
 
 import argparse
 import logging
-import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler, random_split
 
-from vit_pytorch.core.constants import EPS  # I112-3: 统一数值稳定性常量
 
 logger = logging.getLogger(__name__)
 
@@ -790,7 +788,7 @@ class SparseAblationExperiment(BaseExperiment):
                 continue
 
             # I139: Extract from TrainingStats logits
-            logits = stats.logits if hasattr(stats, 'logits') else stats
+            stats.logits if hasattr(stats, 'logits') else stats
 
             # Collect metrics
             img_size = imgs.shape[2:]
@@ -1377,7 +1375,7 @@ class SpatialJigsawLoss(nn.Module):
 
             # 4. 构建有效对集合 P
             i_idx, j_idx = torch.triu_indices(N_k, N_k, offset=1, device=device)
-            P = len(i_idx)
+            len(i_idx)
 
             offset_x = cx[i_idx] - cx[j_idx]  # [P]
             offset_y = cy[i_idx] - cy[j_idx]  # [P]
@@ -2124,7 +2122,6 @@ def main():
     if dataset_name.startswith("cifar"):
         # CIFAR-10/100: 32x32 images, smaller model works well
         num_classes = 100 if dataset_name == "cifar100" else 10
-        image_size = 32
 
         transform = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
@@ -2167,7 +2164,6 @@ def main():
             )
 
         num_classes = 200
-        image_size = 224
 
         transform = transforms.Compose([
             transforms.Resize((224, 224)),

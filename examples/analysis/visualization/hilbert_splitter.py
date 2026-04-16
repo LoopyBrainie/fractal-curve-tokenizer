@@ -33,12 +33,9 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from matplotlib.collections import PatchCollection
-from matplotlib.colors import LinearSegmentedColormap
-from matplotlib.patches import Polygon as MplPolygon
 
 # Shapely 用于精确几何操作
-from shapely.geometry import box, Polygon, MultiPolygon
+from shapely.geometry import box, Polygon
 from shapely.ops import unary_union
 
 # 添加项目路径
@@ -48,7 +45,6 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 # 导入集中的 Hilbert 工具函数（来自 utils/hilbert_utils.py）
 from ..utils.hilbert_utils import (
     generate_hilbert_curve,
-    d_to_xy,
     xy_to_d,
 )
 
@@ -426,7 +422,7 @@ def visualize_quadtree_split(
     z = np.polyfit(hilbert_dists, euclidean_dists, 1)
     p = np.poly1d(z)
     x_line = np.linspace(0, max(hilbert_dists), 100)
-    ax.plot(x_line, p(x_line), 'r--', linewidth=2, label=f'Linear fit')
+    ax.plot(x_line, p(x_line), 'r--', linewidth=2, label='Linear fit')
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -768,7 +764,6 @@ def demo_with_model(
         if hasattr(output, 'regions'):
             regions = output.regions
             depths = output.depths
-            hilbert_indices = output.hilbert_indices
 
             print(f"   Number of tokens: {len(depths)}")
             print(f"   Depth distribution: {torch.bincount(depths.long()).tolist()}")
@@ -923,7 +918,7 @@ def visualize_mixed_depth_regions(
     ax.set_title('Gumbel-Top-K Selection\n(Parallel Evaluation)', fontsize=11, fontweight='bold')
     draw_image_background(ax, image, image_size)
 
-    rng = np.random.default_rng(seed)
+    np.random.default_rng(seed)
 
     # 生成树一致的混合深度“叶节点”分区（覆盖整幅图像，深度 0-5）
     selected_by_depth: Dict[int, List[Tuple[float, float, float, float]]] = {d: [] for d in range(max_depth + 1)}
@@ -1085,7 +1080,7 @@ def visualize_mixed_depth_regions(
     ax = axes[1, 0]
     ax.set_title('Scheme E: Learnable Quota\n(π = softmax(φ))', fontsize=11, fontweight='bold')
 
-    K_total = sum(len(v) for v in selected_by_depth.values())
+    sum(len(v) for v in selected_by_depth.values())
     depths_list = list(range(max_depth + 1))
     counts = np.array([len(selected_by_depth[d]) for d in depths_list], dtype=float)
     quota_probs = counts / counts.sum() if counts.sum() > 0 else np.zeros_like(counts)
@@ -1223,7 +1218,8 @@ if __name__ == "__main__":
         import os
         os.makedirs(args.save_dir, exist_ok=True)
 
-    save_path = lambda name: os.path.join(args.save_dir, name) if args.save_dir else None
+    def save_path(name):
+        return os.path.join(args.save_dir, name) if args.save_dir else None
 
     print("\n" + "=" * 70)
     print(" Hilbert Curve Splitter Visualization Demo")

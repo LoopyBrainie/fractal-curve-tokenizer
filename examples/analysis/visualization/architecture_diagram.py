@@ -7,14 +7,11 @@
 
 import sys
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional
 
-import torch
 import torch.nn as nn
-import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+from matplotlib.patches import FancyBboxPatch
 
 # 添加项目路径
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -297,7 +294,7 @@ def plot_model_components(
         })
 
     # 绘制组件
-    n_components = len(components)
+    len(components)
     colors = {
         'input': 'lightblue',
         'conv': 'lightgreen',

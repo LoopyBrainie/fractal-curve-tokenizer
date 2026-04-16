@@ -36,8 +36,7 @@ from typing import Optional, Dict, List, Tuple
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle, FancyBboxPatch
-from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.patches import FancyBboxPatch
 
 # 添加项目路径
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -92,7 +91,7 @@ def plot_adaptive_flops_heatmap(
     fig, axes = plt.subplots(2, 2, figsize=figsize)
 
     depths = token_depths.cpu().numpy()
-    unique_depths = np.unique(depths)
+    np.unique(depths)
     max_depth = int(depths.max())
 
     # 统一颜色映射: 蓝色(d=0) → 红色(d=max_depth)
@@ -329,7 +328,7 @@ def plot_pareto_frontier(
     # 计算相对于标准 ViT 的效率
     for i in range(len(token_counts)):
         token_reduction = (standard_tokens - token_counts[i]) / standard_tokens * 100
-        acc_diff = accuracies[i] - accuracies[0]  # 相对于最少 token 的提升
+        accuracies[i] - accuracies[0]  # 相对于最少 token 的提升
         ax.annotate(f'-{token_reduction:.0f}% tokens',
                    xy=(token_counts[i], accuracies[i]),
                    xytext=(0, -15), textcoords='offset points',

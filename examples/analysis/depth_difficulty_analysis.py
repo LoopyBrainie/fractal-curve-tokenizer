@@ -23,17 +23,17 @@ sys.path.insert(0, 'src')
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any
 import numpy as np
 import torch
 import torch.nn.functional as F
 try:
     from tqdm import tqdm
 except ImportError:
-    tqdm = lambda x, **kwargs: x
+    def tqdm(x, **kwargs):
+        return x
 
 from training.layered_evaluator import LayeredEvaluator
-from training.evaluation_layers import LayeredEvaluationReport
 
 
 def compute_image_complexity(images: torch.Tensor) -> np.ndarray:
@@ -355,16 +355,16 @@ def run_depth_difficulty_analysis_with_model(
 
     print(f"\n样本数: {results['num_samples']}")
 
-    print(f"\n深度分布:")
+    print("\n深度分布:")
     for key, value in results['depth_distribution_stats'].items():
         print(f"  {key}: {value:.4f}")
 
-    print(f"\n相关性分析:")
+    print("\n相关性分析:")
     for key, value in results['correlations'].items():
         sign = "+" if value > 0 else ""
         print(f"  {key}: {sign}{value:.4f}")
 
-    print(f"\n分组分析 (按图像复杂度):")
+    print("\n分组分析 (按图像复杂度):")
     ga = results['group_analysis']['by_complexity']
     print(f"  高复杂度样本: {ga['high_complexity_samples']}, 准确率: {ga['high_complexity_accuracy']:.1f}%")
     print(f"  低复杂度样本: {ga['low_complexity_samples']}, 准确率: {ga['low_complexity_accuracy']:.1f}%")

@@ -35,7 +35,7 @@ Color Utilities - 颜色映射工具
     plt.scatter(..., c=[DEPTH_COLORS[d] for d in depths])
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -206,12 +206,12 @@ if __name__ == "__main__":
 
     # 深度颜色测试
     colors = get_depth_colors(4)
-    print(f"\n深度颜色 (max_depth=4):")
+    print("\n深度颜色 (max_depth=4):")
     for d, c in colors.items():
         print(f"  d={d}: RGB({int(c[0]*255)}, {int(c[1]*255)}, {int(c[2]*255)})")
 
     # 预设颜色
-    print(f"\n预设深度颜色:")
+    print("\n预设深度颜色:")
     for d, c in DEPTH_COLORS.items():
         print(f"  d={d}: RGB({int(c[0]*255)}, {int(c[1]*255)}, {int(c[2]*255)})")
 

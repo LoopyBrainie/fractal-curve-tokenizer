@@ -7,7 +7,7 @@ HTML 报告生成器
 
 import sys
 from pathlib import Path
-from typing import Optional, Dict, List, Any
+from typing import Dict, List, Any
 from dataclasses import dataclass
 
 # 添加项目路径

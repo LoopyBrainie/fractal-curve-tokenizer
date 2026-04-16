@@ -47,7 +47,8 @@ def main():
         import os
         os.makedirs(args.save_dir, exist_ok=True)
 
-    save_path = lambda name: str(Path(args.save_dir) / name) if args.save_dir else None
+    def save_path(name):
+        return str(Path(args.save_dir) / name) if args.save_dir else None
 
     print(f"\n{'=' * 70}")
     print(" Architecture Visualization Demo")
@@ -72,7 +73,7 @@ def main():
     print("\n[5] Visualizing multi-scale representation...")
     plot_multi_scale_representation(save_path=save_path("multi_scale.png"))
 
-    print(f"\n[6] Demo Complete!")
+    print("\n[6] Demo Complete!")
     print(f"{'=' * 70}")
 
     if not args.no_show:

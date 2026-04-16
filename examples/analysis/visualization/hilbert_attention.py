@@ -29,22 +29,18 @@ Hilbert Attention Visualization - Hilbert 注意力可视化
 
 import sys
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional
 
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle, Rectangle
-from matplotlib.collections import PatchCollection
-from matplotlib.colors import LinearSegmentedColormap
 
 # 添加项目路径
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 # 导入 Hilbert 工具函数
-from ..utils.hilbert_utils import d_to_xy, xy_to_d, generate_hilbert_curve
-from ..utils.color_utils import get_attention_colors
+from ..utils.hilbert_utils import d_to_xy, xy_to_d
 
 
 def hilbert_distance(h1: int, h2: int, n_side: int) -> float:
@@ -134,7 +130,7 @@ def plot_hilbert_attention_map(
     block_colors = ['blue', 'green', 'orange', 'purple']
 
     for b, start in enumerate(range(0, N, block_size)):
-        end = min(start + block_size, N)
+        min(start + block_size, N)
         rect = plt.Rectangle(
             (start - 0.5, start - 0.5),
             block_size, block_size,

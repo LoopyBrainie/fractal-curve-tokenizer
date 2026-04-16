@@ -55,9 +55,8 @@ report = analyzer.generate_report(images)
 
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Union
+from typing import Dict, List, Optional
 from dataclasses import dataclass, field
-from collections import defaultdict
 
 import torch
 import torch.nn as nn
@@ -293,9 +292,9 @@ class FractalViTAnalyzer:
                 hilbert_indices = None
 
             if hasattr(tokenizer_output, 'batch_indices'):
-                batch_indices = tokenizer_output.batch_indices
+                pass
             else:
-                batch_indices = None
+                pass
 
             # 计算深度分布
             if levels_info is not None:
@@ -336,9 +335,9 @@ class FractalViTAnalyzer:
             if images.shape[0] >= 1:
                 img = images[0].cpu()
                 if hilbert_indices is not None:
-                    h_indices = hilbert_indices[0] if hilbert_indices.dim() > 1 else hilbert_indices
+                    hilbert_indices[0] if hilbert_indices.dim() > 1 else hilbert_indices
                 else:
-                    h_indices = torch.arange(result.num_tokens)
+                    torch.arange(result.num_tokens)
 
                 if levels_info is not None:
                     depths_for_viz = levels_info[:, :, 0].long()[0]
@@ -566,7 +565,6 @@ class FractalViTAnalyzer:
         """
         # 提取嵌入
         depth_embed = None
-        path_embed = None
         lca_embed = None
 
         if hasattr(self.model, 'fractal_tokenizer'):
@@ -574,7 +572,7 @@ class FractalViTAnalyzer:
             if hasattr(tokenizer, 'depth_embed'):
                 depth_embed = tokenizer.depth_embed.weight.detach()
             if hasattr(tokenizer, 'path_embed'):
-                path_embed = tokenizer.path_embed.weight.detach()
+                tokenizer.path_embed.weight.detach()
             if hasattr(tokenizer, 'lca_embed'):
                 lca_embed = tokenizer.lca_embed.weight.detach()
 
@@ -662,7 +660,7 @@ class FractalViTAnalyzer:
 
         if targets is None:
             # 创建虚拟目标
-            num_classes = getattr(self.model, 'num_classes', 1000)
+            getattr(self.model, 'num_classes', 1000)
             targets = torch.zeros(images.shape[0], dtype=torch.long, device=self.device)
 
         if loss_fn is None:
@@ -956,7 +954,7 @@ def demo_analyzer():
         images = torch.randn(2, 3, 64, 64)
 
         # 生成综合报告
-        report = analyzer.generate_report(images)
+        analyzer.generate_report(images)
 
         # 可视化
         print("\nGenerating visualizations...")

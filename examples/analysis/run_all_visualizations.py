@@ -41,7 +41,6 @@ from examples.analysis import (
     # New expert-level visualizations
     plot_cross_depth_feature_manifold,
     plot_hilbert_attention_map,
-    compare_attention_patterns,
     plot_adaptive_flops_heatmap,
     plot_pareto_frontier,
     plot_computation_comparison,

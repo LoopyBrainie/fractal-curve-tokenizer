@@ -125,10 +125,10 @@ def analyze_poisson_hypothesis(counts: np.ndarray) -> dict:
     if abs(dispersion_index - 1.0) < 0.2:
         print("  -> I approx 1: Consistent with Poisson (Var approx Mean)")
     elif dispersion_index > 1.0:
-        print(f"  -> I > 1: Over-dispersion detected")
+        print("  -> I > 1: Over-dispersion detected")
         print("    Recommendation: Use Negative Binomial distribution")
     else:
-        print(f"  -> I < 1: Under-dispersion detected")
+        print("  -> I < 1: Under-dispersion detected")
         print("    Recommendation: Use alternative distribution")
 
     # KS检验
@@ -144,7 +144,7 @@ def analyze_poisson_hypothesis(counts: np.ndarray) -> dict:
     if ks_pvalue > 0.05:
         print("  -> p > 0.05: Cannot reject Poisson hypothesis")
     else:
-        print(f"  -> p < 0.05: Rejects Poisson hypothesis (alpha=0.05)")
+        print("  -> p < 0.05: Rejects Poisson hypothesis (alpha=0.05)")
 
     # 频率分布
     print("\n[Frequency Distribution]")
@@ -236,7 +236,7 @@ def analyze_poisson_hypothesis(counts: np.ndarray) -> dict:
     if chi2_pvalue > 0.05:
         print("  -> p > 0.05: Cannot reject Poisson hypothesis")
     else:
-        print(f"  -> p < 0.05: Rejects Poisson hypothesis")
+        print("  -> p < 0.05: Rejects Poisson hypothesis")
 
     # 结论
     print("\n" + "="*60)

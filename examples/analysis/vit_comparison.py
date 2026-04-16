@@ -59,13 +59,11 @@ report = comparator.generate_comparison_report(images)
 
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Union
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
-from collections import defaultdict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -444,7 +442,6 @@ class ViTComparator:
             # 模拟标准 ViT 的分词过程
             x = images
             B, C, H, W = x.shape
-            patch_size = 16
 
             # Patch embedding
             x = self.standard_model.patch_embed(x)  # [B, D, H_p, W_p]
@@ -677,7 +674,7 @@ class ViTComparator:
                 x = block(x)
 
             # 简化：使用 QK^T 作为注意力代理
-            N = x.shape[1]
+            x.shape[1]
             if hasattr(self.standard_model.transformer[0], 'attn'):
                 q = x @ self.standard_model.transformer[0].attn.in_proj_weight[:384]
                 k = x @ self.standard_model.transformer[0].attn.in_proj_weight[384:768]
@@ -1240,7 +1237,7 @@ def demo_comparator():
         images = torch.randn(2, 3, 64, 64)
 
         # 生成对比报告
-        report = comparator.generate_comparison_report(images, verbose=True)
+        comparator.generate_comparison_report(images, verbose=True)
 
         # 可视化
         print("\nGenerating visualizations...")
@@ -1269,7 +1266,7 @@ def demo_comparator():
         comparator = ViTComparator(fractal_model, standard_model, device='cpu')
 
         images = torch.randn(2, 3, 64, 64)
-        report = comparator.generate_comparison_report(images, verbose=True)
+        comparator.generate_comparison_report(images, verbose=True)
 
     print("\n[Demo Complete]")
     print("=" * 70)

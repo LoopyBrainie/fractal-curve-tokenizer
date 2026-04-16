@@ -39,7 +39,8 @@ def main():
         import os
         os.makedirs(args.save_dir, exist_ok=True)
 
-    save_path = lambda name: str(Path(args.save_dir) / name) if args.save_dir else None
+    def save_path(name):
+        return str(Path(args.save_dir) / name) if args.save_dir else None
 
     print(f"\n{'=' * 70}")
     print(" Attention Patterns Visualization Demo")
@@ -66,7 +67,7 @@ def main():
         save_path=save_path("head_comparison.png")
     )
 
-    print(f"\n[4] Demo Complete!")
+    print("\n[4] Demo Complete!")
     print(f"{'=' * 70}")
 
     if not args.no_show:

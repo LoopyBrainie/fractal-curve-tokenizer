@@ -15,11 +15,9 @@ import sys
 from pathlib import Path
 from typing import Optional, List, Tuple
 
-import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from matplotlib.colors import LinearSegmentedColormap
 
 # Seaborn 用于统计可视化
 import seaborn as sns
@@ -134,7 +132,7 @@ def plot_hilbert_vs_raster(
     ax.set_xlim(-1, n)
     ax.set_ylim(-1, n)
     ax.set_aspect('equal')
-    ax.set_title(f'Raster Order\nLocality Broken (Red Dashed = Jumps)', fontsize=14, fontweight='bold')
+    ax.set_title('Raster Order\nLocality Broken (Red Dashed = Jumps)', fontsize=14, fontweight='bold')
     ax.legend(loc='upper right')
     ax.grid(True, alpha=0.3)
 

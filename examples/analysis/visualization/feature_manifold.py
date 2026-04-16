@@ -28,12 +28,11 @@ Feature Manifold Visualization - 特征流形可视化
 
 import sys
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional
 
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 

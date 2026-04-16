@@ -38,7 +38,8 @@ def main():
         import os
         os.makedirs(args.save_dir, exist_ok=True)
 
-    save_path = lambda name: str(Path(args.save_dir) / name) if args.save_dir else None
+    def save_path(name):
+        return str(Path(args.save_dir) / name) if args.save_dir else None
 
     print(f"\n{'=' * 70}")
     print(f" Locality Analysis Demo (order={args.order})")
@@ -53,7 +54,7 @@ def main():
     print("\n[3] Animating Hilbert curve construction...")
     animate_hilbert_curve(order=args.order, save_path=save_path("hilbert_animation.gif"))
 
-    print(f"\n[4] Demo Complete!")
+    print("\n[4] Demo Complete!")
     print(f"{'=' * 70}")
 
     if not args.no_show:

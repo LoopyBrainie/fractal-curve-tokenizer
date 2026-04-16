@@ -11,7 +11,6 @@ from typing import Optional, Dict, List
 
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
 
 # 添加项目路径
 PROJECT_ROOT = Path(__file__).parent.parent.parent

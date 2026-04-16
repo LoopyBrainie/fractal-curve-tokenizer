@@ -8,8 +8,6 @@ from pathlib import Path
 from typing import Optional
 
 import matplotlib.pyplot as plt
-import matplotlib.style as mplstyle
-import seaborn as sns
 import numpy as np
 
 # 添加项目路径
@@ -290,7 +288,7 @@ def plot_confusion_matrix(
     if normalize:
         cm = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-8)
 
-    im = ax.imshow(cm, cmap='Blues')
+    ax.imshow(cm, cmap='Blues')
 
     if labels is not None:
         ax.set_xticks(range(len(labels)))
@@ -301,7 +299,7 @@ def plot_confusion_matrix(
         # 添加数值
         for i in range(len(labels)):
             for j in range(len(labels)):
-                text = ax.text(j, i, f'{cm[i, j]:.2f}',
+                ax.text(j, i, f'{cm[i, j]:.2f}',
                               ha='center', va='center',
                               color='white' if cm[i, j] > 0.5 else 'black',
                               fontsize=8)

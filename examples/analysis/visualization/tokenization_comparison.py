@@ -7,13 +7,12 @@
 
 import sys
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Tuple
 
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from matplotlib.colors import LinearSegmentedColormap
 
 # 添加项目路径
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -270,7 +269,7 @@ def plot_depth_distribution(
     fig, axes = plt.subplots(1, 3, figsize=figsize)
 
     depths_np = depths.cpu().numpy()
-    unique_depths = np.unique(depths_np)
+    np.unique(depths_np)
     max_depth = int(depths_np.max())
 
     # =========================================================================

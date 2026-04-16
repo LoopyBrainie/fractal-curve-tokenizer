@@ -7,7 +7,7 @@
 
 import sys
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional
 
 import torch
 import numpy as np
