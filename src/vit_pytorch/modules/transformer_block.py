@@ -202,16 +202,8 @@ class FractalTransformerBlock(nn.Module):
         Returns:
             输出张量，形状为 [B, S, D]。
         """
-        # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
-        if isinstance(levels_info, torch.Tensor):
-            # 转换为 LevelsInfo，确保数据类型为 Long
-            if levels_info.dtype != torch.long:
-                levels_info = levels_info.long()
-
-            # 从数据形状推断 max_level: info_dim = max_level + 1
-            info_dim = levels_info.shape[-1]
-            inferred_max_level = info_dim - 1
-            levels_info = LevelsInfo(data=levels_info, max_level=inferred_max_level)
+        # Fix-12: 使用统一的护城河工厂方法
+        levels_info = LevelsInfo.ensure(levels_info, default_max_level=self.max_level)
 
         # Task 3 重构: 使用 Sigmoid 门控
         # gate ∈ [0, 1] 确保梯度方向始终正确
@@ -367,16 +359,8 @@ class FractalTransformer(nn.Module):
             如果 return_extra_info=True: (output, extra_info)
             否则: output
         """
-        # I98-4: 兼容 raw tensor 和 LevelsInfo 对象
-        if isinstance(levels_info, torch.Tensor):
-            # 转换为 LevelsInfo，确保数据类型为 Long
-            if levels_info.dtype != torch.long:
-                levels_info = levels_info.long()
-
-            # 从数据形状推断 max_level: info_dim = max_level + 1
-            info_dim = levels_info.shape[-1]
-            inferred_max_level = info_dim - 1
-            levels_info = LevelsInfo(data=levels_info, max_level=inferred_max_level)
+        # Fix-12: 使用统一的护城河工厂方法
+        levels_info = LevelsInfo.ensure(levels_info, default_max_level=self.max_level)
 
         batch_size, seq_len, dim = x.shape
 
