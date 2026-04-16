@@ -282,16 +282,21 @@ def train_one_epoch(
             try:
                 outputs = model(images)
             except torch.cuda.OutOfMemoryError as e:
-                num_tokens_info = "unknown"
+                # OOM 遥测: 打印致命调试信息
+                print(f"\n[CRITICAL] CUDA OOM at Step {state.global_step}, Batch {batch_idx}")
+                print(f"  images.shape: {images.shape}")
+                k_info = f", splitter K_max={model.splitter.K_max}" if hasattr(model, 'splitter') else ""
+                print(f"  Batch size: {images.shape[0]}, Image size: {images.shape[2:]}{k_info}")
+
+                # 导出完整的显存分配摘要到文本文件，供事后分析 (Post-mortem)
                 try:
-                    # 尝试获取异常样本的 token 数量（不稳定的额外诊断）
-                    num_tokens_info = f"tokens_after_OOM={images.shape}"
+                    oom_file = f"oom_summary_step_{state.global_step}.txt"
+                    with open(oom_file, "w") as f:
+                        f.write(torch.cuda.memory_summary(device=images.device))
+                    print(f"  OOM memory summary saved to: {oom_file}")
                 except Exception:
-                    pass
-                print(f"\n[FATAL OOM] images.shape={images.shape}, batch_idx={batch_idx}")
-                print(f"[FATAL OOM] 如果 images.shape[1] 异常大，说明 Splitter 产生了过多 tokens")
-                print(f"[FATAL OOM] 如果 shape 正常但仍 OOM，说明是 SwiGLU 内部维度问题或显存碎片化")
-                print(f"[FATAL OOM] 建议: (1) 降低 batch_size (2) 减小 max_tokens (3) 关闭 compile")
+                    pass  # 不因日志问题影响异常传播
+
                 torch.cuda.empty_cache()
                 raise
 
