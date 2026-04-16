@@ -1898,7 +1898,7 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                 # D1+D3 AUDIT FIX: 使用 bincount 向量化，将 N 次 .item() 同步减少为 1 次
                 # 原循环: for d in range(max_d): ratio = (depths == d).float().sum().item()
                 max_d = depths.max().int().item() + 1  # 一次性同步，用于确定 minlength
-                depth_counts = depths.flatten().float().bincount(minlength=max_d)  # [max_d], fully vectorized
+                depth_counts = depths.flatten().long().bincount(minlength=max_d)  # [max_d], fully vectorized
                 total = depth_counts.sum().clamp(min=1)  # prevent div zero
                 depth_ratios = depth_counts / total  # GPU tensor, no .item()
                 for d in range(depth_ratios.numel()):
