@@ -2351,7 +2351,8 @@ class SDSMetric:
 
         n = sds_values.shape[0]
         mean = sds_values.mean().item()
-        std = sds_values.std().item()
+        # Guard against std() degrees of freedom warning when n <= 1
+        std = sds_values.std(unbiased=False).item() if n > 1 else 0.0
         min_val = sds_values.min().item()
         max_val = sds_values.max().item()
 

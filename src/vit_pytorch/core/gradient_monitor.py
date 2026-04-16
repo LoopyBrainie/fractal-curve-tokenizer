@@ -229,7 +229,7 @@ class DeadNodeDetector:
             (死节点索引, 死节点比例)
         """
         dead_mask = self.selection_counts <= threshold
-        # D1-AUDIT FIX: 使用 torch.where 替代 nonzero(as_tuple=True) 避免 Graph Break
+        # D1-AUDIT FIX: 使用 torch.where 替代 nonzero(as_tuple=True) 避免 Graph
         dead_indices = torch.where(dead_mask)[0]
         # D1-AUDIT FIX: 延迟 .item() 到后处理，移除同步点
         dead_ratio = dead_mask.float().mean()

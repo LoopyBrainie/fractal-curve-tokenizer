@@ -7,6 +7,8 @@
 """
 from typing import Any, Dict, Protocol, runtime_checkable
 
+import torch
+
 
 @runtime_checkable
 class LayerOutputProtocol(Protocol):
@@ -70,9 +72,17 @@ def flatten_layer_outputs(
                 _flatten(value, full_key)
             elif isinstance(value, (int, float)):
                 result[full_key] = float(value)
-            elif hasattr(value, 'item'):
-                # D1-AUDIT FIX: 支持 GPU tensor 延迟回传
-                result[full_key] = value.item()
+            elif isinstance(value, torch.Tensor):
+                # FIX-03: Tensor-First 延迟转换策略
+                # 0-dim tensor (scalar) → .item()
+                if value.dim() == 0:
+                    result[full_key] = value.item()
+                # 小向量 (numel <= 32) → .tolist() (如 levels_used)
+                elif value.numel() <= 32:
+                    result[full_key] = value.detach().cpu().tolist()
+                # 大向量 → 聚合为均值 (保留 GPU 带宽)
+                else:
+                    result[full_key] = value.mean().item()
             # 跳过 None, str, list 等其他类型
 
     for layer_name, layer_output in auxiliary_outputs.items():
