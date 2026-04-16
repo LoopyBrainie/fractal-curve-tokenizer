@@ -17,7 +17,7 @@ import gc
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Generator
+from typing import Any, Dict, List, Tuple, Generator
 
 import numpy as np
 import torch

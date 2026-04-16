@@ -81,10 +81,10 @@ class TestHilbertCurveBoundary:
         n = 8
         # 越界坐标应该仍然能处理（但可能产生错误结果）
         # 实际行为：xy_to_d 接受任何整数，但仅对 [0, n) 内的坐标保证正确性
-        d = HilbertCurve.xy_to_d(n, -1, 0)  # 负坐标
+        HilbertCurve.xy_to_d(n, -1, 0)  # 负坐标
         # 不抛出异常，但结果可能无意义
 
-        d = HilbertCurve.xy_to_d(n, n, 0)  # 边界外坐标
+        HilbertCurve.xy_to_d(n, n, 0)  # 边界外坐标
         # 不抛出异常
 
     def test_large_n(self):
@@ -355,7 +355,7 @@ class TestMathInvariantsBoundary:
     def test_no_duplicates(self):
         """无重复点验证"""
         for order in range(1, 6):
-            n = 1 << order
+            1 << order
             points = HilbertCurve.generate_curve_points(order)
 
             # 检查无重复
@@ -377,7 +377,6 @@ class TestMathInvariantsBoundary:
 
     def test_locality_property(self):
         """局部性性质"""
-        n = 8
         points = HilbertCurve.generate_curve_points(3)
 
         # 计算相邻点的距离

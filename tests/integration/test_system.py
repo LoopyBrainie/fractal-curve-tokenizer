@@ -34,8 +34,6 @@ from tests.unit.utilities.vectorization_audit import (
     enable_vectorization_audit,
     is_audit_enabled,
     run_vectorization_audit_on_model,
-    VectorizationReport,
-    VectorizationIssue,
 )
 
 
@@ -168,7 +166,7 @@ def test_batch_size_independence() -> None:
     # 所以我们只测试批次中位置 0 的样本与单样本输出一致
     batch_images = single_image.repeat(4, 1, 1, 1)
     result_batch = model(batch_images)
-    logits_batch = result_batch.logits if hasattr(result_batch, 'logits') else result_batch
+    result_batch.logits if hasattr(result_batch, 'logits') else result_batch
 
     # 注意：由于 HilbertOptimalSplitter 对批次处理的方式，
     # 批次输出可能与单样本输出不同，这是预期行为
@@ -319,10 +317,10 @@ def test_batch_consistency(vectorization_audit_enabled) -> None:
 
             # 输出审计摘要
             if warnings_list:
-                print(f"\n=== Vectorization Audit Report ===")
+                print("\n=== Vectorization Audit Report ===")
                 print(f"Module: {report.module_name}")
                 print(f"Analysis time: {report.analysis_time:.3f}s")
                 print(f"Issues found: {len(report.issues)}")
                 for issue_type, count in report.summary.items():
                     print(f"  - {issue_type}: {count}")
-                print(f"================================\n")
+                print("================================\n")

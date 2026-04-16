@@ -10,9 +10,7 @@ block_transformer.py 单元测试
 5. FractalTransformer 堆叠
 """
 
-import pytest
 import torch
-import torch.nn as nn
 from vit_pytorch.modules.transformer_block import (
     DropPath,
     FractalTransformerBlock,
@@ -175,7 +173,7 @@ class TestFractalTransformerBlock:
 
         # 训练模式
         block.train()
-        output_train = block(x)
+        block(x)
 
         # 评估模式
         block.eval()
@@ -363,7 +361,7 @@ class TestBlockTransformerIntegration:
 
         block = FractalTransformerBlock(dim=dim, heads=4, dim_head=16, mlp_dim=256)
         x = torch.randn(batch, seq_len, dim)
-        x_copy = x.clone()
+        x.clone()
 
         output = block(x)
 

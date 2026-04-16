@@ -181,7 +181,7 @@ class TestVmapScanner:
         assert result["vmap_success"] is True
 
         # 测试不同批量大小 - 应该失败
-        result_diff = scanner.check_vectorization(
+        scanner.check_vectorization(
             hardcoded_batch_func, (x,), batch_size=8
         )
         # 由于是批量维度匹配，vmap 仍可能成功，但函数内部会抛出异常
@@ -362,7 +362,7 @@ class TestDepthOperationsVectorization:
         # 向量化实现
         def depth_bin_sum(probs_b, depths_b):
             # 使用 scatter_add 进行深度分箱
-            result = torch.zeros(max_depth + 1, device=probs_b.device)
+            torch.zeros(max_depth + 1, device=probs_b.device)
             counts = torch.bincount(depths_b, minlength=max_depth + 1)
             sums = torch.zeros(max_depth + 1, device=probs_b.device)
             for d in range(max_depth + 1):
@@ -492,7 +492,7 @@ class TestIntegrationVectorization:
         try:
             from vit_pytorch.layers.splitters.gumbel_topk import GumbelTopKSplitter
 
-            N, D, dim = 64, 6, 128
+            N, _D, dim = 64, 6, 128
             features = torch.randn(N, dim)
             regions = torch.randint(0, 32, (N, 4))
 

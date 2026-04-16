@@ -11,7 +11,6 @@ L1 Foundation: Hilbert Curve Tests
 - 自适应映射 (adaptive_mapping)
 """
 
-import pytest
 from vit_pytorch.core.curve_hilbert import (
     HilbertCurve,
     get_quadrant_order,
@@ -92,7 +91,7 @@ class TestGetQuadrantOrder:
     def test_wide_rectangle_adjustment(self):
         """验证宽矩形的特殊调整"""
         order_wide = HilbertCurve.get_quadrant_order(0, 2.0)  # 宽矩形
-        order_normal = HilbertCurve.get_quadrant_order(0, 1.0)  # 正方形
+        HilbertCurve.get_quadrant_order(0, 1.0)  # 正方形
         # 宽矩形应该有不同的优化顺序
         assert order_wide == [2, 0, 1, 3]  # 偶数层宽矩形顺序
 
@@ -258,7 +257,7 @@ class TestHilbertScanner:
         ]
 
         for H, W in aspect_ratios:
-            rho = max(H, W) / min(H, W)
+            max(H, W) / min(H, W)
             points_np = HilbertScanner.scan(H, W)
             points = torch.from_numpy(np.array(points_np)).float()
             metrics = compute_locality_metrics(points, H, W)
@@ -319,4 +318,4 @@ class TestHilbertScanner:
         # 测试 Pseudo-Hilbert
         H, W = 32, 128
         points = HilbertScanner.scan(H, W)
-        assert len(points) == H * W, f"Pseudo-Hilbert length error"
+        assert len(points) == H * W, "Pseudo-Hilbert length error"

@@ -20,7 +20,7 @@ def test_h1ss_integration():
         num_layers=4,
         heads=4,
     )
-    print(f"    模型创建成功!")
+    print("    模型创建成功!")
 
     # 验证 splitter 类型
     splitter_type = type(model.splitter).__name__

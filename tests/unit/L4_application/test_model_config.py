@@ -11,7 +11,6 @@ L4 Application Tests: FractalConfig
 - LogitsClamp (从 test_i147_refactoring.py 迁移)
 """
 
-import math
 import pytest
 import torch
 

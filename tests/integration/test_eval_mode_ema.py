@@ -41,7 +41,7 @@ class TestEvalModeEMAInitialization:
         # 检查 EMA buffers 存在且已初始化
         # 注意: 并非所有模型都有 EMA buffers，具体检查取决于实现
         # 这里验证模式切换本身工作正常
-        assert model.training == False, "Model should be in eval mode"
+        assert not model.training, "Model should be in eval mode"
 
     def test_train_eval_mode_switch(self):
         """验证 train/eval 模式切换正常工作."""
@@ -55,15 +55,15 @@ class TestEvalModeEMAInitialization:
         )
 
         # 初始应为训练模式
-        assert model.training == True
+        assert model.training
 
         # 切换到评估模式
         model.eval()
-        assert model.training == False
+        assert not model.training
 
         # 切换回训练模式
         model.train()
-        assert model.training == True
+        assert model.training
 
     def test_eval_mode_forward_no_crash(self):
         """验证 eval 模式下前向传播不崩溃."""

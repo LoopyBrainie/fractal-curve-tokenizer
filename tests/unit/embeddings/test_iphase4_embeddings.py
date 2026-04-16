@@ -12,7 +12,6 @@ I-PHASE4: Embeddings 改进方案测试
 
 import pytest
 import torch
-import torch.nn.functional as F
 from vit_pytorch.layers.embeddings import (
     HilbertNativePatchEmbed,
     FourierPathEncoder,
@@ -271,7 +270,7 @@ class TestIntegration:
     def test_all_components(self):
         """验证所有组件可以一起工作"""
         # Patch Embedding with new features
-        patch_embed = HilbertNativePatchEmbed(
+        HilbertNativePatchEmbed(
             channels=3, dim=64, base_patch_size=4,
             max_level=4,
             use_interpolated_pooling=True,

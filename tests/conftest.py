@@ -19,7 +19,7 @@ Pytest Configuration - Shared Fixtures
 import pathlib
 import sys
 from contextlib import contextmanager
-from typing import Generator, List, Optional, Tuple
+from typing import Generator, Optional, Tuple
 
 import pytest
 import torch

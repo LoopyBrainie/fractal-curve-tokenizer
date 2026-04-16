@@ -11,7 +11,6 @@ I167-1: Hilbert Distance Decay Convolution 测试
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from vit_pytorch.layers.splitters.hilbert_distance_decay_conv import (
     HilbertDistanceDecayConv1D,

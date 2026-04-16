@@ -15,12 +15,10 @@ Usage:
 import sys
 sys.path.insert(0, 'src')
 
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple
-import numpy as np
+from typing import Dict
 
 from vit_pytorch.layers.splitters.hilbert_optimal_splitter import HilbertOptimalSplitter
 
@@ -307,7 +305,7 @@ def main():
               f"new_grad={metrics['grad_new_norm']:.4f}, "
               f"ratio={grad_ratio:.1f}x")
         if grad_ratio > 10:
-            print(f"    → [OLD] Gradient explosion suppressed by fix!")
+            print("    → [OLD] Gradient explosion suppressed by fix!")
 
     # 4. Full Gradient Flow (if possible)
     print("\n[4] Full Gradient Flow Test")

@@ -113,7 +113,7 @@ class TestElasticBudgetAlignment:
         print(f"  K_target={K_target:.0f} in [{K_min}, {K_max}]")
 
         # K_target 应该接近 K_bounds 的中点附近
-        K_mid = (K_min + K_max) / 2
+        (K_min + K_max) / 2
         assert K_min <= K_target <= K_max, \
             f"image_size={image_size}: K_target ({K_target:.0f}) 不在 [{K_min}, {K_max}] 范围内"
 
@@ -229,7 +229,7 @@ class TestKBoundsComputation:
             expected_K_max = min(K_MAX_HARD_LIMIT, int(math.ceil(N * cov_max * scale)))
             assert K_max == expected_K_max, f"K_max 计算错误: {K_max} != {expected_K_max}"
 
-            print(f"  [OK] K_bounds 计算正确")
+            print("  [OK] K_bounds 计算正确")
 
 
 if __name__ == "__main__":

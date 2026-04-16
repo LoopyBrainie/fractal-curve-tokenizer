@@ -331,7 +331,7 @@ class TestSDSMetricEdgeCases:
 
         # 边界点（索引 0 和最后）的 SDS 可能与中间不同
         # 这是因为 roll 会导致边界点"看到"序列另一端的点
-        n = len(sds_values)
+        len(sds_values)
         boundary_sds = torch.cat([sds_values[:2], sds_values[-2:]])
         interior_sds = sds_values[2:-2]
 

@@ -57,14 +57,14 @@ import zipfile
 import shutil
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 from tqdm import tqdm
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torch.amp.autocast_mode import autocast
 from torch.amp.grad_scaler import GradScaler
 from torchvision import datasets, transforms
@@ -149,7 +149,7 @@ def download_tiny_imagenet(data_root: Path) -> bool:
     print("Downloading Tiny ImageNet Dataset")
     print("="*60)
     print(f"  Target: {target_dir}")
-    print(f"  Size: ~237MB")
+    print("  Size: ~237MB")
     print("="*60 + "\n")
 
     zip_path = data_root / "tiny-imagenet-200.zip"
@@ -190,7 +190,7 @@ def download_tiny_imagenet(data_root: Path) -> bool:
                     print(f"[WARN] Downloaded file is invalid: {e}")
                     if zip_path.exists():
                         zip_path.unlink()
-            print(f"[WARN] Failed, trying next source...")
+            print("[WARN] Failed, trying next source...")
 
         if not download_success:
             print("\n[ERROR] All download sources failed.")
@@ -216,7 +216,7 @@ def download_tiny_imagenet(data_root: Path) -> bool:
         # 验证
         train_classes = len(list((target_dir / "train").iterdir()))
         val_classes = len([d for d in (target_dir / "val").iterdir() if d.is_dir()])
-        print(f"\n[OK] Dataset ready:")
+        print("\n[OK] Dataset ready:")
         print(f"  Train classes: {train_classes}")
         print(f"  Val classes: {val_classes}")
 
@@ -832,9 +832,9 @@ def run_experiment(
         print(f"\n{'='*60}")
         print(f"运行 {run_id}: {config.name} (mode={config.mode}, seed={seed})")
         if config.use_channels_last and device.type == 'cuda':
-            print(f"  [I78] channels-last: ON")
+            print("  [I78] channels-last: ON")
         if config.use_compile:
-            print(f"  [I78] torch.compile: ON")
+            print("  [I78] torch.compile: ON")
         print(f"{'='*60}")
 
     # 创建模型
@@ -1158,12 +1158,12 @@ def main():
     print(f"使用设备: {device}")
 
     # I78 性能优化状态
-    print(f"\n[I78] 性能优化:")
+    print("\n[I78] 性能优化:")
     print(f"  channels-last: {'ON' if args.use_channels_last and device.type == 'cuda' else 'OFF (CPU)'}")
     print(f"  torch.compile: {'ON' if args.use_compile else 'OFF'}")
 
     # I31 面积编码配置
-    print(f"\n[I31] 面积编码:")
+    print("\n[I31] 面积编码:")
     print(f"  use_area_encoding: {args.use_area_encoding}")
     print(f"  fourier_levels: {args.fourier_levels}")
 
@@ -1285,13 +1285,13 @@ def main():
         log_content.append("Hilbert vs Raster 消融实验日志")
         log_content.append(f"时间戳: {timestamp}")
         log_content.append("=" * 60)
-        log_content.append(f"\n[I78] 性能优化:")
+        log_content.append("\n[I78] 性能优化:")
         log_content.append(f"  channels-last: {'ON' if args.use_channels_last and device.type == 'cuda' else 'OFF'}")
         log_content.append(f"  torch.compile: {'ON' if args.use_compile else 'OFF'}")
-        log_content.append(f"\n[I31] 面积编码:")
+        log_content.append("\n[I31] 面积编码:")
         log_content.append(f"  use_area_encoding: {args.use_area_encoding}")
         log_content.append(f"  fourier_levels: {args.fourier_levels}")
-        log_content.append(f"\n训练配置:")
+        log_content.append("\n训练配置:")
         log_content.append(f"  epochs: {args.epochs}")
         log_content.append(f"  batch_size: {args.batch_size}")
         log_content.append(f"  learning_rate: {args.lr}")
@@ -1303,12 +1303,12 @@ def main():
 
         # 添加分析结果
         if analysis:
-            log_content.append(f"\n总体结果排名 (按验证准确率):")
+            log_content.append("\n总体结果排名 (按验证准确率):")
             sorted_modes = sorted(analysis.items(), key=lambda x: x[1]['mean_val_acc'], reverse=True)
             for i, (mode, stats) in enumerate(sorted_modes, 1):
                 log_content.append(f"  {i}. {mode.upper()}: {stats['mean_val_acc']:.2f}% ± {stats['std_val_acc']:.2f}%")
 
-            log_content.append(f"\n详细统计:")
+            log_content.append("\n详细统计:")
             for mode, stats in analysis.items():
                 log_content.append(f"\n  [{mode.upper()}]")
                 log_content.append(f"    验证准确率: {stats['mean_val_acc']:.2f}% ± {stats['std_val_acc']:.2f}%")
@@ -1328,7 +1328,7 @@ def main():
             raster_acc = mode_results['raster'].mean_val_acc
             diff = hilbert_acc - raster_acc
 
-            log_content.append(f"\n[Hilbert vs Raster 对比]")
+            log_content.append("\n[Hilbert vs Raster 对比]")
             log_content.append(f"  Hilbert:  {hilbert_acc:.2f}%")
             log_content.append(f"  Raster:   {raster_acc:.2f}%")
             log_content.append(f"  差异:     {diff:+.2f}%")
@@ -1338,7 +1338,7 @@ def main():
             elif diff < -1.0:
                 log_content.append(f"  结论: Raster 排序优于 Hilbert ({diff:.2f}%)")
             else:
-                log_content.append(f"  结论: Hilbert 与 Raster 差异不显著 (|diff| < 1%)")
+                log_content.append("  结论: Hilbert 与 Raster 差异不显著 (|diff| < 1%)")
 
         if 'standard' in mode_results:
             for fractal_mode in ['hilbert', 'raster']:
@@ -1357,7 +1357,7 @@ def main():
                     elif diff < -1.0:
                         log_content.append(f"  结论: 分形 tokenization 下降 {abs(diff):.2f}%")
                     else:
-                        log_content.append(f"  结论: 分形 tokenization 差异不显著")
+                        log_content.append("  结论: 分形 tokenization 差异不显著")
 
         log_content.append("\n" + "=" * 60)
 
@@ -1401,7 +1401,7 @@ def main():
                 'hilbert_best_epoch': hilbert.best_epoch,
                 'raster_best_epoch': raster.best_epoch,
             }
-            print(f"\n[Hilbert vs Raster 评估]")
+            print("\n[Hilbert vs Raster 评估]")
             print(f"  验证准确率: Hilbert={hilbert.mean_val_acc:.2f}%, Raster={raster.mean_val_acc:.2f}%")
             print(f"  提升幅度: {hilbert.mean_val_acc - raster.mean_val_acc:+.2f}%")
             print(f"  吞吐量: Hilbert={hilbert.throughput:.1f}, Raster={raster.throughput:.1f} images/sec")

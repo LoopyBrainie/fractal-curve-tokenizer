@@ -27,15 +27,13 @@ from __future__ import annotations
 
 import ast
 import inspect
-import sys
 import time
 import warnings
 import functools
-from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.fx
@@ -309,7 +307,7 @@ class ASTVectorizationAnalyzer:
                             issue_type="recursion",
                             location=(file_path, func_node.lineno),
                             function_name=func_name,
-                            description=f"Recursive call detected in forward path",
+                            description="Recursive call detected in forward path",
                             severity="warning",
                             suggestion="Recursion in forward pass may cause performance issues. Consider iterative implementation.",
                         )
@@ -324,7 +322,7 @@ class ASTVectorizationAnalyzer:
                                 issue_type="recursion",
                                 location=(file_path, func_node.lineno),
                                 function_name=func_name,
-                                description=f"Recursive call detected in forward path",
+                                description="Recursive call detected in forward path",
                                 severity="warning",
                                 suggestion="Recursion in forward pass may cause performance issues. Consider iterative implementation.",
                             )
@@ -373,7 +371,7 @@ class FXTracingAnalyzer:
                 )
             )
 
-        except Exception as e:
+        except Exception:
             # Other errors (not necessarily vectorization issues)
             pass
 
@@ -782,12 +780,11 @@ def audit_vectorization(
 
             # Get audit tool
             auditor = VectorizationAuditTool()
-            component_name = name or func.__name__
 
             # For methods, get self to access module info
             self_arg = args[0] if args else None
             if hasattr(self_arg, "__class__"):
-                component_name = f"{self_arg.__class__.__name__}.{func.__name__}"
+                pass
 
             # Run analysis
             report, _ = auditor.analyze_component(func, *args, **kwargs)
@@ -836,13 +833,13 @@ def vectorization_audit(
     from . import VectorizationAuditTool
 
     start_time = time.perf_counter()
-    auditor = VectorizationAuditTool()
+    VectorizationAuditTool()
     issues_found: List[VectorizationIssue] = []
 
     try:
         yield
     finally:
-        elapsed = time.perf_counter() - start_time
+        time.perf_counter() - start_time
 
     # Report findings
     if issues_found:

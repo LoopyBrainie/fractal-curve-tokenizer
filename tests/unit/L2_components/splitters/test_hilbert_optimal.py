@@ -12,12 +12,10 @@ H1SS (Hilbert-Optimal Splitter) 6公理验证测试
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 from vit_pytorch.layers.splitters import HilbertOptimalSplitter
 from vit_pytorch.layers.splitters.hilbert_optimal_splitter import (
     compute_locality_score,
-    compute_determinism_score,
     compute_tree_consistency,
     compute_consistency_stats,
 )

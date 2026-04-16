@@ -12,7 +12,6 @@ ffn_swiglu.py 单元测试
 
 import pytest
 import torch
-import torch.nn as nn
 from vit_pytorch.layers.ffn.swiglu import SwiGLUFFN, AdaptiveFractalFeedForward
 
 
@@ -182,7 +181,7 @@ class TestAdaptiveFractalFeedForward:
 
         # 训练模式
         ffn.train()
-        output_train = ffn(x)
+        ffn(x)
 
         # 评估模式
         ffn.eval()
@@ -270,7 +269,7 @@ class TestFFNSwigluIntegration:
         ffn = AdaptiveFractalFeedForward(dim, dim * 4, ffn_type='swiglu_level')
 
         x = torch.randn(2, 16, dim)
-        x_copy = x.clone()
+        x.clone()
 
         output = ffn(x)
 

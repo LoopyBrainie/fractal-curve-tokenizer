@@ -7,7 +7,6 @@ FER协方差计算单元测试 (I112-2)
 3. 协方差计算的数值稳定性
 """
 
-import pytest
 import torch
 import torch.nn.functional as F
 

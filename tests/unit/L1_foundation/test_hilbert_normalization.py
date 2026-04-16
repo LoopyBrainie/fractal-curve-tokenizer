@@ -20,7 +20,6 @@ L1 Foundation: Hilbert Normalization Tests (I161-1 修复)
 
 from __future__ import annotations
 
-import pytest
 import torch
 import numpy as np
 
@@ -125,7 +124,7 @@ class TestHilbertNormalization:
         paths_d1 = torch.zeros(1, 1, 4, dtype=torch.long)
         paths_d1[0, 0, 0] = 1
         levels_d1 = LevelsInfo.from_arrays(depths_d1, paths_d1, max_level=4)
-        h_norm_d1 = levels_d1.get_hilbert_indices(normalize=True)[0, 0].item()
+        levels_d1.get_hilbert_indices(normalize=True)[0, 0].item()
 
         # 深度2: 区域1的4个子区域
         h_norm_children = []
@@ -138,7 +137,7 @@ class TestHilbertNormalization:
             h_norm_children.append(levels_d2.get_hilbert_indices(normalize=True)[0, 0].item())
 
         # 子区域的均值应该接近父区域（考虑Hilbert曲线的特性）
-        mean_child = np.mean(h_norm_children)
+        np.mean(h_norm_children)
 
         # 由于Hilbert曲线的旋转特性，子区域分布可能不完全对称
         # 但我们验证：所有子区域都在[0.5, 1.0]范围内（与父区域接近）
@@ -175,14 +174,14 @@ class TestHilbertNormalizationMathProperties:
         paths = torch.zeros(1, 1, 4, dtype=torch.long)
         levels = LevelsInfo.from_arrays(depths, paths, max_level=4)
         h_norm = levels.get_hilbert_indices(normalize=True)[0, 0].item()
-        assert abs(h_norm - 0.0) < 1e-4, f"深度1的H=0归一化应为0"
+        assert abs(h_norm - 0.0) < 1e-4, "深度1的H=0归一化应为0"
 
         # 深度2，全0路径：H=0
         depths = torch.tensor([[2]], dtype=torch.long)
         paths = torch.zeros(1, 1, 4, dtype=torch.long)
         levels = LevelsInfo.from_arrays(depths, paths, max_level=4)
         h_norm = levels.get_hilbert_indices(normalize=True)[0, 0].item()
-        assert abs(h_norm - 0.0) < 1e-4, f"深度2的H=0归一化应为0"
+        assert abs(h_norm - 0.0) < 1e-4, "深度2的H=0归一化应为0"
 
     def test_consistency_across_same_position(self):
         """相同空间位置在不同深度应有可比较的归一化值."""

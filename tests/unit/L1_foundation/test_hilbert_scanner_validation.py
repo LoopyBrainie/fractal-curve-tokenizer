@@ -18,7 +18,6 @@ L1 Foundation: Hilbert Scanner Validation Tests (I162-2)
 
 import math
 
-import pytest
 
 from vit_pytorch.core.curve_hilbert import (
     HilbertCurve,

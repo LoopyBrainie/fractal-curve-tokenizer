@@ -14,7 +14,6 @@ L1 Foundation: Constants Validation Tests
 - 注意力偏置缩放
 """
 
-import pytest
 import torch
 import torch.nn.functional as F
 
@@ -218,7 +217,6 @@ class TestElasticBudgetConstants:
         """ELASTIC_COVERAGE bounds 与 K_COVERAGE bounds 一致."""
         from vit_pytorch.core.constants import (
             ELASTIC_COVERAGE_MIN,
-            K_COVERAGE_MAX_HARD,
             K_COVERAGE_MIN,
         )
 
@@ -357,7 +355,7 @@ class TestFP16ClampConstants:
         safety_factor = fp16_max / LOGIT_CLAMP_BOUND
 
         assert safety_factor > 1000, f"安全系数 {safety_factor:.0f} 不足"
-        assert LOGIT_CLAMP_BOUND < fp16_max / 10, f"应有 10× 安全余量"
+        assert LOGIT_CLAMP_BOUND < fp16_max / 10, "应有 10× 安全余量"
 
     def test_grad_clamp_fp16_safe(self):
         """GRAD_CLAMP_BOUND << FP16 最大值."""
@@ -438,7 +436,7 @@ class TestFP16ClampConstants:
         from vit_pytorch.core.constants import FP16_SAFE_EPSILON
 
         # FP16 最小正规数 ≈ 6.1e-5
-        fp16_min_normal = 2**-14  # ≈ 6.1e-5
+        2**-14  # ≈ 6.1e-5
 
         # 注意: 1e-6 < 6.1e-5，这可能需要调整
         # 但对于 log 计算等场景，1e-8 仍足够

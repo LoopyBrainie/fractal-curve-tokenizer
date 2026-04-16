@@ -18,7 +18,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -48,7 +48,6 @@ from .benchmark_fractal_vit import (
 )
 
 from .check_convergence import (
-    TrainingHistory,
     train_model,
     analyze_convergence,
     create_color_classification_dataset,

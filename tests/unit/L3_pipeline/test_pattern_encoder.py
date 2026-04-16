@@ -10,7 +10,6 @@ HilbertPatternEncoder单元测试 (I162-1)
 
 import pytest
 import torch
-import torch.nn as nn
 
 from vit_pytorch import (
     HilbertPatternEncoder,
@@ -291,8 +290,8 @@ class TestHilbertLocalityPreservation:
         hilbert_out = encoder(tokens, hilbert_order)
 
         # 计算相邻位置的差异
-        raster_diff = (raster_out[:, 1:, :] - raster_out[:, :-1, :]).abs().mean()
-        hilbert_diff = (hilbert_out[:, 1:, :] - hilbert_out[:, :-1, :]).abs().mean()
+        (raster_out[:, 1:, :] - raster_out[:, :-1, :]).abs().mean()
+        (hilbert_out[:, 1:, :] - hilbert_out[:, :-1, :]).abs().mean()
 
         # Hilbert序的相邻差异应更小（局部性更好）
         # 注意：由于模型学习，这个测试可能不总是成立，但应该显示趋势

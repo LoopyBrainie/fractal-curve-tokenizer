@@ -11,7 +11,6 @@ L1 Foundation: Hilbert Locality Metrics Tests
 """
 
 import math
-from typing import Tuple
 
 import pytest
 
@@ -39,7 +38,7 @@ class TestHilbertLocalityMetrics:
 
     def test_pseudo_hilbert_16x16(self):
         """16×16 Pseudo-Hilbert 局部性."""
-        points = PseudoHilbertCurve.scan(16, 16)
+        PseudoHilbertCurve.scan(16, 16)
 
         metrics = HilbertLocalityMetrics.full_report(16, 16)
 
@@ -52,7 +51,7 @@ class TestHilbertLocalityMetrics:
 
     def test_pseudo_hilbert_12x12(self):
         """12×12 非 2^k Pseudo-Hilbert 局部性."""
-        points = PseudoHilbertCurve.scan(12, 12)
+        PseudoHilbertCurve.scan(12, 12)
 
         metrics = HilbertLocalityMetrics.full_report(12, 12)
 
@@ -151,7 +150,7 @@ class TestHilbertLocalityMetrics:
         """32×32 性能基准测试."""
         import time
 
-        points = PseudoHilbertCurve.scan(32, 32)
+        PseudoHilbertCurve.scan(32, 32)
 
         start = time.time()
         for _ in range(100):
