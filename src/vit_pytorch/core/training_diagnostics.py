@@ -22,13 +22,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 # 導入梯度監控模塊
-from vit_pytorch.core.gradient_monitor import (
-    GradientMonitor,
-    create_gradient_monitor,
-)
 
 
 class LossDiagnostics:
@@ -114,9 +110,9 @@ class LossDiagnostics:
 
             # 診斷建議
             if avg_max > 15:
-                lines.append(f"  ⚠️  WARNING: logits max > 15 可能導致 softmax 溢出!")
+                lines.append("  ⚠️  WARNING: logits max > 15 可能導致 softmax 溢出!")
             if abs(avg_mean) > 10:
-                lines.append(f"  ⚠️  WARNING: logits mean 異常偏離 0")
+                lines.append("  ⚠️  WARNING: logits mean 異常偏離 0")
 
         lines.append("\n" + "=" * 60)
         return "\n".join(lines)

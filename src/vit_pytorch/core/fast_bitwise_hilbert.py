@@ -208,7 +208,7 @@ class FastBitwiseHilbert:
         if H == W and (H & (H - 1)) == 0:
             # 推导位宽
             dtype = x.dtype
-            B = FastBitwiseHilbert.infer_bit_width(dtype)
+            FastBitwiseHilbert.infer_bit_width(dtype)
 
             # 2^k 正方形：直接使用坐标
             # D4-AUDIT FIX: %H → &(H-1)，H 是 2 的幂
@@ -246,7 +246,7 @@ class FastBitwiseHilbert:
         if H == W and (H & (H - 1)) == 0:
             # 推导位宽
             dtype = d.dtype
-            B = FastBitwiseHilbert.infer_bit_width(dtype)
+            FastBitwiseHilbert.infer_bit_width(dtype)
 
             n = H
 

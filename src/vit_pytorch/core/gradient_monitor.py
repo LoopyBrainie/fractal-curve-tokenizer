@@ -22,9 +22,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Any, Tuple
 import warnings
 
 
@@ -230,8 +229,10 @@ class DeadNodeDetector:
             (死节点索引, 死节点比例)
         """
         dead_mask = self.selection_counts <= threshold
-        dead_indices = dead_mask.nonzero(as_tuple=True)[0]
-        dead_ratio = dead_mask.float().mean().item()
+        # D1-AUDIT FIX: 使用 torch.where 替代 nonzero(as_tuple=True) 避免 Graph Break
+        dead_indices = torch.where(dead_mask)[0]
+        # D1-AUDIT FIX: 延迟 .item() 到后处理，移除同步点
+        dead_ratio = dead_mask.float().mean()
         return dead_indices, dead_ratio
 
     def get_selection_distribution(self) -> Dict[str, float]:
@@ -367,7 +368,7 @@ class LossCurvatureAnalyzer:
         lines = [
             "### 损失函数曲率",
             "",
-            f"- LagrangianBudgetLoss ↔ CrossEntropyLoss",
+            "- LagrangianBudgetLoss ↔ CrossEntropyLoss",
             f"- 当前余弦相似度: {latest_sim:.4f}",
             f"- 历史平均相似度: {avg_sim:.4f}",
         ]

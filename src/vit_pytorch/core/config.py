@@ -37,7 +37,6 @@ from .constants import (
     K_MAX_HARD_LIMIT,
     K_ADAPTIVE_REFERENCE_SIZE,
     LEARNABLE_QUOTA_ENABLED,
-    QUOTA_INIT_LOGITS,
     QUOTA_ENTROPY_WEIGHT,
     HILBERT_BIAS_SCALE,
     LEVEL_BIAS_SCALE,
@@ -1251,7 +1250,7 @@ class SemanticSplitterConfig:
         if not 0 < self.diversity_weight <= 1:
             raise ValueError(f"diversity_weight 必须在 (0, 1] 范围内, got {self.diversity_weight}")
         if not 0 < self.reconstruction_weight <= 1:
-            raise ValueError(f"reconstruction_weight 必须在 (0, 1] 范围内")
+            raise ValueError("reconstruction_weight 必须在 (0, 1] 范围内")
         if not 0 < self.split_threshold < 1:
             raise ValueError(f"split_threshold 必须在 (0, 1) 范围内, got {self.split_threshold}")
         if self.gumbel_temp_end >= self.gumbel_temp_start:

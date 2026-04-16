@@ -28,7 +28,6 @@ Hilbert 路径缓存:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, Optional, Tuple

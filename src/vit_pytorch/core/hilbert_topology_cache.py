@@ -152,7 +152,8 @@ class HilbertTopologyCache(nn.Module):
             mask: [N, K] 有效掩码 (True=有效)
         """
         # 计算候选区域数量
-        N = sum(4 ** d for d in range(max_level + 1))
+        # D4-AUDIT FIX: 使用闭式公式替代循环 sum(4**d)
+        N = ((1 << (2 * (max_level + 1))) - 1) // 3
 
         # 获取 Hilbert 索引
         hilbert_indices = self._compute_hilbert_indices(max_level)
@@ -206,7 +207,8 @@ class HilbertTopologyCache(nn.Module):
 
         # 方法1: 直接构建（仍然需要循环，但避免了 sum() 和 extend）
         # 使用闭式公式计算总区域数
-        total_regions = int((4 ** (max_level + 1) - 1) / 3)
+        # D4 AUDIT FIX: 4 ** (max_level + 1) -> 1 << (2 * max_level + 2)
+        total_regions = int(((1 << (2 * max_level + 2)) - 1) / 3)
 
         # 预分配结果张量
         result = torch.empty(total_regions, dtype=torch.long, device=device)
@@ -214,8 +216,9 @@ class HilbertTopologyCache(nn.Module):
         # 单循环填充（比原来高效）
         pos = 0
         for d in range(max_level + 1):
-            n_regions = 4 ** d
-            offset = (4 ** d - 1) // 3
+            # D4-AUDIT FIX: 使用左移替代幂运算
+            n_regions = 1 << (2 * d)
+            offset = ((1 << (2 * d)) - 1) // 3
             result[pos:pos + n_regions] = torch.arange(n_regions, dtype=torch.long, device=device) + offset
             pos += n_regions
 

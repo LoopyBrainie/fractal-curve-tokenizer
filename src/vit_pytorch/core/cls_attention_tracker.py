@@ -24,8 +24,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
-import math
+from typing import Dict, List, Optional
 
 
 @dataclass

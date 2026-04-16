@@ -66,7 +66,6 @@ import torch.nn as nn
 
 from vit_pytorch.core.pattern_encoder import (
     HilbertPatternEncoder,
-    HilbertPatternEncoderLight,
 )
 
 

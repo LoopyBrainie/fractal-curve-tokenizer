@@ -44,16 +44,19 @@ Hilbert Curve 集成:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 import torch
+
+if TYPE_CHECKING:
+    from vit_pytorch.modules.base_tokenizer import TokenizerOutput
+
+from .curve_hilbert import xy_to_hilbert_distance
 
 # I102-8: Hilbert 索引查找表 (预计算)
 # I101-2: 移除深度上限硬编码，扩展到 D_max=8
 # 空间复杂度: Σ_{d=1}^8 4^d = 4(4^8-1)/3 ≈ 21,844 条目 ≈ 175 KB
 # 对于 max_depth > 8，仍可使用但会回退到 Python 循环
 _MAX_HILBERT_DEPTH = 8
-
-from .curve_hilbert import xy_to_hilbert_distance
 
 _HILBERT_LUT = {}
 for d in range(1, _MAX_HILBERT_DEPTH + 1):
@@ -76,6 +79,16 @@ for d in range(1, _MAX_HILBERT_DEPTH + 1):
 
         # 计算 Hilbert 距离
         _HILBERT_LUT[d][path_int] = xy_to_hilbert_distance(1 << d, x, y)
+
+# D2-AUDIT FIX: 预计算 tensor 形式的 LUT 用于向量化查找
+# 避免 Python 循环 + dict lookup，转为直接 tensor 索引
+_HILBERT_LUT_TENSOR = {}
+for d in range(1, _MAX_HILBERT_DEPTH + 1):
+    size = 1 << (2 * d)  # 4**d = 2**(2d)
+    lut = torch.empty(size, dtype=torch.long)
+    for path_int in range(size):
+        lut[path_int] = _HILBERT_LUT[d][path_int]
+    _HILBERT_LUT_TENSOR[d] = lut
 
 # I103-2: Hilbert 索引权重缓存 (类级缓存)
 # 避免在 get_hilbert_indices() 中重复创建权重张量
@@ -404,7 +417,8 @@ class LevelsInfo:
         depth_safe = depth.clamp(min=1, max=12)
 
         # 计算 4^depth [B, N] 或 [N]，并 clamp 防止溢出
-        four_pow_depth = (4 ** depth_safe).clamp(max=1e9)
+        # D4-AUDIT FIX: 4^d = 2^(2d) = exp2(2d)，CUDA 上 fused FMA 比 pow 更快
+        four_pow_depth = torch.exp2(depth_safe * 2.0).clamp(max=1e9)
 
         # 深度根归一化: (H / 4^d)^(1/d)
         normalized = (hilbert_dist.float() / four_pow_depth.float()) ** (1.0 / depth_safe.float())
@@ -464,13 +478,9 @@ class LevelsInfo:
             weights = self._get_hilbert_weights_for_depth(d, self.data.device)
             path_ints = (paths[:, :, :d] * weights).sum(dim=-1)
 
-            # LUT 查找
+            # D2-AUDIT FIX: 向量化 LUT 查找 - Python dict → tensor indexing
             valid_path_ints = path_ints[mask]
-            results[mask] = torch.tensor(
-                [_HILBERT_LUT[d][int(p)] for p in valid_path_ints],
-                dtype=torch.long,
-                device=self.data.device
-            )
+            results[mask] = _HILBERT_LUT_TENSOR[d][valid_path_ints]
 
         # I161-1 修复: 深度根归一化
         if normalize:

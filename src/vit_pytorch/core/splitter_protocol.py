@@ -389,7 +389,6 @@ class SplitResult:
             probs: [B, N] 分割概率（可选）
             K_soft: 可微分 K 值（STE 直通估计）（可选）
         """
-        import torch
 
         self.regions = regions
         self.depths = depths
@@ -407,7 +406,7 @@ class SplitResult:
         # 验证形状一致性
         M = regions.shape[0]
         assert depths.shape[0] == M, f"depths 形状不匹配: {depths.shape[0]} vs {M}"
-        assert batch_indices.shape[0] == M, f"batch_indices 形状不匹配"
+        assert batch_indices.shape[0] == M, "batch_indices 形状不匹配"
         # 注意: hilbert_indices 现在是 [N]（所有候选区域），不再等于 M
 
     @property
