@@ -37,8 +37,8 @@ class ShapeStabilizer:
 
     def __init__(
         self,
-        low_frequency_buckets: Tuple[int, ...] = (128, 256, 512),
-        high_frequency_buckets: Tuple[int, ...] = (1024, 2048, 4096, 8192),
+        low_frequency_buckets: Tuple[int, ...] = (64, 128, 256, 512),
+        high_frequency_buckets: Tuple[int, ...] = (1024, 2048),
     ):
         """
         初始化非线性桶集合。
@@ -127,28 +127,23 @@ class ShapeStabilizer:
         actual_max_len = lengths.max()  # Tensor
         k_bucket_tensor = self.get_nearest_bucket_tensor(actual_max_len)  # Tensor
 
-        # 计算需要 padding 的长度
-        pad_len = int(k_bucket_tensor) - K  # Tensor -> int
+        # 计算需要 padding 的长度（保持为 Tensor）
+        pad_len = k_bucket_tensor - K  # Tensor
 
-        # 条件 padding/truncation
-        if pad_len > 0:
-            # Padding：K < K_bucket
-            tokens_padded = torch.cat(
-                [tokens, tokens.new_zeros((B, pad_len, D))],
-                dim=1,
-            )
-            levels_padded = torch.cat(
-                [levels, levels.new_full((B, pad_len), -1)],  # -1 表示无效
-                dim=1,
-            )
-        elif pad_len < 0:
-            # Truncation：K > K_bucket（K 超过最大桶）
-            tokens_padded = tokens[:, :int(k_bucket_tensor), :]
-            levels_padded = levels[:, :int(k_bucket_tensor)]
-        else:
-            # 无需调整
-            tokens_padded = tokens
-            levels_padded = levels
+        # torch.cat 方式：完全图兼容
+        # 只有当 pad_len > 0 时才创建 padding tensor
+        # 使用 max(pad_len, 0) 确保 size 不为负
+        safe_pad_len = torch.clamp(pad_len, min=0)
+        zeros_tokens = torch.zeros((B, safe_pad_len, D), dtype=tokens.dtype, device=tokens.device)
+        neg_one_levels = torch.full((B, safe_pad_len), -1, dtype=levels.dtype, device=levels.device)
+
+        # 拼接 padding（如果 pad_len <= 0，safe_pad_len = 0，cat 结果与原相同）
+        tokens_padded = torch.cat([tokens, zeros_tokens], dim=1)
+        levels_padded = torch.cat([levels, neg_one_levels], dim=1)
+
+        # Truncation：如果 K > k_bucket，沿 dim=1 截断
+        tokens_padded = tokens_padded[:, :k_bucket_tensor, :]
+        levels_padded = levels_padded[:, :k_bucket_tensor]
 
         return tokens_padded, levels_padded, lengths
 
