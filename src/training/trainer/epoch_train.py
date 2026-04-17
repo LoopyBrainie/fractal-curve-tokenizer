@@ -363,8 +363,11 @@ def train_one_epoch(
                     for _k, _v in _flat.items():
                         if _k not in _aux_flat_accum:
                             _aux_flat_accum[_k] = []
-                        # I-OOM FIX: detach() 断开图 + cpu() 搬离显存 + non_blocking 异步拷贝
-                        _aux_flat_accum[_k].append(_v.detach().to('cpu', non_blocking=True))
+                        # FIX: flatten_layer_outputs 返回 Dict[str, float]，但防御性检查 tensor
+                        if isinstance(_v, torch.Tensor):
+                            _aux_flat_accum[_k].append(_v.detach().to('cpu', non_blocking=True))
+                        else:
+                            _aux_flat_accum[_k].append(_v)
             else:
                 logits = outputs
 
