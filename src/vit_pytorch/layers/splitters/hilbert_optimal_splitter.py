@@ -698,7 +698,24 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             # 识别父节点变化的位置
             parent_changed = torch.zeros_like(sorted_parents)
             parent_changed[1:] = (sorted_parents[1:] != sorted_parents[:-1]).long()
-            slot_within_parent = torch.cumsum(parent_changed, dim=0)  # 从0开始的slot编号
+
+            # 计算全局位置（从0开始）
+            global_pos = torch.arange(len(sorted_parents), device=device, dtype=torch.long)
+
+            # 使用 cumsum 构建每组的其实位置
+            group_positions = torch.where(parent_changed == 1)[0]
+            group_starts = torch.cat([
+                torch.zeros(1, dtype=torch.long, device=device),
+                group_positions
+            ])
+
+            # 计算组起始位置的差值，构建 group_elements 用于 cumsum
+            diff = group_starts[1:] - group_starts[:-1]
+            group_elements = torch.zeros_like(sorted_parents)
+            group_elements[group_positions] = diff
+
+            # slot = 全局位置 - 组起始位置
+            slot_within_parent = global_pos - torch.cumsum(group_elements, dim=0)
 
             # 取出有效的 slot 和对应的子节点（slot 必须在 0-3 范围内）
             valid_mask = slot_within_parent < 4
