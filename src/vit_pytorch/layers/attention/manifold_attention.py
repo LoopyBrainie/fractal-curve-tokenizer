@@ -1365,8 +1365,6 @@ class ManifoldNativeAttention(nn.Module):
         if self._total_count > 0:
             cache["nan_rate"] = self._nan_count / self._total_count
 
-        return cache_count / self._total_count
-
         return cache
 
     @property
