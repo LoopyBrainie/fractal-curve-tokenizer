@@ -2,34 +2,98 @@
 
 ## 5.1 Overview
 
-The `HilbertAwareMultiScaleAttention` extends standard multi-head attention with **Hilbert curve-derived attention biases**, encoding spatial proximity and hierarchical relationships explicitly. It supports **affine modulation** (I31-3) for area-aware attention biasing.
+The `ManifoldNativeAttention` (MNA) is the core attention mechanism of the Fractal Curve ViT, designed to operate on the non-Euclidean manifold of variable-resolution fractal tokens.
 
-**Complexity Note**: Attention complexity remains $O(N^2 \cdot D)$. The ~40× efficiency gain comes from token count reduction ($N \approx 32$ vs $307K$), not asymptotic complexity change.
+**Key Innovation**: Unlike standard ViT that treats tokens as a flat sequence, this mechanism explicitly models **hierarchical and spatial relationships** derived from the Hilbert curve and quadtree structure.
 
-**Bias Scaling**: The Hilbert bias is scaled by `hilbert_bias_scale × √d_k` (I122-2 simplification), eliminating the need for per-head temperature τ_h.
+**Efficiency**: Achieves ~40× reduction in attention matrix complexity by operating on sparse, non-uniform token sets (N ≈ 32-64 vs 307K for standard ViT).
+
+### 5.1.1 Architecture
+
+```
+X_{l+1} = X_l + Attn(X_l) + FractalResidual(X_l)
+
+Attn = BandedAttention(QK + B_manifold)
+B_manifold = GeometricLatentDecoder(ξ)
+```
+
+### 5.1.2 Complexity Analysis
+
+| Metric | Standard ViT | Fractal ViT |
+|:-------|:-------------|:------------|
+| Sequence Length (N) | ~196 | ~32-64 |
+| Attention Matrix | $O(N^2)$ | $O(N \cdot W)$ |
+| **Effective Reduction** | - | **~40×** |
+
+> **Note**: Complexity remains $O(N^2 \cdot D)$. The efficiency gain comes from token count reduction, not asymptotic complexity change.
 
 ---
 
-## 5.2 Mathematical Formulation
+## 5.2 Geometric Latent Decoder (ξ-space)
 
-### 5.2.1 Standard Multi-Head Attention
+The `GeometricLatentDecoder` maps tokens from discrete quadtree paths into a continuous **5-dimensional geometric feature space (ξ-space)**.
 
-$$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V$$
+### 5.2.1 Coordinate Reconstruction
 
-### 5.2.2 Hilbert-Aware Attention
+Tokens are reconstructed into 2D coordinates from their `LevelsInfo` paths using vectorized bitwise operations:
 
-$$\text{HilbertAttn}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}} \cdot \sigma_{scale} + \alpha_h \cdot B_{hilbert} + \alpha_l \cdot B_{level}\right) V$$
+$$x = \sum_{k=0}^{d-1} \text{bit}_k(q_k, 0) \cdot 2^{max\_level-k-1}$$
 
-where:
-- $\sigma_{scale}$: Learnable depth-dependent scaling factor
-- $\alpha_h$: Hilbert bias scale constant (`HILBERT_BIAS_SCALE`)
-- $\alpha_l$: Level bias scale constant (`LEVEL_BIAS_SCALE`)
-- $B_{hilbert}$: LCA-based Hilbert curve bias
-- $B_{level}$: Relative level depth bias
+$$y = \sum_{k=0}^{d-1} \text{bit}_k(q_k, 1) \cdot 2^{max\_level-k-1}$$
 
-### 5.2.3 Bias Scale Constants
+This avoids the $O(N \cdot D)$ serial overhead of traditional quadtree traversal.
 
-To ensure proper gradient magnitudes, bias terms are scaled by constants:
+### 5.2.2 Unified Geometric Feature Vector (ξ_ij)
+
+The feature vector $\xi_{ij}$ between token $i$ and $j$ consists of:
+
+| Component | Formula | Description |
+|:----------|:--------|:------------|
+| **Normalized Hilbert Distance** | $\Delta h_{ij} / N^2$ | Hilbert index difference |
+| **LCA Depth Bias** | $2^{d_{LCA}}$ | Lowest Common Ancestor depth |
+| **Euclidean Distance** | $\|pos_i - pos_j\|_2$ | Physical 2D distance |
+| **Area Ratio** | $area_i / area_j$ | Patch size relationship |
+| **Rotational Similarity** | $1$ if parents share quadrant, else $0$ | Spatial orientation |
+
+---
+
+## 5.3 Poincaré Disk Distance
+
+To handle the multi-scale nature of fractal tokens, the model computes distances on a **Poincaré disk**, a model of hyperbolic geometry.
+
+### 5.3.1 Mathematical Formulation
+
+The 2D coordinates are mapped to the unit disk:
+
+$$u = \tanh(r/2) \cdot \frac{x - c}{\|x - c\|}$$
+
+The hyperbolic distance is:
+
+$$d_H(u, v) = \text{acosh}\left(1 + \frac{2\|u-v\|^2}{(1-\|u\|^2)(1-\|v\|^2)}\right)$$
+
+### 5.3.2 Numerical Stability (I-NAN)
+
+To prevent gradient explosions and NaN values:
+
+| Protection | Method |
+|:-----------|:-------|
+| **FP32 Enforcement** | Internal computations use FP32 to prevent FP16 underflow |
+| **Epsilon Protection** | `acosh(x)` requires $x \geq 1 + \epsilon$ |
+| **Output Clamping** | Distances clamped to $[0, 10.0]$ |
+
+---
+
+## 5.4 Hierarchical Attention Bias (LCA)
+
+### 5.4.1 LCA Matrix Calculation
+
+The attention scores are augmented with a bias $B_{hilbert}$ derived from the **Lowest Common Ancestor (LCA)** of token pairs:
+
+$$B[i,j] = \text{LCAEmbed}(\text{LCA}(i, j))$$
+
+The `get_lca_matrix` function computes the depth of the shared ancestor for every token pair. Tokens within the same quadtree branch receive a higher attention bias.
+
+### 5.4.2 Bias Scale Constants
 
 | Constant | Value | Purpose |
 |:---------|:------|:--------|
@@ -40,42 +104,15 @@ The scaled attention formula:
 
 $$\text{scores} = \frac{QK^T}{\sqrt{d_k}} \cdot \sigma_{scale} + HILBERT\_BIAS\_SCALE \cdot B_{hilbert} + LEVEL\_BIAS\_SCALE \cdot B_{level}$$
 
----
-
-## 5.3 Hilbert Bias Modes
-
-### 5.3.1 LCA Hilbert Bias (Standard)
-
-This bias encodes the tree distance between two tokens using their Lowest Common Ancestor (LCA) in the quadtree structure.
-
-**Mathematical definition**:
-
-$$B[i,j] = \text{LCAEmbed}(\text{LCA}(i, j))$$
-
-where:
-
-- $\text{LCA}(i, j) \in \{0, \dots, d_{max}\}$: Depth of the smallest quadtree region containing both $R_i$ and $R_j$.
-- $\text{LCAEmbed}: \mathbb{Z} \to \mathbb{R}^H$: Learnable embedding table.
-- Bias scaling is handled by `hilbert_bias_scale × √d_k` (I122-2 simplification).
-
-**Note (I122-2)**: The original τ_h temperature parameter has been removed. The bias strength is now controlled by the `HILBERT_BIAS_SCALE` constant multiplied by √d_k, providing unified scaling across heads.
-
-**P11-3: Region-Based LCA Computation**:
-
-For accurate LCA, compute directly from region boundaries:
-
-$$\text{Path}(R) = \text{bit}(cx, D-d) + 2 \cdot \text{bit}(cy, D-d)$$
-$$\text{LCA}(i, j) = \text{Length}(\text{CommonPrefix}(\text{Path}(i), \text{Path}(j)))$$
-
-> **Note**: This replaces fragile index arithmetic with direct geometric computation.
+> **Note (I122-2)**: The original τ_h temperature parameter has been removed. Bias strength is controlled by `HILBERT_BIAS_SCALE × √d_k`.
 
 ---
 
-## 5.4 Level Bias
+## 5.5 Level Bias
 
-### 5.4.1 Relative Level Embedding
+### 5.5.1 Relative Level Embedding
 
-Encodes the relationship between tokens at different scales (e.g., parent-child vs. peer-peer).
+Encodes the relationship between tokens at different scales:
 
 $$B_{level}[i,j] = W_{rel}[\text{clamp}(d_i - d_j + L, 0, 2L)]$$
 
@@ -84,169 +121,29 @@ where:
 - $L$: Maximum relative depth range
 - $W_{rel}$: Embedding table of size $(2L+1) \times H$
 
-### 5.4.2 Level Scaling
+### 5.5.2 Level Scaling
 
-Scales the attention logits based on the depth of the query to stabilize training across scales.
+Scales attention logits based on query depth:
 
 $$\sigma_{scale}(d) = \text{Softplus}(\text{LevelScaleEmb}(d))$$
 
-Deeper tokens (finer resolution) typically learn smaller scaling factors to broaden their attention span or vice-versa.
-
 ---
 
-## 5.5 Affine Modulated Bias (I31-3)
+## 5.6 Hierarchical Soft-Hard Attention (I160-2)
 
-The **AffineModulatedBias** enhances spatial attention with area-aware modulation, enabling the model to learn size-dependent attention patterns.
+> **Recommended**: Use with `DeterministicNeighborSplitter` for hard locality guarantees
 
-### 5.5.1 Mathematical Formulation
-
-**Area Encoding** (NeRF-style Fourier features):
-
-$$f_{area} = \frac{\log(s_{patch} + 1)}{\log(S_{total} + 1)}$$
-$$\gamma(f) = [\sin(2^k \pi f), \cos(2^k \pi f)]_{k=0}^{L-1}$$
-
-where:
-- $s_{patch}$: Patch area
-- $S_{total}$: Total image area
-- $L$: Number of Fourier levels
-
-**Affine Modulation**:
-
-$$B_{\text{final}} = \gamma(s_i, s_j) \odot B_{\text{spatial}} + \beta(s_i, s_j)$$
-
-where:
-- $\gamma(s_i, s_j) = \sigma(\text{MLP}_\gamma(p_s))$: Learnable scale factor
-- $\beta(s_i, s_j) = \text{MLP}_\beta(p_s)$: Learnable bias factor
-- $p_s = \text{area\_emb}[i] \cdot \text{area\_emb}[j]$: Area similarity
-
-**Residual Connection**:
-
-$$B_{\text{combined}} = B_{\text{spatial}} + \alpha \cdot (B_{\text{final}} - B_{\text{spatial}})$$
-
-where $\alpha$ is a learnable zero-initialized parameter for gradual activation.
-
-### 5.5.2 AreaEncoder Architecture
-
-```
-Input: regions [B, N, 4]
-   │
-   ▼
-┌─────────────────────┐
-│ Normalized Area     │
-│ f = log(area+1) /   │
-│     log(total+1)    │
-└─────────────────────┘
-   │
-   ▼
-┌─────────────────────┐
-│ Fourier Features    │
-│ [sin(2^kπf),        │
-│  cos(2^kπf)]_k      │
-│  → 2L dimensions    │
-└─────────────────────┘
-   │
-   ▼
-┌─────────────────────┐
-│ MLP Projection      │
-│ Linear(2L) → hidden │
-│ → Linear(hidden) →  │
-│   Linear(hidden) →  │
-│   dim               │
-└─────────────────────┘
-   │
-   ▼
-Output: area_emb [B, N, dim]
-```
-
-### 5.5.3 AffineModulatedBias Architecture
-
-```
-regions [B, N, 4]
-      │
-      ├──────────────────┐
-      ▼                  ▼
-┌─────────────┐   ┌─────────────┐
-│   LCA       │   │   Area      │
-│   Embedding │   │   Encoder   │
-└─────────────┘   └─────────────┘
-      │                  │
-      ▼                  ▼
-┌─────────────┐   ┌─────────────┐
-│   Spatial   │   │   Area      │
-│   Bias      │   │   Similarity│
-│ [B,dim,N,N] │   │   Matrix    │
-└─────────────┘   └─────────────┘
-      │                  │
-      └────────┬─────────┘
-               ▼
-        ┌─────────────┐
-        │   Affine    │
-        │   Modulation│
-        │ γ·B + β     │
-        └─────────────┘
-               │
-               ▼
-        ┌─────────────┐
-        │   Residual  │
-        │ B + α(·-B)  │
-        └─────────────┘
-               │
-               ▼
-Output: bias [B, dim, N, N]
-```
-
----
-
-## 5.6 Shape-Scale Bias (I31)
-
-The **ShapeScaleEncoder** captures region geometry for enhanced attention bias.
-
-### 5.6.1 Mathematical Formulation
-
-**Aspect Ratio** (log-transformed for symmetry):
-
-$$r = \log(w/h)$$
-
-**Normalized Area**:
-
-$$s = \frac{w \cdot W_{patch}}{W_{total} \cdot H_{total}}$$
-
-**Gated Combination**:
-
-$$g = \sigma(\text{MLP}([r; s]))$$
-$$E_{shape}(R) = \text{MLP}([r \cdot g; s \cdot (1-g)])$$
-
-**Shape-Scale Similarity Matrix**:
-
-$$B_{shape}[i,j] = E_{shape}(R_i) \cdot E_{shape}(R_j)^T$$
-
-### 5.6.2 Combined Bias
-
-$$B_{final} = B_{LCA} + \tau \cdot B_{shape}$$
-
-where $\tau$ is a learnable zero-initialized weight.
-
----
-
-## 5.7 Hierarchical Soft-Hard Attention (I160-2)
-
-> **Recommended**: Use with DeterministicNeighborSplitter for hard locality guarantees
-
-### 5.7.1 Overview
-
-`HierarchicalSoftHardAttention` (HSHA) provides hard locality guarantees through three-region partitioning, solving the problem where standard attention mechanisms cannot forcibly exclude distant tokens.
-
-### 5.7.2 Three-Region Partitioning
+### 5.6.1 Three-Region Partitioning
 
 | Region | LCA Depth Condition | Attention Behavior |
-|:-------|:------------------|:------------------|
+|:-------|:-------------------|:-------------------|
 | **HARD_ZERO** | $\ell < \ell_{min}$ | Force exclusion (mask = 0) |
 | **SOFT_POSITIVE** | $\ell_{min} \leq \ell < \ell_{soft}$ | Soft bias encouragement |
 | **HARD_ONE** | $\ell \geq \ell_{soft}$ | Full encouragement (mask = 1) |
 
 Default values: $\ell_{min} = 1$ (quadrant boundary), $\ell_{soft} = 2$ (sub-quadrant boundary)
 
-### 5.7.3 Mathematical Formulation
+### 5.6.2 Mathematical Formulation
 
 **Hierarchical Mask**:
 
@@ -256,40 +153,116 @@ $$M(\ell) = \begin{cases} 0 & \text{if } \ell < \ell_{min} \\ \sigma(\ell - \ell
 
 $$\tilde{A}_{ij} = \frac{QK^T}{\sqrt{d_k}}[i,j] + \alpha(\ell_{ij}) \cdot B_{hilbert}[i,j]$$
 
-### 5.7.4 Configuration Parameters
+---
+
+## 5.7 Affine Modulated Bias (I31-3)
+
+The **AffineModulatedBias** enhances spatial attention with area-aware modulation.
+
+### 5.7.1 Area Encoding (NeRF-style Fourier Features)
+
+$$f_{area} = \frac{\log(s_{patch} + 1)}{\log(S_{total} + 1)}$$
+
+$$\gamma(f) = [\sin(2^k \pi f), \cos(2^k \pi f)]_{k=0}^{L-1}$$
+
+### 5.7.2 Affine Modulation
+
+$$B_{final} = \gamma(s_i, s_j) \odot B_{spatial} + \beta(s_i, s_j)$$
+
+---
+
+## 5.8 Shape-Scale Bias (I31)
+
+The **ShapeScaleEncoder** captures region geometry for enhanced attention bias.
+
+### 5.8.1 Aspect Ratio
+
+$$r = \log(w/h)$$
+
+### 5.8.2 Gated Combination
+
+$$g = \sigma(\text{MLP}([r; s]))$$
+
+$$E_{shape}(R) = \text{MLP}([r \cdot g; s \cdot (1-g)])$$
+
+---
+
+## 5.9 Scale-Aware Residual (Fractal Residuals)
+
+**ScaleAwareResidual** enables parent-to-child information flow through learned residual connections.
+
+### 5.9.1 Mathematical Formulation
+
+$$X_{l+1}^{(child)} = X_l^{(parent)} \cdot \sigma(g_d) + \text{Attn}(X_l)$$
+
+where $\sigma(g_d) = \text{sigmoid}(\text{Linear}(d))$ is a learnable gate based on depth.
+
+### 5.9.2 Key Property
+
+| Gate Value | Behavior |
+|:-----------|:---------|
+| Close to 1 | Child features dominated by parent projection (information flows up) |
+| Close to 0 | Child features are independent |
+
+---
+
+## 5.10 Cartesian 2D RoPE (I167-4)
+
+**Cartesian2DRoPE** implements rotary position embedding based on physical 2D coordinates $(x, y)$.
+
+### 5.10.1 Mathematical Formulation
+
+Given position $i$ with physical coordinates $p_i = (x_i, y_i)$:
+
+$$\theta_i = \text{atan2}(y_i, x_i)$$
+
+**RoPE application**:
+
+$$\text{RoPE}(q_i, k_i) = \begin{pmatrix} \cos(\theta_i / 2) & -\sin(\theta_i / 2) \\ \sin(\theta_i / 2) & \cos(\theta_i / 2) \end{pmatrix} \begin{pmatrix} q_i^{(0)} \\ q_i^{(1)} \end{pmatrix}$$
+
+### 5.10.2 Implementation
 
 ```python
-from vit_pytorch.layers.attention.hierarchical_soft_hard import HierarchicalAttentionConfig
+class Cartesian2DRoPE(nn.Module):
+    def __init__(self, dim: int, max_level: int = 8):
+        self.dim = dim
+        self.max_level = max_level
 
-config = HierarchicalAttentionConfig(
-    lca_min=1.0,
-    lca_soft=2.0,
-    use_temperature=True,
-    learn_thresholds=True,
-)
+    def forward(self, q: Tensor, paths: Tensor, depths: Tensor) -> Tensor:
+        coords = coords_from_paths(paths, depths, self.max_level)
+        angles = torch.atan2(coords[..., 1], coords[..., 0])
+        cos_angle, sin_angle = torch.cos(angles), torch.sin(angles)
+        # Apply rotation...
 ```
 
 ---
 
-## 5.8 Bias Mode Comparison
+## 5.11 Diagnostics and Monitoring
 
-| Mode | Parameters | Complexity | Geometric Meaning |
-|:-----|:-----------|:-----------|:------------------|
-| `lca` | ~100 | $O(N^2)$ | Explicit (LCA depth) |
-| `affine_modulation` | ~1K | $O(N^2)$ | Area-aware spatial bias |
-| `shape_scale` | ~1K | $O(N^2)$ | Geometry-aware bias |
-| `hierarchical_soft_hard` | ~100 | $O(N^2)$ | Hard locality guarantee |
+### 5.11.1 CLSAttentionTracker
 
-**Recommendation**: Use `lca` for efficiency, `hierarchical_soft_hard` with DeterministicNeighborSplitter for best Hilbert locality.
+The `CLSAttentionTracker` monitors attention flow from the `[CLS]` token to different quadtree depths.
+
+**Link Broken Detection**: When `[CLS]` loses contact with global context (Depth 0 attention < 20%), the tracker signals to adjust `HILBERT_BIAS_SCALE`.
+
+### 5.11.2 get_stats() Diagnostics
+
+The `get_stats()` method returns real-time metrics:
+
+| Metric | Description |
+|:-------|:------------|
+| `manifold_bias_std` | Dispersion of the geometric bias |
+| `poincare_dist_mean` | Average hyperbolic distance between tokens |
+| `effective_rank` | SVD-based rank of attention matrix (detects mode collapse) |
 
 ---
 
-## 5.9 Implementation
+## 5.12 Implementation
 
-### Class: HilbertAwareMultiScaleAttention
+### Class: ManifoldNativeAttention
 
 ```python
-class HilbertAwareMultiScaleAttention(nn.Module):
+class ManifoldNativeAttention(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -297,13 +270,10 @@ class HilbertAwareMultiScaleAttention(nn.Module):
         dim_head: int = 64,
         dropout: float = 0.0,
         max_level: int = 8,
-        use_hilbert_bias: bool = True,
-        use_level_scaling: bool = True,
-        use_affine_modulation: bool = True,
-        fourier_levels: int = 4,
-        use_hierarchical_attention: bool = False,
-        encoder_config: Optional[AttentionEncoderConfig] = None,
-        use_fp16: bool = False,
+        use_cartesian_rope: bool = True,   # I167-4
+        use_scale_aware_residual: bool = True,
+        use_poincare_distance: bool = True,
+        band_width: int = 32,
     ):
         """
         Args:
@@ -311,14 +281,11 @@ class HilbertAwareMultiScaleAttention(nn.Module):
             heads: Number of attention heads
             dim_head: Dimension per head
             dropout: Dropout rate
-            max_level: Maximum quadtree depth (I122-2: uses max_level)
-            use_hilbert_bias: Enable LCA-based Hilbert bias
-            use_level_scaling: Enable depth-dependent scaling
-            use_affine_modulation: Enable I31-3 area-aware bias
-            fourier_levels: Number of Fourier frequency levels
-            use_hierarchical_attention: Enable depth-wise independent attention
-            encoder_config: Protocol-driven attention configuration
-            use_fp16: Use FP16 storage for bias
+            max_level: Maximum quadtree depth
+            use_cartesian_rope: Enable Cartesian 2D RoPE
+            use_scale_aware_residual: Enable fractal residuals
+            use_poincare_distance: Enable Poincaré disk distance
+            band_width: Band width for Hilbert-banded attention
         """
 ```
 
@@ -330,108 +297,39 @@ class LCAHilbertBias(nn.Module):
         self,
         max_depth: int,
         heads: int,
-        lca_temperature: Optional[float] = None,  # I122-2: removed
-        learnable_temperature: bool = False,  # I122-2: removed
+        lca_temperature: Optional[float] = None,  # Removed in I122-2
+        learnable_temperature: bool = False,      # Removed in I122-2
     ):
-        """
-        LCA-based Hilbert bias computation.
-        Note: lca_temperature and learnable_temperature removed in I122-2,
-        bias strength now controlled by hilbert_bias_scale × √d_k.
-        """
-```
-
-### Class: AffineModulatedBias
-
-```python
-class AffineModulatedBias(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        max_depth: int,
-        enable_area_modulation: bool = True,
-        fourier_levels: int = 4,
-    ):
-        """
-        Args:
-            dim: Attention dimension
-            max_depth: Maximum quadtree depth
-            enable_area_modulation: Enable area-aware modulation
-            fourier_levels: Number of Fourier frequency levels
-        """
+        # Note: lca_temperature removed in I122-2
+        # Bias strength now controlled by hilbert_bias_scale × √d_k
 ```
 
 ---
 
-## 5.9 Usage Example
+## 5.13 Bias Mode Comparison
 
-### Basic Configuration
+| Mode | Parameters | Complexity | Geometric Meaning |
+|:-----|:-----------|:-----------|:------------------|
+| `lca` | ~100 | $O(N^2)$ | Explicit (LCA depth) |
+| `affine_modulation` | ~1K | $O(N^2)$ | Area-aware spatial bias |
+| `shape_scale` | ~1K | $O(N^2)$ | Geometry-aware bias |
+| `hierarchical_soft_hard` | ~100 | $O(N^2)$ | Hard locality guarantee |
 
-```python
-from vit_pytorch.layers.attention.hilbert_bias import HilbertAwareMultiScaleAttention
-
-attn = HilbertAwareMultiScaleAttention(
-    dim=512,
-    heads=8,
-    dim_head=64,
-    max_level=8,
-    use_hilbert_bias=True,
-    use_level_scaling=True,
-    use_affine_modulation=True,
-    fourier_levels=4,
-)
-```
-
-### With Affine Modulation (I31-3)
-
-```python
-attn = HilbertAwareMultiScaleAttention(
-    dim=512,
-    heads=8,
-    max_level=8,
-    use_affine_modulation=True,
-    fourier_levels=4,
-)
-
-# During forward pass, provide regions and image_size
-x = torch.randn(2, 100, 512)
-regions = torch.zeros(2, 100, 4)  # Region boundaries
-image_size = 224
-
-out = attn(x, regions=regions, image_size=image_size)
-```
-
-### Direct LCA Computation from Regions
-
-```python
-from vit_pytorch.layers.attention.hilbert_bias import LCAHilbertBias
-
-lca_bias = LCAHilbertBias(
-    max_depth=8,
-    heads=8,
-    # Note: lca_temperature removed in I122-2
-)
-
-# Compute bias directly from regions (P11-3 recommended)
-regions = torch.randn(2, 50, 4)  # [B, N, 4]
-image_size = 224
-
-bias = lca_bias.forward_from_regions(regions, image_size)
-# Output: [B, H, N, N]
-```
+**Recommendation**: Use `lca` for efficiency, `hierarchical_soft_hard` with `DeterministicNeighborSplitter` for best Hilbert locality.
 
 ---
 
-## 5.10 Cache Optimization (I30-9)
+## 5.14 Cache Optimization (I30-9)
 
 For efficiency, LCA depth computation is cached across transformer layers:
 
 **Cache Key**: `data_ptr` + `torch_version`
 
-**Benefits**:
-
-- Eliminates redundant LCA computation per layer
-- ~6x speedup for 6-layer transformers
-- Automatic invalidation on tensor modification
+| Benefit | Description |
+|:---------|:------------|
+| LCA Computation | Eliminates redundant computation per layer |
+| Speedup | ~6× speedup for 6-layer transformers |
+| Invalidation | Automatic on tensor modification |
 
 ```python
 # Cache is automatically managed
@@ -443,25 +341,12 @@ lca_bias.clear_cache()
 
 ---
 
-## 5.11 Numerical Stability
+## 5.15 Document Navigation
 
-### Variance Epsilon
-
-Layer normalization uses $\epsilon = 10^{-5}$ for variance stability:
-
-$$\hat{x} = \frac{x - \mu}{\sqrt{\sigma^2 + \epsilon}}$$
-
-### Bias Scale Constants
-
-To ensure proper gradient magnitudes, bias terms are scaled by constants:
-
-| Constant | Value | Purpose |
-|:---------|:------|:--------|
-| `HILBERT_BIAS_SCALE` | 1.0 | Scale for LCA-based spatial bias |
-| `LEVEL_BIAS_SCALE` | 1.0 | Scale for relative level bias |
-
-The scaled attention formula:
-
-$$\text{scores} = \frac{QK^T}{\sqrt{d_k}} + HILBERT\_BIAS\_SCALE \cdot B_{hilbert} + LEVEL\_BIAS\_SCALE \cdot B_{level}$$
+| Chapter | Content |
+|:--------|:--------|
+| [05_attention_mechanism](05_attention_mechanism.md) | Manifold-native attention (this chapter) |
+| [06_feedforward_network](06_feedforward_network.md) | Feed-forward networks |
+| [07_transformer_encoder](07_transformer_encoder.md) | Transformer blocks |
 
 > **Next**: [06_feedforward_network.md](06_feedforward_network.md) - Feed-Forward Networks
