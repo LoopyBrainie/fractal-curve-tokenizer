@@ -239,7 +239,7 @@ def clear_tokenizer_cache(self):
         ▼
 ┌─────────────────────────────────┐
 │     HilbertOptimalSplitter       │
-│     (H1SS - 推荐)              │
+│     (H1SS - 推荐)               │
 │  ┌────────────────────────────┐ │
 │  │ HilbertConv1D 复杂度        │ │
 │  │ Entmax 稀疏选择              │ │
@@ -249,10 +249,10 @@ def clear_tokenizer_cache(self):
         │
         ▼
 ┌─────────────────────────────────┐
-│  StreamingFractalTokenizerV3    │
+│  StreamingFractalTokenizerV3     │
 │  ├── 复杂度估计                  │
 │  ├── 自适应四叉树分割             │
-│  ├── HilbertNativePatchEmbed    │
+│  ├── HilbertNativePatchEmbed     │
 │  └── Hilbert 重排序              │
 └─────────────────────────────────┘
         │
@@ -261,18 +261,18 @@ def clear_tokenizer_cache(self):
         │
         ▼
 ┌─────────────────────────────────┐
-│     FractalPositionEmbedding     │
+│     FractalPositionEmbedding      │
 │     深度 + 路径编码               │
 └─────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────┐
-│     预置 CLS Token              │
+│     预置 CLS Token               │
 └─────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────┐
-│     FractalTransformer × L      │
+│     FractalTransformer × L        │
 │  ┌────────────────────────────┐ │
 │  │ 级别感知 LayerNorm          │ │
 │  │ HilbertAwareAttention      │ │

@@ -123,11 +123,43 @@ uv run pytest tests/ -n auto -v
 
 ---
 
-## 10.5 基准测试
+## 10.5 CUDA 调试指南
+
+### CUDA 设备端断言
+
+当遇到 CUDA 设备端断言错误（如 `IndexKernel.cu:92 index out of bounds`）时，设置以下环境变量以同步报告错误：
+
+```bash
+# Windows PowerShell
+$env:CUDA_LAUNCH_BLOCKING = "1"
+$env:PYTORCH_NO_CUDA_MEMORY_CACHING = "1"
+
+# Linux/macOS Bash
+export CUDA_LAUNCH_BLOCKING=1
+export PYTORCH_NO_CUDA_MEMORY_CACHING=1
+```
+
+### 常见 CUDA 错误
+
+| 错误 | 原因 | 解决方案 |
+|:------|:------|:---------|
+| `index out of bounds` | batch_indices 包含超出范围的值 | 检查 clamp 逻辑 |
+| `cublasLt` | 数值不稳定 | 检查输入归一化 |
+| `memcpy` | 内存访问违规 | 检查张量形状匹配 |
+
+### 调试技巧
+
+1. **使用 `.item()` 进行 CPU 端验证**：避免在 CUDA 张量上调用 `.min()`/`.max()`
+2. **使用 `torch.where` 进行条件 clamp**：避免触发断言的归约操作
+3. **添加诊断信息**：`torch.where(condition, valid_value, safe_default)`
+
+---
+
+## 10.6 基准测试
 
 ### 核心比较（`compare_fractal_vs_standard.py`）
 
-将 `FractalCurveViT` 与标准 ViT 比较：
+将 `FractalCurveViT` 与标准 ViT 进行比较：
 
 | 指标 | 描述 |
 |:-------|:------------|
@@ -146,7 +178,7 @@ uv run pytest tests/ -n auto -v
 
 ---
 
-## 10.6 测试状态
+## 10.7 测试状态
 
 | 类别 | 数量 | 状态 |
 |:---------|:------|:-------|
@@ -157,7 +189,7 @@ uv run pytest tests/ -n auto -v
 
 ---
 
-## 10.7 编写测试
+## 10.8 编写测试
 
 ### 测试夹具（`conftest.py`）
 
@@ -205,7 +237,7 @@ def test_lca_bias_parameters():
 
 ---
 
-## 10.8 持续集成
+## 10.9 持续集成
 
 ### GitHub Actions 配置
 
