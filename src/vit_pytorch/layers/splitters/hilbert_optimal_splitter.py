@@ -700,11 +700,13 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             parent_changed[1:] = (sorted_parents[1:] != sorted_parents[:-1]).long()
             slot_within_parent = torch.cumsum(parent_changed, dim=0)  # 从0开始的slot编号
 
-            # 取出有效的slot (0-3)
-            valid_slots = slot_within_parent[slot_within_parent < 4]
+            # 取出有效的 slot 和对应的子节点（slot 必须在 0-3 范围内）
+            valid_mask = slot_within_parent < 4
+            valid_slots = slot_within_parent[valid_mask]
+            valid_sorted_children = sorted_children[valid_mask]
 
             # scatter 到 children_matrix
-            children_matrix[sorted_parents, valid_slots] = sorted_children
+            children_matrix[sorted_parents, valid_slots] = valid_sorted_children
 
         self.register_buffer('candidate_regions', candidate_regions)
         self.register_buffer('candidate_depths', candidate_depths)
