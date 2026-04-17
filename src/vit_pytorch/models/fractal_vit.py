@@ -1145,6 +1145,7 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         # I98-4: info_dim = max_level + 1 对应 levels_info 的 (depth + paths) 结构
         info_dim = self.max_level + 1
         padded_tokens, lengths = token_output.get_padded_tokens()
+        # I98-4: 使用 3D one-hot 编码的 levels 用于后续处理
         padded_levels = token_output.get_padded_levels(info_dim)
         levels_list = token_output.levels_list()
 
@@ -1152,9 +1153,11 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         # 将动态 K 映射到固定桶中，解决 torch.compile 的形状动态性问题
         # 替换原有的 MAX_TOKENS_PER_IMAGE 硬截断逻辑
         # 非线性桶: {128, 256, 512} ∪ {1024, 2048, 4096, 8192}
-        padded_tokens, padded_levels, lengths = self.shape_stabilizer.pad_to_bucket(
+        # 注意: pad_to_bucket 需要 2D levels [B, K]，不是 3D one-hot 编码
+        levels_2d = token_output.get_levels_2d()
+        padded_tokens, levels_2d_padded, lengths = self.shape_stabilizer.pad_to_bucket(
             tokens=padded_tokens,
-            levels=padded_levels,
+            levels=levels_2d,
             lengths=lengths,
         )
 

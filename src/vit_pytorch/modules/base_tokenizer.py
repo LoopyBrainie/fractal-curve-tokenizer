@@ -387,6 +387,36 @@ class TokenizerOutput:
                 result.append(levels)
         return result
 
+    def get_levels_2d(self) -> torch.Tensor:
+        """获取 2D 深度值 tensor [B, K] (用于 bucketing)。
+
+        与 get_padded_levels(info_dim) 的区别：
+        - get_padded_levels: 返回 3D one-hot 编码 [B, MaxN, info_dim]，用于 attention mask
+        - get_levels_2d: 返回 2D 原始深度值 [B, K]，用于 bucketing padding
+
+        Returns:
+            levels_2d: [B, max_K] 填充后的深度值，padding 位置为 -1
+        """
+        levels = self.levels_list()
+        if not levels:
+            B = len(self)
+            return torch.zeros(B, 0, dtype=torch.long, device=self.device if hasattr(self, 'device') else 'cpu')
+
+        # 找到最大长度
+        max_len = max(l.shape[0] for l in levels)
+        if max_len == 0:
+            B = len(levels)
+            return torch.zeros(B, 0, dtype=torch.long, device=levels[0].device)
+
+        # Pad all levels to max_len, using -1 for padding
+        B = len(levels)
+        device = levels[0].device
+        levels_padded = torch.full((B, max_len), -1, dtype=torch.long, device=device)
+        for b, l in enumerate(levels):
+            levels_padded[b, :l.shape[0]] = l
+
+        return levels_padded
+
     def get_padded_regions(self) -> Tuple[Optional[torch.Tensor], Optional[int]]:
         """获取预填充的 regions 和 image_size (P11-3 新增).
 
