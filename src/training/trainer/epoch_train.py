@@ -420,6 +420,10 @@ def train_one_epoch(
                 num_tokens_info = f", tokens={ntok:.0f}"
             print(f"  [MEM] Step {batch_idx+1}: alloc={allocated_mb:.1f}MB, reserved={reserved_mb:.1f}MB, peak={max_allocated_mb:.1f}MB{num_tokens_info}")
 
+            # P4-Fix: 每 50 步清理显存碎片，防止 reserved 持续增长
+            if (batch_idx + 1) % 50 == 0:
+                torch.cuda.empty_cache()
+
         # Gradient monitoring
         if config.numerical.record_grad_norms:
             grad_norm = grad_monitor.compute_total_grad_norm()
@@ -479,16 +483,17 @@ def train_one_epoch(
             if current_memory_mb > peak_memory_mb:
                 peak_memory_mb = current_memory_mb
 
-        # I-NAN: 计算裁剪前的梯度范数（用于 NaN 调试）
-        pre_clip_grad_norm = 0.0
+        # I-NAN: 计算裁剪前的梯度范数（P1-Fix: 移除 .item() 避免 Graph Break）
+        # 原代码使用 .item() 强制 GPU-CPU 同步，导致 torch.compile 缓存爆炸
+        # 修改为延迟计算，仅在需要时通过 detach 获取
+        pre_clip_grad_norm_tensor = torch.zeros(1, device=next(p.device for p in model.parameters() if p.grad is not None).device) if hasattr(model, 'parameters') else None
         try:
-            pre_clip_grad_norm = sum(
-                p.grad.norm().item()
-                for p in model.parameters()
-                if p.grad is not None
-            ) or 0.0
+            # 保持为 tensor，不断开计算图
+            pre_clip_grad_norm = torch.stack([
+                p.grad.norm() for p in model.parameters() if p.grad is not None
+            ]).sum() if any(p.grad is not None for p in model.parameters()) else torch.tensor(0.0)
         except Exception:
-            pass
+            pre_clip_grad_norm = torch.tensor(0.0)
 
         # Numerical defense
         should_skip = defender.post_backward()
@@ -505,14 +510,22 @@ def train_one_epoch(
                     norm_type=2.0,
                 )
 
-            # Gradient clipping
+            # Gradient clipping (P0-Fix: 加强梯度裁剪，防止梯度爆炸)
             if config.training.gradient_clip_norm > 0:
                 if scaler is not None:
                     scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
+                # P0-Fix: 使用更严格的 max_norm=1.0（原来可能是 5.0 或更大）
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(),
-                    config.training.gradient_clip_norm,
+                    max_norm=1.0,  # 强制限制梯度范数在 1.0 以内
                 )
+                # P0-Fix: 添加 NaN/Inf 检查，防止异常梯度进入优化器
+                if not torch.isfinite(grad_norm):
+                    print(f"Warning: Gradient norm is {grad_norm}, skipping step!")
+                    optimizer.zero_grad()
+                    if scaler is not None:
+                        scaler.update()
+                    continue
 
             # Update scheduler BEFORE optimizer step
             if scheduler is not None:

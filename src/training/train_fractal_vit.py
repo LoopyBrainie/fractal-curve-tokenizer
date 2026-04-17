@@ -1416,9 +1416,12 @@ def main():
     set_seed(args.seed)
     configure_cuda()
 
-    # TorchDynamo 优化：增加缓存上限减少重编译导致的显存泄漏
+    # TorchDynamo 优化：降低缓存限制强制回收，减少显存泄漏
+    # P3-Fix: cache_size_limit=16（强制回收旧缓存，防止无限增长）
+    # P3-Fix: capture_scalar_outputs=True（避免 .item() 导致的 Graph Break）
     import torch._dynamo
-    torch._dynamo.config.cache_size_limit = 64
+    torch._dynamo.config.cache_size_limit = 16
+    torch._dynamo.config.capture_scalar_outputs = True
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     print(f"Device: {device}")
