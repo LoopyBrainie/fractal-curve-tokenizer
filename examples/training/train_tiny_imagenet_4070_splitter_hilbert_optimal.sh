@@ -166,7 +166,6 @@ uv run python -m src.training.train_fractal_vit \
   --splitter-temp-end 0.5 \
   \
   --gradient-checkpoint \
-  --compile \
   --use-amp \
   --channels-last \
   \

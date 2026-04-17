@@ -1418,10 +1418,11 @@ def main():
 
     # TorchDynamo 优化：降低缓存限制强制回收，减少显存泄漏
     # P3-Fix: cache_size_limit=16（强制回收旧缓存，防止无限增长）
-    # P3-Fix: capture_scalar_outputs=True（避免 .item() 导致的 Graph Break）
+    # 注意：capture_scalar_outputs=True 已禁用，因其会导致 inductor C++ 代码生成 bug
+    # （zuf0/zuf1 等符号变量未正确声明，导致 C++ 编译失败）
     import torch._dynamo
     torch._dynamo.config.cache_size_limit = 16
-    torch._dynamo.config.capture_scalar_outputs = True
+    # torch._dynamo.config.capture_scalar_outputs = True  # 已禁用：会导致 C++ 编译崩溃
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     print(f"Device: {device}")
