@@ -450,6 +450,9 @@ class ExplorationInjector:
         Returns:
             扰动后的温度（如果触发则提升，否则返回原值）
         """
+        # 确保是 Python float（可能是 CUDA tensor）
+        if hasattr(active_ratio, 'item'):
+            active_ratio = active_ratio.item()
         self.active_ratio_history.append(active_ratio)
 
         if len(self.active_ratio_history) > self.patience:
