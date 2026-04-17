@@ -26,14 +26,25 @@ $$I \xrightarrow{\text{Splitter}} \text{split\_result} \xrightarrow{\text{Embedd
 
 H1SS 基于六个公理（A1-A6）实现最优 token 选择：
 
-| 公理 | 描述 |
-|:------|:------------|
-| A1 | 1D Hilbert 流形卷积 |
-| A2 | 无 Gumbel 扰动 |
-| A3 | Entmax 稀疏激活 |
-| A4 | 树一致性软约束 |
-| A5 | 单次 Entmax 投影 |
-| A6 | < 10K 参数 |
+| 公理 | 描述 | 实际表现 |
+|:------|:------------|:---------|
+| A1 | 1D Hilbert 流形卷积 | DistanceDecay Conv1D 固定衰减权重 |
+| A2 | 无 Gumbel 扰动 | ✓ 确定性 |
+| A3 | Entmax 稀疏激活 | **矛盾**：稀疏性 ↔ 梯度流 |
+| A4 | 树一致性软约束 | 课程学习 λ，效果存疑 |
+| A5 | 单次 Entmax 投影 | TopK after Entmax，非真正 Entmax 选择 K |
+| A6 | < 10K 参数 | ✓ 约 10K |
+
+**⚠️ 核心矛盾：稀疏性 ↔ 梯度流**
+
+| α 值 | Entmax 行为 | 梯度覆盖率 | 稀疏性 |
+|:------|:------------|:-----------|:-------|
+| α → 1.0 | Softmax | **100%** | 无 |
+| α = 1.2 | 弱 Entmax | **100%** | 低 |
+| α = 1.49 | 近似 sparsemax | ~60-80% | 中 |
+| α = 1.5 | sparsemax | **~0%** ❌ | 高 |
+
+**关键发现（I107）**：α=1.5 的 sparsemax 导致 **100% 梯度消失**！当某元素概率为 0 时，其对应梯度也为 0。
 
 **α-Entmax 定义**：
 
@@ -41,22 +52,37 @@ $$\text{entmax}_\alpha(z) = \arg\max_{p \in \Delta^{n-1}} (p^T z + H_\alpha(p))$
 
 其中 $H_\alpha(p) = \frac{1}{1-\alpha} \log \sum_i p_i^\alpha$ 是 Rényi 熵。
 
-**属性**：
-- $\alpha \to 1$：退化为 Softmax
-- $\alpha > 1$：产生稀疏分布
-- $\alpha = 1.5$：可能导致硬截断（I107），减少梯度流
+**性质分析**：
+
+| α 值 | 行为 | 梯度性质 |
+|:-----|:-----|:---------|
+| α → 1 | softmax | 完全可微，稠密输出 |
+| α = 1.5 | sparsemax | 稀疏输出，**梯度可能为零** |
+| α → ∞ | argmax | 极度稀疏，**梯度消失** |
+
+**这是一个不可能三角**：
+
+```
+            稀疏性
+              ▲
+             / \
+            /   \
+           /  ✗  \
+          /       \
+        梯度 ◁────▷ 树一致性
+```
+
+任何方案只能同时优化两个目标。
 
 **Alpha 预热策略（I107）**：
 
 H1SS 使用 alpha 预热调度以防止早期训练中的硬截断：
 
-$$\alpha(t) = \begin{cases} 1.2 + 0.3 \cdot \frac{t}{T_{warmup}} & t < T_{warmup} \\ \min(2.0, 1.5 + 0.5 \cdot \frac{t - T_{warmup}}{T_{schedule} - T_{warmup}}) & t \geq T_{warmup} \end{cases}$$
+$$\alpha(t) = \begin{cases} 1.2 + 0.3 \cdot \frac{t}{T_{warmup}} & t < T_{warmup} \\ \min(1.49, 1.2 + 0.29 \cdot \frac{t - T_{warmup}}{T_{schedule} - T_{warmup}}) & t \geq T_{warmup} \end{cases}$$
 
-默认调度：$T_{warmup} = 10$，$T_{schedule} = 20$
+默认调度：$T_{warmup} = 10$，$T_{schedule} = 25$
 
-这确保：
-- 早期训练（$\alpha \approx 1.2$）：软选择，完整梯度流
-- 后期训练（$\alpha \to 1.5-2.0$）：稀疏选择，提高效率
+**⚠️ 重要更新**：α 永远不会达到 1.5，最大为 1.49，以避免梯度消失。
 
 **选择（I122-1 更新）**：
 
@@ -72,26 +98,46 @@ $$\text{selected\_mask} = \text{entmax}_\alpha(z) \cdot K$$
 
 ### 3.2.3 H-entmax: Hilbert 有序 Entmax（替代方案）
 
-**Hilbert 有序 Entmax 分割器**使用 α-Entmax（α=1.5）实现精确稀疏性和完整梯度流：
+**Hilbert 有序 Entmax 分割器**使用 α-Entmax 实现精确稀疏性和完整梯度流：
 
 | 特性 | 描述 |
 |:--------|:------------|
 | **并行性** | 100% |
 | **梯度流** | **100%**（完整，无 STE） |
-| **Hilbert 局部性** | 100% |
-| **稀疏性** | 精确 α-Entmax |
+| **Hilbert 局部性** | 依赖 Conv1D 特征提取 |
+| **稀疏性** | 使用 α=1.5（⚠️ 梯度消失风险） |
 
-### 3.2.4 树一致性
+**H-entmax 的局限性**：
+
+1. **无深度控制**：深度阈值是简单的按层缩放
+2. **无树约束**：可能选择子节点而不选父节点
+3. **无 K 估计**：需要外部指定 K
+
+### 3.2.4 树一致性约束
 
 树一致性约束防止同时选择父节点及其子节点：
 
 $$\text{consistent}(i) \iff i \in \text{Selected} \land \forall c \in \text{children}(i), c \notin \text{Selected}$$
 
+**H1SS 树约束（软约束）**：
+
+$$z_{parent} \leftarrow z_{parent} - \lambda \cdot \max_{c \in children(parent)} z_c$$
+
+**⚠️ 问题分析**：
+
+设 $z_{parent} = 5$, $\max(z_{children}) = 10$, $\lambda = 0.3$
+
+结果：$z_{parent}^{new} = 5 - 0.3 \times 10 = 2$
+
+但如果其他父节点 $z_{other} = 1.5$，而 TopK 选择 K=10 个：
+- $z_{parent}^{new} = 2$ 仍可能被选中
+- $z_{other} = 1.5$ 可能被淘汰
+
+**结论**：树约束**不能保证**树一致性，只能**鼓励**树一致性。
+
 **树约束损失**（H1SS）：
 
 $$\mathcal{L}_{tree} = \sum_{i} \sum_{c \in \text{children}(i)} \max(0, p_i - p_c + \epsilon)$$
-
-其中 $p_i$ 是选择概率。
 
 **跳跃损失**（Hilbert 连续性）：
 
@@ -112,14 +158,58 @@ $$\mathcal{L}_{jump} = \mathbb{E}[(\Delta h - 1)^2_+]$$
 
 ReLU 形式正确实现了直觉：小 Hilbert 跳跃（$\Delta h \leq 1$，对应相邻区域）应该被允许，而大跳跃应该受到二次惩罚。
 
-## 3.3 分割器比较
+## 3.3 分割器深度对比分析
+
+### 3.3.1 梯度覆盖率对比
+
+| 方法 | 梯度覆盖率 | 原因 |
+|:-----|:-----------|:-----|
+| Gumbel-TopK | ~37% | STE 只在选中 token 上传递梯度 |
+| H1SS (α≈1.2) | **100%** | softmax 完全可微 |
+| H1SS (α≈1.49) | ~60-80% | 稀疏 Entmax 仍有部分梯度 |
+| H-entmax (α=1.5) | **~0%** ❌ | 硬截断导致梯度消失 |
+
+### 3.3.2 局部性保持对比
+
+**测量方法**：
+
+$$J(S) = \frac{1}{K-1} \sum_{i=1}^{K-1} |h(s_i) - h(s_{i+1})|$$
+
+**两种实现的局部性来源**：
+
+| 组件 | H1SS | H-entmax |
+|:-----|:-----|:---------|
+| 序列排序 | Hilbert | Hilbert |
+| 特征混合 | DistanceDecay Conv1D | Standard Conv1D |
+| 选择机制 | Entmax TopK | Entmax TopK |
+| 局部性强化 | SDS 正则化（可选） | 无 |
+
+**⚠️ 批判**：H1SS 的 `HilbertDistanceDecayConv1D` 使用**固定衰减权重** $w_d = 1/(|d|+1)$，没有利用梯度学习最优邻域权重。
+
+### 3.3.3 综合对比
+
+| 指标 | H1SS | H-entmax | 备注 |
+|:-----|:-----|:---------|:-----|
+| **可学习参数** | ~10K | ~2K | H-entmax 更轻量 |
+| **配置参数** | ~20 | ~4 | H1SS 更复杂 |
+| **梯度覆盖率** | ~100%（早期）/ 60-80%（晚期） | ~0%（α=1.5 时） | H1SS 更稳定 |
+| **稀疏性** | 可调 | 固定 | H1SS 更灵活 |
+| **树约束** | 有（软约束） | 无 | H1SS 有额外约束 |
+| **α 调度** | 5+ 组件 | 无 | H1SS 复杂 |
+| **维护性** | ⚠️ 复杂 | ✓ 简洁 | H-entmax 更易维护 |
+
+## 3.4 分割器比较总结
 
 | 分割器 | 梯度 | 稀疏性 | 参数 | 状态 |
 |:---------|:---------|:---------|:-----------|:-------|
 | GumbelTopK | ~37% (STE) | 软 | 中等 | 已废弃 |
 | DeterministicNeighbor | 100% | 软 | 中等 | 已废弃 |
-| **H1SS (HilbertOptimal)** | **100%** | **稀疏** | **< 10K** | ✓ **推荐** |
-| **H-entmax** | **100%** | **稀疏** | **中等** | ✓ **替代方案** |
+| **H1SS (HilbertOptimal)** | **~100%（早期）/ 60-80%（晚期）** | **动态** | **< 10K** | ✓ **推荐（需简化）** |
+| **H-entmax** | **~0%（α=1.5）⚠️** | **固定** | **~2K** | ⚠️ **慎用** |
+
+**建议**：
+- **短期**：采用 H1SS，但简化调度器（移除 α 课程学习）
+- **长期**：重新设计 H1SS，用硬约束替代软约束
 
 ### H1SS 参数
 

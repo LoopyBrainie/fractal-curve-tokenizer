@@ -262,6 +262,157 @@ from vit_pytorch.curve_hilbert import HilbertCurve
 
 ---
 
+## H. 验证框架与行动路线图
+
+### H.1 核心矛盾：稀疏性 ↔ 梯度流
+
+**这是一个不可能三角**：
+
+```
+            稀疏性
+              ▲
+             / \
+            /   \
+           /  ✗  \
+          /       \
+        梯度 ◁────▷ 树一致性
+```
+
+任何方案只能同时优化两个目标。
+
+### H.2 关键问题清单
+
+在继续优化之前，必须回答这些问题：
+
+#### H.2.1 局部性验证
+- [ ] H1SS 的实际 Locality Efficiency 测量值是多少？
+- [ ] H-entmax 的 Locality Efficiency 与 H1SS 有显著差异吗？
+- [ ] 如果差异 < 5%，为什么需要 DistanceDecay Conv？
+
+#### H.2.2 树约束验证
+- [ ] 树约束真的减少了树一致性违反吗？
+- [ ] λ 课程学习的最佳值是多少？
+- [ ] 如果 λ=0.1 和 λ=0.3 效果相同，为什么要课程学习？
+
+#### H.2.3 梯度验证
+- [ ] H1SS 早期（α=1.2）的梯度覆盖率真的 100% 吗？
+- [ ] H1SS 晚期（α≈1.49）的梯度覆盖率是多少？
+- [ ] 梯度覆盖率与最终精度有相关性吗？
+
+#### H.2.4 选择稳定性验证
+- [ ] 相同输入的选择 IOU 是多少？
+- [ ] 选择的不稳定性会影响训练收敛吗？
+- [ ] Dropout/batchnorm 如何影响确定性？
+
+#### H.2.5 深度分布验证
+- [ ] 实际深度分布是什么？
+- [ ] 是否过度集中于某个深度？
+- [ ] 深度分布与精度有相关性吗？
+
+### H.3 消融实验设计
+
+| 实验 | H1SS 变体 | 预期结果 | 如何验证 |
+|:-----|:----------|:---------|:---------|
+| A | 移除树约束 | Locality↑? Tree↓? | Tree Consistency Score |
+| B | 移除 SDS | Locality↓? 性能? | Locality Efficiency |
+| C | 固定 α=1.5 | 梯度消失? 性能? | Gradient Coverage |
+| D | 移除 K 课程 | 早期不稳定? | Selection IOU |
+| E | Conv1D vs DistanceDecay | 性能差异? | End-to-end Accuracy |
+
+### H.4 决策矩阵
+
+| 验证结果 | 行动 |
+|:---------|:-----|
+| Locality Efficiency 差异 < 5% | 移除 DistanceDecay Conv1D |
+| Tree Consistency 差异 ≈ 0 | 移除树约束 |
+| α=1.49 固定 = 调度版本 | 移除 α 调度 |
+| 所有上述成立 | 采用 HilbertSplitterV2 简化架构 |
+| 深度分布熵过早塌缩 | 启用 Soft-Halting 策略 |
+| 跨阶特征不对齐 | 引入 Super Token Up-sampling |
+
+### H.5 风险评估
+
+| 风险 | 影响 | 缓解措施 |
+|:-----|:-----|:---------|
+| 简化后精度下降 | 高 | 保留 Ablation 作为回退选项 |
+| 树一致性违反增加 | 中 | 添加简单的硬约束（非课程学习） |
+| 选择稳定性下降 | 中 | 使用温度退火而非完全确定性 |
+| Halting 陷入局部最优 | 高 | Soft-Halting 早期 → Hard-Halting 中后期 |
+| 分形阶数跳变特征不连续 | 高 | SViT Super Token + Implicit Up-sampling |
+| Python Dispatch 开销大 | 中 | Triton/CUDA Fused Kernel |
+
+### H.6 行动路线图
+
+#### 第一优先级：验证核心假设
+
+**问题 1**：DistanceDecay Conv 是否有效？
+```
+如果 Locality Efficiency 差异 < 5%，则 DistanceDecay 是无效复杂性
+验证方法：Ablation E (Conv1D vs DistanceDecay)
+决策点：差异小 → 简化为标准 Conv1D
+```
+
+**问题 2**：树约束是否必要？
+```
+如果移除树约束后 Tree Consistency 不下降，则树约束是无效复杂性
+验证方法：Ablation A (移除树约束)
+决策点：差异小 → 移除树约束
+```
+
+**问题 3**：α 调度是否有效？
+```
+如果固定 α=1.49 与调度版本效果相同，则调度是无效复杂性
+验证方法：Ablation C (固定 α=1.5)
+决策点：差异小 → 简化为固定调度
+```
+
+#### 第二优先级：统一架构
+
+**统一假设**：H1SS 和 H-entmax 的本质区别仅在于：
+1. 邻域复杂度提取方式（DistanceDecay Conv1D vs Standard Conv1D）
+2. 树约束机制
+3. α 调度策略
+
+**统一架构设计**：
+
+```python
+HilbertSplitterV2:
+├── HilbertLocalComplexity (H-Entmax)      # 可学习的 Conv1D
+├── (可选) TreeConstraint: simple λ=0.1   # 硬编码，非课程
+├── EntmaxAlpha: 固定 1.5 或 1.49          # 无调度
+└── K 选择: TopK after Entmax
+```
+
+**预期收益**：
+- 参数：10K → 2K（5x 简化）
+- 调度器：5+ → 0（完全移除）
+- 可维护性：大幅提升
+
+#### 第三优先级：探索新方向
+
+**方向 1**：适应性窗口大小
+```
+当前：固定 kernel_size=5
+改进：根据局部信息密度动态调整窗口
+参考：A-ViT 的 halting score 机制
+```
+
+**方向 2**：可学习的距离衰减
+```
+当前：w_d = 1/(|d|+1) 固定
+改进：w_d = softmax(gap, temperature)
+其中 gap 是数据驱动的距离嵌入
+```
+
+**方向 3**：两阶段选择
+```
+Stage 1：粗筛（Entmax α=1.2，保留 50% tokens）
+Stage 2：精筛（Entmax α=1.5，保留 K tokens）
+参考：CF-ViT 的粗到细策略
+```
+
+---
+
 ## G. 文件参考
 
 | 文件 | 主要类 |
