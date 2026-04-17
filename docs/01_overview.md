@@ -2,35 +2,67 @@
 
 ## 1.1 Overview
 
-This chapter describes the complete data flow and module structure of the Fractal Curve ViT architecture.
-
-### High-Level Pipeline
-
-$$I \xrightarrow{\text{Tokenize}} (T, L) \xrightarrow{E_{pos}} T' \xrightarrow{\text{CLS}} [c; T'] \xrightarrow{\text{Transformer}} X' \xrightarrow{\text{Pool}} z \xrightarrow{\text{MLP}} \hat{y}$$
-
-where:
-- $I \in \mathbb{R}^{B \times C \times H \times W}$: Input image batch
-- $T \in \mathbb{R}^{B \times N \times D}$: Token embeddings
-- $L \in \mathbb{Z}^{B \times N \times \text{Info}}$: Level information (depth + quadtree path)
-- $X' \in \mathbb{R}^{B \times (N+1) \times D}$: Encoded sequence (with CLS token)
-- $\hat{y} \in \mathbb{R}^{B \times C_{out}}$: Class logits
+The **Fractal Curve Tokenizer** project introduces a Vision Transformer (ViT) architecture that replaces traditional fixed-grid patching with **content-adaptive quadtree tokenization** ordered by the **Hilbert space-filling curve**. By leveraging the locality-preserving properties of the Hilbert curve, the model dynamically allocates more tokens to complex image regions while maintaining a spatially coherent sequence for the transformer.
 
 ---
 
-## 1.2 Data Flow Diagram
+## 1.2 Motivation and Key Innovations
+
+Standard ViTs suffer from two fundamental limitations:
+
+1. **Locality Blindness**: Raster-scan serialization destroys 2D spatial proximity - vertically adjacent patches become distant in sequence
+2. **Scale Invariance Violation**: Uniform 16×16 patches waste computation on homogeneous regions (sky, walls) while under-resolving complex areas (edges, textures)
+
+This project addresses these via:
+
+### Hilbert Locality Preservation
+
+Hilbert ordering ensures that adjacent tokens in the sequence are spatially proximate in 2D space, providing a strong inductive bias:
+
+$$\|p_1 - p_2\|_2 \leq C \cdot |H^{-1}(p_1) - H^{-1}(p_2)|^{1/2}$$
+
+### Adaptive Quadtree Splitting
+
+Instead of a fixed grid, the `StreamingFractalTokenizerV3` uses a differentiable splitter to decompose the image into variable-sized patches based on local complexity:
+
+$$\text{Split}(R) \iff C(R) > \tau_d$$
+
+### LCA-Based Attention
+
+By utilizing the **Lowest Common Ancestor (LCA)** in the quadtree hierarchy, the model implements a geometric attention bias with ~100 parameters (vs $O(N^2)$ in standard ViTs):
+
+$$B[i,j] = \text{LCAEmbed}(\text{LCA}(i, j))$$
+
+### Efficiency
+
+Adaptive tokenization achieves a **~40× reduction** in attention matrix size compared to standard ViT-16 (for 224×224 images):
+
+| Metric | Standard ViT-16 | Fractal ViT |
+|:-------|:----------------|:------------|
+| Token Count | ~196 (14×14 patches) | ~32-64 |
+| Attention Matrix | $N^2 \approx 38K$ | $N^2 \approx 1-4K$ |
+| **Reduction** | - | **~40×** |
+
+> **Note**: Complexity remains $O(N^2 \cdot D)$. The efficiency gain comes from token count reduction, not asymptotic complexity.
+
+---
+
+## 1.3 System Architecture Pipeline
+
+**Fractal ViT Data Flow**
 
 ```
-Input Image (B, C, H, W)
+Image (B, C, H, W)
         │
         ▼
 ┌───────────────────────────────────────────────┐
-│       StreamingFractalTokenizerV3             │
-│  ┌─────────────────────────────────────────┐  │
-│  │ 1. Learnable Complexity: C_theta(R)     │  │
-│  │ 2. Differentiable Quadtree Split        │  │
-│  │ 3. Region Pooling via ROI-Align         │  │
-│  │ 4. Hilbert Curve Reordering             │  │
-│  └─────────────────────────────────────────┘  │
+│         StreamingFractalTokenizerV3            │
+│  ┌─────────────────────────────────────────┐ │
+│  │ SharedConv (Feature Extraction)          │ │
+│  │ HilbertOptimalSplitter (Decision)        │ │
+│  │ ROI-Align (Region Pooling)              │ │
+│  │ HilbertSort (Curve Ordering)             │ │
+│  └─────────────────────────────────────────┘ │
 └───────────────────────────────────────────────┘
         │
         ▼
@@ -38,112 +70,161 @@ Input Image (B, C, H, W)
         │
         ▼
 ┌───────────────────────────────────────────────┐
-│       FractalPositionEmbedding                │
-│  E_pos(i) = Fusion(E_depth(d_i) + E_path(i))  │
+│       FractalPositionEmbedding                 │
+│       (Depth + Path Encoding)                 │
 └───────────────────────────────────────────────┘
         │
         ▼
-   T' = T + E_pos
+   Level-Aware LayerNorm
         │
         ▼
 ┌───────────────────────────────────────────────┐
-│            Add CLS Token                      │
-│       [CLS; T'] → (B, N+1, D)                 │
+│     FractalTransformerBlock × L                │
+│  ┌─────────────────────────────────────────┐ │
+│  │ ManifoldNativeAttention (LCA Bias)      │ │
+│  │ Level-Aware LayerNorm                    │ │
+│  │ AdaptiveFractalFeedForward (SwiGLU)      │ │
+│  └─────────────────────────────────────────┘ │
 └───────────────────────────────────────────────┘
+        │
+        ▼
+   Global Pooling (CLS / Mean)
         │
         ▼
 ┌───────────────────────────────────────────────┐
-│         FractalTransformer × L                │
-│  ┌─────────────────────────────────────────┐  │
-│  │ Level-Aware LayerNorm                   │  │
-│  │ HilbertAwareMultiScaleAttention         │  │
-│  │   + LCA Hilbert Bias                    │  │
-│  │ DropPath + Residual                     │  │
-│  │ Level-Aware LayerNorm                   │  │
-│  │ AdaptiveFractalFeedForward (SwiGLU)     │  │
-│  │ DropPath + Residual                     │  │
-│  └─────────────────────────────────────────┘  │
+│       MLP Head + LogitsClamp                  │
 └───────────────────────────────────────────────┘
         │
         ▼
-┌───────────────────────────────────────────────┐
-│     Pooling: CLS or Mean                      │
-└───────────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────────────────────┐
-│     MLP Head: LN → Linear → GELU → Linear     │
-└───────────────────────────────────────────────┘
-        │
-        ▼
-   Logits (B, num_classes)
+   Class Logits (B, num_classes)
 ```
 
 ---
 
-## 1.3 Module Hierarchy
+## 1.4 Architecture Layers
 
-| Layer | Module | File | Core Functionality |
-|:------|:-------|:-----|:-------------------|
-| **L4** | Application | `model_fractal_vit.py` | `FractalCurveViT` |
-| **L3** | Pipeline | `tokenizer_streaming.py` | `StreamingFractalTokenizerV3` |
-|        |          | `block_transformer.py` | `FractalTransformer` |
-| **L2** | Components | `gumbel_topk_splitter.py` | `GumbelTopKSplitter` (Scheme D/E) |
-|        |            | `attn_hilbert_bias.py` | `HilbertAwareMultiScaleAttention`, `LCAHilbertBias` |
-|        |            | `ffn_swiglu.py` | `SwiGLUFFN`, `AdaptiveFractalFeedForward` |
-|        |            | `embed_fractal_position.py` | `FractalPositionEmbedding` |
-| **L1** | Foundation | `curve_hilbert.py` | `HilbertCurve`, `PseudoHilbertCurve` |
+The codebase follows a strict **4-layer hierarchy** for modularity and dependency management:
 
----
+| Layer | Name | Purpose | Key Entities |
+|:------|:-----|:--------|:--------------|
+| **L4** | **Application** | High-level model assembly | `FractalCurveViT` |
+| **L3** | **Pipeline** | Tokenization and Transformer stages | `StreamingFractalTokenizer`, `FractalTransformer` |
+| **L2** | **Components** | Specialized layers and logic | `HilbertOptimalSplitter`, `ManifoldNativeAttention`, `SwiGLUFFN` |
+| **L1** | **Foundation** | Mathematical primitives and config | `HilbertCurve`, `LevelsInfo`, `FractalConfig`, `SplitterProtocol` |
 
-## 1.4 Key Innovations
-
-### 1.4.1 Variable Depth Tokens (V3)
-
-Unlike fixed-grid tokenization, V3 performs **content-adaptive quadtree splitting**:
-
-$$\text{Split}(R) \iff C(R) > \tau_d$$
-
-where:
-- $C(R) = \alpha \cdot \frac{\text{Var}(R)}{\text{Var}(R) + \sigma_0^2} + (1-\alpha) \cdot \frac{G(R)}{G(R) + g_0^2}$
-- $\tau_d = \tau_0 \cdot \gamma^d$ (depth-dependent threshold)
-
-### 1.4.2 LCA Hilbert Bias
-
-Attention bias derived from quadtree LCA (Lowest Common Ancestor) depth:
-
-$$B[i,j] = \text{LCAEmbed}(\text{LCA}(i, j))$$
-
-This provides explicit geometric meaning with only ~100 learnable parameters.
-
-### 1.4.3 SwiGLU FFN with Level Adaptation
-
-$$\text{SwiGLU}(x) = W_{out} \cdot (\text{Swish}(W_{gate} \cdot x) \odot W_{value} \cdot x)$$
-
-Extended with level-adaptive residual:
-
-$$\text{Output} = (1 - \alpha_d) \cdot \text{FFN}(x) + \alpha_d \cdot \text{Adapter}([x; E_{level}(d)])$$
-
----
-
-## 1.5 Configuration
-
-### FractalConfig
+### Import Rules (L1→L2→L3→L4)
 
 ```python
-from vit_pytorch import FractalConfig
+# L1 imports: None (base)
+# L2 imports: L1 only
+from vit_pytorch.core.curve_hilbert import HilbertCurve
+from vit_pytorch.core.levels_info import LevelsInfo
 
+<<<<<<< Updated upstream
 config = FractalConfig(
     d_model=384,
     num_heads=6,
     hilbert_bias_mode='lca',  # 'lca', 'low_rank', 'hierarchical'
     max_depth=4,
 )
+=======
+# L3 imports: L1, L2
+from vit_pytorch.modules.tokenizer import StreamingFractalTokenizerV3
+
+# L4 imports: All
+from vit_pytorch import FractalCurveViT
+>>>>>>> Stashed changes
 ```
 
-### Model Instantiation
+> **Wrong**: `from vit_pytorch.modules.base_splitter import CoreSplitter`
+> **Correct**: `from vit_pytorch.core.splitter_protocol import CoreSplitter`
+
+---
+
+## 1.5 Code Entity Relationship
+
+```
+                    Natural Language Space
+                              │
+                    ┌─────────┴─────────┐
+                    ▼                   ▼
+         "L4 uses L3"          "L3 uses L2 Protocol"
+                              │
+                    ┌─────────┴─────────┐
+                    ▼                   ▼
+              Implementation      ┌───────┴───────┐
+                                 ▼               ▼
+                          FractalCurveViT   StreamingFractalTokenizer
+                          +forward()          +tokenize()
+                          +analyze()          +split()
+                                               │
+                              ┌────────────────┼────────────────┐
+                              ▼                ▼                ▼
+                       HilbertOptimalSplitter ManifoldNativeAttention SwiGLUFFN
+                       +forward()           +forward()         +forward()
+                       +update_candidates()
+```
+
+---
+
+## 1.6 Model-Trainer Interface
+
+**Principle**: Model defines capabilities, Trainer decides usage.
+
+`forward()` returns `TrainingStats`:
 
 ```python
+@dataclass
+class TrainingStats:
+    logits: Tensor              # Classification logits
+    num_tokens: Tensor         # Token count per sample
+    depth_used: Tensor         # Max depth used
+    depth_distribution: Tensor  # Token count per depth
+    features: Optional[Tensor]  # Final layer features
+    transformer_tokens: Tensor  # Tokens after transformer
+    # Auxiliary outputs collected from layers:
+    # - splitter_output (entropy, budget_loss, etc.)
+    # - attention_outputs[i] (geometric_bias_mean, etc.)
+    # - ffn_outputs[i] (level_mixing_mean, etc.)
+```
+
+---
+
+## 1.7 Document Structure
+
+| Chapter | Content |
+|:--------|:--------|
+| [00_introduction](00_introduction.md) | Project background and motivation |
+| [01_overview](01_overview.md) | System architecture (this chapter) |
+| [02_data_structures](02_data_structures.md) | Core mathematical foundations |
+| [03_fractal_tokenizer](03_fractal_tokenizer.md) | Tokenization pipeline |
+| [04_positional_embedding](04_positional_embedding.md) | Position encoding |
+| [05_attention_mechanism](05_attention_mechanism.md) | Manifold-native attention |
+| [06_feedforward_network](06_feedforward_network.md) | Feed-forward networks |
+| [07_transformer_encoder](07_transformer_encoder.md) | Transformer blocks |
+| [08_fractal_vit_model](08_fractal_vit_model.md) | Complete model |
+| [09_training_system](09_training_system.md) | Training infrastructure |
+| [10_testing_qa](10_testing_qa.md) | Testing and benchmarking |
+| [appendix](appendix.md) | Appendix |
+
+---
+
+## 1.8 Quick Start
+
+### Installation
+
+```bash
+# Using uv (recommended)
+uv sync
+
+# Or pip
+pip install -e .
+```
+
+### Basic Usage
+
+```python
+import torch
 from vit_pytorch import FractalCurveViT
 
 model = FractalCurveViT(
@@ -153,26 +234,41 @@ model = FractalCurveViT(
     depth=6,
     heads=6,
     mlp_dim=768,
+<<<<<<< Updated upstream
     tokenizer_type='streaming_v3',
     bias_mode='lca',
     ffn_type='swiglu_level',
+=======
+>>>>>>> Stashed changes
 )
+
+images = torch.randn(4, 3, 224, 224)
+stats = model(images)
+print(f"Logits shape: {stats.logits.shape}")  # (4, 1000)
+print(f"Token count: {stats.num_tokens.mean().item():.1f}")
+```
+
+### Training
+
+```bash
+# CUB-200 (dynamic resolution)
+uv run python src/training/train_fractal_vit.py \
+    --dataset cub200 \
+    --image-size None \
+    --use-amp \
+    --compile
 ```
 
 ---
 
-## 1.6 Complexity Analysis
+## 1.9 Project Status
 
-> **Key Clarification**: The "40× reduction" refers to **token count reduction**, not asymptotic complexity. Token count reduces from ~307K (standard ViT 16×16 patches for 224×224) to ~32 (V3 variable-depth tokens).
+| Metric | Value |
+|:-------|:------|
+| Version | 0.8.x |
+| Test Coverage | 295+ tests passing |
+| Tokenizer | V3 (Variable Depth Tokens) |
+| Attention Bias | LCA (recommended) |
+| FFN | SwiGLU + Level Adaptation |
 
-| Operation | Complexity | Notes |
-|:----------|:-----------|:------|
-| Tokenization | $O(N_{cand} \cdot D)$ | $N_{cand} = \sum_{d=0}^{D} 4^d$ (e.g., 85 for D=3) |
-| Hilbert Reordering | $O(N \log N)$ | Sort by Hilbert index |
-| LCA Computation | $O(N^2)$ | Cached, amortized $O(1)$ |
-| Attention | $O(N^2 \cdot D)$ | Standard transformer (N ≈ 32) |
-| **Effective Computation** | ~40× reduction | $N_{V3} \approx 32$ vs $N_{ViT} \approx 307K$ |
-
-> **Note**: Transformer effective depth is fixed at `depth // 2`. The original dynamic depth mechanism (I97-11) was removed as it offered no practical benefit while adding complexity.
-
-> **Next**: [02_data_structures.md](02_data_structures.md) - Core Data Structures
+> **Next**: [00_introduction.md](00_introduction.md) - Project Background and Motivation

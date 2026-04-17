@@ -1,71 +1,97 @@
-# Chapter 2: Core Data Structures
+# Chapter 2: Core Mathematical Foundations
 
 ## 2.1 Overview
 
-This chapter defines the fundamental data structures that flow through the Fractal Curve ViT pipeline.
+This chapter describes the mathematical primitives that underpin the Fractal Curve Tokenizer system. The architecture relies on the isomorphism between quadtree structures and the Hilbert space-filling curve to transform 2D spatial information into 1-dimensional sequences while preserving maximum locality.
 
 ---
 
-## 2.2 TokenizerOutput
+## 2.2 Hilbert Curve Algorithms
 
-The unified output structure from all tokenizers.
+The system implements several variants of the Hilbert curve to handle different hardware constraints and image geometries.
 
-### Definition
+### 2.2.1 FastBitwiseHilbert
 
-```python
-@dataclass
-class TokenizerOutput:
-    sequences: List[TokenSequence]  # Per-image token sequences
-```
+A **vectorized implementation** using Gray-code and Morton encoding (bit-interleaving) to perform 2D-to-1D mapping without Python loops.
 
-### TokenSequence
+**Key Features**:
+- Bitwise operations for O(1) per-element conversion
+- No recursion overhead
+- Optimized for GPU tensor operations
 
-```python
-@dataclass  
-class TokenSequence:
-    tokens: Tensor           # (N, D) - token embeddings
-    attention_mask: Tensor   # (N,) - valid token mask
-    metadata: Dict[str, Any] # Additional information
-    
-    def get_levels(self) -> Tensor:
-        """Extract levels_info from metadata."""
-        return self.metadata.get('levels', None)
-```
+**Source**: `src/vit_pytorch/core/fast_bitwise_hilbert.py`
 
-### Access Patterns
+### 2.2.2 HilbertCurve (Butz Algorithm)
+
+The standard recursive implementation used for square grids where $N = 2^k$.
 
 ```python
-# Per-image access
-for seq in output.sequences:
-    tokens = seq.tokens          # (N_i, D)
-    levels = seq.get_levels()    # (N_i, max_depth+1)
-    
-# Batch access (with padding)
-tokens, levels, mask = output.to_batch()  # (B, N_max, D), (B, N_max, Info), (B, N_max)
+class HilbertCurve:
+    def __init__(self, level: int):
+        self.level = level
+        self.n = 2 ** level
+
+    def d_to_xy(self, d: int) -> Tuple[int, int]:
+        """Convert Hilbert index to 2D coordinates."""
+        # Butz algorithm implementation
+        ...
+
+    def xy_to_d(self, x: int, y: int) -> int:
+        """Convert 2D coordinates to Hilbert index."""
+        ...
 ```
+
+**Source**: `src/vit_pytorch/core/curve_hilbert.py`
+
+### 2.2.3 PseudoHilbertCurve
+
+Extends the locality benefits to **non-square or non-power-of-two grids**. Useful for arbitrary image dimensions.
+
+### 2.2.4 HilbertTopologyCache
+
+A **lazy precomputation module** that stores `coord_to_idx` and `idx_to_coord` tensors to avoid redundant calculations during training.
+
+```python
+class HilbertTopologyCache:
+    def __init__(self, max_level: int = 8):
+        self.max_level = max_level
+        self._coord_to_idx = {}  # Lazy initialization
+        self._idx_to_coord = {}
+
+    def get_coords(self, indices: Tensor) -> Tensor:
+        """Convert Hilbert indices to 2D coordinates."""
+        if self.max_level not in self._idx_to_coord:
+            self._precompute(self.max_level)
+        return self._idx_to_coord[self.max_level][indices]
+```
+
+**Cache Key**: `data_ptr` + `torch_version` for automatic invalidation
+
+**Source**: `src/vit_pytorch/core/hilbert_topology_cache.py`
 
 ---
 
-## 2.3 levels_info Tensor
+## 2.3 Quadtree and LevelsInfo Data Structures
 
-The hierarchical position encoding for each token.
+### 2.3.1 LevelsInfo Tensor
 
-### Shape
+The hierarchical nature of fractal tokenization is represented by the `LevelsInfo` data structure, which flattens a quadtree into a tensor format suitable for GPU processing.
 
-$$L \in \mathbb{Z}^{B \times N \times (d_{max} + 1)}$$
+**Tensor Definition**:
 
-### Structure
+$$L \in \mathbb{Z}^{B \times N \times (D+1)}$$
+
+where:
 
 | Index | Content | Range | Description |
 |:------|:--------|:------|:------------|
-| `[:, :, 0]` | Depth | $[0, d_{max}]$ | Quadtree depth of the token |
-| `[:, :, 1:]` | Path | $[0, 3]^{d_{max}}$ | Quadtree path (quadrant indices) |
+| `L[:, :, 0]` | Depth | $[0, D_{max}]$ | Quadtree depth of the token |
+| `L[:, :, 1:]` | Path | $[0, 3]^{D_{max}}$ | Quadrant path (quadrant indices) |
 
-### Quadrant Encoding
+### 2.3.2 Quadrant Encoding
 
 ```
 Quadrant indices (Hilbert-compatible):
-    
     ┌─────┬─────┐
     │  2  │  3  │
     ├─────┼─────┤
@@ -73,250 +99,162 @@ Quadrant indices (Hilbert-compatible):
     └─────┴─────┘
 ```
 
-### Mathematical Interpretation
+### 2.3.3 Coordinate Reconstruction
 
-For a token at depth $d$ with path $[q_1, q_2, \ldots, q_d]$:
+Tokens are reconstructed into 2D coordinates from their `LevelsInfo` paths using vectorized bitwise operations:
 
-$$\text{position}(t) = \sum_{i=1}^{d} q_i \cdot 4^{d-i}$$
+$$x = \sum_{k=0}^{d-1} \text{bit}_k(q_k, 0) \cdot 2^{max\_level-k-1}$$
 
-This maps bijectively to a Hilbert curve segment.
+$$y = \sum_{k=0}^{d-1} \text{bit}_k(q_k, 1) \cdot 2^{max\_level-k-1}$$
 
-### Example
+This avoids the $O(N \cdot D)$ serial overhead of traditional quadtree traversal.
+
+### 2.3.4 LCA Matrix
+
+The system computes the **Lowest Common Ancestor (LCA)** between any two tokens to determine their relative geometric bias in attention mechanisms:
+
+$$\text{LCA}(i, j) = \text{Length}(\text{CommonPrefix}(\text{Path}(i), \text{Path}(j)))$$
+
+The LCA depth provides a measure of spatial proximity in the quadtree hierarchy.
+
+### 2.3.5 Precomputed LUTs
+
+For `torch.compile` compatibility, the system uses **eager initialization** of Hilbert Look-Up Tables (LUTs) up to depth 8.
 
 ```python
-# Token at depth 2, path [1, 3] (bottom-right → top-right)
-levels_info[b, t] = [2, 1, 3, 0, 0, 0]
-#                    ^  ^  ^  ^^^^^^^
-#                    |  |  |  padding (unused)
-#                    |  |  └── q_2 = 3
-#                    |  └───── q_1 = 1
-#                    └──────── depth = 2
+# Precomputed LUTs for fast lookup
+_LUT_DEPTH_8 = self._build_lut(max_level=8)
 ```
+
+**Source**: `src/vit_pytorch/core/levels_info.py`
 
 ---
 
-## 2.4 FractalConfig
+## 2.4 Configuration and Splitter Protocols
 
-Unified configuration dataclass for the entire system.
+### 2.4.1 FractalConfig
 
-### Definition
+Automatically derives image geometry, determining `max_level` and whether to use `PseudoHilbertCurve` based on input resolution.
 
 ```python
 @dataclass
 class FractalConfig:
-    # Model dimensions
-    d_model: int = 384
-    num_heads: int = 6
-    
-    # Tokenizer configuration
-    image_size: int = 224
+    image_size: int | Tuple[int, int]
     min_patch_size: int = 4
-    max_depth: int = 4
-    
-    # Hilbert bias configuration
-    hilbert_bias_mode: str = 'lca'  # 'lca', 'low_rank', 'hierarchical'
-    low_rank_r: int = 32
-    
-    # Attention parameters
-    lca_temperature: float = 1.5
-    learnable_temperature: bool = True
-    
-    # FFN configuration
-    ffn_type: str = 'swiglu_level'
+    max_level_limit: int = 8
+    tokenizer_type: str = 'streaming_v3'
+
+    def __post_init__(self):
+        # Auto-derive max_level from image size
+        if isinstance(self.image_size, int):
+            self.max_level = int(np.log2(self.image_size // self.min_patch_size))
+        else:
+            self.max_level = min(
+                int(np.log2(self.image_size[0] // self.min_patch_size)),
+                int(np.log2(self.image_size[1] // self.min_patch_size))
+            )
 ```
 
-### Derived Properties
+### 2.4.2 CoreSplitter Protocol
+
+Standardized interface for different splitting strategies:
 
 ```python
-@property
-def num_scales(self) -> int:
-    """Number of scales in the quadtree."""
-    return self.max_depth + 1
-
-@property
-def patch_sizes(self) -> Tuple[int, ...]:
-    """Available patch sizes from fine to coarse."""
-    return tuple(self.min_patch_size * (2 ** i) for i in range(self.num_scales))
-```
-
----
-
-## 2.5 AdaptiveSplitConfig
-
-Configuration for content-adaptive quadtree splitting.
-
-### Complexity Function Parameters
-
-| Parameter | Symbol | Default | Description |
-|:----------|:-------|:--------|:------------|
-| `alpha` | $\alpha$ | 0.5 | Variance weight in $[0, 1]$ |
-| `sigma_0_sq` | $\sigma_0^2$ | 0.01 | Variance normalization constant |
-| `g_0_sq` | $g_0^2$ | 0.08 | Gradient normalization constant |
-
-### Threshold Function Parameters
-
-| Parameter | Symbol | Default | Description |
-|:----------|:-------|:--------|:------------|
-| `tau_0` | $\tau_0$ | 0.15 | Root threshold |
-| `gamma` | $\gamma$ | 0.85 | Threshold decay factor |
-| `max_depth` | $d_{max}$ | 4 | Maximum split depth |
-
-### Splitting Scheme
-
-```python
-class SplitScheme(Enum):
-    BALANCED_GREEDY = "balanced_greedy"  # Scheme B: Greedy with 2:1 balance
-    FIXED_BUDGET_DP = "fixed_budget_dp"  # Scheme C: DP with token budget
-    LEARNABLE = "learnable"              # Scheme L: End-to-end learnable
-```
-
----
-
-## 2.6 QuadtreeNode
-
-Internal representation of a quadtree node during splitting.
-
-### Definition
-
-```python
-@dataclass
-class QuadtreeNode:
-    x: int              # Top-left x coordinate
-    y: int              # Top-left y coordinate
-    size: int           # Region size (pixels)
-    depth: int          # Quadtree depth
-    path: List[int]     # Quadrant path from root
-    complexity: float   # Computed complexity C(R)
-    
+class CoreSplitter(Protocol):
     @property
-    def region(self) -> Tuple[int, int, int, int]:
-        """Return (x, y, x+size, y+size) bounding box."""
-        return (self.x, self.y, self.x + self.size, self.y + self.size)
-```
-
-### Invariants
-
-1. **Size constraint**: $\text{size} = \text{image\_size} / 2^{\text{depth}}$
-2. **Path length**: $\text{len(path)} = \text{depth}$
-3. **Alignment**: $(x, y)$ aligned to $\text{size}$-pixel grid
-
----
-
-## 2.7 HilbertIndex
-
-Mapping between 2D coordinates and Hilbert curve positions.
-
-### Mathematical Definition
-
-$$H: [0, n^2) \leftrightarrow [0, n) \times [0, n)$$
-
-### Implementation
-
-```python
-class HilbertCurve:
-    def __init__(self, order: int):
-        """Initialize Hilbert curve of given order.
-        
-        Args:
-            order: Log2 of grid size (e.g., order=4 → 16×16 grid)
-        """
-        self.order = order
-        self.n = 2 ** order
-        
-    def d2xy(self, d: int) -> Tuple[int, int]:
-        """Convert Hilbert index to (x, y) coordinates."""
+    def num_candidates(self) -> int:
+        """Number of candidate regions."""
         ...
-        
-    def xy2d(self, x: int, y: int) -> int:
-        """Convert (x, y) coordinates to Hilbert index."""
+
+    def forward(
+        self,
+        features: Tensor,
+        image_size: Tuple[int, int]
+    ) -> SplitResult:
+        """Perform splitting decision."""
+        ...
+
+    def update_candidates(self, image_size: Tuple[int, int]) -> None:
+        """Update candidate regions for new image size."""
         ...
 ```
 
-### Locality Property
+### 2.4.3 Tree Consistency Axioms (H1SS)
 
-For any two points $p_1, p_2$:
+The `HilbertOptimalSplitter` follows six axioms to ensure valid quadtree splitting:
 
-$$\|p_1 - p_2\|_2 \leq C \cdot |H^{-1}(p_1) - H^{-1}(p_2)|^{1/2}$$
+| Axiom | Description |
+|:------|:------------|
+| **A1** | Coverage: Root covers entire image |
+| **A2** | Containment: Each child ⊆ parent |
+| **A3** | Disjointness: Sibling regions don't overlap |
+| **A4** | Tree Depth: Max depth ≤ $D_{max}$ |
+| **A5** | Monotonicity: Parent selected ⇒ at least one child selected |
+| **A6** | Continuity: Selected regions form connected subgraph |
 
 ---
 
-## 2.8 HilbertPatternEncoder (I162-1)
+## 2.5 Mathematical Concepts to Code Entities Mapping
 
-> **New**: Hilbert Order Pattern Encoder
-
-### 2.8.1 Overview
-
-`HilbertPatternEncoder` leverages Hilbert order for spatial pattern extraction. It rearranges tokens by Hilbert order and applies multi-scale 1D convolutions, which is equivalent to 2D window convolutions but more efficient.
-
-### 2.8.2 Mathematical Formulation
-
-$$\tilde{t} = t[\sigma_H]$$
-
-$$f^{(w)} = \text{Conv1D}_w(\tilde{t})$$
-
-$$f = \text{Fusion}([f^{(w_1)}, f^{(w_2)}, \ldots])$$
-
-where $\sigma_H$ is the Hilbert ordering, satisfying $\|pos_i - pos_{i+1}\|_2 \leq \sqrt{2}$.
-
-### 2.8.3 Multi-Scale Design
-
-| Kernel Size | Equivalent Receptive Field | Use Case |
-|:------------|:--------------------------|:---------|
-| k=3 | ~3×3 | Fine-grained texture |
-| k=7 | ~7×7 | Medium-scale patterns |
-| k=15 | ~15×15 | Regional structure |
-
-### 2.8.4 Complexity Analysis
-
-**Time Complexity**: $O(B \cdot N \cdot \sum k_i)$
-
-**Space Complexity**: $O(B \cdot N \cdot D \cdot m)$
-
-Compared to 2D Convolution: $O(B \cdot H \cdot W \cdot \sum k_i^2)$
-
-When $k_i \ll \min(H, W)$, 1D convolution is more efficient.
-
-### 2.8.5 Usage Example
-
-```python
-from vit_pytorch.core.pattern_encoder import HilbertPatternEncoder
-
-encoder = HilbertPatternEncoder(
-    dim=384,
-    window_sizes=(3, 7, 15),  # Multi-scale convolutions
-    out_dim=384,
-)
-
-# Input: tokens [B, N, D], hilbert_order [N]
-pattern_features = encoder(tokens, hilbert_order)
-# Output: [B, N, out_dim]
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              Mathematical Concept Space                          │
+├─────────────────────────────────────────────────────────────────┤
+│  Hilbert Curve Mapping  │  Quadtree Decomposition  │  Spatial Indexing  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼ uses
+┌─────────────────────────────────────────────────────────────────┐
+│                 Code Entity Space (L1 Foundation)               │
+├─────────────────────────────────────────────────────────────────┤
+│  FastBitwiseHilbert         │  HilbertCurve        │  HilbertTopologyCache  │
+│  [core/fast_bitwise_hilbert.py]  [core/curve_hilbert.py]  [core/hilbert_topology_cache.py]  │
+├─────────────────────────────────────────────────────────────────┤
+│  LevelsInfo                      │  PatternEncoder  │  SplitterProtocol  │
+│  [core/levels_info.py]              [core/pattern_encoder.py]  [core/splitter_protocol.py]  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 2.9 Tensor Shape Conventions
+## 2.6 SDS Metric (Spatial Discontinuity Score)
 
-### Input/Output Shapes
+The **SDS (Structure Distortion Score)** validates Hilbert locality preservation:
 
-| Tensor | Shape | Description |
-|:-------|:------|:------------|
-| Image | $(B, C, H, W)$ | Input image batch |
-| Tokens | $(B, N, D)$ | Token embeddings |
-| Levels | $(B, N, d_{max}+1)$ | Level information |
-| Attention Mask | $(B, 1, 1, N)$ | Broadcast-compatible mask |
-| Hilbert Bias | $(B, H, N, N)$ | Per-head attention bias |
-| Logits | $(B, C_{out})$ | Classification output |
+$$\text{SDS} = \frac{1}{N^2} \sum_{i,j} \left| \|p_i - p_j\|_2 - \frac{|h_i - h_j|}{H_{\max}} \right|$$
 
-### Dimension Notation
+where:
 
-| Symbol | Meaning | Typical Value |
-|:-------|:--------|:--------------|
-| $B$ | Batch size | 32 |
-| $C$ | Image channels | 3 |
-| $H, W$ | Image height/width | 224 |
-| $N$ | Number of tokens | 16-196 |
-| $D$ | Model dimension | 384 |
-| $H$ | Number of heads | 6 |
-| $d_{max}$ | Maximum depth | 4 |
+- $p_i, p_j$: 2D physical coordinates
+- $h_i, h_j$: Hilbert indices
+- $H_{\max}$: Maximum Hilbert index for the grid
 
-> **Next**: [03_fractal_tokenizer.md](03_fractal_tokenizer.md) - Tokenization Pipeline
+**Interpretation**:
+
+- SDS ≈ 0: Perfect locality preservation (spatial distance ∝ Hilbert distance)
+- SDS >> 0: Locality distortion (random ordering)
+
+**Source**: `src/vit_pytorch/core/curve_hilbert.py` - `SDSMetric` class
+
+---
+
+## 2.7 Key Abbreviations
+
+| Abbreviation | Full Term | Context |
+|:------------|:---------|:--------|
+| **SDS** | Spatial Discontinuity Score | Hilbert locality validation |
+| **LUT** | Look-Up Table | Precomputed Hilbert mappings |
+| **LCA** | Lowest Common Ancestor | Quadtree hierarchy |
+| **H1SS** | Hilbert-Optimal Splitter (6 Axioms) | Default splitter |
+
+---
+
+## 2.8 Document Navigation
+
+| Chapter | Content |
+|:--------|:--------|
+| [02_data_structures](02_data_structures.md) | Core mathematical foundations (this chapter) |
+| [03_fractal_tokenizer](03_fractal_tokenizer.md) | Tokenization pipeline |
+| [04_positional_embedding](04_positional_embedding.md) | Position encoding |
+
+> **Next**: [03_fractal_tokenizer.md](03_fractal_tokenizer.md) - Fractal Tokenization Pipeline

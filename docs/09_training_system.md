@@ -2,210 +2,245 @@
 
 ## 9.1 Overview
 
-This chapter describes the modular training infrastructure for `FractalCurveViT`, including gradient monitoring, numerical stability defense, mixed-precision training, and a fully decoupled trainer architecture.
+The **Training System** provides a robust, modular infrastructure for optimizing `FractalCurveViT`. It handles unique challenges of fractal tokenization: non-deterministic sequence lengths, complex gradient flow through token splitters, and numerical stability across varying spatial scales.
 
-### Key Design Principles
+**Key Design Principles**:
 
 1. **Model-Agnostic**: Trainer functions do not depend on specific model implementation
 2. **Numerical Safety First**: Comprehensive NaN/Inf detection and gradient validation
-3. **Configuration-Driven**: All hyperparameters via dataclass configs
-4. **Mathematically Verifiable**: All components have formal definitions with unit tests
+3. **Decoupled Architecture**: Training logic separated from model definitions via `TrainingState`
+4. **BPE Schedule**: Budget, Power, Exploration schedule for fractal tree adaptation
+
+`★ Insight ─────────────────────────────────────`
+The BPE (Budget, Power, Exploration) schedule is central to fractal tokenization training — it manages the transition from high-entropy exploration to structural consolidation of the fractal tree. This is crucial because the splitter must learn which regions to split without collapsing into a single scale.
+`─────────────────────────────────────────────────`
+
+### System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      CLI Layer: train_fractal_vit.py                 │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
+│  │  Config (config) │  │ Scheduler (LR)   │  │ NumericalDefense │  │
+│  └────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘  │
+│           │                    │                    │              │
+│           ▼                    ▼                    ▼              │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │               train_one_epoch + GradBalancer                 │   │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │   │
+│  │  │ MixupCutmix  │→ │ Backward+   │→ │   AMP        │      │   │
+│  │  │ Loss         │  │ GradClip    │  │   GradScaler │      │   │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘      │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│           │                    │                    │              │
+│           ▼                    ▼                    ▼              │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐  │
+│  │ GradientMonitor  │  │ CheckpointSaver │  │   EpochLogger   │  │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘  │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
 ### Module Structure
 
-```
-src/training/
-├── config.py           # Config, TrainingHyperparams, NumericalConfig, etc.
-├── train_fractal_vit.py # Main training entry point
-├── trainer/
-│   ├── epoch_train.py  # train_one_epoch, train_one_epoch_simple
-│   ├── epoch_eval.py   # evaluate, evaluate_simple
-│   ├── loss.py         # MixupCutmixLoss, compute_loss
-│   └── state.py       # TrainingState, EpochMetrics
-├── scheduler/
-│   └── lr_scheduler.py # WarmupCosineScheduler, create_scheduler
-├── monitor/
-│   ├── gradient_monitor.py   # GradientMonitor, GradientStatisticsTracker
-│   ├── loss_monitor.py        # LossMonitor, LossTracker
-│   └── numerical_defense.py   # NumericalDefender, GradientValidator
-├── checkpoint/
-│   ├── saver.py        # save_checkpoint, save_epoch_stats
-│   └── loader.py       # load_checkpoint, find_latest_checkpoint
-└── training_logs/
-    ├── epoch_logger.py  # EpochLogger
-    └── metrics.py       # MetricsTracker, compute_* functions
-```
+| Module | Purpose | Key Files |
+|:-------|:--------|:---------|
+| **CLI Layer** | Entry point and argument parsing | `train_fractal_vit.py`, `main.py` |
+| **Config** | Hyperparameter management | `config.py` |
+| **Trainer** | Training/evaluation loops | `epoch_train.py`, `epoch_eval.py`, `loss.py` |
+| **Scheduler** | Learning rate schedules | `lr_scheduler.py` |
+| **Monitor** | Gradient and numerical health | `gradient_monitor.py`, `numerical_defense.py` |
+| **Checkpoint** | State persistence | `saver.py`, `loader.py` |
 
 ---
 
-## 9.2 Training Entry Point
+## 9.2 Training Script and BPE Schedule
 
-### Main Script
+### 9.2.1 Training Entry Point
 
 ```bash
+# Standard entry
 python -m src.training.train_fractal_vit [arguments]
-```
 
-Or directly:
-
-```bash
+# Direct execution
 python src/training/train_fractal_vit.py [arguments]
 ```
 
-### Quick Test
+### 9.2.2 BPE (Budget, Power, Exploration) Schedule
 
-```bash
-python src/training/train_fractal_vit.py --quick-test --use-amp
+The BPE schedule manages the transition from high-entropy exploration to structural consolidation:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      3-Stage BPE Schedule                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Stage 1: Stochastic Exploration (Epochs 0-30)                     │
+│  ├── Temperature τ = 2.0 (high entropy)                            │
+│  ├── Budget penalty = 0 (no compression)                           │
+│  └── Purpose: Explore potential tokenization paths                 │
+│                                                                      │
+│  Stage 2: Power-Law Annealing (Epochs 30-70)                       │
+│  ├── Temperature τ: 2.0 → 0.3 (annealing)                         │
+│  ├── Budget penalty: 0 → 0.1 (gradual compression)                 │
+│  └── Purpose: Balance exploration with compression                  │
+│                                                                      │
+│  Stage 3: Structural Consolidation (Epochs 70-100)                  │
+│  ├── Temperature τ = 0.3 (fixed)                                   │
+│  ├── Budget penalty = 0.1 (fixed)                                   │
+│  └── Purpose: Stabilize learned fractal patterns                     │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Key CLI Arguments
+### 9.2.3 Splitter Parameter Groups
+
+The system uses **separate learning rates** for the token splitter (typically 5× the backbone LR):
+
+```python
+# From src/training/config.py
+param_groups = [
+    {'params': backbone_params, 'lr': base_lr},           # e.g., 8e-5
+    {'params': splitter_params, 'lr': base_lr * 5},      # e.g., 4e-4
+]
+```
+
+This ensures the splitter can adapt quickly to the changing feature manifold.
+
+### 9.2.4 Key CLI Arguments
 
 | Argument | Default | Description |
 |:---------|:--------|:------------|
-| `--splitter-type` | `gumbel_topk` | Splitter type: `hilbert_optimal` (H1SS), `hilbert_entmax`, `gumbel_topk` |
+| `--splitter-type` | `hilbert_optimal` | Splitter: `hilbert_optimal` (H1SS), `hilbert_entmax`, `gumbel_topk` |
 | `--dim` | 384 | Model embedding dimension |
 | `--num-layers` | 8 | Number of transformer layers |
 | `--heads` | 6 | Number of attention heads |
 | `--mlp-dim` | 1536 | FFN hidden dimension |
-| `--lr` | 8e-5 | Learning rate |
+| `--lr` | 8e-5 | Base learning rate |
+| `--splitter-lr` | 4e-4 | Splitter learning rate (typically 5× base_lr) |
 | `--weight-decay` | 0.1 | Weight decay |
 | `--batch-size` | 128 | Batch size |
 | `--num-epochs` | 100 | Number of training epochs |
 | `--use-amp` | False | Use automatic mixed precision |
 | `--compile` | False | Use torch.compile |
-| `--dataset` | `cub200` | Dataset name |
+| `--dataset` | `cub200` | Dataset: `cub200`, `tiny_imagenet` |
 
-> **Note**: Use `--splitter-type hilbert_optimal` for H1SS (recommended) or `hilbert_entmax` for H-entmax.
+### 9.2.5 Training with H1SS
+
+```bash
+python -m src.training.train_fractal_vit \
+    --splitter-type hilbert_optimal \
+    --dataset cub200 \
+    --image-size 224 \
+    --dim 384 \
+    --num-layers 8 \
+    --heads 6 \
+    --use-amp \
+    --compile
+```
 
 ---
 
-## 9.3 Configuration System
+## 9.3 Loss Functions and Evaluation
 
-### Config Dataclasses
+### 9.3.1 FractalViTLoss System
+
+The `FractalViTLoss` combines standard classification objectives with geometric and structural constraints:
+
+| Loss Component | Purpose | Code Entity |
+|:---------------|:--------|:------------|
+| **Classification** | Cross-entropy with Label Smoothing/Mixup | `MixupCutmixLoss` |
+| **Budget Loss** | Penalizes exceeding target token ratio | `budget_loss_weight` |
+| **SDS Regularization** | Spatial-distance-scale consistency | `use_sds_regularization` |
+| **Tree Constraint** | Soft constraint on parent-child quadtree logic | `tree_constraint_weight` |
+
+### 9.3.2 Mixup and CutMix
 
 ```python
-from src.training import (
-    Config,
-    TrainingHyperparams,
-    NumericalConfig,
-    MixedPrecisionConfig,
-    create_config,
-)
+from src.training.trainer.loss import MixupCutmixLoss
 
-# Create default config
-config = create_config(
-    num_epochs=100,
-    batch_size=128,
-    base_lr=8e-5,
-    weight_decay=0.1,
+loss_fn = MixupCutmixLoss(
+    mixup_alpha=0.8,
+    cutmix_alpha=1.0,
+    mixup_prob=0.5,
+    num_classes=200,
 )
-
-# Access hyperparameters
-print(config.hyperparams.num_epochs)
-print(config.numerical.detect_anomaly)
 ```
 
-### TrainingHyperparams
+**Mixup Formulation**:
 
-Core training hyperparameters:
+$$x̃ = \lambda \cdot x_i + (1 - \lambda) \cdot x_j$$
+$$ỹ = \lambda \cdot y_i + (1 - \lambda) \cdot y_j$$
+$$\lambda \sim \text{Beta}(\alpha, \alpha)$$
 
-| Parameter | Default | Description |
-|:----------|:--------|:------------|
-| `num_epochs` | 100 | Total training epochs |
-| `batch_size` | 128 | Batch size per iteration |
-| `accumulation_steps` | 1 | Gradient accumulation steps |
-| `gradient_clip_norm` | 1.0 | Gradient clipping threshold |
-| `base_lr` | 5e-4 | Base learning rate |
-| `warmup_epochs` | 5 | LR warmup epochs |
-| `min_lr` | 1e-6 | Minimum learning rate |
-| `warmup_start_lr` | 1e-7 | Starting LR during warmup |
-| `weight_decay` | 0.05 | Weight decay coefficient |
-| `label_smoothing` | 0.0 | Label smoothing factor |
-| `mixup_alpha` | 0.8 | Mixup alpha parameter |
-| `cutmix_alpha` | 1.0 | CutMix alpha parameter |
-| `mixup_cutmix_prob` | 0.5 | Probability of applying Mixup/Cutmix |
-| `log_interval` | 50 | Logging interval |
-| `eval_interval` | 1 | Evaluation interval |
-| `checkpoint_interval` | 10 | Checkpoint save interval |
+**CutMix Formulation**:
 
-### NumericalConfig
+$$x̃ = \text{Mix}(x_i, x_j, \text{region})$$
+$$\lambda = 1 - \frac{\text{region\_area}}{\text{total\_area}}$$
 
-Numerical stability configuration:
+### 9.3.3 Evaluation Metrics
 
-| Parameter | Default | Description |
-|:----------|:--------|:------------|
-| `detect_anomaly` | False | Enable PyTorch anomaly detection |
-| `check_gradients` | True | Check gradients for NaN/Inf |
-| `skip_on_nan_grad` | True | Skip optimizer step on NaN/Inf gradient |
-| `record_grad_norms` | True | Record gradient norms |
-| `record_layer_grad_norms` | True | Record per-layer gradient norms |
-| `record_loss_components` | True | Record loss component breakdown |
+| Metric | Description |
+|:-------|:------------|
+| **Top-1 Accuracy** | Standard classification accuracy |
+| **Top-5 Accuracy** | Whether correct class in top 5 predictions |
+| **ECE** | Expected Calibration Error |
+| **Hilbert Locality Score (J)** | Measures spatial distance preservation |
 
 ---
 
-## 9.4 Training Functions
+## 9.4 Training Loop and Gradient Management
 
-### Basic Training Loop
+### 9.4.1 GradBalancer
+
+**Problem**: The splitter's auxiliary gradients (budget loss, tree constraint) can vanish or explode relative to classification gradients during training.
+
+**Solution**: `GradBalancer` dynamically adjusts the `budget_loss_weight` using an EMA of gradient norms:
 
 ```python
-from src.training import (
-    train_one_epoch,
-    evaluate,
-    TrainingState,
-    create_scheduler,
-    save_checkpoint,
-)
+# From src/training/trainer/epoch_train.py
+class GradBalancer:
+    def __init__(
+        self,
+        budget_loss_weight: float = 0.1,
+        grad_norm_ema: float = 0.95,
+        target_ratio: float = 0.1,
+    ):
+        self.budget_loss_weight = budget_loss_weight
+        self.grad_norm_ema = grad_norm_ema
+        self.target_ratio = target_ratio
+        self.backbone_grad_norm_ema = None
+        self.splitter_grad_norm_ema = None
 
-# Create model, optimizer, dataloaders
-model = FractalCurveViT(...)
-optimizer = torch.optim.AdamW(model.parameters(), lr=8e-5)
-scheduler = create_scheduler(optimizer, config)
-scaler = torch.cuda.amp.GradScaler()
-
-# Training state
-state = TrainingState(
-    epoch=0,
-    global_step=0,
-    best_metric=0.0,
-)
-
-# Train for one epoch
-for epoch in range(config.hyperparams.num_epochs):
-    state.epoch = epoch
-
-    # Train
-    metrics = train_one_epoch(
-        model=model,
-        train_loader=train_loader,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        scaler=scaler,
-        state=state,
-        config=config,
-        device=device,
-    )
-
-    # Evaluate
-    eval_metrics = evaluate(
-        model=model,
-        val_loader=val_loader,
-        device=device,
-    )
-
-    # Save checkpoint
-    if epoch % 10 == 0:
-        save_checkpoint(
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-            metrics=metrics,
-            epoch=epoch,
-            is_best=(eval_metrics['top1'] > state.best_metric),
-        )
+    def update(
+        self,
+        backbone_grad_norm: float,
+        splitter_grad_norm: float,
+    ) -> float:
+        # Dynamically adjust budget_loss_weight based on gradient ratio
+        ratio = splitter_grad_norm / (backbone_grad_norm + 1e-8)
+        adjustment = self.target_ratio / (ratio + 1e-8)
+        self.budget_loss_weight *= adjustment
+        return self.budget_loss_weight
 ```
 
-### TrainingState
+### 9.4.2 Memory Management
+
+Implements `expandable_segments` to mitigate memory fragmentation caused by dynamic token counts:
+
+```python
+# From train_fractal_vit.py
+torch.backends.cuda.expandable_segments = True
+
+# OOM mitigation
+if OOM occurred:
+    torch.cuda.empty_cache()
+    # Retry with smaller batch
+```
+
+### 9.4.3 Training State
 
 ```python
 from src.training import TrainingState
@@ -218,89 +253,40 @@ state = TrainingState(
     optimizer_state=None,
     scheduler_state=None,
     scaler_state=None,
-    sampler_state=None,
-    metrics_history={},
-    warning_count=0,
-    nan_skip_count=0,
 )
+```
+
+### 9.4.4 Gradient Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Gradient Control Flow                              │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Forward Pass: images → backbone → splitter → tokens → logits       │
+│                                                                      │
+│  Backward Pass:                                                     │
+│  ├── grad_norm_backbone = clip(gradients)                           │
+│  ├── grad_norm_splitter = clip(gradients)                           │
+│  ├── GradBalancer.update(backbone_grad_norm, splitter_grad_norm)     │
+│  └── budget_loss_weight = adjusted_weight                           │
+│                                                                      │
+│  Optimization:                                                       │
+│  ├── scaler.scale(loss + budget_loss_weight * budget_loss).backward()│
+│  ├── scaler.unscale_(optimizer)                                     │
+│  ├── clip_grad_norm_(model.parameters(), max_norm=1.0)              │
+│  └── scaler.step(optimizer)                                         │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 9.5 Loss Functions
+## 9.5 Monitoring, Checkpointing, and Logging
 
-### MixupCutmixLoss
+### 9.5.1 NumericalDefender
 
-Combines Mixup and CutMix augmentation:
-
-```python
-from src.training.trainer.loss import MixupCutmixLoss
-
-loss_fn = MixupCutmixLoss(
-    mixup_alpha=0.8,
-    cutmix_alpha=1.0,
-    mixup_prob=0.5,  # Probability of applying augmentation
-    num_classes=200,
-)
-
-# In training loop
-for images, labels in train_loader:
-    # Apply Mixup/Cutmix automatically
-    mixed_images, mixed_labels = loss_fn(images, labels)
-
-    outputs = model(mixed_images)
-    loss = compute_loss(outputs, mixed_labels, loss_fn)
-```
-
-**Mixup Mathematical Formulation**:
-
-$$x̃ = \lambda \cdot x_i + (1 - \lambda) \cdot x_j$$
-$$ỹ = \lambda \cdot y_i + (1 - \lambda) \cdot y_j$$
-$$\lambda \sim \text{Beta}(\alpha, \alpha)$$
-
-**CutMix Mathematical Formulation**:
-
-$$x̃ = \text{Mix}(x_i, x_j, \text{region})$$
-$$\lambda = 1 - \frac{\text{region\_area}}{\text{total\_area}}$$
-
-### compute_loss
-
-```python
-from src.training.trainer.loss import compute_loss
-
-# For integer labels
-loss = compute_loss(logits, labels, None)
-
-# For soft labels (Mixup/Cutmix)
-loss = compute_loss(logits, mixed_labels, loss_fn)
-```
-
----
-
-## 9.6 Numerical Defense System
-
-### GradientValidator
-
-Checks gradients for numerical issues:
-
-```python
-from src.training.monitor import GradientValidator
-
-validator = GradientValidator(
-    model=model,
-    skip_on_issue=True,
-    log_warnings=True,
-)
-
-# After backward
-should_skip = validator.check_gradients()
-if not should_skip:
-    optimizer.step()
-```
-
-### NumericalDefender
-
-Comprehensive numerical stability protection:
+Intercepts NaNs and Infs during training:
 
 ```python
 from src.training.monitor import NumericalDefender
@@ -318,9 +304,14 @@ with defender:
     scaler.scale(loss).backward()
 ```
 
-### GradientMonitor
+**NaNAutoInvestigation**: When a NaN is detected, the system triggers investigation to pinpoint whether the failure occurred in:
+- Hilbert sort
+- Attention weights
+- Splitter logits
 
-Per-layer gradient monitoring:
+### 9.5.2 GradientMonitor
+
+Tracks backbone-to-splitter gradient norm ratio:
 
 ```python
 from src.training.monitor import GradientMonitor
@@ -334,12 +325,50 @@ monitor = GradientMonitor(
 monitor.record_gradients()
 if state.global_step % 100 == 0:
     stats = monitor.get_statistics()
-    print(stats)
+    # ratio = splitter_grad_norm / backbone_grad_norm
 ```
+
+**Health Check**: A healthy ratio indicates the BPE schedule is working — if the ratio drifts far from the target (typically 0.1), it signals that the splitter's training is becoming unstable.
+
+### 9.5.3 Checkpoint Management
+
+```python
+from src.training.checkpoint import save_checkpoint, load_checkpoint
+
+# Save
+save_checkpoint(
+    model=model,
+    optimizer=optimizer,
+    scheduler=scheduler,
+    scaler=scaler,
+    metrics=metrics,
+    epoch=epoch,
+    checkpoint_dir='./checkpoints',
+    is_best=True,
+)
+
+# Load
+checkpoint = load_checkpoint(
+    checkpoint_path='./checkpoints/best.pth',
+    model=model,
+    optimizer=optimizer,
+    scheduler=scheduler,
+    scaler=scaler,
+)
+start_epoch = checkpoint['epoch'] + 1
+```
+
+**Checkpoint Types**:
+
+| File | Purpose |
+|:-----|:--------|
+| `best.pth` | Best model based on validation metric |
+| `last.pth` | Most recent checkpoint |
+| `epoch_*.pth` | Periodic snapshots |
 
 ---
 
-## 9.7 Learning Rate Scheduling
+## 9.6 Learning Rate Scheduling
 
 ### WarmupCosineScheduler
 
@@ -354,9 +383,6 @@ scheduler = create_scheduler(
     base_lr=8e-5,
     min_lr=1e-6,
 )
-
-# In training loop
-scheduler.step()
 ```
 
 **Mathematical Formulation**:
@@ -369,139 +395,7 @@ $$lr(t) = lr_{min} + (lr_{base} - lr_{min}) \cdot \frac{1}{2}(1 + \cos(\pi \cdot
 
 ---
 
-## 9.8 Checkpoint Management
-
-### Save Checkpoint
-
-```python
-from src.training.checkpoint import save_checkpoint
-
-save_checkpoint(
-    model=model,
-    optimizer=optimizer,
-    scheduler=scheduler,
-    scaler=scaler,
-    metrics=metrics,
-    epoch=epoch,
-    checkpoint_dir='./checkpoints',
-    is_best=True,
-)
-```
-
-### Load Checkpoint
-
-```python
-from src.training.checkpoint import load_checkpoint
-
-checkpoint = load_checkpoint(
-    checkpoint_path='./checkpoints/best.pth',
-    model=model,
-    optimizer=optimizer,
-    scheduler=scheduler,
-    scaler=scaler,
-)
-
-start_epoch = checkpoint['epoch'] + 1
-```
-
-### Find Latest/Best Checkpoint
-
-```python
-from src.training.checkpoint import find_latest_checkpoint, find_best_checkpoint
-
-latest = find_latest_checkpoint('./checkpoints')
-best = find_best_checkpoint('./checkpoints')
-```
-
----
-
-## 9.9 Metrics and Logging
-
-### MetricsTracker
-
-```python
-from src.training.training_logs import MetricsTracker, compute_accuracy
-
-tracker = MetricsTracker()
-
-# During training
-for outputs, targets in dataloader:
-    tracker.update(outputs=outputs, targets=targets)
-
-# Compute metrics
-metrics = tracker.compute()
-# {
-#     'top1_accuracy': 0.85,
-#     'top5_accuracy': 0.98,
-#     'num_samples': 1000,
-# }
-```
-
-### compute_accuracy
-
-```python
-from src.training.training_logs import compute_accuracy
-
-top1, top5 = compute_accuracy(logits, targets, topk=(1, 5))
-```
-
-### EpochLogger
-
-```python
-from src.training.training_logs import EpochLogger
-
-logger = EpochLogger(
-    log_dir='./logs',
-    experiment_name='fractal_vit_exp',
-)
-
-logger.log_epoch(epoch, metrics, lr=scheduler.get_last_lr()[0])
-```
-
----
-
-## 9.10 H1SS Training Characteristics
-
-### Hilbert Splitter with Stable Selection (H1SS)
-
-H1SS is the recommended splitter type, based on six axioms:
-
-| Axiom | Description |
-|:------|:------------|
-| A1 | 1D Hilbert manifold convolution |
-| A2 | No Gumbel perturbation |
-| A3 | Entmax sparse activation |
-| A4 | Tree consistency soft constraint |
-| A5 | Single Entmax projection |
-| A6 | < 10K parameters |
-
-### Training with H1SS
-
-```bash
-python -m src.training.train_fractal_vit \
-    --splitter-type hilbert_optimal \
-    --dataset cub200 \
-    --image-size 224 \
-    --dim 384 \
-    --num-layers 8 \
-    --heads 6 \
-    --use-amp \
-    --compile
-```
-
-### Diagnostics
-
-```python
-# Get model diagnostics
-if hasattr(model, 'get_diagnostics'):
-    diagnostics = model.get_diagnostics()
-    print(f"Splitter type: {diagnostics.get('splitter_type')}")
-    print(f"Gradient coverage: {diagnostics.get('gradient_coverage')}")
-```
-
----
-
-## 9.11 Mixed Precision Training
+## 9.7 Mixed Precision Training
 
 ### Enable AMP
 
@@ -529,47 +423,54 @@ for images, labels in train_loader:
 
 ---
 
-## 9.12 Best Practices
+## 9.8 Best Practices
 
 ### Memory Optimization
 
-1. **Clear tokenizer cache**: Call `model.clear_tokenizer_cache()` after each batch
-2. **Mixed precision**: Use `--use-amp` for 2× memory reduction
-3. **Gradient checkpointing**: Use `--gradient-checkpoint` for large models
-4. **Channels last**: Use `--channels-last` for faster convolution
+| Technique | Benefit |
+|:----------|:--------|
+| `--use-amp` | 2× memory reduction via FP16 |
+| `expandable_segments` | Reduces fragmentation from dynamic token counts |
+| Gradient checkpointing | Trade compute for memory |
 
 ### Training Stability
 
-1. **Gradient clipping**: `gradient_clip_norm=1.0`
-2. **Learning rate warmup**: 15 epochs
-3. **Weight decay**: 0.1 for most configurations
-4. **Numerical defense**: Enable `skip_on_nan=True` to handle NaN gradients
+| Technique | Purpose |
+|:----------|:--------|
+| Gradient clipping | `max_norm=1.0` prevents explosions |
+| GradBalancer | Prevents splitter gradient vanishing/exploding |
+| Warmup (15 epochs) | Stabilizes early training |
+| `skip_on_nan=True` | Handles NaN gradients gracefully |
 
 ### Monitoring
 
-1. **Gradient norms**: Watch for explosions using `GradientMonitor`
-2. **Loss trends**: Use `LossMonitor` to track loss components
+1. **GradientMonitor**: Watch for ratio drift from target (0.1)
+2. **LossMonitor**: Track loss component breakdown
 3. **Token count variance**: Some variation is healthy for adaptive tokenization
 
 ---
 
-## 9.13 Implementation Status
+## 9.9 Implementation Status
 
 | Component | Status | Location |
 |:----------|:-------|:---------|
 | `train_one_epoch` | ✅ Complete | `src/training/trainer/epoch_train.py` |
+| `GradBalancer` | ✅ Complete | `src/training/trainer/epoch_train.py` |
 | `evaluate` | ✅ Complete | `src/training/trainer/epoch_eval.py` |
 | `MixupCutmixLoss` | ✅ Complete | `src/training/trainer/loss.py` |
-| `TrainingState` | ✅ Complete | `src/training/trainer/state.py` |
 | `NumericalDefender` | ✅ Complete | `src/training/monitor/numerical_defense.py` |
 | `GradientMonitor` | ✅ Complete | `src/training/monitor/gradient_monitor.py` |
-| `LossMonitor` | ✅ Complete | `src/training/monitor/loss_monitor.py` |
 | `WarmupCosineScheduler` | ✅ Complete | `src/training/scheduler/lr_scheduler.py` |
-| `save_checkpoint` | ✅ Complete | `src/training/checkpoint/saver.py` |
-| `load_checkpoint` | ✅ Complete | `src/training/checkpoint/loader.py` |
-| `EpochLogger` | ✅ Complete | `src/training/logging/epoch_logger.py` |
-| `MetricsTracker` | ✅ Complete | `src/training/logging/metrics.py` |
+| `CheckpointSaver` | ✅ Complete | `src/training/checkpoint/saver.py` |
 
 ---
 
-> **Next**: [10_testing_qa.md](10_testing_qa.md) - Testing and QA
+## 9.10 Document Navigation
+
+| Chapter | Content |
+|:--------|:--------|
+| [08_fractal_vit_model](08_fractal_vit_model.md) | Complete model architecture |
+| [09_training_system](09_training_system.md) | Training infrastructure (this chapter) |
+| [10_testing_qa](10_testing_qa.md) | Testing and benchmarking |
+
+> **Next**: [10_testing_qa.md](10_testing_qa.md) - Testing and Benchmarking

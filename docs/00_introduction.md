@@ -1,77 +1,118 @@
-# Introduction
+# Chapter 0: Project Background and Motivation
 
-> **Fractal Curve Tokenizer for Vision Transformers**
+## 0.1 Problem Statement: Limitations of Fixed-Patch ViTs
 
-## Background and Motivation
+Traditional Vision Transformers partition images into fixed-size grids (e.g., 16×16 patches). This approach suffers from two primary inefficiencies:
 
-Traditional Vision Transformers (ViT) partition images into fixed-size patches (e.g., 16×16), ignoring the inherent multi-scale structure of visual content. This work explores an alternative: **content-adaptive tokenization** guided by the Hilbert space-filling curve.
+### 0.1.1 Scale Invariance Violation
 
-### Problem Statement
+Uniform grids treat high-entropy regions (edges, textures) and low-entropy regions (sky, uniform backgrounds) with the same resolution. This leads to:
+- **Redundant computation** in simple areas (wasting tokens on homogeneous regions)
+- **Information loss** in complex regions (insufficient resolution for fine details)
 
-Standard ViT tokenization exhibits two fundamental limitations:
+### 0.1.2 Locality Blindness
 
-1. **Scale Invariance Violation**: Uniform patches cannot represent both fine textures and coarse semantics efficiently
-2. **Locality Blindness**: The linear sequence of patches does not encode spatial proximity
-
-### Hypothesis
-
-The **Hilbert curve's locality-preserving property** provides a natural inductive bias for vision transformers, enabling:
-
-- Spatially coherent token sequences
-- Hierarchical attention patterns via LCA (Lowest Common Ancestor) relationships
-- Multi-scale representation through adaptive quadtree splitting
+Standard raster-scan serialization of patches destroys 2D spatial proximity. Two patches that are vertically adjacent in an image become distant in the linear sequence, forcing the Transformer to learn spatial relationships from scratch without any geometric inductive bias.
 
 ---
 
-## Mathematical Foundation
+## 0.2 Mathematical Foundation
 
-### Hilbert Curve
+### 0.2.1 Hilbert Locality Bound
 
-The **Hilbert curve** is a continuous fractal mapping that fills a 2D space while preserving locality:
+The Hilbert curve ($H$) is a continuous fractal mapping:
 
 $$H: [0, n^2) \leftrightarrow [0, n) \times [0, n)$$
 
-**Locality Bound**: For any two points $p_1, p_2$ in the 2D grid:
+It is characterized by a strict **locality bound**:
 
 $$\|p_1 - p_2\|_2 \leq C \cdot |H^{-1}(p_1) - H^{-1}(p_2)|^{1/2}$$
 
-where $C$ is a dimension-dependent constant. This ensures that adjacent positions in the Hilbert sequence correspond to spatially proximate locations.
+This ensures that **points close in the 1D Hilbert sequence are guaranteed to be spatially proximate in 2D space**. The exponent 1/2 reflects the fractal dimension of the Hilbert curve.
 
-### Quadtree-Hilbert Isomorphism
+### 0.2.2 Quadtree-Hilbert Isomorphism
 
-A fundamental property underlies this work: the bijection between quadtree paths and Hilbert curve segments:
+A core technical insight: there exists a **bijection** between quadtree paths and Hilbert curve segments. Any region $R$ defined by a quadtree path can be exactly mapped to a continuous segment of the Hilbert curve:
 
 $$\text{QuadtreePath}(R) = [q_1, q_2, \ldots, q_d] \iff \text{HilbertSegment}(R) = H|_{[a,b]}$$
 
-This enables adaptive quadtree-based splitting to maintain Hilbert-ordered token sequences.
+This isomorphism enables:
+- Variable-sized quadtree regions to map to contiguous Hilbert segments
+- Spatial relationships preserved through the token ordering
+- Hierarchical structure encoded in the sequence
+
+### 0.2.3 LCA-Based Geometry
+
+The hierarchical nature of the quadtree allows for the calculation of the **Lowest Common Ancestor (LCA)** between any two tokens:
+
+$$\text{LCA}(i, j) = \text{Length}(\text{CommonPrefix}(\text{Path}(i), \text{Path}(j)))$$
+
+The depth of the LCA serves as a proxy for spatial and structural distance:
+- **High LCA depth** → tokens are in nearby quadrants → stronger attention bias
+- **Low LCA depth** → tokens are in distant regions → weaker attention bias
+
+This provides **geometric attention bias with minimal parameters** (~100 params vs $O(N^2)$ in standard ViTs).
 
 ---
 
-## Architecture Overview
+## 0.3 Architecture Overview
 
-| Component | Implementation | Description |
-|:----------|:---------------|:------------|
-| Tokenizer | `StreamingFractalTokenizerV3` | Adaptive quadtree + Hilbert reordering |
-| Position Encoding | `FractalPositionEmbedding` | Depth + path encoding |
-| Attention Bias | `LCAHilbertBias` | ~100 parameters, explicit geometric meaning |
-| FFN | `SwiGLUFFN` | Gated activation with level adaptation |
+### Current Implementation: V3 Variable Depth Tokens
+
+The system uses **content-adaptive quadtree splitting** with independent per-region split decisions:
+
+$$\text{Split}(R) \iff C(R) > \tau_d$$
+
+where $C(R)$ is a learnable complexity measure and $\tau_d$ is a depth-dependent threshold. Each region makes its own decision without competing with other scales.
+
+### Key Components
+
+| Component | Purpose |
+|:----------|:--------|
+| `StreamingFractalTokenizerV3` | Adaptive token generation |
+| `HilbertOptimalSplitter` | Region splitting decisions |
+| `ManifoldNativeAttention` | LCA-based geometric attention |
+| `SwiGLUFFN` | Level-adaptive feed-forward network |
 
 ---
 
-## Quick Start
+## 0.4 System Mapping: Concept to Code
 
-### Installation
+### Tokenization Pipeline Data Flow
 
-```bash
-# Using uv (recommended)
-uv sync
-
-# Or pip
-pip install -e .
+```
+Image (B, C, H, W)
+        │
+        ▼
+┌───────────────────────────────────────────────┐
+│       StreamingFractalTokenizerV3             │
+│  ┌─────────────────────────────────────────┐ │
+│  │ SharedConv (Feature Extraction)         │ │
+│  │ HilbertOptimalSplitter (Decision)       │ │
+│  │ ROI-Align (Region Pooling)              │ │
+│  │ HilbertSort (Curve Ordering)            │ │
+│  └─────────────────────────────────────────┘ │
+└───────────────────────────────────────────────┘
+        │
+        ▼
+   TokenizerOutput (tokens, levels_info)
+        │
+        ▼
+┌───────────────────────────────────────────────┐
+│       FractalPositionEmbedding                 │
+│       (Depth + Path Encoding)                 │
+└───────────────────────────────────────────────┘
+        │
+        ▼
+   FractalTransformerBlock × L
+        │
+        ▼
+   Class Logits
 ```
 
-### Basic Usage
+### Architecture Component Hierarchy
 
+<<<<<<< Updated upstream
 ```python
 from vit_pytorch import FractalCurveViT
 
@@ -88,37 +129,63 @@ model = FractalCurveViT(
 
 images = torch.randn(4, 3, 224, 224)
 logits = model(images)  # (4, 1000)
+=======
+```
+FractalCurveViT (L4)
+├── tokenizer: StreamingFractalTokenizerV3
+│   ├── patch_embed: HilbertNativePatchEmbed
+│   └── splitter: CoreSplitter → HilbertOptimalSplitter
+├── transformer: FractalTransformer
+│   └── layers: FractalTransformerBlock[]
+│       ├── attention: ManifoldNativeAttention
+│       │   └── bias: LCAHilbertBias
+│       └── ffn: AdaptiveFractalFeedForward
+└── pos_drop: nn.Dropout
+>>>>>>> Stashed changes
 ```
 
 ---
 
-## Document Structure
+## 0.5 Efficiency Gains
 
-| Chapter | Content |
-|:--------|:--------|
-| [01_overview](01_overview.md) | System architecture and data flow |
-| [02_data_structures](02_data_structures.md) | Core data structures |
-| [03_fractal_tokenizer](03_fractal_tokenizer.md) | Tokenization pipeline |
-| [04_positional_embedding](04_positional_embedding.md) | Position encoding |
-| [05_attention_mechanism](05_attention_mechanism.md) | Hilbert-aware attention |
-| [06_feedforward_network](06_feedforward_network.md) | Feed-forward networks |
-| [07_transformer_encoder](07_transformer_encoder.md) | Transformer encoder |
-| [08_fractal_vit_model](08_fractal_vit_model.md) | Complete model |
-| [09_training_system](09_training_system.md) | Training system |
-| [10_testing_qa](10_testing_qa.md) | Testing and QA |
-| [11_issues_roadmap](11_issues_roadmap.md) | Development history |
-| [appendix](appendix.md) | Appendix |
+By using variable-depth tokens, the model significantly reduces the sequence length $N$ processed by the Transformer:
+
+| Metric | Standard ViT-16 | Fractal ViT |
+|:-------|:----------------|:------------|
+| Image Size | 224×224 | 224×224 |
+| Patch Size | 16×16 | Variable (4×4 to 64×64) |
+| Token Count ($N$) | ~196 (14×14) | ~32-64 |
+| Attention Matrix ($N^2$) | ~38K | ~1-4K |
+| **Reduction Factor** | - | **~40×** |
+
+> **Note**: Attention complexity remains $O(N^2 \cdot D)$. The ~40× efficiency gain comes from token count reduction ($N \approx 32-64$ vs $196$), not asymptotic complexity change.
+
+### Why Variable Token Count Works
+
+- Standard ViT with 16×16 patches on 224×224 image: $N = (224/16)^2 = 196$ tokens
+- Fractal ViT with adaptive splitting: $N \approx 32-64$ tokens (depending on image complexity)
+- The model learns to allocate more tokens to complex regions (edges, textures) and fewer to simple regions (background)
 
 ---
 
-## Project Status
+## 0.6 Key Innovations Summary
 
-| Metric | Value |
-|:-------|:------|
-| Version | 0.8.x |
-| Test Coverage | 295+ tests passing |
-| Tokenizer | V3 (Variable Depth Tokens) |
-| Hilbert Bias | LCA (recommended) |
-| FFN | SwiGLU + Level Adaptation |
+| Innovation | Description | Benefit |
+|:-----------|:------------|:--------|
+| **Hilbert Locality** | Space-filling curve preserves 2D proximity in 1D sequence | Strong geometric inductive bias |
+| **Adaptive Quadtree** | Content-dependent splitting based on complexity | Efficient token allocation |
+| **LCA Attention Bias** | Geometric bias from quadtree hierarchy | ~100 params instead of $O(N^2)$ |
+| **Scale-Aware Residual** | Parent-to-child information flow | Prevents information washout |
+
+---
+
+## 0.7 Document Navigation
+
+| Chapter | Content |
+|:--------|:--------|
+| [00_introduction](00_introduction.md) | Project background and motivation (this chapter) |
+| [01_overview](01_overview.md) | System architecture overview |
+| [02_data_structures](02_data_structures.md) | Core mathematical foundations |
+| [03_fractal_tokenizer](03_fractal_tokenizer.md) | Tokenization pipeline |
 
 > **Next**: [01_overview.md](01_overview.md) - System Architecture
