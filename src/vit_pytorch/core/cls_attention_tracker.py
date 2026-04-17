@@ -88,6 +88,7 @@ class CLSAttentionTracker:
         self.warning_history: List[bool] = []
         self.layer_counter = 0
 
+    @torch._dynamo.disable  # 🌟 I-OOM FIX: 禁用 Dynamo 追踪，防止图断裂导致 backward 泄漏
     def compute_cls_depth_attention(
         self,
         attention_weights: torch.Tensor,

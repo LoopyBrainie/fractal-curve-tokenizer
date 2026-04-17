@@ -1008,10 +1008,11 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         nn.init.trunc_normal_(self.cls_token, std=0.02)
 
         # I-NAN: 为 cls_token 注册梯度 hook，捕获 backward 过程中产生的 NaN
+        # D4-AUDIT FIX: 使用 isfinite().all() 替代 isnan().any() or isinf().any()
         if self.cls_token is not None and self.cls_token.requires_grad:
             self.cls_token.register_hook(
                 lambda grad: torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
-                if torch.isnan(grad).any() or torch.isinf(grad).any() else grad
+                if not grad.isfinite().all() else grad
             )
 
         
@@ -1035,12 +1036,13 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
 
     def _register_all_nan_grad_hooks(self):
         """I-NAN: 为所有参数注册梯度 hook，捕获 backward 过程中产生的 NaN"""
+        # D4-AUDIT FIX: 使用 isfinite().all() 替代 isnan().any() or isinf().any()
         self._all_nan_grad_hooks = []
         for param in self.parameters():
             if param.requires_grad:
                 hook = param.register_hook(
                     lambda grad: torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
-                    if torch.isnan(grad).any() or torch.isinf(grad).any() else grad
+                    if not grad.isfinite().all() else grad
                 )
                 self._all_nan_grad_hooks.append(hook)
 

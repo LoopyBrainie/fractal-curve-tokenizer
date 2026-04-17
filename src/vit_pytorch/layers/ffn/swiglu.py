@@ -316,11 +316,12 @@ class AdaptiveFractalFeedForward(nn.Module):
         # I-NAN: 训练初期 main_ffn_norm 因 gamma=0.01 可能极小，
         # adapter_norm / tiny_value 会产生极大离群点，clamp 防止离群值
         # D1-AUDIT FIX: main_norm 现在是 tensor，torch.where 处理条件
-        main_norm = self._diagnostic_cache.get("main_ffn_norm", torch.tensor(0.0))
+        # D4-AUDIT FIX: 使用 zeros_like 替代 torch.tensor() 创建新 tensor
+        main_norm = self._diagnostic_cache.get("main_ffn_norm", torch.zeros_like(adapter_norm_val))
         contribution = torch.where(
             main_norm > 1e-6,
             (adapter_norm_val / main_norm.clamp(min=1e-6)).clamp(max=100.0),
-            torch.tensor(0.0, device=adapter_norm_val.device)
+            torch.zeros_like(adapter_norm_val)
         )
         self._diagnostic_cache["contribution_ratio"] = contribution.detach()
 
@@ -352,7 +353,8 @@ class AdaptiveFractalFeedForward(nn.Module):
             depths = levels_info.depths  # [B, S], 包含 padding sentinel -1
             # I101-3: 深度边界处理 - padding (-1) 映射到 max_level+1
             # 有效深度 0..max_level 保持不变
-            depths = depths.where(depths >= 0, torch.tensor(self.max_level + 1, device=depths.device))
+            # D4-AUDIT FIX: 使用 new_full 替代 torch.tensor() 创建标量
+            depths = depths.where(depths >= 0, depths.new_full((), self.max_level + 1))
             depths = depths.clamp(min=0, max=self.max_level + 1)
 
         # Task 4 重构: 使用 F.layer_norm 启用 torch.compile Kernel Fusion

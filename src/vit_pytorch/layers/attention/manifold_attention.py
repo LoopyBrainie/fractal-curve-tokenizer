@@ -647,14 +647,8 @@ class ParentTokenLookup(nn.Module):
             current_mask = (depths == d)
             parent_mask_d = (depths == d - 1)
 
-            if not current_mask.any():
-                continue
-
-            # D3-AUDIT FIX: nonzero(as_tuple=False) 避免动态 tuple 返回
-            # nonzero 返回 [num_true, 2] 的 2D 张量，squeeze 后行为不一致:
-            # - num_true=1: [1,2] -> squeeze -> [2] (第一维被移除)
-            # - num_true>1: [N,2] -> squeeze -> [N,2] (不变)
-            # 所以需要条件处理
+            # D4-AUDIT FIX: 使用 shape[0] 替代 .any()，避免 GPU->CPU 同步
+            # nonzero 返回的 [0, 2] 形状空tensor在empty case时shape[0]==0
             current_idx_2d = current_mask.nonzero(as_tuple=False)
             parent_idx_2d = parent_mask_d.nonzero(as_tuple=False)
 
@@ -663,6 +657,10 @@ class ParentTokenLookup(nn.Module):
                 current_idx_2d = current_idx_2d.unsqueeze(0)
             if parent_idx_2d.dim() == 1:
                 parent_idx_2d = parent_idx_2d.unsqueeze(0)
+
+            # D4-AUDIT FIX: 用 shape[0] 检查替代 .any()，shape是metadata访问不触发同步
+            if current_idx_2d.shape[0] == 0:
+                continue
 
             num_current = current_idx_2d.shape[0]
             num_parents = parent_idx_2d.shape[0]
@@ -1212,8 +1210,8 @@ class ManifoldNativeAttention(nn.Module):
         out = self.proj(out)
         out = self.proj_dropout(out)
 
-        # NaN 检测
-        if torch.isnan(out).any() or torch.isinf(out).any():
+        # NaN 检测 (D4-AUDIT FIX: 使用 torch.isfinite 替代 isnan+isinf，避免两次 GPU->CPU 同步)
+        if not out.isfinite().all():
             self._nan_count += 1
         self._total_count += 1
 

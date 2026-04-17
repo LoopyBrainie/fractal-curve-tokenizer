@@ -672,14 +672,39 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         # 子节点矩阵
         children_matrix = torch.full((N, 4), -1, dtype=torch.long, device=device)
-        for i in range(N):
-            parent = new_parent_indices[i]  # I-OPT: 直接用 0-d tensor 索引，无 .item()
-            if parent >= 0:
-                # 找到父节点的下一个可用槽位
-                for slot in range(4):
-                    if children_matrix[parent, slot] == -1:
-                        children_matrix[parent, slot] = i
-                        break
+        # D4-AUDIT FIX: 向量化 children_matrix 构建，避免 O(N*4) Python 循环
+        # 方法：按 (parent, child_order) 排序后批量赋值
+        valid_mask = new_parent_indices >= 0
+        if valid_mask.any():
+            valid_indices = torch.where(valid_mask)[0]  # 子节点的原始索引
+            valid_parents = new_parent_indices[valid_indices]  # 对应的父节点
+
+            # 按父节点排序，相同时按子节点顺序排序
+            sort_keys = valid_parents * N + valid_indices  # 编码为唯一键
+            sorted_order = sort_keys.argsort()
+
+            sorted_parents = valid_parents[sorted_order]
+            sorted_children = valid_indices[sorted_order]
+
+            # 计算每个父节点的子节点数量（用于确定slot起始位置）
+            # 使用 bincount 得到每个父节点的子节点总数
+            parent_counts = torch.zeros(N, device=device, dtype=torch.long)
+            parent_counts.scatter_add_(0, sorted_parents, torch.ones_like(sorted_parents))
+
+            # 计算每个子节点的slot：同一父节点内，按出现顺序编号
+            # 利用排序性质，相同父节点的子节点是连续的
+            # 因此 slot = 该子节点在同父节点组内的位置索引
+            # 使用 cumsum 计算组内计数
+            # 识别父节点变化的位置
+            parent_changed = torch.zeros_like(sorted_parents)
+            parent_changed[1:] = (sorted_parents[1:] != sorted_parents[:-1]).long()
+            slot_within_parent = torch.cumsum(parent_changed, dim=0)  # 从0开始的slot编号
+
+            # 取出有效的slot (0-3)
+            valid_slots = slot_within_parent[slot_within_parent < 4]
+
+            # scatter 到 children_matrix
+            children_matrix[sorted_parents, valid_slots] = sorted_children
 
         self.register_buffer('candidate_regions', candidate_regions)
         self.register_buffer('candidate_depths', candidate_depths)
@@ -926,9 +951,9 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         valid_count = valid_mask.sum(dim=1).clamp(min=1)  # [N]
         sds_values = (all_dist_sq * valid_mask.float()).sum(dim=1) / valid_count  # [N]
 
-        # 归一化
+        # 归一化（使用Step 2的all_dist_sq）
         valid_count = valid_mask.sum(dim=1).clamp(min=1)  # [N]
-        sds_values = (neighbor_dists_sq * valid_mask).sum(dim=1) / valid_count  # [N]
+        sds_values = (all_dist_sq * valid_mask.float()).sum(dim=1) / valid_count  # [N]
 
         # Step 4: 扩展到 batch 维度并返回惩罚
         # sds_values: [N] -> [B, N]
@@ -1039,11 +1064,10 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         else:
             # sigmoid 平滑过渡到 1.7（不达到 2.0）
             progress = (epoch - 30) / 50
-            # 使用 torch.sigmoid 确保数值稳定
-            return 1.5 + 0.2 * torch.sigmoid(
-                # D4-AUDIT FIX: 移除显式 dtype=torch.float32，利用 PyTorch 自动 dtype
-                torch.tensor(0.3 * (progress - 0.5) * 10)
-            ).item()
+            # D4-AUDIT FIX: 使用 Python math 替代 torch.sigmoid + .item()，避免 GPU 同步
+            x = 0.3 * (progress - 0.5) * 10
+            sigmoid_val = 1 / (1 + math.exp(-x))
+            return 1.5 + 0.2 * sigmoid_val
 
     def _sparse_select(
         self,
@@ -1442,10 +1466,10 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         elif epoch < self.entmax_schedule_epochs:
             # 过渡阶段: 使用 sigmoid 平滑曲线，防止 α 在后期突越 1.5
             progress = (epoch - self.entmax_warmup_epochs) / max(1, self.entmax_schedule_epochs - self.entmax_warmup_epochs)
-            # D4-SYNC FIX: 使用 torch.sigmoid 替代 math.exp，确保 AMP 兼容性
-            sigmoid_tensor = torch.sigmoid(torch.tensor(-10.0 * (progress - 0.7), dtype=torch.float32))
-            sigmoid = sigmoid_tensor.item()
-            self.entmax_alpha = 1.2 + 0.29 * sigmoid
+            # D4-AUDIT FIX: 使用 Python math 替代 torch.sigmoid + .item()，避免 GPU 同步
+            x = -10.0 * (progress - 0.7)
+            sigmoid_val = 1 / (1 + math.exp(-x))
+            self.entmax_alpha = 1.2 + 0.29 * sigmoid_val
         else:
             # V4: alpha_max = 1.49 而非 1.5，永远保持轻微梯度流
             self.entmax_alpha = self.entmax_alpha_warmup

@@ -240,7 +240,8 @@ def create_model(args, device: torch.device) -> nn.Module:
         print("Converting to channels_last memory format...")
         model = model.to(memory_format=torch.channels_last)
 
-    return model.to(device)
+    # D4-AUDIT FIX: 使用 non_blocking=True 配合 DataLoader pin_memory
+    return model.to(device, non_blocking=True)
 
 
 # Global cache for dummy dataset labels to ensure train/val consistency
@@ -881,7 +882,8 @@ def train(
     )
 
     # Move model to device
-    model = model.to(device)
+    # D4-AUDIT FIX: 使用 non_blocking=True 配合 DataLoader pin_memory
+    model = model.to(device, non_blocking=True)
 
     # Get eval interval
     eval_interval = getattr(args, 'eval_interval', 1)

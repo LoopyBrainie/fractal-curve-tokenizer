@@ -145,7 +145,7 @@ class AreaEncoder(nn.Module):
         base_freqs = torch.tensor(
             [math.pi * (self.freq_base ** k) for k in range(self.fourier_levels)],
             device=area_scores.device,
-            dtype=area_scores.dtype,
+            dtype=torch.float32,  # D4-AUDIT FIX: Force FP32 for numerical stability in trig ops
         ).view(1, 1, self.fourier_levels)
 
         denom = omega_nyquist - omega_cutoff
@@ -412,19 +412,18 @@ class FractalPositionEmbedding(nn.Module):
             level_1_mean.unsqueeze(0)
         ).abs()
 
-        # I184: 记录但不中断训练（尺度一致性作为日志指标）
+                # I184: 记录但不中断训练（尺度一致性作为日志指标）
         if cos_dist > epsilon:
             warnings.warn(
-                f"Scale consistency violation: {cos_dist.item():.4f} > {epsilon}"
+                f"Scale consistency violation: {float(cos_dist):.4f} > {epsilon}"
             )
 
         # I-NAN: 缓存结果供 embed_output 使用
-        self._diagnostic_cache["health/scale_consistency_dist"] = float(cos_dist.item())
+        self._diagnostic_cache["health/scale_consistency_dist"] = float(cos_dist)
 
         return cos_dist  # 返回供日志系统记录
 
-    @property
-    @property
+@property
     @torch._dynamo.disable  # 🌟 修复：禁止 Dynamo 追踪此属性，防止 Guard 失败导致重编译泄漏
     def embed_output(self) -> Dict[str, Any]:
         """FractalPositionEmbedding 诊断输出

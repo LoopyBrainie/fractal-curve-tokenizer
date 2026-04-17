@@ -485,7 +485,8 @@ class HilbertNativePatchEmbed(nn.Module):
             low, high = depth_bins[i], depth_bins[i + 1]
             mask = (depths >= low) & (depths < high)
             # I-OPT: 使用 .sum() 避免 .any() 的隐式 CPU-GPU 同步
-            if mask.sum() == 0:
+            # D4-AUDIT FIX: 使用 not mask.any() 替代 mask.sum() == 0
+            if not mask.any():
                 continue
 
             indices = mask.nonzero(as_tuple=False).squeeze(-1)  # D3-AUDIT FIX: as_tuple=False 避免 Graph Break
@@ -619,7 +620,8 @@ class HilbertNativePatchEmbed(nn.Module):
             # 批量 grid_sample: 按 batch 分组处理
             for b in range(B):
                 b_mask = batch_idx_ss == b
-                if b_mask.sum() == 0:
+                # D4-AUDIT FIX: 使用 not mask.any() 替代 mask.sum() == 0
+                if not b_mask.any():
                     continue
                 b_grids = grids[b_mask]  # [N_b, ss, ss, 2]
                 feat = features[b]  # [D, H, W]
@@ -642,12 +644,9 @@ class HilbertNativePatchEmbed(nn.Module):
                 assigned_mask[ss_indices[b_mask]] = True
 
         # 组装最终结果 (按原始顺序)
-        if assigned_mask.all():
-            result = pooled_results
-        else:
-            # 极少数未分配时用零填充
-            result = torch.zeros(N, D, device=features.device, dtype=features.dtype)
-            result[assigned_mask] = pooled_results[assigned_mask]
+        # D4-AUDIT FIX: 移除 assigned_mask.all() 检查，因为 pooled_results 初始化时已经包含零值
+        # 即使不是所有 token 都被分配，pooled_results 也已在未分配位置包含正确的零值
+        result = pooled_results
 
         return result
 
@@ -763,14 +762,15 @@ class HilbertNativePatchEmbed(nn.Module):
         all_tokens = pooled_safe + embeds  # [N_total, D]
         
         # 7. 分配到输出 buffer
+        # D4-AUDIT FIX: 向量化批量赋值替代 Python 循环
         tokens = torch.zeros(B, max_tokens, self.dim, device=device, dtype=dtype)
         levels_info = torch.zeros(B, max_tokens, self.max_level + 1, dtype=torch.long, device=device)
-        
-        for idx, (b, i) in enumerate(zip(batch_indices, token_indices)):
-            tokens[b, i] = all_tokens[idx]
-            levels_info[b, i] = torch.tensor(
-                all_levels_info[idx], dtype=torch.long, device=device
-            )
+
+        # 批量赋值：利用高级索引一次性写入所有 token
+        batch_idx_t = torch.tensor(batch_indices, dtype=torch.long, device=device)
+        token_idx_t = torch.tensor(token_indices, dtype=torch.long, device=device)
+        tokens[batch_idx_t, token_idx_t] = all_tokens
+        levels_info[batch_idx_t, token_idx_t] = torch.stack(all_levels_info)
         
         # 8. 层归一化
         tokens = self.norm(tokens)

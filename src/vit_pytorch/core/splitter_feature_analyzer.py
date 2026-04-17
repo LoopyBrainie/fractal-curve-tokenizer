@@ -98,6 +98,7 @@ class SplitterFeatureAnalyzer:
         self.step_counter += 1
         return self.step_counter % self.sample_interval == 0
 
+    @torch._dynamo.disable  # 🌟 I-OOM FIX: 禁用 Dynamo 追踪，防止图断裂导致 backward 泄漏
     def analyze(self, features: torch.Tensor) -> Optional[SVDAnalysisResult]:
         """
         分析输入特征的 SVD 分解结果

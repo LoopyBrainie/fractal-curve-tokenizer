@@ -241,7 +241,8 @@ class HilbertCurve:
             ry = ((y_batch & mask) > 0).long()
 
             # 累积 d: d += s² × ((3 × rx) ⊕ ry)
-            d = d + (s * s) * ((3 * rx) ^ ry)
+            # D4-AUDIT FIX: s = 2^k, 所以 s*s = 2^(2k) = 1 << (2*k)，使用移位替代乘法
+            d = d + (1 << (2 * k)) * ((3 * rx) ^ ry)
 
             # 旋转规则 (ry == 0 时)
             rotation_mask = (ry == 0)
@@ -324,7 +325,8 @@ class HilbertCurve:
             s = 1 << k
 
             # 提取当前位的 rx, ry [B]
-            rx = 1 & (d_batch // 2)
+            # D4-AUDIT FIX: 使用移位替代整数除法，GPU上移位比除法快5-10x
+            rx = 1 & (d_batch >> 1)
             ry = 1 & (d_batch ^ rx)
 
             # 旋转条件: ry == 0
@@ -342,8 +344,8 @@ class HilbertCurve:
             x = x + s * rx
             y = y + s * ry
 
-            # 移位 d
-            d_batch = d_batch // 4
+            # 移位 d (D4-AUDIT FIX: 使用移位替代整数除法)
+            d_batch = d_batch >> 2
 
         return x, y
 

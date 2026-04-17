@@ -356,6 +356,7 @@ class LevelsInfo:
     def from_tokenizer_output(
         output: "TokenizerOutput",
         max_level: int,
+        device: Optional[torch.device] = None,
     ) -> "LevelsInfo":
         """从 TokenizerOutput 创建 LevelsInfo (I98-5 简化).
 
@@ -365,6 +366,7 @@ class LevelsInfo:
         Args:
             output: TokenizerOutput 实例
             max_level: 四叉树最大深度
+            device: 目标设备，默认从 output 获取或使用 cuda
 
         Returns:
             LevelsInfo 实例
@@ -374,9 +376,12 @@ class LevelsInfo:
             return info
 
         # 空输出时创建默认 LevelsInfo
+        # D4-AUDIT FIX: 添加 device 参数，避免默认设备创建后迁移的开销
         B = output.batch_size
         N = 1
-        all_levels = torch.zeros(B, N, max_level + 1, dtype=torch.long)
+        if device is None:
+            device = output.device if hasattr(output, 'device') and output.device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
+        all_levels = torch.zeros(B, N, max_level + 1, dtype=torch.long, device=device)
         return LevelsInfo(data=all_levels, max_level=max_level)
 
     @staticmethod
@@ -429,8 +434,8 @@ class LevelsInfo:
                 path = [random.randint(0, 3) for _ in range(d)]
                 paths_list.append(path + [0] * (max_level - d))
 
-        depths = torch.tensor(depths_list, dtype=torch.long).view(B, N)
-        paths = torch.tensor(paths_list, dtype=torch.long).view(B, N, max_level)
+        depths = torch.tensor(depths_list, dtype=torch.long, device=device).view(B, N)
+        paths = torch.tensor(paths_list, dtype=torch.long, device=device).view(B, N, max_level)
 
         if device:
             depths = depths.to(device, non_blocking=True)
@@ -566,9 +571,10 @@ class LevelsInfo:
         # I167-1 FIX: 直接使用全局 LUT 张量，torch.compile 更友好
         # _HILBERT_LUT_PADDED 在模块加载时已初始化为 CPU 张量
         # 仅在首次遇到不同设备时缓存设备特定版本
+        # D4-AUDIT FIX: 使用 non_blocking=True 避免同步设备转移
         global _hilbert_lut_cached
         if not hasattr(_hilbert_lut_cached, 'device') or _hilbert_lut_cached.device != device:
-            _hilbert_lut_cached = _HILBERT_LUT_PADDED.to(device)
+            _hilbert_lut_cached = _HILBERT_LUT_PADDED.to(device, non_blocking=True)
         lut_2d = _hilbert_lut_cached
         results = lut_2d[depths.long(), path_ints_per_depth]  # [B, N]
 
