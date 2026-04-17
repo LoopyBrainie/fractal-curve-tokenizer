@@ -785,6 +785,10 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         self.register_buffer("aux_loss_weight", torch.tensor(0.0))
         self.register_buffer("_zero_loss", torch.tensor(0.0))
 
+        # I165-OOM FIX: 提前解析 mlp_dim，避免 Transformer 创建时使用 None
+        # 必须在创建 Transformer 之前解析
+        resolved_mlp_dim = mlp_dim if mlp_dim is not None else _get_tensor_core_mlp_dim(dim)
+
         # === Transformer ===
         if transformer is not None:
             # I98-2: 使用注入的 Transformer
@@ -798,7 +802,7 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                 depth=num_layers,
                 heads=heads,
                 dim_head=dim_head,
-                mlp_dim=mlp_dim,
+                mlp_dim=resolved_mlp_dim,
                 dropout=transformer_dropout,
                 max_level=self.max_level,
                 drop_path_rate=drop_path_rate,
@@ -832,18 +836,18 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             # I147: 添加 LogitsClamp 解决训练损失异常 (~82)
             self.mlp_head = nn.Sequential(
                 nn.LayerNorm(mlp_input_dim),
-                nn.Linear(mlp_input_dim, mlp_dim),
+                nn.Linear(mlp_input_dim, resolved_mlp_dim),
                 nn.GELU(),
                 nn.Dropout(transformer_dropout),
-                nn.Linear(mlp_dim, num_classes),
+                nn.Linear(resolved_mlp_dim, num_classes),
                 LogitsClamp(LOGIT_CLAMP_BOUND),  # I147: 钳制 logits 防止损失爆炸
             )
             self.num_classes = num_classes
             self.dim = dim
             self.num_layers = num_layers
             self.heads = heads
-            # I165-OOM: 如果未指定 mlp_dim，使用 Tensor Core 对齐的 8/3 比例
-            self.mlp_dim = mlp_dim if mlp_dim is not None else _get_tensor_core_mlp_dim(dim)
+            # I165-OOM FIX: 使用已解析的 resolved_mlp_dim
+            self.mlp_dim = resolved_mlp_dim
 
         # 权重初始化 - 关键改进，防止类别偏差
         self._init_weights()
@@ -1160,6 +1164,20 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             levels=levels_2d,
             lengths=lengths,
         )
+
+        # FIX: 将原始 padded_levels 截断/扩展到与 bucketed padded_tokens 相同的长度
+        # 解决 shape 不匹配问题 (原来 padded_tokens bucketed 但 padded_levels 没有)
+        B, K_bucket = padded_tokens.shape[0], padded_tokens.shape[1]
+        _, MaxLen_original, info_dim = padded_levels.shape
+        if K_bucket != MaxLen_original:
+            padded_levels = padded_levels[:, :K_bucket, :]  # 截断或保持
+            if padded_levels.shape[1] < K_bucket:
+                # 需要 padding
+                padding_size = K_bucket - padded_levels.shape[1]
+                padding = torch.zeros(
+                    B, padding_size, info_dim, dtype=padded_levels.dtype, device=padded_levels.device
+                )
+                padded_levels = torch.cat([padded_levels, padding], dim=1)
 
         # I24-14: 最终防御层 - 无条件 clamp (torch.compile 安全)
         # 不使用 .item() 或数据依赖的 if，直接 clamp
@@ -1677,6 +1695,23 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
 
             # I30-11: 获取 split_probs 用于加权池化
             split_probs = token_output.get_padded_split_probs()
+
+            # FIX: 如果 split_probs 大小与 key_padding_mask 不匹配，进行截断/填充
+            # 这发生在 bucketing 后，因为 split_probs 来自原始 token_output
+            # 注意: key_padding_mask 包含 CLS token，所以要比较 key_padding_mask[:, 1:] 的长度
+            if split_probs is not None:
+                _, K_mask = key_padding_mask[:, 1:].shape  # 排除 CLS
+                K_probs = split_probs.shape[1]
+                if K_probs < K_mask:
+                    # Padding: 在最后添加 1.0（有效概率）使大小匹配
+                    padding_size = K_mask - K_probs
+                    split_probs = torch.cat([
+                        split_probs,
+                        split_probs.new_ones(split_probs.shape[0], padding_size)
+                    ], dim=1)
+                elif K_probs > K_mask:
+                    # Truncation: 截断到相同大小
+                    split_probs = split_probs[:, :K_mask]
 
             # 5. 池化 + 分类
             pooled = self._apply_pooling(x, key_padding_mask, split_probs)

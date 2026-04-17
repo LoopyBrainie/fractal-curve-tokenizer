@@ -413,7 +413,14 @@ class TokenizerOutput:
         device = levels[0].device
         levels_padded = torch.full((B, max_len), -1, dtype=torch.long, device=device)
         for b, l in enumerate(levels):
-            levels_padded[b, :l.shape[0]] = l
+            # Handle 2D levels [N, info_dim] (e.g., [N, 4] = depth + 3 path coords)
+            # vs 1D levels [N] (just depth values)
+            if l.dim() > 1:
+                # Extract just the depth (first column) for bucketing
+                l_to_assign = l[:, 0]
+            else:
+                l_to_assign = l
+            levels_padded[b, :l.shape[0]] = l_to_assign
 
         return levels_padded
 
