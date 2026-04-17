@@ -424,49 +424,49 @@ class FractalPositionEmbedding(nn.Module):
         return cos_dist  # 返回供日志系统记录
 
 @property
-    @torch._dynamo.disable  # 🌟 修复：禁止 Dynamo 追踪此属性，防止 Guard 失败导致重编译泄漏
-    def embed_output(self) -> Dict[str, Any]:
-        """FractalPositionEmbedding 诊断输出
+@torch._dynamo.disable
+def embed_output(self) -> Dict[str, Any]:
+    """FractalPositionEmbedding 诊断输出
 
-        命名空间:
-            embed/params/*: 可学习参数统计
-            embed/health/*: 数值健康度
+    命名空间:
+        embed/params/*: 可学习参数统计
+        embed/health/*: 数值健康度
 
-        I-OOM FIX: 使用 Disable & Flush 模式：
-        - @torch._dynamo.disable 屏蔽追踪
-        - 读取后立即 .cpu().item() 迁移到 CPU
-        - 读取后立即清空缓存斩断计算图引用
-        """
-        output: Dict[str, Any] = {}
+    I-OOM FIX: 使用 Disable & Flush 模式：
+    - @torch._dynamo.disable 屏蔽追踪
+    - 读取后立即 .cpu().item() 迁移到 CPU
+    - 读取后立即清空缓存斩断计算图引用
+    """
+    output: Dict[str, Any] = {}
 
-        # embed/params/* - 嵌入权重统计
-        if hasattr(self, 'depth_embedding') and self.depth_embedding is not None:
-            w = self.depth_embedding.weight
-            output["params/depth_emb_norm"] = float(w.norm().item())
-            output["params/depth_emb_mean"] = float(w.mean().item())
-            output["params/depth_emb_std"] = float(w.std().item())
+    # embed/params/* - 嵌入权重统计
+    if hasattr(self, 'depth_embedding') and self.depth_embedding is not None:
+        w = self.depth_embedding.weight
+        output["params/depth_emb_norm"] = float(w.norm().item())
+        output["params/depth_emb_mean"] = float(w.mean().item())
+        output["params/depth_emb_std"] = float(w.std().item())
 
-        if hasattr(self, 'quadrant_embedding') and self.quadrant_embedding is not None:
-            w = self.quadrant_embedding.weight
-            output["params/quadrant_emb_norm"] = float(w.norm().item())
-            output["params/quadrant_emb_mean"] = float(w.mean().item())
-            output["params/quadrant_emb_std"] = float(w.std().item())
+    if hasattr(self, 'quadrant_embedding') and self.quadrant_embedding is not None:
+        w = self.quadrant_embedding.weight
+        output["params/quadrant_emb_norm"] = float(w.norm().item())
+        output["params/quadrant_emb_mean"] = float(w.mean().item())
+        output["params/quadrant_emb_std"] = float(w.std().item())
 
-        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标
-        # I-OOM FIX: 访问后清空缓存，防止累积导致显存泄漏
-        if self._diagnostic_cache:
-            for k, v in self._diagnostic_cache.items():
-                if isinstance(v, torch.Tensor):
-                    output[k] = v.detach().cpu().item()
-                else:
-                    output[k] = v
-            self._diagnostic_cache.clear()  # 🌟 立即清空缓存释放计算图
+    # I-NAN: 从统一诊断缓存合并 forward 中计算的指标
+    # I-OOM FIX: 访问后清空缓存，防止累积导致显存泄漏
+    if self._diagnostic_cache:
+        for k, v in self._diagnostic_cache.items():
+            if isinstance(v, torch.Tensor):
+                output[k] = v.detach().cpu().item()
+            else:
+                output[k] = v
+        self._diagnostic_cache.clear()  # 🌟 立即清空缓存释放计算图
 
-        # embed/health/* - nan_grad_hooks 注册数
-        if hasattr(self, '_nan_grad_hooks') and self._nan_grad_hooks:
-            output["health/nan_grad_hooks_registered"] = len(self._nan_grad_hooks)
+    # embed/health/* - nan_grad_hooks 注册数
+    if hasattr(self, '_nan_grad_hooks') and self._nan_grad_hooks:
+        output["health/nan_grad_hooks_registered"] = len(self._nan_grad_hooks)
 
-        return output
+    return output
 
 
 class AreaEnhancedPositionEmbedding(nn.Module):

@@ -60,6 +60,7 @@ from vit_pytorch.core.pattern_encoder import (
 from vit_pytorch.core.pattern_plugin import (
     create_hilbert_pattern_plugin,
 )  # I162-1: 双路径插件
+from vit_pytorch.core.shape_stabilizer import ShapeStabilizer  # Bucketing 策略
 
 
 # =============================================================================
@@ -625,6 +626,11 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             self._dynamic_image_size = False
             self._cached_image_size = None
 
+        # === Shape Stabilizer (Bucketing 策略) ===
+        # 将动态 K 映射到固定桶中，解决 torch.compile 的形状动态性问题
+        # 非线性桶: {128, 256, 512} ∪ {1024, 2048, 4096, 8192}
+        self.shape_stabilizer = ShapeStabilizer()
+
         # I98-2: 优先级 - 使用注入的组件 > 动态参数创建 > 默认配置
         # 依赖注入模式: 检查是否提供了 injected 组件
 
@@ -1142,21 +1148,15 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         padded_levels = token_output.get_padded_levels(info_dim)
         levels_list = token_output.levels_list()
 
-        # === OOM 熔断: 硬截断最大 Token 数 ===
-        # 防止极端样本导致 Sequence Length 暴涨，引发 SwiGLU 显存爆炸
-        # 使用确定性张量切片确保 torch.compile 图捕获兼容
-        MAX_TOKENS_PER_IMAGE = 512  # 安全上限，可根据配置调整
-        seq_len = padded_tokens.shape[1]
-        if seq_len > MAX_TOKENS_PER_IMAGE:
-            padded_tokens = padded_tokens[:, :MAX_TOKENS_PER_IMAGE, :]
-            padded_levels = padded_levels[:, :MAX_TOKENS_PER_IMAGE, :]
-            lengths = lengths.clamp(max=MAX_TOKENS_PER_IMAGE)
-            # 同步截断 token_output 内部缓存，避免下游 Shape Mismatch
-            if hasattr(token_output, 'regions_padded') and token_output.regions_padded is not None:
-                token_output.regions_padded = token_output.regions_padded[:, :MAX_TOKENS_PER_IMAGE, :]
-            if hasattr(token_output, 'split_probs_padded') and token_output.split_probs_padded is not None:
-                token_output.split_probs_padded = token_output.split_probs_padded[:, :MAX_TOKENS_PER_IMAGE]
-        # === 熔断结束 ===
+        # === BUCKETING STRATEGY ===
+        # 将动态 K 映射到固定桶中，解决 torch.compile 的形状动态性问题
+        # 替换原有的 MAX_TOKENS_PER_IMAGE 硬截断逻辑
+        # 非线性桶: {128, 256, 512} ∪ {1024, 2048, 4096, 8192}
+        padded_tokens, padded_levels, lengths = self.shape_stabilizer.pad_to_bucket(
+            tokens=padded_tokens,
+            levels=padded_levels,
+            lengths=lengths,
+        )
 
         # I24-14: 最终防御层 - 无条件 clamp (torch.compile 安全)
         # 不使用 .item() 或数据依赖的 if，直接 clamp
