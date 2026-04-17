@@ -424,12 +424,19 @@ class FractalPositionEmbedding(nn.Module):
         return cos_dist  # 返回供日志系统记录
 
     @property
+    @property
+    @torch._dynamo.disable  # 🌟 修复：禁止 Dynamo 追踪此属性，防止 Guard 失败导致重编译泄漏
     def embed_output(self) -> Dict[str, Any]:
         """FractalPositionEmbedding 诊断输出
 
         命名空间:
             embed/params/*: 可学习参数统计
             embed/health/*: 数值健康度
+
+        I-OOM FIX: 使用 Disable & Flush 模式：
+        - @torch._dynamo.disable 屏蔽追踪
+        - 读取后立即 .cpu().item() 迁移到 CPU
+        - 读取后立即清空缓存斩断计算图引用
         """
         output: Dict[str, Any] = {}
 
@@ -447,8 +454,14 @@ class FractalPositionEmbedding(nn.Module):
             output["params/quadrant_emb_std"] = float(w.std().item())
 
         # I-NAN: 从统一诊断缓存合并 forward 中计算的指标
+        # I-OOM FIX: 访问后清空缓存，防止累积导致显存泄漏
         if self._diagnostic_cache:
-            output.update(self._diagnostic_cache)
+            for k, v in self._diagnostic_cache.items():
+                if isinstance(v, torch.Tensor):
+                    output[k] = v.detach().cpu().item()
+                else:
+                    output[k] = v
+            self._diagnostic_cache.clear()  # 🌟 立即清空缓存释放计算图
 
         # embed/health/* - nan_grad_hooks 注册数
         if hasattr(self, '_nan_grad_hooks') and self._nan_grad_hooks:
@@ -598,11 +611,14 @@ class AreaEnhancedPositionEmbedding(nn.Module):
         return pos_emb
 
     @property
+    @torch._dynamo.disable  # 🌟 修复：禁止 Dynamo 追踪此属性
     def embed_output(self) -> Dict[str, Any]:
         """AreaEnhancedPositionEmbedding 诊断输出
 
         命名空间:
             embed/params/*: 可学习参数统计
+
+        I-OOM FIX: 使用 Disable & Flush 模式
         """
         output: Dict[str, Any] = {}
 
@@ -813,11 +829,14 @@ class GeometryField(nn.Module):
         return layer_bias
 
     @property
+    @torch._dynamo.disable  # 🌟 修复：禁止 Dynamo 追踪此属性
     def embed_output(self) -> Dict[str, Any]:
         """GeometryField 诊断输出
 
         命名空间:
             embed/params/*: 可学习尺度参数
+
+        I-OOM FIX: 使用 Disable & Flush 模式
         """
 
         output: Dict[str, Any] = {}
@@ -890,11 +909,14 @@ class MultiLayerGeometryField(nn.Module):
         return layer_biases
 
     @property
+    @torch._dynamo.disable  # 🌟 修复：禁止 Dynamo 追踪此属性
     def embed_output(self) -> Dict[str, Any]:
         """MultiLayerGeometryField 诊断输出
 
         命名空间:
             embed/params/*: 每层的几何缩放参数
+
+        I-OOM FIX: 使用 Disable & Flush 模式
         """
 
         output: Dict[str, Any] = {}

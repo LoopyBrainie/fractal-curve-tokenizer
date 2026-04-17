@@ -256,7 +256,16 @@ class AdaptiveFractalFeedForward(nn.Module):
         # 保留旧变量以兼容现有逻辑（将在 ffn_output 中整合）
         self._last_adapter_norm: Optional[torch.Tensor] = None
         self._last_level_mixing_weights: Optional[torch.Tensor] = None
-    
+
+    def clear_diagnostics(self) -> None:
+        """清除诊断缓冲区，防止显存泄漏
+
+        I-OOM FIX: 在每次 forward 结束后调用，
+        确保 _last_xxx 引用不累积导致显存泄漏
+        """
+        self._last_adapter_norm = None
+        self._last_level_mixing_weights = None
+
     def _apply_level_adaptation(
         self, 
         x_norm: torch.Tensor, 
@@ -377,9 +386,13 @@ class AdaptiveFractalFeedForward(nn.Module):
         if self.use_level_adaptation and levels_info is not None and levels_info.data.numel() > 0:
             main_out = self._apply_level_adaptation(x_norm, main_out, levels_info, batch, seq_len)
 
+        # I-OOM FIX: 清除诊断引用，防止显存泄漏
+        self.clear_diagnostics()
+
         return main_out
 
     @property
+    @torch._dynamo.disable  # 🌟 修复：禁止 Dynamo 追踪此属性，防止 Guard 失败导致重编译泄漏
     def ffn_output(self) -> dict:
         """FFN 层的增强诊断包裹
 
@@ -388,6 +401,11 @@ class AdaptiveFractalFeedForward(nn.Module):
 
         D1-AUDIT FIX: 所有值现在为 GPU tensor，
         由 flatten_layer_outputs() 在 post_forward() 统一调用 .item()。
+
+        I-OOM FIX: 使用 Disable & Flush 模式：
+        - @torch._dynamo.disable 屏蔽追踪
+        - 读取后立即 .cpu().item() 迁移到 CPU
+        - 读取后立即置 None 斩断计算图引用
 
         诊断字段:
             - ffn_gamma_mean/std, ffn_beta_mean/std: 层级感知归一化参数
@@ -400,27 +418,37 @@ class AdaptiveFractalFeedForward(nn.Module):
         """
         output = {}
 
-        # 1. 层级感知归一化参数（来自 ffn_gamma/ffn_beta Embedding 权重）
-        # D1-AUDIT FIX: GPU tensor 直接返回，flatten_layer_outputs 处理 .item()
+        # 1. 层级感知归一化参数（CPU 迁移）
         if hasattr(self, 'ffn_gamma'):
-            output["ffn_gamma_mean"] = self.ffn_gamma.weight.mean()
-            output["ffn_gamma_std"] = self.ffn_gamma.weight.std()
+            output["ffn_gamma_mean"] = self.ffn_gamma.weight.mean().item()
+            output["ffn_gamma_std"] = self.ffn_gamma.weight.std().item()
         if hasattr(self, 'ffn_beta'):
-            output["ffn_beta_mean"] = self.ffn_beta.weight.mean()
-            output["ffn_beta_std"] = self.ffn_beta.weight.std()
+            output["ffn_beta_mean"] = self.ffn_beta.weight.mean().item()
+            output["ffn_beta_std"] = self.ffn_beta.weight.std().item()
 
-        # 2. 运行时诊断缓存（forward 中捕获，现在都是 GPU tensor）
-        output.update(self._diagnostic_cache)
+        # 2. 运行时诊断缓存（CPU 迁移 + 清空）
+        if self._diagnostic_cache:
+            for k, v in self._diagnostic_cache.items():
+                if isinstance(v, torch.Tensor):
+                    output[k] = v.detach().cpu().item()
+                else:
+                    output[k] = v
+            self._diagnostic_cache.clear()  # 🌟 立即清空缓存释放计算图
 
-        # 3. 兼容旧版 _last_xxx 变量（level_mixing 统计）
-        # D1-AUDIT FIX: GPU tensor 直接返回
-        if self._last_level_mixing_weights is not None:
-            w = self._last_level_mixing_weights
-            output["level_mixing_mean"] = w.mean()
-            output["level_mixing_std"] = w.std()
-            output["level_mixing_max"] = w.max()
+        # 3. _last_level_mixing_weights（取后即清 + CPU 迁移）
+        if getattr(self, '_last_level_mixing_weights', None) is not None:
+            w = self._last_level_mixing_weights.detach().cpu()
+            output["level_mixing_mean"] = w.mean().item()
+            output["level_mixing_std"] = w.std().item()
+            output["level_mixing_max"] = w.max().item()
+            self._last_level_mixing_weights = None  # 🌟 斩断幽灵引用
 
-        # 4. FFN 类型标志
+        # 4. _last_adapter_norm（取后即清 + CPU 迁移）
+        if getattr(self, '_last_adapter_norm', None) is not None:
+            output["adapter_norm_fallback"] = self._last_adapter_norm.detach().cpu().item()
+            self._last_adapter_norm = None  # 🌟 斩断幽灵引用
+
+        # 5. FFN 类型标志
         output["ffn_type"] = self.ffn_type
 
         return output

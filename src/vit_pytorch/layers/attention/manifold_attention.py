@@ -1008,6 +1008,21 @@ class ManifoldNativeAttention(nn.Module):
         # 避免 get_stats() 每次返回新 dict (torch.compile 按 id() 追踪缓存)
         self._stats_cache: dict = {}
 
+    def clear_diagnostics(self) -> None:
+        """清除诊断缓冲区，防止显存泄漏
+
+        I-OOM FIX: 在每次 forward 结束后调用，
+        确保 _last_xxx 引用不累积导致显存泄漏
+        """
+        self._last_geo_bias = None
+        self._last_attn_weights = None
+        self._last_bandwidths = None
+        self._last_manifold_coords = None
+        self._last_residual_scale = None
+        self._last_input_x = None
+        self._last_poincare_norm = None
+        self._last_depths = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1202,15 +1217,25 @@ class ManifoldNativeAttention(nn.Module):
             self._nan_count += 1
         self._total_count += 1
 
+        # I-OOM FIX: 清除诊断引用，防止显存泄漏
+        self.clear_diagnostics()
+
         return out
 
     @torch.no_grad()
     @torch._dynamo.disable  # 排除 torch.compile 追踪，避免 _last_depths 等可变属性触发重复编译
+    @torch.no_grad()
+    @torch._dynamo.disable  # 🌟 修复：禁止 Dynamo 追踪此方法，防止 Guard 失败导致重编译泄漏
     def get_stats(self) -> dict:
         """获取诊断统计信息（延迟求值，GPU tensor 直接返回）
 
         D1-AUDIT FIX: 所有 .item() 调用移至 post_forward() 阶段，
         由 flatten_layer_outputs() 统一处理。forward 热路径零同步。
+
+        I-OOM FIX: 使用 Disable & Flush 模式：
+        - @torch._dynamo.disable 屏蔽追踪
+        - 读取后立即 .cpu().item() 迁移到 CPU
+        - 读取后立即置 None 斩断计算图引用
 
         返回
         ----
@@ -1241,89 +1266,93 @@ class ManifoldNativeAttention(nn.Module):
         cache = self._stats_cache
         cache.clear()
 
-        # 几何偏置统计
+        # 几何偏置统计（取后即清 + CPU 迁移）
         if self._last_geo_bias is not None:
-            bias = self._last_geo_bias.detach()
-            cache["geometric_bias_mean"] = bias.mean()
-            cache["geometric_bias_std"] = bias.std()
-            cache["geometric_bias_max"] = bias.max()
+            bias = self._last_geo_bias.detach().cpu()
+            cache["geometric_bias_mean"] = bias.mean().item()
+            cache["geometric_bias_std"] = bias.std().item()
+            cache["geometric_bias_max"] = bias.max().item()
+            self._last_geo_bias = None  # 🌟 斩断幽灵引用
 
         # === P0: geo_decoder.layer_scale (流形偏置强度) ===
         # layer_scale 是 GeometricLatentDecoder 中唯一可学习的缩放参数
         # 控制 B_manifold = layer_scale × tanh(...) 的强度
         # 数学意义: layer_scale 是否激活是流形偏置是否生效的最直接信号
         if hasattr(self, 'geo_decoder') and self.geo_decoder is not None:
-            ls = self.geo_decoder.layer_scale.detach()
-            cache["layer_scale_mean"] = ls.mean()
-            cache["layer_scale_max"] = ls.max()
-            cache["layer_scale_min"] = ls.min()
-            cache["layer_scale_std"] = ls.std()
+            ls = self.geo_decoder.layer_scale.detach().cpu()
+            cache["layer_scale_mean"] = ls.mean().item()
+            cache["layer_scale_max"] = ls.max().item()
+            cache["layer_scale_min"] = ls.min().item()
+            cache["layer_scale_std"] = ls.std().item()
 
-        # 带宽统计
+        # 带宽统计（取后即清 + CPU 迁移）
         if self._last_bandwidths is not None:
-            bw = self._last_bandwidths.detach().float()
-            cache["bandwidth_mean"] = bw.mean()
-            cache["bandwidth_min"] = bw.min()
-            cache["bandwidth_max"] = bw.max()
+            bw = self._last_bandwidths.detach().float().cpu()
+            cache["bandwidth_mean"] = bw.mean().item()
+            cache["bandwidth_min"] = bw.min().item()
+            cache["bandwidth_max"] = bw.max().item()
+            self._last_bandwidths = None  # 🌟 斩断幽灵引用
 
             # === P0: band_saturation_ratio (带宽饱和比例) ===
             # 比较 bandwidth >= 4^depth（可attend到该深度所有token）
             if self._last_depths is not None:
-                d = self._last_depths.detach().float()
+                d = self._last_depths.detach().float().cpu()
                 four_pow_depths = torch.exp2(d * 2.0)  # D4-AUDIT FIX: pow(4,x) → exp2(x*2)
                 saturated = (bw >= four_pow_depths).float()
-                cache["band_saturation_ratio"] = saturated.mean()
+                cache["band_saturation_ratio"] = saturated.mean().item()
 
                 # === Hilbert Lipschitz 合规性 ===
                 # 理论最优带宽 = 2^d（来自 Lipschitz: 邻域 ∝ √(4^d) = 2^d）
                 # 合规性 = 实际带宽 / 理论最优带宽，应接近 1.0
                 theoretical_optimal = torch.exp2(d)  # D4-AUDIT FIX: pow(2,x) → exp2(x)
                 compliance = (bw / theoretical_optimal.clamp(min=1)).mean()
-                cache["lipschitz_compliance"] = compliance
+                cache["lipschitz_compliance"] = compliance.item()
+                self._last_depths = None  # 🌟 斩断幽灵引用
 
-        # Poincaré 距离统计
+        # Poincaré 距离统计（取后即清 + CPU 迁移）
         if self._last_manifold_coords is not None:
-            coords = self._last_manifold_coords.detach()
-            cache["poincare_dist_mean"] = coords.mean()
-            cache["poincare_dist_std"] = coords.std()
+            coords = self._last_manifold_coords.detach().cpu()
+            cache["poincare_dist_mean"] = coords.mean().item()
+            cache["poincare_dist_std"] = coords.std().item()
+            self._last_manifold_coords = None  # 🌟 斩断幽灵引用
 
-        # 残差门控统计
+        # 残差门控统计（取后即清 + CPU 迁移）
         if self._last_residual_scale is not None:
-            scale = self._last_residual_scale.detach()
-            cache["residual_scale_mean"] = scale.mean()
+            scale = self._last_residual_scale.detach().cpu()
+            cache["residual_scale_mean"] = scale.mean().item()
+            self._last_residual_scale = None  # 🌟 斩断幽灵引用
 
-        # attention_compression_ratio = 1 - sum(bandwidths) / N^2
-        if self._last_bandwidths is not None:
-            bw = self._last_bandwidths.detach().float()
-            B, N = bw.shape
-            total_bandwidth = bw.sum()  # GPU tensor → flatten_layer_outputs .item()
-            compression = 1.0 - total_bandwidth / (B * N * N)
-            cache["attention_compression_ratio"] = compression
+        # attention_compression_ratio = 1 - sum(bandwidths) / N^2（已在上面处理）
 
-        # geometric_boundary_proximity = mean of poincare_norm
+        # geometric_boundary_proximity = mean of poincare_norm（取后即清）
         if self._last_poincare_norm is not None:
-            norm = self._last_poincare_norm.detach()
-            cache["geometric_boundary_proximity"] = norm.mean()
+            norm = self._last_poincare_norm.detach().cpu()
+            cache["geometric_boundary_proximity"] = norm.mean().item()
+            self._last_poincare_norm = None  # 🌟 斩断幽灵引用
 
-        # fractal_residual_energy_ratio = ||residual|| / ||x||
+        # fractal_residual_energy_ratio = ||residual|| / ||x||（取后即清）
         if self._last_input_x is not None and self._last_residual_scale is not None:
-            x_norm = self._last_input_x.detach().norm(p=2)
-            residual_est = self._last_residual_scale.mean().detach() * x_norm
+            x_norm = self._last_input_x.detach().norm(p=2).cpu().item()
+            residual_est = (self._last_residual_scale.mean().detach().cpu().item() * x_norm) if self._last_residual_scale is not None else 0
             if x_norm > 0:
                 cache["fractal_residual_energy_ratio"] = residual_est / x_norm
+            self._last_input_x = None  # 🌟 斩断幽灵引用
 
-        # poincare_norm_max
-        if self._last_poincare_norm is not None:
-            cache["poincare_norm_max"] = self._last_poincare_norm.detach().max()
+        # poincare_norm_max（取后即清）
+        if hasattr(self, '_last_poincare_norm') and self._last_poincare_norm is not None:
+            cache["poincare_norm_max"] = self._last_poincare_norm.detach().cpu().max().item()
+            self._last_poincare_norm = None  # 🌟 斩断幽灵引用
 
         # === P1: true_avg_jump_distance (真实跳跃距离) ===
         # 使用注意力权重和带宽倒数作为跳越距离的加权计算
-        if self._last_attn_weights is not None and self._last_bandwidths is not None:
-            attn = self._last_attn_weights.detach()  # [B, H, N, N]
-            bw = self._last_bandwidths.detach().float()  # [B, N]
-            jump_proxy = 1.0 / (bw.unsqueeze(1).unsqueeze(-1) + EPS)  # [B, 1, N, 1]
-            weighted_jump = (attn * jump_proxy).sum(dim=[2, 3]) / (attn.sum(dim=[2, 3]) + EPS)  # [B, H]
-            cache["true_avg_jump_distance"] = weighted_jump.mean()
+        if self._last_attn_weights is not None:
+            attn = self._last_attn_weights.detach().cpu()  # [B, H, N, N]
+            bw = self._last_bandwidths.detach().float().cpu() if self._last_bandwidths is not None else None
+            if bw is not None:
+                jump_proxy = 1.0 / (bw.unsqueeze(1).unsqueeze(-1) + EPS)  # [B, 1, N, 1]
+                weighted_jump = (attn * jump_proxy).sum(dim=[2, 3]) / (attn.sum(dim=[2, 3]) + EPS)  # [B, H]
+                cache["true_avg_jump_distance"] = weighted_jump.mean().item()
+            self._last_attn_weights = None  # 🌟 斩断幽灵引用
 
         # === P1: entmax_sparsity (entmax 稀疏度) ===
         if self._last_attn_weights is not None:
@@ -1335,6 +1364,8 @@ class ManifoldNativeAttention(nn.Module):
         # nan_rate
         if self._total_count > 0:
             cache["nan_rate"] = self._nan_count / self._total_count
+
+        return cache_count / self._total_count
 
         return cache
 

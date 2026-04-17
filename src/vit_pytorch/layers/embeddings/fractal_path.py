@@ -485,11 +485,11 @@ class BitFlippedPositionEncoder(nn.Module):
         geometry_emb = geometry_emb * token_scales  # 应用深度衰减
 
         # I-NAN: 更新统一诊断缓存（D1-AUDIT FIX: GPU tensor 存储）
+        # I-OOM FIX: 使用 .clear() + .detach() 模式，防止显存泄漏
         gate_values = torch.sigmoid(self.rotation_gate).detach()
-        self._diagnostic_cache = {
-            "params/rotation_gate_mean": gate_values.mean(),
-            "params/depth_gamma": gamma,  # γ = σ(depth_decay_scale)，GPU tensor
-        }
+        self._diagnostic_cache.clear()
+        self._diagnostic_cache["params/rotation_gate_mean"] = gate_values.mean()
+        self._diagnostic_cache["params/depth_gamma"] = gamma.detach() if torch.is_tensor(gamma) else gamma
 
         return pos_emb, geometry_emb
 
@@ -602,6 +602,8 @@ class BitFlippedPositionEncoder(nn.Module):
         return enc
 
     @property
+    @property
+    @torch._dynamo.disable  # 🌟 修复：禁止 Dynamo 追踪此属性
     def embed_output(self) -> Dict[str, Any]:
         """BitFlippedPositionEncoder 诊断输出
 
@@ -611,36 +613,44 @@ class BitFlippedPositionEncoder(nn.Module):
 
         D1-AUDIT FIX: 所有值现在为 GPU tensor，
         由 flatten_layer_outputs() 在 post_forward() 统一调用 .item()。
+
+        I-OOM FIX: 使用 Disable & Flush 模式：
+        - @torch._dynamo.disable 屏蔽追踪
+        - 读取后立即 .cpu().item() 迁移到 CPU
+        - 读取后立即清空缓存斩断计算图引用
         """
         output: Dict[str, Any] = {}
 
-        # embed/params/* - rotation_gate 参数
-        # D1-AUDIT FIX: 存储整个 tensor，由 flatten_layer_outputs 处理
+        # embed/params/* - rotation_gate 参数（CPU 迁移）
         if hasattr(self, 'rotation_gate') and self.rotation_gate is not None:
-            gate_values = torch.sigmoid(self.rotation_gate)  # [max_level]
-            # D1-AUDIT FIX: 直接存储 tensor，用 key 中的索引标记各层级
+            gate_values = torch.sigmoid(self.rotation_gate).cpu()  # [max_level]
             for d in range(gate_values.numel()):
-                output[f"params/rotation_gate_lvl_{d}"] = gate_values[d]
-            output["params/rotation_gate_mean"] = gate_values.mean()
+                output[f"params/rotation_gate_lvl_{d}"] = gate_values[d].item()
+            output["params/rotation_gate_mean"] = gate_values.mean().item()
 
         # embed/params/* - depth_decay_scale 参数 (gamma)
         if hasattr(self, 'depth_decay_scale') and self.depth_decay_scale is not None:
-            gamma = torch.sigmoid(self.depth_decay_scale)  # GPU tensor
-            output["params/depth_gamma"] = gamma  # γ ∈ (0,1)
+            gamma = torch.sigmoid(self.depth_decay_scale).cpu()  # GPU tensor
+            output["params/depth_gamma"] = gamma.item()  # γ ∈ (0,1)
 
-        # embed/params/* - 嵌入权重统计（D1-AUDIT FIX: GPU tensor））
+        # embed/params/* - 嵌入权重统计（CPU 迁移）
         if hasattr(self, 'depth_embedding') and self.depth_embedding is not None:
             w = self.depth_embedding.weight
-            output["params/depth_emb_norm"] = w.norm()
-            output["params/depth_emb_mean"] = w.mean()
+            output["params/depth_emb_norm"] = w.norm().item()
+            output["params/depth_emb_mean"] = w.mean().item()
 
         if hasattr(self, 'quadrant_embedding') and self.quadrant_embedding is not None:
             w = self.quadrant_embedding.weight
-            output["params/quadrant_emb_norm"] = w.norm()
+            output["params/quadrant_emb_norm"] = w.norm().item()
 
-        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标（现在都是 GPU tensor）
+        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标（CPU 迁移 + 清空）
         if self._diagnostic_cache:
-            output.update(self._diagnostic_cache)
+            for k, v in self._diagnostic_cache.items():
+                if isinstance(v, torch.Tensor):
+                    output[k] = v.detach().cpu().item()
+                else:
+                    output[k] = v
+            self._diagnostic_cache.clear()  # 🌟 立即清空缓存释放计算图
 
         # embed/health/* - nan_grad_hooks 注册数
         if hasattr(self, '_nan_grad_hooks') and self._nan_grad_hooks:
@@ -847,6 +857,8 @@ class FractalPathEmbedding(nn.Module):
             self._diagnostic_cache["distribution/path_entropy"] = torch.tensor(0.0, device=paths.device, dtype=torch.float32)
 
     @property
+    @property
+    @torch._dynamo.disable  # 🌟 修复：禁止 Dynamo 追踪此属性
     def embed_output(self) -> Dict[str, Any]:
         """FractalPathEmbedding 诊断输出
 
@@ -856,23 +868,30 @@ class FractalPathEmbedding(nn.Module):
 
         D1-AUDIT FIX: 所有值现在为 GPU tensor，
         由 flatten_layer_outputs() 在 post_forward() 统一调用 .item()。
+
+        I-OOM FIX: 使用 Disable & Flush 模式
         """
         output: Dict[str, Any] = {}
 
-        # embed/params/* - 嵌入权重统计（D1-AUDIT FIX: GPU tensor））
+        # embed/params/* - 嵌入权重统计（CPU 迁移）
         if hasattr(self, 'scale_embedding') and self.scale_embedding is not None:
             w = self.scale_embedding.weight
-            output["params/scale_emb_norm"] = w.norm()
-            output["params/scale_emb_mean"] = w.mean()
+            output["params/scale_emb_norm"] = w.norm().item()
+            output["params/scale_emb_mean"] = w.mean().item()
 
         if hasattr(self, 'quadrant_embedding') and self.quadrant_embedding is not None:
             w = self.quadrant_embedding.weight
-            output["params/quadrant_emb_norm"] = w.norm()
-            output["params/quadrant_emb_std"] = w.std()
+            output["params/quadrant_emb_norm"] = w.norm().item()
+            output["params/quadrant_emb_std"] = w.std().item()
 
-        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标（现在都是 GPU tensor）
+        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标（CPU 迁移 + 清空）
         if self._diagnostic_cache:
-            output.update(self._diagnostic_cache)
+            for k, v in self._diagnostic_cache.items():
+                if isinstance(v, torch.Tensor):
+                    output[k] = v.detach().cpu().item()
+                else:
+                    output[k] = v
+            self._diagnostic_cache.clear()  # 🌟 立即清空缓存释放计算图
 
         return output
 
@@ -1345,6 +1364,8 @@ class FourierPathEncoder(nn.Module):
         return similarities if not was_2d else similarities.view(B, -1)
 
     @property
+    @property
+    @torch._dynamo.disable  # 🌟 修复：禁止 Dynamo 追踪此属性
     def embed_output(self) -> Dict[str, Any]:
         """FourierPathEncoder 诊断输出
 
@@ -1359,19 +1380,26 @@ class FourierPathEncoder(nn.Module):
 
         D1-AUDIT FIX: 所有值现在为 GPU tensor，
         由 flatten_layer_outputs() 在 post_forward() 统一调用 .item()。
+
+        I-OOM FIX: 使用 Disable & Flush 模式
         """
         output: Dict[str, Any] = {}
 
-        # embed/params/* - 投影层参数统计（D1-AUDIT FIX: GPU tensor））
+        # embed/params/* - 投影层参数统计（CPU 迁移）
         if hasattr(self, 'projection') and self.projection is not None:
             w = self.projection.weight
-            output["params/projection_norm"] = w.norm()
-            output["params/projection_mean"] = w.mean()
-            output["params/projection_std"] = w.std()
+            output["params/projection_norm"] = w.norm().item()
+            output["params/projection_mean"] = w.mean().item()
+            output["params/projection_std"] = w.std().item()
 
-        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标（现在都是 GPU tensor）
+        # I-NAN: 从统一诊断缓存合并 forward 中计算的指标（CPU 迁移 + 清空）
         if self._diagnostic_cache:
-            output.update(self._diagnostic_cache)
+            for k, v in self._diagnostic_cache.items():
+                if isinstance(v, torch.Tensor):
+                    output[k] = v.detach().cpu().item()
+                else:
+                    output[k] = v
+            self._diagnostic_cache.clear()  # 🌟 立即清空缓存释放计算图
 
         # embed/health/* - nan_grad_hooks 注册数
         if hasattr(self, '_nan_grad_hooks') and self._nan_grad_hooks:

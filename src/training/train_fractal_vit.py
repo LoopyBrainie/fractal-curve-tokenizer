@@ -1413,6 +1413,10 @@ def main():
     # Setup
     set_seed(args.seed)
     configure_cuda()
+
+    # TorchDynamo 优化：增加缓存上限减少重编译导致的显存泄漏
+    import torch._dynamo
+    torch._dynamo.config.cache_size_limit = 64
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     print(f"Device: {device}")
