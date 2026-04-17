@@ -82,9 +82,8 @@ class GradientMonitor:
         def create_hook(name: str):
             def hook(grad: torch.Tensor) -> None:
                 if grad is not None:
-                    # I-OPT: 存储原始 tensor norm，在 finalize() 时批量 .item()
-                    # 这样避免了每个参数 backward hook 都触发一次 GPU-CPU 同步
-                    self._pending_grad_norms[name].append(grad.norm())
+                    # I-OOM FIX: detach() 断开梯度图，防止显存泄漏
+                    self._pending_grad_norms[name].append(grad.norm().detach())
             return hook
 
         # Register hooks on parameters
@@ -375,16 +374,15 @@ class EnhancedGradientMonitor:
             if not isinstance(grad, torch.Tensor) or grad.numel() == 0:
                 return
 
-            # I-OPT: 存储原始 tensor norm，在 finalize() 时批量 .item()
-            # 避免每个 module 的 backward hook 都触发一次 GPU-CPU 同步
-            self._pending_grad_norms.setdefault(name, []).append(grad.norm())
+            # I-OOM FIX: detach() 断开梯度图，防止显存泄漏
+            self._pending_grad_norms.setdefault(name, []).append(grad.norm().detach())
 
             # I-OPT: 延迟 ratio 计算，改为存储 tensor 在 finalize 时检查
             # 原实现: 在 hook 内调用 named_parameters() + .norm() + .item() 多次同步
             for n, p in module.named_parameters():
                 if p.grad is not None:
                     ratio = p.grad.norm() / (p.norm() + 1e-8)
-                    self._pending_grad_ratios.append((name, n, ratio))
+                    self._pending_grad_ratios.append((name, n, ratio.detach()))
 
         return hook
 

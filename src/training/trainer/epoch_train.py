@@ -319,42 +319,42 @@ def train_one_epoch(
                 # 新增: 提取实验详细日志指标
                 # I-AUDIT: 使用计数器跟踪有效值数量，避免平均值计算时除以错误分母
                 if outputs.splitter_logits_mean is not None:
-                    total_splitter_logits_mean = (total_splitter_logits_mean or 0.0) + outputs.splitter_logits_mean
-                    total_splitter_logits_std = (total_splitter_logits_std or 0.0) + (outputs.splitter_logits_std or 0.0)
+                    total_splitter_logits_mean = (total_splitter_logits_mean or 0.0) + outputs.splitter_logits_mean.detach()
+                    total_splitter_logits_std = (total_splitter_logits_std or 0.0) + (outputs.splitter_logits_std.detach() if outputs.splitter_logits_std is not None else 0.0)
                     _splitter_logits_count += 1
                 if outputs.active_ratio is not None:
-                    total_active_ratio = (total_active_ratio or 0.0) + outputs.active_ratio
+                    total_active_ratio = (total_active_ratio or 0.0) + outputs.active_ratio.detach()
                     _active_ratio_count += 1
                 if outputs.manifold_bias_max is not None:
-                    total_manifold_bias_max = (total_manifold_bias_max or 0.0) + outputs.manifold_bias_max
-                    total_manifold_bias_min = (total_manifold_bias_min or 0.0) + (outputs.manifold_bias_min or 0.0)
-                    total_manifold_bias_mean = (total_manifold_bias_mean or 0.0) + (outputs.manifold_bias_mean or 0.0)
-                    total_manifold_bias_std = (total_manifold_bias_std or 0.0) + (outputs.manifold_bias_std or 0.0)
+                    total_manifold_bias_max = (total_manifold_bias_max or 0.0) + outputs.manifold_bias_max.detach()
+                    total_manifold_bias_min = (total_manifold_bias_min or 0.0) + (outputs.manifold_bias_min.detach() if outputs.manifold_bias_min is not None else 0.0)
+                    total_manifold_bias_mean = (total_manifold_bias_mean or 0.0) + outputs.manifold_bias_mean.detach()
+                    total_manifold_bias_std = (total_manifold_bias_std or 0.0) + (outputs.manifold_bias_std.detach() if outputs.manifold_bias_std is not None else 0.0)
                     _manifold_bias_count += 1
                 if outputs.poincare_dist_mean is not None:
-                    total_poincare_dist_mean = (total_poincare_dist_mean or 0.0) + outputs.poincare_dist_mean
-                    total_poincare_dist_std = (total_poincare_dist_std or 0.0) + (outputs.poincare_dist_std or 0.0)
+                    total_poincare_dist_mean = (total_poincare_dist_mean or 0.0) + outputs.poincare_dist_mean.detach()
+                    total_poincare_dist_std = (total_poincare_dist_std or 0.0) + (outputs.poincare_dist_std.detach() if outputs.poincare_dist_std is not None else 0.0)
                     _poincare_dist_count += 1
                 if outputs.budget_penalty is not None:
-                    total_budget_penalty = (total_budget_penalty or 0.0) + abs(outputs.budget_penalty)
+                    total_budget_penalty = (total_budget_penalty or 0.0) + abs(outputs.budget_penalty.detach())
                     _budget_penalty_count += 1
                 if outputs.consistency_loss is not None:
-                    total_consistency_loss = (total_consistency_loss or 0.0) + outputs.consistency_loss
+                    total_consistency_loss = (total_consistency_loss or 0.0) + outputs.consistency_loss.detach()
                     _consistency_loss_count += 1
                 if outputs.entropy_loss is not None:
-                    total_entropy_loss = (total_entropy_loss or 0.0) + outputs.entropy_loss
+                    total_entropy_loss = (total_entropy_loss or 0.0) + outputs.entropy_loss.detach()
                     _entropy_loss_count += 1
                 if outputs.theoretical_flops_reduction is not None:
-                    total_theoretical_flops_reduction = (total_theoretical_flops_reduction or 0.0) + outputs.theoretical_flops_reduction
+                    total_theoretical_flops_reduction = (total_theoretical_flops_reduction or 0.0) + outputs.theoretical_flops_reduction.detach()
                     _theoretical_flops_count += 1
                 if outputs.mean_abs_logits is not None:
-                    total_mean_abs_logits = (total_mean_abs_logits or 0.0) + outputs.mean_abs_logits
+                    total_mean_abs_logits = (total_mean_abs_logits or 0.0) + outputs.mean_abs_logits.detach()
                     _mean_abs_logits_count += 1
                 if outputs.raw_budget_error is not None:
-                    total_raw_budget_error = (total_raw_budget_error or 0.0) + outputs.raw_budget_error
+                    total_raw_budget_error = (total_raw_budget_error or 0.0) + outputs.raw_budget_error.detach()
                     _raw_budget_error_count += 1
                 if outputs.density_regularization is not None:
-                    total_density_regularization = (total_density_regularization or 0.0) + outputs.density_regularization
+                    total_density_regularization = (total_density_regularization or 0.0) + outputs.density_regularization.detach()
                     _density_reg_count += 1
 
                 # auxiliary_outputs flattening (layer-packaged → trainer-unpacked)
@@ -363,7 +363,8 @@ def train_one_epoch(
                     for _k, _v in _flat.items():
                         if _k not in _aux_flat_accum:
                             _aux_flat_accum[_k] = []
-                        _aux_flat_accum[_k].append(_v)
+                        # I-OOM FIX: detach() 断开图 + cpu() 搬离显存 + non_blocking 异步拷贝
+                        _aux_flat_accum[_k].append(_v.detach().to('cpu', non_blocking=True))
             else:
                 logits = outputs
 
