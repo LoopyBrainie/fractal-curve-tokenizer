@@ -486,7 +486,7 @@ def train_one_epoch(
         # I-NAN: 计算裁剪前的梯度范数（P1-Fix: 移除 .item() 避免 Graph Break）
         # 原代码使用 .item() 强制 GPU-CPU 同步，导致 torch.compile 缓存爆炸
         # 修改为延迟计算，仅在需要时通过 detach 获取
-        pre_clip_grad_norm_tensor = torch.zeros(1, device=next(p.device for p in model.parameters() if p.grad is not None).device) if hasattr(model, 'parameters') else None
+        pre_clip_grad_norm_tensor = torch.zeros(1, device=next((p.device for p in model.parameters() if p.grad is not None), None)) if hasattr(model, 'parameters') else None
         try:
             # 保持为 tensor，不断开计算图
             pre_clip_grad_norm = torch.stack([

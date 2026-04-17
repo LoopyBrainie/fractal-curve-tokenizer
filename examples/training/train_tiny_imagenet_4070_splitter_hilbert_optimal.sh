@@ -167,6 +167,7 @@ uv run python -m src.training.train_fractal_vit \
   \
   --gradient-checkpoint \
   --use-amp \
+  --compile \
   --channels-last \
   \
   --lr 8e-5 \
