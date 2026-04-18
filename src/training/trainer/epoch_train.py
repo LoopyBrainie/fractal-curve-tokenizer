@@ -127,6 +127,11 @@ def train_one_epoch(
     collector: Optional[Any] = None,  # NEW: Optional MetricsCollector
     warmup_params: Optional[dict] = None,  # NEW: BPE-style warmup params
     grad_balancer: Optional[GradBalancer] = None,  # V3: 动态梯度平衡器
+    # I-OOM FIX: Monitors now passed from outside to prevent O(N^2) hook leak
+    grad_monitor: Optional[GradientMonitor] = None,
+    loss_monitor: Optional[LossMonitor] = None,
+    defender: Optional[NumericalDefender] = None,
+    nan_investigator: Optional[NaNAutoInvestigation] = None,
 ) -> EpochMetrics:
     """Train for one epoch
 
@@ -151,32 +156,40 @@ def train_one_epoch(
 
     model.train()
 
-    # Initialize monitors (use collector if provided)
-    grad_monitor = GradientMonitor(
-        model=model,
-        record_layer_norms=config.numerical.record_layer_grad_norms,
-        hooks_enabled=config.numerical.record_grad_norms,
-        collector=collector,
-    )
-    # I-NAN: 注册梯度 hooks 以启用 layer_norms 追踪
-    if config.numerical.record_grad_norms:
-        grad_monitor.register_hooks(model)
-    loss_monitor = LossMonitor(collector=collector)
-    defender = NumericalDefender(
-        model=model,
-        detect_anomaly=config.numerical.detect_anomaly,
-        skip_on_nan=config.numerical.skip_on_nan_grad,
-        collector=collector,
-    )
+    # I-OOM FIX: Only create monitors if not provided from outside
+    # This prevents O(N^2) hook leak where each epoch created new hooks
+    if grad_monitor is None:
+        grad_monitor = GradientMonitor(
+            model=model,
+            record_layer_norms=config.numerical.record_layer_grad_norms,
+            hooks_enabled=config.numerical.record_grad_norms,
+            collector=collector,
+        )
+        # I-NAN: 注册梯度 hooks 以启用 layer_norms 追踪
+        if config.numerical.record_grad_norms:
+            grad_monitor.register_hooks(model)
+
+    if loss_monitor is None:
+        loss_monitor = LossMonitor(collector=collector)
+
+    if defender is None:
+        defender = NumericalDefender(
+            model=model,
+            detect_anomaly=config.numerical.detect_anomaly,
+            skip_on_nan=config.numerical.skip_on_nan_grad,
+            collector=collector,
+        )
 
     # I-NAN: 初始化 NaN 自动取证器
     # debug_dir 默认为实验目录下的 debug 子目录
-    _debug_dir = debug_dir if debug_dir else "experiments/debug"
-    nan_investigator = NaNAutoInvestigation(
-        model=model,
-        debug_dir=_debug_dir,
-        enabled=True,  # 始终启用，用于捕获第一次 NaN
-    )
+    # I-OOM FIX: Only create if not provided
+    if nan_investigator is None:
+        _debug_dir = debug_dir if debug_dir else "experiments/debug"
+        nan_investigator = NaNAutoInvestigation(
+            model=model,
+            debug_dir=_debug_dir,
+            enabled=True,  # 始终启用，用于捕获第一次 NaN
+        )
 
     # 用于记录输入数据统计（用于调试）
     _input_stats: Dict[str, float] = {}
@@ -409,6 +422,10 @@ def train_one_epoch(
             scaler.scale(loss).backward()
         else:
             loss.backward()
+
+        # I-OOM FIX: 调用 finalize 将 GPU tensors 转为 Python floats，释放显存
+        if grad_monitor is not None:
+            grad_monitor.finalize()
 
         # MEMORY DIAGNOSTIC: 每10步监控显存，定位暴涨时刻
         if torch.cuda.is_available() and (batch_idx + 1) % 10 == 0:

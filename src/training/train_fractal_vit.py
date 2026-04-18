@@ -850,13 +850,17 @@ def train(
             mixup_prob=getattr(args, 'mixup_prob', 0.5),
         )
 
-    # Create monitors
+    # Create monitors - I-OOM FIX: 移到循环外，只创建一次
     grad_monitor = GradientMonitor(
         model=model,
         record_layer_norms=config.numerical.record_layer_grad_norms,
+        hooks_enabled=config.numerical.record_grad_norms,
     )
+    # I-OOM FIX: 注册 hooks 一次，不再每 epoch 重复注册
+    if config.numerical.record_grad_norms:
+        grad_monitor.register_hooks(model)
     loss_monitor = LossMonitor()
-    NumericalDefender(
+    defender = NumericalDefender(
         model=model,
         detect_anomaly=config.numerical.detect_anomaly,
         skip_on_nan=config.numerical.skip_on_nan_grad,
@@ -917,6 +921,7 @@ def train(
         )
 
         # Train one epoch
+        # I-OOM FIX: 传入外部创建的 monitors，防止每 epoch 重复创建 hooks
         train_metrics = train_one_epoch(
             model=model,
             dataloader=train_loader,
@@ -931,6 +936,9 @@ def train(
             debug_dir=str(output_dir / "debug"),
             warmup_params=warmup_params,
             grad_balancer=grad_balancer,
+            grad_monitor=grad_monitor,
+            loss_monitor=loss_monitor,
+            defender=defender,
         )
 
         # Reset monitors

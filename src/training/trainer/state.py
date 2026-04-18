@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional
+from collections import deque
 import torch
 
 
@@ -51,22 +52,23 @@ class TrainingState:
     nan_skip_count: int = 0
 
     def __post_init__(self):
-        """Initialize default metrics history"""
+        """Initialize default metrics history with bounded deque"""
+        # I-OOM FIX: 使用 deque(maxlen=1000) 防止无限增长
+        maxlen = 1000
         if not self.metrics_history:
             self.metrics_history = {
-                "train_loss": [],
-                "train_accuracy": [],
-                "val_loss": [],
-                "val_accuracy": [],
-                "val_top5_accuracy": [],
-                "learning_rate": [],
-                "grad_norm": [],
+                name: deque(maxlen=maxlen)
+                for name in [
+                    "train_loss", "train_accuracy", "val_loss", "val_accuracy",
+                    "val_top5_accuracy", "learning_rate", "grad_norm",
+                ]
             }
 
     def update_metric(self, name: str, value: float) -> None:
-        """Update a metric in history"""
+        """Update a metric in history with bounded deque"""
+        # I-OOM FIX: 使用 deque(maxlen=1000) 防止无限增长
         if name not in self.metrics_history:
-            self.metrics_history[name] = []
+            self.metrics_history[name] = deque(maxlen=1000)
         self.metrics_history[name].append(value)
 
     def get_metric_history(self, name: str) -> list:
