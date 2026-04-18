@@ -7,7 +7,7 @@ handles Layer 3 (hyperparameters) for evaluation.
 
 from __future__ import annotations
 
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Union
 import torch
 from tqdm import tqdm
 import torch.nn as nn
@@ -47,23 +47,25 @@ def evaluate(
     """
     model.eval()
 
-    total_loss = 0.0
-    total_correct = 0
-    total_top5_correct = 0
+    # I-OPT: 初始化为 GPU tensor，直接累加避免循环内 .item() 同步
+    # 注意: 评估模式下使用 torch.no_grad()，所以 tensor 累积是安全的
+    total_loss = torch.tensor(0.0, device=device)
+    total_correct = torch.tensor(0, device=device)
+    total_top5_correct = torch.tensor(0, device=device)
     total_samples = 0
     num_batches = 0
 
-    # For ECE calculation
-    all_confidences: List[float] = []
-    all_correct: List[bool] = []
+    # For ECE calculation - 保持 GPU tensor，最后统一转换
+    all_confidences: List[torch.Tensor] = []
+    all_correct: List[torch.Tensor] = []
 
-    # For confusion matrix
+    # For confusion matrix - 保持 GPU tensor
     all_predictions: List[torch.Tensor] = []
     all_targets: List[torch.Tensor] = []
 
-    # For per-class accuracy
-    class_correct = torch.zeros(num_classes)
-    class_total = torch.zeros(num_classes)
+    # For per-class accuracy - 使用 bincount 向量化的 GPU tensor
+    class_correct = torch.zeros(num_classes, device=device)
+    class_total = torch.zeros(num_classes, device=device)
 
     total_batches = len(dataloader)
 
@@ -94,9 +96,10 @@ def evaluate(
                     logits = outputs
 
             # Compute loss
+            # I-OPT: 直接累加 tensor，不在循环内 .item()
             if labels is not None:
                 loss = nn.functional.cross_entropy(logits, labels)
-                total_loss += loss.item()
+                total_loss = total_loss + loss.detach()
 
             # Get predictions
             if logits is not None:
@@ -106,62 +109,73 @@ def evaluate(
                 pred = logits.argmax(dim=-1)
 
                 if labels is not None:
-                    correct = (pred == labels).sum().item()
-                    total_correct += correct
+                    correct = (pred == labels).sum()  # I-OPT: tensor, no .item()
+                    total_correct = total_correct + correct.detach()
 
-                    # Per-class accuracy
-                    for c in range(num_classes):
-                        mask = labels == c
-                        if mask.any():
-                            class_correct[c] += ((pred == labels) & mask).sum().item()
-                            class_total[c] += mask.sum().item()
+                    # I-OPT: 向量化 per-class accuracy，使用 scatter_add 替代循环
+                    # 原实现: for c in range(num_classes): .item() x2 per class (200 syncs/batch)
+                    # 新实现: 使用 scatter_add 向量化，延迟 .item() 到最后
+                    # 每个类的正确预测数
+                    correct_mask = (pred == labels).long()  # [B]
+                    class_correct.scatter_add_(0, labels.long(), correct_mask)
+                    # 每个类的总样本数
+                    class_total.scatter_add_(0, labels.long(), torch.ones_like(labels).long())
 
-                    # Top-5 accuracy
+                    # Top-5 accuracy - I-OPT: 直接累加 tensor
                     if num_classes > 1:
                         _, top5_pred = logits.topk(min(5, num_classes), dim=-1)
-                        top5_correct = (top5_pred == labels.unsqueeze(-1)).any(dim=-1).sum().item()
-                        total_top5_correct += top5_correct
+                        top5_correct = (top5_pred == labels.unsqueeze(-1)).any(dim=-1).sum()
+                        total_top5_correct = total_top5_correct + top5_correct.detach()
 
-                    # Collect for ECE
+                    # I-OPT: ECE 数据保持 GPU tensor，最后统一转换
                     probs = torch.softmax(logits, dim=-1)
                     confidences, _ = probs.max(dim=-1)
-                    all_confidences.extend(confidences.cpu().tolist())
-                    all_correct.extend((pred == labels).cpu().tolist())
+                    all_confidences.append(confidences.detach())  # Keep tensor
+                    all_correct.append((pred == labels).detach())  # Keep tensor
 
-                    # Collect for confusion matrix
-                    all_predictions.append(pred.cpu())
-                    all_targets.append(labels.cpu())
+                    # I-OPT: Confusion matrix 保持 GPU tensor
+                    all_predictions.append(pred.detach())
+                    all_targets.append(labels.detach())
 
                 total_samples += batch_size
 
             num_batches += 1
 
-            # Batch 进度日志 (每 10 个 batch 打印一次)
+            # I-OPT: Batch 进度日志 - 延迟 .item() 到日志输出时
+            # 只在每 10 个 batch 打印，不影响性能
             if batch_idx > 0 and batch_idx % 10 == 0 and labels is not None:
-                batch_acc = correct / batch_size if batch_size > 0 else 0.0
-                print(f"  Eval batch {batch_idx}/{total_batches} | Loss: {loss.item():.4f} | Acc: {batch_acc:.2%}")
+                loss_val = loss.detach().item()
+                batch_acc = correct.detach().item() / batch_size
+                print(f"  Eval batch {batch_idx}/{total_batches} | Loss: {loss_val:.4f} | Acc: {batch_acc:.2%}")
 
     # Compute final metrics
-    avg_loss = total_loss / max(num_batches, 1)
-    accuracy = total_correct / max(total_samples, 1) if total_samples > 0 else 0.0
-    top5_accuracy = total_top5_correct / max(total_samples, 1) if total_samples > 0 else None
+    # I-OPT: 直接 .item() 转换，tensor 已在 GPU
+    avg_loss = (total_loss / max(num_batches, 1)).item()
+    accuracy = (total_correct / max(total_samples, 1)).item()
+    top5_accuracy = (total_top5_correct / max(total_samples, 1)).item()
 
     # Compute ECE
+    # I-OPT: all_confidences/all_correct 现在是 List[Tensor]，需要转换
     ece = None
     if compute_ece and all_confidences:
+        # 批量转换所有 tensor 到 CPU 列表（单次同步）
+        all_conf_flat = torch.cat(all_confidences).cpu().tolist()
+        all_correct_flat = torch.cat(all_correct).cpu().tolist()
+        # D3-AUDIT FIX: 传入 device 避免 compute_ece_score 内部创建 CPU tensor
         ece = compute_ece_score(
-            all_confidences,
-            all_correct,
+            all_conf_flat,
+            all_correct_flat,
             num_bins=ece_bins,
+            device=device,
         )
 
-    # Per-class accuracy
+    # Per-class accuracy - I-OPT: class_correct/class_total 现在是 GPU tensor
     per_class_acc = {}
     for c in range(num_classes):
         if class_total[c] > 0:
             per_class_acc[c] = (class_correct[c] / class_total[c]).item()
 
-    # Compute confusion matrix
+    # Compute confusion matrix - I-OPT: all_predictions/targets 已是 GPU tensor
     confusion_matrix = None
     if all_predictions and all_targets:
         all_pred = torch.cat(all_predictions)
@@ -183,6 +197,7 @@ def compute_ece_score(
     confidences: List[float],
     correct: List[bool],
     num_bins: int = 15,
+    device: Optional[torch.device] = None,
 ) -> float:
     """Compute Expected Calibration Error
 
@@ -201,8 +216,11 @@ def compute_ece_score(
     if not confidences or not correct:
         return 0.0
 
-    confidences = torch.tensor(confidences)
-    correct = torch.tensor(correct, dtype=torch.float)
+    # D3-AUDIT FIX: 指定 device 避免隐式 CPU 创建
+    # 若 device 为 None，则默认 CPU（对 ECE 计算无性能影响）
+    _device = device or torch.device('cpu')
+    confidences = torch.tensor(confidences, device=_device)
+    correct = torch.tensor(correct, dtype=torch.float, device=_device)
 
     # Create bins
     bin_boundaries = torch.linspace(0, 1, num_bins + 1)
@@ -260,8 +278,8 @@ def evaluate_simple(
 
     with torch.no_grad():
         for batch_idx, batch in tqdm(enumerate(dataloader), total=total_batches, desc="Evaluating", leave=False):
-            images = batch[0].to(device)
-            labels = batch[1].to(device)
+            images = batch[0].to(device, non_blocking=True)
+            labels = batch[1].to(device, non_blocking=True)
 
             outputs = model(images)
             if hasattr(outputs, 'logits'):
