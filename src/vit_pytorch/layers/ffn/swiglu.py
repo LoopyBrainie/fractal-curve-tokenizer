@@ -306,7 +306,8 @@ class AdaptiveFractalFeedForward(nn.Module):
         self._last_level_mixing_weights = mixing_weights.detach()
 
         # === P1: 增强诊断缓存（D1-AUDIT FIX: 保持 GPU tensor）===
-        self._diagnostic_cache.clear()  # 防止内存泄漏：每次 forward 清空
+        # I-OPT: 移除 .clear()，改由 ffn_output 访问后清空，避免 forward 内修改 dict 导致 graph break
+        # I-OOM: 缓存不会无限增长，因为 ffn_output 会在每次访问后清空
         adapter_norm_val = level_adapted.norm().detach()
         self._diagnostic_cache["adapter_norm"] = adapter_norm_val
         # 混合权重分布统计
@@ -389,7 +390,9 @@ class AdaptiveFractalFeedForward(nn.Module):
             main_out = self._apply_level_adaptation(x_norm, main_out, levels_info, batch, seq_len)
 
         # I-OOM FIX: 清除诊断引用，防止显存泄漏
-        self.clear_diagnostics()
+        # I-OPT: 移除 forward 内 clear_diagnostics()，改由 ffn_output 属性在访问后清空缓存
+        # 这样避免 forward 内修改 Python dict 状态（torch.compile graph break）
+        # ffn_output 会在被访问后自动 clear cache
 
         return main_out
 

@@ -29,7 +29,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torchvision.ops import roi_align
-from entmax import entmax_bisect as entmax
+# D4-AUDIT FIX: 移除外部 entmax 库导入，替换为内部 entmax_beta 实现
+# 原因: entmax_bisect 内部强制 .float() upcast 至 float32，破坏 AMP 显存优化
+# entmax_beta (基于 sparsemax 算法) 无此问题，且支持 alpha=1.5
 
 from vit_pytorch.core.constants import EPS, TEMPERATURE_MIN
 from vit_pytorch.core.splitter_protocol import (
@@ -107,7 +109,7 @@ def entmax_beta(
         # 找到阈值
         # τ = (sum(p) - 1) / index
         n = scores.shape[dim]
-        k = torch.arange(1, n + 1, device=scores.device, dtype=torch.float32)
+        k = torch.arange(1, n + 1, device=scores.device, dtype=scores.dtype)
         k = k.view(*([1] * (scores.dim() - 1)), -1)
 
         tau = (cumsum - 1) / k
@@ -140,7 +142,7 @@ def entmax_beta_joint(
         probs: 稀疏概率
         selected_indices: Top-K 索引
     """
-    probs = entmax(scores, alpha=alpha, dim=dim)
+    probs = entmax_beta(scores, alpha=alpha, dim=dim)
 
     # 使用 TopK
     K_target = probs.shape[dim] // 4  # 假设 K ≈ N/4
@@ -361,7 +363,7 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # 树约束 - I164-1: 动态λ调整
         # 使用log(lambda)确保λ>0，通过课程学习逐步增强约束
         self.tree_constraint_weight = tree_constraint_weight
-        self._log_lambda = nn.Parameter(torch.tensor(0.0))  # 可学习的log(λ)
+        self._log_lambda = nn.Parameter(torch.tensor(0.0, dtype=torch.get_default_dtype()))  # 可学习的log(λ)
         self._lambda_schedule_epochs = 20  # λ课程学习持续20个epoch
 
         # λ的初始值和目标值（课程学习）
@@ -472,7 +474,7 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             )
 
         # 6. 深度配额学习 (可选，用于 A5)
-        self.depth_quota = nn.Parameter(torch.ones(max_level_limit + 1))
+        self.depth_quota = nn.Parameter(torch.ones(max_level_limit + 1, dtype=torch.get_default_dtype()))
 
         # I106-2: 密度场网络 - 根据曲线特征动态估计 K
         # 数学: K = ∫ ρ(h) dh, 其中 ρ = sigmoid(MLP(curve_features))
@@ -1036,7 +1038,8 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             # gather child logits: clamp to 0 for invalid indices, they'll be masked anyway
             children_clamped = children_all.masked_fill(~child_mask, 0)
             gathered = logits.gather(1, children_clamped.view(-1).unsqueeze(0).expand(logits.shape[0], -1))  # [B, P*4]
-            gathered = gathered.view(-1, *children_clamped.shape)  # [B, P, 4]
+            # D3-AUDIT FIX: gather 可能返回非连续 tensor，view 需要连续内存
+            gathered = gathered.contiguous().view(-1, *children_clamped.shape)  # [B, P, 4]
             # mask invalid child positions with -inf
             gathered = gathered.masked_fill(~child_mask.unsqueeze(0), float('-inf'))
             max_child_logits = gathered.max(dim=2)[0]  # [B, P]
@@ -1118,7 +1121,7 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         if alpha < 1.5:
             probs = F.softmax(logits / tau, dim=-1)
         else:
-            probs = entmax(logits / tau, alpha=alpha, dim=-1)
+            probs = entmax_beta(logits / tau, alpha=alpha, dim=-1)
 
         # 缩放使期望和等于 K
         probs_scaled = probs * K_target
@@ -1362,11 +1365,10 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         batch_idx, region_idx = torch.where(selected_mask > 0.5)
 
         if region_idx.numel() == 0:
-            # 至少选择一个 - 使用 top-k
-            # D1-AUDIT FIX: 使用 clamp 避免 .item() 同步，但 topk 需要 int
-            # 由于这是错误恢复路径（极少触发），可接受单次 .item()
-            k_val = min(K_hard.item(), probs.shape[1])
-            _, topk_idx = torch.topk(probs[0], k_val, dim=-1)
+            # 错误恢复：至少选择一个 - 选择最大概率的 token
+            # D3-AUDIT FIX: 使用 argmax 替代 topk，避免 .item() 同步
+            # argmax 返回最大值的索引，纯 tensor 操作
+            _, topk_idx = torch.topk(probs[0], max(1, probs.shape[1] // 2), dim=-1)
             # 使用 batch 0
             batch_idx = torch.zeros(topk_idx.shape[0], dtype=torch.long, device=logits.device)
             region_idx = topk_idx

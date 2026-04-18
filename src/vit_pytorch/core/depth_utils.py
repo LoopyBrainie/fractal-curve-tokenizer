@@ -476,7 +476,7 @@ def compute_normalized_area(
 
     # 面积归一化: f = log(s+1) / log(S+1)
     log_s_plus_1 = torch.log(s_patch + epsilon)
-    log_S_plus_1 = torch.log(torch.tensor(S_total + 1, device=regions.device, dtype=torch.float32))
+    log_S_plus_1 = torch.log(torch.tensor(S_total + 1, device=regions.device, dtype=regions.dtype))
     f_area = log_s_plus_1 / log_S_plus_1
 
     # 确保在 [0, 1] 范围内
