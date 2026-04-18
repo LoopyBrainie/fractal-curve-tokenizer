@@ -219,15 +219,9 @@ class FastBitwiseHilbert:
             # Gray 码变换
             return FastBitwiseHilbert._gray_code_transform(xv, yv, n)
         else:
-            # 矩形或非 2^k：使用 HilbertScanner (Pseudo-Hilbert)
-            # 将 Tensor 转换为标量列表处理
-            x_np = x.long().cpu().numpy()
-            y_np = y.long().cpu().numpy()
-            d_np = [
-                HilbertScanner.xy_to_d(H, W, int(xi), int(yi))
-                for xi, yi in zip(x_np, y_np)
-            ]
-            return torch.tensor(d_np, dtype=x.dtype, device=x.device)
+            # 矩形或非 2^k：使用 HilbertScanner 向量化 batch 方法
+            # I-OPT: 使用 xy_to_d_batch 避免 cpu().numpy() + list comprehension
+            return HilbertScanner.xy_to_d_batch(H, W, x.long(), y.long())
 
     @staticmethod
     def d_to_xy(d: Tensor, H: int, W: int) -> Tuple[Tensor, Tensor]:
@@ -260,16 +254,10 @@ class FastBitwiseHilbert:
 
             return x, y
         else:
-            # 矩形或非 2^k：使用 HilbertScanner
-            d_np = d.long().cpu().numpy()
-            coords = [
-                HilbertScanner.d_to_xy(H, W, int(di))
-                for di in d_np
-            ]
-            x_np = [c[0] for c in coords]
-            y_np = [c[1] for c in coords]
-            return torch.tensor(x_np, dtype=d.dtype, device=d.device), \
-                   torch.tensor(y_np, dtype=d.dtype, device=d.device)
+            # 矩形或非 2^k：使用 HilbertScanner 向量化 batch 方法
+            # I-OPT: 使用 d_to_xy_batch 避免 cpu().numpy() + list comprehension
+            x_out, y_out = HilbertScanner.d_to_xy_batch(H, W, d.long())
+            return x_out.to(dtype=d.dtype, non_blocking=True), y_out.to(dtype=d.dtype, non_blocking=True)
 
     @staticmethod
     def _gray_code_transform(xv: Tensor, yv: Tensor, n: int) -> Tensor:
@@ -352,7 +340,7 @@ class FastBitwiseHilbert:
             s = 1 << k
 
             # 提取当前位
-            rx = 1 & (d_batch // 2)
+            rx = 1 & (d_batch >> 1)
             ry = 1 & (d_batch ^ rx)
 
             # 旋转条件: ry == 0
@@ -494,7 +482,7 @@ def _fast_lca_vectorized(idx1: Tensor, idx2: Tensor) -> Tensor:
     # 计算分歧深度: bit_length(x) = floor(log2(x)) + 1 (对于 x > 0)
     # 使用 log2 方式兼容旧版 PyTorch
     # xor=0 时 log2(1)=0，bit_length=0，depth=-1，需要 clamp
-    depth = torch.log2(xor.float() + 1).ceil().long() - 1
+    depth = torch.where(xor == 0, torch.zeros_like(xor), xor.bit_length() - 1)
     # 确保深度非负
     depth = depth.clamp(min=0)
 

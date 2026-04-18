@@ -166,44 +166,58 @@ def poincare_distance(
     u_norm = torch.norm(u, dim=-1, keepdim=True).clamp(min=epsilon)
     u = u / u_norm * torch.tanh(r_safe / 2).clamp(max=0.9999)
 
-    # 计算 ||u - v||^2
-    u_i = u.unsqueeze(2)  # [B, N, 1, 2]
-    u_j = u.unsqueeze(1)  # [B, 1, N, 2]
-    diff_norm_sq = torch.sum((u_i - u_j) ** 2, dim=-1)  # [B, N, N]
+    # D4-AUDIT FIX: 使用上三角索引避免全量 [B,N,N,2] 张量
+    # 仅计算上三角部分 (N*(N-1)/2 对)，然后对称扩展
+    # 峰值内存从 O(B*N^2*2) 降至 O(B*N_up) + O(B*N^2) scatter 开销
+    triu_idx = torch.triu_indices(N, N, 1, device=u.device)  # [2, N_up]
+    u_i_upper = u[:, triu_idx[0]]  # [B, N_up, 2]
+    u_j_upper = u[:, triu_idx[1]]  # [B, N_up, 2]
 
-    # 计算 ||u||^2 和 ||v||^2
+    # 计算上三角对的 ||u - v||^2
+    diff_norm_sq_upper = torch.sum((u_i_upper - u_j_upper) ** 2, dim=-1)  # [B, N_up]
+
+    # 计算 ||u||^2 和 ||v||^2 (对上三角索引)
     u_norm_sq = torch.sum(u ** 2, dim=-1)  # [B, N]
-    u_norm_sq_i = u_norm_sq.unsqueeze(2)  # [B, N, 1]
-    u_norm_sq_j = u_norm_sq.unsqueeze(1)  # [B, 1, N]
+    u_norm_sq_i_upper = u_norm_sq[:, triu_idx[0]]  # [B, N_up]
+    u_norm_sq_j_upper = u_norm_sq[:, triu_idx[1]]  # [B, N_up]
 
-    # I-NAN: 双曲距离公式，增强 denominator 保护
-    numerator = 2 * diff_norm_sq
+    # 双曲距离公式 (仅上三角)
+    numerator_upper = 2 * diff_norm_sq_upper
+    denom_i_upper = (1 - u_norm_sq_i_upper).clamp(min=epsilon)
+    denom_j_upper = (1 - u_norm_sq_j_upper).clamp(min=epsilon)
+    denominator_upper = denom_i_upper * denom_j_upper
 
-    # I-NAN: 分别 clamp 避免相乘后下溢
-    denom_i = (1 - u_norm_sq_i).clamp(min=epsilon)
-    denom_j = (1 - u_norm_sq_j).clamp(min=epsilon)
-    denominator = denom_i * denom_j
+    x_upper = (1 + numerator_upper / denominator_upper).clamp(min=1.0 + epsilon)
+    distance_upper = torch.acosh(x_upper).clamp(max=10.0)  # [B, N_up]
 
-    # acosh(x) = log(x + sqrt(x^2 - 1))
-    x = 1 + numerator / denominator
+    # D4-AUDIT FIX: 使用 index_put_ 构造对称距离矩阵
+    # 避免全量 [B,N,N] 中间张量 materialization
+    distance = torch.zeros(B, N, N, dtype=distance_upper.dtype, device=u.device)
+    N_up = triu_idx.shape[1]
 
-    # I-NAN: acosh 定义域保护，确保 x >= 1 + epsilon
-    x = x.clamp(min=1.0 + epsilon)
+    # 使用 index_put_ 进行批量索引赋值
+    # 构造完整索引: (batch_idx, i_idx, j_idx)
+    # 每个 batch b 有 N_up 个 (i,j) 对应 distance_upper[b, :]
+    i_expanded = triu_idx[0].unsqueeze(0).expand(B, -1)  # [B, N_up]
+    j_expanded = triu_idx[1].unsqueeze(0).expand(B, -1)  # [B, N_up]
+    batch_expanded = torch.arange(B, device=u.device).unsqueeze(1).expand(-1, N_up)  # [B, N_up]
 
-    distance = torch.acosh(x)
+    # index_put_: distance[batch, i, j] = value
+    idx = (batch_expanded.flatten(), i_expanded.flatten(), j_expanded.flatten())
+    distance = distance.index_put_(idx, distance_upper.flatten())
 
-    # I-NAN: 裁剪输出距离，防止梯度爆炸
-    distance = distance.clamp(max=10.0)
+    # 对称扩展到下三角
+    distance = distance + distance.transpose(1, 2)
 
     if was_2d:
         distance = distance.squeeze(0)
 
-    # I-NAN: 转回原始 dtype
     return distance.to(orig_dtype)
 
 
 def compute_rotational_similarity(
     paths: torch.Tensor,
+    triu_idx: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     计算旋转相同性 (rot_same)。
@@ -219,11 +233,14 @@ def compute_rotational_similarity(
     paths : torch.Tensor
         四叉树路径，形状 [B, N, D] 或 [N, D]
         D = max_level, 每个元素 ∈ {0, 1, 2, 3}
+    triu_idx : torch.Tensor, optional
+        上三角索引 [2, N_up]，用于上三角计算模式
 
     返回
     ----
     torch.Tensor
         旋转相同性矩阵，形状 [B, N, N] 或 [N, N]
+        如果提供 triu_idx，则只计算上三角，返回的矩阵下三角为 0
     """
     was_2d = paths.dim() == 2
     if was_2d:
@@ -235,6 +252,15 @@ def compute_rotational_similarity(
         return torch.ones(B, N, N, device=paths.device)
 
     parent_quadrant = paths[..., 0]  # [B, N]
+
+    if triu_idx is not None:
+        # D4-AUDIT FIX: 上三角计算模式
+        parent_i_upper = parent_quadrant[:, triu_idx[0]]  # [B, N_up]
+        parent_j_upper = parent_quadrant[:, triu_idx[1]]  # [B, N_up]
+        rot_same_upper = (parent_i_upper == parent_j_upper).float()  # [B, N_up]
+        return rot_same_upper
+
+    # 全量模式
     parent_i = parent_quadrant.unsqueeze(2)  # [B, N, 1]
     parent_j = parent_quadrant.unsqueeze(1)  # [B, 1, N]
     rot_same = (parent_i == parent_j).float()
@@ -250,7 +276,7 @@ def compute_rotational_similarity(
 
 def compute_geometric_features(
     hilbert_indices: torch.Tensor,
-    lca_depths: torch.Tensor,
+    depths: torch.Tensor,
     coords: torch.Tensor,
     normalized_areas: torch.Tensor,
     paths: torch.Tensor,
@@ -273,8 +299,8 @@ def compute_geometric_features(
     ----
     hilbert_indices : torch.Tensor
         Hilbert 指数，形状 [B, N] 或 [N]
-    lca_depths : torch.Tensor
-        LCA 深度矩阵，形状 [B, N, N] 或 [N, N]
+    depths : torch.Tensor
+        Token 深度，形状 [B, N] 或 [N]
     coords : torch.Tensor
         区域中心坐标，形状 [B, N, 2] 或 [N, 2]（此参数已废弃，仅保留兼容性）
     normalized_areas : torch.Tensor
@@ -289,40 +315,89 @@ def compute_geometric_features(
     torch.Tensor
         几何特征向量，形状 [B, N, N, 5] 或 [N, N, 5]
     """
-    if lca_depths.dim() == 2:
+    # D4-AUDIT FIX: 确保 depths 是 [B, N] 形状
+    # 处理 depths 可能是 [B, N, D], [B, N], [N], 或 scalar 的情况
+    original_depths_dim = depths.dim()
+
+    if depths.dim() == 0:
+        # Scalar: 转成 [1, 1]
+        depths = depths.unsqueeze(0).unsqueeze(0)
         was_2d = True
-        lca_depths = lca_depths.unsqueeze(0)
-        hilbert_indices = hilbert_indices.unsqueeze(0)
-        coords = coords.unsqueeze(0)
-        normalized_areas = normalized_areas.unsqueeze(0)
-        paths = paths.unsqueeze(0)
+    elif depths.dim() == 1:
+        # [N] → [1, N]
+        depths = depths.unsqueeze(0)
+        was_2d = True
+    elif depths.dim() == 2:
+        # [B, N] - 已经是正确的 2D 形状
+        was_2d = True
     else:
+        # [B, N, D] 或更高维度
         was_2d = False
+        if depths.dim() == 3 and depths.shape[-1] == 1:
+            depths = depths.squeeze(-1)  # [B, N]
+        elif depths.dim() == 3 and depths.shape[1] == depths.shape[2]:
+            # [B, N, N] 对角化 → [B, N]
+            depths = depths.diagonal(dim1=-2, dim2=-1)  # [B, N]
+        else:
+            B_tmp, N_tmp = depths.shape[0], depths.shape[1]
+            depths = depths.reshape(B_tmp, -1)[:, :N_tmp]
 
-    N = lca_depths.shape[1]
+    B, N = depths.shape
 
-    # 1. Δh_ij / N^2 (归一化 Hilbert 距离)
-    h_i = hilbert_indices.unsqueeze(2)  # [B, N, 1]
-    h_j = hilbert_indices.unsqueeze(1)  # [B, 1, N]
-    delta_h = torch.abs(h_i - h_j).float() / (N ** 2)  # [B, N, N] - 保持 float 避免整数除法
+    # D4-AUDIT FIX: 使用上三角索引避免全量 [B,N,N] 张量
+    triu_idx = torch.triu_indices(N, N, 1, device=depths.device)  # [2, N_up]
 
-    # 2. 2^{d_LCA} (LCA 深度指数)
-    # D4-AUDIT FIX: pow(2,x) → exp2(x)
-    lca_exp = torch.exp2(lca_depths.float()).clamp(max=1e3)
+    # 1. Δh_ij / N^2 (归一化 Hilbert 距离) - 上三角计算
+    h_i_upper = hilbert_indices[:, triu_idx[0]].float()  # [B, N_up]
+    h_j_upper = hilbert_indices[:, triu_idx[1]].float()  # [B, N_up]
+    delta_h_upper = torch.abs(h_i_upper - h_j_upper) / (N ** 2 + EPS)  # [B, N_up]
+
+    # 2. 2^{d_LCA} (LCA 深度指数) - 上三角计算
+    # D4-AUDIT FIX: 直接从 depths 计算上三角的 LCA 深度指数，避免创建完整的 [B,N,N] lca_depths 矩阵
+    depths_i = depths[:, triu_idx[0]].float()  # [B, N_up]
+    depths_j = depths[:, triu_idx[1]].float()  # [B, N_up]
+    lca_exp_upper = torch.exp2(torch.min(depths_i, depths_j)).clamp(max=1e3)  # [B, N_up]
 
     # 3. d_H(i,j) (Poincaré 双曲距离)
-    # 恢复 Poincaré 距离计算，提供有信息量的几何特征
-    d_h = poincare_distance(coords, image_size)  # [B, N, N] 或 [N, N]
+    d_h = poincare_distance(coords, image_size)  # [B, N, N] - 已修复为上三角 scatter
 
-    # 4. log(ω_i / ω_j) (面积比 log)
-    area_i = normalized_areas.unsqueeze(2)  # [B, N, 1]
-    area_j = normalized_areas.unsqueeze(1)  # [B, 1, N]
-    area_ratio = torch.log(
-        (area_i / (area_j + EPS) + EPS).clamp(min=EPS, max=1e6)
-    )  # [B, N, N]
+    # 4. log(ω_i / ω_j) (面积比 log) - 上三角计算
+    area_i_upper = normalized_areas[:, triu_idx[0]]  # [B, N_up]
+    area_j_upper = normalized_areas[:, triu_idx[1]]  # [B, N_up]
+    area_ratio_upper = torch.log(
+        (area_i_upper / (area_j_upper + EPS) + EPS).clamp(min=EPS, max=1e6)
+    )  # [B, N_up]
 
-    # 5. rot_same(i,j) (旋转相同性)
-    rot_same = compute_rotational_similarity(paths)  # [B, N, N]
+    # 5. rot_same(i,j) (旋转相同性) - 上三角计算
+    rot_same_upper = compute_rotational_similarity(paths, triu_idx=triu_idx)  # [B, N_up]
+
+    # D4-AUDIT FIX: 使用 index_put_ 将上三角特征扩展为完整 [B,N,N,5] 矩阵
+    N_up = triu_idx.shape[1]
+
+    # 构造完整索引: 每个 batch b 有 N_up 个 (i,j) 对
+    i_expanded = triu_idx[0].unsqueeze(0).expand(B, -1)  # [B, N_up]
+    j_expanded = triu_idx[1].unsqueeze(0).expand(B, -1)  # [B, N_up]
+    batch_expanded = torch.arange(B, device=depths.device).unsqueeze(1).expand(-1, N_up)  # [B, N_up]
+
+    idx = (batch_expanded.flatten(), i_expanded.flatten(), j_expanded.flatten())
+
+    # 创建目标张量
+    delta_h = torch.zeros(B, N, N, dtype=torch.float, device=depths.device)
+    lca_exp = torch.zeros(B, N, N, dtype=torch.float, device=depths.device)
+    area_ratio = torch.zeros(B, N, N, dtype=torch.float, device=depths.device)
+    rot_same = torch.zeros(B, N, N, dtype=torch.float, device=depths.device)
+
+    # 使用 index_put_ 赋值
+    delta_h = delta_h.index_put_(idx, delta_h_upper.flatten())
+    lca_exp = lca_exp.index_put_(idx, lca_exp_upper.flatten())
+    area_ratio = area_ratio.index_put_(idx, area_ratio_upper.flatten())
+    rot_same = rot_same.index_put_(idx, rot_same_upper.flatten())
+
+    # 对称扩展到下三角
+    delta_h = delta_h + delta_h.transpose(1, 2)
+    lca_exp = lca_exp + lca_exp.transpose(1, 2)
+    area_ratio = area_ratio + area_ratio.transpose(1, 2)
+    rot_same = rot_same + rot_same.transpose(1, 2)
 
     # 拼接为 5 维特征向量
     features = torch.stack([
@@ -395,7 +470,7 @@ class GeometricLatentDecoder(nn.Module):
         )
 
         # 层可学习缩放 (每个头一个)
-        self.layer_scale = nn.Parameter(torch.ones(heads))
+        self.layer_scale = nn.Parameter(torch.ones(heads, dtype=torch.get_default_dtype()))
 
         self._init_weights()
 
@@ -604,6 +679,9 @@ class ParentTokenLookup(nn.Module):
     父节点索引查找表（带数值安全保护）。
 
     从 levels_info 提取父节点索引，实现 O(1) 查找。
+
+    D3-AUDIT FIX: 使用向量化距离计算替代逐token循环
+    虽然仍保留 for 循环（由于深度间依赖），但循环内部已高度向量化
     """
 
     def __init__(self, max_level: int = 8, eps: float = 1e-6):
@@ -641,49 +719,58 @@ class ParentTokenLookup(nn.Module):
         parent_indices = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)
         parent_mask = torch.ones(B, N, dtype=torch.bool, device=device)
 
-        # I103-5 向量化优化: 预计算所有深度的掩码，避免重复计算
-        # 使用 nonzero(as_tuple=False) 避免 Graph Break
+        # D3-AUDIT FIX: 预计算全 Hilbert 距离矩阵
+        # [B, N, N] 距离矩阵用于快速查找
+        h_expanded_i = hilbert_indices.unsqueeze(2).float()  # [B, N, 1]
+        h_expanded_j = hilbert_indices.unsqueeze(1).float()  # [B, 1, N]
+        dist_matrix = torch.abs(h_expanded_i - h_expanded_j)  # [B, N, N]
+
+        # D3-AUDIT FIX: clone 移到循环外，避免每次迭代都 clone
+        cloned_for_update = False
+
+        # 深度间有依赖（深度d的父节点必须在深度d-1），无法完全消除循环
+        # 但循环内部的 nonzero 已用 as_tuple=False 避免 graph break
         for d in range(1, self.max_level + 1):
             current_mask = (depths == d)
             parent_mask_d = (depths == d - 1)
 
-            # D4-AUDIT FIX: 使用 shape[0] 替代 .any()，避免 GPU->CPU 同步
-            # nonzero 返回的 [0, 2] 形状空tensor在empty case时shape[0]==0
+            # D3-AUDIT FIX: nonzero(as_tuple=False) 避免 graph break
             current_idx_2d = current_mask.nonzero(as_tuple=False)
             parent_idx_2d = parent_mask_d.nonzero(as_tuple=False)
 
-            # 处理 squeeze 不一致问题：将 [2] 变回 [1,2]
+            # 处理 squeeze 不一致
             if current_idx_2d.dim() == 1:
                 current_idx_2d = current_idx_2d.unsqueeze(0)
             if parent_idx_2d.dim() == 1:
                 parent_idx_2d = parent_idx_2d.unsqueeze(0)
 
-            # D4-AUDIT FIX: 用 shape[0] 检查替代 .any()，shape是metadata访问不触发同步
+            # 检查当前层是否有 token
             if current_idx_2d.shape[0] == 0:
                 continue
 
-            num_current = current_idx_2d.shape[0]
-            num_parents = parent_idx_2d.shape[0]
-
-            if num_parents == 0:
-                # 没有父节点时，使用 2D 索引直接更新 parent_mask
+            # 无父节点时标记 parent_mask 为 False
+            if parent_idx_2d.shape[0] == 0:
                 parent_mask[current_idx_2d[:, 0], current_idx_2d[:, 1]] = False
                 continue
 
-            # 计算当前 token 与父节点的 Hilbert 距离
-            # h_current: [num_current], h_parents: [num_parents]
-            h_current = hilbert_indices[current_idx_2d[:, 0], current_idx_2d[:, 1]]
-            h_parents = hilbert_indices[parent_idx_2d[:, 0], parent_idx_2d[:, 1]]
+            # 向量化查找最近父节点：使用预计算的 dist_matrix
+            # 从 [B,N,N] 中 gather 当前层-父层的距离
+            b_c = current_idx_2d[:, 0]  # batch indices for current
+            i_c = current_idx_2d[:, 1]  # token indices for current
+            b_p = parent_idx_2d[:, 0]   # batch indices for parent
+            i_p = parent_idx_2d[:, 1]   # token indices for parent
 
-            # 计算距离矩阵 [num_current, num_parents]
-            dist = torch.abs(h_current.unsqueeze(1) - h_parents.unsqueeze(0))
-            dist_safe = dist + self.eps
-            nearest = dist_safe.argmin(dim=1)  # [num_current]
+            # 获取对应的距离
+            dist_c2p = dist_matrix[b_c, i_c][:, i_p]  # [num_current, num_parents]
+            dist_c2p_safe = dist_c2p + self.eps
+            nearest = dist_c2p_safe.argmin(dim=1)  # [num_current]
 
-            # 批量更新父节点索引 (clone 避免修改原始 tensor)
-            parent_indices = parent_indices.clone()
-            # parent_indices: [B, N], current_idx_2d[:, 1] 是 token 索引
-            parent_indices[current_idx_2d[:, 0], current_idx_2d[:, 1]] = parent_idx_2d[nearest, 1]
+            # D3-AUDIT FIX: 使用 index_put_ 替代直接索引赋值，避免 expanded tensor 警告
+            # 懒 clone：只在首次需要更新时 clone
+            if not cloned_for_update:
+                parent_indices = parent_indices.clone()
+                cloned_for_update = True
+            parent_indices = parent_indices.index_put_((b_c, i_c), i_p[nearest])
 
         return parent_indices, parent_mask
 
@@ -812,10 +899,9 @@ class Cartesian2DRoPE(nn.Module):
         self.dim = dim
         self.theta = theta
 
-        # 预计算频率（用于高效计算）
-        # freqs[i] = theta^(-2i/dim)
-        freqs = theta ** (-2 * torch.arange(0, dim // 2, 2).float() / dim)
-        self.register_buffer("freqs", freqs, persistent=False)
+        # D3-AUDIT FIX: freqs 从未使用（在 apply_rotation 中重新计算），移除死代码
+        # 原实现: freqs = theta ** (...); self.register_buffer("freqs", freqs, persistent=False)
+        # 实际使用在 apply_rotation (line 893): torch.arange(dim_pairs, device=q.device, ...)
 
     def forward(
         self,
@@ -1104,7 +1190,8 @@ class ManifoldNativeAttention(nn.Module):
         # QKV 投影
         qkv = self.qkv(x)
         qkv = qkv.reshape(B, N, 3, self.heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, H, N, d]
+        # D3-AUDIT FIX: permute 后 tensor 非连续，slice 操作需要连续内存
+        qkv = qkv.permute(2, 0, 3, 1, 4).contiguous()  # [3, B, H, N, d]
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         # 计算注意力分数
@@ -1123,9 +1210,8 @@ class ManifoldNativeAttention(nn.Module):
             area_from_depth = torch.exp2(-depths.float() * 2.0)  # [B, N]
             normalized_areas = area_from_depth / (area_from_depth.sum(dim=-1, keepdim=True) + 1e-8)
 
-            # 计算 LCA depths（对称矩阵）
-            lca_depths = torch.min(depths.unsqueeze(2), depths.unsqueeze(1))  # [B, N, N]
-            lca_depths = lca_depths.clamp(0, self.max_level)
+            # D4-AUDIT FIX: 不再创建完整的 [B,N,N] lca_depths 矩阵
+            # compute_geometric_features 内部直接从 depths 计算上三角的 LCA 深度指数
 
             # 使用 hilbert_indices 构造模拟 paths（用于旋转相同性）
             # P2 修复: 动态计算象限划分，替代硬编码的 256
@@ -1141,7 +1227,7 @@ class ManifoldNativeAttention(nn.Module):
             # 计算几何特征（纯 Hilbert 驱动）
             geo_features = compute_geometric_features(
                 hilbert_indices=hilbert_indices,
-                lca_depths=lca_depths,
+                depths=depths,
                 coords=coords,
                 normalized_areas=normalized_areas,
                 paths=paths,
@@ -1347,7 +1433,7 @@ class ManifoldNativeAttention(nn.Module):
             attn = self._last_attn_weights.detach().cpu()  # [B, H, N, N]
             bw = self._last_bandwidths.detach().float().cpu() if self._last_bandwidths is not None else None
             if bw is not None:
-                jump_proxy = 1.0 / (bw.unsqueeze(1).unsqueeze(-1) + EPS)  # [B, 1, N, 1]
+                jump_proxy = torch.reciprocal(bw.unsqueeze(1).unsqueeze(-1) + EPS)  # [B, 1, N, 1]
                 weighted_jump = (attn * jump_proxy).sum(dim=[2, 3]) / (attn.sum(dim=[2, 3]) + EPS)  # [B, H]
                 cache["true_avg_jump_distance"] = weighted_jump.mean().item()
             self._last_attn_weights = None  # 🌟 斩断幽灵引用

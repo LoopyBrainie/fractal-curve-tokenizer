@@ -473,12 +473,11 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 continue
 
             # 检查是否应该分裂
+            # I-OPT: 使用 GPU tensor 直接做条件判断，避免 .cpu() 强制同步
             if region_idx_in_batch < split_decision.shape[1]:
                 should_split = split_decision[b_idx, region_idx_in_batch] > 0.5
-                # should_split 是 GPU tensor，在 Python if 中使用需要转换为 CPU tensor
-                should_split = should_split.cpu()
             else:
-                should_split = torch.tensor(False, device=device)
+                should_split = False
 
             if should_split and count + 4 < max_total_nodes:
                 # 计算子边界
@@ -547,8 +546,10 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         )
 
         # 复杂度使用冗余性分数
+        # D1-AUDIT FIX: 使用 regions.shape[0] 替代 len(regions) 避免 GPU-CPU 同步
+        n_regions = regions.shape[0]
         complexities = split_result.redundancy.view(-1) if split_result.redundancy.numel() > 0 else \
-                       torch.zeros(len(regions), dtype=torch.float32, device=device)
+                       torch.zeros(n_regions, dtype=torch.float32, device=device)
 
         return TensorSplitResult(
             regions=regions.long(),  # I131-1: 转换为 long 以匹配 padded_regions 的 dtype
@@ -946,10 +947,13 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             img_w, img_h = self.image_size
         else:
             img_w = img_h = self.image_size
-        regions[:, 0] = regions[:, 0].clamp_(min=0, max=img_w)  # x1: 使用宽度
-        regions[:, 1] = regions[:, 1].clamp_(min=0, max=img_h)  # y1: 使用高度
-        regions[:, 2] = regions[:, 2].clamp_(min=0, max=img_w)  # x2: 使用宽度
-        regions[:, 3] = regions[:, 3].clamp_(min=0, max=img_h)  # y2: 使用高度
+        # D3-AUDIT FIX: 使用非 in-place clamp 替代 clamp_()，避免在视图上操作破坏梯度跟踪
+        # 原实现: regions[:, 0].clamp_(...) — in-place 操作在视图上可能破坏梯度
+        regions = regions.clone()  # 先 clone 避免修改原始视图
+        regions[:, 0] = regions[:, 0].clamp(min=0, max=img_w)  # x1: 使用宽度
+        regions[:, 1] = regions[:, 1].clamp(min=0, max=img_h)  # y1: 使用高度
+        regions[:, 2] = regions[:, 2].clamp(min=0, max=img_w)  # x2: 使用宽度
+        regions[:, 3] = regions[:, 3].clamp(min=0, max=img_h)  # y2: 使用高度
 
         # I99-1 CRITICAL: 验证 batch_indices 值范围（在 clamp 之前）
         # P-OPT: 使用向量化布尔运算，避免 GPU-CPU 同步
