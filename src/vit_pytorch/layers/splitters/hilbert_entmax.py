@@ -107,6 +107,13 @@ def entmax_1_5(
     result = q.reshape(shape_before)
     result = result.permute(*perm)
 
+    # I-NAN FIX: Splitter 梯度防火墙（方案 B）
+    # 原理: 在 entmax 反向传播时将梯度截断至 [-10, 10]
+    # 即使放大 2048 倍也只有 20480 < 65504 (FP16 max)
+    # 这样可以防止 Entmax 冷启动时的大梯度冲击波传回主干网络
+    if result.requires_grad:
+        result.register_hook(lambda grad: torch.clamp(grad, -10.0, 10.0))
+
     return result
 
 
@@ -178,6 +185,10 @@ def entmax(
 
     result = q.reshape(shape_before)
     result = result.permute(*perm)
+
+    # I-NAN FIX: Splitter 梯度防火墙（方案 B）
+    if result.requires_grad:
+        result.register_hook(lambda grad: torch.clamp(grad, -10.0, 10.0))
 
     return result
 

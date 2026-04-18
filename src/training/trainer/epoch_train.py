@@ -557,20 +557,30 @@ def train_one_epoch(
             if current_memory_mb > peak_memory_mb:
                 peak_memory_mb = current_memory_mb
 
-        # I-NAN: 计算裁剪前的梯度范数（P1-Fix: 移除 .item() 避免 Graph Break）
-        # 原代码使用 .item() 强制 GPU-CPU 同步，导致 torch.compile 缓存爆炸
-        # 修改为延迟计算，仅在需要时通过 detach 获取
-        pre_clip_grad_norm_tensor = torch.zeros(1, device=next((p.device for p in model.parameters() if p.grad is not None), None)) if hasattr(model, 'parameters') else None
-        try:
-            # 保持为 tensor，不断开计算图
-            pre_clip_grad_norm = torch.stack([
-                p.grad.norm() for p in model.parameters() if p.grad is not None
-            ]).sum() if any(p.grad is not None for p in model.parameters()) else torch.tensor(0.0)
-        except Exception:
-            pre_clip_grad_norm = torch.tensor(0.0)
+        # I-NAN FIX: 重构 GradScaler 逻辑（方案 A）
+        # 核心原则: PyTorch 官方推荐的健壮 AMP 写法
+        # 1. unscale_ 必须在所有操作之前执行，让梯度恢复正常范围
+        if scaler is not None:
+            scaler.unscale_(optimizer)
 
-        # Numerical defense
-        should_skip = defender.post_backward()
+        # 2. 鲁棒的梯度统计 (FP32 计算，防止 L2-norm 平方和溢出)
+        # 使用 torch.no_grad() 包裹，避免污染计算图
+        with torch.no_grad():
+            try:
+                device_for_norm = next((p.device for p in model.parameters() if p.grad is not None), torch.device('cpu'))
+                total_norm_sq = torch.tensor(0.0, device=device_for_norm, dtype=torch.float32)
+                for p in model.parameters():
+                    if p.grad is not None:
+                        # 强制 float32，防止平方和溢出
+                        param_norm = p.grad.detach().float().pow(2).sum()
+                        total_norm_sq += param_norm
+                pre_clip_grad_norm = torch.sqrt(total_norm_sq).clamp(min=1e-6)
+            except Exception:
+                pre_clip_grad_norm = torch.tensor(float('nan'), device=device_for_norm)
+
+        # 3. 梯度防御检查（使用恢复后的真实梯度）
+        is_finite = torch.isfinite(pre_clip_grad_norm)
+        should_skip = not is_finite or (defender.post_backward() if defender else False)
 
         if should_skip:
             # P1-1 FIX: Splitter 梯度裁剪（独立于主梯度裁剪）
@@ -585,9 +595,8 @@ def train_one_epoch(
                 )
 
             # Gradient clipping (P0-Fix: 加强梯度裁剪，防止梯度爆炸)
+            # 注意: scaler.unscale_() 已在前面调用过，此处不再重复调用
             if config.training.gradient_clip_norm > 0:
-                if scaler is not None:
-                    scaler.unscale_(optimizer)
                 # P0-Fix: 使用更严格的 max_norm=1.0（原来可能是 5.0 或更大）
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(),
@@ -598,7 +607,7 @@ def train_one_epoch(
                     print(f"Warning: Gradient norm is {grad_norm}, skipping step!")
                     optimizer.zero_grad()
                     if scaler is not None:
-                        scaler.update()
+                        scaler.update()  # 即使 skip，也必须 update 以便自动降 scale
                     continue
 
             # Update scheduler BEFORE optimizer step
@@ -675,6 +684,8 @@ def train_one_epoch(
             if splitter_scheduler is not None:
                 splitter_scheduler.step(state.global_step)
             optimizer.zero_grad()
+            if scaler is not None:
+                scaler.update()  # 即使 skip，也必须 update 以便自动降 scale
             skipped_steps += 1
             state.nan_skip_count += 1
 
