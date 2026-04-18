@@ -546,12 +546,15 @@ class NaNAutoInvestigation:
         # D. 参数范围分析
         report["param_ranges"] = self._analyze_param_ranges()
 
-        # 保存到文件
+        # 保存到文件 - 确保所有 tensors 都被转换为 Python 原生类型
         filename = f"nan_snapshot_epoch_{epoch:04d}_step_{step:06d}.json"
         filepath = self.debug_dir / filename
 
+        # 递归转换所有可能的 tensor（深度优先，覆盖所有嵌套层级）
+        report_serializable = _tensor_to_python(report)
+
         with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
+            json.dump(report_serializable, f, indent=2, ensure_ascii=False)
 
         print(f"[DEBUG] NaN investigation report saved to: {filepath}")
         return filepath
