@@ -70,6 +70,10 @@ def entmax_1_5(
     perm[-1] = dim
     z_transposed = z.permute(*perm)
 
+    # D3-AUDIT FIX: permute 后 tensor 可能非连续，reshape 需要连续内存
+    # 使用 contiguous() 确保内存连续，避免 reshape 隐式拷贝
+    z_transposed = z_transposed.contiguous()
+
     # 展平维度以进行计算
     shape_before = z_transposed.shape
     n = shape_before[-1]
@@ -151,6 +155,9 @@ def entmax(
     perm[dim] = -1
     perm[-1] = dim
     z_transposed = z.permute(*perm)
+
+    # D3-AUDIT FIX: permute 后 tensor 可能非连续，reshape 需要连续内存
+    z_transposed = z_transposed.contiguous()
 
     shape_before = z_transposed.shape
     n = shape_before[-1]

@@ -77,9 +77,11 @@ def flatten_layer_outputs(
                 # 0-dim tensor (scalar) → .item()
                 if value.dim() == 0:
                     result[full_key] = value.item()
-                # 小向量 (numel <= 32) → .tolist() (如 levels_used)
+                # 小向量 (numel <= 32) → .item() 单次同步，避免 .cpu().tolist() 双重同步
                 elif value.numel() <= 32:
-                    result[full_key] = value.detach().cpu().tolist()
+                    # D1-AUDIT FIX: .cpu().tolist() 导致两次同步 (.cpu() + .tolist())
+                    # 改用 .item() 只触发一次 GPU-CPU 同步
+                    result[full_key] = value.detach().item()
                 # 大向量 → 聚合为均值 (保留 GPU 带宽)
                 else:
                     result[full_key] = value.mean().item()

@@ -782,8 +782,10 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         self.emb_dropout_module = nn.Dropout(emb_dropout)
 
         # I30-11: 已删除 Mixed Pooling
-        self.register_buffer("aux_loss_weight", torch.tensor(0.0))
-        self.register_buffer("_zero_loss", torch.tensor(0.0))
+        # D3-AUDIT FIX: register_buffer 需要 device 参数，torch.tensor(0.0) 默认 CPU
+        # 模型在 CUDA 时 buffer 却为 CPU 会导致 device 不匹配错误
+        self.register_buffer("aux_loss_weight", torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu'))
+        self.register_buffer("_zero_loss", torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu'))
 
         # I165-OOM FIX: 提前解析 mlp_dim，避免 Transformer 创建时使用 None
         # 必须在创建 Transformer 之前解析
@@ -1454,29 +1456,26 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                     probs_safe = probs_masked + (probs_masked == 0).to(probs_masked.dtype) * PROB_EPSILON
                     # 计算每个样本的熵 [B]
                     entropies_gpu = -(probs_safe * torch.log(probs_safe)).sum(dim=1)
-                    # 最后一次性转换为 Python float
-                    entropies_list = entropies_gpu.tolist()
+                    # D1-AUDIT FIX: 不在此处调用 .tolist()，延迟到循环内按需转换
 
                 # P-OPT: 向量化构建 levels_used_list - 避免 Python 循环
                 # 原始: for i in range(B): nonzero.tolist()
                 # 向量化: 批量处理所有 batch
                 depth_counts_sliced = all_depth_counts[:, :max_level + 1]  # [B, max_level+1]
                 has_tokens_mask = depth_counts_sliced.sum(dim=1) > 0  # [B]
-                # nonzero 返回每个 batch 中非零元素的索引
-                levels_used_list = []
-                for i in range(B):
-                    if has_tokens_mask[i]:
-                        nonzero = depth_counts_sliced[i].nonzero(as_tuple=False).squeeze(-1)  # D3-AUDIT FIX: as_tuple=False 避免 Graph Break
-                        levels_used_list.append(nonzero.tolist())
-                    else:
-                        levels_used_list.append([])
+                # D1-AUDIT FIX: nonzero().tolist() 延迟到循环内，避免批量同步
 
                 # I145: 使用模块级 LazyDiagnostics，延迟到首次访问时计算
                 lazy_diag = LazyDiagnostics(self)
 
                 for i in range(B):
                     num_tokens = lengths_list[i]  # 使用预转换的 Python list
-                    levels_used = levels_used_list[i]
+                    # D1-AUDIT FIX: levels_used 计算移到循环内，延迟 .tolist() 同步
+                    if has_tokens_mask[i]:
+                        nonzero = depth_counts_sliced[i].nonzero(as_tuple=False).squeeze(-1)  # D3-AUDIT FIX: as_tuple=False 避免 Graph Break
+                        levels_used = nonzero.tolist()
+                    else:
+                        levels_used = []
 
                     # P1 Fix: 使用已定义的 has_tokens_mask 替代未定义的 valid_bool
                     if not has_tokens_mask[i] or not levels_used:
@@ -1505,7 +1504,8 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                     }
 
                     if split_probs is not None:
-                        aux_info["token_selection_entropy"] = entropies_list[i]
+                        # D1-AUDIT FIX: 延迟 .item() 到循环内，避免批量 .tolist() 同步
+                        aux_info["token_selection_entropy"] = entropies_gpu[i].item()
 
                     aux_infos.append(aux_info)
 
@@ -1618,11 +1618,16 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                 # 原实现问题: torch.eye mask 方式创建了 [B,N,N] 矩阵 + bool mask，
                 # 仍然需要 O(B×N²) 内存和计算，新实现通过 gather 直接选取上三角坐标对
                 triu_idx = torch.triu_indices(N, N, 1, device=hilbert_indices.device)  # [2, N×(N-1)/2]
-                h_i = hilbert_indices[:, triu_idx[0]]  # [B, N_up]
-                h_j = hilbert_indices[:, triu_idx[1]]  # [B, N_up]
-                hilbert_dist_upper = torch.abs(h_i.float() - h_j.float())  # [B, N_up]
-                poincare_dist_mean = hilbert_dist_upper.mean()
-                poincare_dist_std = hilbert_dist_upper.std()
+                # D4-AUDIT FIX: 完全避免创建 hilbert_dist_upper tensor
+                # 直接在 gather 后采样，只计算 S 个采样点的 abs 差值
+                # 对于 N=1024，N_up ≈ 524K，采样 4096 对足以估计 mean/std
+                S = min(4096, triu_idx.shape[1])
+                perm = torch.randperm(triu_idx.shape[1], device=hilbert_indices.device)[:S]
+                h_i_sample = hilbert_indices[:, triu_idx[0][perm]].float()  # [B, S]
+                h_j_sample = hilbert_indices[:, triu_idx[1][perm]].float()  # [B, S]
+                hilbert_sample = torch.abs(h_i_sample - h_j_sample)  # [B, S]
+                poincare_dist_mean = hilbert_sample.mean()
+                poincare_dist_std = hilbert_sample.std()
             else:
                 # 回退：如果无法获取 Hilbert 索引，使用 manifold_emb 范数（不推荐）
                 manifold_raw = manifold_emb_for_stats[:, 1:, :]  # [B, N, dim], 排除 CLS

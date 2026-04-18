@@ -129,16 +129,28 @@ class CLSAttentionTracker:
 
         # 计算各深度的注意力
         attention_by_depth: Dict[int, float] = {}
-        total_attention = cls_attn.sum(dim=-1).mean().item()  # 归一化基数
 
-        for depth in range(self.max_depth + 1):
-            # 找出该深度的所有 token
-            depth_mask = token_depths[:, :N] == depth  # [B, N]
-            if depth_mask.any():
-                # CLS 对该深度 token 的注意力总和
-                depth_attn = (cls_attn * depth_mask.float()).sum(dim=-1).mean()
-                attention_ratio = (depth_attn.item() / (total_attention + 1e-8))
-                attention_by_depth[depth] = attention_ratio
+        # D1-AUDIT FIX: 向量化替代 for 循环，避免每个 depth 都触发 .item() 同步
+        # 原实现: for depth in range(max_depth+1): depth_attn.item() — 每 depth 1次同步
+        # 优化: 批量在 GPU 计算所有 depth 的 attention，然后单次 .tolist() 转换
+        total_attention = cls_attn.sum(dim=-1).mean()  # 留在 GPU，不调用 .item()
+
+        # 构建 depth mask 矩阵: [max_depth+1, B, N]
+        max_d = self.max_depth + 1
+        depth_range = torch.arange(max_d, device=token_depths.device).unsqueeze(1).unsqueeze(2)  # [max_d, 1, 1]
+        token_depths_expanded = token_depths[:, :N].unsqueeze(0)  # [1, B, N]
+        depth_mask_all = depth_range == token_depths_expanded  # [max_d, B, N]
+
+        # 批量计算所有 depth 的 attention ratio [max_depth+1]
+        cls_attn_expanded = cls_attn.unsqueeze(0)  # [1, B, N]
+        depth_attention_sums = (cls_attn_expanded * depth_mask_all.float()).sum(dim=-1)  # [max_depth+1, B]
+        depth_attention_means = depth_attention_sums.mean(dim=-1)  # [max_depth+1]
+        attention_ratios = depth_attention_means / (total_attention + 1e-8)  # [max_depth+1]
+
+        # 单次批量转换替代逐个 .item()
+        attention_ratios_list = attention_ratios.tolist()
+        for depth in range(max_d):
+            attention_by_depth[depth] = attention_ratios_list[depth]
 
         # 提取关键指标
         depth0_attention = attention_by_depth.get(0, 0.0)
@@ -257,7 +269,7 @@ class GlobalContextAnchor(nn.Module):
         self.anchor_layers = anchor_layers
 
         # 可学习的 anchor 强度（对数尺度，确保为正）
-        self.log_anchor_strength = nn.Parameter(torch.tensor(initial_strength))
+        self.log_anchor_strength = nn.Parameter(torch.tensor(initial_strength, dtype=torch.get_default_dtype()))
 
     def forward(
         self,

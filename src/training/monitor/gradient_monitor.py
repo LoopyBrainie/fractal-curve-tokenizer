@@ -62,6 +62,8 @@ class GradientMonitor:
         self._hooks: List[torch.utils.hooks.RemovableHandle] = []
         # I-OPT: 延迟 .item() - 在 backward 期间存储原始 tensor，归一化后转换
         self._pending_grad_norms: Dict[str, List[torch.Tensor]] = defaultdict(list)
+        # I-OPT: finalize() 将 tensor norms 缓存此处，compute_* 在 finalize 后仍能读取
+        self._cached_norm_tensors: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
         # I150-3: 关键组件梯度统计
         self.component_grad_norms: Dict[str, List[float]] = defaultdict(list)
@@ -101,10 +103,12 @@ class GradientMonitor:
         if self.model is None:
             return {}
 
+        # I-OPT: Use cached tensor norms from finalize() to avoid GPU→CPU sync.
+        # finalize() moved tensors to _cached_norm_tensors, so we average those.
         norms = {}
-        for name, param in self.model.named_parameters():
-            if param.grad is not None:
-                norms[name] = param.grad.norm().item()
+        for name, norm_tensors in self._cached_norm_tensors.items():
+            if norm_tensors:
+                norms[name] = sum(t.item() for t in norm_tensors) / len(norm_tensors)
 
         # Emit to MetricsCollector if available
         if self.collector is not None:
@@ -119,28 +123,31 @@ class GradientMonitor:
         Returns:
             Total gradient norm
         """
-        total_norm = 0.0
-        for param in self.model.parameters():
-            if param.grad is not None:
-                total_norm += param.grad.norm().item() ** 2
-        return total_norm ** 0.5
+        # I-OPT: use cached norm tensors from finalize() to avoid per-param GPU→CPU sync
+        total_norm_sq = 0.0
+        for norm_tensors in self._cached_norm_tensors.values():
+            for t in norm_tensors:
+                total_norm_sq += t.item() ** 2
+        return total_norm_sq ** 0.5
 
     def finalize(self) -> None:
-        """I-OPT: 在 backward 结束后调用，将 pending tensor norms 批量转换为 Python float
+        """I-OPT: 在 backward 结束后调用，将 pending tensor norms 批量缓存
 
         在训练循环中的正确使用位置:
             loss.backward()
             monitor.finalize()  # <-- 在这里调用
-            grad_stats = monitor.compute_grad_norms()
+            grad_stats = monitor.compute_grad_norms()  # 在 finalize 后读取缓存的 tensor norms
             monitor.reset()
 
         这样将 N 个 .item() 同步（每个参数一次）合并为 N 个顺序 .item() 调用，
         GPU 会重叠所有 tensor 的计算，减少等待时间。
+
+        注意: layer_norms (float 列表) 不会被 finalize 填充，只有 _cached_norm_tensors
+        被填充供 compute_* 方法使用。在 reset() 被调用前可以多次调用 compute_*。
         """
-        # I-OPT: 将所有 pending tensor norms 批量转换为 Python float
+        # I-OPT: 将所有 pending tensor norms 缓存到 _cached_norm_tensors
         for name, norm_tensors in self._pending_grad_norms.items():
-            for t in norm_tensors:
-                self.layer_norms[name].append(t.item())
+            self._cached_norm_tensors[name].extend(norm_tensors)
         self._pending_grad_norms.clear()
 
     def get_layer_statistics(self) -> Dict[str, Dict[str, float]]:
@@ -255,6 +262,8 @@ class GradientMonitor:
         """Reset accumulated statistics"""
         self.layer_norms.clear()
         self.grad_norms_by_step.clear()
+        self._pending_grad_norms.clear()
+        self._cached_norm_tensors.clear()
         # I150-3: 重置关键组件梯度统计
         self.component_grad_norms.clear()
         self.component_grad_stats.clear()
