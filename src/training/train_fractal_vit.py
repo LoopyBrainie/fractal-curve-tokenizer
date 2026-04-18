@@ -642,10 +642,10 @@ def _update_fractal_hyperparams(
 
     # Stage 判断
     if warmup_progress < 0.3:
-        # Stage 1: Stochastic Exploration（纯 CE 梯度，无 budget 约束）
+        # Stage 1: Stochastic Exploration（Budget Soft-Start 防止 token 膨胀）
         stage = 1
         target_ratio = 0.5
-        budget_weight = 0.0
+        budget_weight = 0.005  # 改: 0.0 → 0.005 (Soft-Start 防止 epoch 7 清算危机)
         tau = 2.0
         logits_diversity = False
     elif warmup_progress < 1.0:
@@ -832,8 +832,14 @@ def train(
         if hasattr(state, 'splitter_scheduler_state') and state.splitter_scheduler_state:
             splitter_scheduler.load_state_dict(state.splitter_scheduler_state)
 
-    # Create GradScaler
-    scaler = GradScaler() if config.amp.enabled else None
+    # Create GradScaler (保守初始化，防止 warmup 期 GradScaler collapse)
+    # init_scale=2048: 从 65536 降至 2048，崩溃阶梯从 16 步降到 5 步
+    # growth_interval=500: 更长的稳定观察期，防止 scale 过快反弹
+    scaler = GradScaler(
+        init_scale=2048.0,
+        growth_interval=500,
+        backoff_factor=0.5,
+    ) if config.amp.enabled else None
 
     # Resume scaler state if available
     if scaler and state.scaler_state:

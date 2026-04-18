@@ -187,8 +187,14 @@ def train(
     if state.scheduler_state:
         scheduler.load_state_dict(state.scheduler_state)
 
-    # Create GradScaler
-    scaler = GradScaler() if config.amp.enabled else None
+    # Create GradScaler (保守初始化，防止 warmup 期 GradScaler collapse)
+    # init_scale=2048: 崩溃阶梯从 16 步降到 5 步
+    # growth_interval=500: 更长的稳定观察期
+    scaler = GradScaler(
+        init_scale=2048.0,
+        growth_interval=500,
+        backoff_factor=0.5,
+    ) if config.amp.enabled else None
 
     # Resume scaler state if available
     if scaler and state.scaler_state:

@@ -545,6 +545,48 @@ class FractalViTLoss(nn.Module):
 
         return loss.clamp(max=20.0)
 
+    def compute_budget_loss_smooth(
+        self,
+        split_probs: torch.Tensor,
+        ce_loss_val: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """平滑预算损失（避免 Hard Clamp 的梯度突变）
+
+        使用 softplus 替代 max(0,x) 计算 over_quota，
+        使用 Sigmoid 加权实现 C¹ 连续的软截断。
+
+        数学形式化：
+            over_quota = softplus(E[N] - K_max)
+            raw_loss = 0.5 * over_quota²
+
+            weight = sigmoid((raw_loss - clamp_max) / clamp_max * 10)
+            safe_loss = raw_loss * (1 - weight) + clamp_max * weight
+
+        性质：
+            - C¹ 连续（梯度永远不为零或突变）
+            - 当 raw_loss << clamp_max 时，safe_loss ≈ raw_loss
+            - 当 raw_loss → clamp_max 时，平滑过渡到 clamp_max
+        """
+        expected_tokens = split_probs.sum(dim=-1).mean()
+
+        # softplus 是 max(0,x) 的光滑近似，梯度永远不为零
+        over_quota = F.softplus(expected_tokens - self.max_tokens)
+
+        raw_loss = 0.5 * over_quota ** 2
+
+        # 自适应截断上限：CE Loss 的 5 倍，保底 5.0
+        clamp_max = max(5.0, ce_loss_val * 5.0)
+
+        # Sigmoid 软截断：当 raw_loss << clamp_max 时 weight≈1，接近时平滑过渡
+        # 使用原始公式但数值稳定
+        diff = (raw_loss - clamp_max) / clamp_max * 10
+        # 限制 diff 范围以避免 exp() 溢出
+        diff = diff.clamp(min=-20, max=20)
+        weight = torch.sigmoid(diff)
+        safe_loss = raw_loss * (1 - weight) + clamp_max * weight
+
+        return safe_loss, expected_tokens
+
     def compute_manifold_loss(
         self,
         attention_bias: Optional[torch.Tensor] = None,
@@ -705,11 +747,14 @@ class FractalViTLoss(nn.Module):
             total_loss = total_loss + scheduled_weights['depth'] * depth_loss
             loss_dict['depth_loss'] = depth_loss
 
-        # Budget loss (using expected value of split probabilities)
+        # Budget loss (using smooth clamping to prevent gradient explosion)
         if split_probs is not None:
-            budget_loss = self.compute_raw_budget_error(split_probs)  # D162: 重命名
-            total_loss = total_loss + scheduled_weights['budget'] * budget_loss
-            loss_dict['raw_budget_error'] = budget_loss  # D162: 重命名 key
+            # D162+_smooth: 使用平滑截断版本，防止 Budget Loss 主导
+            safe_budget_loss, expected_tokens = self.compute_budget_loss_smooth(
+                split_probs, ce_loss.item()
+            )
+            total_loss = total_loss + scheduled_weights['budget'] * safe_budget_loss
+            loss_dict['raw_budget_error'] = safe_budget_loss  # 平滑版本
 
         # Manifold loss
         manifold_loss = self.compute_manifold_loss(attention_bias, poincare_distances)

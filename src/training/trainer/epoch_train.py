@@ -7,7 +7,7 @@ handles Layer 3 (hyperparameters) for training loop.
 
 from __future__ import annotations
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 import time
 import torch
 import torch.nn as nn
@@ -58,11 +58,13 @@ class GradBalancer:
         eta: float = 0.1,
         budget_weight_target: float = 0.2,
         min_weight: float = 0.01,
+        max_ratio: float = 3.0,
     ):
         self.beta = beta
         self.eta = eta
         self.budget_weight_target = budget_weight_target
         self.min_weight = min_weight
+        self.max_ratio = max_ratio  # Budget 梯度相对于 CE 梯度的最大比例
 
         self.g_ce_ema: Optional[float] = None
         self.g_budget_ema: Optional[float] = None
@@ -110,6 +112,57 @@ class GradBalancer:
             return self.budget_weight_target  # fallback to target
         adaptive = self.eta * self.g_ce_ema / self.g_budget_ema
         return max(self.min_weight, min(adaptive, self.budget_weight_target))
+
+    def compute_scale(self, ce_grad_norm: float, budget_grad_norm: float) -> float:
+        """计算 Budget 梯度的缩放因子（二级防御）
+
+        基于梯度范数计算动态缩放比例，防止 Budget 梯度主导。
+
+        数学形式:
+            ratio = budget_grad_norm / (ce_grad_norm + eps)
+            dynamic_max = min(max_ratio, ratio_ema)
+            scale = min(1.0, 1.0 / ratio) when ratio > dynamic_max
+
+        使用场景:
+            - 在 post_backward 中调用，对已存在的梯度进行缩放
+            - 比 autograd.grad() 分离计算更高效（无需 retain_graph）
+
+        Args:
+            ce_grad_norm: CE 梯度的 L2 范数
+            budget_grad_norm: Budget 梯度的 L2 范数
+
+        Returns:
+            缩放因子 (0.0, 1.0]，1.0 表示不需要缩放
+        """
+        eps = 1e-8
+
+        # 更新 EMA（用于动态阈值）
+        if self.g_ce_ema is None:
+            self.g_ce_ema = ce_grad_norm
+            self.g_budget_ema = budget_grad_norm if budget_grad_norm > 0 else eps
+
+        # EMA 平滑更新
+        self.g_ce_ema = self.beta * self.g_ce_ema + (1 - self.beta) * max(ce_grad_norm, eps)
+        self.g_budget_ema = self.beta * self.g_budget_ema + (1 - self.beta) * max(budget_grad_norm, eps)
+
+        # 动态比例：有缓冲的限流
+        # 如果 budget_grad_norm 比 ce_grad_norm 的 max_ratio 倍还大，则缩放
+        ratio = budget_grad_norm / (ce_grad_norm + eps)
+        ratio_ema = self.g_budget_ema / (self.g_ce_ema + eps)
+
+        # 动态上限：使用 EMA 比例，但不超过 max_ratio
+        dynamic_max_ratio = min(self.max_ratio if hasattr(self, 'max_ratio') else 3.0, ratio_ema)
+
+        # 计算允许的最大 budget 梯度
+        allowed_budget_norm = ce_grad_norm * dynamic_max_ratio
+
+        # 缩放因子：确保 budget_grad 不会超过 allowed
+        if budget_grad_norm > allowed_budget_norm:
+            scale = allowed_budget_norm / (budget_grad_norm + eps)
+        else:
+            scale = 1.0
+
+        return max(0.0, min(scale, 1.0))  # 限制在 [0, 1]
 
 
 def train_one_epoch(
@@ -194,9 +247,9 @@ def train_one_epoch(
     # 用于记录输入数据统计（用于调试）
     _input_stats: Dict[str, float] = {}
 
-    # Metrics accumulators
-    total_loss = 0.0
-    total_correct = 0
+    # Metrics accumulators (I-OPT: tensor accumulation, single .item() at epoch end)
+    total_loss: Union[torch.Tensor, float] = 0.0
+    total_correct: Union[torch.Tensor, int] = 0
     total_samples = 0
     total_tokens = 0.0
     total_grad_norm = 0.0
@@ -318,16 +371,17 @@ def train_one_epoch(
                 logits = outputs.logits
 
                 # Extract token info if available
+                # I-OPT: 延迟 .item()，使用 tensor 累加模式
                 if hasattr(outputs, 'num_tokens'):
                     num_tokens_raw = outputs.num_tokens
                     # Handle different types (int, tensor, list)
                     if isinstance(num_tokens_raw, torch.Tensor):
-                        batch_tokens = num_tokens_raw.float().mean().item()
+                        # I-OPT: 直接累加 tensor，不调用 .item() 强制同步
+                        total_tokens += num_tokens_raw.float().mean().detach()
                     elif isinstance(num_tokens_raw, (int, float)):
-                        batch_tokens = float(num_tokens_raw)
+                        total_tokens += float(num_tokens_raw)
                     else:
-                        batch_tokens = float(sum(num_tokens_raw) / len(num_tokens_raw))
-                    total_tokens += batch_tokens
+                        total_tokens += float(sum(num_tokens_raw) / len(num_tokens_raw))
 
                 # 新增: 提取实验详细日志指标
                 # I-AUDIT: 使用计数器跟踪有效值数量，避免平均值计算时除以错误分母
@@ -394,34 +448,32 @@ def train_one_epoch(
                 loss = torch.tensor(0.0, device=device)
                 loss_components = {}
 
-        # Record loss components
-        if config.numerical.record_loss_components:
-            # D1-SYNC: 统一在此处对 loss_components 做 .item()，避免多次同步
-            loss_components_float = {}
-            for k, v in loss_components.items():
-                if isinstance(v, torch.Tensor):
-                    loss_components_float[k] = v.item()
-                else:
-                    loss_components_float[k] = v
-            loss_components_float["total"] = loss.item()
-            # Update progress bar with current loss
-            pbar.set_postfix_str(f"loss: {loss.item():.4f}")
-            # I-AUDIT: 使用 is not None 检查，TrainingStats 字段现在是 Optional[float] = None
-            if outputs.raw_budget_error is not None:
-                loss_components_float["raw_budget_error"] = outputs.raw_budget_error.item() if isinstance(outputs.raw_budget_error, torch.Tensor) else outputs.raw_budget_error
-            if outputs.density_regularization is not None:
-                loss_components_float["density_regularization"] = outputs.density_regularization.item() if isinstance(outputs.density_regularization, torch.Tensor) else outputs.density_regularization
-            if outputs.consistency_loss is not None:
-                loss_components_float["consistency_loss"] = outputs.consistency_loss.item() if isinstance(outputs.consistency_loss, torch.Tensor) else outputs.consistency_loss
-            if outputs.entropy_loss is not None:
-                loss_components_float["entropy_loss"] = outputs.entropy_loss.item() if isinstance(outputs.entropy_loss, torch.Tensor) else outputs.entropy_loss
-            loss_monitor.record(loss_components_float)
-
         # Backward
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
+
+        # I-OPT: 延迟 .item() 到 backward 结束后，避免阻塞 GPU 流水线
+        # 将 loss component 记录从 forward 路径移到此处，确保 backward 可以先完成
+        if config.numerical.record_loss_components and targets is not None:
+            loss_components_float = {}
+            for k, v in loss_components.items():
+                if isinstance(v, torch.Tensor):
+                    loss_components_float[k] = v.detach().item()
+                else:
+                    loss_components_float[k] = v
+            loss_components_float["total"] = loss.detach().item()
+            # I-AUDIT: 使用 is not None 检查，TrainingStats 字段现在是 Optional[float] = None
+            if outputs.raw_budget_error is not None:
+                loss_components_float["raw_budget_error"] = outputs.raw_budget_error.detach().item() if isinstance(outputs.raw_budget_error, torch.Tensor) else outputs.raw_budget_error
+            if outputs.density_regularization is not None:
+                loss_components_float["density_regularization"] = outputs.density_regularization.detach().item() if isinstance(outputs.density_regularization, torch.Tensor) else outputs.density_regularization
+            if outputs.consistency_loss is not None:
+                loss_components_float["consistency_loss"] = outputs.consistency_loss.detach().item() if isinstance(outputs.consistency_loss, torch.Tensor) else outputs.consistency_loss
+            if outputs.entropy_loss is not None:
+                loss_components_float["entropy_loss"] = outputs.entropy_loss.detach().item() if isinstance(outputs.entropy_loss, torch.Tensor) else outputs.entropy_loss
+            loss_monitor.record(loss_components_float)
 
         # I-OOM FIX: 调用 finalize 将 GPU tensors 转为 Python floats，释放显存
         if grad_monitor is not None:
@@ -433,11 +485,12 @@ def train_one_epoch(
             reserved_mb = torch.cuda.memory_reserved() / 1024**2
             max_allocated_mb = torch.cuda.max_memory_allocated() / 1024**2
             # 获取 num_tokens (从 forward 时获取的 outputs)
+            # I-OPT: 使用 .detach().item() 避免阻塞 backward 后的 GPU 流水线
             num_tokens_info = ""
             if hasattr(outputs, 'num_tokens') and outputs.num_tokens is not None:
                 ntok = outputs.num_tokens
                 if isinstance(ntok, torch.Tensor):
-                    ntok = ntok.float().mean().item()
+                    ntok = ntok.detach().float().mean().item()
                 num_tokens_info = f", tokens={ntok:.0f}"
             print(f"  [MEM] Step {batch_idx+1}: alloc={allocated_mb:.1f}MB, reserved={reserved_mb:.1f}MB, peak={max_allocated_mb:.1f}MB{num_tokens_info}")
 
@@ -628,39 +681,43 @@ def train_one_epoch(
         # Note: Scheduler is now updated inside the conditional block above
 
         # Compute accuracy (if targets available)
+        # I-OPT: 延迟 .item()，使用 tensor 累加
         if targets is not None and logits is not None:
             if targets.dim() == 2:
                 # Mixed labels from Mixup/Cutmix - compute approximate accuracy
                 pred = logits.argmax(dim=-1)
                 target_cls = targets.argmax(dim=-1)
-                correct = (pred == target_cls).sum().item()
+                correct = (pred == target_cls).sum()
             else:
-                correct = (logits.argmax(dim=-1) == targets).sum().item()
+                correct = (logits.argmax(dim=-1) == targets).sum()
 
             batch_size = images.size(0)
-            total_correct += correct
+            total_correct += correct.detach()
             total_samples += batch_size
 
-        # Accumulate loss
-        total_loss += loss.item()
+        # I-OPT: 累积 tensor，不在循环内 .item()
+        total_loss += loss.detach()
         num_batches += 1
         state.increment_step()
 
         # Logging
         if (batch_idx + 1) % config.training.log_interval == 0:
             current_lr = optimizer.param_groups[0]["lr"]
+            # I-OPT:延迟 .item() 到打印前，减少 GPU→CPU 同步频率
+            grad_str = f"Grad: {grad_norm:.4f}" if config.numerical.record_grad_norms and grad_norm is not None else ""
             print(f"  Step [{batch_idx + 1}/{len(dataloader)}] "
-                  f"Loss: {loss.item():.4f} "
+                  f"Loss: {loss.detach().item():.4f} "
                   f"LR: {current_lr:.2e} "
-                  f"Grad: {grad_norm:.4f}" if config.numerical.record_grad_norms else "")
+                  f"{grad_str}")
 
     epoch_time = time.time() - epoch_start_time
 
     # Compute final metrics
-    avg_loss = total_loss / max(num_batches, 1)
-    accuracy = total_correct / max(total_samples, 1) if total_samples > 0 else 0.0
-    avg_grad_norm = total_grad_norm / max(num_batches, 1)
-    avg_tokens = total_tokens / max(num_batches, 1)
+    # I-OPT: 在 epoch 结束时一次性 .item()，避免每 batch 同步
+    avg_loss = (total_loss / max(num_batches, 1)).item() if isinstance(total_loss, torch.Tensor) else total_loss / max(num_batches, 1)
+    accuracy = (total_correct / max(total_samples, 1)).item() if isinstance(total_correct, torch.Tensor) else total_correct / max(total_samples, 1)
+    avg_grad_norm = (total_grad_norm / max(num_batches, 1)).item() if isinstance(total_grad_norm, torch.Tensor) else total_grad_norm / max(num_batches, 1)
+    avg_tokens = (total_tokens / max(num_batches, 1)).item() if isinstance(total_tokens, torch.Tensor) else total_tokens / max(num_batches, 1)
     samples_per_second = total_samples / max(epoch_time, 1e-8)
 
     # Get loss components
@@ -828,8 +885,8 @@ def train_one_epoch_simple(
 
     for epoch in range(num_epochs):
         for batch_idx, batch in enumerate(dataloader):
-            images = batch[0].to(device)
-            labels = batch[1].to(device)
+            images = batch[0].to(device, non_blocking=True)
+            labels = batch[1].to(device, non_blocking=True)
 
             optimizer.zero_grad()
 
