@@ -950,6 +950,7 @@ def train(
         # Reset monitors
         grad_monitor.reset()
         loss_monitor.reset()
+        defender.clear()  # I-SLOW FIX: 清理 NumericalDefender.stats 中的 GPU tensor 引用
 
         # Evaluate
         eval_metrics = None

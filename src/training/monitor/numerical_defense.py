@@ -293,15 +293,31 @@ def check_tensor_numerical_health(
     Returns:
         Dictionary of health metrics
     """
-    result = {
-        "name": name,
-        "has_nan": torch.isnan(tensor).any().item(),
-        "has_inf": torch.isinf(tensor).any().item(),
-        "min": tensor.min().item() if tensor.numel() > 0 else None,
-        "max": tensor.max().item() if tensor.numel() > 0 else None,
-        "mean": tensor.mean().item() if tensor.numel() > 0 else None,
-        "std": tensor.std().item() if tensor.numel() > 0 else None,
-    }
+    # D1-AUDIT FIX: 使用 isfinite().all() 替代 isnan().any() + isinf().any()，减少 1 次同步
+    if tensor.numel() > 0:
+        tensor_f = tensor.float()
+        isfinite_all = tensor_f.isfinite().all().item()
+        result = {
+            "name": name,
+            "has_nan": not isfinite_all,  # 从 isfinite 反推
+            "has_inf": not isfinite_all,   # 从 isfinite 反推
+            "isfinite": isfinite_all,
+            "min": tensor_f.min().item(),
+            "max": tensor_f.max().item(),
+            "mean": tensor_f.mean().item(),
+            "std": tensor_f.std().item(),
+        }
+    else:
+        result = {
+            "name": name,
+            "has_nan": False,
+            "has_inf": False,
+            "isfinite": True,
+            "min": None,
+            "max": None,
+            "mean": None,
+            "std": None,
+        }
 
     has_issues = result["has_nan"] or result["has_inf"]
 

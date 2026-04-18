@@ -1021,8 +1021,10 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
 
         # I-NAN: 为 cls_token 注册梯度 hook，捕获 backward 过程中产生的 NaN
         # D4-AUDIT FIX: 使用 isfinite().all() 替代 isnan().any() or isinf().any()
+        # D1-AUDIT FIX: 存储 hook handle 以便后续清理
+        self._cls_token_hook = None
         if self.cls_token is not None and self.cls_token.requires_grad:
-            self.cls_token.register_hook(
+            self._cls_token_hook = self.cls_token.register_hook(
                 lambda grad: torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
                 if not grad.isfinite().all() else grad
             )
@@ -1049,6 +1051,10 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
     def _register_all_nan_grad_hooks(self):
         """I-NAN: 为所有参数注册梯度 hook，捕获 backward 过程中产生的 NaN"""
         # D4-AUDIT FIX: 使用 isfinite().all() 替代 isnan().any() or isinf().any()
+        # D1-AUDIT FIX: 先清理旧 hooks，避免重复注册
+        if hasattr(self, '_all_nan_grad_hooks'):
+            for hook in self._all_nan_grad_hooks:
+                hook.remove()
         self._all_nan_grad_hooks = []
         for param in self.parameters():
             if param.requires_grad:
@@ -1057,6 +1063,37 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                     if not grad.isfinite().all() else grad
                 )
                 self._all_nan_grad_hooks.append(hook)
+
+    def remove_hooks(self) -> None:
+        """D1-AUDIT FIX: Remove all registered gradient hooks to prevent memory leak"""
+        # 清理 CLS token hook
+        try:
+            cls_hook = getattr(self, '_cls_token_hook', None)
+            if cls_hook is not None:
+                cls_hook.remove()
+                object.__setattr__(self, '_cls_token_hook', None)
+        except (AttributeError, TypeError):
+            pass
+        # 清理所有参数 hooks
+        try:
+            if hasattr(self, '_all_nan_grad_hooks'):
+                for hook in self._all_nan_grad_hooks:
+                    hook.remove()
+                self._all_nan_grad_hooks.clear()
+        except (AttributeError, TypeError):
+            pass
+
+    def __del__(self):
+        """Cleanup hooks on deletion"""
+        try:
+            self.remove_hooks()
+        except Exception:
+            pass
+
+    def __del__(self):
+        """Cleanup hooks on deletion"""
+        if hasattr(self, '_cls_token_hook') or hasattr(self, '_all_nan_grad_hooks'):
+            self.remove_hooks()
 
     def _init_transformer_weights(self):
         """初始化 Transformer 层的权重"""
@@ -1456,7 +1493,8 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                     probs_safe = probs_masked + (probs_masked == 0).to(probs_masked.dtype) * PROB_EPSILON
                     # 计算每个样本的熵 [B]
                     entropies_gpu = -(probs_safe * torch.log(probs_safe)).sum(dim=1)
-                    # D1-AUDIT FIX: 不在此处调用 .tolist()，延迟到循环内按需转换
+                    # D1-AUDIT FIX: 批量 .tolist() 替代循环内 .item()，减少 B 次同步为 1 次
+                    entropies_list = entropies_gpu.tolist()
 
                 # P-OPT: 向量化构建 levels_used_list - 避免 Python 循环
                 # 原始: for i in range(B): nonzero.tolist()
@@ -1504,8 +1542,8 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                     }
 
                     if split_probs is not None:
-                        # D1-AUDIT FIX: 延迟 .item() 到循环内，避免批量 .tolist() 同步
-                        aux_info["token_selection_entropy"] = entropies_gpu[i].item()
+                        # D1-AUDIT FIX: 使用预转换的 entropies_list (已在循环外转换)
+                        aux_info["token_selection_entropy"] = entropies_list[i]
 
                     aux_infos.append(aux_info)
 

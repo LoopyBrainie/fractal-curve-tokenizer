@@ -144,10 +144,15 @@ class GradientMonitor:
 
         注意: layer_norms (float 列表) 不会被 finalize 填充，只有 _cached_norm_tensors
         被填充供 compute_* 方法使用。在 reset() 被调用前可以多次调用 compute_*。
+
+        I-OOM FIX: finalize() 现在 REPLACE 而不是 EXTEND _cached_norm_tensors，
+        防止每 step 累积 tensor 引用导致的显存泄漏。
         """
-        # I-OPT: 将所有 pending tensor norms 缓存到 _cached_norm_tensors
+        # I-OPT: 将 pending tensor norms 缓存到 _cached_norm_tensors
+        # I-OOM FIX: REPLACE not EXTEND - prevents memory leak from accumulating across steps
+        self._cached_norm_tensors.clear()
         for name, norm_tensors in self._pending_grad_norms.items():
-            self._cached_norm_tensors[name].extend(norm_tensors)
+            self._cached_norm_tensors[name] = list(norm_tensors)
         self._pending_grad_norms.clear()
 
     def get_layer_statistics(self) -> Dict[str, Dict[str, float]]:

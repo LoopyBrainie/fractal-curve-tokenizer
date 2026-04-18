@@ -79,9 +79,10 @@ class MixupCutmixLoss:
         device = images.device
 
         # Sample lambda from Beta distribution
+        # D1-AUDIT FIX: 添加 non_blocking=True 避免 forward pass 阻塞
         lam = torch.distributions.Beta(
             self.mixup_alpha, self.mixup_alpha
-        ).sample((batch_size,)).to(device)
+        ).sample((batch_size,)).to(device, non_blocking=True)
 
         # Random permutation
         index = torch.randperm(batch_size, device=device)
@@ -117,9 +118,10 @@ class MixupCutmixLoss:
         _, _, H, W = images.shape
 
         # Sample lambda
+        # D1-AUDIT FIX: 添加 non_blocking=True 避免 forward pass 阻塞
         lam = torch.distributions.Beta(
             self.cutmix_alpha, self.cutmix_alpha
-        ).sample((batch_size,)).to(device)
+        ).sample((batch_size,)).to(device, non_blocking=True)
 
         # Random permutation
         index = torch.randperm(batch_size, device=device)

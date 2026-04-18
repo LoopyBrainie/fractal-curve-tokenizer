@@ -320,6 +320,21 @@ class HilbertNativePatchEmbed(nn.Module):
                 )
                 self._nan_grad_hooks.append(hook)
 
+        # D1-AUDIT FIX: 用于 forward hook 的 handle，以便在下次 forward 时移除
+        self._forward_grad_hook = None
+
+    def remove_hooks(self) -> None:
+        """D1-AUDIT FIX: Remove all registered gradient hooks to prevent memory leak"""
+        for hook in self._nan_grad_hooks:
+            hook.remove()
+        self._nan_grad_hooks.clear()
+        if hasattr(self, '_forward_grad_hook') and self._forward_grad_hook is not None:
+            self._forward_grad_hook.remove()
+            self._forward_grad_hook = None
+
+    def __del__(self):
+        """Cleanup hooks on deletion"""
+        self.remove_hooks()
 
     def _apply_depth_modulation(
         self,
@@ -776,12 +791,14 @@ class HilbertNativePatchEmbed(nn.Module):
         tokens = self.norm(tokens)
 
         # I-NAN: 注册梯度 hook，捕获从 Transformer 传回的 NaN/Inf
-        # 这是最后一道防线，确保任何 backward 过程中的 NaN 都被修复
+        # D1-AUDIT FIX: 先移除旧 hook，避免每 forward 累积
+        if self._forward_grad_hook is not None:
+            self._forward_grad_hook.remove()
         def safe_grad(grad):
             if torch.isnan(grad).any() or torch.isinf(grad).any():
                 return torch.nan_to_num(grad, nan=0.0, posinf=1.0, neginf=-1.0)
             return grad
-        tokens.register_hook(safe_grad)
+        self._forward_grad_hook = tokens.register_hook(safe_grad)
         
         return tokens, levels_info
 
