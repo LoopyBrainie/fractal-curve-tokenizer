@@ -91,19 +91,23 @@ def entmax_beta(
     if alpha == 2.0:
         return F.softmax(scores, dim=dim)
 
+    # D1: Logits 稳定性限制 (针对 FP16)
+    # clamp 防止 exp() 溢出: exp(10) ≈ 22026 < 65504 (FP16 max)
+    scores = torch.clamp(scores, min=-10.0, max=10.0)
+
     # 使用更稳定的实现
     # 基于 Alpha-Entmax 的迭代算法 (Peters et al., 2019)
     # D4-AUDIT FIX: 移除不必要的 .float()，保留原始 dtype
 
     # 初始化
     max_score = scores.max(dim=dim, keepdim=True)[0]
-    scores_norm = scores - max_score
+    scores_std = scores - max_score
 
     # 简化的实现：使用固定的稀疏度
     # alpha=1.5 产生稀疏但可微的分布
     if alpha == 1.5:
         # Sparsemax 变体
-        sorted_scores, _ = torch.sort(scores_norm, dim=dim, descending=True)
+        sorted_scores, _ = torch.sort(scores_std, dim=dim, descending=True)
         cumsum = torch.cumsum(sorted_scores, dim=dim)
 
         # 找到阈值
@@ -112,7 +116,9 @@ def entmax_beta(
         k = torch.arange(1, n + 1, device=scores.device, dtype=scores.dtype)
         k = k.view(*([1] * (scores.dim() - 1)), -1)
 
-        tau = (cumsum - 1) / k
+        # D2: Epsilon 保护分母，防止除零
+        k_safe = k.clamp(min=1e-8)
+        tau = (cumsum - 1) / k_safe
         tau_valid = tau > sorted_scores
 
         # 找到最大的有效 tau
@@ -122,10 +128,14 @@ def entmax_beta(
         tau_final = torch.gather(tau, dim=dim, index=tau_max.long())
 
         # 计算概率
-        probs = F.relu(scores_norm - tau_final)
+        probs = F.relu(scores_std - tau_final)
     else:
         # 简化的 soft-max 实现（当 α 接近 2 时）
-        probs = F.softmax(scores_norm * (alpha - 1), dim=dim)
+        probs = F.softmax(scores_std * (alpha - 1), dim=dim)
+
+    # A-NAN FIX: Fallback - 如果产生 NaN，回退到 softmax
+    if not torch.isfinite(probs).all():
+        return F.softmax(scores, dim=dim)
 
     return probs
 

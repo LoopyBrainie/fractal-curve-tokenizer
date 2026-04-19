@@ -580,9 +580,14 @@ def train_one_epoch(
 
         # 3. 梯度防御检查（使用恢复后的真实梯度）
         is_finite = torch.isfinite(pre_clip_grad_norm)
-        should_skip = not is_finite or (defender.post_backward() if defender else False)
+        should_skip_step = not is_finite or (defender.post_backward() if defender else False)
 
-        if should_skip:
+        # A-NAN FIX: 修复 GradScaler "更新死锁"
+        # 核心原则：无论是否 skip，scaler.update() 都必须在所有路径执行
+        # 否则 loss_scale 永不下降，NaN 会像幽灵一样在计算图中循环
+
+        if not should_skip_step:
+            # 正常路径：尝试 optimizer step
             # P1-1 FIX: Splitter 梯度裁剪（独立于主梯度裁剪）
             # 理论: 当 splitter_grad_norm >> backbone_grad_norm 时，
             # AdamW 动量会将大量步长分配给 Splitter，导致 Backbone 被"漂移"
@@ -595,37 +600,36 @@ def train_one_epoch(
                 )
 
             # Gradient clipping (P0-Fix: 加强梯度裁剪，防止梯度爆炸)
-            # 注意: scaler.unscale_() 已在前面调用过，此处不再重复调用
             if config.training.gradient_clip_norm > 0:
-                # P0-Fix: 使用更严格的 max_norm=1.0（原来可能是 5.0 或更大）
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(),
-                    max_norm=1.0,  # 强制限制梯度范数在 1.0 以内
+                    max_norm=1.0,
                 )
-                # P0-Fix: 添加 NaN/Inf 检查，防止异常梯度进入优化器
+                # A-NAN FIX: 检查裁剪后的梯度是否有限
                 if not torch.isfinite(grad_norm):
                     print(f"Warning: Gradient norm is {grad_norm}, skipping step!")
-                    optimizer.zero_grad()
-                    if scaler is not None:
-                        scaler.update()  # 即使 skip，也必须 update 以便自动降 scale
-                    continue
+                    should_skip_step = True  # 转换为 skip
 
-            # Update scheduler BEFORE optimizer step
-            if scheduler is not None:
-                scheduler.step(state.global_step)
-            # V4: Splitter 独立 LR scheduler 也同步 step
-            if splitter_scheduler is not None:
-                splitter_scheduler.step(state.global_step)
+            if not should_skip_step:
+                # Update scheduler BEFORE optimizer step
+                if scheduler is not None:
+                    scheduler.step(state.global_step)
+                if splitter_scheduler is not None:
+                    splitter_scheduler.step(state.global_step)
 
-            # Optimizer step
-            if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            optimizer.zero_grad()
-        else:
-            # I-NAN: 检测到 NaN！触发自动取证
+                # Optimizer step
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()  # A-NAN FIX: 正常路径也必须 update
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
+
+            # A-NAN FIX: scaler.update() 在所有路径后执行（已在上方正常路径执行）
+            # 如果进入 skip 分支，下方的 scaler.update() 会执行
+
+        if should_skip_step:
+            # I-NAN: 检测到 NaN 或梯度异常！触发自动取证并 skip
             # 收集 Classification logits 统计（outputs.logits 是分类 logits，不是 splitter 内部 logits）
             classification_logits_stats: Dict[str, Any] = {}
             if hasattr(outputs, 'logits') and outputs.logits is not None:

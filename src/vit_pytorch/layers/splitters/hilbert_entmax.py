@@ -40,7 +40,7 @@ def entmax_1_5(
     """
     α-Entmax (α=1.5) 实现。
 
-    使用 CSS (Convex Sparse Sinkhorn) 算法。
+    使用 CSS (Convex Sparse Sinkhorn) 算法，配合三重数值防御。
 
     参数
     ----
@@ -60,6 +60,10 @@ def entmax_1_5(
     """
     alpha = 1.5
 
+    # D1: Logits 稳定性限制 (针对 FP16)
+    # clamp 防止 exp() 溢出: exp(10) ≈ 22026 < 65504 (FP16 max)
+    z = torch.clamp(z, min=-10.0, max=10.0)
+
     # 保存原始维度信息
     if dim < 0:
         dim = dim + z.dim()
@@ -69,9 +73,6 @@ def entmax_1_5(
     perm[dim] = -1
     perm[-1] = dim
     z_transposed = z.permute(*perm)
-
-    # D3-AUDIT FIX: permute 后 tensor 可能非连续，reshape 需要连续内存
-    # 使用 contiguous() 确保内存连续，避免 reshape 隐式拷贝
     z_transposed = z_transposed.contiguous()
 
     # 展平维度以进行计算
@@ -84,35 +85,30 @@ def entmax_1_5(
 
     # CSS 迭代
     for _ in range(max_iter):
-        # 计算 p^α
         p_alpha = q ** (alpha - 1)
-
-        # 计算分母: Σ p_i^α
+        # D2: Epsilon 保护分母，防止 0/0
         denom = p_alpha.sum(dim=-1, keepdim=True).clamp(min=epsilon)
-
-        # 计算 temp = z / Σ p_i^α
         temp = z_flat / denom
-
-        # 归一化确保 Σ temp_i = n
         temp = temp - temp.logsumexp(dim=-1, keepdim=True) + math.log(n)
-
-        # AMP FIX: clamp before exp to prevent overflow/underflow
-        # exp(10) ≈ 22026 in fp16, so clamp max to 10
-        # exp(-50) ≈ 2e-22, still numerically safe, so clamp min to -50
+        # AMP 保护: exp(10) ≈ 22026 < 65504 (FP16 max)
         temp = temp.clamp(min=-50, max=10.0)
         q = p_alpha * torch.exp(temp)
-        q = q / q.sum(dim=-1, keepdim=True).clamp(min=epsilon)
+        # D2: Epsilon 保护分母，防止 0/0
+        q = q / (q.sum(dim=-1, keepdim=True).clamp(min=epsilon))
 
     # 恢复原始形状
     result = q.reshape(shape_before)
     result = result.permute(*perm)
 
-    # I-NAN FIX: Splitter 梯度防火墙（方案 B）
-    # 原理: 在 entmax 反向传播时将梯度截断至 [-10, 10]
-    # 即使放大 2048 倍也只有 20480 < 65504 (FP16 max)
-    # 这样可以防止 Entmax 冷启动时的大梯度冲击波传回主干网络
+    # D3: 保留 Hook 作为 NaN 最后防线（不破坏计算图）
+    # 关键: 使用 PyTorch 自动梯度，Hook 只负责"事后清理" NaN
     if result.requires_grad:
-        result.register_hook(lambda grad: torch.clamp(grad, -10.0, 10.0))
+        def nan_robust_hook(grad):
+            if not torch.isfinite(grad).all():
+                # 将污染源置零，防止 NaN 传播和 Adam 动量污染
+                return torch.nan_to_num(grad, nan=0.0)
+            return torch.clamp(grad, -10.0, 10.0)
+        result.register_hook(nan_robust_hook)
 
     return result
 
@@ -150,12 +146,15 @@ def entmax(
         return F.softmax(z, dim=dim)
 
     if abs(alpha - 1.5) < 0.01:
-        # 使用优化的 1.5 版本
+        # 使用优化的 1.5 版本（包含分布平滑）
         return entmax_1_5(z, dim, max_iter, epsilon)
 
     # 通用实现
     if dim < 0:
         dim = dim + z.dim()
+
+    # D1: Logits 稳定性限制 (针对 FP16)
+    z = torch.clamp(z, min=-10.0, max=10.0)
 
     # 转置
     perm = list(range(z.dim()))
@@ -175,20 +174,27 @@ def entmax(
 
     for _ in range(max_iter):
         p_alpha = q ** (alpha - 1)
+        # D2: Epsilon 保护分母，防止 0/0
         denom = p_alpha.sum(dim=-1, keepdim=True).clamp(min=epsilon)
         temp = z_flat / denom
         temp = temp - temp.logsumexp(dim=-1, keepdim=True) + math.log(n)
         # AMP FIX: clamp to prevent overflow/underflow
         temp = temp.clamp(min=-50, max=10.0)
         q = p_alpha * torch.exp(temp)
-        q = q / q.sum(dim=-1, keepdim=True).clamp(min=epsilon)
+        # D2: Epsilon 保护分母，防止 0/0
+        q = q / (q.sum(dim=-1, keepdim=True).clamp(min=epsilon))
 
     result = q.reshape(shape_before)
     result = result.permute(*perm)
 
-    # I-NAN FIX: Splitter 梯度防火墙（方案 B）
+    # A-NAN FIX: Splitter 梯度防火墙
+    # 关键改进: 先用 nan_to_num 处理 NaN，防止污染 Adam 动量
     if result.requires_grad:
-        result.register_hook(lambda grad: torch.clamp(grad, -10.0, 10.0))
+        def nan_robust_hook(grad):
+            if not torch.isfinite(grad).all():
+                return torch.nan_to_num(grad, nan=0.0)
+            return torch.clamp(grad, -10.0, 10.0)
+        result.register_hook(nan_robust_hook)
 
     return result
 
