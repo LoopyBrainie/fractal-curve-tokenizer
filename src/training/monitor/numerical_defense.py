@@ -233,6 +233,7 @@ class NumericalDefender:
 
         self.step_count = 0
         self._last_ghost_nan: Optional[str] = None  # Discovery: track raw NaN source
+        self.stats: Dict[str, Dict[str, float]] = {}  # I-SLOW FIX: track stats for clearing GPU tensor refs
 
     def should_check(self) -> bool:
         """Check if we should validate gradients this step"""
@@ -278,6 +279,10 @@ class NumericalDefender:
         self.validator.reset()
         self.step_count = 0
         self._last_ghost_nan = None
+
+    def clear(self) -> None:
+        """Clear stats to release GPU tensor references (I-SLOW FIX)"""
+        self.stats.clear()
 
     def register_discovery_hooks(self, target_modules: Optional[List[str]] = None) -> None:
         """Register pre-hook to detect NaN before nan_robust_hook cleans it
