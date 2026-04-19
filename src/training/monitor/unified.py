@@ -88,6 +88,7 @@ class UnifiedMonitor:
             skip_on_nan=self.config.get("skip_on_nan", True),
             collector=collector,
         )
+        self.defender.register_discovery_hooks()
 
         self.activation_collector = ActivationStatsCollector(
             model=model,

@@ -871,6 +871,7 @@ def train(
         detect_anomaly=config.numerical.detect_anomaly,
         skip_on_nan=config.numerical.skip_on_nan_grad,
     )
+    defender.register_discovery_hooks()
 
     # Create logger
     logger = EpochLogger(output_dir=str(output_dir))

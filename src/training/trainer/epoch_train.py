@@ -232,6 +232,7 @@ def train_one_epoch(
             skip_on_nan=config.numerical.skip_on_nan_grad,
             collector=collector,
         )
+        defender.register_discovery_hooks()
 
     # I-NAN: 初始化 NaN 自动取证器
     # debug_dir 默认为实验目录下的 debug 子目录
