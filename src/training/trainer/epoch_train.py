@@ -580,8 +580,15 @@ def train_one_epoch(
                 pre_clip_grad_norm = torch.tensor(float('nan'), device=device_for_norm)
 
         # 3. 梯度防御检查（使用恢复后的真实梯度）
+        # BUG FIX: post_backward() 返回 True=可以继续, False=应该跳过
+        # 原代码错误地将 True 当作"跳过"导致误报
         is_finite = torch.isfinite(pre_clip_grad_norm)
-        should_skip_step = not is_finite or (defender.post_backward() if defender else False)
+        if defender:
+            # post_backward(): True= proceed(不skip), False= skip
+            defender_says_skip = not defender.post_backward()
+        else:
+            defender_says_skip = False
+        should_skip_step = not is_finite or defender_says_skip
 
         # A-NAN FIX: 修复 GradScaler "更新死锁"
         # 核心原则：无论是否 skip，scaler.update() 都必须在所有路径执行
