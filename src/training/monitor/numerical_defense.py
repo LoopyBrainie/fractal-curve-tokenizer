@@ -310,8 +310,11 @@ class NumericalDefender:
         for name, module in self.model.named_modules():
             # Check if module matches targets
             if any(target in name.lower() for target in target_modules):
-                # Register discovery hook FIRST (runs before nan_robust_hook)
-                module.register_hook(nan_discovery_hook(name))
+                # Register discovery hook on each parameter's gradient tensor
+                # (hooks on module parameters fire before module-level hooks)
+                for param_name, param in module.named_parameters():
+                    full_name = f"{name}.{param_name}" if name else param_name
+                    param.register_hook(nan_discovery_hook(full_name))
 
 
 def check_tensor_numerical_health(
