@@ -84,7 +84,7 @@ def entmax_1_5(
     q = torch.ones_like(z_flat) / n
 
     # CSS 迭代
-    for _ in range(max_iter):
+    for i in range(max_iter):
         p_alpha = q ** (alpha - 1)
         # D2: Epsilon 保护分母，防止 0/0
         denom = p_alpha.sum(dim=-1, keepdim=True).clamp(min=epsilon)
@@ -96,13 +96,28 @@ def entmax_1_5(
         # D2: Epsilon 保护分母，防止 0/0
         q = q / (q.sum(dim=-1, keepdim=True).clamp(min=epsilon))
 
+        # Discovery: 每隔 5 次迭代检测一次状态，及早发现发散
+        if i % 5 == 0 and not torch.isfinite(q).all():
+            print(f"!!! [CSS DIVERGENCE] entmax_1_5 iteration {i}")
+            print(f"    - q stats: mean={q.mean().item():.2e}, min={q.min().item():.2e}, max={q.max().item():.2e}")
+            print(f"    - z_flat stats: mean={z_flat.mean().item():.2e}, min={z_flat.min().item():.2e}, max={z_flat.max().item():.2e}")
+
     # 恢复原始形状
     result = q.reshape(shape_before)
     result = result.permute(*perm)
 
-    # D3: 保留 Hook 作为 NaN 最后防线（不破坏计算图）
-    # 关键: 使用 PyTorch 自动梯度，Hook 只负责"事后清理" NaN
+    # Discovery: NaN 检测（在 nan_robust_hook 清理之前）
     if result.requires_grad:
+        def nan_discovery_hook(grad):
+            """在 nan_robust_hook 之前执行，记录原始 NaN 状态"""
+            if grad is not None and not torch.isfinite(grad).all():
+                nan_mask = torch.isnan(grad)
+                print(f"!!! [GHOST NAN] Detected in entmax_1_5 gradient before suppression")
+                print(f"    - NaN Ratio: {nan_mask.float().mean().item():.4%}")
+                print(f"    - grad stats: mean={grad.mean().item():.2e}, min={grad.min().item():.2e}, max={grad.max().item():.2e}")
+            return grad
+        result.register_hook(nan_discovery_hook)
+
         def nan_robust_hook(grad):
             if not torch.isfinite(grad).all():
                 # 将污染源置零，防止 NaN 传播和 Adam 动量污染
@@ -172,7 +187,7 @@ def entmax(
     # 初始化
     q = torch.ones_like(z_flat) / n
 
-    for _ in range(max_iter):
+    for i in range(max_iter):
         p_alpha = q ** (alpha - 1)
         # D2: Epsilon 保护分母，防止 0/0
         denom = p_alpha.sum(dim=-1, keepdim=True).clamp(min=epsilon)
@@ -184,12 +199,25 @@ def entmax(
         # D2: Epsilon 保护分母，防止 0/0
         q = q / (q.sum(dim=-1, keepdim=True).clamp(min=epsilon))
 
+        # Discovery: 每隔 5 次迭代检测一次状态，及早发现发散
+        if i % 5 == 0 and not torch.isfinite(q).all():
+            print(f"!!! [CSS DIVERGENCE] entmax (α={alpha}) iteration {i}")
+            print(f"    - q stats: mean={q.mean().item():.2e}, min={q.min().item():.2e}, max={q.max().item():.2e}")
+
     result = q.reshape(shape_before)
     result = result.permute(*perm)
 
     # A-NAN FIX: Splitter 梯度防火墙
-    # 关键改进: 先用 nan_to_num 处理 NaN，防止污染 Adam 动量
+    # Discovery hook FIRST (catches raw NaN before cleanup)
     if result.requires_grad:
+        def nan_discovery_hook(grad):
+            if grad is not None and not torch.isfinite(grad).all():
+                nan_mask = torch.isnan(grad)
+                print(f"!!! [GHOST NAN] Detected in entmax (α={alpha}) gradient before suppression")
+                print(f"    - NaN Ratio: {nan_mask.float().mean().item():.4%}")
+            return grad
+        result.register_hook(nan_discovery_hook)
+
         def nan_robust_hook(grad):
             if not torch.isfinite(grad).all():
                 return torch.nan_to_num(grad, nan=0.0)

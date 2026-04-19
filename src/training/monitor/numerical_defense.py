@@ -232,6 +232,7 @@ class NumericalDefender:
         self.anomaly_context = AnomalyDetectionContext(enabled=detect_anomaly)
 
         self.step_count = 0
+        self._last_ghost_nan: Optional[str] = None  # Discovery: track raw NaN source
 
     def should_check(self) -> bool:
         """Check if we should validate gradients this step"""
@@ -276,6 +277,41 @@ class NumericalDefender:
         """Reset defender state"""
         self.validator.reset()
         self.step_count = 0
+        self._last_ghost_nan = None
+
+    def register_discovery_hooks(self, target_modules: Optional[List[str]] = None) -> None:
+        """Register pre-hook to detect NaN before nan_robust_hook cleans it
+
+        This discovers NaN at the source by registering hooks that run BEFORE
+        the nan_robust_hook. PyTorch executes hooks in registration order.
+
+        Args:
+            target_modules: List of module name substrings to target.
+                           If None, defaults to ["splitter", "entmax", "manifold"].
+        """
+        if self.model is None:
+            return
+
+        target_modules = target_modules or ["splitter", "entmax", "manifold", "decoder"]
+
+        def nan_discovery_hook(module_name: str):
+            """Hook that fires BEFORE nan_robust_hook - catches raw NaN"""
+            def hook(grad):
+                if grad is not None and not torch.isfinite(grad).all():
+                    nan_mask = torch.isnan(grad)
+                    nan_ratio = nan_mask.float().mean().item()
+                    print(f"!!! [GHOST NAN] Detected in {module_name} before suppression.")
+                    print(f"    - Layer: {module_name} | NaN Ratio: {nan_ratio:.4%}")
+                    # Store for later investigation
+                    self._last_ghost_nan = module_name
+                return grad
+            return hook
+
+        for name, module in self.model.named_modules():
+            # Check if module matches targets
+            if any(target in name.lower() for target in target_modules):
+                # Register discovery hook FIRST (runs before nan_robust_hook)
+                module.register_hook(nan_discovery_hook(name))
 
 
 def check_tensor_numerical_health(
