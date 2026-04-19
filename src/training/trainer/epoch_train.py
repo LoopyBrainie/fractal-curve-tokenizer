@@ -443,7 +443,20 @@ def train_one_epoch(
             if targets is not None:
                 # I-AUDIT: 传递 H1SS 辅助损失给 compute_loss
                 aux_losses = outputs.auxiliary_losses if hasattr(outputs, 'auxiliary_losses') else None
-                loss, loss_components = compute_loss(logits, targets, aux_losses=aux_losses)
+
+                # P0 FIX: GradBalancer 闭环 - 计算 final_budget_weight = schedule * w_adaptive
+                # 在每步开始时获取 w_adaptive（基于上一步 EMA），在 backward 后更新 EMA
+                budget_weight_override = None
+                if grad_balancer is not None and warmup_params is not None:
+                    w_adaptive = grad_balancer.get_adaptive_budget_weight()
+                    schedule_budget_weight = warmup_params.get('budget_weight', 0.0)
+                    budget_weight_override = schedule_budget_weight * w_adaptive
+
+                loss, loss_components = compute_loss(
+                    logits, targets,
+                    aux_losses=aux_losses,
+                    budget_weight_override=budget_weight_override
+                )
             else:
                 # Fallback if no targets
                 loss = torch.tensor(0.0, device=device)
@@ -507,6 +520,13 @@ def train_one_epoch(
             # I150-3 FIX: 计算 backbone 和 splitter 的梯度范数（按参数名前缀分类）
             # 按照日志系统规范: backbone_grad_norm 和 splitter_grad_norm 是 TrainingStats 直接字段
             layer_norms = grad_monitor.compute_grad_norms()
+            # P1 FIX: 如果 Hook 失效，添加手动审计
+            if not layer_norms and (batch_idx + 1) % config.training.log_interval == 0:
+                print(f"[CRITICAL] Gradient hooks failed at Step {state.global_step}. Manual Audit:")
+                for name, param in model.named_parameters():
+                    if "splitter" in name:
+                        g_norm = param.grad.norm().item() if param.grad is not None else "NONE"
+                        print(f"  - {name}: grad_norm = {g_norm}")
             if layer_norms:
                 backbone_grad_sq = 0.0
                 splitter_grad_sq = 0.0

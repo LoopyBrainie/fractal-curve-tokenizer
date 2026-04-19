@@ -604,67 +604,83 @@ def _update_fractal_hyperparams(
     warmup_epochs: int,
     config,
 ) -> dict:
-    """更新 Fractal ViT 动态超参数（三阶段 warmup V2）
+    """更新 Fractal ViT 动态超参数（三阶段 warmup V3 - P0 修复）
 
-    V2 改进：
-        - Power-Law Annealing: 使用 (0.5 * (1 - cos(πt)))^1.5 加速后期收敛
-        - Diversity 提前介入: Stage 2 即开启 diversity 惩罚，防止死路径
+    P0 修复：Stage 0 (epochs 0-5) 完全禁用 budget_weight，让 Backbone
+    在无稀疏压力下建立判别特征。
 
-    三阶段设计：
-        Stage 1 (0.0-0.3): 纯探索阶段，高活跃度，无 budget 约束
-        Stage 2 (0.3-1.0): Power-Law 压缩，逐渐引入 budget 约束 + diversity
-        Stage 3 (1.0+):    结构巩固阶段，启用完整约束
+    三阶段设计（P0 修复版）：
+        Stage 0 (0-5):   纯探索阶段，budget_weight=0，K=N（Standard ViT 模式）
+        Stage 1 (5-12):  温和稀疏区，budget_weight 0→0.005，K 从 N 退火到 0.75K_target
+        Stage 2 (12-25): 加速压缩，budget_weight 0.005→0.05，K 从 0.75K_target 退火到 0.5K_target
+        Stage 3 (25+):    结构巩固，budget_weight 0.05→0.20
+
+    注意：α 退火在 splitter.set_epoch() 中独立处理，不在此函数中
 
     Args:
         model: FractalCurveViT 模型
         epoch: 当前 epoch
-        warmup_epochs: warmup 总 epoch 数
+        warmup_epochs: warmup 总 epoch 数（用于 Stage 3 之后）
         config: 配置对象（需包含 config.training.budget_loss_weight）
 
     Returns:
-        包含 stage, target_ratio, budget_weight, tau, logits_diversity 的字典
+        包含 stage, target_ratio, budget_weight, tau, logits_diversity, k_min_ratio 的字典
     """
-    warmup_progress = epoch / max(warmup_epochs, 1)  # [0, 1]
-    # V2: 从 config.training 读取（而不是 getattr）
     budget_loss_weight_target = config.training.budget_loss_weight
 
     def cosine_progress(t: float) -> float:
         """S 型曲线进度因子: t=0 → 0.0, t=1 → 1.0（单向递增，避免悬崖）"""
         return 0.5 * (1 - math.cos(math.pi * t))
 
-    def power_law_progress(t: float, power: float = 1.5) -> float:
-        """V2: Power-Law 加速进度因子
+    def smoothstep(epoch: int, warmup_end: int, ramp_end: int) -> float:
+        """Smoothstep function for smoother annealing
 
-        公式: (0.5 * (1 - cos(πt)))^power
-        效果: 在 t → 1 时加速收敛，产生更强的向心压缩力
+        t=0 → 0.0, t=1 → 1.0，中间平滑过渡
         """
-        return cosine_progress(t) ** power
+        if epoch < warmup_end:
+            return 0.0
+        elif epoch > ramp_end:
+            return 1.0
+        else:
+            t = (epoch - warmup_end) / (ramp_end - warmup_end)
+            return t * t * (3 - 2 * t)
 
-    # Stage 判断
-    if warmup_progress < 0.3:
-        # Stage 1: Stochastic Exploration（Budget Soft-Start 防止 token 膨胀）
-        stage = 1
+    # Stage 判断（基于绝对 epoch，而非 warmup_progress 比例）
+    if epoch < 5:
+        # Stage 0: Pure Exploration - Backbone 建立基础特征
+        stage = 0
         target_ratio = 0.5
-        budget_weight = 0.005  # 改: 0.0 → 0.005 (Soft-Start 防止 epoch 7 清算危机)
+        budget_weight = 0.0  # P0 FIX: 彻底禁用 budget
         tau = 2.0
+        k_min_ratio = 1.0  # K_min = N，保留所有 token
         logits_diversity = False
-    elif warmup_progress < 1.0:
-        # Stage 2: Power-Law Budget Annealing（V2: 加速收敛 + diversity 提前开启）
-        stage = 2
-        stage_progress = (warmup_progress - 0.3) / 0.7  # [0, 1]
-        # V2: 使用 Power-Law 加速: factor^1.5
-        progress = power_law_progress(stage_progress, power=1.5)  # 单调递增: 0.0 → 1.0
-        target_ratio = 0.5 + (0.1 - 0.5) * progress  # 0.5 → 0.1
-        budget_weight = budget_loss_weight_target * progress  # 0.0 → 0.20
+    elif epoch < 12:
+        # Stage 1: Gentle Sparsification - 温和稀疏区
+        stage = 1
+        progress = (epoch - 5) / (12 - 5)  # 0.0 → 1.0
+        target_ratio = 0.5  # 保持 0.5，直到 Stage 2
+        budget_weight = 0.005 * progress  # 0.0 → 0.005
         tau = 2.0 + (1.0 - 2.0) * progress  # 2.0 → 1.0
-        # V2: Diversity 在 Stage 2 即开启，辅助压缩过程中的路径筛选
+        k_min_ratio = 1.0 - 0.25 * progress  # 1.0 → 0.75 (N → 0.75K_target)
+        logits_diversity = False
+    elif epoch < 25:
+        # Stage 2: Accelerated Compression - 加速压缩阶段
+        stage = 2
+        progress = (epoch - 12) / (25 - 12)  # 0.0 → 1.0
+        # Power-Law 加速
+        power_progress = cosine_progress(progress) ** 1.5
+        target_ratio = 0.5 - 0.4 * power_progress  # 0.5 → 0.1
+        budget_weight = 0.005 + 0.045 * power_progress  # 0.005 → 0.05
+        tau = 1.0  # τ 在 Stage 2 保持 1.0
+        k_min_ratio = 0.75 - 0.25 * power_progress  # 0.75 → 0.5 (0.75K_target → 0.5K_target)
         logits_diversity = True
     else:
-        # Stage 3: Structural Consolidation（锁定目标）
+        # Stage 3: Structural Consolidation - 结构巩固阶段
         stage = 3
         target_ratio = 0.1
-        budget_weight = budget_loss_weight_target
+        budget_weight = budget_loss_weight_target  # 使用配置的目标值
         tau = 1.0
+        k_min_ratio = 0.5  # K_min = 0.5 * K_target
         logits_diversity = True
 
     # 更新 model splitter 参数
@@ -678,18 +694,16 @@ def _update_fractal_hyperparams(
             splitter.set_budget_weight(budget_weight)
         if hasattr(splitter, 'set_logits_diversity'):
             splitter.set_logits_diversity(logits_diversity)
-
-    # V3: τ Floor - 防止 τ 过早降至 1.0，与 α 形成双重退火坍缩
-    # α 在 epoch 25 后才稳定到 1.5，所以 τ 也应该延迟到 epoch 25 后才降至 1.0
-    tau_floor = 1.2
-    if epoch < 25:
-        tau = max(tau, tau_floor)
+        if hasattr(splitter, 'set_k_min_ratio'):
+            # P0 FIX: 动态 K_min - 让 splitter 知道当前的 K_min 比例
+            splitter.set_k_min_ratio(k_min_ratio)
 
     return {
         'stage': stage,
         'target_ratio': target_ratio,
         'budget_weight': budget_weight,
         'tau': tau,
+        'k_min_ratio': k_min_ratio,  # P0 FIX: 传递给日志记录
         'logits_diversity': logits_diversity,
     }
 

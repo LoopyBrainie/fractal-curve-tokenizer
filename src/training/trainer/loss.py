@@ -197,6 +197,7 @@ def compute_loss(
     reduction: str = "mean",
     aux_losses: Optional[Dict[str, Tensor]] = None,
     aux_weight: float = 0.08,  # I107-OPT: 从 0.02 增到 0.08，增加预算损失梯度影响
+    budget_weight_override: Optional[float] = None,
 ) -> Tuple[torch.Tensor, dict]:
     """Compute cross-entropy loss with optional auxiliary losses
 
@@ -205,7 +206,10 @@ def compute_loss(
         targets: [B, C] (one-hot) or [B] (class indices)
         reduction: Loss reduction method
         aux_losses: Optional dict of auxiliary losses from splitter
-        aux_weight: Base weight for auxiliary losses (default: 0.02)
+        aux_weight: Base weight for auxiliary losses (default: 0.08)
+        budget_weight_override: Optional budget-specific weight from GradBalancer.
+            When provided, used instead of dynamic_w for budget loss.
+            Expected to be schedule_weight * w_adaptive.
 
     Returns:
         loss: Scalar loss tensor (main + weighted aux)
@@ -238,17 +242,22 @@ def compute_loss(
                 aux_mag = aux_loss.abs().detach().mean()
 
                 # I-OPT: 动态权重 - 保持 aux loss 在 CE 的 2-20% 范围
-                # dynamic_weight = aux_weight * (ce_mag / aux_mag).clamp(0.02, 1.0)
                 if aux_mag > 1e-8:
                     ratio = (ce_mag / aux_mag).clamp(0.02, 1.0)
                     dynamic_w = aux_weight * ratio
                 else:
                     dynamic_w = aux_weight
 
+                # P0 FIX: GradBalancer 闭环 - 对 budget loss 应用 budget_weight_override
+                if name == "budget" and budget_weight_override is not None:
+                    final_weight = budget_weight_override
+                else:
+                    final_weight = dynamic_w
+
                 # I-OPT: 不再 .detach()，让梯度流过 aux_loss（特别是 budget loss）
-                loss = loss + dynamic_w * aux_loss
+                loss = loss + final_weight * aux_loss
                 components[f"aux_{name}"] = aux_loss
-                components[f"aux_weight_{name}"] = dynamic_w
+                components[f"aux_weight_{name}"] = final_weight
 
     return loss, components
 

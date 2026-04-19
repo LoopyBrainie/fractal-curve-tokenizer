@@ -363,12 +363,13 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         # Entmax 参数 (I107: 添加预热策略 + 修复课程学习)
         self.entmax_alpha = entmax_alpha
-        self.entmax_alpha_init = 1.2      # 起始值 (softmax 模式)
+        self.entmax_alpha_init = 1.0      # P1 FIX: 起始值改为 1.0 (强制 softmax)
         self.entmax_alpha_warmup = 1.49    # V4: 1.49 而非 1.5，永远保持轻微梯度流
         self.entmax_alpha_max = 1.5       # 稳定值 (不再继续增加到 2.0)
-        self.entmax_warmup_epochs = 5      # 预热 epoch 数 (0-5: α=1.2)
+        self.entmax_warmup_epochs = 5      # Stage 0: epoch 0-5 (α=1.0)
+        self.entmax_transition_epochs = 12 # P1 FIX: Stage 1 结束 epoch (α 从 1.0 → 1.22)
         # V3: α 延迟调度 (15→25) 防止双重退火坍缩
-        self.entmax_schedule_epochs = 25   # 总调度 epoch 数 (5-25: α 线性增长到 1.5)
+        self.entmax_schedule_epochs = 25   # 总调度 epoch 数 (5-25: α 增长到 1.49)
 
         # 树约束 - I164-1: 动态λ调整
         # 使用log(lambda)确保λ>0，通过课程学习逐步增强约束
@@ -392,6 +393,9 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         self._target_ratio = 0.25        # 目标 token 比例
         self._budget_weight = None       # None 表示使用 get_auxiliary_losses 内的默认值
         self._logits_diversity_enabled = True  # 是否启用 logits 多样性惩罚
+        # P0 FIX: 动态 K_min 比例，由 _update_fractal_hyperparams 调度
+        # 1.0 = K_min = N（保留所有 token），0.5 = K_min = 0.5 * K_target
+        self._k_min_ratio = 1.0
 
         # Jump Loss 权重
         self.jump_loss_weight = jump_loss_weight
@@ -1483,27 +1487,53 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         """设置是否启用 logits 多样性惩罚"""
         self._logits_diversity_enabled = enabled
 
+    def set_k_min_ratio(self, ratio: float) -> None:
+        """P0 FIX: 设置 K_min 比例（用于动态 K_min 退火）
+
+        Args:
+            ratio: K_min 占 K_target 的比例，范围 [0.5, 1.0]
+                - 1.0: K_min = N（Stage 0，保留所有 token）
+                - 0.5: K_min = 0.5 * K_target（Stage 3+）
+        """
+        self._k_min_ratio = max(0.5, min(1.0, ratio))
+
     def set_epoch(self, epoch: int):
-        """设置当前 epoch"""
+        """P1 FIX: 设置当前 epoch，进行 Entmax α 分阶段退火
+
+        三阶段设计：
+            Stage 0 (0-5):   α = 1.0 (强制 softmax，稠密梯度)
+            Stage 1 (5-12):  α: 1.0 → 1.22 (温和稀疏区)
+            Stage 2 (12-25): α: 1.22 → 1.49 (高稀疏区)
+            Stage 3 (25+):   α = 1.49 (稳定期)
+
+        关键阈值 α ≈ 1.22：Entmax 开始表现明显稀疏性但仍保留较多"次要概率梯度"
+        """
         self._current_epoch = epoch
 
-        # V4: Entmax Alpha Sigmoid 平滑着陆
-        # Epoch 0-5:   α=1.2 (softmax 模式, 全梯度流)
-        # Epoch 5-25:  α sigmoid 平滑增长到 1.49  (V4: 代替线性插值)
-        # Epoch > 25: α=1.49 (永远保持轻微梯度流，不撞击 1.5 奇点)
+        def smoothstep(epoch: int, warmup_end: int, ramp_end: int) -> float:
+            """Smoothstep function for smoother alpha annealing"""
+            if epoch < warmup_end:
+                return 0.0
+            elif epoch > ramp_end:
+                return 1.0
+            else:
+                t = (epoch - warmup_end) / (ramp_end - warmup_end)
+                return t * t * (3 - 2 * t)
+
         if epoch < self.entmax_warmup_epochs:
-            # 预热阶段: α=1.2 (softmax 模式)
-            self.entmax_alpha = self.entmax_alpha_init
+            # Stage 0: α = 1.0 (强制 softmax，稠密梯度流)
+            self.entmax_alpha = 1.0
+        elif epoch < self.entmax_transition_epochs:
+            # Stage 1 (5-12): 温和稀疏区，α 从 1.0 退火到 1.22
+            progress = smoothstep(epoch, self.entmax_warmup_epochs, self.entmax_transition_epochs)
+            self.entmax_alpha = 1.0 + 0.22 * progress  # 1.0 → 1.22
         elif epoch < self.entmax_schedule_epochs:
-            # 过渡阶段: 使用 sigmoid 平滑曲线，防止 α 在后期突越 1.5
-            progress = (epoch - self.entmax_warmup_epochs) / max(1, self.entmax_schedule_epochs - self.entmax_warmup_epochs)
-            # D4-AUDIT FIX: 使用 Python math 替代 torch.sigmoid + .item()，避免 GPU 同步
-            x = -10.0 * (progress - 0.7)
-            sigmoid_val = 1 / (1 + math.exp(-x))
-            self.entmax_alpha = 1.2 + 0.29 * sigmoid_val
+            # Stage 2 (12-25): 高稀疏区，α 从 1.22 退火到 1.49
+            progress = smoothstep(epoch, self.entmax_transition_epochs, self.entmax_schedule_epochs)
+            self.entmax_alpha = 1.22 + 0.27 * progress  # 1.22 → 1.49
         else:
-            # V4: alpha_max = 1.49 而非 1.5，永远保持轻微梯度流
-            self.entmax_alpha = self.entmax_alpha_warmup
+            # Stage 3 (25+): α = 1.49 (稳定期)
+            self.entmax_alpha = 1.49
 
         # 温度由 BPE 三阶段调度器在 train_fractal_vit._update_fractal_hyperparams()
         # 中通过 set_temperature() 管理，此处不再内部退火，避免梯度冲突。
@@ -1582,38 +1612,35 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             losses['entropy'] = entropy
 
         # 2. Budget损失 - 控制 token 数量
-        # I-OPT: 使用 K_soft (STE) 替代 selected_mask.sum()
-        # 这样梯度可以流过 K 值到 density_field
-        # BUG-FIX: 归一化到 [0,1] 范围，使损失值与分辨率无关
+        # P0 FIX: 动态 K_min + 对数域 Budget Loss
+        # 使用 K_soft (STE) 替代 selected_mask.sum()，让梯度流过 K 值到 density_field
         if split_result.selected_mask is not None:
             B, N = split_result.selected_mask.shape
             # 优先使用 K_soft（梯度可流），否则 fallback 到实际选择数（无梯度）
             if hasattr(split_result, 'K_soft') and split_result.K_soft is not None:
-                K_loss = split_result.K_soft.squeeze()  # [1] or [B] -> []
-                # 确保 K_loss 是标量用于 MSE
-                if K_loss.dim() > 0:
-                    K_loss = K_loss.mean()
+                K_soft = split_result.K_soft.squeeze()  # [1] or [B] -> []
+                if K_soft.dim() > 0:
+                    K_soft = K_soft.mean()
             else:
                 # Fallback: 使用实际选择的 token 数（无梯度）
-                K_loss = split_result.selected_mask.sum(dim=1).float().mean()
-            # 归一化到 [0,1]：K_loss/N ∈ [0, 1], target_ratio ∈ [0, 1]
-            # 同时 clamp target_ratio 确保可达（不能超过 K_max/N）
-            # 优先使用实例属性 _target_ratio（外部调度），fallback 到参数
+                K_soft = split_result.selected_mask.sum(dim=1).float().mean()
+
+            # P0 FIX: 动态 K_min - 根据 _k_min_ratio 计算 K_min
+            # k_min_ratio = 1.0 (Stage 0): K_min = N，保留所有 token
+            # k_min_ratio = 0.5 (Stage 3+): K_min = 0.5 * K_target
             effective_target_ratio = getattr(self, '_target_ratio', target_ratio)
-            target_ratio_clamped = min(effective_target_ratio, self.K_max / N)
-            budget_loss = F.mse_loss(K_loss / N, target_ratio_clamped * torch.ones_like(K_loss))
-            # 应用外部 budget_weight（由 BPE 三阶段调度器设置）
-            # - None:  无调度器，沿用旧行为（compute_loss 动态权重）
-            # - 0.0:   Stage 1，完全排除 budget（纯 CE 梯度，零 budget 影响）
-            # - > 0:   Stage 2/3，预乘权重后加入损失字典
-            budget_weight = getattr(self, '_budget_weight', None)
-            if budget_weight is None:
-                # 原始行为：compute_loss 的 dynamic_w 负责权重
-                losses['budget'] = budget_loss
-            elif budget_weight > 0:
-                # BPE Stage 2/3：预乘 warmup 权重
-                losses['budget'] = budget_weight * budget_loss
-            # else budget_weight == 0.0 → BPE Stage 1：彻底排除，保证纯 CE 梯度
+            K_target = effective_target_ratio * N
+            k_min = max(1.0, self._k_min_ratio * K_target)
+            K_soft_clamped = K_soft.clamp(min=k_min)
+
+            # P0 FIX: 对数域 Budget Loss
+            # 公式: L_budget = (log(K_soft / K_target))^2
+            # 优势: 尺度不变性，K 接近目标时梯度平滑，防止平凡解 K→0
+            eps = 1e-8
+            log_ratio = torch.log(K_soft_clamped / (K_target + eps))
+            budget_loss = torch.pow(log_ratio, 2)
+
+            losses['budget'] = budget_loss
 
         # H1SS 公理 A4 (Tree): 树一致性通过局部层级软约束实现
         # z_parent -= λ × max(z_children)
