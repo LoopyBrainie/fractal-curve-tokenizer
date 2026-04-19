@@ -64,8 +64,9 @@ def evaluate(
     all_targets: List[torch.Tensor] = []
 
     # For per-class accuracy - 使用 bincount 向量化的 GPU tensor
-    class_correct = torch.zeros(num_classes, device=device)
-    class_total = torch.zeros(num_classes, device=device)
+    # I-OPT: 使用 torch.long 避免 scatter_add dtype 不匹配
+    class_correct = torch.zeros(num_classes, device=device, dtype=torch.long)
+    class_total = torch.zeros(num_classes, device=device, dtype=torch.long)
 
     total_batches = len(dataloader)
 
