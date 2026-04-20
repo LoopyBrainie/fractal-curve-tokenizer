@@ -454,6 +454,13 @@ class GeometricLatentDecoder(nn.Module):
         # 5 维几何特征 → rank 维
         self.feature_proj = nn.Linear(5, rank)
 
+        # 方案 C: 残差适配器 - 将 geometry_emb 投影到 rank 维后与 feature_proj 输出相加
+        # D = dim（隐藏维度），geometry_emb 是 [B, N, D]
+        self.emb_adapter = nn.Linear(dim, rank)
+        # 小初始化确保加载旧权重后初始行为不变
+        nn.init.normal_(self.emb_adapter.weight, std=1e-6)
+        nn.init.zeros_(self.emb_adapter.bias)
+
         # A1 修复: 移除 LayerNorm，直接用投影输出
         # 原因: LayerNorm 会归一化几何特征的均值和尺度
         #       几何特征的均值包含有用的距离趋势信息
@@ -491,6 +498,7 @@ class GeometricLatentDecoder(nn.Module):
     def forward(
         self,
         geometric_features: torch.Tensor,
+        geometry_emb: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         前向传播。
@@ -499,6 +507,10 @@ class GeometricLatentDecoder(nn.Module):
         ----
         geometric_features : torch.Tensor
             几何特征向量，形状 [B, N, N, 5] 或 [N, N, 5]
+        geometry_emb : torch.Tensor, optional
+            几何嵌入，形状 [B, N, D]。方案 C 残差适配器：
+            将其投影到 rank 维后与 feature_proj 输出相加，
+            打通 Splitter → geometry_emb → Attention 的梯度流。
 
         返回
         ----
@@ -516,6 +528,15 @@ class GeometricLatentDecoder(nn.Module):
 
         # 投影: [B, N, N, 5] → [B, N, N, rank]
         x = self.feature_proj(geometric_features)
+
+        # 方案 C: 残差融合 - geometry_emb 投影后与主干特征相加
+        # geometry_emb: [B, N, D] → [B, N, rank]
+        # 广播到 [B, N, N, rank]：每个 (i, j) 位置使用 source token i 的几何嵌入
+        if geometry_emb is not None:
+            emb_proj = self.emb_adapter(geometry_emb)  # [B, N, rank]
+            emb_proj = emb_proj.unsqueeze(2)  # [B, N, 1, rank]
+            emb_proj = emb_proj.expand(-1, -1, N, -1)  # [B, N, N, rank]
+            x = x + emb_proj  # 残差融合，梯度同时流向 feature_proj 和 emb_adapter
 
         # A1 修复: 移除 feature_norm，保持几何尺度和方向信息
 
@@ -1235,7 +1256,8 @@ class ManifoldNativeAttention(nn.Module):
             )
 
             # 解码为偏置
-            bias, manifold_coords = self.geo_decoder(geo_features)
+            # 方案 C: 传递 geometry_emb 到 geo_decoder，实现残差融合
+            bias, manifold_coords = self.geo_decoder(geo_features, geometry_emb)
 
             # P4-A 修复: 使用 in-place nan_to_num 保留梯度流
             # 原实现: bias = torch.nan_to_num(...) 创建新张量，断开梯度连接
