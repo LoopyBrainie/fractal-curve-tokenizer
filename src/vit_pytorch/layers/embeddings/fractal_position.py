@@ -775,16 +775,6 @@ class GeometryField(nn.Module):
             manifold_bias: [B, dim] 流形场编码
         """
 
-        # [DEBUG] P0: levels_info 空检查
-        num_elements = levels_info.data.numel()
-        if num_elements == 0:
-            # P0: 确认是否跳过了该模块
-            print(f"[CRITICAL] GeometryField.forward skipped: levels_info is empty at step {getattr(self, 'global_step', 'N/A')}")
-        else:
-            # P1 预检: 如果运行了，检查输入是否有梯度
-            if not levels_info.data.requires_grad and self.training:
-                print(f"[WARNING] GeometryField input 'levels_info.data' has no grad at step {getattr(self, 'global_step', 'N/A')}")
-
         # 提取深度和路径
         depths = levels_info.depths.clamp(0, self.max_level)
         paths = levels_info.paths

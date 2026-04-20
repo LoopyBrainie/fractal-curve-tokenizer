@@ -448,6 +448,12 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             embedding_dim=hidden_dim,
         )
 
+        # 3.5. 旋转嵌入投影层 (用于参数共享后维度对齐)
+        # 正常情况: rot_emb dim == hidden_dim (无需投影)
+        # 参数共享后: rot_emb dim == geometry_field.dim (需要投影到 hidden_dim)
+        # 注意: 使用 bias=False 避免引入额外的仿射变换，保持几何感知的线性投影特性
+        self.rot_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+
         # 4. 面积编码
         # D4 AUDIT FIX: 4.0 ** (-d) -> torch.exp2(-d.float() * 2.0) (vectorized, no Python loop)
         d_indices = torch.arange(max_level_limit + 1, dtype=torch.float32)
@@ -872,8 +878,16 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         final_rot_dir = rotation_dirs[:, -1]  # [N]
 
         # 使用 direction_embedding
-        rot_emb = self.orientation_extractor.direction_embedding(final_rot_dir)  # [N, hidden_dim]
-
+        rot_emb = self.orientation_extractor.direction_embedding(final_rot_dir)  # [N, hidden_dim 或 dim]
+        # 旋转嵌入投影（参数共享后维度可能不匹配：GeometryField 用 dim，Splitter 用 hidden_dim）
+        if rot_emb.shape[-1] != path_emb.shape[-1]:
+            # 维度不匹配：使用 rot_proj 进行投影
+            # rot_proj 输入维度固定为 hidden_dim，需要先调整 rot_emb 到 hidden_dim 维度
+            rot_emb_adjusted = F.linear(rot_emb, torch.eye(path_emb.shape[-1], rot_emb.shape[-1], device=rot_emb.device))
+            rot_emb = self.rot_proj(rot_emb_adjusted)
+        else:
+            # 维度匹配：直接使用 rot_proj（初始化为近似恒等映射）
+            rot_emb = self.rot_proj(rot_emb)
         # 面积编码 - 4^(-depth) → Linear 投影（消除 expand 导致的秩塌陷）
         area_enc = self._area_encoding[depths]  # [N]
         area_enc = self.area_proj(area_enc.unsqueeze(-1))  # [N] → [N, 1] → [N, hidden_dim]

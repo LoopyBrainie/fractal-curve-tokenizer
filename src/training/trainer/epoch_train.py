@@ -500,16 +500,6 @@ def train_one_epoch(
         else:
             loss.backward()
 
-        # [DEBUG] P0-Audit: 梯度断路审计
-        # 检查 splitter 参数的梯度是否正确回传
-        if (batch_idx + 1) % config.training.log_interval == 0:
-            for name, param in model.named_parameters():
-                if "splitter" in name.lower():
-                    if param.grad is None:
-                        print(f"  ❌ [GRAD_DISCONNECT] {name}: grad is None (不在计算图中)")
-                    elif param.grad.norm() == 0:
-                        print(f"  ⚠️  [ZERO_GRAD] {name}: grad norm = 0")
-
         # 将 loss component 记录从 forward 路径移到此处，确保 backward 可以先完成
         if config.numerical.record_loss_components and targets is not None:
             loss_components_float = {}

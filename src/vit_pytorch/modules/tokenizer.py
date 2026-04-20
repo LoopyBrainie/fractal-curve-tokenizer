@@ -655,12 +655,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
 
             tokens_per_batch = torch.bincount(batch_indices_for_bincount, minlength=B)
 
-            # [DEBUG] P0-Audit: batch_indices 塌缩验证
-            # 如果零值数量 >> 0，说明 batch_indices 塌缩到少数几个索引
-            zero_count = (tokens_per_batch == 0).sum().item()
-            if zero_count > 0:
-                print(f"  [DEBUG] batch_indices 塌缩检测: 零值batch数={zero_count}/{B}, min={tokens_per_batch.min().item()}, max={tokens_per_batch.max().item()}, mean={tokens_per_batch.float().mean().item():.1f}")
-
             # I24-14: 无条件 clamp (torch.compile 安全)
             # 不使用 .item() 或数据依赖的 if，直接 clamp
             tokens_per_batch = tokens_per_batch.clamp(min=1)
