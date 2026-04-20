@@ -364,12 +364,12 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # Entmax 参数 (I107: 添加预热策略 + 修复课程学习)
         self.entmax_alpha = entmax_alpha
         self.entmax_alpha_init = 1.0      # P1 FIX: 起始值改为 1.0 (强制 softmax)
-        self.entmax_alpha_warmup = 1.49    # V4: 1.49 而非 1.5，永远保持轻微梯度流
-        self.entmax_alpha_max = 1.5       # 稳定值 (不再继续增加到 2.0)
+        self.entmax_alpha_warmup = 1.30    # P1 FIX: 上限从 1.49 降至 1.30，防止过度稀疏化
+        self.entmax_alpha_max = 1.30       # P1 FIX: 稳定值设为 1.30
         self.entmax_warmup_epochs = 5      # Stage 0: epoch 0-5 (α=1.0)
         self.entmax_transition_epochs = 12 # P1 FIX: Stage 1 结束 epoch (α 从 1.0 → 1.22)
-        # V3: α 延迟调度 (15→25) 防止双重退火坍缩
-        self.entmax_schedule_epochs = 25   # 总调度 epoch 数 (5-25: α 增长到 1.49)
+        # P1 FIX: α 延迟调度 (12→25) 爬升至 1.30，不再到达 1.49
+        self.entmax_schedule_epochs = 25   # 总调度 epoch 数 (5-25: α 增长到 1.30)
 
         # 树约束 - I164-1: 动态λ调整
         # 使用log(lambda)确保λ>0，通过课程学习逐步增强约束
@@ -1130,9 +1130,10 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # get_adaptive_alpha 最大返回 ~1.7，永远低于 1.9 阈值，导致 entmax 死代码
         alpha = self.entmax_alpha
 
-        # alpha < 1.5: Softmax（早期训练，全梯度流）
-        # alpha >= 1.5: Entmax（逐渐稀疏，晚期稀疏性选择）
-        if alpha < 1.5:
+        # P1 FIX: alpha < 1.2: Softmax（早期训练，全梯度流）
+        # alpha >= 1.2: Entmax（逐渐稀疏，晚期稀疏性选择）
+        # 原阈值 1.5 降至 1.2，因为稳定期 alpha 现在是 1.30
+        if alpha < 1.2:
             probs = F.softmax(logits / tau, dim=-1)
         else:
             probs = entmax_beta(logits / tau, alpha=alpha, dim=-1)
@@ -1528,12 +1529,12 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             progress = smoothstep(epoch, self.entmax_warmup_epochs, self.entmax_transition_epochs)
             self.entmax_alpha = 1.0 + 0.22 * progress  # 1.0 → 1.22
         elif epoch < self.entmax_schedule_epochs:
-            # Stage 2 (12-25): 高稀疏区，α 从 1.22 退火到 1.49
+            # Stage 2 (12-25): 高稀疏区，α 从 1.22 退火到 1.30
             progress = smoothstep(epoch, self.entmax_transition_epochs, self.entmax_schedule_epochs)
-            self.entmax_alpha = 1.22 + 0.27 * progress  # 1.22 → 1.49
+            self.entmax_alpha = 1.22 + 0.08 * progress  # 1.22 → 1.30 (P1 FIX)
         else:
-            # Stage 3 (25+): α = 1.49 (稳定期)
-            self.entmax_alpha = 1.49
+            # Stage 3 (25+): α = 1.30 (稳定期)
+            self.entmax_alpha = 1.30
 
         # 温度由 BPE 三阶段调度器在 train_fractal_vit._update_fractal_hyperparams()
         # 中通过 set_temperature() 管理，此处不再内部退火，避免梯度冲突。

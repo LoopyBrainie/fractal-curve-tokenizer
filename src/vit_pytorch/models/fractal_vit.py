@@ -1880,6 +1880,9 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             actual_tokens = num_tokens_tensor.sum()  # D1-AUDIT: GPU tensor
             if target_tokens > 0:
                 raw_budget_error = torch.abs(actual_tokens.float() - target_tokens) / target_tokens  # D1-AUDIT: GPU tensor
+            # [DEBUG] P0-Audit: raw_budget_error = 3.0 来源追踪
+            if raw_budget_error is not None and raw_budget_error.item() > 2.0:
+                print(f"  [DEBUG] raw_budget_error 异常: actual={actual_tokens.item():.0f}, target={target_tokens.item():.0f}, rbe={raw_budget_error.item():.3f}")
 
         # I-AUDIT: 计算 density_regularization (密度正则化)
         # 基于选中 token 分布的均匀性

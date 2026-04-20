@@ -164,6 +164,34 @@ class GradBalancer:
 
         return max(0.0, min(scale, 1.0))  # 限制在 [0, 1]
 
+    def compute_scale_from_ema(self) -> float:
+        """基于已更新的EMA计算缩放因子（不重复更新EMA）
+
+        在 train_one_epoch 中，grad_balancer.compute() 已更新 EMA，
+        所以此方法直接使用已有的 EMA 值计算缩放因子。
+
+        Returns:
+            缩放因子 (0.0, 1.0]，1.0 表示不需要缩放
+        """
+        eps = 1e-8
+
+        # 使用已更新的 EMA 计算比例
+        ratio_ema = self.g_budget_ema / (self.g_ce_ema + eps)
+
+        # 动态上限：使用 EMA 比例，但不超过 max_ratio
+        dynamic_max_ratio = min(self.max_ratio, ratio_ema)
+
+        # 计算允许的最大 budget 梯度（使用当前 EMA 值）
+        allowed_budget_norm = self.g_ce_ema * dynamic_max_ratio
+
+        # 缩放因子：确保 budget_grad 不会超过 allowed
+        if self.g_budget_ema > allowed_budget_norm:
+            scale = allowed_budget_norm / (self.g_budget_ema + eps)
+        else:
+            scale = 1.0
+
+        return max(0.0, min(scale, 1.0))  # 限制在 [0, 1]
+
 
 def train_one_epoch(
     model: nn.Module,
@@ -462,13 +490,22 @@ def train_one_epoch(
                 loss = torch.tensor(0.0, device=device)
                 loss_components = {}
 
-        # Backward
+# Backward
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
 
-        # I-OPT: 延迟 .item() 到 backward 结束后，避免阻塞 GPU 流水线
+        # [DEBUG] P0-Audit: 梯度断路审计
+        # 检查 splitter 参数的梯度是否正确回传
+        if (batch_idx + 1) % config.training.log_interval == 0:
+            for name, param in model.named_parameters():
+                if "splitter" in name.lower():
+                    if param.grad is None:
+                        print(f"  ❌ [GRAD_DISCONNECT] {name}: grad is None (不在计算图中)")
+                    elif param.grad.norm() == 0:
+                        print(f"  ⚠️  [ZERO_GRAD] {name}: grad norm = 0")
+
         # 将 loss component 记录从 forward 路径移到此处，确保 backward 可以先完成
         if config.numerical.record_loss_components and targets is not None:
             loss_components_float = {}
@@ -616,16 +653,17 @@ def train_one_epoch(
 
         if not should_skip_step:
             # 正常路径：尝试 optimizer step
-            # P1-1 FIX: Splitter 梯度裁剪（独立于主梯度裁剪）
+            # P1-1 FIX: Splitter 梯度动态缩放（二级防御）
             # 理论: 当 splitter_grad_norm >> backbone_grad_norm 时，
             # AdamW 动量会将大量步长分配给 Splitter，导致 Backbone 被"漂移"
-            # clip_grad_norm_ 按向量范数缩放，保留梯度方向（优于 clamp_ 的逐元素截断）
+            # 使用 GradBalancer.compute_scale_from_ema() 动态计算缩放因子
+            # 注意: grad_balancer.compute() 已在 line 572 更新了 EMA，此处直接使用
             if hasattr(model, 'splitter') and model.splitter is not None:
-                torch.nn.utils.clip_grad_norm_(
-                    model.splitter.parameters(),
-                    max_norm=5.0,
-                    norm_type=2.0,
-                )
+                scale = grad_balancer.compute_scale_from_ema() if grad_balancer else 1.0
+                if scale < 1.0:
+                    for param in model.splitter.parameters():
+                        if param.grad is not None:
+                            param.grad.mul_(scale)
 
             # Gradient clipping (P0-Fix: 加强梯度裁剪，防止梯度爆炸)
             if config.training.gradient_clip_norm > 0:
