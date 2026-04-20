@@ -1619,12 +1619,18 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             # 计算几何流形场编码 (levels_info 已包含 CLS)
             manifold_emb = self.geometry_field(levels_info)  # [B, N+1, dim]
 
+            # [DEBUG] P1.5 诊断 A: 检查 manifold_emb 的梯度函数
+            print(f"  [DEBUG] manifold_emb.grad_fn={manifold_emb.grad_fn}, requires_grad={manifold_emb.requires_grad}")
+
             # I-AUDIT: 保存原始 manifold_emb 用于统计计算（在融合前）
             manifold_emb_for_stats = manifold_emb.detach()
 
             # 缩放并融合到现有的 geometry_emb
             # geometry_emb_with_cls 形状: [B, N+1, dim]
             geometry_emb_with_cls = geometry_emb_with_cls + self.manifold_bias_scale * manifold_emb
+
+            # [DEBUG] P1.5 诊断 B: 检查融合后的 geometry_emb_with_cls
+            print(f"  [DEBUG] geometry_emb_with_cls grad_fn={geometry_emb_with_cls.grad_fn}, requires_grad={geometry_emb_with_cls.requires_grad}")
 
         # I-AUDIT: 计算 manifold_bias_* 统计（在融合后仍有 geometry_emb_with_cls 可用）
         manifold_bias_max = None
