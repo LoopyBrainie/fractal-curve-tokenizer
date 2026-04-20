@@ -647,10 +647,12 @@ def _update_fractal_hyperparams(
 
     # Stage 判断（基于绝对 epoch，而非 warmup_progress 比例）
     if epoch < 5:
-        # Stage 0: Pure Exploration - Backbone 建立基础特征
+        # Stage 0: 占位策略 - 强制 Splitter 全路径激活，打破"保守初始化"死锁
+        # P1-1 FIX: 目标比例从 0.5 提升到 1.0，budget_weight 从 0 改为 0.001
+        # 原因：Stage 0 原设计(budget_weight=0)导致 Splitter 陷入"低 token 数"局部最优
         stage = 0
-        target_ratio = 0.5
-        budget_weight = 0.0  # P0 FIX: 彻底禁用 budget
+        target_ratio = 1.0  # 全路径激活，鼓励探索
+        budget_weight = 0.001  # 轻微预算压力，防止完全自由探索
         tau = 2.0
         k_min_ratio = 1.0  # K_min = N，保留所有 token
         logits_diversity = False
@@ -697,6 +699,10 @@ def _update_fractal_hyperparams(
         if hasattr(splitter, 'set_k_min_ratio'):
             # P0 FIX: 动态 K_min - 让 splitter 知道当前的 K_min 比例
             splitter.set_k_min_ratio(k_min_ratio)
+
+    # P1-3 FIX: 同步更新 model.target_ratio，确保 fractal_vit.py 中的 raw_budget_error 计算一致
+    if hasattr(model, 'target_ratio'):
+        model.target_ratio = target_ratio
 
     return {
         'stage': stage,
