@@ -175,6 +175,10 @@ class GradBalancer:
         """
         eps = 1e-8
 
+        # 如果 EMA 尚未初始化（compute() 从未被调用），返回 1.0
+        if self.g_ce_ema is None or self.g_budget_ema is None:
+            return 1.0
+
         # 使用已更新的 EMA 计算比例
         ratio_ema = self.g_budget_ema / (self.g_ce_ema + eps)
 
