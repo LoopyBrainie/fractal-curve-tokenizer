@@ -5,19 +5,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Quick Commands
 
 ```bash
-# Testing
 uv run pytest tests/ -v
-uv run pytest -m "not slow"          # Skip slow tests
+uv run pytest -m "not slow"
+uv run pytest tests/test_fractal_rope.py
 
-# Training
 uv run python src/training/train_fractal_vit.py --quick-test --use-amp
-.\src\training\train_tiny_imagenet_4070_optimal.ps1  # RTX 4070
+uv run python src/training/train_fractal_vit.py --dataset cub200 --image-size None --use-amp --compile
+.\src\training\train_tiny_imagenet_4070_optimal.ps1
 ```
 
 ## Package Import
 
-**CRITICAL**: Before any Python execution, always add src to path:
-
+**CRITICAL**: `src/` path is auto-configured in training scripts. For standalone scripts:
 ```python
 import sys
 sys.path.insert(0, 'src')
@@ -28,16 +27,16 @@ sys.path.insert(0, 'src')
 ## Development Rules
 
 - Use `uv run pytest ...` / `uv run python ...` (not bare commands)
-- IDE: PowerShell (no CUDA locally); Training: Podman container (CUDA)
+- **Mathematical Formalization First**: Derive mathematical forms before any code changes
 
 ## Module Hierarchy
 
-| Layer | Purpose | Key Files |
-| ----- | ----- | ----- |
-| L4 Application | Main model | `models/fractal_vit.py` |
-| L3 Pipeline | Tokenization & Transformer | `modules/tokenizer.py`, `modules/transformer_block.py` |
-| L2 Components | Splitter, Attention, FFN | `layers/splitters/hilbert_optimal_splitter.py`, `layers/attention/manifold_attention.py`, `layers/ffn/swiglu.py` |
-| L1 Foundation | Hilbert curves, config | `core/curve_hilbert.py`, `core/config.py` |
+| Layer | Purpose |
+| ----- | ----- |
+| L4 Application | Main model (`FractalCurveViT`) |
+| L3 Pipeline | Tokenization (`StreamingFractalTokenizer`) & Transformer (`FractalTransformer`) |
+| L2 Components | Splitter, Attention, FFN |
+| L1 Foundation | Hilbert curves, config primitives |
 
 ## Import Rules
 
@@ -51,12 +50,19 @@ sys.path.insert(0, 'src')
 **Wrong**: `from vit_pytorch.modules.base_splitter import CoreSplitter`
 **Correct**: `from vit_pytorch.core.splitter_protocol import CoreSplitter`
 
-## Training
+## Core Concepts
 
-```bash
-# CUB-200 (dynamic resolution)
-uv run python src/training/train_fractal_vit.py --dataset cub200 --image-size None --use-amp --compile
-```
+### Hilbert Curve Tokenization
+Space-filling curve preserving 2D locality. Tokenizer: `StreamingFractalTokenizerV3` + `HilbertOptimalSplitter` (H1SS) for adaptive quadtree decomposition.
+
+### Dual-Path RoPE
+- **Physical field** (first D/2): `Cartesian2DRoPE`
+- **Topology field** (second D/2): `DirectionAwareSubspacedRoPE` (C+ RoPE)
+
+C+ RoPE provides direction-aware subspace isolation for Hilbert curve topology.
+
+### Adaptive Tokenization
+Token count `N ∈ [K_min, K_max]` where `K_min=8, K_max=64`. More tokens → complex regions; fewer → uniform areas.
 
 ## Model-Trainer Interface
 
@@ -64,65 +70,51 @@ uv run python src/training/train_fractal_vit.py --dataset cub200 --image-size No
 
 `forward()` returns `TrainingStats`: `logits`, `num_tokens`, `depth_used`, `depth_distribution`, `features`, `transformer_tokens`
 
+## Logging System Design
+
+**Layer-Packaged → Trainer-Unpacked**: `LAYER → auxiliary_outputs → FractalCurveViT.forward() → flatten → UnifiedMonitor`
+
+Key format: `train/{layer}/{metric}`
+
+| Source | Format |
+| ----- | ----- |
+| Splitter | `train/splitter/{metric}` |
+| Attention | `train/attn_{i}/{metric}` |
+| FFN | `train/ffn_{i}/{metric}` |
+
+**Adding a new layer**: Implement `xxx_output` property → add key in `fractal_vit.py` auxiliary_outputs → no trainer changes.
+
+## Critical Patterns
+
+- **STE Gradient**: `F.gumbel_softmax(logits, hard=True)` + `loss.backward()`
+- **Dynamic Resolution**: `model = FractalCurveViT(image_size=None, ...)`
+- **torch.compile cache**:
+  ```python
+  def _dynamo_safe_lru_cache(maxsize: int = 128):
+      cached = lru_cache(maxsize=maxsize)(func)
+      return torch._dynamo.disable(cached)
+  ```
+
 ## Conventions
 
 - Constants: `from vit_pytorch.core.constants import EPS, TEMPERATURE_MIN`
 - Default splitter: `HilbertOptimalSplitter` (H1SS)
-
-## Logging System Design
-
-### Layer-Packaged → Trainer-Unpacked Architecture
-
-```
-LAYER → auxiliary_outputs → FractalCurveViT.forward() → flatten → UnifiedMonitor
-```
-
-**Core files**:
-
-- `src/vit_pytorch/core/layer_output.py` - `LayerOutputProtocol` + `flatten_layer_outputs()`
-- `src/vit_pytorch/core/splitter_protocol.py` - `SplitResult.splitter_output` property
-- `src/vit_pytorch/models/fractal_vit.py` - collects auxiliary_outputs
-- `src/training/monitor/unified.py` - `_record_auxiliary_outputs()` + `_record_training_stats()`
-
-**Flattened key format**: `train/{layer}/{metric}`
-
-| Source | Format | Example |
-| ----- | ----- | ----- |
-| Splitter | `train/splitter/{metric}` | `train/splitter/entropy` |
-| Attention | `train/attn_{i}/{metric}` | `train/attn_0/geometric_bias_mean` |
-| FFN | `train/ffn_{i}/{metric}` | `train/ffn_0/level_mixing_mean` |
-
-**Adding a new layer**:
-
-1. Implement `xxx_output` property returning `Dict[str, float]`
-2. Add key in `fractal_vit.py` auxiliary_outputs collection
-3. No trainer changes needed
-
-## Critical Patterns
-
-- **STE Gradient**: `selected_mask = F.gumbel_softmax(logits, hard=True); loss.backward()`
-- **Dynamic Resolution**: `model = FractalCurveViT(image_size=None, ...)`
-- **torch.compile cache**: `cached = lru_cache(maxsize=maxsize)(func); return torch._dynamo.disable(cached)`
-
-## Known Limitations
-
-- **Hilbert locality**: Upper bound, actual preservation depends on traversal order
-- **Gradient coverage**: Limited to K selected tokens in分裂 regions
-- **LCA correspondence**: Hilbert indices provide good but not exact quadtree correspondence
+- Issue tracking: `test_<issue_id>_<feature>.py`
+- Code comments: `# I24-2: Import Scheme E learnable quota constants`
 
 ## Common Pitfalls
 
 ### Numerical Stability
-
 - Use constants from `constants.py` instead of magic numbers
 - Prevent log(0)/div(0) with `*_EPSILON` constants
 
 ### Gradient Flow
-
 - STE operations require `detach().item()` for loss extraction
 - Hierarchical Top-K breaks computation graph - use `detach()` + separate loss calls
 
 ## Documentation
 
 - [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md): Issue tracker
-- [docs/](docs): Architecture deep-dives
+- [docs/01_overview.md](docs/01_overview.md): System architecture
+- [docs/03_fractal_tokenizer.md](docs/03_fractal_tokenizer.md): Tokenization
+- [docs/05_attention_mechanism.md](docs/05_attention_mechanism.md): Attention

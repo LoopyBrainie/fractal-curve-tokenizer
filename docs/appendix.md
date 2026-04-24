@@ -204,11 +204,6 @@ ffn = SwiGLUFFN(dim=384, hidden_dim=512)
 
 # Position embedding
 pos_emb = FractalPositionEmbedding(dim=384, max_level=50)
-
-# Hierarchical Attention Bias
-from vit_pytorch import FractalConfig
-config = FractalConfig(image_size=224)
-hier_bias = HierarchicalAttentionBias(config=config, heads=6)
 ```
 
 ---

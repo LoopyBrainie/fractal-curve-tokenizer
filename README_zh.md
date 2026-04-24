@@ -1,5 +1,8 @@
 # Fractal Curve ViT
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/LoopyBrainie/fractal-curve-tokenizer)
+[![Docker Hub](https://img.shields.io/docker/v/loopybrainie/fractal-curve-tokenizer?label=docker&color=2496ed)](https://hub.docker.com/repository/docker/loopybrainie/fractal-curve-tokenizer/general)
+
 [English](README.md) | [中文](README_zh.md)
 
 采用 **Hilbert 曲线分词** 和 **自适应多尺度 patch 选择** 的视觉 Transformer。Fractal ViT 根据图像复杂度动态分配 token。

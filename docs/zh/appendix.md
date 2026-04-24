@@ -191,7 +191,6 @@ from vit_pytorch import (
     ManifoldNativeAttention,
     SwiGLUFFN,
     FractalPositionEmbedding,
-    HierarchicalAttentionBias,
 )
 
 # 注意力
@@ -204,11 +203,6 @@ ffn = SwiGLUFFN(dim=384, hidden_dim=512)
 
 # 位置嵌入
 pos_emb = FractalPositionEmbedding(dim=384, max_level=50)
-
-# 层级注意力偏置
-from vit_pytorch import FractalConfig
-config = FractalConfig(image_size=224)
-hier_bias = HierarchicalAttentionBias(config=config, heads=6)
 ```
 
 ---
