@@ -117,6 +117,62 @@ class GradientMonitor:
 
         return norms
 
+    def compute_spectral_norm(self, module: nn.Module) -> float:
+        """Compute spectral norm (max singular value) of module's weight matrices
+
+        C1: Spectral norm is a more fundamental health metric than grad norm.
+        It measures the "amplification factor" of the weight matrix. A sudden
+        increase in spectral norm indicates the weight matrix is becoming
+        ill-conditioned (precursor to training collapse).
+
+        Args:
+            module: The module to compute spectral norm for
+
+        Returns:
+            Maximum spectral norm across all weight matrices in the module
+        """
+        max_spec_norm = 0.0
+        try:
+            with torch.no_grad():
+                for name, param in module.named_parameters():
+                    if 'weight' in name and param.dim() >= 2:
+                        try:
+                            # Compute singular values using torch.linalg.svd
+                            # s[0] is the largest singular value (spectral norm)
+                            s = torch.linalg.svd(param.float(), compute_uv=False).s
+                            spec_norm = s[0].item()
+                            max_spec_norm = max(max_spec_norm, spec_norm)
+                        except (RuntimeError, torch.cuda.OutOfMemoryError):
+                            # Handle non-full-rank matrices or OOM
+                            pass
+        except Exception:
+            pass
+        return max_spec_norm
+
+    def compute_geometry_spectral_norms(self) -> Dict[str, float]:
+        """C1: Compute spectral norms for GeometryField modules
+
+        GeometryField is particularly susceptible to spectral norm explosion
+        because it operates on potentially ill-conditioned distance matrices.
+
+        Returns:
+            Dictionary of module name -> spectral norm
+        """
+        if self.model is None:
+            return {}
+
+        spec_norms = {}
+        for name, module in self.model.named_modules():
+            if 'geometry' in name.lower() or 'geo_decoder' in name.lower():
+                if len(list(module.parameters())) > 0:
+                    spec_norm = self.compute_spectral_norm(module)
+                    if spec_norm > 0:
+                        spec_norms[name] = spec_norm
+                        if self.collector is not None:
+                            self.collector.record(f'spectral_norm/{name}', spec_norm)
+
+        return spec_norms
+
     def compute_total_grad_norm(self) -> float:
         """Compute total gradient norm (for clipping)
 

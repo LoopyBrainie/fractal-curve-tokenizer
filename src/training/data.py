@@ -88,6 +88,117 @@ class HFDatasetWrapper(Dataset):
         return self._dataset[idx]
 
 
+class CUB200Dataset(ImageFolder):
+    """CUB-200-2011 Dataset with proper train/val split.
+
+    CUB-200-2011 dataset structure:
+        CUB_200_2011/
+        ├── images/                    # All images in class folders
+        │   ├── class1/
+        │   │   ├── image1.jpg
+        │   │   └── ...
+        │   └── class2/
+        ├── train_test_split.txt      # Train/test split annotation
+        └── ... (other metadata)
+
+    The train_test_split.txt contains lines like:
+        images/class1/image1.jpg 1
+        images/class2/image2.jpg 0
+    Where 1 = training, 0 = test/validation
+    """
+
+    def __init__(
+        self,
+        root: str,
+        split: str = 'train',
+        transform: Optional[transforms.Compose] = None,
+    ):
+        """Initialize CUB-200 dataset.
+
+        Args:
+            root: Root directory of CUB-200-2011 dataset
+            split: 'train' or 'val'
+            transform: Optional transform to apply
+        """
+        self._root = Path(root)
+        self._split = split
+        self._split_file = self._root / 'train_test_split.txt'
+
+        # Parse split file to get train/val indices
+        self._split_dict = self._parse_split_file()
+
+        # Initialize ImageFolder with all images
+        super().__init__(root=str(self._root / 'images'), transform=transform)
+
+        # Filter samples based on split
+        self._filter_samples()
+
+    def _parse_split_file(self) -> Dict[str, bool]:
+        """Parse train_test_split.txt file.
+
+        Returns:
+            Dict mapping image path (relative to images/) to is_train flag
+        """
+        split_dict = {}
+        if self._split_file.exists():
+            with open(self._split_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            img_path = parts[0]  # e.g., "images/class1/image1.jpg"
+                            is_train = parts[1] == '1'
+                            split_dict[img_path] = is_train
+        else:
+            print(f"Warning: {self._split_file} not found. Using all images for both splits.")
+            # Fallback: treat all as training if split file doesn't exist
+        return split_dict
+
+    def _filter_samples(self):
+        """Filter samples based on split (train or val)."""
+        if not self._split_dict:
+            return  # Fallback mode, no filtering
+
+        # Get class-to-idx mapping from ImageFolder
+        class_to_idx = self.class_to_idx
+
+        # Filter samples
+        filtered_samples = []
+        for path, class_idx in self.samples:
+            # Convert path to relative path from root/images/
+            try:
+                rel_path = path.relative_to(self._root / 'images')
+                rel_path_str = str(rel_path).replace('\\', '/')
+            except ValueError:
+                # If relative_to fails, try to construct the path
+                rel_path_str = Path(path).name
+
+            # Check if this sample belongs to the current split
+            # The split file uses paths like "images/class1/image1.jpg"
+            # We need to match against the full relative path
+            is_train = self._split_dict.get(rel_path_str, True)
+
+            if self._split == 'train' and is_train:
+                filtered_samples.append((path, class_idx))
+            elif self._split == 'val' and not is_train:
+                filtered_samples.append((path, class_idx))
+
+        self.samples = filtered_samples
+
+        # Update targets accordingly
+        self.targets = [s[1] for s in self.samples]
+
+        # Re-index class-to-idx to only include classes in this split
+        # (optional, but helps avoid empty class indices)
+        if filtered_samples:
+            used_classes = set(s[1] for s in filtered_samples)
+            self.class_to_idx = {
+                cls: idx for cls, idx in self.class_to_idx.items()
+                if idx in used_classes
+            }
+
+
 class HFStreamingDatasetWrapper(IterableDataset):
     """Wrapper for streaming Hugging Face IterableDatasets with on-the-fly transforms.
 
@@ -404,15 +515,13 @@ def create_dataset(
         return ImageFolder(root=str(data_path), transform=transform)
 
     elif name_lower == 'cub200':
-        # CUB-200-2011
+        # CUB-200-2011 - uses train_test_split.txt for train/val separation
         cub_root = root / 'CUB_200_2011'
-
-        if split == 'train':
-            data_path = cub_root / 'images'  # Will be filtered
-        else:
-            data_path = cub_root / 'images'
-
-        return ImageFolder(root=str(data_path), transform=transform)
+        return CUB200Dataset(
+            root=str(cub_root),
+            split=split,
+            transform=transform,
+        )
 
     elif name_lower == 'mnist':
         from torchvision.datasets import MNIST
@@ -440,4 +549,5 @@ __all__ = [
     'get_hf_path',
     'DATASET_INFO',
     'HFDatasetWrapper',
+    'CUB200Dataset',
 ]

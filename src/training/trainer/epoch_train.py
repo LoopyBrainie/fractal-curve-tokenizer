@@ -206,7 +206,6 @@ def train_one_epoch(
     config: Config,
     device: torch.device,
     scheduler: Optional[Any] = None,
-    splitter_scheduler: Optional[Any] = None,  # V4: Splitter 独立 LR scheduler
     mixup_cutmix: Optional[MixupCutmixLoss] = None,
     debug_dir: Optional[str] = None,
     collector: Optional[Any] = None,  # NEW: Optional MetricsCollector
@@ -372,7 +371,17 @@ def train_one_epoch(
         if mixup_cutmix is not None and labels is not None:
             images, targets = mixup_cutmix(images, labels, apply_aug=apply_mixup)
         else:
-            targets = torch.nn.functional.one_hot(labels, model.num_classes).float() if labels is not None else None
+            # P0 FIX: num_classes fallback - 从 model 属性获取，若无则报错
+            if labels is not None:
+                model_classes = getattr(model, 'num_classes', None)
+                if model_classes is None:
+                    raise ValueError(
+                        "model.num_classes is required for one-hot encoding when labels provided. "
+                        "Ensure model architecture has num_classes attribute set."
+                    )
+                targets = torch.nn.functional.one_hot(labels, model_classes).float()
+            else:
+                targets = None
 
         # Forward pass with AMP
         with amp_autocast('cuda', enabled=config.amp.enabled):
@@ -603,6 +612,16 @@ def train_one_epoch(
                 if grad_balancer is not None and backbone_grad_norm > 0 and splitter_grad_norm > 0:
                     grad_balancer.compute(backbone_grad_norm, splitter_grad_norm)
 
+            # C1: Spectral Norm 监控 - 每 100 步计算一次 Geometry 模块的谱范数
+            # 谱范数 = 权重矩阵的最大奇异值，反映结构健康度
+            # 异常阈值: >10 或突然翻倍预警
+            if (state.global_step + 1) % (config.training.log_interval * 10) == 0:
+                geo_spec_norms = grad_monitor.compute_geometry_spectral_norms()
+                if geo_spec_norms:
+                    for name, spec_norm in geo_spec_norms.items():
+                        if spec_norm > 10.0:
+                            print(f"  [WARN] Spectral norm explosion: {name} = {spec_norm:.2f}")
+
         # 显存峰值监控
         if torch.cuda.is_available():
             current_memory_mb = torch.cuda.max_memory_allocated() / 1024**2
@@ -659,11 +678,12 @@ def train_one_epoch(
                         if param.grad is not None:
                             param.grad.mul_(scale)
 
-            # Gradient clipping (P0-Fix: 加强梯度裁剪，防止梯度爆炸)
+            # Gradient clipping (P0-Fix: 使用配置值替代硬编码max_norm=1.0)
             if config.training.gradient_clip_norm > 0:
+                # P0 修复: 改用 config.gradient_clip_norm，允许临时放宽到 1000 进行诊断
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(),
-                    max_norm=1.0,
+                    max_norm=config.training.gradient_clip_norm,
                 )
                 # A-NAN FIX: 检查裁剪后的梯度是否有限
                 if not torch.isfinite(grad_norm):
@@ -674,8 +694,6 @@ def train_one_epoch(
                 # Update scheduler BEFORE optimizer step
                 if scheduler is not None:
                     scheduler.step(state.global_step)
-                if splitter_scheduler is not None:
-                    splitter_scheduler.step(state.global_step)
 
                 # Optimizer step
                 if scaler is not None:
@@ -744,9 +762,6 @@ def train_one_epoch(
             # Still need to update scheduler even when skipping
             if scheduler is not None:
                 scheduler.step(state.global_step)
-            # V4: Splitter 独立 LR scheduler 也同步 step
-            if splitter_scheduler is not None:
-                splitter_scheduler.step(state.global_step)
             optimizer.zero_grad()
             if scaler is not None:
                 scaler.update()  # 即使 skip，也必须 update 以便自动降 scale
@@ -800,6 +815,22 @@ def train_one_epoch(
 
     # Get layer gradient norms
     layer_grad_norms = grad_monitor.get_layer_statistics()
+
+    # P0: Layer-wise SNR 监控 - 诊断梯度展平和 Rank Collapse
+    # SNR = mean / (std + 1e-6), SNR < 0.05 说明噪声主导
+    layer_snr = {}
+    low_snr_layers = []
+    for param_name, stats in layer_grad_norms.items():
+        if isinstance(stats, dict) and "mean" in stats and "std" in stats:
+            snr = stats["mean"] / (stats["std"] + 1e-6)
+            layer_snr[param_name] = snr
+            if snr < 0.05:
+                low_snr_layers.append((param_name, snr))
+
+    if low_snr_layers and state.global_step % config.training.log_interval == 0:
+        print(f"  [Layer-wise SNR] Low SNR detected ({len(low_snr_layers)} layers < 0.05):")
+        for param_name, snr in sorted(low_snr_layers, key=lambda x: x[1])[:5]:
+            print(f"    - {param_name[:60]}: SNR={snr:.4f}")
 
     # P4-A FIX: 从 layer_grad_norms（累积的hook数据）计算 manifold_decoder 梯度范数
     # 问题根源: compute_grad_norms() 返回的 param.grad.norm() 与 hooks 累积的数据不一致

@@ -8,6 +8,7 @@ handles Layer 3 (hyperparameters) for evaluation.
 from __future__ import annotations
 
 from typing import Optional, Dict, List, Union
+from pathlib import Path
 import torch
 from tqdm import tqdm
 import torch.nn as nn
@@ -16,7 +17,7 @@ from torch.utils.data import DataLoader
 
 from ..config import Config
 from .state import EvaluationMetrics
-from ..training_logs.metrics import compute_confusion_matrix
+from ..training_logs.metrics import compute_confusion_matrix as _compute_cm
 
 
 def evaluate(
@@ -24,9 +25,11 @@ def evaluate(
     dataloader: DataLoader,
     device: torch.device,
     config: Optional[Config] = None,
-    num_classes: int = 200,
+    num_classes: Optional[int] = None,
     compute_ece: bool = True,
     ece_bins: int = 15,
+    compute_confusion_matrix: bool = False,
+    save_confusion_matrix_dir: Optional[str] = None,
 ) -> EvaluationMetrics:
     """Evaluate model on validation/test set
 
@@ -38,13 +41,27 @@ def evaluate(
         dataloader: Validation/test data loader
         device: Device to evaluate on
         config: Optional training config
-        num_classes: Number of classes
+        num_classes: Number of classes (auto-detected from model if not provided)
         compute_ece: Whether to compute Expected Calibration Error
         ece_bins: Number of bins for ECE calculation
+        compute_confusion_matrix: Whether to compute confusion matrix (default: False)
+        save_confusion_matrix_dir: If provided, save confusion matrix to this directory
+                                  as a .pt file (default: None, not saved)
 
     Returns:
         EvaluationMetrics with validation statistics
     """
+    # P0 FIX: num_classes 传播链 - 从 model 属性推断，若无则报错
+    if num_classes is None:
+        if hasattr(model, 'num_classes'):
+            num_classes = model.num_classes
+        else:
+            raise ValueError(
+                "num_classes must be passed explicitly or model must have "
+                "num_classes attribute. Got neither. "
+                "This ensures correct per-class accuracy tracking."
+            )
+
     model.eval()
 
     # I-OPT: 初始化为 GPU tensor，直接累加避免循环内 .item() 同步
@@ -59,7 +76,9 @@ def evaluate(
     all_confidences: List[torch.Tensor] = []
     all_correct: List[torch.Tensor] = []
 
-    # For confusion matrix - 保持 GPU tensor
+    # For confusion matrix - 只有在需要时才收集数据
+    # I-OPT: 默认关闭以节省内存，只有明确需要时才收集
+    should_compute_cm = compute_confusion_matrix or save_confusion_matrix_dir is not None
     all_predictions: List[torch.Tensor] = []
     all_targets: List[torch.Tensor] = []
 
@@ -134,9 +153,10 @@ def evaluate(
                     all_confidences.append(confidences.detach())  # Keep tensor
                     all_correct.append((pred == labels).detach())  # Keep tensor
 
-                    # I-OPT: Confusion matrix 保持 GPU tensor
-                    all_predictions.append(pred.detach())
-                    all_targets.append(labels.detach())
+                    # I-OPT: Confusion matrix 保持 GPU tensor (仅在需要时收集)
+                    if should_compute_cm:
+                        all_predictions.append(pred.detach())
+                        all_targets.append(labels.detach())
 
                 total_samples += batch_size
 
@@ -177,11 +197,21 @@ def evaluate(
             per_class_acc[c] = (class_correct[c] / class_total[c]).item()
 
     # Compute confusion matrix - I-OPT: all_predictions/targets 已是 GPU tensor
+    # I-OPT: 默认不计算 confusion_matrix，只在明确需要时计算并保存到单独文件
     confusion_matrix = None
-    if all_predictions and all_targets:
+    if should_compute_cm and all_predictions and all_targets:
         all_pred = torch.cat(all_predictions)
         all_target = torch.cat(all_targets)
-        confusion_matrix = compute_confusion_matrix(all_pred, all_target, num_classes)
+        confusion_matrix = _compute_cm(all_pred, all_target, num_classes)
+
+        # 如果提供了保存目录，则保存到单独文件
+        if save_confusion_matrix_dir is not None:
+            save_path = Path(save_confusion_matrix_dir)
+            save_path.mkdir(parents=True, exist_ok=True)
+            # 保存为 .pt 文件以便后续分析
+            cm_path = save_path / "confusion_matrix.pt"
+            torch.save(confusion_matrix.cpu(), cm_path)
+            print(f"  [CONFUSION_MATRIX] Saved to {cm_path}")
 
     return EvaluationMetrics(
         loss=avg_loss,

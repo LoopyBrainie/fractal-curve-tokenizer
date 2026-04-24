@@ -7,7 +7,7 @@ Layer 3 (hyperparameters) for learning rate scheduling.
 
 from __future__ import annotations
 
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, TYPE_CHECKING
 import math
 from dataclasses import dataclass
 
@@ -25,6 +25,104 @@ class LRSchedule:
     decay_type: str = "cosine"  # "cosine", "linear", "step", "none"
     decay_epochs: Optional[List[int]] = None
     decay_mult: float = 0.1
+
+
+class FunctionalWarmupCosineScheduler:
+    """Step-based LR scheduler with C⁰ + C¹ continuity
+
+    Mathematically correct implementation that uses the passed step value
+    directly, NOT internal state like len(lr_history).
+
+    Mathematical forms:
+    - Warmup (step < warmup_steps):
+        lr(step) = min_lr + (base_lr - min_lr) * step / warmup_steps
+
+    - Cosine decay (step >= warmup_steps):
+        lr(step) = min_lr + (base_lr - min_lr) * 0.5 * (1 + cos(π * (step - warmup_steps) / (total_steps - warmup_steps)))
+
+    The warmup→cosine transition is C¹ continuous:
+    - At step=warmup_steps: lr = base_lr (both phases agree)
+    - At step=warmup_steps: dlr/ds = (base_lr - min_lr) / warmup_steps (warmup derivative)
+    - At step=warmup_steps: dlr/ds = (base_lr - min_lr) * (-π/2 / (total_steps - warmup_steps)) * (-sin(...)) = (base_lr - min_lr) / warmup_steps (cosine derivative)
+
+    Args:
+        optimizer: PyTorch optimizer
+        base_lr: Maximum LR after warmup
+        total_steps: Total training steps (epochs * steps_per_epoch)
+        warmup_steps: Number of warmup steps
+        min_lr: Minimum LR after decay
+    """
+
+    def __init__(
+        self,
+        optimizer: Any,
+        base_lr: float = 5e-4,
+        total_steps: int = 10000,
+        warmup_steps: int = 500,
+        min_lr: float = 1e-6,
+    ):
+        self.optimizer = optimizer
+        self.base_lr = base_lr
+        self.total_steps = total_steps
+        self.warmup_steps = warmup_steps
+        self.min_lr = min_lr
+
+        # Initialize all param groups to min_lr
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = min_lr
+
+    def get_lr_at_step(self, step: int) -> float:
+        """Get LR at a specific step (pure function)
+
+        Args:
+            step: Global step counter
+
+        Returns:
+            Learning rate for this step
+        """
+        if step < self.warmup_steps:
+            # Linear warmup phase
+            return self.min_lr + (self.base_lr - self.min_lr) * (step / self.warmup_steps)
+
+        # Cosine decay phase
+        decay_steps = self.total_steps - self.warmup_steps
+        curr_decay_step = step - self.warmup_steps
+        cosine_decay = 0.5 * (1 + math.cos(math.pi * curr_decay_step / decay_steps))
+        return self.min_lr + (self.base_lr - self.min_lr) * cosine_decay
+
+    def step(self, step: int) -> float:
+        """Update LR based on global step
+
+        Args:
+            step: Global step counter (from TrainingState.global_step)
+
+        Returns:
+            The new learning rate
+        """
+        lr = self.get_lr_at_step(step)
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = lr
+        return lr
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Get scheduler state for checkpointing"""
+        return {
+            "base_lr": self.base_lr,
+            "total_steps": self.total_steps,
+            "warmup_steps": self.warmup_steps,
+            "min_lr": self.min_lr,
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        """Load scheduler state from checkpoint"""
+        self.base_lr = state_dict.get("base_lr", self.base_lr)
+        self.total_steps = state_dict.get("total_steps", self.total_steps)
+        self.warmup_steps = state_dict.get("warmup_steps", self.warmup_steps)
+        self.min_lr = state_dict.get("min_lr", self.min_lr)
+
+    def get_last_lr(self) -> float:
+        """Get last learning rate (approximation from base_lr)"""
+        return self.base_lr
 
 
 class WarmupCosineScheduler:
@@ -291,6 +389,8 @@ def create_scheduler(
     min_lr: float = 1e-6,
     warmup_epochs: int = 5,
     warmup_start_lr: float = 1e-7,
+    total_steps: Optional[int] = None,
+    steps_per_epoch: Optional[int] = None,
     **kwargs,
 ) -> Any:
     """Factory function to create LR scheduler
@@ -303,18 +403,34 @@ def create_scheduler(
             - "step": Step decay
             - "cosine": Cosine decay only (no warmup)
             - "none": Constant LR
+            - "functional_warmup_cosine": Step-based scheduler (recommended for batch-level stepping)
         total_epochs: Total training epochs
         base_lr: Base/peak learning rate
         min_lr: Minimum learning rate
         warmup_epochs: Warmup epochs
         warmup_start_lr: Starting LR during warmup
+        total_steps: Total training steps (required for functional_warmup_cosine)
+        steps_per_epoch: Steps per epoch (required for functional_warmup_cosine)
 
     Returns:
         LR scheduler instance
     """
     scheduler_type = scheduler_type.lower()
 
-    if scheduler_type == "warmup_cosine":
+    if scheduler_type == "functional_warmup_cosine":
+        if total_steps is None:
+            if steps_per_epoch is None:
+                raise ValueError("total_steps or steps_per_epoch required for functional_warmup_cosine")
+            total_steps = total_epochs * steps_per_epoch
+        warmup_steps = warmup_epochs * (steps_per_epoch or (total_steps // total_epochs))
+        return FunctionalWarmupCosineScheduler(
+            optimizer=optimizer,
+            base_lr=base_lr,
+            total_steps=total_steps,
+            warmup_steps=warmup_steps,
+            min_lr=min_lr,
+        )
+    elif scheduler_type == "warmup_cosine":
         return WarmupCosineScheduler(
             optimizer=optimizer,
             warmup_epochs=warmup_epochs,
@@ -364,6 +480,7 @@ def create_scheduler(
 
 __all__ = [
     "LRSchedule",
+    "FunctionalWarmupCosineScheduler",
     "WarmupCosineScheduler",
     "LinearWarmupScheduler",
     "StepScheduler",

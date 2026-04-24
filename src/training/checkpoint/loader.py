@@ -75,7 +75,8 @@ def load_model_weights(
     model: nn.Module,
     checkpoint_path: str,
     device: str = "cpu",
-    strict: bool = False,
+    strict: bool = True,
+    backward_compat: bool = False,
 ) -> Tuple[nn.Module, Dict[str, Any]]:
     """Load only model weights from checkpoint
 
@@ -83,10 +84,16 @@ def load_model_weights(
         model: Model to load weights into
         checkpoint_path: Path to checkpoint
         device: Device to load to
-        strict: Whether to strictly enforce key matching
+        strict: Whether to strictly enforce key matching (default True)
+        backward_compat: If True, allow loading checkpoints with mismatched keys
+                        (e.g., from older model versions) with warnings
 
     Returns:
         Tuple of (model, metadata dict)
+
+    Raises:
+        FileNotFoundError: If checkpoint not found
+        RuntimeError: If strict=True and key mismatch detected
     """
     checkpoint_path = Path(checkpoint_path)
 
@@ -98,8 +105,35 @@ def load_model_weights(
     # Get model state
     model_state = checkpoint.get("model_state_dict", checkpoint)
 
+    # Determine effective strictness
+    effective_strict = strict and not backward_compat
+
+    # Validate architecture compatibility BEFORE loading (only in strict mode)
+    if strict:
+        model_keys = set(model.state_dict().keys())
+        checkpoint_keys = set(model_state.keys())
+        missing_in_checkpoint = model_keys - checkpoint_keys
+        unexpected_in_checkpoint = checkpoint_keys - model_keys
+
+        if missing_in_checkpoint or unexpected_in_checkpoint:
+            msg_parts = []
+            if missing_in_checkpoint:
+                msg_parts.append(f"Missing in checkpoint: {list(missing_in_checkpoint)[:5]}")
+            if unexpected_in_checkpoint:
+                msg_parts.append(f"Unexpected in checkpoint: {list(unexpected_in_checkpoint)[:5]}")
+
+            if backward_compat:
+                print(f"[CHECKPOINT] WARNING: Architecture mismatch detected. "
+                      f"Using backward_compat mode - proceeding with mismatched keys.")
+                print(f"[CHECKPOINT] Issues: {'; '.join(msg_parts)}")
+            else:
+                raise RuntimeError(
+                    f"Checkpoint architecture mismatch (strict mode): {'; '.join(msg_parts)}. "
+                    f"Use backward_compat=True to load anyway."
+                )
+
     # Load weights
-    missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=strict)
+    missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=effective_strict)
 
     if missing_keys:
         print(f"[CHECKPOINT] Missing keys: {missing_keys[:5]}...")

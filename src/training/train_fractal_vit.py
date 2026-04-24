@@ -22,6 +22,7 @@ from datetime import datetime
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler
@@ -41,7 +42,7 @@ from .trainer import (
     MixupCutmixLoss,
     GradBalancer,
 )
-from .scheduler import create_scheduler, WarmupCosineScheduler
+from .scheduler import create_scheduler, WarmupCosineScheduler, FunctionalWarmupCosineScheduler
 from .monitor import (
     GradientMonitor,
     LossMonitor,
@@ -132,7 +133,6 @@ def create_model(args, device: torch.device) -> nn.Module:
 
     # Parse boolean flags
     use_checkpoint = getattr(args, 'gradient_checkpoint', False)
-    compile_model = getattr(args, 'compile', False)
     channels_last = getattr(args, 'channels_last', False)
 
     # Parse splitter type
@@ -229,7 +229,7 @@ def create_model(args, device: torch.device) -> nn.Module:
     model = FractalCurveViT(**model_kwargs)
 
     # Apply optimizations
-    if compile_model:
+    if getattr(args, 'compile', False):
         print("Compiling model with torch.compile...")
         # I164-1: 使用 mode='default' 替代 'reduce-overhead'
         # 'reduce-overhead' 启用 CUDA Graphs，与 gradient_checkpointing 不兼容
@@ -337,10 +337,15 @@ def create_dataloader(args, split: str = 'train') -> DataLoader:
     if use_hf and hf_path:
         num_workers = 0
 
+    # Shuffle strategy:
+    # - HF streaming datasets: shuffle handled internally by hf_dataset.shuffle() in create_hf_dataset
+    # - Local datasets: shuffle only for training split to ensure randomization
+    should_shuffle = (split == 'train') and not use_hf
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=False,  # HF datasets already handle shuffling internally
+        shuffle=should_shuffle,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=(split == 'train'),
@@ -604,18 +609,18 @@ def _update_fractal_hyperparams(
     warmup_epochs: int,
     config,
 ) -> dict:
-    """更新 Fractal ViT 动态超参数（三阶段 warmup V3 - P0 修复）
+    """更新 Fractal ViT 动态超参数（方案B: 非线性退火 + Temperature Annealing）
 
-    P0 修复：Stage 0 (epochs 0-5) 完全禁用 budget_weight，让 Backbone
-    在无稀疏压力下建立判别特征。
+    P1 修复：整合评审意见的方案B
+    - 核心思想：分形结构收敛具有非线性相变特征，线性权重增加跟不上特征空间坍塌速度
+    - Stage 0 budget_weight 从 0.001 → 0.05（防止无约束路由惯性）
+    - Temperature Annealing：τ=2.0→1.0，高温强迫路由分布平滑
 
-    三阶段设计（P0 修复版）：
-        Stage 0 (0-5):   纯探索阶段，budget_weight=0，K=N（Standard ViT 模式）
-        Stage 1 (5-12):  温和稀疏区，budget_weight 0→0.005，K 从 N 退火到 0.75K_target
-        Stage 2 (12-25): 加速压缩，budget_weight 0.005→0.05，K 从 0.75K_target 退火到 0.5K_target
-        Stage 3 (25+):    结构巩固，budget_weight 0.05→0.20
-
-    注意：α 退火在 splitter.set_epoch() 中独立处理，不在此函数中
+    阶段设计（方案B）：
+        Stage 0 (0-5):   budget_weight=0.05, τ=2.0（高温平滑，防止极端路由）
+        Stage 1 (5-12):  budget_weight 0.05→0.1, τ=2.0→1.5
+        Stage 2 (12-25): budget_weight 0.1→0.2, τ=1.5→1.0
+        Stage 3 (25+):   budget_weight=0.2, τ=1.0
 
     Args:
         model: FractalCurveViT 模型
@@ -645,39 +650,36 @@ def _update_fractal_hyperparams(
             t = (epoch - warmup_end) / (ramp_end - warmup_end)
             return t * t * (3 - 2 * t)
 
-    # Stage 判断（基于绝对 epoch，而非 warmup_progress 比例）
+    # Stage 判断（方案B: 非线性退火 + Temperature Annealing）
     if epoch < 5:
-        # Stage 0: 占位策略 - 强制 Splitter 全路径激活，打破"保守初始化"死锁
-        # P1-1 FIX: 目标比例从 0.5 提升到 1.0，budget_weight 从 0 改为 0.001
-        # 原因：Stage 0 原设计(budget_weight=0)导致 Splitter 陷入"低 token 数"局部最优
+        # Stage 0: 高温平滑阶段 - budget_weight 从 0.05 起步（防止无约束路由惯性）
         stage = 0
         target_ratio = 1.0  # 全路径激活，鼓励探索
-        budget_weight = 0.001  # 轻微预算压力，防止完全自由探索
-        tau = 2.0
+        budget_weight = 0.05  # P1 修复：从 0.001 → 0.05，起点更高
+        tau = 2.0  # 高温强迫路由分布平滑，防止极端化
         k_min_ratio = 1.0  # K_min = N，保留所有 token
         logits_diversity = False
     elif epoch < 12:
-        # Stage 1: Gentle Sparsification - 温和稀疏区
+        # Stage 1: 温和稀疏区 - Temperature 退火
         stage = 1
         progress = (epoch - 5) / (12 - 5)  # 0.0 → 1.0
+        budget_weight = 0.05 + 0.05 * progress  # 0.05 → 0.1（而非 0→0.005）
+        tau = 2.0 + (1.5 - 2.0) * progress  # 2.0 → 1.5（而非 2.0→1.0）
         target_ratio = 0.5  # 保持 0.5，直到 Stage 2
-        budget_weight = 0.005 * progress  # 0.0 → 0.005
-        tau = 2.0 + (1.0 - 2.0) * progress  # 2.0 → 1.0
         k_min_ratio = 1.0 - 0.25 * progress  # 1.0 → 0.75 (N → 0.75K_target)
         logits_diversity = False
     elif epoch < 25:
-        # Stage 2: Accelerated Compression - 加速压缩阶段
+        # Stage 2: 加速压缩阶段 - Temperature 继续退火
         stage = 2
         progress = (epoch - 12) / (25 - 12)  # 0.0 → 1.0
-        # Power-Law 加速
         power_progress = cosine_progress(progress) ** 1.5
+        budget_weight = 0.1 + 0.1 * power_progress  # 0.1 → 0.2（而非 0.005→0.05）
+        tau = 1.5 + (1.0 - 1.5) * progress  # 1.5 → 1.0（温度继续下降）
         target_ratio = 0.5 - 0.4 * power_progress  # 0.5 → 0.1
-        budget_weight = 0.005 + 0.045 * power_progress  # 0.005 → 0.05
-        tau = 1.0  # τ 在 Stage 2 保持 1.0
         k_min_ratio = 0.75 - 0.25 * power_progress  # 0.75 → 0.5 (0.75K_target → 0.5K_target)
         logits_diversity = True
     else:
-        # Stage 3: Structural Consolidation - 结构巩固阶段
+        # Stage 3: 结构巩固阶段
         stage = 3
         target_ratio = 0.1
         budget_weight = budget_loss_weight_target  # 使用配置的目标值
@@ -699,10 +701,19 @@ def _update_fractal_hyperparams(
         if hasattr(splitter, 'set_k_min_ratio'):
             # P0 FIX: 动态 K_min - 让 splitter 知道当前的 K_min 比例
             splitter.set_k_min_ratio(k_min_ratio)
+        if hasattr(splitter, 'set_target_entropy'):
+            # P1 FIX: 路由熵目标 - 与 Temperature Annealing 协同退火
+            target_entropy = 0.55 - (0.55 - 0.40) * (tau - 1.0) / (2.0 - 1.0)
+            splitter.set_target_entropy(target_entropy)
 
     # P1-3 FIX: 同步更新 model.target_ratio，确保 fractal_vit.py 中的 raw_budget_error 计算一致
     if hasattr(model, 'target_ratio'):
         model.target_ratio = target_ratio
+
+    # 计算目标熵（与 Temperature Annealing 协同）
+    # Stage 0: τ=2.0 → 高温平滑 → 熵目标 0.55（中等随机性）
+    # Stage 3+: τ=1.0 → 低熵 → 熵目标 0.40（收敛状态）
+    target_entropy = 0.55 - (0.55 - 0.40) * (tau - 1.0) / (2.0 - 1.0)
 
     return {
         'stage': stage,
@@ -711,6 +722,7 @@ def _update_fractal_hyperparams(
         'tau': tau,
         'k_min_ratio': k_min_ratio,  # P0 FIX: 传递给日志记录
         'logits_diversity': logits_diversity,
+        'target_entropy': target_entropy,  # P1 FIX: 路由熵目标
     }
 
 
@@ -796,24 +808,20 @@ def train(
     print(f"Checkpoints: {checkpoints_dir}")
     print(f"{'='*60}\n")
 
-    # V4: Splitter 独立学习率 - 先收集 splitter 参数 id，再从主参数组排除
-    splitter_param_ids = set(id(p) for p in model.splitter.parameters() if p.requires_grad)
-    backbone_params = [p for p in model.parameters() if id(p) not in splitter_param_ids]
+    # B1: 拓扑冷启动隔离 - 三参数组分离 (排他性匹配)
+    # 优先级: geo > splitter > backbone (确保参数只属于一个组)
+    # 注意: "splitter.geo_norm" 同时匹配两者, 必须用 elif 确保排他
+    geometry_params = [p for n, p in model.named_parameters() if "geo" in n]
+    splitter_params = [p for n, p in model.named_parameters()
+                       if "splitter" in n and "geo" not in n]
+    backbone_params = [p for n, p in model.named_parameters()
+                       if "splitter" not in n and "geo" not in n]
 
-    optimizer = optim.AdamW(
-        backbone_params,
-        lr=config.training.base_lr,
-        weight_decay=config.training.weight_decay,
-    )
-
-    # V4: Splitter 独立学习率 - 添加专用参数组
-    splitter_lr = config.training.base_lr * config.training.splitter_lr_multiplier
-    optimizer.add_param_group({
-        'params': [p for p in model.splitter.parameters() if p.requires_grad],
-        'lr': splitter_lr,
-        'name': 'splitter',
-        'weight_decay': config.training.weight_decay,  # Splitter 也使用相同的 weight_decay
-    })
+    optimizer = optim.AdamW([
+        {'params': backbone_params, 'lr': config.training.base_lr, 'name': 'backbone'},
+        {'params': splitter_params, 'lr': config.training.base_lr * 0.1, 'name': 'splitter'},
+        {'params': geometry_params, 'lr': config.training.base_lr * 0.1, 'name': 'geometry'},
+    ], weight_decay=config.training.weight_decay)
 
     # V3: Safety Check - 验证优化器覆盖所有模型参数
     verify_optimizer_coverage(model, optimizer)
@@ -822,35 +830,28 @@ def train(
     if state.optimizer_state:
         optimizer.load_state_dict(state.optimizer_state)
 
-    # Create scheduler
+    # A1: 计算 steps_per_epoch 用于 FunctionalWarmupCosineScheduler
+    steps_per_epoch = len(train_loader)
+
+    # A1: 使用 FunctionalWarmupCosineScheduler (step-based, 避免时间基准 bug)
     scheduler = create_scheduler(
         optimizer=optimizer,
-        scheduler_type="warmup_cosine",
+        scheduler_type="functional_warmup_cosine",
         total_epochs=config.training.num_epochs,
         base_lr=config.training.base_lr,
         min_lr=config.training.min_lr,
         warmup_epochs=config.training.warmup_epochs,
-        warmup_start_lr=getattr(args, 'warmup_start_lr', config.training.base_lr * 0.1),
+        total_steps=config.training.num_epochs * steps_per_epoch,
+        steps_per_epoch=steps_per_epoch,
     )
 
-    # V4: Splitter 独立学习率 scheduler
-    splitter_lr = config.training.base_lr * config.training.splitter_lr_multiplier
-    splitter_scheduler = WarmupCosineScheduler(
-        optimizer=optimizer,
-        warmup_epochs=config.training.warmup_epochs,
-        warmup_start_lr=config.training.warmup_start_lr * config.training.splitter_lr_multiplier,
-        base_lr=splitter_lr,
-        min_lr=config.training.min_lr * config.training.splitter_lr_multiplier,
-        total_epochs=config.training.num_epochs,
-        param_group_name='splitter',
-    )
+    # B1: Splitter/Geometry LR 恢复状态跟踪
+    # 在 epoch 5-10 期间，splitter/geometry LR 从 0.1× 线性恢复到 1.0×
+    _splitter_lr_multiplier = 0.1  # 初始 0.1× (冷启动隔离)
 
     # Resume scheduler state if available
     if state.scheduler_state:
         scheduler.load_state_dict(state.scheduler_state)
-        # V4: 恢复 splitter scheduler 状态
-        if hasattr(state, 'splitter_scheduler_state') and state.splitter_scheduler_state:
-            splitter_scheduler.load_state_dict(state.splitter_scheduler_state)
 
     # Create GradScaler (保守初始化，防止 warmup 期 GradScaler collapse)
     # init_scale=2048: 从 65536 降至 2048，崩溃阶梯从 16 步降到 5 步
@@ -919,6 +920,77 @@ def train(
     # D4-AUDIT FIX: 使用 non_blocking=True 配合 DataLoader pin_memory
     model = model.to(device, non_blocking=True)
 
+    # P0: Pre-flight Check（零时刻诊断）
+    print("\n" + "=" * 60)
+    print("PRE-FLIGHT CHECK (零时刻诊断)")
+    print("=" * 60)
+
+    # 1. Identity Test: 随机噪声输入，检查 Poincaré 距离
+    random_input = torch.randn(1, 3, 224, 224).to(device)
+    with torch.no_grad():
+        # 只获取 poincare_dist，不做完整前向（避免额外开销）
+        if hasattr(model, 'forward_features'):
+            features = model.forward_features(random_input)
+        else:
+            features = model(random_input)
+        # 检查 poincare_dist_mean
+        if hasattr(features, 'poincare_dist_mean'):
+            poincare_dist_init = features.poincare_dist_mean
+        elif isinstance(features, dict) and 'poincare_dist_mean' in features:
+            poincare_dist_init = features['poincare_dist_mean']
+        else:
+            poincare_dist_init = None
+
+        if poincare_dist_init is not None:
+            print(f"[Pre-flight] Init Poincaré dist: {poincare_dist_init:.2f}")
+            if poincare_dist_init > 10:
+                print(f"  WARNING: Poincaré 距离过大({poincare_dist_init:.2f} > 10)，需缩小 geometry_field 初始化")
+
+    # 2. Gradient Check: backbone_grad_norm / splitter_grad_norm 初始比值
+    # 简单的单步梯度检查
+    model.eval()
+    try:
+        from vit_pytorch.models.fractal_vit import TrainingStats
+
+        test_input = torch.randn(2, 3, 64, 64).to(device)
+        test_target = torch.randint(0, model.num_classes if hasattr(model, 'num_classes') else 10, (2,)).to(device)
+        test_output = model(test_input)
+        if isinstance(test_output, TrainingStats):
+            loss = F.cross_entropy(test_output.logits, test_target)
+        elif isinstance(test_output, dict) and 'logits' in test_output:
+            loss = F.cross_entropy(test_output['logits'], test_target)
+        else:
+            loss = F.cross_entropy(test_output, test_target)
+        loss.backward()
+
+        # 计算梯度范数
+        backbone_grad_norm = 0.0
+        splitter_grad_norm = 0.0
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                grad_norm = param.grad.norm(2).item()
+                if 'splitter' in name and 'geo' not in name:
+                    splitter_grad_norm += grad_norm ** 2
+                elif 'splitter' not in name and 'geo' not in name:
+                    backbone_grad_norm += grad_norm ** 2
+
+        backbone_grad_norm = backbone_grad_norm ** 0.5
+        splitter_grad_norm = splitter_grad_norm ** 0.5
+        grad_ratio = splitter_grad_norm / (backbone_grad_norm + 1e-8)
+
+        print(f"[Pre-flight] Backbone grad norm: {backbone_grad_norm:.4f}")
+        print(f"[Pre-flight] Splitter grad norm: {splitter_grad_norm:.4f}")
+        print(f"[Pre-flight] Grad ratio (splitter/backbone): {grad_ratio:.4f}")
+        if grad_ratio > 1.5:
+            print(f"  WARNING: 梯度比异常({grad_ratio:.2f} > 1.5)，可能需要梯度缩放器")
+
+        model.zero_grad()
+    except Exception as e:
+        print(f"[Pre-flight] Gradient check skipped: {e}")
+
+    model.train()
+    print("=" * 60 + "\n")
+
     # Get eval interval
     eval_interval = getattr(args, 'eval_interval', 1)
     patience = getattr(args, 'patience', 999)
@@ -932,6 +1004,25 @@ def train(
 
     for epoch in range(state.epoch, config.training.num_epochs):
         state.epoch = epoch
+
+        # B1: Splitter/Geometry LR 恢复逻辑 (epoch 5-10)
+        # Stage 0 (epoch 0-5): splitter_lr = 0.1× base_lr (冷启动隔离)
+        # Stage 1 (epoch 5-10): splitter_lr 从 0.1× 线性恢复到 1.0×
+        # Stage 2 (epoch 10+): splitter_lr = 1.0× base_lr (正常)
+        if epoch < 5:
+            _splitter_lr_multiplier = 0.1
+        elif epoch < 10:
+            # Smoothstep 恢复: 0.1 → 1.0
+            progress = (epoch - 5) / (10 - 5)  # 0.0 → 1.0
+            smooth = progress * progress * (3 - 2 * progress)  # smoothstep
+            _splitter_lr_multiplier = 0.1 + 0.9 * smooth
+        else:
+            _splitter_lr_multiplier = 1.0
+
+        # 更新 splitter 和 geometry 参数组的学习率
+        for param_group in optimizer.param_groups:
+            if param_group.get('name') == 'splitter' or param_group.get('name') == 'geometry':
+                param_group['lr'] = config.training.base_lr * _splitter_lr_multiplier
 
         # I-BUGFIX: 调用 splitter.set_epoch() 更新课程学习进度
         # 修复 K_min 钳制 Bug：_current_K 之前从未被更新，导致 avg_tokens 永远 = K_min = 8
@@ -958,7 +1049,6 @@ def train(
             config=config,
             device=device,
             scheduler=scheduler,
-            splitter_scheduler=splitter_scheduler,  # V4: Splitter 独立 LR scheduler
             mixup_cutmix=mixup_cutmix,
             debug_dir=str(output_dir / "debug"),
             warmup_params=warmup_params,
@@ -976,11 +1066,16 @@ def train(
         # Evaluate
         eval_metrics = None
         if (epoch + 1) % eval_interval == 0:
+            # Confusion matrix 保存目录
+            cm_dir = str(output_dir / "confusion_matrices" / f"epoch_{epoch+1:04d}")
+
             eval_result = evaluate(
                 model=model,
                 dataloader=val_loader,
                 device=device,
                 config=config,
+                num_classes=model.num_classes,
+                save_confusion_matrix_dir=cm_dir,
             )
             eval_metrics = eval_result.to_dict()
 
@@ -1030,7 +1125,6 @@ def train(
         if scaler:
             state.scaler_state = scaler.state_dict()
         state.scheduler_state = scheduler.state_dict()
-        state.splitter_scheduler_state = splitter_scheduler.state_dict()  # V4: Splitter 独立 LR
 
         # Check if best (handle first epoch: initialize best_metric to -inf for "max" mode)
         is_best = False
@@ -1495,6 +1589,34 @@ def main():
         args.image_size = 64
         args.num_classes = 200
 
+    # Auto-adjust dim to ensure dim_per_subspace is even for fractal RoPE
+    # Formula: dim_per_subspace = (heads * dim_head) // max_level
+    # where dim_head = dim // heads, max_level = ceil(log2(image_size / min_patch_size))
+    # For fractal RoPE to work, dim_per_subspace must be even
+    if args.dim is not None and args.image_size is not None:
+        import math
+        min_patch = getattr(args, 'min_patch_size', 4)
+        heads = getattr(args, 'heads', 8)
+        computed_max_level = math.ceil(math.log2(args.image_size // min_patch))
+        if computed_max_level > 0:
+            dim_head = args.dim // heads
+            inner_dim = heads * dim_head
+            dim_per_subspace = inner_dim // computed_max_level
+            if dim_per_subspace % 2 == 1:
+                # dim_per_subspace is odd - adjust dim to make it even
+                # Find the nearest lower dim that gives even dim_per_subspace
+                for new_dim in range(args.dim, 63, -2):  # Step by 2 to keep even/odd consistent
+                    new_dim_head = new_dim // heads
+                    if new_dim_head <= 0:
+                        continue
+                    new_inner_dim = heads * new_dim_head
+                    new_dim_per_subspace = new_inner_dim // computed_max_level
+                    if new_dim_per_subspace % 2 == 0:
+                        print(f"\n[AUTO-ADJUST] dim_per_subspace={dim_per_subspace} (odd) -> adjusting dim from {args.dim} to {new_dim} for fractal RoPE compatibility")
+                        args.dim = new_dim
+                        args.mlp_dim = new_dim * 4  # Maintain mlp_ratio=4
+                        break
+
     # Quick test mode: override with smaller model parameters
     if getattr(args, 'quick_test', False):
         args.dim = 128
@@ -1506,6 +1628,9 @@ def main():
         # P1-2 FIX: BS=4 is too small for ViT, use BS=16 (gradient accumulation will be added separately)
         args.batch_size = 16
         args.epochs = 30  # Warmup test: 30 epochs covers Stage 1 (0-9) + Stage 2 (9-30) + Stage 3 (30+)
+        args.compile = False  # P6-1: Disable compile on Windows (torch.compile has unicode path issue)
+        import torch._dynamo
+        torch._dynamo.config.suppress_errors = True  # Fallback to eager for function-level compile decorators
         print(f"\n[Quick Test Mode] Using small model: dim={args.dim}, layers={args.num_layers}, epochs={args.epochs}, batch_size={args.batch_size}")
 
     # Create model

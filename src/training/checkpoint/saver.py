@@ -25,6 +25,7 @@ def save_checkpoint(
     is_best: bool = False,
     filename: Optional[str] = None,
     save_epoch_checkpoint: bool = True,
+    model_config: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Save training checkpoint
 
@@ -34,6 +35,7 @@ def save_checkpoint(
     - Scheduler state dict
     - GradScaler state dict
     - Training metrics
+    - Model config snapshot (for compatibility verification)
 
     Args:
         checkpoint_dir: Directory to save checkpoint
@@ -48,12 +50,18 @@ def save_checkpoint(
         filename: Optional custom filename
         save_epoch_checkpoint: Whether to save epoch checkpoint (default True)
             Set to False when only updating best.pth/last.pth without epoch checkpoint
+        model_config: Optional model architecture config dict
+            (auto-detected if model has get_config() method)
 
     Returns:
         Path to saved checkpoint
     """
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Auto-detect model_config if not provided
+    if model_config is None and hasattr(model, 'get_config'):
+        model_config = model.get_config()
 
     # Prepare checkpoint dict
     checkpoint = {
@@ -72,6 +80,10 @@ def save_checkpoint(
 
     if training_state is not None:
         checkpoint["training_state"] = training_state
+
+    # P1 FIX: Add model_config for checkpoint compatibility verification
+    if model_config is not None:
+        checkpoint["model_config"] = model_config
 
     # Save regular checkpoint (epoch checkpoint)
     checkpoint_path = None
