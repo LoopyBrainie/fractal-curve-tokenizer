@@ -184,7 +184,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         use_hilbert_order: 是否使用 Hilbert 曲线排序
         target_tokens: 目标 token 数量
         enforce_balance: 是否强制 2:1 平衡约束
-        depth_scale_range: (P6-1) 深度缩放范围 (σ_min, σ_max)
         gamma: 可学习分割器的阈值衰减因子 γ ∈ (0,1)
         learnable_temperature: 可学习分割的初始温度
         use_gumbel: 是否使用 Gumbel-Softmax
@@ -210,15 +209,14 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         use_hilbert_order: bool = True,
         # I98-1: 移除 Splitter 相关参数
         # Splitter 现在是独立组件，通过 tokenize() 参数传入
-        # 移除: K_min, K_max, splitter_dropout, splitter_config, enable_learnable_quota
-        # 保留 depth_scale_range (用于 patch_embed)
-        depth_scale_range: Optional[Tuple[float, float]] = (0.5, 2.0),
         # I-PHASE4: 池化方法选择
         use_interpolated_pooling: bool = False,
         # I-PHASE4: 动态权重 (C3 尺度等变性)
         use_dynamic_weight: bool = False,
         # Step 3: HilbertTopologyCache for O(1) Tensor Lookup
         hilbert_cache: Optional[Any] = None,
+        # P6-1: depth_scale_range - sigmoid 参数化防止梯度爆炸
+        depth_scale_range: Optional[Tuple[float, float]] = None,
     ) -> None:
         super().__init__()
 
@@ -246,10 +244,13 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         self.min_patch_size = effective_min_patch_size  # 存储规范化后的值
 
         # 动态计算 max_level (用于 splitter)
-        # 公式: L_max = max(0, floor(log2(min(H, W) / min_patch_size)))
-        from vit_pytorch.core.depth_utils import compute_max_level
-        self._computed_max_level = compute_max_level(
-            image_size, effective_min_patch_size
+        # 公式: L_max = max(0, ceil(log2(min(H, W) / min_patch_size)))
+        # I-NAN: 使用 round_to_pow2=True 确保 dim_per_subspace 为偶数
+        # 原因: DirectionAwareSubspacedRoPE 要求 dim_per_subspace 为偶数
+        # 修正: 改为使用 compute_max_depth 并 round_to_pow2
+        from vit_pytorch.core.depth_utils import compute_max_depth
+        self._computed_max_level = compute_max_depth(
+            image_size, effective_min_patch_size, round_to_pow2=True
         )
 
         # I30-17-EXT: 确定最终使用的 max_level
@@ -273,10 +274,11 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             max_level=self.max_level,  # 保持使用计算后的深度
             conv_layers=2,
             use_batch_norm=False,  # I130-2: 禁用 BatchNorm 确保确定性
-            depth_scale_range=depth_scale_range,
             # I-PHASE4: 新参数
             use_interpolated_pooling=use_interpolated_pooling,
             use_dynamic_weight=use_dynamic_weight,
+            # P6-1: depth_scale_range
+            depth_scale_range=depth_scale_range,
         )
 
         # =====================================================================
@@ -808,10 +810,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
                 features.shape[2], features.shape[3]
             )
         
-        # 深度编码
-        scales = self.patch_embed.depth_scale[depths_tensor]
-        embeds = self.patch_embed.depth_embed(depths_tensor)
-        all_tokens = pooled * scales.unsqueeze(-1) + embeds
+        # 深度编码已移至 DirectionAwareSubspacedRoPE（注意力层）
+        # tokenizer 仅输出 patch embedding，由 C+ RoPE 处理深度/位置编码
+        all_tokens = pooled
         
         # 分配到输出 buffer (P-PERF-3: 向量化分配)
         tokens = torch.zeros(B, max_tokens, dim, device=device, dtype=dtype)
@@ -1025,9 +1026,9 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # ====================================================================
         # I34-7 Fix: Add min=0 boundary protection to prevent negative depth index errors
         depths = tensor_result.depths.clamp(min=0, max=self.max_level)
-        scales = self.patch_embed.depth_scale[depths]  # [N]
-        embeds = self.patch_embed.depth_embed(depths)   # [N, D]
-        all_tokens = pooled * scales.unsqueeze(-1) + embeds  # [N, D]
+        # 深度编码已移至 DirectionAwareSubspacedRoPE（注意力层）
+        # tokenizer 仅输出 patch embedding，由 C+ RoPE 处理深度/位置编码
+        all_tokens = pooled
 
         # ====================================================================
         # 向量化分配到输出 buffer

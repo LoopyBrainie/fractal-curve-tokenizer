@@ -99,6 +99,31 @@ for d in range(1, _MAX_HILBERT_DEPTH + 1):
 _MAX_LUT_DEPTH = _MAX_HILBERT_DEPTH  # 与 _HILBERT_LUT 填充深度保持一致
 
 
+# =============================================================================
+# C+ RoPE: Hilbert 方向状态表 (用于方向感知子空间隔离 RoPE)
+# =============================================================================
+
+# Hilbert 曲线方向状态转移表
+# NEXT_DIR_TABLE[parent_dir, quadrant] -> child_dir
+# 方向: 0=Up(U), 1=Right(R), 2=Down(D), 3=Left(L)
+NEXT_DIR_TABLE = torch.tensor([
+    [1, 0, 3, 2],  # Parent Up (0): 进入 q0→Right, q1→Up, q2→Left, q3→Down
+    [0, 1, 2, 3],  # Parent Right (1): 进入 q0→Down, q1→Right, q2→Up, q3→Left
+    [3, 2, 1, 0],  # Parent Down (2): 进入 q0→Left, q1→Down, q2→Right, q3→Up
+    [2, 3, 0, 1],  # Parent Left (3): 进入 q0→Up, q1→Left, q2→Down, q3→Right
+], dtype=torch.long)
+
+# 几何重映射表: 将递归方向下的象限映射回物理标准象限
+# GEOM_MAP_TABLE[dir, q] -> std_quadrant
+# 确保局部保序性: 相邻象限角度差为 π/2
+GEOM_MAP_TABLE = torch.tensor([
+    [0, 1, 2, 3],  # Up 方向: 标准 Z-序
+    [2, 0, 3, 1],  # Right 方向: 顺时针 90° + 翻转
+    [3, 2, 1, 0],  # Down 方向: 180° 旋转
+    [1, 3, 0, 2],  # Left 方向: 逆时针 90° + 翻转
+], dtype=torch.long)
+
+
 def _init_hilbert_lut_padded() -> torch.Tensor:
     """在模块加载时预先构建对齐的 2D 查找表（Eager Initialization）"""
     max_size = 1 << (2 * _MAX_LUT_DEPTH)  # 4^8 = 65536
@@ -180,6 +205,7 @@ class LevelsInfo:
     # 缓存字段 (惰性求值)
     _depths: Optional[torch.Tensor] = field(default=None, repr=False)
     _paths: Optional[torch.Tensor] = field(default=None, repr=False)
+    _directions: Optional[torch.Tensor] = field(default=None, repr=False)  # C+ RoPE 方向状态
 
     def __post_init__(self):
         """Invariant validation - Hilbert Curve ViT 核心契约检查。"""
@@ -306,6 +332,7 @@ class LevelsInfo:
             max_level=self.max_level,
             _depths=self._depths.to(device, non_blocking=non_blocking) if self._depths is not None else None,
             _paths=self._paths.to(device, non_blocking=non_blocking) if self._paths is not None else None,
+            _directions=self._directions.to(device, non_blocking=non_blocking) if self._directions is not None else None,
         )
 
     def cuda(self, non_blocking: bool = False) -> "LevelsInfo":
@@ -464,6 +491,53 @@ class LevelsInfo:
         """
         # I162-1: 缓存已预填充，直接访问并 clone 以避免 CUDA Graphs 覆盖
         return _hilbert_weights_cache[d].clone().to(device, non_blocking=True)
+
+    # ========== C+ RoPE: Hilbert 方向状态计算 ==========
+
+    def _compute_directions(self) -> torch.Tensor:
+        """计算 Hilbert 方向状态轨迹 (用于 C+ RoPE)。
+
+        数学形式:
+            d_0 = 0 (初始方向: Up)
+            d_l = NEXT_DIR_TABLE[d_{l-1}, q_{l-1}] for l >= 1
+
+        其中:
+            - d_l ∈ {0, 1, 2, 3} 表示第 l 层的方向状态
+            - q_{l-1} ∈ {0, 1, 2, 3} 表示第 l-1 层的象限
+
+        返回:
+            directions: [B, N, D] 每层の方向状态
+        """
+        if self._directions is not None:
+            return self._directions
+
+        B, N, D_plus_1 = self.data.shape
+        D = D_plus_1 - 1
+        paths = self._compute_paths()
+        device = self.data.device
+
+        # 初始化方向为 0 (Up)
+        directions = torch.zeros(B, N, D, dtype=torch.long, device=device)
+
+        # 递推计算: d_l = NEXT_DIR_TABLE[d_{l-1}, q_{l-1}]
+        # 使用展开循环 (L_max <= 8, torch.compile 友好)
+        for l in range(1, D):
+            prev_dirs = directions[:, :, l - 1]  # [B, N]
+            prev_quads = paths[:, :, l - 1]  # [B, N]
+            # gather 使用: NEXT_DIR_TABLE[prev_dirs, prev_quads]
+            directions[:, :, l] = NEXT_DIR_TABLE[prev_dirs, prev_quads]
+
+        self._directions = directions
+        return self._directions
+
+    @property
+    def directions(self) -> torch.Tensor:
+        """Property accessor for Hilbert 方向状态轨迹。
+
+        Returns:
+            directions: [B, N, D] 每层の方向状态 (用于 C+ RoPE)
+        """
+        return self._compute_directions()
 
     # ========== 深度根归一化 (I161-1 修复) ==========
 

@@ -72,6 +72,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from vit_pytorch.core.levels_info import LevelsInfo
+from vit_pytorch.layers.embeddings.fractal_rope import DirectionAwareSubspacedRoPE
+
 # I100-4: 强制依赖 torchvision
 # 移除 _fallback_roi_pool 回退实现，统一使用 torchvision.ops.roi_align
 from torchvision.ops import roi_align  # 强制依赖，无回退
@@ -180,22 +183,30 @@ class HilbertNativePatchEmbed(nn.Module):
         image_size: Optional[Tuple[int, int]] = None,
         conv_layers: int = 2,
         use_batch_norm: bool = True,
-        depth_scale_beta: float = 0.2,
-        depth_scale_range: Optional[Tuple[float, float]] = (0.5, 2.0),
         # I-PHASE4: 池化方法选择
         use_interpolated_pooling: bool = False,
         # I-PHASE4: 动态权重 (C3 尺度等变性)
         use_dynamic_weight: bool = False,
+        # P6-1: depth_scale_range - 使用 sigmoid 参数化防止 CUDA 梯度爆炸
+        depth_scale_range: Optional[Tuple[float, float]] = None,  # (σ_min, σ_max)
     ) -> None:
         super().__init__()
 
         self.channels = channels
         self.dim = dim
         self.base_patch_size = base_patch_size
-        self.depth_scale_beta = depth_scale_beta
-        self.depth_scale_range = depth_scale_range
         self.use_interpolated_pooling = use_interpolated_pooling
         self.use_dynamic_weight = use_dynamic_weight
+
+        # P6-1: depth_scale_range - sigmoid 参数化存储
+        if depth_scale_range is not None:
+            self.depth_scale_range = depth_scale_range
+            self.depth_scale_sigma_min = depth_scale_range[0]
+            self.depth_scale_sigma_max = depth_scale_range[1]
+        else:
+            self.depth_scale_range = None
+            self.depth_scale_sigma_min = None
+            self.depth_scale_sigma_max = None
 
         # I30-17-EXT: 处理新旧 API
         if max_level is not None:
@@ -268,32 +279,6 @@ class HilbertNativePatchEmbed(nn.Module):
                 nn.Conv2d(dim, dim, kernel_size=3, padding=1)
             )
         
-        # =====================================================================
-        # 深度编码
-        # =====================================================================
-        
-        # 深度嵌入: 加法偏置，编码 region 的「语义角色」
-        # I24: 使用较小的初始化标准差 (0.02)，避免淹没 pooled features
-        # 原问题: nn.Embedding 默认初始化 std~1.0，而 ROI-Align pooled std~0.2
-        # 这导致 96% 的 token (同一 depth) 共享几乎相同的表示
-        self.depth_embed = nn.Embedding(max_level + 1, dim)
-        nn.init.normal_(self.depth_embed.weight, mean=0.0, std=0.02)
-        
-        # 深度缩放: 乘法因子，编码 region 的「信息密度」
-        # P6-1 改进: 使用 softplus 参数化（替代 sigmoid），避免梯度饱和
-        if depth_scale_range is not None:
-            # 新版: 可学习 softplus 参数化
-            # σ_d = σ_min + (σ_max - σ_min) · softplus(γ_d) / (1 + softplus(0))
-            # 使用 uniform 初始化确保非零值（避免 randn * 0.01 可能产生的接近 0 问题）
-            self._depth_scale_raw = nn.Parameter(
-                torch.empty(max_level + 1).uniform_(0.3, 0.7)
-            )
-        else:
-            # 旧版: 固定线性初始化 (向后兼容)
-            self._depth_scale_raw = None
-            self._depth_scale_fixed = nn.Parameter(torch.ones(max_level + 1))
-            self._init_depth_scale_legacy()
-        
         # I-PHASE4: 深度感知特征调制 (DAFM)
         # 解决 C3 尺度等变性问题
         if use_dynamic_weight:
@@ -306,6 +291,20 @@ class HilbertNativePatchEmbed(nn.Module):
 
         # 层归一化 (可选，用于稳定训练)
         self.norm = nn.LayerNorm(dim)
+
+        # C+ RoPE: 方向感知子空间隔离 RoPE（绝对相位注入）
+        # 仅对后半维度（拓扑场）应用，物理场保持不变
+        # I-NAN: 修正检查逻辑 - dim_per_subspace = dim // max_level 必须为偶整数
+        # 而非仅检查 rope_dim_per_subspace（这是错误的）
+        dim_per_subspace = dim // max_level
+        if dim_per_subspace > 0 and dim_per_subspace % 2 == 0:
+            self.rope_fractal = DirectionAwareSubspacedRoPE(
+                dim=dim // 2,  # RoPE 仅作用于后半维度（拓扑场）
+                max_level=max_level,
+            )
+        else:
+            # 维度不满足 RoPE 要求，跳过 RoPE
+            self.rope_fractal = None
 
         # I-NAN: 为所有参数注册梯度 hook，捕获 backward 过程中产生的 NaN
         # 解决 patch_embed 内部 backward 产生 NaN 的问题
@@ -373,43 +372,6 @@ class HilbertNativePatchEmbed(nn.Module):
         modulated = pooled_features * gamma + beta
 
         return modulated
-
-    def _init_depth_scale_legacy(self) -> None:
-        """旧版初始化 (向后兼容).
-        
-        初始化: σ_d = 1.0 + β * d / max_level ∈ [1.0, 1.0+β]
-        """
-        assert self._depth_scale_fixed is not None
-        with torch.no_grad():
-            for d in range(self.max_level + 1):
-                self._depth_scale_fixed[d] = 1.0 + self.depth_scale_beta * d / self.max_level
-    
-    @property
-    def depth_scale(self) -> torch.Tensor:
-        """获取深度缩放因子，带数值安全保护.
-
-        使用 softplus 参数化替代 sigmoid，避免梯度饱和问题：
-        - softplus(x) = log(1 + exp(x)) 总是正值且梯度平滑
-        - 不会像 sigmoid 在极端值时梯度接近 0
-
-        Returns:
-            shape: (max_level + 1,) 的缩放因子张量
-        """
-        if self._depth_scale_raw is not None:
-            assert self.depth_scale_range is not None
-            sigma_min, sigma_max = self.depth_scale_range
-
-            # I-NAN: 使用 SafeSoftplus 在 backward 时检测和修复 NaN/Inf 梯度
-            # 注意：SafeSoftplus 内部已经加了 eps
-            scale = SafeSoftplus.apply(self._depth_scale_raw, 1e-6)
-
-            # 裁剪到有效范围
-            scale = scale.clamp_(min=sigma_min, max=sigma_max)
-
-            return scale
-        else:
-            # 旧版: 直接返回固定参数
-            return self._depth_scale_fixed
 
     def _build_fpn_features(self, features: torch.Tensor) -> list:
         """构建 FPN 特征金字塔
@@ -762,19 +724,10 @@ class HilbertNativePatchEmbed(nn.Module):
         if self.use_dynamic_weight:
             pooled = self._apply_depth_modulation(pooled, depths_tensor)
 
-        # 6. 批量应用深度编码
-        # t_i = pooled_i * σ_{d_i} + E_{d_i}
-        # I-NAN: clamp depths_tensor 防止 padding (-1) 导致索引越界
-        depths_safe = depths_tensor.clamp(min=0, max=self.max_level)
-        scales = self.depth_scale[depths_safe]  # [N_total]
-        # I-NAN: 添加 eps 保护，防止除零和极端梯度
-        eps = 1e-6
-        scales = scales + eps  # 确保 scale 不为 0
-        embeds = self.depth_embed(depths_safe)  # [N_total, D]
-        # 使用 nan_to_num 确保数值安全
-        pooled_safe = pooled * scales.unsqueeze(-1)
-        pooled_safe = torch.nan_to_num(pooled_safe, nan=0.0, posinf=100.0, neginf=-100.0)
-        all_tokens = pooled_safe + embeds  # [N_total, D]
+        # 6. 批量应用深度编码（纯 RoPE - 无加性/乘性 depth encoding）
+        # C+ RoPE 方案：绝对相位通过 DirectionAwareSubspacedRoPE 在拓扑场注入
+        # 不再使用 depth_scale (乘性) 和 depth_embed (加性)
+        all_tokens = pooled
         
         # 7. 分配到输出 buffer
         # D4-AUDIT FIX: 向量化批量赋值替代 Python 循环
@@ -789,6 +742,27 @@ class HilbertNativePatchEmbed(nn.Module):
         
         # 8. 层归一化
         tokens = self.norm(tokens)
+
+        # 9. C+ RoPE: 对拓扑场应用方向感知子空间隔离（绝对相位注入）
+        # 仅在维度满足要求时应用 (dim_per_subspace 需为偶数)
+        if self.rope_fractal is not None:
+            # 分割 tokens: 前 D/2 物理场保持不变，后 D/2 拓扑场应用 RoPE
+            tokens_physical, tokens_fractal = tokens.chunk(2, dim=-1)  # [B, N, D/2] each
+
+            # 转换为 [B, H, N, D/2] 格式以匹配 RoPE 期望 (H=1 对于 tokenizer)
+            tokens_fractal = tokens_fractal.unsqueeze(1)  # [B, 1, N, D/2]
+
+            # 创建 LevelsInfo 对象用于 RoPE
+            levels_info_obj = LevelsInfo(data=levels_info, max_level=self.max_level)
+
+            # 应用 RoPE（注入绝对相位）
+            tokens_fractal = self.rope_fractal(tokens_fractal, levels_info_obj)  # [B, 1, N, D/2]
+
+            # 恢复原始形状
+            tokens_fractal = tokens_fractal.squeeze(1)  # [B, N, D/2]
+
+            # 拼接回物理场和拓扑场
+            tokens = torch.cat([tokens_physical, tokens_fractal], dim=-1)  # [B, N, D]
 
         # I-NAN: 注册梯度 hook，捕获从 Transformer 传回的 NaN/Inf
         # D1-AUDIT FIX: 先移除旧 hook，避免每 forward 累积
@@ -837,15 +811,10 @@ class HilbertNativePatchEmbed(nn.Module):
         # I109-7: 使用 bit_length() 替代 int(math.log2(...)) 避免浮点精度问题
         depth = max(grid_h, grid_w).bit_length() - 1
         depth = min(depth, self.max_level)
-        
-        # 应用深度编码
-        scale = self.depth_scale[depth]
-        embed = self.depth_embed.weight[depth]
-        tokens = tokens * scale + embed.unsqueeze(0).unsqueeze(0)
-        
+
         # 4. 层归一化
         tokens = self.norm(tokens)
-        
+
         # 5. 创建 levels_info (统一深度)
         N = tokens.shape[1]
         levels_info = torch.zeros(
@@ -853,7 +822,7 @@ class HilbertNativePatchEmbed(nn.Module):
             dtype=torch.long, device=device
         )
         levels_info[:, :, 0] = depth
-        
+
         # 填充四叉树路径 (从 HilbertPathCache 获取)
         from vit_pytorch.core.hilbert_indexer import HilbertPathCache
         _, quadtree_paths = HilbertPathCache.get_or_compute(
@@ -862,7 +831,28 @@ class HilbertNativePatchEmbed(nn.Module):
         path_len = min(quadtree_paths.shape[1], self.max_level)
         actual_n = min(N, quadtree_paths.shape[0])
         levels_info[:, :actual_n, 1:path_len+1] = quadtree_paths[:actual_n, :path_len]
-        
+
+        # 6. C+ RoPE: 对拓扑场应用方向感知子空间隔离（绝对相位注入）
+        # 仅在维度满足要求时应用 (dim_per_subspace 需为偶数)
+        if self.rope_fractal is not None:
+            # 分割 tokens: 前 D/2 物理场保持不变，后 D/2 拓扑场应用 RoPE
+            tokens_physical, tokens_fractal = tokens.chunk(2, dim=-1)  # [B, N, D/2] each
+
+            # 转换为 [B, H, N, D/2] 格式以匹配 RoPE 期望 (H=1 对于 tokenizer)
+            tokens_fractal = tokens_fractal.unsqueeze(1)  # [B, 1, N, D/2]
+
+            # 创建 LevelsInfo 对象用于 RoPE
+            levels_info_obj = LevelsInfo(data=levels_info, max_level=self.max_level)
+
+            # 应用 RoPE（注入绝对相位）
+            tokens_fractal = self.rope_fractal(tokens_fractal, levels_info_obj)  # [B, 1, N, D/2]
+
+            # 恢复原始形状
+            tokens_fractal = tokens_fractal.squeeze(1)  # [B, N, D/2]
+
+            # 拼接回物理场和拓扑场
+            tokens = torch.cat([tokens_physical, tokens_fractal], dim=-1)  # [B, N, D]
+
         return tokens, levels_info
 
     @property
@@ -870,27 +860,23 @@ class HilbertNativePatchEmbed(nn.Module):
         """HilbertNativePatchEmbed 诊断输出
 
         命名空间:
-            embed/params/*: 可学习尺度参数
             embed/health/*: 数值健康度
-
-        注意:
-            使用 self.depth_scale (动态计算属性) 而非 self._depth_scale_raw，
-            因为 depth_scale 包含 SafeSoftplus 变换后的实际物理尺度值。
+            embed/rope/*: DirectionAwareSubspacedRoPE 诊断
         """
         output: Dict[str, Any] = {}
-
-        # embed/params/* - depth_scale 实际使用值
-        if hasattr(self, 'depth_scale'):
-            ds = self.depth_scale  # [max_level+1] 动态计算后的 scale
-            if isinstance(ds, torch.Tensor):
-                for d in range(ds.numel()):
-                    output[f"params/depth_scale_lvl_{d}"] = float(ds[d].item())
-                output["params/depth_scale_mean"] = float(ds.mean().item())
-                output["params/depth_scale_std"] = float(ds.std().item())
 
         # embed/health/* - nan_grad_hooks 注册数
         if hasattr(self, '_nan_grad_hooks') and self._nan_grad_hooks:
             output["health/nan_grad_hooks_registered"] = len(self._nan_grad_hooks)
+
+        # === 收集 RoPE 诊断（嵌套子模块）===
+        # I-EMBED: rope_fractal 是 DirectionAwareSubspacedRoPE 子模块，
+        # 其 embed_output 不会自动被 collect_auxiliary_diagnostics 收集
+        if hasattr(self, 'rope_fractal') and self.rope_fractal is not None:
+            rope_output = self.rope_fractal.embed_output
+            if rope_output:
+                for k, v in rope_output.items():
+                    output[f"rope/{k}"] = v  # train/embed/rope/...
 
         return output
 

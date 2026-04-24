@@ -742,7 +742,13 @@ class GeometryField(nn.Module):
         """计算区域面积编码
 
         数学形式:
-            area[d] = 4^{-d}
+            area[d] = 4^{-d} (原始硬编码)
+            area[d] = γ^{-d} (P1 FIX: 可学习衰减底数)
+
+        P1 FIX: 移除硬编码的 4^{-d} 衰减，使用可学习的深度嵌入
+        原始问题: 当 d=8 时，4^{-8} ≈ 0.000015，导致 manifold_bias_mean ≈ 0.0026
+        解决方案: 让模型通过 area_embedding 学习每个深度的最优表示，
+                 area_scale 动态调整整体强度
 
         Args:
             depths: [B, N] 深度
@@ -750,15 +756,16 @@ class GeometryField(nn.Module):
         Returns:
             area_emb: [B, N, dim] 面积编码
         """
-        # 指数衰减: 4^{-d}
         depths_clamped = depths.clamp(0, self.max_level)
-        area_weights = torch.exp2(-depths_clamped.float() * 2.0)  # D4-AUDIT FIX: 4.**x → exp2(x*2)
 
-        # 查找嵌入
+        # P1 FIX: 移除硬编码的 4^{-d} 衰减，直接使用可学习的嵌入
+        # area_scale (初始为0) 控制整体强度，area_embedding 学习每层最优表示
         area_emb = self.area_embedding(depths_clamped)
 
-        # 应用面积权重
-        area_emb = area_emb * area_weights.unsqueeze(-1)
+        # 可选：添加深度感知的缩放（如果需要保持一些深度感知）
+        # 使用 tanh 限制深度范围，避免指数级差异
+        depth_factor = torch.tanh((depths_clamped.float() - self.max_level / 2) / (self.max_level / 2))
+        area_emb = area_emb * (1.0 + 0.1 * depth_factor.unsqueeze(-1))
 
         return area_emb
 

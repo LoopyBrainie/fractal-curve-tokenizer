@@ -120,6 +120,9 @@ class FractalTransformerBlock(nn.Module):
         drop_path: float = 0.0,
         ffn_type: FFNType = 'swiglu_level',
         manifold_beta: float = 4.0,
+        # v7.1: 宏观/微观频率配置
+        macro_ratio: float = 0.5,
+        macro_base: float = 1000.0,
     ):
         super().__init__()
         self.dim = dim
@@ -136,6 +139,9 @@ class FractalTransformerBlock(nn.Module):
             dropout=dropout,
             use_banded=True,
             use_fractal_residual=True,
+            # v7.1: 传递宏观频率配置
+            macro_ratio=macro_ratio,
+            macro_base=macro_base,
         )
 
         self.ff = AdaptiveFractalFeedForward(
@@ -270,6 +276,9 @@ class FractalTransformer(nn.Module):
         ffn_type: FFNType = 'swiglu_level',
         use_checkpoint: bool = False,
         manifold_beta: float = 4.0,
+        # v7.1: 宏观/微观频率配置
+        macro_ratio: float = 0.5,
+        macro_base: float = 1000.0,
     ):
         super().__init__()
         self.dim = dim
@@ -295,6 +304,9 @@ class FractalTransformer(nn.Module):
                     drop_path=self._drop_path_rates[i],
                     ffn_type=ffn_type,
                     manifold_beta=manifold_beta,
+                    # v7.1: 传递宏观频率配置
+                    macro_ratio=macro_ratio,
+                    macro_base=macro_base,
                 )
                 for i in range(depth)
             ]

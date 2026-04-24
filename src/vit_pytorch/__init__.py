@@ -55,10 +55,8 @@ from .layers import (
     AdaptiveFractalFeedForward,
     FFNType,
     FractalPathEmbedding,
-    HierarchicalAttentionBias,
     VectorizedPathEncoder,
     FractalPositionEmbedding,
-    MultiScalePatchEncoder,
     HilbertNativePatchEmbed,
 )
 
@@ -160,10 +158,8 @@ __all__ = [
     "AdaptiveFractalFeedForward",
     "FFNType",
     "FractalPathEmbedding",
-    "HierarchicalAttentionBias",
     "VectorizedPathEncoder",
     "FractalPositionEmbedding",
-    "MultiScalePatchEncoder",
     "HilbertNativePatchEmbed",
     "CoreSplitter",
     "AnnealingSplitter",

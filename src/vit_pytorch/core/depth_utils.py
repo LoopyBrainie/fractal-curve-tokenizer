@@ -44,6 +44,7 @@ def compute_max_depth(
     image_size: Tuple[int, int],
     min_patch_size: int,
     hard_limit: Optional[int] = None,
+    round_to_pow2: bool = False,
 ) -> int:
     """
     动态计算四叉树最大深度。
@@ -63,6 +64,10 @@ def compute_max_depth(
         目标最小 patch 大小
     hard_limit : int, optional
         硬上限，None 表示无限制（由图像尺寸和 min_patch_size 自动决定）
+    round_to_pow2 : bool, optional
+        是否将结果对齐到最近的 2 幂（默认 False）
+        当为 True 时，返回最接近的 2 幂值，确保与 DirectionAwareSubspacedRoPE
+        的 dim_per_subspace 约束兼容（dim // max_level 必须为偶整数）
 
     返回
     ----
@@ -74,11 +79,13 @@ def compute_max_depth(
     >>> compute_max_depth((64, 64), 4)
     4
     >>> compute_max_depth((224, 224), 4)
-    5
+    6  # ceil(log2(56)) = 6
     >>> compute_max_depth((512, 512), 4)
     7
     >>> compute_max_depth((64, 64), 4, hard_limit=3)  # 64/2^3=8，实际最小 patch
     3
+    >>> compute_max_depth((224, 224), 4, round_to_pow2=True)
+    8  # 6 -> 8 (最近的 2 幂)
 
     边界情况
     --------
@@ -95,10 +102,23 @@ def compute_max_depth(
     if min_patch_size <= 0:
         raise ValueError(f"min_patch_size must be positive, got {min_patch_size}")
 
-    # 动态计算深度 (I34-5 修复: 使用 ceil 而非 floor)
+    # 动态计算深度
     # 公式: L_max = ceil(log2(min_dim / min_patch_size))
     # 语义: 确保 min_patch_size * 2^L_max >= min_dim，即最小 patch 达到目标尺寸
     max_depth = int(math.ceil(math.log2(min_dim / min_patch_size)))
+
+    # 对齐到 2 幂（I-NAN: 确保与 RoPE 的 dim_per_subspace 约束兼容）
+    # 当 round_to_pow2=True 时，返回最接近的 2 幂值
+    # 例如: 6 -> 8, 5 -> 4, 3 -> 4
+    if round_to_pow2 and max_depth > 0:
+        # 计算最近的 2 幂
+        pow2_floor = 2 ** int(math.floor(math.log2(max_depth)))
+        pow2_ceil = 2 ** int(math.ceil(math.log2(max_depth)))
+        # 选择差值最小的 2 幂
+        if abs(pow2_ceil - max_depth) <= abs(pow2_floor - max_depth):
+            max_depth = pow2_ceil
+        else:
+            max_depth = pow2_floor
 
     # 应用硬上限（如果指定）
     if hard_limit is not None:

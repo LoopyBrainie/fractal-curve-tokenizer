@@ -364,12 +364,12 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # Entmax 参数 (I107: 添加预热策略 + 修复课程学习)
         self.entmax_alpha = entmax_alpha
         self.entmax_alpha_init = 1.0      # P1 FIX: 起始值改为 1.0 (强制 softmax)
-        self.entmax_alpha_warmup = 1.30    # P1 FIX: 上限从 1.49 降至 1.30，防止过度稀疏化
-        self.entmax_alpha_max = 1.30       # P1 FIX: 稳定值设为 1.30
-        self.entmax_warmup_epochs = 5      # Stage 0: epoch 0-5 (α=1.0)
-        self.entmax_transition_epochs = 12 # P1 FIX: Stage 1 结束 epoch (α 从 1.0 → 1.22)
-        # P1 FIX: α 延迟调度 (12→25) 爬升至 1.30，不再到达 1.49
-        self.entmax_schedule_epochs = 25   # 总调度 epoch 数 (5-25: α 增长到 1.30)
+        self.entmax_alpha_warmup = 1.25    # P1 FIX: 上限从 1.30 降至 1.25
+        self.entmax_alpha_max = 1.25       # P1 FIX: 稳定值设为 1.25（平滑过渡）
+        self.entmax_warmup_epochs = 8      # P1 FIX: Stage 0 延长到 epoch 0-8 (α=1.0)
+        self.entmax_transition_epochs = 15 # P1 FIX: Stage 1 延长到 epoch 8-15 (α: 1.0 → 1.15)
+        # P1 FIX: α 延迟调度 (15→25) 缓慢爬升至 1.25
+        self.entmax_schedule_epochs = 25   # 总调度 epoch 数
 
         # 树约束 - I164-1: 动态λ调整
         # 使用log(lambda)确保λ>0，通过课程学习逐步增强约束
@@ -396,6 +396,9 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         # P0 FIX: 动态 K_min 比例，由 _update_fractal_hyperparams 调度
         # 1.0 = K_min = N（保留所有 token），0.5 = K_min = 0.5 * K_target
         self._k_min_ratio = 1.0
+        # P1 FIX: 目标熵，用于路由正则化退火
+        # 0.55 = 中等随机性（高温平滑），0.40 = 低随机性（收敛状态）
+        self._target_entropy = 0.55
 
         # Jump Loss 权重
         self.jump_loss_weight = jump_loss_weight
@@ -1512,16 +1515,29 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         """
         self._k_min_ratio = max(0.5, min(1.0, ratio))
 
+    def set_target_entropy(self, entropy: float) -> None:
+        """P1 FIX: 设置目标熵（用于路由正则化退火）
+
+        Args:
+            entropy: 目标路由熵，范围 [0.3, 0.6]
+                - 0.55: 中等随机性（Stage 0，高温平滑）
+                - 0.40: 低随机性（Stage 3+，收敛状态）
+        """
+        self._target_entropy = max(0.3, min(0.6, entropy))
+
     def set_epoch(self, epoch: int):
-        """P1 FIX: 设置当前 epoch，进行 Entmax α 分阶段退火
+        """P1 FIX: 设置当前 epoch，进行 Entmax α 平滑退火
 
-        三阶段设计：
-            Stage 0 (0-5):   α = 1.0 (强制 softmax，稠密梯度)
-            Stage 1 (5-12):  α: 1.0 → 1.22 (温和稀疏区)
-            Stage 2 (12-25): α: 1.22 → 1.49 (高稀疏区)
-            Stage 3 (25+):   α = 1.49 (稳定期)
+        三阶段设计（平滑过渡）：
+            Stage 0 (0-8):    α = 1.0 (强制 softmax，稠密梯度)
+            Stage 1 (8-15):  α: 1.0 → 1.15 (温和稀疏区)
+            Stage 2 (15-25): α: 1.15 → 1.25 (稳定区)
+            Stage 3 (25+):   α = 1.25 (稳定期)
 
-        关键阈值 α ≈ 1.22：Entmax 开始表现明显稀疏性但仍保留较多"次要概率梯度"
+        关键改进：
+            - Stage 0 从 5 延长到 8，延长 softmax 阶段
+            - α 最终值从 1.30 降到 1.25，减少过度稀疏化
+            - 过渡期延长，允许 Splitter 更平滑地适应
         """
         self._current_epoch = epoch
 
@@ -1539,16 +1555,16 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             # Stage 0: α = 1.0 (强制 softmax，稠密梯度流)
             self.entmax_alpha = 1.0
         elif epoch < self.entmax_transition_epochs:
-            # Stage 1 (5-12): 温和稀疏区，α 从 1.0 退火到 1.22
+            # Stage 1 (8-15): 温和稀疏区，α 从 1.0 平滑退火到 1.15
             progress = smoothstep(epoch, self.entmax_warmup_epochs, self.entmax_transition_epochs)
-            self.entmax_alpha = 1.0 + 0.22 * progress  # 1.0 → 1.22
+            self.entmax_alpha = 1.0 + 0.15 * progress  # 1.0 → 1.15
         elif epoch < self.entmax_schedule_epochs:
-            # Stage 2 (12-25): 高稀疏区，α 从 1.22 退火到 1.30
+            # Stage 2 (15-25): 稳定区，α 从 1.15 平滑到 1.25
             progress = smoothstep(epoch, self.entmax_transition_epochs, self.entmax_schedule_epochs)
-            self.entmax_alpha = 1.22 + 0.08 * progress  # 1.22 → 1.30 (P1 FIX)
+            self.entmax_alpha = 1.15 + 0.10 * progress  # 1.15 → 1.25
         else:
-            # Stage 3 (25+): α = 1.30 (稳定期)
-            self.entmax_alpha = 1.30
+            # Stage 3 (25+): α = 1.25 (稳定期)
+            self.entmax_alpha = 1.25
 
         # 温度由 BPE 三阶段调度器在 train_fractal_vit._update_fractal_hyperparams()
         # 中通过 set_temperature() 管理，此处不再内部退火，避免梯度冲突。
@@ -1625,6 +1641,17 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             # 避免 log(0)
             entropy = -(probs_flat * torch.log(probs_flat + EPS)).sum() / (probs.numel() + EPS)
             losses['entropy'] = entropy
+
+            # P1: 路由熵正则化 - 防止路由概率走向极端（0/1）
+            # 熵的最大值是 log(2)≈0.693（二分类情况）
+            # 目标熵 0.5-0.6 对应中等程度的路由随机性
+            # 使用 MSE 趋向目标熵值，防止过度锐化或过度平滑
+            target_entropy = getattr(self, '_target_entropy', 0.55)
+            # 展平后的二值熵: H = -(p*log(p) + (1-p)*log(1-p))
+            p_clamped = probs_flat.clamp(min=EPS, max=1 - EPS)
+            binary_entropy = -(p_clamped * torch.log(p_clamped) + (1 - p_clamped) * torch.log(1 - p_clamped))
+            entropy_reg_loss = F.mse_loss(binary_entropy.mean(), torch.tensor(target_entropy, device=probs.device))
+            losses['entropy_reg'] = entropy_reg_loss
 
         # 2. Budget损失 - 控制 token 数量
         # P0 FIX: 动态 K_min + 对数域 Budget Loss

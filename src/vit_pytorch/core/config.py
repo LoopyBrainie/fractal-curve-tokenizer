@@ -1440,6 +1440,12 @@ class FractalConfig:
     # ========== Tokenizer 配置 ==========
     tokenizer_type: TokenizerType = 'streaming_v3'
 
+    # ========== RoPE 宏观/微观频率配置 ==========
+    # macro_ratio: 宏观子空间占比 (前 macro_ratio*D 维为宏观, 低频)
+    macro_ratio: float = 0.5
+    # macro_base: 宏观频率基准 (比 micro base 小 10x, 近线性旋转)
+    macro_base: float = 1000.0
+
     # ========== 推导参数 (自动计算) ==========
     max_level: int = field(init=False)
     num_scales: int = field(init=False)

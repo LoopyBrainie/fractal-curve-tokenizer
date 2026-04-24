@@ -61,6 +61,10 @@ from vit_pytorch.core.pattern_plugin import (
     create_hilbert_pattern_plugin,
 )  # I162-1: 双路径插件
 from vit_pytorch.core.shape_stabilizer import ShapeStabilizer  # Bucketing 策略
+from vit_pytorch.layers.attention.manifold_attention import (
+    coords_from_paths,
+    poincare_distance,
+)  # P0 FIX: 真 Poincaré 距离计算
 
 
 # =============================================================================
@@ -434,12 +438,12 @@ class FractalCurveViT(nn.Module):
         # I110-7: 语义分裂器配置（已废弃 - 2026-03-23）
         use_semantic_splitter: bool = False,  # DEPRECATED
         semantic_splitter_config: Optional[SemanticSplitterConfig] = None,  # DEPRECATED
-        # P6-1: 深度缩放参数 (传递给 HilbertPatchEmbed)
-        depth_scale_range: Optional[Tuple[float, float]] = None,
         # I-PHASE4: 池化方法选择 (传递给 HilbertPatchEmbed)
         use_interpolated_pooling: bool = False,
         # I-PHASE4: 动态权重 (传递给 HilbertPatchEmbed)
         use_dynamic_weight: bool = False,
+        # P6-1: depth_scale_range - 深度缩放范围 (σ_min, σ_max)，使用 sigmoid 参数化
+        depth_scale_range: Optional[Tuple[float, float]] = None,
         # I-PHASE4: Low-Rank 几何场 (传递给 GeometryField)
         geometry_field_rank: int = 16,
         # I162-1: Hilbert 模式编码器参数
@@ -456,6 +460,9 @@ class FractalCurveViT(nn.Module):
         geometry_field_dim: Optional[int] = None,  # 几何流形场维度 (默认等于 dim)
         manifold_bias_scale: float = 1.0,  # 流形偏置缩放因子
         manifold_beta: float = 4.0,  # Hilbert 带宽系数
+        # v7.1: DirectionAwareSubspacedRoPE 宏观/微观频率配置
+        macro_ratio: float = 0.5,  # 宏观子空间占比 (前 macro_ratio*D 维为宏观)
+        macro_base: float = 1000.0,  # 宏观频率基准 (比 micro base 小 10x)
     ) -> None:
         """初始化 FractalCurveViT。
 
@@ -540,8 +547,6 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         self.splitter_feature_dim = splitter_feature_dim
         self.splitter_pool_size = splitter_pool_size
 
-        # P6-1: 深度缩放参数
-        self.depth_scale_range = depth_scale_range
         # I-PHASE4: 新参数
         self.use_interpolated_pooling = use_interpolated_pooling
         self.use_dynamic_weight = use_dynamic_weight
@@ -721,11 +726,12 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                 d_model=dim,
                 base_patch_size=effective_min_patch_size,
                 min_patch_size=effective_min_patch_size,
-                depth_scale_range=self.depth_scale_range,
                 # I-PHASE4: 新参数
                 use_interpolated_pooling=self.use_interpolated_pooling,
                 use_dynamic_weight=self.use_dynamic_weight,
                 hilbert_cache=self.hilbert_cache,  # Step 3: O(1) Hilbert lookup
+                # P6-1: depth_scale_range
+                depth_scale_range=depth_scale_range,
             )
 
         # I110-7: 语义分裂器已废弃（2026-03-23）
@@ -751,11 +757,6 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         self.max_level = computed_max_level
 
         self.token_processor = None
-
-        # v6.0+: Position Embedding 已移除，由 Cartesian2DRoPE 替代
-        # （保持 self.pos_embedding 引用以兼容 check_scale_consistency 检查）
-        self.pos_embedding = None  # type: ignore
-        self.position_embedding = None  # type: ignore
 
         # === Scheme C: GeometryField ===
         self.use_geometry_field = use_geometry_field
@@ -816,6 +817,9 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                 ffn_type=ffn_type,
                 use_checkpoint=use_checkpoint,
                 manifold_beta=manifold_beta,
+                # v7.1: 传递宏观频率配置
+                macro_ratio=macro_ratio,
+                macro_base=macro_base,
             )
 
         # === 一致性检查：确保 tokenizer 和 transformer 使用相同的 max_level ===
@@ -1237,11 +1241,11 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         padded_levels: torch.Tensor,
         regions: Optional[torch.Tensor] = None,
         image_size: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, "LevelsInfo", torch.Tensor]:
+    ) -> Tuple[torch.Tensor, "LevelsInfo"]:
         """添加位置编码和 CLS token。
 
         I98-4: 返回 LevelsInfo 而非 raw tensor
-        v6.0: 返回 geometry_emb_with_cls 用于 Attention 注入
+        v7.0+: geometry_emb 已移除，统一由 DirectionAwareSubspacedRoPE 提供位置信息
 
         Args:
             padded_tokens: 填充后的 tokens [B, MaxLen, Dim]
@@ -1250,10 +1254,9 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             image_size: (I31-3) 图像尺寸，可以是整数或 (W, H) 元组
 
         Returns:
-            (x, levels_info, geometry_emb_with_cls):
+            (x, levels_info):
             - x: 带位置编码和 CLS 的序列 [B, 1+MaxLen, Dim]
             - levels_info: LevelsInfo 实例（包含 CLS）
-            - geometry_emb_with_cls: 带 CLS 的几何嵌入 [B, 1+MaxLen, Dim]
         """
         batch_size = padded_tokens.shape[0]
         device = padded_tokens.device
@@ -1262,18 +1265,11 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         from vit_pytorch.core.levels_info import LevelsInfo
         levels_info = LevelsInfo(data=padded_levels, max_level=self.max_level)
 
-        # v6.0+: 2D RoPE 已集成到 ManifoldNativeAttention 内部
-        # 移除 Learned PE (BitFlippedPositionEncoder)，不再添加绝对位置编码
-        x = padded_tokens  # 2D RoPE 在 attention 内部提供位置信息
+        # v7.0+: 位置信息统一由 DirectionAwareSubspacedRoPE 在 attention 内部提供
+        x = padded_tokens
 
-        # 为 CLS 添加零几何嵌入（保持接口兼容）
-        # 注意: geometry_emb 旧版本从未被 ManifoldNativeAttention 使用
+        # 添加 CLS token
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        cls_geometry = torch.zeros(batch_size, 1, self.dim, device=x.device)
-        # geometry_emb 形状: [B, N, D]，全零（2D RoPE 替代了它的功能）
-        geometry_emb = torch.zeros(batch_size, padded_tokens.shape[1], self.dim, device=x.device)
-        geometry_emb_with_cls = torch.cat([cls_geometry, geometry_emb], dim=1)  # [B, N+1, D]
-
         x = torch.cat((cls_tokens, x), dim=1)
         # I-NAN: 添加数值安全保护，防止反向传播时梯度出现 NaN
         x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
@@ -1290,8 +1286,8 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
 
         x = self.emb_dropout_module(x)
 
-        # v6.0: 返回 geometry_emb_with_cls
-        return x, levels_info_with_cls, geometry_emb_with_cls
+        # v7.0: 不再返回 geometry_emb
+        return x, levels_info_with_cls
 
     def _create_attention_mask(
         self,
@@ -1611,27 +1607,21 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             actual_num_tokens = actual_num_tokens.clamp(max=hilbert_order.shape[0])
             hilbert_order = hilbert_order[:actual_num_tokens]
 
-        # 2. 添加位置编码和 CLS token (v6.0: 同时获取 geometry_emb)
-        x, levels_info, geometry_emb_with_cls = self._apply_position_and_cls(
+        # 2. 添加位置编码和 CLS token (v7.0: 不再返回 geometry_emb)
+        x, levels_info = self._apply_position_and_cls(
             padded_tokens, padded_levels, regions=regions, image_size=image_size
         )
 
-        # Scheme C: 如果启用 GeometryField，计算流形场偏置并与现有 geometry_emb 融合
-        # 注意: levels_info 已经包含 CLS，所以 manifold_emb 形状已经是 [B, N+1, dim]
-        # I-AUDIT: manifold_bias_* 和 poincare_dist_* 需要在融合前计算（使用原始 manifold_emb）
+        # v7.0: geometry_emb 已移除，统一由 DirectionAwareSubspacedRoPE 提供位置信息
+        # 注意: geometry_field 的 manifold_emb 不再添加到 geometry_emb
+        # GeometricLatentDecoder 将收到 geometry_emb=None 并退化为 pass
         manifold_emb_for_stats = None
         if self.use_geometry_field and self.geometry_field is not None:
-            # 计算几何流形场编码 (levels_info 已包含 CLS)
+            # 计算几何流形场编码 (用于统计，不参与残差融合)
             manifold_emb = self.geometry_field(levels_info)  # [B, N+1, dim]
-
-            # I-AUDIT: 保存原始 manifold_emb 用于统计计算（在融合前）
             manifold_emb_for_stats = manifold_emb.detach()
 
-            # 缩放并融合到现有的 geometry_emb
-            # geometry_emb_with_cls 形状: [B, N+1, dim]
-            geometry_emb_with_cls = geometry_emb_with_cls + self.manifold_bias_scale * manifold_emb
-
-        # I-AUDIT: 计算 manifold_bias_* 统计（在融合后仍有 geometry_emb_with_cls 可用）
+        # I-AUDIT: 计算 manifold_bias_* 统计（使用 manifold_emb）
         manifold_bias_max = None
         manifold_bias_min = None
         manifold_bias_mean = None
@@ -1639,9 +1629,8 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         poincare_dist_mean = None
         poincare_dist_std = None
         if self.use_geometry_field and manifold_emb_for_stats is not None:
-            # manifold_bias 统计：使用融合后的 geometry_emb_with_cls（因为这是实际使用的值）
-            # geometry_emb_with_cls 形状: [B, N+1, dim]，排除 CLS token
-            manifold_bias = geometry_emb_with_cls[:, 1:, :]  # [B, N, dim] 排除 CLS
+            # manifold_bias 统计：使用 manifold_emb（排除 CLS token）
+            manifold_bias = manifold_emb_for_stats[:, 1:, :]  # [B, N, dim] 排除 CLS
 
             # D1-AUDIT FIX: 保持 GPU tensor，延迟到 post_forward 统一 .item()
             manifold_bias_max = manifold_bias.max()
@@ -1649,30 +1638,34 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             manifold_bias_mean = manifold_bias.mean()
             manifold_bias_std = manifold_bias.std()
 
-            # P2-B 修复: 使用 Hilbert 距离统计替代 atanh(||manifold_emb||)
-            # 原实现问题: atanh(||manifold_emb||) 测量的是 embedding 范数饱和度，
-            # 不是 token-to-token 距离。当所有 manifold_emb 范数饱和在 0.99 时，
-            # atanh(0.99) = 2.6467，所有 token 得到相同值，std ≈ 0
-            # 新实现: 使用 Hilbert 索引差异作为距离代理
-            if levels_info is not None and hasattr(levels_info, 'get_hilbert_indices'):
-                hilbert_indices = levels_info.get_hilbert_indices()  # [B, N]
-                N = hilbert_indices.shape[1]
-                # P2.1 FIX: 使用 triu_indices 直接 gather 上三角元素
-                # 原实现问题: torch.eye mask 方式创建了 [B,N,N] 矩阵 + bool mask，
-                # 仍然需要 O(B×N²) 内存和计算，新实现通过 gather 直接选取上三角坐标对
-                triu_idx = torch.triu_indices(N, N, 1, device=hilbert_indices.device)  # [2, N×(N-1)/2]
-                # D4-AUDIT FIX: 完全避免创建 hilbert_dist_upper tensor
-                # 直接在 gather 后采样，只计算 S 个采样点的 abs 差值
-                # 对于 N=1024，N_up ≈ 524K，采样 4096 对足以估计 mean/std
+            # P0 FIX: 使用真 Poincaré 距离替代 Hilbert 索引差
+            # 原实现问题: hilbert_sample 是 Hilbert 索引差的绝对值，范围 [0, 4^max_level)
+            # 这不是流形上的测地线距离，无法反映 token-to-token 的双曲几何距离
+            # 新实现: 使用 coords_from_paths 重建 2D 坐标，计算 Poincaré 磁盘模型中的测地线距离
+            if levels_info is not None:
+                B_dim, N_dim, D_plus_1 = levels_info.data.shape
+                depths = levels_info.data[:, :, 0]  # [B, N]
+                paths = levels_info.data[:, :, 1:]  # [B, N, max_level]
+
+                # 1. 从 Hilbert paths 重建 2D 坐标
+                coords_2d = coords_from_paths(paths, depths, self.max_level)  # [B, N, 2], 范围 [0, 1]
+
+                # 2. 坐标映射到 Poincaré 磁盘单位圆 (-1, 1)²
+                # 注意: poincare_distance 要求 ||u||² < 1，否则分母 1 - ||u||² 产生数值问题
+                coords_normalized = coords_2d * 2.0 - 1.0  # 放射变换到 (-1, 1)
+
+                # 3. 计算真 Poincaré 距离矩阵 [B, N, N]
+                true_poincare_dist = poincare_distance(coords_normalized, self.image_size)
+
+                # 4. 采样上三角元素计算统计量
+                triu_idx = torch.triu_indices(N_dim, N_dim, 1, device=coords_2d.device)
                 S = min(4096, triu_idx.shape[1])
-                perm = torch.randperm(triu_idx.shape[1], device=hilbert_indices.device)[:S]
-                h_i_sample = hilbert_indices[:, triu_idx[0][perm]].float()  # [B, S]
-                h_j_sample = hilbert_indices[:, triu_idx[1][perm]].float()  # [B, S]
-                hilbert_sample = torch.abs(h_i_sample - h_j_sample)  # [B, S]
-                poincare_dist_mean = hilbert_sample.mean()
-                poincare_dist_std = hilbert_sample.std()
+                perm = torch.randperm(triu_idx.shape[1], device=coords_2d.device)[:S]
+                poincare_sample = true_poincare_dist[:, triu_idx[0][perm], triu_idx[1][perm]]
+                poincare_dist_mean = poincare_sample.mean()
+                poincare_dist_std = poincare_sample.std()
             else:
-                # 回退：如果无法获取 Hilbert 索引，使用 manifold_emb 范数（不推荐）
+                # 回退：如果无法获取 levels_info，使用 manifold_emb 范数（不推荐）
                 manifold_raw = manifold_emb_for_stats[:, 1:, :]  # [B, N, dim], 排除 CLS
                 norm_x = manifold_raw.norm(dim=-1)  # [B, N]
                 poincare_dist = torch.atanh(torch.clamp(norm_x, max=0.99))
@@ -1700,7 +1693,7 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             fused_tokens, pooled = self.pattern_plugin(
                 direct_tokens=x,  # [B, N+1, D] 含 CLS
                 levels_info=levels_info,
-                geometry_emb=geometry_emb_with_cls,
+                geometry_emb=None,  # v7.0: geometry_emb 已移除
                 transformer=self.transformer,
                 hilbert_order=hilbert_order,
             )
@@ -1731,11 +1724,11 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
 
         # 如果不是插件模式，继续执行原有的 transformer 处理逻辑
         if not _plugin_mode:
-            # 4. Transformer 处理 (v6.0: 注入 geometry_emb)
+            # 4. Transformer 处理 (v7.0: geometry_emb 已移除)
             x = self.transformer(
                 x, levels_info, attn_mask,
                 regions=regions, image_size=image_size,
-                geometry_emb=geometry_emb_with_cls,
+                geometry_emb=None,  # v7.0: geometry_emb 已移除
             )
 
             # 获取 transformer 输出 (排除 CLS token)
@@ -1884,7 +1877,12 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             target_tokens = total_patches.float() * self.target_ratio  # float for ratio multiplication
             actual_tokens = num_tokens_tensor.sum()  # D1-AUDIT: GPU tensor
             if target_tokens > 0:
-                raw_budget_error = torch.abs(actual_tokens.float() - target_tokens) / target_tokens  # D1-AUDIT: GPU tensor
+                raw_budget_error = torch.abs(actual_tokens.float() - target_tokens) / target_tokens
+                # P1 FIX: Dead-zone 机制 - ±10% 死区内不惩罚
+                # 防止模型在初始化阶段为纠正微小偏差而牺牲核心特征学习
+                dead_zone = 0.1
+                if raw_budget_error.item() < dead_zone:
+                    raw_budget_error = torch.tensor(0.0, device=raw_budget_error.device)
             # I-AUDIT: 计算 density_regularization (密度正则化)
         # 基于选中 token 分布的均匀性
         density_regularization = None
@@ -2018,16 +2016,6 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                 levels_diag["distribution/geo_emb_norm_mean"] = norms.mean()
                 levels_diag["distribution/geo_emb_norm_std"] = norms.std()
 
-            # scale_consistency_dist（C3 约束）
-            if hasattr(self.pos_embedding, 'check_scale_consistency'):
-                try:
-                    scale_dist = self.pos_embedding.check_scale_consistency(levels_info)
-                    if scale_dist is not None:
-                        # D1-AUDIT FIX: 保持 GPU tensor
-                        levels_diag["health/scale_consistency_dist"] = scale_dist
-                except Exception:
-                    pass
-
         if levels_diag:
             auxiliary_outputs["levels"] = levels_diag
 
@@ -2113,32 +2101,6 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         if hasattr(self, '_semantic_splitter') and self._semantic_splitter is not None:
             # SemanticRedundancySplitter 无缓存需要清理
             pass
-
-    # =====================================================================
-    # I110-7: 语义分裂器接口（已废弃 - 2026-03-23）
-    # =====================================================================
-    def get_semantic_splitter(self) -> Optional[nn.Module]:
-        """获取语义分裂器实例（已废弃，总返回 None）"""
-        return None
-
-    def get_semantic_loss_fn(self) -> Optional[nn.Module]:
-        """获取语义损失函数（已废弃，总返回 None）"""
-        return None
-
-    def compute_semantic_loss(
-        self,
-        parent_features: torch.Tensor,
-        child_features: torch.Tensor,
-        split_decision: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """计算语义冗余损失 (I110-7 - 已废弃)
-
-        Returns:
-            总返回零损失（语义分裂器已废弃 - 2026-03-23）
-        """
-        # 参数保留但未使用（避免接口变更）
-        _ = parent_features, child_features, split_decision
-        return {'loss': torch.tensor(0.0, device=parent_features.device)}
 
     def analyze_tokenization(self, img: torch.Tensor) -> Dict[str, Any]:
         """分析 tokenization 过程，返回详细统计信息。

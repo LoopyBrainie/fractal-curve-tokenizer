@@ -20,10 +20,8 @@ from .ffn import (
 )
 from .embeddings import (
     FractalPathEmbedding,
-    HierarchicalAttentionBias,
     VectorizedPathEncoder,
     FractalPositionEmbedding,
-    MultiScalePatchEncoder,
     HilbertNativePatchEmbed,
 )
 # Note: CoreSplitter, AnnealingSplitter, MetricsSplitter, SplitResult
@@ -45,9 +43,7 @@ __all__ = [
     "FFNType",
     # Embeddings
     "FractalPathEmbedding",
-    "HierarchicalAttentionBias",
     "VectorizedPathEncoder",
     "FractalPositionEmbedding",
-    "MultiScalePatchEncoder",
     "HilbertNativePatchEmbed",
 ]

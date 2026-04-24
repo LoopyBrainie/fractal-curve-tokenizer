@@ -18,13 +18,17 @@ Manifold-Native 多尺度注意力 (ManifoldNativeAttention)
 """
 
 from __future__ import annotations
+import math
 
+import logging
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from vit_pytorch.core.constants import EPS
+from vit_pytorch.layers.embeddings.fractal_rope import DirectionAwareSubspacedRoPE
 
 if TYPE_CHECKING:
     from vit_pytorch.core.levels_info import LevelsInfo
@@ -537,6 +541,10 @@ class GeometricLatentDecoder(nn.Module):
             emb_proj = emb_proj.unsqueeze(2)  # [B, N, 1, rank]
             emb_proj = emb_proj.expand(-1, -1, N, -1)  # [B, N, N, rank]
             x = x + emb_proj  # 残差融合，梯度同时流向 feature_proj 和 emb_adapter
+        else:
+            # v7.0: 纯 RoPE 模式 - 完全依赖 DirectionAwareSubspacedRoPE 几何表示
+            # GeometricLatentDecoder 退化为无残差融合的原始行为
+            pass
 
         # A1 修复: 移除 feature_norm，保持几何尺度和方向信息
 
@@ -623,7 +631,8 @@ def compute_hilbert_bandwidth(
 # P2.2 FIX: torch.compile 融合内核
 # 使用 reduce-overhead 模式降低 Python 开销并启用 CUDA Kernel 融合
 # 将 Float32 距离矩阵与 Bool 比较融合为单一 CUDA Kernel
-@torch.compile(mode='reduce-overhead', dynamic=False)
+# TEMP DISABLED: causing MemoryError on import
+# @torch.compile(mode='reduce-overhead', dynamic=False)
 def _compile_hilbert_band_core(
     h_i: torch.Tensor,
     h_j: torch.Tensor,
@@ -880,148 +889,6 @@ class ScaleAwareResidual(nn.Module):
         return self.dropout(residual)
 
 
-class Cartesian2DRoPE(nn.Module):
-    """
-    基于物理坐标的 Cartesian 2D Rotary Position Embedding。
-
-    数学形式化
-    ==========
-    给定位置 i 的物理坐标 p_i = (x_i, y_i)，
-    计算绝对角度 θ_i = atan2(y_i, x_i)
-
-    利用三角恒等式进行高效实现:
-    - 存储: 每个位置只需 (cos θ_i, sin θ_i)，O(N) 空间
-    - 相对角度: θ_ij = θ_j - θ_i
-    - cos(θ_ij) = cos(θ_i)cos(θ_j) + sin(θ_i)sin(θ_j)
-    - sin(θ_ij) = sin(θ_j)cos(θ_i) - cos(θ_j)sin(θ_i)
-
-    旋转矩阵作用于每对维度 (2d, 2d+1):
-        R(θ) = [[cos(θ), -sin(θ)],
-                [sin(θ),  cos(θ)]]
-
-    特性
-    ----
-    - 相对位置编码，不依赖绝对位置
-    - O(N) 空间复杂度（无需存储 N² 角度矩阵）
-    - 与 Manifold Bias 正交，可叠加
-
-    参数
-    ----
-    dim : int
-        向量维度 D（必须为偶数）
-    theta : float
-        基础频率，默认 10000.0
-    """
-
-    def __init__(self, dim: int, theta: float = 10000.0):
-        super().__init__()
-        if dim % 2 != 0:
-            raise ValueError(f"dim must be even, got {dim}")
-        self.dim = dim
-        self.theta = theta
-
-        # D3-AUDIT FIX: freqs 从未使用（在 apply_rotation 中重新计算），移除死代码
-        # 原实现: freqs = theta ** (...); self.register_buffer("freqs", freqs, persistent=False)
-        # 实际使用在 apply_rotation (line 893): torch.arange(dim_pairs, device=q.device, ...)
-
-    def forward(
-        self,
-        coords: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        计算每个位置的 (cos θ, sin θ) 用于后续注意力计算。
-
-        参数
-        ----
-        coords : torch.Tensor
-            物理坐标 [B, N, 2]，格式 (x, y)，归一化到 [0, 1)
-
-        返回
-        ----
-        Tuple[torch.Tensor, torch.Tensor]
-            (cos_θ, sin_θ)，每个 [B, N]
-        """
-        # 计算每个位置的绝对角度 θ_i = atan2(y_i, x_i)
-        angles = torch.atan2(coords[..., 1], coords[..., 0])  # [B, N]
-
-        # 预计算 cos 和 sin
-        cos_θ = torch.cos(angles)  # [B, N]
-        sin_θ = torch.sin(angles)  # [B, N]
-
-        # 存储用于后续应用
-        self._last_cos = cos_θ.detach()
-        self._last_sin = sin_θ.detach()
-        self._last_coords = coords.detach()
-
-        return cos_θ, sin_θ
-
-    def apply_rotation(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        cos_θ: torch.Tensor,
-        sin_θ: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        将 2D RoPE 旋转应用到 Q 和 K。
-
-        公式（应用于每对维度）:
-            x' = cos(φ) * x_{2d} - sin(φ) * x_{2d+1}
-            x'' = sin(φ) * x_{2d} + cos(φ) * x_{2d+1}
-
-        其中 φ = θ * freq，θ 是位置角度，freq 是频率。
-
-        参数
-        ----
-        q : torch.Tensor
-            Query 向量 [B, H, N, d]
-        k : torch.Tensor
-            Key 向量 [B, H, N, d]
-        cos_θ : torch.Tensor
-            每个位置的 cos(θ_i), [B, N]
-        sin_θ : torch.Tensor
-            每个位置的 sin(θ_i), [B, N]
-
-        返回
-        ----
-        Tuple[torch.Tensor, torch.Tensor]
-            旋转后的 (q, k)
-        """
-        B, H, N, D = q.shape
-        dim_pairs = D // 2
-
-        # 计算相位 φ = θ * freq
-        # 标准 RoPE: 每对维度 (2i, 2i+1) 应用角度 θ_i = theta^(-2i/D)
-        # cos_θ: [B, N] -> [B, 1, N, 1]
-        # freqs: [dim_pairs] 频率序列
-        cos_θ = cos_θ.unsqueeze(1).unsqueeze(-1)  # [B, 1, N, 1]
-        sin_θ = sin_θ.unsqueeze(1).unsqueeze(-1)  # [B, 1, N, 1]
-        # 正确公式: theta^(-2i/D) for i = 0, 1, ..., dim_pairs-1
-        freqs = self.theta ** (-2 * torch.arange(dim_pairs, device=q.device, dtype=q.dtype).float() / D)
-        freqs = freqs.view(1, 1, 1, dim_pairs)  # [1, 1, 1, dim_pairs]
-
-        cos_phi = cos_θ * freqs
-        sin_phi = sin_θ * freqs
-
-        # 重塑 q 和 k 为维度对
-        q_pairs = q.reshape(B, H, N, dim_pairs, 2)  # [B, H, N, d//2, 2]
-        k_pairs = k.reshape(B, H, N, dim_pairs, 2)
-
-        # 应用旋转到 q
-        # q' = cos(φ) * q_{even} - sin(φ) * q_{odd}
-        # q'' = sin(φ) * q_{even} + cos(φ) * q_{odd}
-        q_rot = torch.empty_like(q)
-        q_rot[..., 0::2] = cos_phi * q_pairs[..., 0] - sin_phi * q_pairs[..., 1]
-        q_rot[..., 1::2] = sin_phi * q_pairs[..., 0] + cos_phi * q_pairs[..., 1]
-
-        # 应用旋转到 k
-        k_rot = torch.empty_like(k)
-        k_rot[..., 0::2] = cos_phi * k_pairs[..., 0] - sin_phi * k_pairs[..., 1]
-        k_rot[..., 1::2] = sin_phi * k_pairs[..., 0] + cos_phi * k_pairs[..., 1]
-
-        return q_rot, k_rot
-
-
 # ==================== 主模块 ====================
 
 
@@ -1052,6 +919,9 @@ class ManifoldNativeAttention(nn.Module):
         dropout: float = 0.0,
         use_banded: bool = True,
         use_fractal_residual: bool = True,
+        # v7.1: 宏观/微观频率配置 (用于 DirectionAwareSubspacedRoPE)
+        macro_ratio: float = 0.5,
+        macro_base: float = 1000.0,
     ):
         super().__init__()
 
@@ -1063,6 +933,9 @@ class ManifoldNativeAttention(nn.Module):
         self.dropout = dropout
         self.use_banded = use_banded
         self.use_fractal_residual = use_fractal_residual
+        # v7.1: 存储宏观频率配置
+        self.macro_ratio = macro_ratio
+        self.macro_base = macro_base
 
         self.inner_dim = heads * dim_head
         self.head_dim = dim_head
@@ -1095,8 +968,21 @@ class ManifoldNativeAttention(nn.Module):
         else:
             self.residual_proj = nn.Identity()
 
-        # Cartesian 2D RoPE（基于物理坐标的旋转位置编码）
-        self.rope_2d = Cartesian2DRoPE(dim=self.inner_dim)
+        # 统一 RoPE: 方向感知子空间隔离 RoPE (DirectionAwareSubspacedRoPE)
+        # 全维度 D 使用单一 RoPE，macro_ratio 分割宏观/微观子空间
+        # 维度检查：dim_per_subspace 必须为偶数
+        rope_dim = self.inner_dim
+        rope_dim_per_subspace = rope_dim // max_level if max_level > 0 else rope_dim
+        if rope_dim_per_subspace % 2 == 0:
+            # v7.1: 显式注入 macro_ratio 和 macro_base
+            self.rope_fractal = DirectionAwareSubspacedRoPE(
+                dim=rope_dim,
+                max_level=max_level,
+                macro_ratio=self.macro_ratio,
+                macro_base=self.macro_base,
+            )
+        else:
+            self.rope_fractal = None
 
         # 诊断缓冲区
         self._last_geo_bias: Optional[torch.Tensor] = None
@@ -1188,6 +1074,28 @@ class ManifoldNativeAttention(nn.Module):
 
         B, N, D = x.shape
 
+        # CLS token 检测：比较 x 序列长度与 levels_info 条目数
+        # 如果 x 序列长度 > levels_info 条目数，说明存在 CLS token
+        if levels_info is not None:
+            levels_info_len = levels_info.depths.shape[1]
+            has_cls_token = (N > levels_info_len)
+        else:
+            has_cls_token = False
+
+        # CLS token 处理：为保持维度对齐，需要为 CLS token 添加 dummy 条目
+        if has_cls_token:
+            # 为 CLS token 创建 dummy 条目（使用深度 0，不影响注意力计算）
+            cls_depth = torch.zeros(B, 1, dtype=depths.dtype, device=depths.device)
+            cls_hilbert = torch.zeros(B, 1, dtype=hilbert_indices.dtype, device=hilbert_indices.device)
+            cls_coords = torch.zeros(B, 1, 2, dtype=coords.dtype, device=coords.device)
+            cls_path = torch.zeros(B, 1, raw_paths.shape[-1], dtype=raw_paths.dtype, device=raw_paths.device)
+
+            # 拼接 CLS dummy 到现有 tensors（用于 geo_decoder 和 fractal residual）
+            depths = torch.cat([depths, cls_depth], dim=1)  # [B, N+1]
+            hilbert_indices = torch.cat([hilbert_indices, cls_hilbert], dim=1)  # [B, N+1]
+            coords = torch.cat([coords, cls_coords], dim=1)  # [B, N+1, 2]
+            raw_paths = torch.cat([raw_paths, cls_path], dim=1)  # [B, N+1, L]
+
         # 早期坐标重建（用于 2D RoPE）
         # 如果有 raw_paths，可以提前计算 coords
         if raw_paths is not None and depths is not None:
@@ -1199,11 +1107,22 @@ class ManifoldNativeAttention(nn.Module):
                 max_level=actual_max_level,
             )  # [B, N, 2] 归一化到 [0, 1)
         elif hilbert_indices is not None:
-            # 回退：使用基于 hilbert_indices 的简化坐标
-            h_norm = hilbert_indices.float() / (hilbert_indices.max().float() + 1e-8)
-            # P2 修复: 使用 [h_norm, 1-h_norm] 恢复二维流形张力
-            # 原 [h_norm, h_norm] 导致所有点落在 y=x 对角线，双曲几何完全退化
-            coords = torch.stack([h_norm, 1 - h_norm], dim=-1)  # [B, N, 2]
+            # 回退：使用 Hilbert 展平索引重建 2D 网格坐标
+            # P0 修复: 原 [h_norm, 1-h_norm] 产生 1D 对角线，||x||≈1.0 触发 Poincaré 边界溢出
+            # 改进：使用 ceil(sqrt()) 避免完全平方数假设，保留空间序 (Spatial Order)
+            batch_size, seq_len = hilbert_indices.shape
+            W = H = int(math.ceil(math.sqrt(seq_len)))  # 向上取整
+
+            x_grid = (torch.arange(seq_len, device=hilbert_indices.device) % W).float() / W * 2 - 1  # [N]
+            y_grid = (torch.arange(seq_len, device=hilbert_indices.device) // W).float() / H * 2 - 1  # [N]
+
+            # 扩展 batch 维度: [N] → [B, N]
+            x_grid = x_grid.unsqueeze(0).expand(batch_size, -1)
+            y_grid = y_grid.unsqueeze(0).expand(batch_size, -1)
+
+            # 安全收缩因子 0.95 + tanh 软压缩防止边界震荡
+            safe_scale = 0.95 * float(math.tanh(1.0))
+            coords = torch.stack([x_grid, y_grid], dim=-1) * safe_scale  # [B, N, 2], ||x|| < 1
 
         # 存储输入用于诊断
         self._last_input_x = x.detach()
@@ -1216,10 +1135,47 @@ class ManifoldNativeAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         # 计算注意力分数
-        # 应用 Cartesian 2D RoPE（在 QKV 投影后、注意力计算前）
+        # 应用 RoPE（在 QKV 投影后、注意力计算前）
+        # 前 D/2 维: Cartesian2DRoPE (物理场)
+        # 后 D/2 维: DirectionAwareSubspacedRoPE (拓扑场)
         if coords is not None:
-            cos_θ, sin_θ = self.rope_2d(coords)
-            q, k = self.rope_2d.apply_rotation(q, k, cos_θ, sin_θ)
+            # 检测是否存在 CLS token（通过 coords 长度与 q 长度判断）
+            if has_cls_token:
+                # CLS token 存在：分离 CLS token，仅对 spatial tokens 应用统一 RoPE
+                q_cls = q[:, :, 0:1, :]
+                k_cls = k[:, :, 0:1, :]
+                q_spatial = q[:, :, 1:, :]
+                k_spatial = k[:, :, 1:, :]
+            else:
+                # 无 CLS token：直接对全部 tokens 应用统一 RoPE
+                q_cls, k_cls = None, None
+                q_spatial, k_spatial = q, k
+
+            # 统一 RoPE: DirectionAwareSubspacedRoPE (全维度 D)
+            # macro_ratio 分割宏观/微观子空间，替代原有的 Cartesian2DRoPE + 分裂
+            # 维度兼容性检查：D 必须被 max_level 整除
+            rope_dim = q_spatial.shape[-1]
+            max_level_from_input = self.rope_fractal.max_level if self.rope_fractal else 0
+            dim_compatible = (max_level_from_input > 0) and (rope_dim % max_level_from_input == 0)
+
+            if levels_info is not None and self.rope_fractal is not None:
+                if dim_compatible:
+                    q_spatial = self.rope_fractal(q_spatial, levels_info)
+                    k_spatial = self.rope_fractal(k_spatial, levels_info)
+                else:
+                    # 维度不兼容时发出警告（仅首次触发）
+                    logging.warning(
+                        f"[ManifoldNativeAttention] dim_per_subspace={rope_dim // max_level_from_input} "
+                        f"is odd - fractal RoPE disabled for this layer. "
+                        f"Consider using even D or adjusting max_level."
+                    )
+
+            # 如果存在 CLS token，重新拼接
+            if q_cls is not None:
+                q = torch.cat([q_cls, q_spatial], dim=2)
+                k = torch.cat([k_cls, k_spatial], dim=2)
+            else:
+                q, k = q_spatial, k_spatial
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
 
@@ -1290,8 +1246,8 @@ class ManifoldNativeAttention(nn.Module):
             attn = attn.masked_fill(~band_mask.unsqueeze(1), -1e9)
 
         # Entmax 稀疏激活 + Dropout
-        from vit_pytorch.layers.splitters.hilbert_entmax import entmax_1_5
-        attn = entmax_1_5(attn, dim=-1)
+        # [DIAGNOSTIC] Temporarily replaced entmax_1_5 with F.softmax to test if entmax causes NaN
+        attn = F.softmax(attn, dim=-1)
         attn = self.attn_dropout(attn)
 
         # 存储注意力权重用于诊断
