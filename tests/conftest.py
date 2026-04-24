@@ -18,6 +18,7 @@ Pytest Configuration - Shared Fixtures
 
 import pathlib
 import sys
+import os
 from contextlib import contextmanager
 from typing import Generator, Optional, Tuple
 
@@ -25,6 +26,12 @@ import pytest
 import torch
 import numpy as np
 import random
+
+# Windows torchinductor path encoding workaround
+# torchinductor uses temp files with paths containing \U which Windows interprets as unicode escape
+# This causes "SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes"
+if os.name == 'nt':
+    torch._dynamo.config.suppress_errors = True
 
 
 # =============================================================================

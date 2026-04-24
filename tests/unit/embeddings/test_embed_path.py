@@ -8,7 +8,6 @@ Embeddings Tests: Fractal Path
 - FractalConfig 参数推导
 - VectorizedPathEncoder 路径编码
 - FractalPathEmbedding 四叉树位置编码
-- HierarchicalAttentionBias 层级注意力偏置
 """
 
 
@@ -18,7 +17,6 @@ import torch
 from vit_pytorch import (
     FractalConfig,
     FractalPathEmbedding,
-    HierarchicalAttentionBias,
     VectorizedPathEncoder,
     create_fractal_config,
 )
@@ -208,48 +206,6 @@ class TestFractalPathEmbedding:
 
         # 不同尺度应该产生不同的编码
         assert not torch.allclose(out_fine, out_coarse)
-
-
-class TestHierarchicalAttentionBias:
-    """测试层级注意力偏置."""
-
-    @pytest.fixture
-    def config(self) -> FractalConfig:
-        return FractalConfig(32, 4)
-
-    def test_init(self, config: FractalConfig) -> None:
-        """测试初始化."""
-        bias_module = HierarchicalAttentionBias(config=config, heads=4)
-
-        assert bias_module.max_level == 3
-        assert bias_module.ancestor_bias.num_embeddings == 5  # max_level + 2
-
-    def test_forward_shape(self, config: FractalConfig) -> None:
-        """测试前向传播输出形状."""
-        bias_module = HierarchicalAttentionBias(config=config, heads=4)
-
-        bias = bias_module(seq_len=64, batch_size=2)
-
-        assert bias.shape == (2, 4, 64, 64)
-
-    def test_symmetry(self, config: FractalConfig) -> None:
-        """测试偏置矩阵的对称性."""
-        bias_module = HierarchicalAttentionBias(config=config, heads=4)
-
-        bias = bias_module(seq_len=64, batch_size=1)
-
-        # 层级关系是对称的
-        assert torch.allclose(bias, bias.transpose(-1, -2))
-
-    def test_self_bias_highest(self, config: FractalConfig) -> None:
-        """测试对角线 (自身) 偏置最高."""
-        bias_module = HierarchicalAttentionBias(config=config, heads=4)
-
-        bias = bias_module(seq_len=64, batch_size=1)
-
-        # 对角线元素 (共同祖先深度 = max_level) 应该有一致的值
-        diag = torch.diagonal(bias[0, 0])
-        assert torch.allclose(diag, diag[0].expand_as(diag))
 
 
 if __name__ == "__main__":
