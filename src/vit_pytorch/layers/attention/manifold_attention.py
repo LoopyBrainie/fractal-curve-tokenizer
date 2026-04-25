@@ -28,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vit_pytorch.core.constants import EPS
-from vit_pytorch.layers.embeddings.fractal_rope import DirectionAwareSubspacedRoPE
+from vit_pytorch.layers.embeddings.fractal_rope import DirectionAwareSubspacedRoPE, Cartesian2DRoPE
 
 if TYPE_CHECKING:
     from vit_pytorch.core.levels_info import LevelsInfo
@@ -922,6 +922,8 @@ class ManifoldNativeAttention(nn.Module):
         # v7.1: 宏观/微观频率配置 (用于 DirectionAwareSubspacedRoPE)
         macro_ratio: float = 0.5,
         macro_base: float = 1000.0,
+        # Stage 4: layer_idx 用于 temp_geom 层级衰减
+        layer_idx: int = 0,
     ):
         super().__init__()
 
@@ -936,6 +938,8 @@ class ManifoldNativeAttention(nn.Module):
         # v7.1: 存储宏观频率配置
         self.macro_ratio = macro_ratio
         self.macro_base = macro_base
+        # Stage 4: 存储 layer_idx 用于 temp_geom 层级衰减
+        self.layer_idx = layer_idx
 
         self.inner_dim = heads * dim_head
         self.head_dim = dim_head
@@ -968,21 +972,46 @@ class ManifoldNativeAttention(nn.Module):
         else:
             self.residual_proj = nn.Identity()
 
-        # 统一 RoPE: 方向感知子空间隔离 RoPE (DirectionAwareSubspacedRoPE)
-        # 全维度 D 使用单一 RoPE，macro_ratio 分割宏观/微观子空间
-        # 维度检查：dim_per_subspace 必须为偶数
-        rope_dim = self.inner_dim
-        rope_dim_per_subspace = rope_dim // max_level if max_level > 0 else rope_dim
-        if rope_dim_per_subspace % 2 == 0:
-            # v7.1: 显式注入 macro_ratio 和 macro_base
+        # 🚀 Stage 2: 双 RoPE 架构 - Cartesian(物理场) + C+(拓扑场)
+        # 物理场(1/4): Cartesian2DRoPE - 全局平移不变性
+        # 拓扑场(3/4): DirectionAwareSubspacedRoPE - 分形树层级与局部拓扑
+        phys_dim = self.inner_dim // 4
+        topo_dim = self.inner_dim - phys_dim  # = inner_dim * 3 // 4
+
+        # Cartesian2DRoPE 用于物理场 (前 1/4 维度)
+        if phys_dim % 2 == 0:
+            self.rope_cartesian = Cartesian2DRoPE(dim=phys_dim, theta=self.macro_base)
+        else:
+            self.rope_cartesian = None
+
+        # DirectionAwareSubspacedRoPE 用于拓扑场 (后 3/4 维度)
+        topo_dim_per_subspace = topo_dim // max_level if max_level > 0 else topo_dim
+        if topo_dim_per_subspace % 2 == 0:
             self.rope_fractal = DirectionAwareSubspacedRoPE(
-                dim=rope_dim,
+                dim=topo_dim,
                 max_level=max_level,
                 macro_ratio=self.macro_ratio,
                 macro_base=self.macro_base,
             )
         else:
             self.rope_fractal = None
+
+        # 🚀 三分支门控温度系数（阶段 1: 几何隔离网关）
+        # 使用 exp(τ) 确保权重始终为正
+        # 初始 τ₁ = τ₂ = τ₃ = 0 → exp(0) = 1.0，等能量初始化
+        self.temp_phys = nn.Parameter(torch.zeros(1))  # 物理场门控
+        self.temp_topo = nn.Parameter(torch.zeros(1))  # 拓扑场门控
+        self.temp_geom = nn.Parameter(torch.zeros(1))  # 几何场门控（控制 B_manifold 强度）
+
+        # 🚀 Stage 4: 度量校准 - 可学习的层级衰减
+        # 浅层需要更强的几何偏置来锁定大尺度物体，深层允许更多语义自由度
+        # layer_decay ∈ [-2, 0]，使深层的 temp_geom 约为浅层的 ~36% (exp(-1) ≈ 0.368)
+        # 初始化为从 0 到 -1.0 的线性衰减
+        if layer_idx == 0:
+            # 全局共享的衰减参数（非 per-layer）
+            self._geom_decay = nn.Parameter(torch.zeros(1))
+        else:
+            self._geom_decay = None  # 只有第一层有可学习的衰减参数
 
         # 诊断缓冲区
         self._last_geo_bias: Optional[torch.Tensor] = None
@@ -1134,52 +1163,109 @@ class ManifoldNativeAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4).contiguous()  # [3, B, H, N, d]
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        # 计算注意力分数
-        # 应用 RoPE（在 QKV 投影后、注意力计算前）
-        # 前 D/2 维: Cartesian2DRoPE (物理场)
-        # 后 D/2 维: DirectionAwareSubspacedRoPE (拓扑场)
-        if coords is not None:
-            # 检测是否存在 CLS token（通过 coords 长度与 q 长度判断）
+        # 🚀 Stage 2: 双 RoPE 应用 - 先分割后旋转
+        # 1/4 维度: Cartesian2DRoPE (物理场)
+        # 3/4 维度: DirectionAwareSubspacedRoPE (拓扑场)
+        inner_dim = q.shape[-1]
+        phys_dim = inner_dim // 4
+        topo_dim = inner_dim - phys_dim
+
+        # 在应用 RoPE 之前先分割 Q/K
+        q_phys = q[..., :phys_dim]
+        k_phys = k[..., :phys_dim]
+        q_topo = q[..., phys_dim:]
+        k_topo = k[..., phys_dim:]
+
+        # 🚀 Stage 2: 对物理场应用 Cartesian2DRoPE
+        if coords is not None and self.rope_cartesian is not None:
+            cos_θ, sin_θ = self.rope_cartesian(coords)
+            q_phys, k_phys = self.rope_cartesian.apply_rotation(q_phys, k_phys, cos_θ, sin_θ)
+
+        # 🚀 Stage 2: 对拓扑场应用 DirectionAwareSubspacedRoPE
+        if levels_info is not None and self.rope_fractal is not None:
+            # 检测是否存在 CLS token
             if has_cls_token:
-                # CLS token 存在：分离 CLS token，仅对 spatial tokens 应用统一 RoPE
-                q_cls = q[:, :, 0:1, :]
-                k_cls = k[:, :, 0:1, :]
-                q_spatial = q[:, :, 1:, :]
-                k_spatial = k[:, :, 1:, :]
+                # 分离 CLS token
+                q_phys_cls = q_phys[:, :, 0:1, :]
+                k_phys_cls = k_phys[:, :, 0:1, :]
+                q_phys_spatial = q_phys[:, :, 1:, :]
+                k_phys_spatial = k_phys[:, :, 1:, :]
+
+                q_topo_cls = q_topo[:, :, 0:1, :]
+                k_topo_cls = k_topo[:, :, 0:1, :]
+                q_topo_spatial = q_topo[:, :, 1:, :]
+                k_topo_spatial = k_topo[:, :, 1:, :]
             else:
-                # 无 CLS token：直接对全部 tokens 应用统一 RoPE
-                q_cls, k_cls = None, None
-                q_spatial, k_spatial = q, k
+                q_phys_cls, k_phys_cls = None, None
+                q_phys_spatial, k_phys_spatial = q_phys, k_phys
+                q_topo_cls, k_topo_cls = None, None
+                q_topo_spatial, k_topo_spatial = q_topo, k_topo
 
-            # 统一 RoPE: DirectionAwareSubspacedRoPE (全维度 D)
-            # macro_ratio 分割宏观/微观子空间，替代原有的 Cartesian2DRoPE + 分裂
-            # 维度兼容性检查：D 必须被 max_level 整除
-            rope_dim = q_spatial.shape[-1]
-            max_level_from_input = self.rope_fractal.max_level if self.rope_fractal else 0
-            dim_compatible = (max_level_from_input > 0) and (rope_dim % max_level_from_input == 0)
+            # 检查拓扑场维度兼容性
+            topo_dim_check = q_topo_spatial.shape[-1]
+            max_level_topo = self.rope_fractal.max_level if self.rope_fractal else 0
+            topo_dim_compatible = (max_level_topo > 0) and (topo_dim_check % max_level_topo == 0)
 
-            if levels_info is not None and self.rope_fractal is not None:
-                if dim_compatible:
-                    q_spatial = self.rope_fractal(q_spatial, levels_info)
-                    k_spatial = self.rope_fractal(k_spatial, levels_info)
-                else:
-                    # 维度不兼容时发出警告（仅首次触发）
-                    logging.warning(
-                        f"[ManifoldNativeAttention] dim_per_subspace={rope_dim // max_level_from_input} "
-                        f"is odd - fractal RoPE disabled for this layer. "
-                        f"Consider using even D or adjusting max_level."
-                    )
+            if topo_dim_compatible:
+                q_topo_spatial = self.rope_fractal(q_topo_spatial, levels_info)
+                k_topo_spatial = self.rope_fractal(k_topo_spatial, levels_info)
 
-            # 如果存在 CLS token，重新拼接
-            if q_cls is not None:
-                q = torch.cat([q_cls, q_spatial], dim=2)
-                k = torch.cat([k_cls, k_spatial], dim=2)
+            # 重新拼接 CLS token
+            if q_phys_cls is not None:
+                q_phys = torch.cat([q_phys_cls, q_phys_spatial], dim=2)
+                k_phys = torch.cat([k_phys_cls, k_phys_spatial], dim=2)
+                q_topo = torch.cat([q_topo_cls, q_topo_spatial], dim=2)
+                k_topo = torch.cat([k_topo_cls, k_topo_spatial], dim=2)
             else:
-                q, k = q_spatial, k_spatial
+                q_phys, k_phys = q_phys_spatial, k_phys_spatial
+                q_topo, k_topo = q_topo_spatial, k_topo_spatial
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        # 🚀 阶段 1 残留逻辑: 三分支门控 - 维度分割实现
+        # 注意: RoPE 已在上方应用到此分割后的 Q/K 上
 
-        # B2 修复: 无条件执行（仅依赖 levels_info，不再需要 regions/image_size）
+        # 计算分分支注意力分数（不使用 RoPE，隔离诊断）
+        # 阶段 1 核心：分离物理场和拓扑场的内积计算
+        score_phys = (q_phys @ k_phys.transpose(-2, -1)) * (phys_dim ** -0.5)
+        score_topo = (q_topo @ k_topo.transpose(-2, -1)) * (topo_dim ** -0.5)
+
+        # 🚀 获取加性几何偏置 B_manifold（已在 geo_decoder 中计算）
+        # 偏置的数值量级需要归一化处理，防止与 QK^T 量级不匹配导致 Softmax 饱和
+        if self._last_geo_bias is not None:
+            bias = self._last_geo_bias.detach()
+            # 归一化偏置：减去均值防止偏移，缩放到合理范围
+            bias_normalized = bias - bias.mean(dim=-1, keepdim=True)
+            b_manifold = bias_normalized * self.scale  # 缩放至与 attn scale 一致
+        else:
+            b_manifold = None
+
+        # 🚀 三分支加权融合
+        # Score = exp(τ₁) * score_phys + exp(τ₂) * score_topo + exp(τ₃) * B_manifold
+        # 使用 exp(τ) 确保权重始终为正
+        # 阶段 1 隔离：暂不使用 RoPE，让训练动态决定主导场
+        exp_temp_phys = torch.exp(self.temp_phys)
+        exp_temp_topo = torch.exp(self.temp_topo)
+
+        # 🚀 Stage 4: 度量校准 - 应用层级衰减到几何场门控
+        # 浅层(l=0): 几何偏置更强，锁定大尺度物体
+        # 深层(l>0): 几何偏置衰减，允许更多语义自由度
+        if self._geom_decay is not None:
+            # 使用带衰减的 temp_geom: exp(τ₃ + layer_decay * idx)
+            # 其中 layer_decay ≈ -0.1，使每层衰减约 10%
+            effective_temp_geom = self.temp_geom + self._geom_decay * self.layer_idx
+            exp_temp_geom = torch.exp(effective_temp_geom) if b_manifold is not None else 0.0
+        else:
+            exp_temp_geom = torch.exp(self.temp_geom) if b_manifold is not None else 0.0
+
+        # 广播 temperature weights 到 attention shape
+        # exp_temp_phys/topo: [1, 1, 1, 1] -> broadcast to [B, H, N, N]
+        attn = exp_temp_phys * score_phys + exp_temp_topo * score_topo
+        if b_manifold is not None:
+            attn = attn + exp_temp_geom * b_manifold
+
+        # 🚀 阶段 1 诊断结束 - 以下代码保持原架构，暂时禁用
+        # TODO(阶段2): 恢复 Hilbert 带宽注意力 + Fractal Residual
+        # 临时注释以验证三分支门控逻辑
+        """
         if self.use_banded and hilbert_indices is not None and depths is not None:
             # 使用 depths 推断面积（面积 ∝ 4^{-d}）
             # 这是尺度不变的，不依赖图像尺寸
@@ -1229,7 +1315,10 @@ class ManifoldNativeAttention(nn.Module):
 
             # 应用偏置
             attn = attn + bias
-
+        """
+        # 🚀 阶段 1 暂时禁用 Hilbert 带宽注意力，验证三分支门控
+        # TODO(阶段2): 恢复以下代码
+        """
         # 使用 Hilbert 带宽注意力
         if self.use_banded and depths is not None and hilbert_indices is not None:
             # 计算带宽 (返回 torch.long)
@@ -1244,7 +1333,7 @@ class ManifoldNativeAttention(nn.Module):
 
             # 应用带宽掩码
             attn = attn.masked_fill(~band_mask.unsqueeze(1), -1e9)
-
+        """
         # Entmax 稀疏激活 + Dropout
         # [DIAGNOSTIC] Temporarily replaced entmax_1_5 with F.softmax to test if entmax causes NaN
         attn = F.softmax(attn, dim=-1)
@@ -1346,6 +1435,17 @@ class ManifoldNativeAttention(nn.Module):
             cache["layer_scale_max"] = ls.max().item()
             cache["layer_scale_min"] = ls.min().item()
             cache["layer_scale_std"] = ls.std().item()
+
+        # 🚀 阶段 1: 三分支门控温度系数监控
+        # 监控 exp(τ₁)、exp(τ₂)、exp(τ₃) 的演化，判断主导场
+        # exp(τ) > 1.0: 增强该分支；exp(τ) < 1.0: 抑制该分支
+        cache["temp_phys"] = torch.exp(self.temp_phys).detach().cpu().item()
+        cache["temp_topo"] = torch.exp(self.temp_topo).detach().cpu().item()
+        cache["temp_geom"] = torch.exp(self.temp_geom).detach().cpu().item()
+        # 关键指标：物理场/拓扑场比率，exp(τ₁ - τ₂)
+        cache["temp_ratio_phys_topo"] = cache["temp_phys"] / (cache["temp_topo"] + 1e-8)
+        # 几何场相对强度
+        cache["temp_ratio_geom_phys"] = cache["temp_geom"] / (cache["temp_phys"] + 1e-8)
 
         # 带宽统计（取后即清 + CPU 迁移）
         if self._last_bandwidths is not None:
