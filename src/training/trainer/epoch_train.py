@@ -55,7 +55,7 @@ class GradBalancer:
     def __init__(
         self,
         beta: float = 0.95,
-        eta: float = 0.1,
+        eta: float = 0.25,  # P1 FIX: 提高到 25%，加强 splitter 梯度
         budget_weight_target: float = 0.2,
         min_weight: float = 0.01,
         max_ratio: float = 3.0,

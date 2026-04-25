@@ -212,10 +212,6 @@ def create_model(args, device: torch.device) -> nn.Module:
     }
 
     # Add optional parameters if provided
-    if hasattr(args, 'use_area_encoding') and args.use_area_encoding:
-        model_kwargs['use_area_encoding'] = True
-        # Note: fourier_levels is not a FractalCurveViT parameter
-
     if hasattr(args, 'use_pattern_encoder') and args.use_pattern_encoder:
         model_kwargs['use_pattern_encoder'] = True
 
@@ -665,7 +661,9 @@ def _update_fractal_hyperparams(
         progress = (epoch - 5) / (12 - 5)  # 0.0 → 1.0
         budget_weight = 0.05 + 0.05 * progress  # 0.05 → 0.1（而非 0→0.005）
         tau = 2.0 + (1.5 - 2.0) * progress  # 2.0 → 1.5（而非 2.0→1.0）
-        target_ratio = 0.5  # 保持 0.5，直到 Stage 2
+        # P1 FIX: 平滑过渡 target_ratio (epoch 5-8)，而不是突然跳变
+        target_ratio_progress = smoothstep(epoch, 5, 8)  # 0.0 → 1.0 (epoch 5-8)
+        target_ratio = 1.0 - 0.5 * target_ratio_progress  # 1.0 → 0.5 (epoch 5-8)
         k_min_ratio = 1.0 - 0.25 * progress  # 1.0 → 0.75 (N → 0.75K_target)
         logits_diversity = False
     elif epoch < 25:
