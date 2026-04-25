@@ -14,7 +14,7 @@ Layer 2 (组件层):
     layers/attention/       ManifoldNativeAttention
     layers/splitters/       HilbertOptimalSplitter, HilbertOrderedEntmaxSplitter
     layers/ffn/             SwiGLUFFN
-    layers/embeddings/      FractalPositionEmbedding, FractalPathEmbedding
+    layers/embeddings/      VectorizedPathEncoder, HilbertNativePatchEmbed
 
 Layer 1 (基础层):
     core/          HilbertCurve, LevelsInfo, Constants, Utils
@@ -54,9 +54,7 @@ from .layers import (
     SwiGLUFFN,
     AdaptiveFractalFeedForward,
     FFNType,
-    FractalPathEmbedding,
     VectorizedPathEncoder,
-    FractalPositionEmbedding,
     HilbertNativePatchEmbed,
 )
 
@@ -157,9 +155,7 @@ __all__ = [
     "SwiGLUFFN",
     "AdaptiveFractalFeedForward",
     "FFNType",
-    "FractalPathEmbedding",
     "VectorizedPathEncoder",
-    "FractalPositionEmbedding",
     "HilbertNativePatchEmbed",
     "CoreSplitter",
     "AnnealingSplitter",

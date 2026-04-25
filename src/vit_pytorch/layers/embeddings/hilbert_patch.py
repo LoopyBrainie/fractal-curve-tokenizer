@@ -292,14 +292,11 @@ class HilbertNativePatchEmbed(nn.Module):
         # 层归一化 (可选，用于稳定训练)
         self.norm = nn.LayerNorm(dim)
 
-        # C+ RoPE: 方向感知子空间隔离 RoPE（绝对相位注入）
-        # 仅对后半维度（拓扑场）应用，物理场保持不变
-        # I-NAN: 修正检查逻辑 - dim_per_subspace = dim // max_level 必须为偶整数
-        # 而非仅检查 rope_dim_per_subspace（这是错误的）
-        dim_per_subspace = dim // max_level
+        # 🚀 Stage 3: C+ RoPE 仅作用于拓扑场(3D/4)，物理场(D/4)保持不变
+        dim_per_subspace = (dim * 3 // 4) // max_level
         if dim_per_subspace > 0 and dim_per_subspace % 2 == 0:
             self.rope_fractal = DirectionAwareSubspacedRoPE(
-                dim=dim // 2,  # RoPE 仅作用于后半维度（拓扑场）
+                dim=dim * 3 // 4,  # RoPE 仅作用于拓扑场(3D/4)
                 max_level=max_level,
             )
         else:
@@ -743,14 +740,18 @@ class HilbertNativePatchEmbed(nn.Module):
         # 8. 层归一化
         tokens = self.norm(tokens)
 
-        # 9. C+ RoPE: 对拓扑场应用方向感知子空间隔离（绝对相位注入）
-        # 仅在维度满足要求时应用 (dim_per_subspace 需为偶数)
-        if self.rope_fractal is not None:
-            # 分割 tokens: 前 D/2 物理场保持不变，后 D/2 拓扑场应用 RoPE
-            tokens_physical, tokens_fractal = tokens.chunk(2, dim=-1)  # [B, N, D/2] each
+        # 🚀 Stage 3: 非对称切分 - 1/4 物理场 + 3/4 拓扑场
+        # 与 Attention 层的三分支门控对齐，确保子空间定义一致
+        # 物理场(D/4): 保持线性平移特征，用于后续 Cartesian RoPE 或作为"粘合"基础
+        # 拓扑场(3D/4): 应用 DirectionAwareSubspacedRoPE（绝对相位注入）
+        phys_dim = tokens.shape[-1] // 4
+        topo_dim = tokens.shape[-1] - phys_dim  # = tokens.shape[-1] * 3 // 4
 
-            # 转换为 [B, H, N, D/2] 格式以匹配 RoPE 期望 (H=1 对于 tokenizer)
-            tokens_fractal = tokens_fractal.unsqueeze(1)  # [B, 1, N, D/2]
+        tokens_physical, tokens_fractal = tokens[..., :phys_dim], tokens[..., phys_dim:]
+        if self.rope_fractal is not None:
+
+            # 转换为 [B, H, N, 3D/4] 格式以匹配 RoPE 期望 (H=1 对于 tokenizer)
+            tokens_fractal = tokens_fractal.unsqueeze(1)  # [B, 1, N, 3D/4]
 
             # 创建 LevelsInfo 对象用于 RoPE
             levels_info_obj = LevelsInfo(data=levels_info, max_level=self.max_level)
@@ -832,14 +833,16 @@ class HilbertNativePatchEmbed(nn.Module):
         actual_n = min(N, quadtree_paths.shape[0])
         levels_info[:, :actual_n, 1:path_len+1] = quadtree_paths[:actual_n, :path_len]
 
-        # 6. C+ RoPE: 对拓扑场应用方向感知子空间隔离（绝对相位注入）
-        # 仅在维度满足要求时应用 (dim_per_subspace 需为偶数)
-        if self.rope_fractal is not None:
-            # 分割 tokens: 前 D/2 物理场保持不变，后 D/2 拓扑场应用 RoPE
-            tokens_physical, tokens_fractal = tokens.chunk(2, dim=-1)  # [B, N, D/2] each
+        # 🚀 Stage 3: 非对称切分 - 1/4 物理场 + 3/4 拓扑场
+        # 与 Attention 层的三分支门控对齐，确保子空间定义一致
+        phys_dim = tokens.shape[-1] // 4
+        topo_dim = tokens.shape[-1] - phys_dim  # = tokens.shape[-1] * 3 // 4
 
-            # 转换为 [B, H, N, D/2] 格式以匹配 RoPE 期望 (H=1 对于 tokenizer)
-            tokens_fractal = tokens_fractal.unsqueeze(1)  # [B, 1, N, D/2]
+        tokens_physical, tokens_fractal = tokens[..., :phys_dim], tokens[..., phys_dim:]
+        if self.rope_fractal is not None:
+
+            # 转换为 [B, H, N, 3D/4] 格式以匹配 RoPE 期望 (H=1 对于 tokenizer)
+            tokens_fractal = tokens_fractal.unsqueeze(1)  # [B, 1, N, 3D/4]
 
             # 创建 LevelsInfo 对象用于 RoPE
             levels_info_obj = LevelsInfo(data=levels_info, max_level=self.max_level)
@@ -879,55 +882,3 @@ class HilbertNativePatchEmbed(nn.Module):
                     output[f"rope/{k}"] = v  # train/embed/rope/...
 
         return output
-
-
-class DepthAwarePositionalEncoding(nn.Module):
-    """深度感知位置编码.
-    
-    结合传统正弦位置编码和深度信息:
-        PE(i, d) = sin/cos(pos) + DepthEmbed(d)
-    
-    与 HilbertNativePatchEmbed 配合使用时，
-    提供额外的位置信息补充。
-    """
-    
-    def __init__(
-        self,
-        dim: int,
-        max_tokens: int = 1024,
-        max_level: int = 4,
-    ) -> None:
-        super().__init__()
-        
-        self.dim = dim
-        self.max_tokens = max_tokens
-        
-        # 正弦位置编码 (预计算)
-        # D4-AUDIT FIX: 显式 dtype + exp clamp 防止 AMP 数值溢出
-        pe = torch.zeros(max_tokens, dim, dtype=torch.float32)
-        position = torch.arange(0, max_tokens, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(
-            (torch.arange(0, dim, 2, dtype=torch.float32) * (-math.log(10000.0) / dim)).clamp(min=-50, max=50)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
-        
-        # 深度嵌入
-        self.depth_embed = nn.Embedding(max_level + 1, dim)
-    
-    def forward(
-        self,
-        tokens: Tensor,  # [B, N, dim]
-        depths: Tensor,  # [B, N] 每个 token 的深度
-    ) -> Tensor:
-        """添加位置编码."""
-        B, N, D = tokens.shape
-        
-        # 正弦位置编码
-        pos_enc = self.pe[:N].unsqueeze(0).expand(B, -1, -1)
-        
-        # 深度嵌入
-        depth_enc = self.depth_embed(depths)  # [B, N, dim]
-        
-        return tokens + pos_enc + depth_enc
