@@ -12,7 +12,7 @@
           I                                                     if l > depth
 
 其中:
-    - d_{l-1} ∈ {0,1,2,3} 是第 l-1 层の方向状态
+    - d_{l-1} ∈ {0,1,2,3} 是第 l-1 层的方向状态
     - q_l ∈ {0,1,2,3} 是第 l 层的象限
     - G 是格雷码，用于局部保序
     - ω_base = base^{-2k/D_s} 是频率展宽因子
@@ -25,13 +25,13 @@
     ω_k = base^{-2k/D_s}
 
 与 Cartesian2DRoPE 的互补关系:
-    - 物理场 (前 D/2): Cartesian2DRoPE - 全局平移不变性
-    - 拓扑场 (后 D/2): C+ RoPE - 分形树层级与局部拓扑
+    - 物理场 (前 D/4): Cartesian2DRoPE - 全局平移不变性
+    - 拓扑场 (后 3D/4): C+ RoPE - 分形树层级与局部拓扑
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -40,6 +40,149 @@ from vit_pytorch.core.levels_info import GEOM_MAP_TABLE, NEXT_DIR_TABLE
 
 if TYPE_CHECKING:
     from vit_pytorch.core.levels_info import LevelsInfo
+
+
+class Cartesian2DRoPE(nn.Module):
+    """
+    基于物理坐标的 Cartesian 2D Rotary Position Embedding.
+
+    数学形式化
+    ==========
+    给定位置 i 的物理坐标 p_i = (x_i, y_i)，
+    计算绝对角度 θ_i = atan2(y_i, x_i)
+
+    利用三角恒等式进行高效实现:
+    - 存储: 每个位置只需 (cos θ_i, sin θ_i)，O(N) 空间
+    - 相对角度: θ_ij = θ_j - θ_i
+    - cos(θ_ij) = cos(θ_i)cos(θ_j) + sin(θ_i)sin(θ_j)
+    - sin(θ_ij) = sin(θ_j)cos(θ_i) - cos(θ_j)sin(θ_i)
+
+    旋转矩阵作用于每对维度 (2d, 2d+1):
+        R(θ) = [[cos(θ), -sin(θ)],
+                [sin(θ),  cos(θ)]]
+
+    特性
+    ----
+    - 相对位置编码，不依赖绝对位置
+    - O(N) 空间复杂度（无需存储 N² 角度矩阵）
+    - 与 Manifold Bias 正交，可叠加
+
+    参数
+    ----
+    dim : int
+        向量维度 D（必须为偶数）
+    theta : float
+        基础频率，默认 10000.0
+    """
+
+    def __init__(self, dim: int, theta: float = 10000.0):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"dim must be even, got {dim}")
+        self.dim = dim
+        self.theta = theta
+
+        # 预计算频率（用于高效计算）
+        # freqs[i] = theta^(-2i/dim)
+        freqs = theta ** (-2 * torch.arange(0, dim // 2, 2).float() / dim)
+        self.register_buffer("freqs", freqs, persistent=False)
+
+    def forward(
+        self,
+        coords: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        计算每个位置的 (cos θ, sin θ) 用于后续注意力计算。
+
+        参数
+        ----
+        coords : torch.Tensor
+            物理坐标 [B, N, 2]，格式 (x, y)，归一化到 [0, 1)
+
+        返回
+        ----
+        Tuple[torch.Tensor, torch.Tensor]
+            (cos_θ, sin_θ)，每个 [B, N]
+        """
+        # 计算每个位置的绝对角度 θ_i = atan2(y_i, x_i)
+        angles = torch.atan2(coords[..., 1], coords[..., 0])  # [B, N]
+
+        # 预计算 cos 和 sin
+        cos_θ = torch.cos(angles)  # [B, N]
+        sin_θ = torch.sin(angles)  # [B, N]
+
+        # 存储用于后续应用
+        self._last_cos = cos_θ.detach()
+        self._last_sin = sin_θ.detach()
+        self._last_coords = coords.detach()
+
+        return cos_θ, sin_θ
+
+    def apply_rotation(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cos_θ: torch.Tensor,
+        sin_θ: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        将 2D RoPE 旋转应用到 Q 和 K。
+
+        公式（应用于每对维度）:
+            x' = cos(φ) * x_{2d} - sin(φ) * x_{2d+1}
+            x'' = sin(φ) * x_{2d} + cos(φ) * x_{2d+1}
+
+        其中 φ = θ * freq，θ 是位置角度，freq 是频率。
+
+        参数
+        ----
+        q : torch.Tensor
+            Query 向量 [B, H, N, d]
+        k : torch.Tensor
+            Key 向量 [B, H, N, d]
+        cos_θ : torch.Tensor
+            每个位置的 cos(θ_i), [B, N]
+        sin_θ : torch.Tensor
+            每个位置的 sin(θ_i), [B, N]
+
+        返回
+        ----
+        Tuple[torch.Tensor, torch.Tensor]
+            旋转后的 (q, k)
+        """
+        B, H, N, D = q.shape
+        dim_pairs = D // 2
+
+        # 计算相位 φ = θ * freq
+        # 标准 RoPE: 每对维度 (2i, 2i+1) 应用角度 θ_i = theta^(-2i/D)
+        # cos_θ: [B, N] -> [B, 1, N, 1]
+        # freqs: [dim_pairs] 频率序列
+        cos_θ = cos_θ.unsqueeze(1).unsqueeze(-1)  # [B, 1, N, 1]
+        sin_θ = sin_θ.unsqueeze(1).unsqueeze(-1)  # [B, 1, N, 1]
+        # 正确公式: theta^(-2i/D) for i = 0, 1, ..., dim_pairs-1
+        freqs = self.theta ** (-2 * torch.arange(dim_pairs, device=q.device, dtype=q.dtype).float() / D)
+        freqs = freqs.view(1, 1, 1, dim_pairs)  # [1, 1, 1, dim_pairs]
+
+        cos_phi = cos_θ * freqs
+        sin_phi = sin_θ * freqs
+
+        # 重塑 q 和 k 为维度对
+        q_pairs = q.reshape(B, H, N, dim_pairs, 2)  # [B, H, N, d//2, 2]
+        k_pairs = k.reshape(B, H, N, dim_pairs, 2)
+
+        # 应用旋转到 q
+        # q' = cos(φ) * q_{even} - sin(φ) * q_{odd}
+        # q'' = sin(φ) * q_{even} + cos(φ) * q_{odd}
+        q_rot = torch.empty_like(q)
+        q_rot[..., 0::2] = cos_phi * q_pairs[..., 0] - sin_phi * q_pairs[..., 1]
+        q_rot[..., 1::2] = sin_phi * q_pairs[..., 0] + cos_phi * q_pairs[..., 1]
+
+        # 应用旋转到 k
+        k_rot = torch.empty_like(k)
+        k_rot[..., 0::2] = cos_phi * k_pairs[..., 0] - sin_phi * k_pairs[..., 1]
+        k_rot[..., 1::2] = sin_phi * k_pairs[..., 0] + cos_phi * k_pairs[..., 1]
+
+        return q_rot, k_rot
 
 
 class DirectionAwareSubspacedRoPE(nn.Module):
