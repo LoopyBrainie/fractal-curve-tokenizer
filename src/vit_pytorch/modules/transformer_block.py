@@ -118,22 +118,18 @@ class FractalTransformerBlock(nn.Module):
         dropout: float = 0.0,
         max_level: int = 8,
         drop_path: float = 0.0,
-        ffn_type: FFNType = 'swiglu_level',
+        ffn_type: FFNType = 'swiglu',
         manifold_beta: float = 4.0,
         # v7.1: 宏观/微观频率配置
         macro_ratio: float = 0.5,
         macro_base: float = 1000.0,
-        # Stage 4: layer_idx 用于 temp_geom 层级衰减
-        layer_idx: int = 0,
     ):
         super().__init__()
         self.dim = dim
         self.max_level = max_level
         self.manifold_beta = manifold_beta
-        self.layer_idx = layer_idx
 
         # Manifold-Native 注意力
-        # 🚀 Stage 4: 传递 layer_idx 用于 temp_geom 层级衰减
         self.attention = ManifoldNativeAttention(
             dim=dim,
             heads=heads,
@@ -142,12 +138,9 @@ class FractalTransformerBlock(nn.Module):
             beta=manifold_beta,
             dropout=dropout,
             use_banded=True,
-            use_fractal_residual=True,
             # v7.1: 传递宏观频率配置
             macro_ratio=macro_ratio,
             macro_base=macro_base,
-            # Stage 4: 传递 layer_idx 用于 temp_geom 层级衰减
-            layer_idx=layer_idx,
         )
 
         self.ff = AdaptiveFractalFeedForward(
@@ -279,7 +272,7 @@ class FractalTransformer(nn.Module):
         dropout: float = 0.0,
         max_level: int = 8,
         drop_path_rate: float = 0.1,
-        ffn_type: FFNType = 'swiglu_level',
+        ffn_type: FFNType = 'swiglu',
         use_checkpoint: bool = False,
         manifold_beta: float = 4.0,
         # v7.1: 宏观/微观频率配置
@@ -313,8 +306,6 @@ class FractalTransformer(nn.Module):
                     # v7.1: 传递宏观频率配置
                     macro_ratio=macro_ratio,
                     macro_base=macro_base,
-                    # Stage 4: 传递 layer_idx 用于 temp_geom 层级衰减
-                    layer_idx=i,
                 )
                 for i in range(depth)
             ]

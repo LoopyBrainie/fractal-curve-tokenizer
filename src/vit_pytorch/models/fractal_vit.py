@@ -61,10 +61,6 @@ from vit_pytorch.core.pattern_plugin import (
     create_hilbert_pattern_plugin,
 )  # I162-1: 双路径插件
 from vit_pytorch.core.shape_stabilizer import ShapeStabilizer  # Bucketing 策略
-from vit_pytorch.layers.attention.manifold_attention import (
-    coords_from_paths,
-    poincare_distance,
-)  # P0 FIX: 真 Poincaré 距离计算
 
 
 # =============================================================================
@@ -77,36 +73,6 @@ MLP_RATIO = 8 / 3  # ≈ 2.67，替代原来的 4.0
 TENSOR_CORE_ALIGNMENT = 64
 
 
-def manifold_telemetry(manifold_emb: torch.Tensor) -> Dict[str, torch.Tensor]:
-    """manifold_emb 数值健康度探针 (GPU-native)
-
-    设计原则
-    ========
-    - 所有运算保持在 GPU 上，避免 CPU-GPU 同步
-    - 返回 dict of tensors，由下游 trainer 在 compile 边界外执行 .item()
-    - 不触发 torch.compile 图断裂
-
-    参数
-    ====
-    manifold_emb: GeometryField 输出，形状 [B, N+1, dim]
-
-    返回
-    ====
-    Dict with keys:
-        - sparsity: 零值比例 ((emb == 0).float().mean())
-        - l2_mean: L2 范数均值 (norm(dim=-1).mean())
-        - l2_std: L2 范数标准差 (norm(dim=-1).std())
-        - is_finite: NaN/Inf 检测 (torch.isfinite().all())
-    """
-    # 排除 CLS token，只看 patch embeddings
-    patch_emb = manifold_emb[:, 1:, :]  # [B, N, dim]
-
-    return {
-        'sparsity': (patch_emb == 0).float().mean(),
-        'l2_mean': patch_emb.norm(p=2, dim=-1).mean(),
-        'l2_std': patch_emb.norm(p=2, dim=-1).std(),
-        'is_finite': torch.isfinite(patch_emb).all(),
-    }
 
 
 def _get_tensor_core_mlp_dim(dim: int) -> int:
@@ -252,27 +218,11 @@ class TrainingStats:
     # 覆盖率
     active_ratio: Optional[float] = None  # 实际参与计算的区域覆盖率
 
-    # 流形统计
-    manifold_bias_max: Optional[float] = None
-    manifold_bias_min: Optional[float] = None
-    manifold_bias_mean: Optional[float] = None
-    manifold_bias_std: Optional[float] = None
-
-    # Poincaré 距离统计
-    poincare_dist_mean: Optional[float] = None
-    poincare_dist_std: Optional[float] = None
-
     # 梯度比值 (backward 时记录)
     backbone_grad_norm: Optional[float] = None
     splitter_grad_norm: Optional[float] = None
     backbone_vs_splitter_grad_ratio: Optional[float] = None
 
-    # === P0: Manifold Embedding 数值探针 (GPU-native) ===
-    # 设计原则：存储 GPU tensor，在 compile 边界外由 trainer 执行 .item()
-    manifold_sparsity: Optional[torch.Tensor] = None  # 零值比例
-    manifold_l2_mean: Optional[torch.Tensor] = None   # L2 范数均值
-    manifold_l2_std: Optional[torch.Tensor] = None     # L2 范数标准差
-    manifold_is_finite: Optional[torch.Tensor] = None # NaN/Inf 检测
 
     # Bottleneck 层梯度
     entmax_grad_norm: Optional[float] = None
@@ -431,7 +381,7 @@ class FractalCurveViT(nn.Module):
         use_spatial_encoding: bool = True,
         use_checkpoint: bool = False,
         drop_path_rate: float = 0.0,
-        ffn_type: FFNType = 'swiglu_level',
+        ffn_type: FFNType = 'swiglu',
         # I122-2: 移除 lca_temperature，由 hilbert_bias_scale 统一缩放
         # I33: 覆盖率参数（用于在不同分辨率下正确复算 K 值）
         # K_min/K_max 现在作为计算属性，不再是直接参数
@@ -482,8 +432,6 @@ class FractalCurveViT(nn.Module):
         use_dynamic_weight: bool = False,
         # P6-1: depth_scale_range - 深度缩放范围 (σ_min, σ_max)，使用 sigmoid 参数化
         depth_scale_range: Optional[Tuple[float, float]] = None,
-        # I-PHASE4: Low-Rank 几何场 (传递给 GeometryField)
-        geometry_field_rank: int = 16,
         # I162-1: Hilbert 模式编码器参数
         use_pattern_encoder: bool = False,  # 是否启用模式编码器
         pattern_encoder_mode: str = "light",  # "light", "standard", "multihead"
@@ -492,11 +440,7 @@ class FractalCurveViT(nn.Module):
         use_pattern_plugin: bool = False,  # 是否启用双路径插件 (替代串行模式)
         pattern_plugin_config: Optional[dict] = None,  # 插件配置字典
 
-        # Scheme C: Structured Manifold Bias 参数
-        # I107-OPT: 启用几何流形场以激活Manifold Attention核心创新
-        use_geometry_field: bool = True,  # 是否启用几何流形场
-        geometry_field_dim: Optional[int] = None,  # 几何流形场维度 (默认等于 dim)
-        manifold_bias_scale: float = 1.0,  # 流形偏置缩放因子
+        # Hilbert 带宽参数
         manifold_beta: float = 4.0,  # Hilbert 带宽系数
         # v7.1: DirectionAwareSubspacedRoPE 宏观/微观频率配置
         macro_ratio: float = 0.5,  # 宏观子空间占比 (前 macro_ratio*D 维为宏观)
@@ -532,7 +476,7 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             max_level: 最大递归深度 (P0: 统一使用 max_level)
             use_hilbert_encoding: 是否使用 Hilbert 编码
             use_spatial_encoding: 是否使用空间编码
-            ffn_type: FFN 变体 ('gelu', 'swiglu', 'swiglu_level')
+            ffn_type: FFN 变体 ('gelu', 'swiglu')
             I122-2: 移除 lca_temperature，由 hilbert_bias_scale 统一缩放
             K_min: 最少 token 数
             K_max: 最多 token 数
@@ -587,7 +531,6 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         # I-PHASE4: 新参数
         self.use_interpolated_pooling = use_interpolated_pooling
         self.use_dynamic_weight = use_dynamic_weight
-        self.geometry_field_rank = geometry_field_rank
 
         # I162-1: Hilbert 模式编码器配置
         self.use_pattern_encoder = use_pattern_encoder
@@ -722,26 +665,17 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             # 参数 (Parameters): feature_dim, hidden_dim, max_level_limit, min_patch_size
             # 变参数 (Variable): K_min, K_max, sampling_ratio_schedule (由 image_size 动态计算)
             # 超参数 (Hyper): entmax_alpha, tree_constraint_weight, temperature, jump_loss_weight
+            # Phase 2: Gumbel-STE + 固定 K（K_fixed 作为架构超参数）
+            K_fixed = max(8, min(computed_k_max, 64))
             self.splitter = HilbertOptimalSplitter(
                 feature_dim=splitter_feature_dim or dim,
                 hidden_dim=splitter_hidden_dim or 64,
                 max_level_limit=max_level_limit,
                 min_patch_size=effective_min_patch_size,
-                K_min=effective_k_min,  # I-NAN: 使用受保护的 K_min
-                K_max=computed_k_max,
-                sampling_ratio_schedule=(2, 4),  # 动态 sampling_ratio
-                # I107: 改为 1.2 (不再用 2.0)，防止 Entmax 硬截断导致梯度消失
-                entmax_alpha=1.2,
-                tree_constraint_weight=0.1,
+                K_fixed=K_fixed,
                 temperature_init=splitter_temp_start if splitter_temp_start is not None else 1.0,
-                temperature_min=splitter_temp_end if splitter_temp_end is not None else 0.3,
-                jump_loss_weight=jump_loss_weight if jump_loss_weight is not None else 0.1,
-                density_field_hidden_dim=density_field_hidden_dim if density_field_hidden_dim is not None else 32,
-                # I167-1: 距离衰减卷积
+                temperature_min=splitter_temp_end if splitter_temp_end is not None else 0.1,
                 use_distance_decay_conv=use_distance_decay_conv,
-                # I167-4: SDS 正则化
-                use_sds_regularization=use_sds_regularization,
-                sds_lambda=sds_lambda,
             )
 
         # H1SS 不需要 SemanticRedundancySplitter 检查
@@ -793,35 +727,6 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         self.max_level = computed_max_level
 
         self.token_processor = None
-
-        # === Scheme C: GeometryField ===
-        self.use_geometry_field = use_geometry_field
-        self.manifold_bias_scale = manifold_bias_scale
-        self.geometry_field_dim = geometry_field_dim or dim
-        self.geometry_field = None
-
-        # P1: 依赖注入 - 先创建 OrientationExtractor，再传入 GeometryField
-        if use_geometry_field:
-            from vit_pytorch.layers.embeddings.fractal_position import GeometryField
-            from vit_pytorch.layers.embeddings.fractal_path import OrientationExtractor
-
-            # P1: 创建独立的 OrientationExtractor 实例
-            self.orientation_extractor = OrientationExtractor(
-                max_level=self.max_level,
-                embedding_dim=self.geometry_field_dim,
-            )
-
-            self.geometry_field = GeometryField(
-                dim=self.geometry_field_dim,
-                max_level=self.max_level,
-                heads=heads,
-                rank=geometry_field_rank,  # I-PHASE4: Low-Rank
-                orientation_extractor=self.orientation_extractor,  # P1: DI 注入
-            )
-
-            # P1: Splitter 与 GeometryField 共用同一个 OrientationExtractor
-            if hasattr(self, 'splitter') and self.splitter is not None:
-                self.splitter.orientation_extractor = self.orientation_extractor
 
         # === CLS Token ===
         if cls_token is not None:
@@ -1021,10 +926,6 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             'ffn_type': self.ffn_type,
             # I24-2: 可学习配额
             'quota_learnable': quota_learnable,
-            # Scheme C: 几何流形场参数
-            'use_geometry_field': getattr(self, 'use_geometry_field', False),
-            'geometry_field_dim': getattr(self, 'geometry_field_dim', None),
-            'manifold_bias_scale': getattr(self, 'manifold_bias_scale', 1.0),
         }
 
     # I98-2: 特征提取器抽象 - 封装 tokenizer.shared_conv
@@ -1656,79 +1557,6 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             padded_tokens, padded_levels, regions=regions, image_size=image_size
         )
 
-        # v7.0: geometry_emb 已移除，统一由 DirectionAwareSubspacedRoPE 提供位置信息
-        # 注意: geometry_field 的 manifold_emb 不再添加到 geometry_emb
-        # GeometricLatentDecoder 将收到 geometry_emb=None 并退化为 pass
-        manifold_emb_for_stats = None
-        manifold_emb = None
-        if self.use_geometry_field and self.geometry_field is not None:
-            # 计算几何流形场编码 (用于统计和潜在的未来融合)
-            manifold_emb = self.geometry_field(levels_info)  # [B, N+1, dim]
-            manifold_emb_for_stats = manifold_emb  # 保留梯度用于统计
-
-        # I-AUDIT: 计算 manifold_bias_* 统计（使用 manifold_emb）
-        manifold_bias_max = None
-        manifold_bias_min = None
-        manifold_bias_mean = None
-        manifold_bias_std = None
-        poincare_dist_mean = None
-        poincare_dist_std = None
-        # P0: Manifold Embedding 数值探针 (GPU-native)
-        manifold_sparsity = None
-        manifold_l2_mean = None
-        manifold_l2_std = None
-        manifold_is_finite = None
-        if self.use_geometry_field and manifold_emb_for_stats is not None:
-            # manifold_bias 统计：使用 manifold_emb（排除 CLS token）
-            manifold_bias = manifold_emb_for_stats[:, 1:, :]  # [B, N, dim] 排除 CLS
-
-            # D1-AUDIT FIX: 保持 GPU tensor，延迟到 post_forward 统一 .item()
-            manifold_bias_max = manifold_bias.max()
-            manifold_bias_min = manifold_bias.min()
-            manifold_bias_mean = manifold_bias.mean()
-            manifold_bias_std = manifold_bias.std()
-
-            # P0: 数值健康度探针 (不触发图断裂)
-            emb_stats = manifold_telemetry(manifold_emb_for_stats)
-            manifold_sparsity = emb_stats['sparsity'].detach()
-            manifold_l2_mean = emb_stats['l2_mean'].detach()
-            manifold_l2_std = emb_stats['l2_std'].detach()
-            manifold_is_finite = emb_stats['is_finite'].detach()
-
-            # P0 FIX: 使用真 Poincaré 距离替代 Hilbert 索引差
-            # 原实现问题: hilbert_sample 是 Hilbert 索引差的绝对值，范围 [0, 4^max_level)
-            # 这不是流形上的测地线距离，无法反映 token-to-token 的双曲几何距离
-            # 新实现: 使用 coords_from_paths 重建 2D 坐标，计算 Poincaré 磁盘模型中的测地线距离
-            if levels_info is not None:
-                B_dim, N_dim, D_plus_1 = levels_info.data.shape
-                depths = levels_info.data[:, :, 0]  # [B, N]
-                paths = levels_info.data[:, :, 1:]  # [B, N, max_level]
-
-                # 1. 从 Hilbert paths 重建 2D 坐标
-                coords_2d = coords_from_paths(paths, depths, self.max_level)  # [B, N, 2], 范围 [0, 1]
-
-                # 2. 坐标映射到 Poincaré 磁盘单位圆 (-1, 1)²
-                # 注意: poincare_distance 要求 ||u||² < 1，否则分母 1 - ||u||² 产生数值问题
-                coords_normalized = coords_2d * 2.0 - 1.0  # 放射变换到 (-1, 1)
-
-                # 3. 计算真 Poincaré 距离矩阵 [B, N, N]
-                true_poincare_dist = poincare_distance(coords_normalized, self.image_size)
-
-                # 4. 采样上三角元素计算统计量
-                triu_idx = torch.triu_indices(N_dim, N_dim, 1, device=coords_2d.device)
-                S = min(4096, triu_idx.shape[1])
-                perm = torch.randperm(triu_idx.shape[1], device=coords_2d.device)[:S]
-                poincare_sample = true_poincare_dist[:, triu_idx[0][perm], triu_idx[1][perm]]
-                poincare_dist_mean = poincare_sample.mean()
-                poincare_dist_std = poincare_sample.std()
-            else:
-                # 回退：如果无法获取 levels_info，使用 manifold_emb 范数（不推荐）
-                manifold_raw = manifold_emb_for_stats[:, 1:, :]  # [B, N, dim], 排除 CLS
-                norm_x = manifold_raw.norm(dim=-1)  # [B, N]
-                poincare_dist = torch.atanh(torch.clamp(norm_x, max=0.99))
-                poincare_dist_mean = poincare_dist.mean()
-                poincare_dist_std = poincare_dist.std()
-
         # P11-3: 为 regions 添加 CLS 对应的零填充
         if regions is not None:
             cls_region = torch.zeros(batch_size, 1, 4, dtype=regions.dtype, device=device)
@@ -1952,19 +1780,8 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             # D1-AUDIT FIX: 保持 GPU tensor，延迟到 post_forward
             density_regularization = ratios.var() if ratios.numel() > 1 else None
 
-        # I-AUDIT: 计算 H1SS 辅助损失 (可微分的真实损失)
-        # 这些是真正的 tensor 损失，会影响梯度
+        # Phase 3: 辅助损失已移除，由 UnifiedLoss (CE + batch-wise 熵) 替代
         auxiliary_losses = None
-        if self.training and split_result is not None:
-            if hasattr(self.splitter, 'get_auxiliary_losses'):
-                try:
-                    auxiliary_losses = self.splitter.get_auxiliary_losses(
-                        split_result=split_result,
-                        target_ratio=self.target_ratio if hasattr(self, 'target_ratio') else 0.1,
-                    )
-                except Exception:
-                    # 如果辅助损失计算失败，跳过（不中断训练）
-                    auxiliary_losses = None
 
         # I-AUDIT: 计算 theoretical_flops_reduction
         # 分形 ViT: O(K^2) attention，标准 ViT: O(N^2) attention
@@ -1991,8 +1808,6 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                 theoretical_flops_reduction = 1.0 - (fractal_flops / standard_flops)
 
         # I170: 添加 redundancy 和 child_features 到 TrainingStats
-        # I-AUDIT: 添加 splitter_logits_mean/std, active_ratio, manifold_bias_*, poincare_dist_*,
-        #           budget_loss, density_regularization, theoretical_flops_reduction
 
         # === 收集 auxiliary_outputs（layer-packaged → trainer-unpacked 架构） ===
         auxiliary_outputs: Dict[str, Any] = {}
@@ -2064,15 +1879,6 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                     diversity_ratio = unique_t / max_possible_t if max_possible > 0 else depths.new_zeros(1)
                     levels_diag[f"distribution/path_diversity_ratio_lvl_{lvl}"] = diversity_ratio
 
-            # geo_emb_norm（使用 manifold_emb_for_stats）
-            if manifold_emb_for_stats is not None:
-                # manifold_emb_for_stats 形状: [B, N+1, dim]，排除 CLS
-                geo_emb = manifold_emb_for_stats[:, 1:, :].reshape(-1, manifold_emb_for_stats.shape[-1])
-                norms = geo_emb.norm(dim=-1)
-                # D1-AUDIT FIX: 保持 GPU tensor
-                levels_diag["distribution/geo_emb_norm_mean"] = norms.mean()
-                levels_diag["distribution/geo_emb_norm_std"] = norms.std()
-
         if levels_diag:
             auxiliary_outputs["levels"] = levels_diag
 
@@ -2101,17 +1907,6 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             splitter_logits_mean=splitter_logits_mean,  # I-AUDIT: Splitter logits 均值
             splitter_logits_std=splitter_logits_std,  # I-AUDIT: Splitter logits 标准差
             active_ratio=active_ratio,  # I-AUDIT: 活跃 token 比例
-            manifold_bias_max=manifold_bias_max,  # I-AUDIT: 流形偏置最大值
-            manifold_bias_min=manifold_bias_min,  # I-AUDIT: 流形偏置最小值
-            manifold_bias_mean=manifold_bias_mean,  # I-AUDIT: 流形偏置均值
-            manifold_bias_std=manifold_bias_std,  # I-AUDIT: 流形偏置标准差
-            poincare_dist_mean=poincare_dist_mean,  # I-AUDIT: Poincaré 距离均值
-            # P0: Manifold Embedding 数值探针
-            manifold_sparsity=manifold_sparsity,  # 零值比例
-            manifold_l2_mean=manifold_l2_mean,  # L2 范数均值
-            manifold_l2_std=manifold_l2_std,  # L2 范数标准差
-            manifold_is_finite=manifold_is_finite,  # NaN/Inf 检测
-            poincare_dist_std=poincare_dist_std,  # I-AUDIT: Poincaré 距离标准差
             raw_budget_error=raw_budget_error,  # I-AUDIT: Elastic Budget 损失 (D162: 重命名)
             density_regularization=density_regularization,  # I-AUDIT: 密度正则化
             theoretical_flops_reduction=theoretical_flops_reduction,  # I-AUDIT: FLOPs 减少量
