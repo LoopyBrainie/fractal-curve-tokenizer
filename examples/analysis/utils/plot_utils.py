@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
 
 # 添加项目路径
@@ -28,7 +29,7 @@ def set_style(style: str = 'seaborn-v0_8'):
     """
     try:
         plt.style.use(style)
-    except:
+    except Exception:
         print(f"Warning: Style '{style}' not found, using default")
 
 
@@ -197,7 +198,7 @@ def add_colorbar(
     mappable: plt.cm.ScalarMappable,
     label: str = '',
     shrink: float = 0.8
-) -> 'matplotlib.colorbar.Colorbar':
+) -> 'matplotlib.colorbar.Colorbar':  # noqa: F821
     """
     添加颜色条
 

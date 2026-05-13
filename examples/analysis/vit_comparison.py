@@ -66,6 +66,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 import seaborn as sns
 
 # 添加项目路径
@@ -1040,13 +1041,14 @@ class ViTComparator:
 
         # 可视化
         if visualize:
-            self._visualize_efficiency_comparison(result, save_path)
+            self._visualize_efficiency_comparison(result, images, save_path)
 
         return result
 
     def _visualize_efficiency_comparison(
         self,
         result: EfficiencyComparison,
+        images: torch.Tensor,
         save_path: Optional[str] = None
     ):
         """可视化效率对比"""
