@@ -29,8 +29,7 @@ def splitter_base():
         min_patch_size=4,
         max_level_limit=3,
         hidden_dim=32,
-        K_min=4,
-        K_max=16,
+        K_fixed=8,
     )
 
 
@@ -47,8 +46,7 @@ def splitter_with_quota():
         min_patch_size=8,
         max_level_limit=4,
         hidden_dim=32,
-        K_min=8,
-        K_max=32,
+        K_fixed=16,
     )
 
 
@@ -65,8 +63,7 @@ def splitter_for_ema():
         min_patch_size=4,
         max_level_limit=8,
         hidden_dim=128,
-        K_min=16,
-        K_max=64,
+        K_fixed=32,
     )
 
 

@@ -145,6 +145,7 @@ class TestTokenizerDynamicResolution:
             feature_dim=256,
             min_patch_size=4,
             max_level_limit=8,
+            K_fixed=16,
         )
 
         # Test with different sizes - tokenizer should adapt to input

@@ -107,43 +107,6 @@ class TestTemperatureSchedule:
         assert 0.1 <= SPLITTER_TEMP_END <= 1.0
 
 
-class TestQuotaInitialization:
-    """配额初始化常量验证."""
-
-    def test_quota_logits_softmax_sum(self):
-        """QUOTA_INIT_LOGITS softmax 后求和为 1."""
-        from vit_pytorch.core.constants import QUOTA_INIT_LOGITS
-
-        logits = torch.tensor(QUOTA_INIT_LOGITS)
-        probs = F.softmax(logits, dim=-1)
-
-        sum_probs = probs.sum().item()
-        assert abs(sum_probs - 1.0) < 1e-6
-
-    def test_quota_distribution_increases_with_depth(self):
-        """配额分布随深度递增 (深度优先策略)."""
-        from vit_pytorch.core.constants import QUOTA_INIT_LOGITS
-
-        logits = torch.tensor(QUOTA_INIT_LOGITS)
-        probs = F.softmax(logits, dim=-1)
-
-        for i in range(len(probs) - 1):
-            assert probs[i].item() < probs[i + 1].item()
-
-    def test_quota_min_ratio_positive(self):
-        """QUOTA_MIN_RATIO > 0."""
-        from vit_pytorch.core.constants import QUOTA_MIN_RATIO
-
-        assert QUOTA_MIN_RATIO > 0
-        assert QUOTA_MIN_RATIO < 1.0
-
-    def test_quota_entropy_weight_reasonable(self):
-        """QUOTA_ENTROPY_WEIGHT 在合理范围内."""
-        from vit_pytorch.core.constants import QUOTA_ENTROPY_WEIGHT
-
-        assert 0 <= QUOTA_ENTROPY_WEIGHT <= 1.0
-
-
 class TestCoverageConstants:
     """覆盖率常量验证."""
 
@@ -178,15 +141,6 @@ class TestCoverageConstants:
         assert 1 <= K_MIN_HARD_LIMIT <= 64
         assert 1024 <= K_MAX_HARD_LIMIT <= 8192
 
-    def test_sample_ratios_order(self):
-        """K_MIN_SAMPLE_RATIO < K_MAX_SAMPLE_RATIO."""
-        from vit_pytorch.core.constants import (
-            K_MIN_SAMPLE_RATIO,
-            K_MAX_SAMPLE_RATIO,
-        )
-
-        assert K_MIN_SAMPLE_RATIO < K_MAX_SAMPLE_RATIO
-
     def test_coverage_adaptive_formula_works(self):
         """覆盖率自适应公式数学正确性."""
         from vit_pytorch.core.constants import (
@@ -210,63 +164,6 @@ class TestCoverageConstants:
             assert abs(computed_coverage / expected_coverage - 1.0) < 0.01
 
 
-class TestElasticBudgetConstants:
-    """Elastic Budget 常量验证."""
-
-    def test_elastic_bounds_consistent_with_k_coverage(self):
-        """ELASTIC_COVERAGE bounds 与 K_COVERAGE bounds 一致."""
-        from vit_pytorch.core.constants import (
-            ELASTIC_COVERAGE_MIN,
-            K_COVERAGE_MIN,
-        )
-
-        # ELASTIC_COVERAGE_MIN 是崩溃检测阈值（0.03）
-        # K_COVERAGE_MIN 是覆盖率下界（0.01）
-        # 这是两个不同的概念，都应该在合理范围内
-        assert 0.01 <= ELASTIC_COVERAGE_MIN <= 0.1  # 崩溃阈值范围
-        assert 0.01 <= K_COVERAGE_MIN <= 0.1  # 覆盖率下界范围
-
-    def test_elastic_lambda_weights_reasonable(self):
-        """ELASTIC_LAMBDA weights 在合理范围内."""
-        from vit_pytorch.core.constants import (
-            ELASTIC_LAMBDA_TARGET,
-            ELASTIC_LAMBDA_BOUNDARY,
-            ELASTIC_LAMBDA_COLLAPSE,
-        )
-
-        # 验证 λ_TARGET 和 λ_BOUNDARY 在合理范围 (0.01 ~ 1.0)
-        assert 0.01 <= ELASTIC_LAMBDA_TARGET <= 1.0
-        assert 0.01 <= ELASTIC_LAMBDA_BOUNDARY <= 1.0
-        # λ_COLLAPSE >= 1.0 用于惩罚崩溃
-        assert ELASTIC_LAMBDA_COLLAPSE >= 1.0
-
-
-class TestThresholdRegularization:
-    """阈值正则化常量验证."""
-
-    def test_threshold_var_reg_weight_reasonable(self):
-        """THRESHOLD_VAR_REG_WEIGHT 在 [0, 1] 范围内."""
-        from vit_pytorch.core.constants import THRESHOLD_VAR_REG_WEIGHT
-
-        assert 0 <= THRESHOLD_VAR_REG_WEIGHT <= 1.0
-
-
-class TestDepthVarianceNormalization:
-    """深度方差归一化常量验证."""
-
-    def test_ema_alpha_reasonable(self):
-        """DEPTH_EMA_ALPHA 在有效范围内."""
-        from vit_pytorch.core.constants import DEPTH_EMA_ALPHA
-
-        assert 0.01 <= DEPTH_EMA_ALPHA <= 0.5
-
-    def test_depth_variance_init_eps_reasonable(self):
-        """DEPTH_VARIANCE_INIT_EPS 为保守初始化下界."""
-        from vit_pytorch.core.constants import DEPTH_VARIANCE_INIT_EPS
-
-        assert 0.01 <= DEPTH_VARIANCE_INIT_EPS <= 1.0
-
-
 class TestAttentionBiasScales:
     """注意力偏置缩放常量验证."""
 
@@ -285,27 +182,6 @@ class TestAttentionBiasScales:
 
         assert 0.01 <= LEVEL_BIAS_SCALE <= 1.0
         assert LEVEL_BIAS_SCALE <= HILBERT_BIAS_SCALE
-
-
-class TestOverlapPenalty:
-    """重叠惩罚常量验证."""
-
-    def test_overlap_penalty_weight_reasonable(self):
-        """OVERLAP_PENALTY_WEIGHT 在 [0, 1] 范围内."""
-        from vit_pytorch.core.constants import OVERLAP_PENALTY_WEIGHT
-
-        assert 0 <= OVERLAP_PENALTY_WEIGHT <= 1.0
-
-
-class TestSoftExclusionMargin:
-    """软排除边距常量验证."""
-
-    def test_soft_exclusion_margin_reasonable(self):
-        """SOFT_EXCLUSION_MARGIN 在 (0, 1) 范围内."""
-        from vit_pytorch.core.constants import SOFT_EXCLUSION_MARGIN
-
-        assert 0 < SOFT_EXCLUSION_MARGIN < 1
-        assert SOFT_EXCLUSION_MARGIN <= 0.5
 
 
 class TestFP16ClampConstants:

@@ -262,9 +262,8 @@ class TestIntegrationWithHilbertOptimalSplitter:
         splitter = HilbertOptimalSplitter(
             feature_dim=256,
             hidden_dim=64,
-            max_level_limit=4,  # 减小以加快测试
-            K_min=8,
-            K_max=32,
+            max_level_limit=4,
+            K_fixed=16,
             use_distance_decay_conv=True,
         )
 
@@ -282,9 +281,8 @@ class TestIntegrationWithHilbertOptimalSplitter:
             feature_dim=256,
             hidden_dim=64,
             max_level_limit=4,
-            K_min=8,
-            K_max=32,
-            use_distance_decay_conv=False,  # 使用标准 Conv1D
+            K_fixed=16,
+            use_distance_decay_conv=False,
         )
 
         features = torch.randn(1, 256, 16, 16)

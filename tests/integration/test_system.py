@@ -116,8 +116,7 @@ def test_streaming_v3_tokenizer_device_consistency(device: str) -> None:
         min_patch_size=4,
         max_level_limit=3,
         hidden_dim=32,
-        K_min=8,
-        K_max=32,
+        K_fixed=8,
     ).to(device)
 
     images = torch.randn(2, 3, 32, 32, device=device)

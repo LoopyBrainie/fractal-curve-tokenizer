@@ -137,20 +137,10 @@ class TestAdaptiveFractalFeedForward:
         output = ffn(x)
         assert output.shape == (batch, seq_len, dim)
 
-    def test_forward_output_shape_swiglu_level(self):
-        """SwiGLU Level 类型输出形状"""
-        batch, seq_len, dim = 2, 16, 64
-
-        ffn = AdaptiveFractalFeedForward(dim, dim * 4, ffn_type='swiglu_level')
-        x = torch.randn(batch, seq_len, dim)
-
-        output = ffn(x)
-        assert output.shape == (batch, seq_len, dim)
-
     def test_gradient_flow(self):
         """梯度流动测试"""
         dim = 64
-        ffn = AdaptiveFractalFeedForward(dim, dim * 4, ffn_type='swiglu_level')
+        ffn = AdaptiveFractalFeedForward(dim, dim * 4, ffn_type='swiglu')
 
         x = torch.randn(2, 16, dim, requires_grad=True)
         output = ffn(x)
@@ -163,9 +153,9 @@ class TestAdaptiveFractalFeedForward:
         assert not torch.isinf(x.grad).any()
 
     def test_level_adaptation_no_levels_info(self):
-        """无 levels_info 时的层级自适应"""
+        """无 levels_info 时仍可正常前向"""
         dim = 64
-        ffn = AdaptiveFractalFeedForward(dim, dim * 4, ffn_type='swiglu_level')
+        ffn = AdaptiveFractalFeedForward(dim, dim * 4, ffn_type='swiglu')
 
         x = torch.randn(2, 16, dim)
         output = ffn(x)  # 无 levels_info
@@ -175,7 +165,7 @@ class TestAdaptiveFractalFeedForward:
     def test_training_eval_mode(self):
         """训练/评估模式切换"""
         dim = 64
-        ffn = AdaptiveFractalFeedForward(dim, dim * 4, ffn_type='swiglu_level', dropout=0.5)
+        ffn = AdaptiveFractalFeedForward(dim, dim * 4, ffn_type='swiglu', dropout=0.5)
 
         x = torch.randn(2, 16, dim)
 
@@ -209,8 +199,8 @@ class TestAdaptiveFractalFeedForward:
         """max_depth 参数测试"""
         dim = 64
 
-        ffn_small = AdaptiveFractalFeedForward(dim, dim * 4, max_level=4, ffn_type='swiglu_level')
-        ffn_large = AdaptiveFractalFeedForward(dim, dim * 4, max_level=8, ffn_type='swiglu_level')
+        ffn_small = AdaptiveFractalFeedForward(dim, dim * 4, max_level=4, ffn_type='swiglu')
+        ffn_large = AdaptiveFractalFeedForward(dim, dim * 4, max_level=8, ffn_type='swiglu')
 
         x = torch.randn(2, 16, dim)
 
@@ -220,22 +210,6 @@ class TestAdaptiveFractalFeedForward:
         # 两者都应该正常工作
         assert out_small.shape == (2, 16, dim)
         assert out_large.shape == (2, 16, dim)
-
-    def test_use_level_adaptation_flag(self):
-        """use_level_adaptation 标志测试"""
-        dim = 64
-
-        ffn_with = AdaptiveFractalFeedForward(dim, dim * 4, ffn_type='gelu', use_level_adaptation=True)
-        ffn_without = AdaptiveFractalFeedForward(dim, dim * 4, ffn_type='gelu', use_level_adaptation=False)
-
-        x = torch.randn(2, 16, dim)
-
-        out_with = ffn_with(x)
-        out_without = ffn_without(x)
-
-        # 有/无层级自适应应该产生不同输出
-        assert not torch.equal(out_with, out_without)
-
 
 class TestFFNSwigluIntegration:
     """FFN SwiGLU 集成测试"""
@@ -266,7 +240,7 @@ class TestFFNSwigluIntegration:
     def test_residual_connection_implied(self):
         """残差连接隐式测试（通过 LayerNorm）"""
         dim = 64
-        ffn = AdaptiveFractalFeedForward(dim, dim * 4, ffn_type='swiglu_level')
+        ffn = AdaptiveFractalFeedForward(dim, dim * 4, ffn_type='swiglu')
 
         x = torch.randn(2, 16, dim)
         x.clone()
@@ -291,13 +265,13 @@ class TestFFNSwigluIntegration:
         assert not torch.isinf(output).any()
 
     def test_depth_variance_normalization_effect(self):
-        """深度方差归一化效果测试"""
+        """不同深度输入处理测试（简化后验证基本正确性）"""
         dim = 64
 
         # 模拟不同深度的输入
         x = torch.randn(2, 32, dim)
 
-        ffn = AdaptiveFractalFeedForward(dim, dim * 4, ffn_type='swiglu_level')
+        ffn = AdaptiveFractalFeedForward(dim, dim * 4, ffn_type='swiglu')
 
         # 应该能处理
         output = ffn(x)

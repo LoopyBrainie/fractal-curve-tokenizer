@@ -31,10 +31,7 @@ class TestHilbertOptimalSplitterAxioms:
             feature_dim=256,
             hidden_dim=64,
             max_level_limit=6,
-            K_min=8,
-            K_max=64,
-            entmax_alpha=2.0,  # 使用 softmax 模式
-            tree_constraint_weight=0.1,
+            K_fixed=16,
         )
 
     @pytest.fixture
