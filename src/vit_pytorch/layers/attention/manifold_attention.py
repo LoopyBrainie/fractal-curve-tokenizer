@@ -19,14 +19,12 @@
 from __future__ import annotations
 import math
 
-import logging
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vit_pytorch.core.constants import EPS
 from vit_pytorch.layers.embeddings.fractal_rope import DirectionAwareSubspacedRoPE, Cartesian2DRoPE
 
 if TYPE_CHECKING:

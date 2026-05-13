@@ -34,11 +34,13 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 
+if TYPE_CHECKING:
+    from vit_pytorch.core.levels_info import LevelsInfo
 
 @dataclass
 class TokenSequence:
@@ -226,7 +228,7 @@ class TokenizerOutput:
         levels_list = [seq.get_levels() for seq in self]
 
         # 如果所有 levels 都是 None，返回 None
-        if all(l is None for l in levels_list):
+        if all(level is None for level in levels_list):
             return None
 
         # 找到最大维度
@@ -234,13 +236,13 @@ class TokenizerOutput:
             device = self._padded_tokens_cache.device
         else:
             device = next(iter(self)).device
-        max_len = max(l.shape[0] if l is not None else 0 for l in levels_list)
+        max_len = max(level.shape[0] if level is not None else 0 for level in levels_list)
 
         if max_len == 0:
             return None
 
         # 确定 info_dim（处理 1D 和 2D 情况）
-        info_dims = [l.shape[1] if l is not None and l.dim() > 1 else 1 for l in levels_list]
+        info_dims = [level.shape[1] if level is not None and level.dim() > 1 else 1 for level in levels_list]
         info_dim = max(info_dims)
 
         # 创建填充后的张量
@@ -403,7 +405,7 @@ class TokenizerOutput:
             return torch.zeros(B, 0, dtype=torch.long, device=self.device if hasattr(self, 'device') else 'cpu')
 
         # 找到最大长度
-        max_len = max(l.shape[0] for l in levels)
+        max_len = max(level.shape[0] for level in levels)
         if max_len == 0:
             B = len(levels)
             return torch.zeros(B, 0, dtype=torch.long, device=levels[0].device)
@@ -412,15 +414,15 @@ class TokenizerOutput:
         B = len(levels)
         device = levels[0].device
         levels_padded = torch.full((B, max_len), -1, dtype=torch.long, device=device)
-        for b, l in enumerate(levels):
+        for b, level in enumerate(levels):
             # Handle 2D levels [N, info_dim] (e.g., [N, 4] = depth + 3 path coords)
             # vs 1D levels [N] (just depth values)
-            if l.dim() > 1:
+            if level.dim() > 1:
                 # Extract just the depth (first column) for bucketing
-                l_to_assign = l[:, 0]
+                l_to_assign = level[:, 0]
             else:
-                l_to_assign = l
-            levels_padded[b, :l.shape[0]] = l_to_assign
+                l_to_assign = level
+            levels_padded[b, :level.shape[0]] = l_to_assign
 
         return levels_padded
 

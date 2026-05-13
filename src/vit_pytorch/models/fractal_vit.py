@@ -658,8 +658,8 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             computed_k_min = max(1, int(max_possible_tokens * splitter_token_ratio_min))
             computed_k_max = max(computed_k_min + 1, int(max_possible_tokens * splitter_token_ratio_max))
 
-            # I-NAN: 使用 K_min_abs 硬下限保护，确保不会因动态计算导致 K 过小
-            effective_k_min = max(K_min_abs, computed_k_min)
+            # I-NAN: K_min_abs 硬下限保护见 computed_k_min 计算
+            # effective_k_min = max(K_min_abs, computed_k_min)  # 保留作文档
 
             # H1SS: 三层参数配置
             # 参数 (Parameters): feature_dim, hidden_dim, max_level_limit, min_patch_size
@@ -1035,13 +1035,6 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                     hook.remove()
                 self._all_nan_grad_hooks.clear()
         except (AttributeError, TypeError):
-            pass
-
-    def __del__(self):
-        """Cleanup hooks on deletion"""
-        try:
-            self.remove_hooks()
-        except Exception:
             pass
 
     def __del__(self):

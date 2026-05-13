@@ -521,11 +521,11 @@ class LevelsInfo:
 
         # 递推计算: d_l = NEXT_DIR_TABLE[d_{l-1}, q_{l-1}]
         # 使用展开循环 (L_max <= 8, torch.compile 友好)
-        for l in range(1, D):
-            prev_dirs = directions[:, :, l - 1]  # [B, N]
-            prev_quads = paths[:, :, l - 1]  # [B, N]
+        for level in range(1, D):
+            prev_dirs = directions[:, :, level - 1]  # [B, N]
+            prev_quads = paths[:, :, level - 1]  # [B, N]
             # gather 使用: NEXT_DIR_TABLE[prev_dirs, prev_quads]
-            directions[:, :, l] = NEXT_DIR_TABLE[prev_dirs, prev_quads]
+            directions[:, :, level] = NEXT_DIR_TABLE[prev_dirs, prev_quads]
 
         self._directions = directions
         return self._directions

@@ -66,9 +66,6 @@ from .modules import (
     SplitResult,
 )
 
-# === L1: Core additional exports ===
-from .core.splitter_protocol import TensorSplitResult
-
 # === L1: Core ===
 from .core import (
     HilbertCurve,
@@ -117,15 +114,15 @@ from .core import (
     compute_normalized_area,
     compute_area_similarity,
     # Splitter Protocol (L1 - Protocol interfaces)
-    CoreSplitter,
-    AnnealingSplitter,
-    MetricsSplitter,
-    SplitResult,
+    CoreSplitter,  # noqa: F811
+    AnnealingSplitter,  # noqa: F811
+    MetricsSplitter,  # noqa: F811
+    SplitResult,  # noqa: F811
     validate_splitter,
 )
 
 # === 向后兼容别名 ===
-StreamingFractalTokenizerV3 = StreamingFractalTokenizer
+StreamingFractalTokenizerV3 = StreamingFractalTokenizer  # noqa: F811
 
 __all__ = [
     # === L4: Models ===

@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -33,7 +33,7 @@ from torchvision.ops import roi_align
 # 原因: entmax_bisect 内部强制 .float() upcast 至 float32，破坏 AMP 显存优化
 # entmax_beta (基于 sparsemax 算法) 无此问题，且支持 alpha=1.5
 
-from vit_pytorch.core.constants import EPS, TEMPERATURE_MIN
+from vit_pytorch.core.constants import EPS
 from vit_pytorch.core.splitter_protocol import (
     CoreSplitter,
     SplitResult,

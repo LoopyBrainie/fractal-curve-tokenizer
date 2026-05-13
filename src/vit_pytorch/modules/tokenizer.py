@@ -47,8 +47,7 @@ Note:
 from __future__ import annotations
 
 import math
-from collections import deque
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -59,6 +58,8 @@ from vit_pytorch.core.constants import PROB_EPSILON  # I12-7: 数值稳定性常
 
 # I99-1: 延迟导入 VectorizedPathEncoder 以避免循环导入
 # 使用函数内导入模式，确保在运行时正确加载
+if TYPE_CHECKING:
+    from vit_pytorch.core.splitter_protocol import TensorSplitResult, SplitResult
 try:
     from vit_pytorch.layers.embeddings.fractal_path import VectorizedPathEncoder
 except ImportError:
@@ -780,7 +781,6 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         # D1-AUDIT FIX: 使用 torch.as_tensor 避免不必要的数据拷贝
         # torch.tensor 会创建新拷贝，torch.as_tensor 尽可能复用已有内存
         boxes_tensor = torch.as_tensor(all_boxes, device=device, dtype=dtype)
-        depths_tensor = torch.as_tensor(all_depths, device=device, dtype=torch.long)
 
         # P-OPT: 直接替换 NaN/Inf，移除 .any() 同步检查
         # 批量操作保持 GPU 利用率，避免 GPU-CPU 同步
