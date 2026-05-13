@@ -364,6 +364,9 @@ class SplitResult:
     logits: Optional[Tensor] = None         # [B, N] 原始 logits
     probs: Optional[Tensor] = None          # [B, N] 分割概率
     K_soft: Optional[Tensor] = None         # [1] or [B] 可微分 K 值 (STE)
+    mask_ste: Optional[Tensor] = None       # [B, N] Gumbel-STE 掩码（Tokenizer 权重乘法用）
+    roi_features_raw: Optional[Tensor] = None  # [B, N, d_model] 统一池化结果（供 Tokenizer 复用）
+    candidate_indices: Optional[Tensor] = None  # [M] 选中 token 在候选池中的索引
 
     def __init__(
         self,
@@ -375,6 +378,9 @@ class SplitResult:
         logits: Optional[Tensor] = None,
         probs: Optional[Tensor] = None,
         K_soft: Optional[Tensor] = None,
+        mask_ste: Optional[Tensor] = None,
+        roi_features_raw: Optional[Tensor] = None,
+        candidate_indices: Optional[Tensor] = None,
     ):
         """
         初始化 SplitResult。
@@ -388,6 +394,9 @@ class SplitResult:
             logits: [B, N] 原始 logits（可选）
             probs: [B, N] 分割概率（可选）
             K_soft: 可微分 K 值（STE 直通估计）（可选）
+            mask_ste: [B, N] Gumbel-STE 掩码（Tokenizer 权重乘法用）
+            roi_features_raw: [B, N, d_model] 统一池化结果（供 Tokenizer 复用）
+            candidate_indices: [M] 选中 token 在候选池中的索引（供 Tokenizer 快速路径用）
         """
 
         self.regions = regions
@@ -398,6 +407,9 @@ class SplitResult:
         self.logits = logits
         self.probs = probs
         self.K_soft = K_soft
+        self.mask_ste = mask_ste
+        self.roi_features_raw = roi_features_raw
+        self.candidate_indices = candidate_indices
 
         # I: 添加 split_decision 别名以兼容 tokenizer
         # split_decision 用于语义分裂器，selected_mask 用于 H1SS
@@ -539,6 +551,9 @@ class TensorSplitResult:
     hilbert_indices: Tensor   # [M] Hilbert 索引
     token_indices: Tensor     # [M] token 索引
     complexities: Tensor      # [M] 复杂度分数
+    mask_ste: Optional[Tensor] = None       # [B, N] Gumbel-STE 掩码（Tokenizer 权重乘法用）
+    roi_features_raw: Optional[Tensor] = None  # [B, N, d_model] 统一池化结果
+    candidate_indices: Optional[Tensor] = None  # [M] 选中 token 在候选池中的索引
 
     @property
     def num_tokens(self) -> int:
@@ -582,6 +597,11 @@ class TensorSplitResult:
                 device=regions.device
             )
 
+        # 传递 mask_ste, roi_features_raw, candidate_indices（新 Splitter 路径）
+        mask_ste = getattr(split_result, 'mask_ste', None)
+        roi_features_raw = getattr(split_result, 'roi_features_raw', None)
+        candidate_indices = getattr(split_result, 'candidate_indices', None)
+
         return cls(
             regions=regions.long(),
             depths=depths,
@@ -589,6 +609,9 @@ class TensorSplitResult:
             hilbert_indices=hilbert_indices,
             token_indices=token_indices,
             complexities=complexities,
+            mask_ste=mask_ste,
+            roi_features_raw=roi_features_raw,
+            candidate_indices=candidate_indices,
         )
 
 

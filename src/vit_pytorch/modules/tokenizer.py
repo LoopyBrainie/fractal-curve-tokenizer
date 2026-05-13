@@ -990,36 +990,49 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         boxes[:, 4] = torch.maximum(boxes[:, 2] + 0.5, boxes[:, 4])
 
         # ====================================================================
-        # ROI-Align (批量)
+        # 特征提取: 优先使用 Splitter 预计算的 roi_features_raw（避免重复 ROI-Align）
         # ====================================================================
-        from torchvision.ops import roi_align
-        # I99-1: ROIAlign 需要 channels_first 格式进行 CUDA 操作
-        # 如果 features 是 channels_last，转换为 channels_first 以避免 CUDA 断言错误
-        if features.dim() == 4 and features.is_contiguous(memory_format=torch.channels_last):
-            features_roi = features.to(memory_format=torch.contiguous_format)
+        has_fast_path = (
+            hasattr(tensor_result, 'roi_features_raw')
+            and tensor_result.roi_features_raw is not None
+            and hasattr(tensor_result, 'mask_ste')
+            and tensor_result.mask_ste is not None
+            and hasattr(tensor_result, 'candidate_indices')
+            and tensor_result.candidate_indices is not None
+        )
+
+        if has_fast_path:
+            # 快速路径: tokens = roi_features_raw * mask_ste 权重乘法
+            roi_raw = tensor_result.roi_features_raw  # [B, N_candidates, d_model]
+            mask_ste = tensor_result.mask_ste  # [B, N_candidates]
+            candidate_indices = tensor_result.candidate_indices  # [M] 选中 token 在候选池中的索引
+            batch_idx_for_token = batch_indices.clamp(min=0, max=B_int - 1)  # [M]
+
+            # 应用 STE 权重: tokens_all[b, n, :] * mask_ste[b, n]
+            tokens_all = roi_raw * mask_ste.unsqueeze(-1)  # [B, N, d_model]
+
+            # 从 tokens_all 中按 (batch, candidate_idx) 提取选中的 token 特征
+            pooled = tokens_all[batch_idx_for_token, candidate_indices, :]  # [M, d_model]
         else:
-            features_roi = features
+            # 回退路径: 传统 ROI-Align
+            from torchvision.ops import roi_align
+            if features.dim() == 4 and features.is_contiguous(memory_format=torch.channels_last):
+                features_roi = features.to(memory_format=torch.contiguous_format)
+            else:
+                features_roi = features
 
-        # P-OPT: 直接替换 NaN/Inf，移除 .any() 同步检查
-        # 批量操作保持 GPU 利用率，避免 GPU-CPU 同步
-        # I-OPT: 使用 | 合并 mask 避免重复计算
-        nan_mask = torch.isnan(boxes)
-        inf_mask = torch.isinf(boxes)
-        combined_mask = nan_mask | inf_mask
-        # 使用 fused 操作避免显式 .any() 调用
-        boxes = torch.where(combined_mask, torch.zeros_like(boxes), boxes)
+            nan_mask = torch.isnan(boxes)
+            inf_mask = torch.isinf(boxes)
+            combined_mask = nan_mask | inf_mask
+            boxes = torch.where(combined_mask, torch.zeros_like(boxes), boxes)
 
-        # P1-FIX: 确保 boxes 和 features_roi 在同一设备上
-        if boxes.device != features_roi.device:
-            boxes = boxes.to(features_roi.device, non_blocking=True)
+            if boxes.device != features_roi.device:
+                boxes = boxes.to(features_roi.device, non_blocking=True)
 
-        pooled = roi_align(
-            features_roi,
-            boxes,
-            output_size=(1, 1),
-            spatial_scale=1.0,
-            aligned=True,
-        ).squeeze(-1).squeeze(-1)  # [N, C]
+            pooled = roi_align(
+                features_roi, boxes,
+                output_size=(1, 1), spatial_scale=1.0, aligned=True,
+            ).squeeze(-1).squeeze(-1)  # [N_total, C]
         
         # ====================================================================
         # 深度编码 (向量化)

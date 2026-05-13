@@ -61,9 +61,51 @@ class _MinimalPathEncoderConfig:
 
 
 # =============================================================================
-# Entmax 稀疏激活
+# Gumbel-STE 离散选择 (替换 Entmax)
 # =============================================================================
 
+def gumbel_ste_topk(
+    logits: Tensor,
+    K: int,
+    tau: float,
+    logit_scale: float = 1.0,
+) -> Tuple[Tensor, Tensor]:
+    """Gumbel-STE Top-K 选择。
+
+    Logit Scale 修正（关键数值稳定性保障）:
+        问题: _manifold_convolution 的 logits 量级可能 >> Gumbel 噪声量级
+              (Gumbel(0,1) 均值~0.577)，导致噪声被淹没 -> 退化为确定性 argmax。
+        修正: noisy = (logits * gamma) + g
+              其中 gamma = logit_scale.exp()，初始化为 1.0
+              确保训练初期噪声有足够力量强制探索。
+
+    Args:
+        logits: [B, N] 选择分数
+        K: 固定 token 数量
+        tau: Gumbel-Softmax 温度
+        logit_scale: 可学习的对数缩放因子
+
+    Returns:
+        mask_ste: [B, N] 前向离散/反向连续的 STE 掩码
+        mask_soft: [B, N] 软代理概率（用于 batch-wise 熵正则化）
+    """
+    gamma = logit_scale.exp() if isinstance(logit_scale, torch.Tensor) else logit_scale
+    g = -torch.log(-torch.log(torch.rand_like(logits).clamp(min=EPS)))
+    noisy = (logits * gamma) + g
+
+    # 硬选择（前向）
+    _, top_idx = torch.topk(noisy, K, dim=-1)
+    mask_hard = torch.zeros_like(logits).scatter_(-1, top_idx, 1.0)
+
+    # 软代理（反向）
+    mask_soft = F.softmax(noisy / tau, dim=-1)
+
+    # STE 绑定
+    mask_ste = (mask_hard - mask_soft).detach() + mask_soft
+    return mask_ste, mask_soft
+
+
+# 保留 entmax_beta 供向后兼容（但不再在 Splitter 中使用）
 def entmax_beta(
     scores: Tensor,
     alpha: float = 1.5,
@@ -140,131 +182,30 @@ def entmax_beta(
     return probs
 
 
-def entmax_beta_joint(
-    scores: Tensor,
-    alpha: float = 1.5,
-    dim: int = -1,
-) -> Tuple[Tensor, Tensor]:
-    """
-    Entmax + Top-K 联合实现
-
-    返回:
-        probs: 稀疏概率
-        selected_indices: Top-K 索引
-    """
-    probs = entmax_beta(scores, alpha=alpha, dim=dim)
-
-    # 使用 TopK
-    K_target = probs.shape[dim] // 4  # 假设 K ≈ N/4
-
-    # 补足 TopK
-    _, topk_indices = torch.topk(probs, K_target, dim=dim)
-
-    return probs, topk_indices
-
-
-# =============================================================================
-# Differentiable K Selection (STE Straight-Through Estimator)
-# =============================================================================
-
-class DifferentiableK(nn.Module):
-    """Straight-Through Estimator for differentiable K selection.
-
-    数学形式:
-        前向: K_hard = round(clamp(K_float, K_min, K_max))
-        反向: dK_soft/dK_float = 1 (STE, 恒等梯度)
-
-    用途:
-        1. K_soft 用于 aux_budget 损失计算（保持梯度流）
-        2. K_hard 用于实际 token 选择（离散决策）
-
-    解决的核心问题:
-        原代码 K = K_float.long().clamp(...).item() 使用 .item() 断裂梯度,
-        导致 density_field 的输出无法通过 K 误差信号更新。
-    """
-
-    def __init__(self, K_min: int, K_max: int):
-        super().__init__()
-        self.K_min = K_min
-        self.K_max = K_max
-
-    def forward(self, K_float: Tensor) -> Tuple[Tensor, Tensor]:
-        """返回 (K_hard, K_soft)
-
-        Args:
-            K_float: 来自 density_field 的连续 K 值 [1] 或 [B]
-
-        Returns:
-            K_hard: 四舍五入的整数用于实际选择
-            K_soft: clamp 后的连续值用于损失计算（保持梯度）
-        """
-        K_soft = K_float.clamp(self.K_min, self.K_max)
-        # STE: 前向使用 round（离散），反向使用恒等梯度
-        K_hard = K_soft.round().long()
-        return K_hard, K_soft
-
-
 # =============================================================================
 # Hilbert-Optimal Splitter
 # =============================================================================
 
 @dataclass
 class HilbertOptimalSplitterConfig:
-    """Hilbert-Optimal Splitter 配置
+    """Hilbert-Optimal Splitter 配置 (简化版: 固定K + Gumbel-STE)
 
-    三层参数原则:
-    - 参数 (Parameters): 固定架构 - min_patch_size, max_level_limit, feature_dim, hidden_dim
-    - 变参数 (Variable): 运行时 - K_min, K_max, sampling_ratio
-    - 超参数 (Hyper): 可调优 - entmax_alpha, tree_constraint_weight, temperature, jump_loss_weight
+    参数:
+        min_patch_size, max_level_limit, feature_dim, hidden_dim
+        K_fixed: 固定 token 数量
+        temperature_init/temperature_min: Gumbel 温度范围
+        use_distance_decay_conv: 是否使用距离衰减卷积
     """
 
-    # ========== 参数 (Parameters) - 固定架构 ==========
     min_patch_size: int = 4
     max_level_limit: int = 8
     feature_dim: int = 256
     hidden_dim: int = 64
-
-    # ========== 变参数 (Variable) - 运行时 ==========
-    K_min: int = 8
-    K_max: int = 64
-    # 动态 sampling_ratio: [浅层阈值, 深层阈值] → [sratio_0, sratio_1, sratio_2]
-    sampling_ratio_schedule: tuple = (2, 4)  # d ≤ 2: 1, 2 < d ≤ 4: 2, d > 4: 4
-
-    # ========== 超参数 (Hyper) - 可调优 ==========
-    # Entmax 参数
-    # I107: 从 1.5 改为 1.2，防止 alpha=1.5 导致 Entmax 硬截断
-    # 测试结果: alpha=1.5 产生 0% 非零输出，梯度无法回传
-    # I107: 添加 alpha 预热策略
-    entmax_alpha_init: float = 1.2      # 起始值 (保证梯度流动)
-    entmax_alpha_warmup: float = 1.49   # V4: 1.49 而非 1.5，永远保持轻微梯度流
-    entmax_alpha_max: float = 2.0       # 最终稀疏度
-    entmax_warmup_epochs: int = 10       # 预热 epoch 数
-    # V3: α 延迟调度 (20→25) 防止双重退火坍缩
-    entmax_schedule_epochs: int = 25     # 总调度 epoch 数
-
-    # 树约束参数
-    tree_constraint_weight: float = 0.1
-
-    # 温度参数
+    K_fixed: int = 16
     temperature_init: float = 1.0
-    temperature_min: float = 0.3
-
-    # Jump Loss 参数
-    jump_loss_weight: float = 0.1
-
-    # Density Field 参数
-    density_field_hidden_dim: int = 32
-
-    # I167-1: 距离衰减卷积
-    # True: 使用解耦版 - 空间混合(固定) + 通道混合(可学习)
-    # False: 回退到标准 Conv1D (向后兼容)
+    temperature_min: float = 0.1
     use_distance_decay_conv: bool = True
 
-    # I167-4: SDS 正则化
-    # True: 启用 SDS 正则化，惩罚高 SDS（空间局部性破坏）的位置
-    # SDS 正则化: z = z - λ * SDS_penalty
-    use_sds_regularization: bool = False
-    sds_lambda: float = 0.1  # SDS 正则化强度
 
 
 class HilbertOptimalSplitter(nn.Module, CoreSplitter):
@@ -305,18 +246,10 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         min_patch_size: int = 4,
         max_level_limit: int = 8,
         hidden_dim: int = 64,
-        K_min: int = 8,
-        K_max: int = 64,
-        sampling_ratio_schedule: tuple = (2, 4),
-        entmax_alpha: float = 1.2,  # I107: 改为 1.2 防止硬截断
-        tree_constraint_weight: float = 0.1,
+        K_fixed: int = 16,
         temperature_init: float = 1.0,
-        temperature_min: float = 0.3,
-        jump_loss_weight: float = 0.1,
-        density_field_hidden_dim: int = 32,
-        use_distance_decay_conv: bool = True,  # I167-1: 距离衰减卷积
-        use_sds_regularization: bool = False,  # I167-4: SDS 正则化
-        sds_lambda: float = 0.1,  # I167-4: SDS 正则化强度
+        temperature_min: float = 0.1,
+        use_distance_decay_conv: bool = True,
     ):
         super().__init__()
 
@@ -328,117 +261,39 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             min_patch_size = config.min_patch_size
             max_level_limit = config.max_level_limit
             hidden_dim = config.hidden_dim
-            K_min = config.K_min
-            K_max = config.K_max
-            sampling_ratio_schedule = config.sampling_ratio_schedule
-            entmax_alpha = config.entmax_alpha_init
-            tree_constraint_weight = config.tree_constraint_weight
-            temperature_init = config.temperature_init
-            temperature_min = config.temperature_min
-            jump_loss_weight = config.jump_loss_weight
-            density_field_hidden_dim = config.density_field_hidden_dim
-            # I167-1: 安全读取 config 中的字段（兼容旧 config）
-            use_distance_decay_conv = getattr(
-                config, 'use_distance_decay_conv', True
-            )
-            # I167-4: SDS 正则化
-            use_sds_regularization = getattr(
-                config, 'use_sds_regularization', False
-            )
-            sds_lambda = getattr(config, 'sds_lambda', 0.1)
+            K_fixed = getattr(config, 'K_fixed', 16)
+            temperature_init = getattr(config, 'temperature_init', 1.0)
+            temperature_min = getattr(config, 'temperature_min', 0.1)
+            use_distance_decay_conv = getattr(config, 'use_distance_decay_conv', True)
 
         self.feature_dim = feature_dim
         self.min_patch_size = min_patch_size
         self.max_level_limit = max_level_limit
         self.hidden_dim = hidden_dim
-        self.K_min = K_min
-        self.K_max = K_max
-        # K 课程学习：当前使用的 K 值（随 epoch 增大）
-        self._current_K = K_min
-        self._K_schedule_epochs = 30  # K 课程学习持续 30 个 epoch
-        # K 向上取整：找到能囊括 K_max 的最小 level 对应的候选区域数
-        # 例如: K_max=38 → level 3 (4^3=64) → K_max_rounded=64
-        self._K_max_rounded = self._compute_min_level_regions(K_max, max_level_limit)
-        self.sampling_ratio_schedule = sampling_ratio_schedule
-
-        # Entmax 参数 (I107: 添加预热策略 + 修复课程学习)
-        self.entmax_alpha = entmax_alpha
-        self.entmax_alpha_init = 1.0      # P1 FIX: 起始值改为 1.0 (强制 softmax)
-        self.entmax_alpha_warmup = 1.25    # P1 FIX: 上限从 1.30 降至 1.25
-        self.entmax_alpha_max = 1.25       # P1 FIX: 稳定值设为 1.25（平滑过渡）
-        self.entmax_warmup_epochs = 8      # P1 FIX: Stage 0 延长到 epoch 0-8 (α=1.0)
-        self.entmax_transition_epochs = 15 # P1 FIX: Stage 1 延长到 epoch 8-15 (α: 1.0 → 1.15)
-        # P1 FIX: α 延迟调度 (15→25) 缓慢爬升至 1.25
-        self.entmax_schedule_epochs = 25   # 总调度 epoch 数
-
-        # 树约束 - I164-1: 动态λ调整
-        # 使用log(lambda)确保λ>0，通过课程学习逐步增强约束
-        self.tree_constraint_weight = tree_constraint_weight
-        self._log_lambda = nn.Parameter(torch.tensor(0.0, dtype=torch.get_default_dtype()))  # 可学习的log(λ)
-        self._lambda_schedule_epochs = 20  # λ课程学习持续20个epoch
-
-        # λ的初始值和目标值（课程学习）
-        self._lambda_init = 0.05
-        self._lambda_max = 0.3
+        self.K_fixed = K_fixed
 
         # 温度
         self.temperature = temperature_init
         self.temperature_init = temperature_init
         self.temperature_min = temperature_min
 
-        # =====================================================================
-        # BPE-style 三阶段 Warmup 动态参数
-        # 初始化默认值，由外部调度器通过 setter 更新
-        # =====================================================================
-        self._target_ratio = 0.25        # 目标 token 比例
-        self._budget_weight = None       # None 表示使用 get_auxiliary_losses 内的默认值
-        self._logits_diversity_enabled = True  # 是否启用 logits 多样性惩罚
-        # P0 FIX: 动态 K_min 比例，由 _update_fractal_hyperparams 调度
-        # 1.0 = K_min = N（保留所有 token），0.5 = K_min = 0.5 * K_target
-        self._k_min_ratio = 1.0
-        # P1 FIX: 目标熵，用于路由正则化退火
-        # 0.55 = 中等随机性（高温平滑），0.40 = 低随机性（收敛状态）
-        self._target_entropy = 0.55
-
-        # Jump Loss 权重
-        self.jump_loss_weight = jump_loss_weight
-
-        # Density Field 隐藏层维度
-        self.density_field_hidden_dim = density_field_hidden_dim
-
-        # I167-4: SDS 正则化
-        self.use_sds_regularization = use_sds_regularization
-        self.sds_lambda = sds_lambda
+        # Gumbel-STE logit_scale：防止 Gumbel 噪声被 logits 淹没
+        self.logit_scale = nn.Parameter(torch.zeros(1, dtype=torch.get_default_dtype()))
 
         # 当前状态
         self._current_image_size: Optional[Tuple[int, int]] = None
         self._epoch = 0
 
-        # =====================================================================
-        # I150-3: Token 稳定性监控
-        # =====================================================================
-        self._monitor_token_stability = False
-        self._token_history: List[Tensor] = []
-
-        # =====================================================================
-        # Phase 2: 中间变量安全缓冲区 (DDP 训练安全)
-        # D1-AUDIT FIX: 存储 GPU tensor，在 get_output() 中延迟 .item()
-        # =====================================================================
-        self._last_sds_stats: Optional[Dict[str, float]] = None
-        # D1-AUDIT FIX: 改为 Optional[Tensor] 避免 forward 内 .item() 同步
-        self._last_tree_delta_z_t: Optional[torch.Tensor] = None
-
-        # =====================================================================
         # 核心组件
-        # =====================================================================
-
         # 1. 特征投影
         self.feature_proj = nn.Linear(feature_dim, hidden_dim)
+        nn.init.orthogonal_(self.feature_proj.weight, gain=nn.init.calculate_gain('relu'))
+        nn.init.zeros_(self.feature_proj.bias)
 
-        # 2. 深度嵌入 (A1: 与 Embed 层一致)
+        # 2. 深度嵌入
         self.depth_embedding = nn.Embedding(max_level_limit + 1, hidden_dim)
 
-        # 3. 路径编码器 - 创建最小配置
+        # 3. 路径编码器
         self._path_encoder_config = _MinimalPathEncoderConfig(
             image_size=224,
             min_patch_size=min_patch_size,
@@ -451,107 +306,48 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             embedding_dim=hidden_dim,
         )
 
-        # 3.5. 旋转嵌入投影层 (用于参数共享后维度对齐)
-        # 正常情况: rot_emb dim == hidden_dim (无需投影)
-        # 参数共享后: rot_emb dim == geometry_field.dim (需要投影到 hidden_dim)
-        # 注意: 使用 bias=False 避免引入额外的仿射变换，保持几何感知的线性投影特性
+        # 3.5. 旋转嵌入投影
         self.rot_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
 
         # 4. 面积编码
-        # D4 AUDIT FIX: 4.0 ** (-d) -> torch.exp2(-d.float() * 2.0) (vectorized, no Python loop)
         d_indices = torch.arange(max_level_limit + 1, dtype=torch.float32)
         self.register_buffer(
             '_area_encoding',
-            torch.exp2(-d_indices * 2.0)  # 4^(-d) = 2^(-2d)
+            torch.exp2(-d_indices * 2.0)
         )
 
-        # 4.5. 面积投影（消除 expand 导致的秩塌陷，赋予模型学习最优面积表示的能力）
+        # 4.5. 面积投影
         self.area_proj = nn.Linear(1, hidden_dim)
 
-        # 4.6. 分组特征归一化（解决 roi_features 范数 >> 几何嵌入范数导致的几何信息被压制问题）
-        # 语义组：[B, N, 64] — roi_features 来自 backbone，初始范数 O(2-8)
-        # 几何组：[N, 192] — path_emb + rot_emb + area_proj 输出，初始范数 O(0.16)
-        self.roi_norm = nn.LayerNorm(hidden_dim)          # 语义特征归一化
-        self.geo_norm = nn.LayerNorm(hidden_dim * 3)       # 几何特征归一化（path + rot + area）
+        # 4.6. 分组特征归一化
+        self.roi_norm = nn.LayerNorm(hidden_dim)
+        self.geo_norm = nn.LayerNorm(hidden_dim * 3)
 
-        # 5. 1D Hilbert 流形卷积 (A1: 核心创新)
-        # 输入: [B, N, hidden_dim * 4] (feat + path + rot + area)
-        # 输出: [B, N, 1]
-        conv_input_dim = hidden_dim * 4
+        # 4.7. 可学习的语义-几何融合比例
+        self._semantic_ratio = nn.Parameter(torch.zeros(1, dtype=torch.get_default_dtype()))
+        # sigmoid(0) = 0.5, 即初始时语义和几何各占一半
 
-        # I167-1: 根据配置选择卷积实现
+        # 5. 1D Hilbert 流形卷积
+        conv_input_dim = hidden_dim * 4  # semantics (1x) + geometry (3x: path + rot + area)
+
         if use_distance_decay_conv:
-            # 解耦版: 空间混合(固定距离衰减) + 通道混合(可学习)
-            # 数学: z = Pointwise(Depthwise(x, w_decay))
-            # 参数: D × 1 (比标准 Conv1D 减少约 90%)
             from .hilbert_distance_decay_conv import HilbertDistanceDecayConv1D
             self.conv1d_hilbert = HilbertDistanceDecayConv1D(conv_input_dim)
         else:
-            # 标准版: 向后兼容
             self.conv1d_hilbert = nn.Conv1d(
-                conv_input_dim,
-                1,
-                kernel_size=5,
-                padding=2,
-                groups=1,
+                conv_input_dim, 1, kernel_size=5, padding=2, groups=1,
             )
-
-        # 6. 深度配额学习 (可选，用于 A5)
-        self.depth_quota = nn.Parameter(torch.ones(max_level_limit + 1, dtype=torch.get_default_dtype()))
-
-        # I106-2: 密度场网络 - 根据曲线特征动态估计 K
-        # 数学: K = ∫ ρ(h) dh, 其中 ρ = sigmoid(MLP(curve_features))
-        self.density_field = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid(),
-        )
-
-        # I-NAN: 初始化 density_field 偏置为 -1.1
-        # sigmoid(-1.1) ≈ 0.25，强迫模型在训练初期产生更多 token
-        # 这解决了 avg_tokens 死锁在 5 个的问题
-        self._init_density_field_bias()
 
         # 初始化 conv1d_hilbert 偏置为 +0.5，强制初期尝试更多分裂
         self._init_logits_bias()
 
-        # I-OPT: Differentiable K 选择器 (STE 直通估计)
-        # 用于恢复 K 值的梯度流，解决原 .item() 断裂梯度的问题
-        self.K_estimator = DifferentiableK(K_min=K_min, K_max=K_max)
-
         # 候选区域缓存
         self.register_buffer('candidate_regions', torch.zeros(0, 4))
         self.register_buffer('candidate_depths', torch.zeros(0, dtype=torch.long))
-        self.register_buffer('parent_indices', torch.zeros(0, dtype=torch.long))
         self.register_buffer('hilbert_indices', torch.zeros(0, dtype=torch.long))
-        self.register_buffer('children_matrix', torch.zeros(0, 4, dtype=torch.long))
 
         self._children_matrix: Optional[Tensor] = None
 
-    def _init_density_field_bias(self) -> None:
-        """
-        初始化 density_field 的最后一层偏置为 -1.1
-
-        数学原理：
-            sigmoid(x + b) 当 b = -1.1 时，初始密度 ≈ 0.25
-            这迫使模型在训练初期产生更多 token (K > 5)
-
-        效果：
-            - 训练初期：更多 token → 更多梯度流动 → 更好的学习
-            - 训练后期：模型自动调整偏置以优化 token 数量
-        """
-        # density_field 结构: Linear -> GELU -> Linear -> Sigmoid
-        # 最后一层是索引 2
-        last_linear = self.density_field[2]
-
-        # 重置权重为较小的值
-        nn.init.xavier_uniform_(last_linear.weight, gain=0.1)
-
-        # P1 修复: 偏置设为 0.0，使初始 sigmoid 输出 = 0.5
-        # sigmoid(0) = 0.5，赋予模型充足的信息带宽探索视觉特征
-        # Budget_Loss（目标 25%）在后续缓慢剪枝，避免开局"极度贫血"
-        nn.init.constant_(last_linear.bias, 0.0)
 
     def _init_logits_bias(self) -> None:
         """
@@ -567,15 +363,6 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         if hasattr(self.conv1d_hilbert, 'bias') and self.conv1d_hilbert.bias is not None:
             nn.init.constant_(self.conv1d_hilbert.bias, 0.5)
 
-    def reset_density_field(self) -> None:
-        """
-        重置 density_field 参数（公开接口）
-
-        用于：
-            - 训练中断后恢复
-            - 调试 token 数量问题
-        """
-        self._init_density_field_bias()
 
     @property
     def max_level_limit(self) -> int:
@@ -758,31 +545,26 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         self._children_matrix = children_matrix
 
-    def _extract_features(self, features: Tensor, regions: Tensor, depths: Tensor) -> Tensor:
+    def _extract_features(self, features: Tensor, regions: Tensor, depths: Tensor) -> Tuple[Tensor, Tensor]:
         """提取结构化特征
 
         数学:
-            f_i = ROIAlign(F, R_i, sampling_ratio(d_i)) ⊙ σ(d_i) + E_d(d_i)
+            f_i = ROIAlign(F, R_i, sampling_ratio(d_i)) * sigma(d_i) + E_d(d_i)
 
-        I106-1: 动态 sampling_ratio 实现尺度感知特征提取
-            - 浅层 (d ≤ 2): sampling_ratio=1, 全局特征
-            - 中层 (2 < d ≤ 4): sampling_ratio=2, 中等细节
-            - 深层 (d > 4): sampling_ratio=4, 细致采样
+        Returns:
+            roi_features: [B, N, hidden_dim] 投影 + 深度注入后的特征
+            roi_raw: [B, N, feature_dim] 原始池化特征（供 Tokenizer 复用）
         """
         B = features.shape[0]
         N = regions.shape[0]
         _, C_feat, H_feat, W_feat = features.shape
 
-        # 定义深度区间和对应的 sampling_ratio
         depth_bins = [0, 2, 4, self.max_level_limit + 1]
         sampling_ratios = [1, 2, 4]
 
-        # 构建 ROI boxes: [batch_idx, x1, y1, x2, y2]
-        # 假设所有 region 属于同一 batch (batch_idx=0)
         batch_indices = torch.zeros(N, dtype=torch.long, device=regions.device)
-        boxes = torch.cat([batch_indices.unsqueeze(-1).float(), regions], dim=-1)  # [N, 5]
+        boxes = torch.cat([batch_indices.unsqueeze(-1).float(), regions], dim=-1)
 
-        # 按深度分组，使用动态 sampling_ratio
         pooled_list = []
         indices_list = []
 
@@ -792,48 +574,39 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             if not mask.any():
                 continue
 
-            indices = mask.nonzero(as_tuple=False).squeeze(-1)  # D3-AUDIT FIX: as_tuple=False 避免 Graph Break
+            indices = mask.nonzero(as_tuple=False).squeeze(-1)
             group_boxes = boxes[indices]
 
-            # 调用 ROIAlign，使用对应的 sampling_ratio
             pooled = roi_align(
-                features,
-                group_boxes,
-                output_size=(1, 1),
-                spatial_scale=1.0,
-                sampling_ratio=sampling_ratios[i],
-                aligned=True,
-            )  # [N_group, C, 1, 1]
+                features, group_boxes,
+                output_size=(1, 1), spatial_scale=1.0,
+                sampling_ratio=sampling_ratios[i], aligned=True,
+            )
             pooled = pooled.squeeze(-1).squeeze(-1)
 
             pooled_list.append(pooled)
             indices_list.append(indices)
 
-        # 合并结果
         if len(pooled_list) == 0:
-            # 无 token 时的边界情况
-            roi_features = torch.zeros(B, N, C_feat, device=features.device, dtype=features.dtype)
+            roi_raw = torch.zeros(B, N, C_feat, device=features.device, dtype=features.dtype)
         else:
-            # 按原始顺序合并
-            roi_features = torch.zeros(B, N, C_feat, device=features.device, dtype=features.dtype)
+            roi_raw = torch.zeros(B, N, C_feat, device=features.device, dtype=features.dtype)
             for pooled, indices in zip(pooled_list, indices_list):
-                roi_features[:, indices] = pooled.unsqueeze(0)
+                roi_raw[:, indices] = pooled.unsqueeze(0)
 
         # 投影到 hidden_dim
-        roi_features = self.feature_proj(roi_features)  # [B, N, hidden_dim]
+        roi_features = self.feature_proj(roi_raw)
 
-        # 深度缩放 (与 Embed 一致)
-        depth_scale = torch.sigmoid(self.depth_embedding.weight)  # [max_level+1, hidden_dim]
-        depth_scale = depth_scale[depths]  # [N, hidden_dim]
-
-        # 注入深度信息
+        # 深度缩放
+        depth_scale = torch.sigmoid(self.depth_embedding.weight)
+        depth_scale = depth_scale[depths]
         roi_features = roi_features * depth_scale.unsqueeze(0)
 
-        # 添加深度嵌入
-        depth_emb = self.depth_embedding(depths)  # [N, hidden_dim]
+        # 深度嵌入
+        depth_emb = self.depth_embedding(depths)
         roi_features = roi_features + depth_emb.unsqueeze(0)
 
-        return roi_features
+        return roi_features, roi_raw
 
     def _encode_geometry(self, regions: Tensor, depths: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """编码几何信息
@@ -897,126 +670,6 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         return path_emb, rot_emb, area_enc
 
-    def _compute_sds_penalty(
-        self,
-        logits: Tensor,
-        image_size: Tuple[int, int],
-        k: int = 4,
-    ) -> Tensor:
-        """计算 SDS 正则化惩罚
-
-        数学:
-            SDS(i) = Σ_{j∈N_k(i)} ||p_i - p_j||²_2 / (2k)
-            Penalty(i) = λ * SDS(i)
-
-        其中:
-            - N_k(i) 是 Hilbert 序中位置 i 的 k 个最近邻
-            - p_i 是位置 i 在网格上的 2D 中心坐标
-            - λ 是正则化强度
-
-        实现:
-            1. 从 Hilbert 索引重建 2D 坐标（考虑深度缩放）
-            2. 按 Hilbert 序排序
-            3. 计算 k 近邻欧氏距离平方
-            4. 返回惩罚值（与 logits 形状相同 [B, N]）
-
-        Args:
-            logits: [B, N] 原始 logits
-            image_size: (H, W) 原始图像尺寸
-            k: 考虑的最近邻数量
-
-        Returns:
-            sds_penalty: [B, N] SDS 惩罚，可直接从 logits 减去
-        """
-        B = logits.shape[0]
-        N = logits.shape[1]
-        device = logits.device
-
-        # 获取候选区域的 Hilbert 索引和深度
-        hilbert_indices = self.hilbert_indices  # [N]
-        depths = self.candidate_depths  # [N]
-
-        # Step 1: 从 Hilbert 索引重建 2D 坐标
-        # 注意: 每个深度的 Hilbert 索引在其自己的网格分辨率下
-        # 需要缩放到 max_level 以便统一比较
-        coordinates_list = []
-        max_level = self.max_level_limit
-
-        for depth in range(max_level + 1):
-            depth_mask = (depths == depth)
-            if not depth_mask.any():
-                continue
-
-            depth_indices = hilbert_indices[depth_mask]  # 该深度的 Hilbert 索引
-            n_grid = 1 << depth  # 该深度的网格大小
-
-            # 转换 Hilbert 距离到 2D 坐标
-            x_coords, y_coords = HilbertCurve.d_to_xy_batch(n_grid, depth_indices)
-
-            # 缩放到 max_level 分辨率
-            scale = 1 << (max_level - depth)  # 2^(max_level - depth)
-            x_coords = x_coords.float() * scale
-            y_coords = y_coords.float() * scale
-
-            # 合并坐标
-            coords_depth = torch.stack([x_coords, y_coords], dim=1)  # [N_depth, 2]
-            coordinates_list.append(coords_depth)
-
-        # 合并所有深度的坐标
-        all_coordinates = torch.zeros(N, 2, device=device)
-        depth_mask_flat = torch.zeros(N, dtype=torch.long, device=device)
-        pos = 0
-        for depth in range(max_level + 1):
-            depth_mask = (depths == depth)
-            if depth_mask.any():
-                all_coordinates[depth_mask] = coordinates_list[pos]
-                depth_mask_flat[depth_mask] = depth
-                pos += 1
-
-        # Step 2: 按 Hilbert 索引排序
-        sort_idx = hilbert_indices.argsort()
-        sorted_coords = all_coordinates[sort_idx]  # [N, 2]
-
-        # Step 3: 计算 k 近邻欧氏距离平方（完全向量化）
-        # P-OPT: 一次性计算所有 2k 个邻居的距离，避免 Python 循环
-        # 创建所有偏移量: [-k, ..., -1, 1, ..., k]
-        offsets = torch.arange(-k, k + 1, device=device)
-        offsets = offsets[offsets != 0]  # 移除 0 偏移
-        num_neighbors = offsets.numel()  # 应该是 2k
-
-        # 计算所有邻居索引: [N, num_neighbors]
-        neighbor_idx = torch.arange(N, device=device).unsqueeze(1) + offsets.unsqueeze(0)
-        # Clamp 到有效范围 [0, N-1]
-        neighbor_idx_clamped = neighbor_idx.clamp(min=0, max=N - 1)
-
-        # 计算所有邻居的坐标: [N, num_neighbors, 2]
-        neighbor_coords = sorted_coords[neighbor_idx_clamped]  # [N, num_neighbors, 2]
-
-        # 使用 broadcasting 一次性计算所有距离: [N, num_neighbors]
-        diff = sorted_coords.unsqueeze(1) - neighbor_coords  # [N, num_neighbors, 2]
-        all_dist_sq = (diff ** 2).sum(dim=2)  # [N, num_neighbors]
-
-        # 计算有效掩码（排除原始位置的 0 偏移已被移除）
-        valid_mask = (neighbor_idx >= 0) & (neighbor_idx < N)  # [N, num_neighbors]
-
-        # 归一化: 只对有效邻居求平均
-        valid_count = valid_mask.sum(dim=1).clamp(min=1)  # [N]
-        sds_values = (all_dist_sq * valid_mask.float()).sum(dim=1) / valid_count  # [N]
-
-        # 归一化（使用Step 2的all_dist_sq）
-        valid_count = valid_mask.sum(dim=1).clamp(min=1)  # [N]
-        sds_values = (all_dist_sq * valid_mask.float()).sum(dim=1) / valid_count  # [N]
-
-        # Step 4: 扩展到 batch 维度并返回惩罚
-        # sds_values: [N] -> [B, N]
-        sds_penalty = sds_values.unsqueeze(0).expand(B, -1) * self.sds_lambda  # [B, N]
-
-        # 取消排序，恢复原始顺序
-        # 需要将 penalty 放回原始位置
-        unsort_idx = sort_idx.argsort()
-        sds_penalty = sds_penalty[:, unsort_idx]  # [B, N]
-
-        return sds_penalty
 
     def _manifold_convolution(self, features: Tensor) -> Tensor:
         """1D Hilbert 流形卷积
@@ -1041,248 +694,9 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         return z
 
-    def _apply_tree_constraint(self, logits: Tensor, depths: Tensor) -> Tensor:
-        """应用树一致性软约束
 
-        数学:
-            z_parent -= λ × max(z_children)
 
-        I164-1: 动态λ调整
-            - 课程学习: λ从_init逐步增加到_max
-            - 可学习残差: log_lambda提供额外的学习信号
-        """
-        if self.tree_constraint_weight <= 0:
-            return logits
 
-        # 计算动态λ (课程学习 + 可学习残差)
-        lambda_cur = self._compute_dynamic_lambda()
-
-        constrained_logits = logits.clone()
-
-        # D2-AUDIT FIX: 向量化 parent-child penalty 避免 Python for 循环
-        # 对每个父节点，降低其分数如果子节点分数更高
-        valid_mask = self.parent_indices >= 0
-        if valid_mask.any():
-            valid_parents = torch.masked_select(self.parent_indices, valid_mask)  # [P]
-            children_all = self.children_matrix[valid_parents]  # [P, 4]
-            child_mask = children_all >= 0  # [P, 4]
-            # gather child logits: clamp to 0 for invalid indices, they'll be masked anyway
-            children_clamped = children_all.masked_fill(~child_mask, 0)
-            gathered = logits.gather(1, children_clamped.view(-1).unsqueeze(0).expand(logits.shape[0], -1))  # [B, P*4]
-            # D3-AUDIT FIX: gather 可能返回非连续 tensor，view 需要连续内存
-            gathered = gathered.contiguous().view(-1, *children_clamped.shape)  # [B, P, 4]
-            # mask invalid child positions with -inf
-            gathered = gathered.masked_fill(~child_mask.unsqueeze(0), float('-inf'))
-            max_child_logits = gathered.max(dim=2)[0]  # [B, P]
-            constrained_logits[:, valid_parents] -= lambda_cur * max_child_logits
-
-        return constrained_logits
-
-    def _compute_dynamic_lambda(self) -> Tensor:
-        """计算动态λ (课程学习)
-
-        λ(t) = λ_init + (λ_max - λ_init) × min(1, t / T_schedule) + σ(log_lambda)
-
-        其中 t 是当前epoch，T_schedule 是课程学习持续时间
-
-        Returns:
-            GPU tensor (与 logits 等设备兼容)，避免 forward 内 .item() 同步
-        """
-        # 课程学习组件
-        progress = min(1.0, self._current_epoch / max(1, self._lambda_schedule_epochs))
-        lambda_scheduled = self._lambda_init + (self._lambda_max - self._lambda_init) * progress
-
-        # 可学习残差 (sigmoid确保正值)
-        # D1-AUDIT FIX: 返回 GPU tensor，整体计算图保持 GPU
-        lambda_learnable = torch.sigmoid(self._log_lambda) * 0.2  # 缩放到合理范围
-
-        # 组合: lambda_scheduled (float) + tensor → tensor
-        return lambda_scheduled + lambda_learnable
-
-    def get_adaptive_alpha(self, epoch: int) -> float:
-        """自适应 α 调度器 - 保证早期全梯度流
-
-        数学:
-            α*(t) = 1.2 + 0.3 * sigmoid(0.3 * (t - 10))
-
-        调度策略:
-            - epoch < 10:  α = 1.2 (早期保证梯度覆盖率)
-            - 10 <= epoch < 30: α = 1.5 (中期标准 entmax)
-            - epoch >= 30: α → 1.7 (后期适度稀疏，通过 sigmoid 平滑过渡)
-        """
-        if epoch < 10:
-            return 1.2
-        elif epoch < 30:
-            return 1.5
-        else:
-            # sigmoid 平滑过渡到 1.7（不达到 2.0）
-            progress = (epoch - 30) / 50
-            # D4-AUDIT FIX: 使用 Python math 替代 torch.sigmoid + .item()，避免 GPU 同步
-            x = 0.3 * (progress - 0.5) * 10
-            sigmoid_val = 1 / (1 + math.exp(-x))
-            return 1.5 + 0.2 * sigmoid_val
-
-    def _sparse_select(
-        self,
-        logits: Tensor,
-        K_target,  # I-OPT: 接受 int 或 Tensor，避免 .item() 同步
-        hard: bool = False,
-        epoch: int = 0,
-    ) -> Tuple[Tensor, Tensor]:
-        """稀疏选择
-
-        数学:
-            s = softmax(z / τ) × K (用于更好的梯度流)
-            s = Entmax_{α}(z / τ) × K (用于稀疏)
-
-        参数:
-            epoch: 训练轮次，用于自适应调整 α
-        """
-        B, N = logits.shape
-
-        # 温度调度
-        tau = max(self.temperature, TEMPERATURE_MIN)
-
-        # 使用 set_epoch 管理的 entmax_alpha（课程学习调度至 2.0）
-        # get_adaptive_alpha 最大返回 ~1.7，永远低于 1.9 阈值，导致 entmax 死代码
-        alpha = self.entmax_alpha
-
-        # P1 FIX: alpha < 1.2: Softmax（早期训练，全梯度流）
-        # alpha >= 1.2: Entmax（逐渐稀疏，晚期稀疏性选择）
-        # 原阈值 1.5 降至 1.2，因为稳定期 alpha 现在是 1.30
-        if alpha < 1.2:
-            probs = F.softmax(logits / tau, dim=-1)
-        else:
-            probs = entmax_beta(logits / tau, alpha=alpha, dim=-1)
-
-        # 缩放使期望和等于 K
-        probs_scaled = probs * K_target
-
-        if hard:
-            # 硬选择
-            selected_mask = torch.zeros_like(probs)
-            _, topk_idx = torch.topk(probs_scaled, K_target, dim=-1)
-            selected_mask.scatter_(1, topk_idx, 1.0)
-            # 硬模式下返回缩放后的概率（用于梯度）
-            return selected_mask, probs_scaled
-        else:
-            # 软选择 (用于训练)
-            return probs_scaled, probs_scaled
-
-    def enable_token_stability_monitoring(self) -> "HilbertOptimalSplitter":
-        """启用 token 选择稳定性监控"""
-        self._monitor_token_stability = True
-        self._token_history.clear()
-        return self
-
-    def disable_token_stability_monitoring(self) -> "HilbertOptimalSplitter":
-        """禁用 token 选择稳定性监控"""
-        self._monitor_token_stability = False
-        return self
-
-    def compute_token_iou(self) -> Optional[float]:
-        """
-        计算最近两次 token 选择的 IOU（重合率）。
-
-        Returns:
-            IOU 值（0.0-1.0），或 None（如果历史不足）
-        """
-        if len(self._token_history) < 2:
-            return None
-
-        indices1 = set(self._token_history[-2].tolist())
-        indices2 = set(self._token_history[-1].tolist())
-
-        if not indices1 or not indices2:
-            return None
-
-        intersection = len(indices1 & indices2)
-        union = len(indices1 | indices2)
-
-        return intersection / union if union > 0 else 0.0
-
-    def get_token_stability_stats(self) -> Dict[str, float]:
-        """
-        获取 token 稳定性统计信息。
-
-        Returns:
-            包含 iou_mean, iou_std, iou_min 的字典
-        """
-        if len(self._token_history) < 2:
-            return {"iou_mean": 0.0, "iou_std": 0.0, "iou_min": 0.0, "iou_max": 0.0}
-
-        ious = []
-        for i in range(len(self._token_history) - 1):
-            set1 = set(self._token_history[i].tolist())
-            set2 = set(self._token_history[i + 1].tolist())
-            if set1 and set2:
-                intersection = len(set1 & set2)
-                union = len(set1 | set2)
-                ious.append(intersection / union if union > 0 else 0.0)
-
-        if not ious:
-            return {"iou_mean": 0.0, "iou_std": 0.0, "iou_min": 0.0, "iou_max": 0.0}
-
-        import numpy as np
-        return {
-            "iou_mean": float(np.mean(ious)),
-            "iou_std": float(np.std(ious)),
-            "iou_min": float(np.min(ious)),
-            "iou_max": float(np.max(ious)),
-        }
-
-    def _compute_locality_efficiency(
-        self,
-        selected_mask: Tensor,
-        num_selected: int,
-    ) -> float:
-        """
-        计算 Locality Efficiency (Selection/Oracle 对比)
-
-        Selection Locality: J(S) = mean(|h(s_i) - h(s_{i+1})|)
-        Oracle Locality: 连续采样能达到的最高聚合度 (理想情况下跳距 = 1)
-
-        Locality Efficiency = Selection Locality / Oracle Locality ∈ [0, 1]
-        值越高表示越接近理想的连续采样
-
-        Args:
-            selected_mask: [B, N] 选中掩码
-            num_selected: 选中的 token 数量
-
-        Returns:
-            Locality efficiency 值
-        """
-        if num_selected < 2:
-            return 1.0
-
-        # 处理批量掩码 [B, N]
-        if selected_mask.dim() == 2:
-            efficiencies = []
-            for i in range(selected_mask.shape[0]):
-                mask_1d = selected_mask[i] > 0.5
-                selected_h = self.hilbert_indices[mask_1d].float().sort()[0]
-                if len(selected_h) < 2:
-                    efficiencies.append(1.0)
-                    continue
-                selection_jumps = (selected_h[1:] - selected_h[:-1]).abs()
-                selection_locality = selection_jumps.mean().item()
-                # Oracle Locality = 1.0 (连续采样的理想跳距)
-                efficiencies.append(selection_locality / 1.0 if 1.0 > 0 else 1.0)
-            return sum(efficiencies) / len(efficiencies) if efficiencies else 1.0
-
-        # 处理 1D 掩码 [N]
-        selected_h = self.hilbert_indices[selected_mask > 0.5].float().sort()[0]
-        if len(selected_h) < 2:
-            return 1.0
-
-        # Selection Locality: 实际跳距
-        selection_jumps = (selected_h[1:] - selected_h[:-1]).abs()
-        selection_locality = selection_jumps.mean().item()
-
-        # Oracle Locality: 理想情况下连续采样跳距 = 1
-        oracle_locality = 1.0
-
-        return selection_locality / oracle_locality if oracle_locality > 0 else 1.0
 
     def forward(
         self,
@@ -1291,404 +705,135 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
         hard: bool = False,
         epoch: int = 0,
     ) -> SplitResult:
-        """
-        前向传播
+        """前向传播（简化版：Gumbel-STE + 固定 K）。
+
+        数学流程:
+            1. 统一 ROI-Align → roi_features (投影后) + roi_raw (原始)
+            2. 几何编码 → path_emb, rot_emb, area_enc
+            3. 可学习融合 → α·norm(roi) + (1-α)·norm(geo)
+            4. Hilbert 流形卷积 → logits
+            5. Gumbel-STE 离散选择 → mask_ste, mask_soft
+            6. 提取选中区域元数据
 
         Args:
             features: [B, C, H, W] 输入特征
             image_size: (H, W) 原始图像尺寸
-            hard: 是否使用硬选择
-            epoch: 训练轮次，用于自适应 α 调度
-            features: [B, C, H, W] 输入特征
-            image_size: (H, W) 原始图像尺寸
-            hard: 是否使用硬选择
+            hard: 保留兼容性（未使用 — Gumbel-STE 始终返回 STE mask）
+            epoch: 保留兼容性（τ 退火由外部 set_temperature 控制）
 
         Returns:
-            SplitResult: 分割结果
+            SplitResult: 包含 roi_features_raw + mask_ste 供 Tokenizer 复用
         """
         B = features.shape[0]
 
         # 更新候选区域
         if image_size is None:
             image_size = self._current_image_size
-
         if image_size is None:
             raise ValueError("image_size must be provided")
-
         if self.num_candidates == 0 or self._current_image_size != image_size:
             self.update_candidates(image_size)
 
-        N = self.num_candidates
+        # 1. 统一 ROI-Align（返回投影后 + 原始特征）
+        roi_features, roi_raw = self._extract_features(
+            features, self.candidate_regions, self.candidate_depths,
+        )
 
-        # 提取特征
-        roi_features = self._extract_features(features, self.candidate_regions, self.candidate_depths)
+        # 2. 几何编码
+        path_emb, rot_emb, area_enc = self._encode_geometry(
+            self.candidate_regions, self.candidate_depths,
+        )
 
-        # 几何编码
-        path_emb, rot_emb, area_enc = self._encode_geometry(self.candidate_regions, self.candidate_depths)
-
-        # 拼接所有特征 (roi + path + rot + area = 4 * hidden_dim)
-        # 注意: conv1d 输入调整为 hidden_dim * 4
-        # 分组归一化：将语义组与几何组分别归一化到单位超球面，强制信息博弈
-        roi_features_norm = self.roi_norm(roi_features)  # [B, N, 64] — 语义归一化
+        # 3. 可学习融合: alpha * norm(roi) || (1-alpha) * norm(geo)
+        alpha = torch.sigmoid(self._semantic_ratio)
+        roi_normed = self.roi_norm(roi_features)
         geo_embs = self.geo_norm(torch.cat([
             path_emb.unsqueeze(0).expand(B, -1, -1),
             rot_emb.unsqueeze(0).expand(B, -1, -1),
             area_enc.unsqueeze(0).expand(B, -1, -1),
-        ], dim=-1))  # [B, N, 192] — 几何归一化
-        combined = torch.cat([roi_features_norm, geo_embs], dim=-1)  # [B, N, 256]
+        ], dim=-1))
+        combined = torch.cat([
+            alpha * roi_normed,
+            (1 - alpha) * geo_embs,
+        ], dim=-1)
 
-        # 1D Hilbert 流形卷积
-        logits = self._manifold_convolution(combined)  # [B, N]
+        # 4. Hilbert 流形卷积 → logits
+        logits = self._manifold_convolution(combined)
 
-        # I167-4: SDS 正则化 - 惩罚高 SDS（空间局部性破坏）的位置
-        # SDS 衡量 Hilbert 曲线上邻居的空间距离，值越高表示局部性保持越差
-        if self.use_sds_regularization and image_size is not None:
-            sds_penalty = self._compute_sds_penalty(logits, image_size)  # [B, N]
-            # D1-AUDIT FIX: 保持 tensor，延迟 .item() 到后处理
-            self._last_sds_stats_t = {
-                "mean": sds_penalty.mean().detach(),
-                "max": sds_penalty.max().detach()
-            }
-            logits = logits - sds_penalty  # 抑制高 SDS 位置
+        # 5. 离散选择
+        if hard:
+            # 确定性 STE: softmax → hard Top-K → STE（无 Gumbel 噪声）
+            mask_soft = F.softmax(logits / self.temperature, dim=-1)
+            _, top_idx = torch.topk(mask_soft, self.K_fixed, dim=-1)
+            mask_hard_local = torch.zeros_like(logits).scatter_(-1, top_idx, 1.0)
+            mask_ste = (mask_hard_local - mask_soft).detach() + mask_soft
+        else:
+            # Gumbel-STE 离散选择（训练模式 — Gumbel 噪声强制探索）
+            mask_ste, mask_soft = gumbel_ste_topk(
+                logits, K=self.K_fixed, tau=self.temperature,
+                logit_scale=self.logit_scale,
+            )
 
-        # Phase 2: 保存 logits_pre_tree 并计算树约束修正量 Δz
-        logits_pre_tree = logits.clone().detach()  # 断开梯度链用于记录
-
-        # 树约束
-        logits = self._apply_tree_constraint(logits, self.candidate_depths)
-
-        # 计算树约束修正量: Δz = ||logits_pre - logits_post||₁
-        # D1-AUDIT FIX: 保持 tensor，延迟 .item() 到后处理
-        self._last_tree_delta_z_t = (logits_pre_tree - logits).abs().sum()
-
-        # 深度配额
-        depth_quota = F.softmax(self.depth_quota, dim=0)
-        depth_quota = depth_quota[self.candidate_depths]  # [N]
-        logits = logits + torch.log(depth_quota + EPS).unsqueeze(0)
-
-        # K 估计 (动态)
-        # 使用密度场网络估计每个区域的"信息密度"
-        # 然后积分得到总 K
-
-        density_per_region = self.density_field(roi_features[0])  # [N, 1]
-
-# I-NAN FIX: 直接求和，K_float 范围 [0, N]
-        # 原公式 K = Σ(density_i × 4^(-depth_i)) 范围仅为 [0, 4]
-        # 新公式 K = Σ(density_i) 范围为 [0, N=85]
-        K_float = density_per_region.squeeze(-1).sum()  # [N] -> scalar
-
-        # I-OPT: 使用 STE 直通估计器获取可微分 K
-        # K_soft: 用于 aux_budget 损失计算，min=1 防止零损失
-        # K_hard: 用于实际 token 选择
-        N = density_per_region.shape[0]  # 候选区域数
-        K_soft = K_float.clamp(min=1)  # 用于损失计算
-        # I-NAN FIX v2: 先 round 再 clamp，确保 K_hard 在 [1, N] 范围内
-        # clamp(round(x)) vs round(clamp(x)) - 前者可能在 round 后超出
-        K_hard = K_float.round().long()  # STE: forward=hard
-        K_hard = K_hard.clamp(min=1, max=N)  # 显式 clamp 到有效范围
-
-        # 稀疏选择使用硬 K（离散整数）
-        # D1-AUDIT FIX: 直接传 K_hard tensor，_sparse_select 内部处理
-        selected_mask, probs = self._sparse_select(logits, K_hard, hard=hard)
-
-        # 构建结果
-        # D3-AUDIT FIX: torch.where 替代 nonzero(as_tuple=True) 避免 Graph Break
-        # nonzero(as_tuple=True) 会返回动态数量的张量，torch.compile 无法处理
-        batch_idx, region_idx = torch.where(selected_mask > 0.5)
+        # 6. 提取选中区域（用于 Tokenizer 元数据）
+        mask_hard = (mask_ste > 0.5).float()
+        batch_idx, region_idx = torch.where(mask_hard > 0.5)
 
         if region_idx.numel() == 0:
-            # 错误恢复：至少选择一个 - 选择最大概率的 token
-            # D3-AUDIT FIX: 使用 argmax 替代 topk，避免 .item() 同步
-            # argmax 返回最大值的索引，纯 tensor 操作
-            _, topk_idx = torch.topk(probs[0], max(1, probs.shape[1] // 2), dim=-1)
-            # 使用 batch 0
-            batch_idx = torch.zeros(topk_idx.shape[0], dtype=torch.long, device=logits.device)
+            _, topk_idx = torch.topk(
+                mask_soft[0], max(1, mask_soft.shape[1] // 2), dim=-1,
+            )
+            batch_idx = torch.zeros(
+                topk_idx.shape[0], dtype=torch.long, device=logits.device,
+            )
             region_idx = topk_idx
 
-        # 提取选中区域
         selected_regions = self.candidate_regions[region_idx]
         selected_depths = self.candidate_depths[region_idx]
 
-        # 按 Hilbert 索引排序（仅对选中区域）
+        # 按 Hilbert 索引排序
         selected_hilbert = self.hilbert_indices[region_idx]
         sort_idx = selected_hilbert.argsort()
         selected_regions = selected_regions[sort_idx]
         selected_depths = selected_depths[sort_idx]
         batch_idx = batch_idx[sort_idx]
 
-        result = SplitResult(
+        # 保存排序后的候选索引（供 Tokenizer 快速路径映射）
+        candidate_indices = region_idx[sort_idx]
+
+        return SplitResult(
             regions=selected_regions,
             depths=selected_depths,
             batch_indices=batch_idx,
-            hilbert_indices=selected_hilbert,  # [M] 选中区域的 Hilbert 索引
-            # 注意: 全局 Hilbert 排序 self.hilbert_indices [N] 不存储在 SplitResult 中
-            # TV Loss 直接使用 split_result.probs [B,N] 和 splitter.full_hilbert_indices
-            selected_mask=selected_mask,
+            hilbert_indices=selected_hilbert[sort_idx],
+            selected_mask=mask_hard,
             logits=logits,
-            probs=probs,
-            K_soft=K_soft,  # I-OPT: 可微分 K 值用于 aux_budget 损失
+            probs=mask_soft,
+            mask_ste=mask_ste,
+            roi_features_raw=roi_raw,
+            candidate_indices=candidate_indices,
         )
-
-        # === Phase 1: 填充诊断属性到 result（供 splitter_output 使用）===
-        # 计算完备性原则: SplitResult 离开 forward 作用域前必须包含所有诊断数据
-
-        # 1. 调用 get_auxiliary_losses() 并设置到 result 属性
-        losses = self.get_auxiliary_losses(result, target_ratio=0.25)
-        result.entropy = losses.get('entropy')
-        result.raw_budget_error = losses.get('budget')  # D162: 重命名以区分误差值与损失权重
-        result.tree_consistency = losses.get('tree')
-
-        # 2. 计算 locality_score (A1 公理) - O(N) 复杂度
-        result.locality_score = compute_locality_score(
-            self.hilbert_indices, result.selected_mask
-        )
-
-        # 3. 计算 Locality Efficiency (Selection/Oracle 对比)
-        result.locality_efficiency = self._compute_locality_efficiency(
-            result.selected_mask, result.selected_mask.sum()
-        )
-
-        # 4. 计算 jump_loss
-        result.jump_loss = compute_jump_loss(
-            self.hilbert_indices, result.selected_mask
-        )
-
-        # 5. 计算 iou 稳定性
-        iou = self.compute_token_iou()
-        if iou is not None:
-            result.iou_mean = iou
-            result.iou_std = 0.0  # 单值无法计算 std
-
-        # 6. 设置 alpha
-        result.alpha = self.entmax_alpha
-
-        # === Phase 2: 中间变量统计（SDS 惩罚 + 树约束修正量）===
-
-        # SDS 惩罚统计 (I167-4)
-        # D1-AUDIT FIX: 使用新命名的 tensor 变量，延迟 .item() 到结果赋值
-        if hasattr(self, '_last_sds_stats_t') and self._last_sds_stats_t is not None:
-            result.sds_penalty_mean = self._last_sds_stats_t["mean"].item()
-            result.sds_penalty_max = self._last_sds_stats_t["max"].item()
-
-        # 树约束透明化：动态 lambda + 修正量 Δz
-        lambda_cur = self._compute_dynamic_lambda()
-        result.tree_lambda = lambda_cur.item() if hasattr(lambda_cur, 'item') else lambda_cur
-        # D1-AUDIT FIX: 提取 tensor 值用于结果
-        if hasattr(self, '_last_tree_delta_z_t') and self._last_tree_delta_z_t is not None:
-            result.tree_constraint_delta_z = self._last_tree_delta_z_t.item()
-
-        # I150-3: 记录 token 选择历史用于稳定性监控
-        if self._monitor_token_stability and hard:
-            # 记录 batch 0 的选择（用于统计）
-            if B > 0:
-                token_idx = region_idx[batch_idx == 0].cpu()
-                self._token_history.append(token_idx)
-                # 限制历史长度
-                if len(self._token_history) > 100:
-                    self._token_history.pop(0)
-
-        return result
 
     def set_temperature(self, temperature: float) -> None:
         """设置温度（用于训练脚本兼容性）"""
         self.temperature = temperature
-
-    def set_target_ratio(self, target_ratio: float) -> None:
-        """设置目标 token 比例（用于 warmup 调度）"""
-        self._target_ratio = target_ratio
-
-    def set_budget_weight(self, budget_weight: float) -> None:
-        """设置 budget loss 权重（用于 warmup 调度）"""
-        self._budget_weight = budget_weight
-
-    def set_logits_diversity(self, enabled: bool) -> None:
-        """设置是否启用 logits 多样性惩罚"""
-        self._logits_diversity_enabled = enabled
-
-    def set_k_min_ratio(self, ratio: float) -> None:
-        """P0 FIX: 设置 K_min 比例（用于动态 K_min 退火）
-
-        Args:
-            ratio: K_min 占 K_target 的比例，范围 [0.5, 1.0]
-                - 1.0: K_min = N（Stage 0，保留所有 token）
-                - 0.5: K_min = 0.5 * K_target（Stage 3+）
-        """
-        self._k_min_ratio = max(0.5, min(1.0, ratio))
-
-    def set_target_entropy(self, entropy: float) -> None:
-        """P1 FIX: 设置目标熵（用于路由正则化退火）
-
-        Args:
-            entropy: 目标路由熵，范围 [0.3, 0.6]
-                - 0.55: 中等随机性（Stage 0，高温平滑）
-                - 0.40: 低随机性（Stage 3+，收敛状态）
-        """
-        self._target_entropy = max(0.3, min(0.6, entropy))
-
-    def set_epoch(self, epoch: int):
-        """P1 FIX: 设置当前 epoch，进行 Entmax α 平滑退火
-
-        三阶段设计（平滑过渡）：
-            Stage 0 (0-8):    α = 1.0 (强制 softmax，稠密梯度)
-            Stage 1 (8-15):  α: 1.0 → 1.15 (温和稀疏区)
-            Stage 2 (15-25): α: 1.15 → 1.25 (稳定区)
-            Stage 3 (25+):   α = 1.25 (稳定期)
-
-        关键改进：
-            - Stage 0 从 5 延长到 8，延长 softmax 阶段
-            - α 最终值从 1.30 降到 1.25，减少过度稀疏化
-            - 过渡期延长，允许 Splitter 更平滑地适应
-        """
-        self._current_epoch = epoch
-
-        def smoothstep(epoch: int, warmup_end: int, ramp_end: int) -> float:
-            """Smoothstep function for smoother alpha annealing"""
-            if epoch < warmup_end:
-                return 0.0
-            elif epoch > ramp_end:
-                return 1.0
-            else:
-                t = (epoch - warmup_end) / (ramp_end - warmup_end)
-                return t * t * (3 - 2 * t)
-
-        if epoch < self.entmax_warmup_epochs:
-            # Stage 0: α = 1.0 (强制 softmax，稠密梯度流)
-            self.entmax_alpha = 1.0
-        elif epoch < self.entmax_transition_epochs:
-            # Stage 1 (8-15): 温和稀疏区，α 从 1.0 平滑退火到 1.15
-            progress = smoothstep(epoch, self.entmax_warmup_epochs, self.entmax_transition_epochs)
-            self.entmax_alpha = 1.0 + 0.15 * progress  # 1.0 → 1.15
-        elif epoch < self.entmax_schedule_epochs:
-            # Stage 2 (15-25): 稳定区，α 从 1.15 平滑到 1.25
-            progress = smoothstep(epoch, self.entmax_transition_epochs, self.entmax_schedule_epochs)
-            self.entmax_alpha = 1.15 + 0.10 * progress  # 1.15 → 1.25
-        else:
-            # Stage 3 (25+): α = 1.25 (稳定期)
-            self.entmax_alpha = 1.25
-
-        # 温度由 BPE 三阶段调度器在 train_fractal_vit._update_fractal_hyperparams()
-        # 中通过 set_temperature() 管理，此处不再内部退火，避免梯度冲突。
-
-        # K 课程学习：从 K_min 逐渐增大到 K_max
-        # 符合课程学习原则：先学简单（少 token），后学复杂（多 token）
-        if epoch <= self._K_schedule_epochs:
-            # 线性增长：K_min → _K_max_rounded（能囊括 K_max 的最小 level 对应区域数）
-            progress = epoch / self._K_schedule_epochs
-            self._current_K = int(self.K_min + (self._K_max_rounded - self.K_min) * progress)
-        else:
-            # 课程学习阶段结束后，使用 _K_max_rounded
-            self._current_K = self._K_max_rounded
-
-    def _compute_min_level_regions(self, K_target: int, max_level: int) -> int:
-        """计算能囊括 K_target 个 token 的最小 level 对应的候选区域数
-
-        例如: K_target=38, max_level=4
-            - level 0: 4^0 = 1 < 38
-            - level 1: 4^1 = 4 < 38
-            - level 2: 4^2 = 16 < 38
-            - level 3: 4^3 = 64 >= 38 ✓
-            → 返回 64
-        """
-        for level in range(max_level + 1):
-            regions = 1 << (2 * level)  # D4-AUDIT FIX: 4**level → 1<<(2*level)
-            if regions >= K_target:
-                return regions
-        # 如果所有 level 都不满足，返回最大 level 的区域数
-        # D4-AUDIT FIX: 4**max_level → 1 << (2 * max_level)
-        return 1 << (2 * max_level)
 
     def extra_repr(self) -> str:
         return (
             f"HilbertOptimalSplitter("
             f"max_level={self.max_level_limit}, "
             f"hidden_dim={self.hidden_dim}, "
-            f"K={self.K_min}-{self._K_max_rounded}[current={self._current_K}], "
-            f"entmax_alpha={self.entmax_alpha:.2f}, "
-            f"tree_weight={self.tree_constraint_weight})"
+            f"K_fixed={self.K_fixed}, "
+            f"temperature={self.temperature:.2f})"
         )
 
-    def get_auxiliary_losses(
-        self,
-        split_result: SplitResult,
-        target_ratio: float = 0.25,  # I107-OPT: 从 0.1 增到 0.25
-    ) -> Dict[str, Tensor]:
-        """
-        计算 H1SS 辅助损失（用于端到端训练）。
 
-        数学形式:
-            1. 熵损失: L_entropy = -Σ_d π_d × log(π_d + ε)
-               鼓励配额分布多样性
 
-            2. Budget损失: L_budget = MSE(actual_K, target_K)
-               控制选中的 token 数量
 
-            3. 树一致性损失: L_tree = -std(logits)（当 _logits_diversity_enabled=True 时启用）
 
-        Args:
-            split_result: H1SS 返回的 SplitResult
-            target_ratio: 目标 token 比例 (default: 0.1)，仅当未设置 _target_ratio 时使用
 
-        Returns:
-            Dict[str, Tensor]: 辅助损失字典
-        """
-        losses = {}
 
-        # 1. 熵损失 - 促进稀疏选择
-        if split_result.probs is not None:
-            probs = split_result.probs  # [B, N]
-            # 展平计算熵
-            probs_flat = probs.view(-1)
-            # 避免 log(0)
-            entropy = -(probs_flat * torch.log(probs_flat + EPS)).sum() / (probs.numel() + EPS)
-            losses['entropy'] = entropy
 
-            # P1: 路由熵正则化 - 防止路由概率走向极端（0/1）
-            # 熵的最大值是 log(2)≈0.693（二分类情况）
-            # 目标熵 0.5-0.6 对应中等程度的路由随机性
-            # 使用 MSE 趋向目标熵值，防止过度锐化或过度平滑
-            target_entropy = getattr(self, '_target_entropy', 0.55)
-            # 展平后的二值熵: H = -(p*log(p) + (1-p)*log(1-p))
-            p_clamped = probs_flat.clamp(min=EPS, max=1 - EPS)
-            binary_entropy = -(p_clamped * torch.log(p_clamped) + (1 - p_clamped) * torch.log(1 - p_clamped))
-            entropy_reg_loss = F.mse_loss(binary_entropy.mean(), torch.tensor(target_entropy, device=probs.device))
-            losses['entropy_reg'] = entropy_reg_loss
 
-        # 2. Budget损失 - 控制 token 数量
-        # P0 FIX: 动态 K_min + 对数域 Budget Loss
-        # 使用 K_soft (STE) 替代 selected_mask.sum()，让梯度流过 K 值到 density_field
-        if split_result.selected_mask is not None:
-            B, N = split_result.selected_mask.shape
-            # 优先使用 K_soft（梯度可流），否则 fallback 到实际选择数（无梯度）
-            if hasattr(split_result, 'K_soft') and split_result.K_soft is not None:
-                K_soft = split_result.K_soft.squeeze()  # [1] or [B] -> []
-                if K_soft.dim() > 0:
-                    K_soft = K_soft.mean()
-            else:
-                # Fallback: 使用实际选择的 token 数（无梯度）
-                K_soft = split_result.selected_mask.sum(dim=1).float().mean()
-
-            # P0 FIX: 动态 K_min - 根据 _k_min_ratio 计算 K_min
-            # k_min_ratio = 1.0 (Stage 0): K_min = N，保留所有 token
-            # k_min_ratio = 0.5 (Stage 3+): K_min = 0.5 * K_target
-            effective_target_ratio = getattr(self, '_target_ratio', target_ratio)
-            K_target = effective_target_ratio * N
-            k_min = max(1.0, self._k_min_ratio * K_target)
-            K_soft_clamped = K_soft.clamp(min=k_min)
-
-            # P0 FIX: 对数域 Budget Loss
-            # 公式: L_budget = (log(K_soft / K_target))^2
-            # 优势: 尺度不变性，K 接近目标时梯度平滑，防止平凡解 K→0
-            eps = 1e-8
-            log_ratio = torch.log(K_soft_clamped / (K_target + eps))
-            budget_loss = torch.pow(log_ratio, 2)
-
-            losses['budget'] = budget_loss
-
-        # H1SS 公理 A4 (Tree): 树一致性通过局部层级软约束实现
-        # z_parent -= λ × max(z_children)
-        # 全局 logits 方差惩罚已被移除（无数学依据，干扰局部决策）
-
-        return losses
 
 
 # =============================================================================
@@ -1743,99 +888,9 @@ def compute_locality_score(
     return jumps.mean().item()
 
 
-def compute_jump_loss(
-    hilbert_indices: Tensor,
-    selected_mask: Tensor,
-    gamma: float = 1.0,
-) -> Tensor:
-    """
-    计算修正后的 Jump Loss (ReLU 形式)
-
-    数学:
-        L_jump = E[ReLU(Δh - 1)²]
-
-    与错误的 exp(-γΔh) 形式对比:
-        - exp(-γΔh): Δh=1 → 0.37 (惩罚大), Δh→∞ → 0 (无惩罚) ❌
-        - ReLU(Δh-1)²: Δh≤1 → 0 (无惩罚), Δh>1 → 二次增长 (正确惩罚) ✅
-
-    Args:
-        hilbert_indices: [N] Hilbert 索引
-        selected_mask: [N] 或 [B, N] 选中掩码
-        gamma: 缩放因子
-
-    Returns:
-        loss: 标量损失
-    """
-    # 处理批量掩码 [B, N]
-    if selected_mask.dim() == 2:
-        losses = []
-        for i in range(selected_mask.shape[0]):
-            mask_1d = selected_mask[i] > 0.5
-            selected_h = hilbert_indices[mask_1d].float().sort()[0]
-            if len(selected_h) < 2:
-                losses.append(torch.tensor(0.0, device=hilbert_indices.device))
-                continue
-            diffs = selected_h[1:] - selected_h[:-1]
-            jump_loss = F.relu(diffs - 1.0) ** 2
-            losses.append(jump_loss.mean())
-        return sum(losses) / len(losses) if losses else torch.tensor(0.0, device=hilbert_indices.device)
-
-    # 处理 1D 掩码 [N]
-    selected_h = hilbert_indices[selected_mask > 0.5].float()
-    selected_h = selected_h.sort()[0]
-
-    if len(selected_h) < 2:
-        return torch.tensor(0.0, device=hilbert_indices.device)
-
-    # 计算相邻差值
-    diffs = selected_h[1:] - selected_h[:-1]  # [K-1]
-
-    # ReLU(Δh - 1)² 形式
-    jump_loss = F.relu(diffs - 1.0) ** 2
-
-    return jump_loss.mean()
 
 
-def compute_determinism_score(
-    train_selected: Tensor,
-    eval_selected: Tensor,
-) -> float:
-    """
-    计算 A2: Determinism Score (IOU)
 
-    IOU = |S_train ∩ S_eval| / |S_train ∪ S_eval|
-    """
-    train_set = set(train_selected.cpu().tolist())
-    eval_set = set(eval_selected.cpu().tolist())
-
-    intersection = len(train_set & eval_set)
-    union = len(train_set | eval_set)
-
-    if union == 0:
-        return 1.0
-
-    return intersection / union
-
-
-def compute_gradient_coverage(
-    logits: Tensor,
-    loss: Tensor,
-    threshold: float = 1e-4,
-) -> float:
-    """
-    计算 A3: Gradient Coverage
-
-    coverage = |{i : |grad_i| > threshold}| / N
-    """
-    logits.requires_grad = True
-    loss.backward(retain_graph=True)
-
-    grads = logits.grad
-    if grads is None:
-        return 0.0
-
-    coverage = (grads.abs() > threshold).float().mean().item()
-    return coverage
 
 
 def compute_tree_consistency(
