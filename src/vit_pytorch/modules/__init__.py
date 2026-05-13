@@ -7,7 +7,6 @@ from .tokenizer import StreamingFractalTokenizerV3
 from .base_tokenizer import BaseTokenizer, BaseTokenProcessor, TokenSequence, TokenizerOutput
 from .transformer_block import FractalTransformer, FractalTransformerBlock
 from .base_splitter import CoreSplitter, AnnealingSplitter, MetricsSplitter, SplitResult
-from .semantic_losses import SemanticRedundancyLoss
 
 __all__ = [
     "StreamingFractalTokenizer",
@@ -22,5 +21,4 @@ __all__ = [
     "AnnealingSplitter",
     "MetricsSplitter",
     "SplitResult",
-    "SemanticRedundancyLoss",
 ]
