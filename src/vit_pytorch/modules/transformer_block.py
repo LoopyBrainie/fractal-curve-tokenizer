@@ -71,9 +71,9 @@ from torch.utils.checkpoint import checkpoint
 
 logger = logging.getLogger(__name__)
 
-from vit_pytorch.layers.attention.manifold_attention import ManifoldNativeAttention
-from vit_pytorch.layers.ffn.swiglu import AdaptiveFractalFeedForward, FFNType
-from vit_pytorch.core.levels_info import LevelsInfo
+from vit_pytorch.layers.attention.manifold_attention import ManifoldNativeAttention  # noqa: E402
+from vit_pytorch.layers.ffn.swiglu import AdaptiveFractalFeedForward, FFNType  # noqa: E402
+from vit_pytorch.core.levels_info import LevelsInfo  # noqa: E402
 
 
 class DropPath(nn.Module):

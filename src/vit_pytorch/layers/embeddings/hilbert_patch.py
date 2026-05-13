@@ -64,7 +64,6 @@ Variable Depth Token 的 Patch Embedding 必须满足 4 个约束:
 
 from __future__ import annotations
 
-import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -745,7 +744,7 @@ class HilbertNativePatchEmbed(nn.Module):
         # 物理场(D/4): 保持线性平移特征，用于后续 Cartesian RoPE 或作为"粘合"基础
         # 拓扑场(3D/4): 应用 DirectionAwareSubspacedRoPE（绝对相位注入）
         phys_dim = tokens.shape[-1] // 4
-        topo_dim = tokens.shape[-1] - phys_dim  # = tokens.shape[-1] * 3 // 4
+        # topo_dim = tokens.shape[-1] - phys_dim  # = tokens.shape[-1] * 3 // 4 (computed but unused)
 
         tokens_physical, tokens_fractal = tokens[..., :phys_dim], tokens[..., phys_dim:]
         if self.rope_fractal is not None:
@@ -836,7 +835,7 @@ class HilbertNativePatchEmbed(nn.Module):
         # 🚀 Stage 3: 非对称切分 - 1/4 物理场 + 3/4 拓扑场
         # 与 Attention 层的三分支门控对齐，确保子空间定义一致
         phys_dim = tokens.shape[-1] // 4
-        topo_dim = tokens.shape[-1] - phys_dim  # = tokens.shape[-1] * 3 // 4
+        # topo_dim = tokens.shape[-1] - phys_dim  # = tokens.shape[-1] * 3 // 4 (computed but unused)
 
         tokens_physical, tokens_fractal = tokens[..., :phys_dim], tokens[..., phys_dim:]
         if self.rope_fractal is not None:

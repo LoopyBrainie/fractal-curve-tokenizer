@@ -31,7 +31,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -310,10 +310,10 @@ class DirectionAwareSubspacedRoPE(nn.Module):
 
         # 递推计算: d_l = NEXT_DIR_TABLE[d_{l-1}, q_{l-1}]
         # 展开循环 (L_max <= 8, torch.compile 友好)
-        for l in range(1, L):
-            prev_dirs = dirs[:, :, l - 1]  # [B, N]
-            prev_quads = paths[:, :, l - 1]  # [B, N]
-            dirs[:, :, l] = self.next_dir_table[prev_dirs, prev_quads]
+        for level in range(1, L):
+            prev_dirs = dirs[:, :, level - 1]  # [B, N]
+            prev_quads = paths[:, :, level - 1]  # [B, N]
+            dirs[:, :, level] = self.next_dir_table[prev_dirs, prev_quads]
 
         return dirs
 
@@ -443,22 +443,22 @@ class DirectionAwareSubspacedRoPE(nn.Module):
         # 输出: [B, H, N, L, D_s]
         x_rot = torch.zeros_like(x_sub)
 
-        for l in range(L_info):
+        for level in range(L_info):
             # 获取当前层的旋转矩阵: [B, N, D_s/2, 2, 2]
-            rot_l = rotations[:, :, l]  # [B, N, D_s/2, 2, 2]
+            rot_l = rotations[:, :, level]  # [B, N, D_s/2, 2, 2]
 
             # 对每对维度应用旋转
             for k in range(D_s // 2):
                 # x_sub[..., l, 2k:2k+2]: [B, H, N, 2]
                 # rot_l[..., k]: [B, N, 2, 2]
-                x_pair = x_sub[..., l, 2 * k:2 * k + 2]  # [B, H, N, 2]
+                x_pair = x_sub[..., level, 2 * k:2 * k + 2]  # [B, H, N, 2]
 
                 # 转置旋转矩阵以匹配 batch matmul: [B, N, 2, 2] @ [B, H, N, 2]^T
                 # -> [B, H, N, 2]
                 rot_k = rot_l[:, :, k].transpose(-2, -1)  # [B, N, 2, 2]
 
                 # 广播乘法: [B, N, 2, 2] @ [B, H, N, 2]^T -> [B, H, N, 2]
-                x_rot[..., l, 2 * k:2 * k + 2] = torch.einsum(
+                x_rot[..., level, 2 * k:2 * k + 2] = torch.einsum(
                     'bnij,bhnj->bhni', rot_k, x_pair
                 )
 

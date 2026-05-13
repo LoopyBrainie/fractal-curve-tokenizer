@@ -368,7 +368,6 @@ class DiagnosticHook:
             return
 
         has_nan = torch.isnan(tensor).any()
-        has_inf = torch.isinf(tensor).any()
 
         # 检测到 NaN 时标记（不立即 .item()）
         if has_nan and not self._has_nan:

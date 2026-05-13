@@ -215,8 +215,8 @@ K_MAX_HARD_LIMIT: int = 8192
 # 这些函数根据传入的参数动态计算变参数。
 # 设计原则：计算在模型架构内部进行，而非由训练器/评估器计算。
 
-import math
-from typing import Optional, Tuple
+import math  # noqa: E402
+from typing import Optional, Tuple  # noqa: E402
 
 
 def compute_max_level(image_size: int, min_patch_size: int) -> int:

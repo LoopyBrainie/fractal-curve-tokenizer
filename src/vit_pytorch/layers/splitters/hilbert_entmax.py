@@ -112,7 +112,7 @@ def entmax_1_5(
             """在 nan_robust_hook 之前执行，记录原始 NaN 状态"""
             if grad is not None and not torch.isfinite(grad).all():
                 nan_mask = torch.isnan(grad)
-                print(f"!!! [GHOST NAN] Detected in entmax_1_5 gradient before suppression")
+                print("!!! [GHOST NAN] Detected in entmax_1_5 gradient before suppression")
                 print(f"    - NaN Ratio: {nan_mask.float().mean().item():.4%}")
                 print(f"    - grad stats: mean={grad.mean().item():.2e}, min={grad.min().item():.2e}, max={grad.max().item():.2e}")
             return grad

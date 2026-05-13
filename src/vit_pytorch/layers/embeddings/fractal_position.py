@@ -44,17 +44,12 @@ P11-5 修复: 删除了未使用的 level_attention_bias 参数和 get_attention
 """
 from __future__ import annotations
 
-import math
-import warnings
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from vit_pytorch.core.constants import EMBEDDING_INIT_STD, EPS
 from vit_pytorch.core.levels_info import LevelsInfo  # I98-4
-from vit_pytorch.core.depth_utils import compute_normalized_area
 from vit_pytorch.layers.embeddings.fractal_path import OrientationExtractor  # Scheme C
 
 

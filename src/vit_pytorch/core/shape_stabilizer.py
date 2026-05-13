@@ -170,12 +170,6 @@ class ShapeStabilizer:
         """
         K = mask.shape[-1] if mask is not None else lengths.shape[0]
         pad_len = k_bucket - K
-        B = lengths.shape[0]
-
-        # 创建 padding mask：[B, K_bucket] - True 表示 padding 位置
-        padding_mask = (
-            torch.arange(k_bucket, device=lengths.device).unsqueeze(0) >= lengths.unsqueeze(1)
-        )  # [B, K_bucket]
 
         if mask is not None:
             # 扩展原 mask 并拼接 padding mask

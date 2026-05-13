@@ -29,7 +29,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch._dynamo
@@ -38,7 +38,6 @@ import math
 
 from vit_pytorch.core.config import FractalConfig  # I97-5: 合并 config_fractal.py
 from vit_pytorch.core.curve_hilbert import HilbertCurve
-from vit_pytorch.core.constants import EPS
 
 
 # 创建兼容 torch.compile 的缓存装饰器
