@@ -180,29 +180,10 @@ class EpochMetrics:
     # 覆盖率
     active_ratio: float = 0.0
 
-    # 流形统计
-    manifold_bias_max: float = 0.0
-    manifold_bias_min: float = 0.0
-    manifold_bias_mean: float = 0.0
-    manifold_bias_std: float = 0.0
-
-    # Poincaré 距离统计
-    poincare_dist_mean: float = 0.0
-    poincare_dist_std: float = 0.0
-
     # 梯度比值
     backbone_grad_norm: float = 0.0
     splitter_grad_norm: float = 0.0
     backbone_vs_splitter_grad_ratio: float = 0.0
-
-    # Bottleneck 层梯度
-    entmax_grad_norm: float = 0.0
-    manifold_decoder_grad_norm: float = 0.0
-
-    # 损失项
-    budget_penalty: float = 0.0
-    consistency_loss: float = 0.0
-    entropy_loss: float = 0.0
 
     # FLOPs 理论节省
     theoretical_flops_reduction: float = 0.0
@@ -211,9 +192,6 @@ class EpochMetrics:
     mean_abs_logits: float = 0.0
     raw_budget_error: float = 0.0  # D162: 重命名 (原 budget_loss)
     density_regularization: float = 0.0  # I150-3 NEW: 密度正则化损失
-
-    # V3: GradBalancer 状态
-    adaptive_budget_weight: float = 0.0  # GradBalancer 计算的自适应 budget_weight
 
     # Layer-packaged auxiliary outputs (flattened).
     # Keys follow the convention "train/{layer}/{metric}",
@@ -250,11 +228,8 @@ class EpochMetrics:
             result["loss_components"] = self.loss_components
 
         # 强制记录所有损失项（即使为 0）
-        result["raw_budget_error"] = self.raw_budget_error  # D162: 重命名
+        result["raw_budget_error"] = self.raw_budget_error
         result["density_regularization"] = self.density_regularization
-        result["budget_penalty"] = self.budget_penalty
-        result["consistency_loss"] = self.consistency_loss
-        result["entropy_loss"] = self.entropy_loss
 
         # 新增: 实验详细日志指标
         if self.peak_memory_mb > 0:
@@ -270,30 +245,10 @@ class EpochMetrics:
         # 覆盖率
         result["active_ratio"] = self.active_ratio
 
-        # 流形统计（强制输出）
-        result["manifold_bias_stats"] = {
-            "max": self.manifold_bias_max,
-            "min": self.manifold_bias_min,
-            "mean": self.manifold_bias_mean,
-            "std": self.manifold_bias_std,
-        }
-
-        # Poincaré 距离统计（强制输出）
-        result["poincare_dist_stats"] = {
-            "mean": self.poincare_dist_mean,
-            "std": self.poincare_dist_std,
-        }
-
         # 梯度比值（强制输出）
         result["backbone_vs_splitter_grad_ratio"] = self.backbone_vs_splitter_grad_ratio
         result["backbone_grad_norm"] = self.backbone_grad_norm
         result["splitter_grad_norm"] = self.splitter_grad_norm
-
-        # Bottleneck 层梯度（强制输出）
-        result["bottleneck_layer_grad"] = {
-            "entmax": self.entmax_grad_norm,
-            "manifold_decoder": self.manifold_decoder_grad_norm,
-        }
 
         # FLOPs 理论节省
         if self.theoretical_flops_reduction > 0:
@@ -303,10 +258,6 @@ class EpochMetrics:
         # Keys are slash-namespaced so they cannot collide with existing fields.
         if self.auxiliary_flat_metrics:
             result.update(self.auxiliary_flat_metrics)
-
-        # V3: GradBalancer 状态
-        if self.adaptive_budget_weight > 0:
-            result["adaptive_budget_weight"] = self.adaptive_budget_weight
 
         return result
 
@@ -352,20 +303,9 @@ class EpochMetrics:
         metrics.active_ratio = summary.get("active_ratio", 0.0)
         metrics.mean_abs_logits = summary.get("mean_abs_logits", 0.0)
 
-        # 流形统计
-        metrics.manifold_bias_max = summary.get("manifold_bias_max", 0.0)
-        metrics.manifold_bias_mean = summary.get("manifold_bias_mean", 0.0)
-        metrics.manifold_bias_std = summary.get("manifold_bias_std", 0.0)
-
-        # Poincaré 距离
-        metrics.poincare_dist_mean = summary.get("poincare_dist_mean", 0.0)
-        metrics.poincare_dist_std = summary.get("poincare_dist_std", 0.0)
-
         # 梯度统计
         metrics.backbone_grad_norm = summary.get("backbone_grad_norm", 0.0)
         metrics.splitter_grad_norm = summary.get("splitter_grad_norm", 0.0)
-        metrics.entmax_grad_norm = summary.get("entmax_grad_norm", 0.0)
-        metrics.manifold_decoder_grad_norm = summary.get("manifold_decoder_grad_norm", 0.0)
         metrics.backbone_vs_splitter_grad_ratio = summary.get("backbone_vs_splitter_grad_ratio", 0.0)
 
         # 损失项

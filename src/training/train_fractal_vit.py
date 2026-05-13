@@ -40,7 +40,6 @@ from .trainer import (
     train_one_epoch,
     evaluate,
     MixupCutmixLoss,
-    GradBalancer,
 )
 from .scheduler import create_scheduler, WarmupCosineScheduler, FunctionalWarmupCosineScheduler
 from .monitor import (
@@ -205,7 +204,7 @@ def create_model(args, device: torch.device) -> nn.Module:
         'depth_scale_range': (0.5, 2.0),
 
         # FFN type
-        'ffn_type': getattr(args, 'ffn_type', 'swiglu_level'),
+        'ffn_type': getattr(args, 'ffn_type', 'swiglu'),
 
         # Use checkpoint
         'use_checkpoint': use_checkpoint,
@@ -407,151 +406,6 @@ def create_dummy_dataloader(args, split: str = 'train', label_cache: Optional[di
     )
 
 
-class ExplorationInjector:
-    """V3: 连续 N epoch 活跃度冻结时触发温度扰动
-
-    检测 active_ratio 是否在连续 patience 个 epoch 内保持冻结（方差 < threshold）。
-    当验证准确率较低时说明模型陷入局部最优，此时临时提升 τ 打破僵局。
-
-    数学形式:
-       冻结检测: var(active_ratio_history[-patience:]) < freeze_threshold
-       触发条件: frozen AND val_acc < exploration_threshold
-       扰动幅度: τ_boost = tau * tau_boost_factor
-
-    Args:
-        patience: 冻结检测窗口大小 (default: 3)
-        tau_boost_factor: τ 提升倍数 (default: 1.5)
-        freeze_threshold: 冻结判定方差阈值 (default: 0.0001)
-        exploration_threshold: 探索触发验证准确率阈值 (default: 0.05)
-    """
-
-    def __init__(
-        self,
-        patience: int = 3,
-        tau_boost_factor: float = 1.5,
-        freeze_threshold: float = 0.0001,
-        exploration_threshold: float = 0.05,
-    ):
-        self.patience = patience
-        self.tau_boost_factor = tau_boost_factor
-        self.freeze_threshold = freeze_threshold
-        self.exploration_threshold = exploration_threshold
-
-        self.active_ratio_history: List[float] = []
-        self.triggered_count: int = 0
-
-    def update(self, active_ratio: float, val_acc: float, current_tau: float) -> float:
-        """检测冻结状态并返回扰动后的温度
-
-        Args:
-            active_ratio: 当前 epoch 的 active_ratio
-            val_acc: 当前 epoch 的验证准确率 (0-1)
-            current_tau: 当前温度 τ
-
-        Returns:
-            扰动后的温度（如果触发则提升，否则返回原值）
-        """
-        # 确保是 Python float（可能是 CUDA tensor）
-        if hasattr(active_ratio, 'item'):
-            active_ratio = active_ratio.item()
-        self.active_ratio_history.append(active_ratio)
-
-        if len(self.active_ratio_history) > self.patience:
-            self.active_ratio_history.pop(0)
-
-        # 检查冻结条件
-        if len(self.active_ratio_history) == self.patience:
-            variance = np.var(self.active_ratio_history)
-            if variance < self.freeze_threshold and val_acc < self.exploration_threshold:
-                self.triggered_count += 1
-                return current_tau * self.tau_boost_factor
-
-        return current_tau
-
-    def get_status(self) -> Dict[str, Any]:
-        """返回当前状态"""
-        return {
-            "triggered_count": self.triggered_count,
-            "history_len": len(self.active_ratio_history),
-        }
-
-
-class GradAwareExplorationInjector:
-    """V4: 梯度感知的探索注入学
-
-    当检测到 splitter 梯度下降时，自动降低 τ 开启路径搜索。
-    这是对原有 ExplorationInjector 的增强，补充了梯度监控维度。
-
-    数学形式:
-       梯度下降检测: splitter_grad_norm / prev_grad < grad_drop_threshold
-       触发条件: 连续 patience 次下降
-       扰动动作: τ_new = max(1.0, τ - 0.2)
-
-    Args:
-        patience: 连续下降检测窗口大小 (default: 2)
-        grad_drop_threshold: 梯度下降判定阈值 (default: 0.5)
-    """
-
-    def __init__(
-        self,
-        patience: int = 2,
-        grad_drop_threshold: float = 0.5,
-    ):
-        self.patience = patience
-        self.grad_drop_threshold = grad_drop_threshold
-
-        self.prev_splitter_grad: Optional[float] = None
-        self.consecutive_drop_count: int = 0
-
-    def update(
-        self,
-        splitter_grad_norm: float,
-        current_tau: float,
-        active_ratio: float = 0.0,
-        val_acc: float = 0.0,
-    ) -> float:
-        """检测 splitter 梯度下降并返回调整后的温度
-
-        Args:
-            splitter_grad_norm: 当前 splitter 梯度范数
-            current_tau: 当前温度 τ
-            active_ratio: 当前 active_ratio (未使用，为兼容性保留)
-            val_acc: 当前验证准确率 (未使用，为兼容性保留)
-
-        Returns:
-            调整后的温度（如果触发下降检测则降低，否则返回原值）
-        """
-        if self.prev_splitter_grad is None:
-            self.prev_splitter_grad = splitter_grad_norm
-            return current_tau
-
-        grad_ratio = splitter_grad_norm / max(self.prev_splitter_grad, 1e-8)
-
-        if grad_ratio < self.grad_drop_threshold:
-            self.consecutive_drop_count += 1
-        else:
-            self.consecutive_drop_count = 0
-
-        # V4: 如果连续下降，强制降低 τ 开启探索
-        if self.consecutive_drop_count >= self.patience:
-            new_tau = max(1.0, current_tau - 0.2)  # 最低降至 1.0
-            if new_tau < current_tau:
-                print(f"  [GradAwareExplorationInjector] τ forced down: {current_tau:.3f} -> {new_tau:.3f}")
-                self.consecutive_drop_count = 0  # 重置计数
-                self.prev_splitter_grad = splitter_grad_norm
-                return new_tau
-
-        self.prev_splitter_grad = splitter_grad_norm
-        return current_tau
-
-    def get_status(self) -> Dict[str, Any]:
-        """返回当前状态"""
-        return {
-            "consecutive_drop_count": self.consecutive_drop_count,
-            "prev_grad": self.prev_splitter_grad,
-        }
-
-
 def verify_optimizer_coverage(model: nn.Module, optimizer) -> bool:
     """V3: 打印模型参数与优化器的覆盖情况
 
@@ -599,129 +453,24 @@ def verify_optimizer_coverage(model: nn.Module, optimizer) -> bool:
     return all_covered
 
 
-def _update_fractal_hyperparams(
-    model,
-    epoch: int,
-    warmup_epochs: int,
-    config,
-) -> dict:
-    """更新 Fractal ViT 动态超参数（方案B: 非线性退火 + Temperature Annealing）
-
-    P1 修复：整合评审意见的方案B
-    - 核心思想：分形结构收敛具有非线性相变特征，线性权重增加跟不上特征空间坍塌速度
-    - Stage 0 budget_weight 从 0.001 → 0.05（防止无约束路由惯性）
-    - Temperature Annealing：τ=2.0→1.0，高温强迫路由分布平滑
-
-    阶段设计（方案B）：
-        Stage 0 (0-5):   budget_weight=0.05, τ=2.0（高温平滑，防止极端路由）
-        Stage 1 (5-12):  budget_weight 0.05→0.1, τ=2.0→1.5
-        Stage 2 (12-25): budget_weight 0.1→0.2, τ=1.5→1.0
-        Stage 3 (25+):   budget_weight=0.2, τ=1.0
+def _update_tau_only(model, epoch, tau_start=1.0, tau_end=0.1, tau_epochs=20):
+    """τ 线性退火: Phase 4 唯一保留的调度器。
 
     Args:
         model: FractalCurveViT 模型
         epoch: 当前 epoch
-        warmup_epochs: warmup 总 epoch 数（用于 Stage 3 之后）
-        config: 配置对象（需包含 config.training.budget_loss_weight）
+        tau_start: 初始温度 (default: 1.0)
+        tau_end: 最终温度 (default: 0.1)
+        tau_epochs: 退火 epoch 数 (default: 20)
 
     Returns:
-        包含 stage, target_ratio, budget_weight, tau, logits_diversity, k_min_ratio 的字典
+        {'tau': current_tau}
     """
-    budget_loss_weight_target = config.training.budget_loss_weight
-
-    def cosine_progress(t: float) -> float:
-        """S 型曲线进度因子: t=0 → 0.0, t=1 → 1.0（单向递增，避免悬崖）"""
-        return 0.5 * (1 - math.cos(math.pi * t))
-
-    def smoothstep(epoch: int, warmup_end: int, ramp_end: int) -> float:
-        """Smoothstep function for smoother annealing
-
-        t=0 → 0.0, t=1 → 1.0，中间平滑过渡
-        """
-        if epoch < warmup_end:
-            return 0.0
-        elif epoch > ramp_end:
-            return 1.0
-        else:
-            t = (epoch - warmup_end) / (ramp_end - warmup_end)
-            return t * t * (3 - 2 * t)
-
-    # Stage 判断（方案B: 非线性退火 + Temperature Annealing）
-    if epoch < 5:
-        # Stage 0: 高温平滑阶段 - budget_weight 从 0.05 起步（防止无约束路由惯性）
-        stage = 0
-        target_ratio = 1.0  # 全路径激活，鼓励探索
-        budget_weight = 0.05  # P1 修复：从 0.001 → 0.05，起点更高
-        tau = 2.0  # 高温强迫路由分布平滑，防止极端化
-        k_min_ratio = 1.0  # K_min = N，保留所有 token
-        logits_diversity = False
-    elif epoch < 12:
-        # Stage 1: 温和稀疏区 - Temperature 退火
-        stage = 1
-        progress = (epoch - 5) / (12 - 5)  # 0.0 → 1.0
-        budget_weight = 0.05 + 0.05 * progress  # 0.05 → 0.1（而非 0→0.005）
-        tau = 2.0 + (1.5 - 2.0) * progress  # 2.0 → 1.5（而非 2.0→1.0）
-        # P1 FIX: 平滑过渡 target_ratio (epoch 5-8)，而不是突然跳变
-        target_ratio_progress = smoothstep(epoch, 5, 8)  # 0.0 → 1.0 (epoch 5-8)
-        target_ratio = 1.0 - 0.5 * target_ratio_progress  # 1.0 → 0.5 (epoch 5-8)
-        k_min_ratio = 1.0 - 0.25 * progress  # 1.0 → 0.75 (N → 0.75K_target)
-        logits_diversity = False
-    elif epoch < 25:
-        # Stage 2: 加速压缩阶段 - Temperature 继续退火
-        stage = 2
-        progress = (epoch - 12) / (25 - 12)  # 0.0 → 1.0
-        power_progress = cosine_progress(progress) ** 1.5
-        budget_weight = 0.1 + 0.1 * power_progress  # 0.1 → 0.2（而非 0.005→0.05）
-        tau = 1.5 + (1.0 - 1.5) * progress  # 1.5 → 1.0（温度继续下降）
-        target_ratio = 0.5 - 0.4 * power_progress  # 0.5 → 0.1
-        k_min_ratio = 0.75 - 0.25 * power_progress  # 0.75 → 0.5 (0.75K_target → 0.5K_target)
-        logits_diversity = True
-    else:
-        # Stage 3: 结构巩固阶段
-        stage = 3
-        target_ratio = 0.1
-        budget_weight = budget_loss_weight_target  # 使用配置的目标值
-        tau = 1.0
-        k_min_ratio = 0.5  # K_min = 0.5 * K_target
-        logits_diversity = True
-
-    # 更新 model splitter 参数
-    if hasattr(model, 'splitter'):
-        splitter = model.splitter
-        if hasattr(splitter, 'set_temperature'):
-            splitter.set_temperature(tau)
-        if hasattr(splitter, 'set_target_ratio'):
-            splitter.set_target_ratio(target_ratio)
-        if hasattr(splitter, 'set_budget_weight'):
-            splitter.set_budget_weight(budget_weight)
-        if hasattr(splitter, 'set_logits_diversity'):
-            splitter.set_logits_diversity(logits_diversity)
-        if hasattr(splitter, 'set_k_min_ratio'):
-            # P0 FIX: 动态 K_min - 让 splitter 知道当前的 K_min 比例
-            splitter.set_k_min_ratio(k_min_ratio)
-        if hasattr(splitter, 'set_target_entropy'):
-            # P1 FIX: 路由熵目标 - 与 Temperature Annealing 协同退火
-            target_entropy = 0.55 - (0.55 - 0.40) * (tau - 1.0) / (2.0 - 1.0)
-            splitter.set_target_entropy(target_entropy)
-
-    # P1-3 FIX: 同步更新 model.target_ratio，确保 fractal_vit.py 中的 raw_budget_error 计算一致
-    if hasattr(model, 'target_ratio'):
-        model.target_ratio = target_ratio
-
-    # 计算目标熵（与 Temperature Annealing 协同）
-    # Stage 0: τ=2.0 → 高温平滑 → 熵目标 0.55（中等随机性）
-    # Stage 3+: τ=1.0 → 低熵 → 熵目标 0.40（收敛状态）
-    target_entropy = 0.55 - (0.55 - 0.40) * (tau - 1.0) / (2.0 - 1.0)
-
-    return {
-        'stage': stage,
-        'target_ratio': target_ratio,
-        'budget_weight': budget_weight,
-        'tau': tau,
-        'k_min_ratio': k_min_ratio,  # P0 FIX: 传递给日志记录
-        'logits_diversity': logits_diversity,
-        'target_entropy': target_entropy,  # P1 FIX: 路由熵目标
-    }
+    progress = min(1.0, epoch / tau_epochs)
+    tau = tau_start + (tau_end - tau_start) * progress
+    if hasattr(model, 'splitter') and hasattr(model.splitter, 'set_temperature'):
+        model.splitter.set_temperature(tau)
+    return {'tau': tau}
 
 
 def train(
@@ -787,8 +536,6 @@ def train(
     config.training.cutmix_alpha = getattr(args, 'cutmix_alpha', 0.0)
     config.training.label_smoothing = getattr(args, 'label_smoothing', 0.0)
     config.training.gradient_clip_norm = getattr(args, 'gradient_clip', 1.0)
-    # V2: Budget loss weight for gradient balancing
-    config.training.budget_loss_weight = getattr(args, 'budget_loss_weight', 0.20)
     config.numerical.detect_anomaly = getattr(args, 'detect_anomaly', False)
     config.numerical.skip_on_nan_grad = getattr(args, 'skip_on_nan', True)
     config.training.log_interval = getattr(args, 'log_interval', 10)
@@ -843,10 +590,6 @@ def train(
         steps_per_epoch=steps_per_epoch,
     )
 
-    # B1: Splitter/Geometry LR 恢复状态跟踪
-    # 在 epoch 5-10 期间，splitter/geometry LR 从 0.1× 线性恢复到 1.0×
-    _splitter_lr_multiplier = 0.1  # 初始 0.1× (冷启动隔离)
-
     # Resume scheduler state if available
     if state.scheduler_state:
         scheduler.load_state_dict(state.scheduler_state)
@@ -895,25 +638,6 @@ def train(
     # Create logger
     logger = EpochLogger(output_dir=str(output_dir))
 
-    # V3: 初始化 GradBalancer 和 ExplorationInjector
-    grad_balancer = GradBalancer(
-        beta=0.95,
-        eta=0.1,
-        budget_weight_target=config.training.budget_loss_weight,
-        min_weight=0.01,
-    )
-    exploration_injector = ExplorationInjector(
-        patience=3,
-        tau_boost_factor=1.5,
-        freeze_threshold=0.0001,
-        exploration_threshold=0.05,
-    )
-    # V4: 梯度感知的探索注入
-    grad_aware_injector = GradAwareExplorationInjector(
-        patience=2,
-        grad_drop_threshold=0.5,
-    )
-
     # Move model to device
     # D4-AUDIT FIX: 使用 non_blocking=True 配合 DataLoader pin_memory
     model = model.to(device, non_blocking=True)
@@ -923,29 +647,7 @@ def train(
     print("PRE-FLIGHT CHECK (零时刻诊断)")
     print("=" * 60)
 
-    # 1. Identity Test: 随机噪声输入，检查 Poincaré 距离
-    random_input = torch.randn(1, 3, 224, 224).to(device)
-    with torch.no_grad():
-        # 只获取 poincare_dist，不做完整前向（避免额外开销）
-        if hasattr(model, 'forward_features'):
-            features = model.forward_features(random_input)
-        else:
-            features = model(random_input)
-        # 检查 poincare_dist_mean
-        if hasattr(features, 'poincare_dist_mean'):
-            poincare_dist_init = features.poincare_dist_mean
-        elif isinstance(features, dict) and 'poincare_dist_mean' in features:
-            poincare_dist_init = features['poincare_dist_mean']
-        else:
-            poincare_dist_init = None
-
-        if poincare_dist_init is not None:
-            print(f"[Pre-flight] Init Poincaré dist: {poincare_dist_init:.2f}")
-            if poincare_dist_init > 10:
-                print(f"  WARNING: Poincaré 距离过大({poincare_dist_init:.2f} > 10)，需缩小 geometry_field 初始化")
-
-    # 2. Gradient Check: backbone_grad_norm / splitter_grad_norm 初始比值
-    # 简单的单步梯度检查
+    # Gradient Check: backbone_grad_norm / splitter_grad_norm 初始比值
     model.eval()
     try:
         from vit_pytorch.models.fractal_vit import TrainingStats
@@ -961,15 +663,14 @@ def train(
             loss = F.cross_entropy(test_output, test_target)
         loss.backward()
 
-        # 计算梯度范数
         backbone_grad_norm = 0.0
         splitter_grad_norm = 0.0
         for name, param in model.named_parameters():
             if param.grad is not None:
                 grad_norm = param.grad.norm(2).item()
-                if 'splitter' in name and 'geo' not in name:
+                if 'splitter' in name:
                     splitter_grad_norm += grad_norm ** 2
-                elif 'splitter' not in name and 'geo' not in name:
+                else:
                     backbone_grad_norm += grad_norm ** 2
 
         backbone_grad_norm = backbone_grad_norm ** 0.5
@@ -980,7 +681,7 @@ def train(
         print(f"[Pre-flight] Splitter grad norm: {splitter_grad_norm:.4f}")
         print(f"[Pre-flight] Grad ratio (splitter/backbone): {grad_ratio:.4f}")
         if grad_ratio > 1.5:
-            print(f"  WARNING: 梯度比异常({grad_ratio:.2f} > 1.5)，可能需要梯度缩放器")
+            print(f"  WARNING: 梯度比异常({grad_ratio:.2f} > 1.5)")
 
         model.zero_grad()
     except Exception as e:
@@ -1003,41 +704,10 @@ def train(
     for epoch in range(state.epoch, config.training.num_epochs):
         state.epoch = epoch
 
-        # B1: Splitter/Geometry LR 恢复逻辑 (epoch 5-10)
-        # Stage 0 (epoch 0-5): splitter_lr = 0.1× base_lr (冷启动隔离)
-        # Stage 1 (epoch 5-10): splitter_lr 从 0.1× 线性恢复到 1.0×
-        # Stage 2 (epoch 10+): splitter_lr = 1.0× base_lr (正常)
-        if epoch < 5:
-            _splitter_lr_multiplier = 0.1
-        elif epoch < 10:
-            # Smoothstep 恢复: 0.1 → 1.0
-            progress = (epoch - 5) / (10 - 5)  # 0.0 → 1.0
-            smooth = progress * progress * (3 - 2 * progress)  # smoothstep
-            _splitter_lr_multiplier = 0.1 + 0.9 * smooth
-        else:
-            _splitter_lr_multiplier = 1.0
-
-        # 更新 splitter 和 geometry 参数组的学习率
-        for param_group in optimizer.param_groups:
-            if param_group.get('name') == 'splitter' or param_group.get('name') == 'geometry':
-                param_group['lr'] = config.training.base_lr * _splitter_lr_multiplier
-
-        # I-BUGFIX: 调用 splitter.set_epoch() 更新课程学习进度
-        # 修复 K_min 钳制 Bug：_current_K 之前从未被更新，导致 avg_tokens 永远 = K_min = 8
-        if hasattr(model, 'splitter') and hasattr(model.splitter, 'set_epoch'):
-            model.splitter.set_epoch(epoch)
-
-        # BPE-style 三阶段动态探索 Warmup
-        # 更新 splitter 的温度、目标比例、budget 权重等参数
-        warmup_params = _update_fractal_hyperparams(
-            model=model,
-            epoch=epoch,
-            warmup_epochs=config.training.warmup_epochs,
-            config=config,
-        )
+        # Phase 4: τ 线性退火 — 唯一保留的调度器
+        warmup_params = _update_tau_only(model, epoch)
 
         # Train one epoch
-        # I-OOM FIX: 传入外部创建的 monitors，防止每 epoch 重复创建 hooks
         train_metrics = train_one_epoch(
             model=model,
             dataloader=train_loader,
@@ -1050,7 +720,6 @@ def train(
             mixup_cutmix=mixup_cutmix,
             debug_dir=str(output_dir / "debug"),
             warmup_params=warmup_params,
-            grad_balancer=grad_balancer,
             grad_monitor=grad_monitor,
             loss_monitor=loss_monitor,
             defender=defender,
@@ -1077,36 +746,8 @@ def train(
             )
             eval_metrics = eval_result.to_dict()
 
-            # V3: Exploration Injection - 检测活跃度冻结并临时提升 τ
-            val_acc = eval_metrics.get("accuracy", 0.0)
-            active_ratio = train_metrics.to_dict().get("active_ratio", 0.0)
-            boosted_tau = exploration_injector.update(
-                active_ratio=active_ratio,
-                val_acc=val_acc,
-                current_tau=warmup_params["tau"],
-            )
-            if boosted_tau != warmup_params["tau"]:
-                print(f"  [ExplorationInjector] τ boosted: {warmup_params['tau']:.3f} -> {boosted_tau:.3f}")
-                # 下个 epoch 会通过 set_temperature 应用（需要存储状态）
-                # 临时修改 warmup_params 中的 tau 值供下次 _update_fractal_hyperparams 读取
-                warmup_params["tau"] = boosted_tau
-
-            # V4: Grad-Aware Exploration Injection - 基于 splitter 梯度的 τ 调整
-            splitter_grad_norm = train_metrics.to_dict().get("splitter_grad_norm", 0.0)
-            grad_aware_tau = grad_aware_injector.update(
-                splitter_grad_norm=splitter_grad_norm,
-                current_tau=warmup_params["tau"],
-            )
-            if grad_aware_tau != warmup_params["tau"]:
-                print(f"  [GradAwareExplorationInjector] τ adjusted: {warmup_params['tau']:.3f} -> {grad_aware_tau:.3f}")
-                warmup_params["tau"] = grad_aware_tau
-
-        # V4: 构建 extra 日志字典，包含 BPE 内部变量
+        # Phase 4: 简化日志 — 仅记录 τ
         extra_logs = {
-            "bpe/current_stage": warmup_params.get("stage", 0),
-            "bpe/target_ratio": warmup_params.get("target_ratio", 0.25),
-            "bpe/budget_weight": warmup_params.get("budget_weight", 0.0),
-            "splitter/alpha_actual": model.splitter.entmax_alpha if hasattr(model.splitter, 'entmax_alpha') else None,
             "splitter/temperature": warmup_params.get("tau", 1.0),
         }
 
@@ -1115,7 +756,7 @@ def train(
             epoch=epoch + 1,
             train_metrics=train_metrics.to_dict(),
             eval_metrics=eval_metrics,
-            extra=extra_logs,  # V4: BPE 内部变量日志
+            extra=extra_logs,
         )
 
         # Update state
@@ -1353,8 +994,8 @@ def add_args(parser: argparse.ArgumentParser):
     # ==================== Pooling & FFN ====================
     parser.add_argument('--pool', type=str, default='weighted',
                         help='Pooling type: cls, mean, weighted')
-    parser.add_argument('--ffn-type', type=str, default='swiglu_level',
-                        help='FFN type: swiglu, swiglu_level, geglu')
+    parser.add_argument('--ffn-type', type=str, default='swiglu',
+                        help='FFN type: swiglu, geglu')
 
     # ==================== Dropout ====================
     parser.add_argument('--dropout', type=float, default=0.0,
@@ -1441,9 +1082,6 @@ def add_args(parser: argparse.ArgumentParser):
                         help='Minimum learning rate')
     parser.add_argument('--weight-decay', type=float, default=0.1,
                         help='Weight decay')
-    # V2: Budget loss weight for gradient balancing (BPE regularization)
-    parser.add_argument('--budget-loss-weight', type=float, default=0.20,
-                        help='Budget loss weight for BPE regularization (default: 0.20)')
     parser.add_argument('--warmup-epochs', type=int, default=15,
                         help='Number of warmup epochs')
     parser.add_argument('--warmup-start-lr', type=float, default=1e-7,

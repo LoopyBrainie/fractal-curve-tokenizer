@@ -29,174 +29,6 @@ def _get_flatten_layer_outputs():
     return flatten_layer_outputs
 
 
-class GradBalancer:
-    """动态梯度平衡器 - 使用 EMA 平滑避免抖动
-
-    V3 核心组件，解决 "双重退火坍缩" 问题。
-
-    数学形式:
-        G_CE_EMA ← β·G_CE_EMA + (1-β)·||∇CE||
-        G_Budget_EMA ← β·G_Budget_EMA + (1-β)·||∇Budget||
-
-        W_adaptive = η · G_CE_EMA / (G_Budget_EMA + ε)
-        W_final = clamp(W_adaptive, min=min_weight, max=budget_weight_target)
-
-    使用场景:
-        - 监测到 splitter_grad_norm < backbone_grad_norm / 15 时自动提升 W_budget
-        - 防止 Budget Loss 在低梯度阶段过度主导训练
-
-    Args:
-        beta: EMA 平滑系数 (default: 0.95)
-        eta: 目标梯度比例 (default: 0.1, Budget ≈ 10% × CE)
-        budget_weight_target: Budget weight 上限
-        min_weight: Budget weight 下限 (default: 0.01)
-    """
-
-    def __init__(
-        self,
-        beta: float = 0.95,
-        eta: float = 0.25,  # P1 FIX: 提高到 25%，加强 splitter 梯度
-        budget_weight_target: float = 0.2,
-        min_weight: float = 0.01,
-        max_ratio: float = 3.0,
-    ):
-        self.beta = beta
-        self.eta = eta
-        self.budget_weight_target = budget_weight_target
-        self.min_weight = min_weight
-        self.max_ratio = max_ratio  # Budget 梯度相对于 CE 梯度的最大比例
-
-        self.g_ce_ema: Optional[float] = None
-        self.g_budget_ema: Optional[float] = None
-        self.step_count: int = 0
-
-    def compute(self, grad_ce_norm: float, grad_budget_norm: float) -> float:
-        """计算自适应 budget weight
-
-        Args:
-            grad_ce_norm: CE loss 的梯度范数 (backbone_grad_norm)
-            grad_budget_norm: Budget loss 的梯度范数 (splitter_grad_norm)
-
-        Returns:
-            自适应计算的 budget_weight
-        """
-        self.step_count += 1
-
-        # 初始化 EMA (使用第一个有效值)
-        if self.g_ce_ema is None:
-            self.g_ce_ema = grad_ce_norm
-            self.g_budget_ema = grad_budget_norm if grad_budget_norm > 0 else 1e-8
-
-        # EMA 更新
-        self.g_ce_ema = self.beta * self.g_ce_ema + (1 - self.beta) * grad_ce_norm
-        self.g_budget_ema = self.beta * self.g_budget_ema + (1 - self.beta) * max(grad_budget_norm, 1e-8)
-
-        # 计算自适应权重: W = η · G_CE / G_Budget
-        adaptive = self.eta * self.g_ce_ema / self.g_budget_ema
-
-        # Clamp 并返回
-        clamped = max(self.min_weight, min(adaptive, self.budget_weight_target))
-        return clamped
-
-    def get_status(self) -> Dict[str, float]:
-        """返回当前 EMA 状态 (用于调试)"""
-        return {
-            "g_ce_ema": self.g_ce_ema or 0.0,
-            "g_budget_ema": self.g_budget_ema or 0.0,
-            "step_count": self.step_count,
-        }
-
-    def get_adaptive_budget_weight(self) -> float:
-        """获取当前 EMA 计算的自适应 budget_weight (不更新状态)"""
-        if self.g_ce_ema is None or self.g_budget_ema is None:
-            return self.budget_weight_target  # fallback to target
-        adaptive = self.eta * self.g_ce_ema / self.g_budget_ema
-        return max(self.min_weight, min(adaptive, self.budget_weight_target))
-
-    def compute_scale(self, ce_grad_norm: float, budget_grad_norm: float) -> float:
-        """计算 Budget 梯度的缩放因子（二级防御）
-
-        基于梯度范数计算动态缩放比例，防止 Budget 梯度主导。
-
-        数学形式:
-            ratio = budget_grad_norm / (ce_grad_norm + eps)
-            dynamic_max = min(max_ratio, ratio_ema)
-            scale = min(1.0, 1.0 / ratio) when ratio > dynamic_max
-
-        使用场景:
-            - 在 post_backward 中调用，对已存在的梯度进行缩放
-            - 比 autograd.grad() 分离计算更高效（无需 retain_graph）
-
-        Args:
-            ce_grad_norm: CE 梯度的 L2 范数
-            budget_grad_norm: Budget 梯度的 L2 范数
-
-        Returns:
-            缩放因子 (0.0, 1.0]，1.0 表示不需要缩放
-        """
-        eps = 1e-8
-
-        # 更新 EMA（用于动态阈值）
-        if self.g_ce_ema is None:
-            self.g_ce_ema = ce_grad_norm
-            self.g_budget_ema = budget_grad_norm if budget_grad_norm > 0 else eps
-
-        # EMA 平滑更新
-        self.g_ce_ema = self.beta * self.g_ce_ema + (1 - self.beta) * max(ce_grad_norm, eps)
-        self.g_budget_ema = self.beta * self.g_budget_ema + (1 - self.beta) * max(budget_grad_norm, eps)
-
-        # 动态比例：有缓冲的限流
-        # 如果 budget_grad_norm 比 ce_grad_norm 的 max_ratio 倍还大，则缩放
-        ratio = budget_grad_norm / (ce_grad_norm + eps)
-        ratio_ema = self.g_budget_ema / (self.g_ce_ema + eps)
-
-        # 动态上限：使用 EMA 比例，但不超过 max_ratio
-        dynamic_max_ratio = min(self.max_ratio if hasattr(self, 'max_ratio') else 3.0, ratio_ema)
-
-        # 计算允许的最大 budget 梯度
-        allowed_budget_norm = ce_grad_norm * dynamic_max_ratio
-
-        # 缩放因子：确保 budget_grad 不会超过 allowed
-        if budget_grad_norm > allowed_budget_norm:
-            scale = allowed_budget_norm / (budget_grad_norm + eps)
-        else:
-            scale = 1.0
-
-        return max(0.0, min(scale, 1.0))  # 限制在 [0, 1]
-
-    def compute_scale_from_ema(self) -> float:
-        """基于已更新的EMA计算缩放因子（不重复更新EMA）
-
-        在 train_one_epoch 中，grad_balancer.compute() 已更新 EMA，
-        所以此方法直接使用已有的 EMA 值计算缩放因子。
-
-        Returns:
-            缩放因子 (0.0, 1.0]，1.0 表示不需要缩放
-        """
-        eps = 1e-8
-
-        # 如果 EMA 尚未初始化（compute() 从未被调用），返回 1.0
-        if self.g_ce_ema is None or self.g_budget_ema is None:
-            return 1.0
-
-        # 使用已更新的 EMA 计算比例
-        ratio_ema = self.g_budget_ema / (self.g_ce_ema + eps)
-
-        # 动态上限：使用 EMA 比例，但不超过 max_ratio
-        dynamic_max_ratio = min(self.max_ratio, ratio_ema)
-
-        # 计算允许的最大 budget 梯度（使用当前 EMA 值）
-        allowed_budget_norm = self.g_ce_ema * dynamic_max_ratio
-
-        # 缩放因子：确保 budget_grad 不会超过 allowed
-        if self.g_budget_ema > allowed_budget_norm:
-            scale = allowed_budget_norm / (self.g_budget_ema + eps)
-        else:
-            scale = 1.0
-
-        return max(0.0, min(scale, 1.0))  # 限制在 [0, 1]
-
-
 def train_one_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -209,8 +41,7 @@ def train_one_epoch(
     mixup_cutmix: Optional[MixupCutmixLoss] = None,
     debug_dir: Optional[str] = None,
     collector: Optional[Any] = None,  # NEW: Optional MetricsCollector
-    warmup_params: Optional[dict] = None,  # NEW: BPE-style warmup params
-    grad_balancer: Optional[GradBalancer] = None,  # V3: 动态梯度平衡器
+    warmup_params: Optional[dict] = None,  # Phase 4: only {'tau': current_tau}
     # I-OOM FIX: Monitors now passed from outside to prevent O(N^2) hook leak
     grad_monitor: Optional[GradientMonitor] = None,
     loss_monitor: Optional[LossMonitor] = None,
@@ -295,28 +126,10 @@ def train_one_epoch(
     _splitter_logits_count: int = 0  # I-AUDIT: 跟踪有效值数量
     total_active_ratio: Optional[float] = None
     _active_ratio_count: int = 0
-    total_manifold_bias_max: Optional[float] = None
-    total_manifold_bias_min: Optional[float] = None
-    total_manifold_bias_mean: Optional[float] = None
-    total_manifold_bias_std: Optional[float] = None
-    _manifold_bias_count: int = 0
-    total_poincare_dist_mean: Optional[float] = None
-    total_poincare_dist_std: Optional[float] = None
-    _poincare_dist_count: int = 0
     total_backbone_grad_norm: Optional[float] = None
     _backbone_grad_count: int = 0
     total_splitter_grad_norm: Optional[float] = None
     _splitter_grad_count: int = 0
-    total_entmax_grad_norm: Optional[float] = None
-    _entmax_grad_count: int = 0
-    total_manifold_decoder_grad_norm: Optional[float] = None
-    _manifold_decoder_grad_count: int = 0
-    total_budget_penalty: Optional[float] = None
-    _budget_penalty_count: int = 0
-    total_consistency_loss: Optional[float] = None
-    _consistency_loss_count: int = 0
-    total_entropy_loss: Optional[float] = None
-    _entropy_loss_count: int = 0
     total_theoretical_flops_reduction: Optional[float] = None
     _theoretical_flops_count: int = 0
     total_mean_abs_logits: Optional[float] = None  # I150-3 NEW: Splitter Logits 平均绝对值
@@ -325,11 +138,6 @@ def train_one_epoch(
     _raw_budget_error_count: int = 0
     total_density_regularization: Optional[float] = None  # I150-3 NEW: 密度正则化损失
     _density_reg_count: int = 0
-
-    # V3: GradBalancer 梯度跟踪
-    _total_grad_ce_norm: float = 0.0  # CE (backbone) 梯度范数累加
-    _total_grad_budget_norm: float = 0.0  # Budget (splitter) 梯度范数累加
-    _grad_balancer_count: int = 0
 
     # Auxiliary outputs accumulator: maps flat key → list of per-batch values.
     # Populated by flatten_layer_outputs() on each forward pass.
@@ -434,25 +242,6 @@ def train_one_epoch(
                 if outputs.active_ratio is not None:
                     total_active_ratio = (total_active_ratio or 0.0) + outputs.active_ratio.detach()
                     _active_ratio_count += 1
-                if outputs.manifold_bias_max is not None:
-                    total_manifold_bias_max = (total_manifold_bias_max or 0.0) + outputs.manifold_bias_max.detach()
-                    total_manifold_bias_min = (total_manifold_bias_min or 0.0) + (outputs.manifold_bias_min.detach() if outputs.manifold_bias_min is not None else 0.0)
-                    total_manifold_bias_mean = (total_manifold_bias_mean or 0.0) + outputs.manifold_bias_mean.detach()
-                    total_manifold_bias_std = (total_manifold_bias_std or 0.0) + (outputs.manifold_bias_std.detach() if outputs.manifold_bias_std is not None else 0.0)
-                    _manifold_bias_count += 1
-                if outputs.poincare_dist_mean is not None:
-                    total_poincare_dist_mean = (total_poincare_dist_mean or 0.0) + outputs.poincare_dist_mean.detach()
-                    total_poincare_dist_std = (total_poincare_dist_std or 0.0) + (outputs.poincare_dist_std.detach() if outputs.poincare_dist_std is not None else 0.0)
-                    _poincare_dist_count += 1
-                if outputs.budget_penalty is not None:
-                    total_budget_penalty = (total_budget_penalty or 0.0) + abs(outputs.budget_penalty.detach())
-                    _budget_penalty_count += 1
-                if outputs.consistency_loss is not None:
-                    total_consistency_loss = (total_consistency_loss or 0.0) + outputs.consistency_loss.detach()
-                    _consistency_loss_count += 1
-                if outputs.entropy_loss is not None:
-                    total_entropy_loss = (total_entropy_loss or 0.0) + outputs.entropy_loss.detach()
-                    _entropy_loss_count += 1
                 if outputs.theoretical_flops_reduction is not None:
                     total_theoretical_flops_reduction = (total_theoretical_flops_reduction or 0.0) + outputs.theoretical_flops_reduction.detach()
                     _theoretical_flops_count += 1
@@ -482,22 +271,7 @@ def train_one_epoch(
 
             # Compute loss
             if targets is not None:
-                # I-AUDIT: 传递 H1SS 辅助损失给 compute_loss
-                aux_losses = outputs.auxiliary_losses if hasattr(outputs, 'auxiliary_losses') else None
-
-                # P0 FIX: GradBalancer 闭环 - 计算 final_budget_weight = schedule * w_adaptive
-                # 在每步开始时获取 w_adaptive（基于上一步 EMA），在 backward 后更新 EMA
-                budget_weight_override = None
-                if grad_balancer is not None and warmup_params is not None:
-                    w_adaptive = grad_balancer.get_adaptive_budget_weight()
-                    schedule_budget_weight = warmup_params.get('budget_weight', 0.0)
-                    budget_weight_override = schedule_budget_weight * w_adaptive
-
-                loss, loss_components = compute_loss(
-                    logits, targets,
-                    aux_losses=aux_losses,
-                    budget_weight_override=budget_weight_override
-                )
+                loss, loss_components = compute_loss(logits, targets)
             else:
                 # Fallback if no targets
                 loss = torch.tensor(0.0, device=device)
@@ -523,10 +297,6 @@ def train_one_epoch(
                 loss_components_float["raw_budget_error"] = outputs.raw_budget_error.detach().item() if isinstance(outputs.raw_budget_error, torch.Tensor) else outputs.raw_budget_error
             if outputs.density_regularization is not None:
                 loss_components_float["density_regularization"] = outputs.density_regularization.detach().item() if isinstance(outputs.density_regularization, torch.Tensor) else outputs.density_regularization
-            if outputs.consistency_loss is not None:
-                loss_components_float["consistency_loss"] = outputs.consistency_loss.detach().item() if isinstance(outputs.consistency_loss, torch.Tensor) else outputs.consistency_loss
-            if outputs.entropy_loss is not None:
-                loss_components_float["entropy_loss"] = outputs.entropy_loss.detach().item() if isinstance(outputs.entropy_loss, torch.Tensor) else outputs.entropy_loss
             loss_monitor.record(loss_components_float)
 
         # I-OOM FIX: 调用 finalize 将 GPU tensors 转为 Python floats，释放显存
@@ -570,47 +340,24 @@ def train_one_epoch(
             if layer_norms:
                 backbone_grad_sq = 0.0
                 splitter_grad_sq = 0.0
-                entmax_grad_sq = 0.0
-                manifold_decoder_grad_sq = 0.0
                 for param_name, norm in layer_norms.items():
                     if param_name.startswith("splitter."):
                         splitter_grad_sq += norm ** 2
-                    elif "entmax" in param_name.lower() or "bottleneck" in param_name.lower():
-                        # I150-3: 追踪 entmax 和 bottleneck 梯度
-                        entmax_grad_sq += norm ** 2
-                    elif "geo_decoder" in param_name.lower() or "manifold_decoder" in param_name.lower():
-                        # I150-3: 追踪 manifold_decoder 梯度
-                        manifold_decoder_grad_sq += norm ** 2
                     else:
                         backbone_grad_sq += norm ** 2
                 backbone_grad_norm = backbone_grad_sq ** 0.5
                 splitter_grad_norm = splitter_grad_sq ** 0.5
-                entmax_grad_norm = entmax_grad_sq ** 0.5 if entmax_grad_sq > 0 else 0.0
-                manifold_decoder_grad_norm = manifold_decoder_grad_sq ** 0.5 if manifold_decoder_grad_sq > 0 else 0.0
                 # 累加到 epoch 统计
                 if total_backbone_grad_norm is None:
                     total_backbone_grad_norm = backbone_grad_norm
                     total_splitter_grad_norm = splitter_grad_norm
-                    total_entmax_grad_norm = entmax_grad_norm
-                    total_manifold_decoder_grad_norm = manifold_decoder_grad_norm
                     _backbone_grad_count = 1
                     _splitter_grad_count = 1
-                    _entmax_grad_count = 1
-                    _manifold_decoder_grad_count = 1
                 else:
                     total_backbone_grad_norm += backbone_grad_norm
                     total_splitter_grad_norm += splitter_grad_norm
-                    total_entmax_grad_norm += entmax_grad_norm
-                    total_manifold_decoder_grad_norm += manifold_decoder_grad_norm
                     _backbone_grad_count += 1
                     _splitter_grad_count += 1
-                    _entmax_grad_count += 1
-                    _manifold_decoder_grad_count += 1
-
-                # V3: GradBalancer 梯度跟踪
-                # 在每个 step 后更新 EMA 梯度范数
-                if grad_balancer is not None and backbone_grad_norm > 0 and splitter_grad_norm > 0:
-                    grad_balancer.compute(backbone_grad_norm, splitter_grad_norm)
 
             # C1: Spectral Norm 监控 - 每 100 步计算一次 Geometry 模块的谱范数
             # 谱范数 = 权重矩阵的最大奇异值，反映结构健康度
@@ -665,19 +412,6 @@ def train_one_epoch(
         # 否则 loss_scale 永不下降，NaN 会像幽灵一样在计算图中循环
 
         if not should_skip_step:
-            # 正常路径：尝试 optimizer step
-            # P1-1 FIX: Splitter 梯度动态缩放（二级防御）
-            # 理论: 当 splitter_grad_norm >> backbone_grad_norm 时，
-            # AdamW 动量会将大量步长分配给 Splitter，导致 Backbone 被"漂移"
-            # 使用 GradBalancer.compute_scale_from_ema() 动态计算缩放因子
-            # 注意: grad_balancer.compute() 已在 line 572 更新了 EMA，此处直接使用
-            if hasattr(model, 'splitter') and model.splitter is not None:
-                scale = grad_balancer.compute_scale_from_ema() if grad_balancer else 1.0
-                if scale < 1.0:
-                    for param in model.splitter.parameters():
-                        if param.grad is not None:
-                            param.grad.mul_(scale)
-
             # Gradient clipping (P0-Fix: 使用配置值替代硬编码max_norm=1.0)
             if config.training.gradient_clip_norm > 0:
                 # P0 修复: 改用 config.gradient_clip_norm，允许临时放宽到 1000 进行诊断
@@ -832,54 +566,22 @@ def train_one_epoch(
         for param_name, snr in sorted(low_snr_layers, key=lambda x: x[1])[:5]:
             print(f"    - {param_name[:60]}: SNR={snr:.4f}")
 
-    # P4-A FIX: 从 layer_grad_norms（累积的hook数据）计算 manifold_decoder 梯度范数
-    # 问题根源: compute_grad_norms() 返回的 param.grad.norm() 与 hooks 累积的数据不一致
-    # 解决: 直接从 layer_grad_norms 的均值统计计算，确保与 stats 文件中的 layer_grad_norms 一致
-    manifold_decoder_grad_sq = 0.0
-    for param_name, stats in layer_grad_norms.items():
-        if isinstance(stats, dict) and "mean" in stats:
-            mean_norm = stats["mean"]
-        elif isinstance(stats, (int, float)):
-            mean_norm = stats  # 有些可能是直接的值
-        else:
-            continue
-        if "geo_decoder" in param_name.lower() or "manifold_decoder" in param_name.lower():
-            manifold_decoder_grad_sq += mean_norm ** 2
-    avg_manifold_decoder_grad_norm = manifold_decoder_grad_sq ** 0.5 if manifold_decoder_grad_sq > 0 else 0.0
-
     # 新增: 计算平均指标
-    # I-AUDIT: 使用 None 检查，只有在有数据时才计算平均值
     def safe_avg(total, num_batches):
         """安全计算平均值，如果 total 为 None 则返回 None"""
         if total is None or num_batches == 0:
             return None
         return total / num_batches
 
-    # I-AUDIT: 使用各自的计数器计算平均值，避免除以错误分母
     avg_splitter_logits_mean = safe_avg(total_splitter_logits_mean, _splitter_logits_count)
     avg_splitter_logits_std = safe_avg(total_splitter_logits_std, _splitter_logits_count)
     avg_active_ratio = safe_avg(total_active_ratio, _active_ratio_count)
-    avg_manifold_bias_max = safe_avg(total_manifold_bias_max, _manifold_bias_count)
-    avg_manifold_bias_min = safe_avg(total_manifold_bias_min, _manifold_bias_count)
-    avg_manifold_bias_mean = safe_avg(total_manifold_bias_mean, _manifold_bias_count)
-    avg_manifold_bias_std = safe_avg(total_manifold_bias_std, _manifold_bias_count)
-    avg_poincare_dist_mean = safe_avg(total_poincare_dist_mean, _poincare_dist_count)
-    avg_poincare_dist_std = safe_avg(total_poincare_dist_std, _poincare_dist_count)
     avg_backbone_grad_norm = safe_avg(total_backbone_grad_norm, _backbone_grad_count)
     avg_splitter_grad_norm = safe_avg(total_splitter_grad_norm, _splitter_grad_count)
-    avg_entmax_grad_norm = safe_avg(total_entmax_grad_norm, _entmax_grad_count)  # I150-3 NEW
-    # P4-A FIX: 使用 epoch 级别从 layer_grad_norms（hooks 累积数据）计算的 manifold_decoder 梯度范数
-    # 注意: per-step compute_grad_norms() 与 hooks 累积数据不一致，改用 get_layer_statistics() 的数据
-    # avg_manifold_decoder_grad_norm 已在 line 472 从 layer_grad_norms 计算，直接使用
-    # (line 495 被注释，不再用 per-step 的污染数据覆盖正确值)
-    # avg_manifold_decoder_grad_norm = safe_avg(total_manifold_decoder_grad_norm, _manifold_decoder_grad_count)
-    avg_budget_penalty = safe_avg(total_budget_penalty, _budget_penalty_count)
-    avg_consistency_loss = safe_avg(total_consistency_loss, _consistency_loss_count)
-    avg_entropy_loss = safe_avg(total_entropy_loss, _entropy_loss_count)
     avg_theoretical_flops_reduction = safe_avg(total_theoretical_flops_reduction, _theoretical_flops_count)
-    avg_mean_abs_logits = safe_avg(total_mean_abs_logits, _mean_abs_logits_count)  # I150-3 NEW
-    avg_raw_budget_error = safe_avg(total_raw_budget_error, _raw_budget_error_count)  # D162: 重命名
-    avg_density_regularization = safe_avg(total_density_regularization, _density_reg_count)  # I150-3 NEW
+    avg_mean_abs_logits = safe_avg(total_mean_abs_logits, _mean_abs_logits_count)
+    avg_raw_budget_error = safe_avg(total_raw_budget_error, _raw_budget_error_count)
+    avg_density_regularization = safe_avg(total_density_regularization, _density_reg_count)
 
     # Average auxiliary flat metrics across all batches.
     auxiliary_flat_metrics: Dict[str, float] = {
@@ -907,24 +609,13 @@ def train_one_epoch(
         splitter_logits_mean=avg_splitter_logits_mean,
         splitter_logits_std=avg_splitter_logits_std,
         active_ratio=avg_active_ratio,
-        manifold_bias_max=avg_manifold_bias_max,
-        manifold_bias_min=avg_manifold_bias_min,
-        manifold_bias_mean=avg_manifold_bias_mean,
-        manifold_bias_std=avg_manifold_bias_std,
-        poincare_dist_mean=avg_poincare_dist_mean,
-        poincare_dist_std=avg_poincare_dist_std,
         backbone_grad_norm=avg_backbone_grad_norm,
         splitter_grad_norm=avg_splitter_grad_norm,
-        entmax_grad_norm=avg_entmax_grad_norm,  # I150-3 NEW
-        manifold_decoder_grad_norm=avg_manifold_decoder_grad_norm,  # I150-3 NEW
         backbone_vs_splitter_grad_ratio=backbone_vs_splitter_ratio,
-        budget_penalty=avg_budget_penalty,
-        consistency_loss=avg_consistency_loss,
-        entropy_loss=avg_entropy_loss,
         theoretical_flops_reduction=avg_theoretical_flops_reduction,
-        mean_abs_logits=avg_mean_abs_logits,  # I150-3 NEW
-        raw_budget_error=avg_raw_budget_error,  # D162: 重命名
-        density_regularization=avg_density_regularization,  # I150-3 NEW
+        mean_abs_logits=avg_mean_abs_logits,
+        raw_budget_error=avg_raw_budget_error,
+        density_regularization=avg_density_regularization,
         auxiliary_flat_metrics=auxiliary_flat_metrics,
     )
 
@@ -935,27 +626,9 @@ def train_one_epoch(
         # Reset peak memory for next epoch
         torch.cuda.reset_peak_memory_stats()
 
-    # BPE-style warmup params（附加到 metrics 用于日志）
+    # Phase 4: 仅记录 τ
     if warmup_params:
-        metrics.warmup_stage = warmup_params.get('stage', 0)
         metrics.current_tau = warmup_params.get('tau', 1.0)
-        metrics.current_target_ratio = warmup_params.get('target_ratio', 0.25)
-        metrics.current_budget_weight = warmup_params.get('budget_weight', 0.0)
-        # V2: active_ratio 警告检查（Stage 2 结束时仍高于 30% 视为异常）
-        active_ratio = getattr(metrics, 'active_ratio', 0.0)
-        stage = warmup_params.get('stage', 0)
-        if stage == 2 and warmup_params.get('target_ratio', 0.25) < 0.15 and active_ratio > 0.30:
-            print(f"[WARNING] V2: active_ratio={active_ratio:.3f} still above 30% at Stage 2 target_ratio={warmup_params.get('target_ratio', 0):.3f}")
-
-    # V3: GradBalancer 状态
-    if grad_balancer is not None:
-        balancer_status = grad_balancer.get_status()
-        # 计算当前自适应 budget_weight
-        if balancer_status["g_ce_ema"] > 0 and balancer_status["g_budget_ema"] > 0:
-            metrics.adaptive_budget_weight = grad_balancer.compute(
-                balancer_status["g_ce_ema"],
-                balancer_status["g_budget_ema"]
-            )
 
     return metrics
 
@@ -1024,5 +697,5 @@ def train_one_epoch_simple(
 __all__ = [
     "train_one_epoch",
     "train_one_epoch_simple",
-    "GradBalancer",
+
 ]
