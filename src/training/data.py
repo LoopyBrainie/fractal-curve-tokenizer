@@ -160,9 +160,6 @@ class CUB200Dataset(ImageFolder):
         if not self._split_dict:
             return  # Fallback mode, no filtering
 
-        # Get class-to-idx mapping from ImageFolder
-        class_to_idx = self.class_to_idx
-
         # Filter samples
         filtered_samples = []
         for path, class_idx in self.samples:
@@ -466,6 +463,7 @@ def create_dataset(
     split: str = 'train',
     transform: Optional[transforms.Compose] = None,
     root: str = './data',
+    image_size: int = 28,  # MNIST 默认尺寸
 ) -> Dataset:
     """Create a dataset
 
