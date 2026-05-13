@@ -11,12 +11,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sys
 import random
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from datetime import datetime
 
 import numpy as np
@@ -34,24 +33,24 @@ def _setup_path():
         sys.path.insert(0, str(src_dir))
 _setup_path()
 
-from .config import create_config
-from .trainer import (
+from .config import create_config  # noqa: E402
+from .trainer import (  # noqa: E402
     TrainingState,
     train_one_epoch,
     evaluate,
     MixupCutmixLoss,
 )
-from .scheduler import create_scheduler, WarmupCosineScheduler, FunctionalWarmupCosineScheduler
-from .monitor import (
+from .scheduler import create_scheduler  # noqa: E402
+from .monitor import (  # noqa: E402
     GradientMonitor,
     LossMonitor,
     NumericalDefender,
 )
-from .checkpoint import (
+from .checkpoint import (  # noqa: E402
     save_checkpoint,
     load_checkpoint,
 )
-from .training_logs import EpochLogger
+from .training_logs import EpochLogger  # noqa: E402
 
 
 def set_seed(seed: int):

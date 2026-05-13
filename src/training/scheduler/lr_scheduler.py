@@ -7,7 +7,7 @@ Layer 3 (hyperparameters) for learning rate scheduling.
 
 from __future__ import annotations
 
-from typing import Optional, List, Dict, Any, TYPE_CHECKING
+from typing import Optional, List, Dict, Any
 import math
 from dataclasses import dataclass
 

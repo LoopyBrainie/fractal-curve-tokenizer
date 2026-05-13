@@ -197,7 +197,7 @@ def train_one_epoch(
             # 当 OOM 发生时，打印 Batch 形状和 Token 数量，帮助定位异常样本
             try:
                 outputs = model(images)
-            except torch.cuda.OutOfMemoryError as e:
+            except torch.cuda.OutOfMemoryError:
                 # OOM 遥测: 打印致命调试信息
                 print(f"\n[CRITICAL] CUDA OOM at Step {state.global_step}, Batch {batch_idx}")
                 print(f"  images.shape: {images.shape}")

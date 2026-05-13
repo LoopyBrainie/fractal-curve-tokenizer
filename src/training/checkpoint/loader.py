@@ -14,7 +14,7 @@ import torch.nn as nn
 
 
 def load_checkpoint(
-    checkpoint_path: str,
+    checkpoint_path: str | Path,
     device: str = "cpu",
     load_optimizer: bool = True,
     load_scheduler: bool = True,
@@ -73,7 +73,7 @@ def load_checkpoint(
 
 def load_model_weights(
     model: nn.Module,
-    checkpoint_path: str,
+    checkpoint_path: str | Path,
     device: str = "cpu",
     strict: bool = True,
     backward_compat: bool = False,
@@ -123,8 +123,8 @@ def load_model_weights(
                 msg_parts.append(f"Unexpected in checkpoint: {list(unexpected_in_checkpoint)[:5]}")
 
             if backward_compat:
-                print(f"[CHECKPOINT] WARNING: Architecture mismatch detected. "
-                      f"Using backward_compat mode - proceeding with mismatched keys.")
+                print("[CHECKPOINT] WARNING: Architecture mismatch detected. "
+                      "Using backward_compat mode - proceeding with mismatched keys.")
                 print(f"[CHECKPOINT] Issues: {'; '.join(msg_parts)}")
             else:
                 raise RuntimeError(
@@ -149,7 +149,7 @@ def load_model_weights(
     return model, metadata
 
 
-def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
+def find_latest_checkpoint(checkpoint_dir: str | Path) -> Optional[str]:
     """Find the latest checkpoint in directory
 
     Args:
@@ -180,7 +180,7 @@ def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
     return str(checkpoints[-1])
 
 
-def find_best_checkpoint(checkpoint_dir: str) -> Optional[str]:
+def find_best_checkpoint(checkpoint_dir: str | Path) -> Optional[str]:
     """Find the best checkpoint in directory
 
     Args:

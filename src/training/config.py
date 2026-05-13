@@ -195,9 +195,9 @@ class Config:
 
     def save(self, path: str) -> None:
         """Save config to JSON file"""
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w") as f:
             json.dump(self.to_dict(), f, indent=2)
 
     @classmethod

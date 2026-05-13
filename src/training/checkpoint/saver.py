@@ -14,7 +14,7 @@ import json
 
 
 def save_checkpoint(
-    checkpoint_dir: str,
+    checkpoint_dir: str | Path,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     epoch: int,
@@ -109,7 +109,7 @@ def save_checkpoint(
 
 
 def save_epoch_stats(
-    output_dir: str,
+    output_dir: str | Path,
     epoch: int,
     train_metrics: Dict[str, Any],
     eval_metrics: Dict[str, Any],

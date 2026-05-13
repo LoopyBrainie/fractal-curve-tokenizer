@@ -7,7 +7,7 @@ handles Layer 3 (hyperparameters) for evaluation.
 
 from __future__ import annotations
 
-from typing import Optional, Dict, List, Union
+from typing import Optional, Dict, List
 from pathlib import Path
 import torch
 from tqdm import tqdm
