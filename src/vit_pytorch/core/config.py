@@ -521,18 +521,25 @@ class NeighborAwareSplitterConfig:
 
         return K_min, K_max
 
+    def try_validate(self) -> Outcome[None, ConfigError]:
+        """Outcome-returning validator (Phase 1 / AEH)."""
+        if self.min_patch_size <= 0:
+            return Err(ConfigError("min_patch_size", f"必须为正数, got {self.min_patch_size}"))
+        if self.max_level_limit < 2:
+            return Err(ConfigError("max_level_limit", f">= 2 是推荐配置, got {self.max_level_limit}"))
+        if not 0 < self.coverage_base <= 1.0:
+            return Err(ConfigError("coverage_base", f"必须在 (0, 1] 范围内, got {self.coverage_base}"))
+        if not 0 < self.coverage_min < self.coverage_max_hard <= 1.0:
+            return Err(ConfigError("coverage_order", f"coverage_min ({self.coverage_min}) < coverage_max_hard"))
+        if not 0 < self.temperature_min <= self.temperature_init:
+            return Err(ConfigError("temperature_min", f"temperature_min ({self.temperature_min}) 必须 < temperature_init"))
+        return Ok(None)
+
     def validate(self) -> None:
         """验证配置参数的有效性"""
-        if self.min_patch_size <= 0:
-            raise ValueError(f"min_patch_size 必须为正数, got {self.min_patch_size}")
-        if self.max_level_limit < 2:
-            raise ValueError(f"max_level_limit >= 2 是推荐配置, got {self.max_level_limit}")
-        if not 0 < self.coverage_base <= 1.0:
-            raise ValueError(f"coverage_base 必须在 (0, 1] 范围内, got {self.coverage_base}")
-        if not 0 < self.coverage_min < self.coverage_max_hard <= 1.0:
-            raise ValueError(f"coverage_min ({self.coverage_min}) < coverage_max_hard")
-        if not 0 < self.temperature_min <= self.temperature_init:
-            raise ValueError(f"temperature_min ({self.temperature_min}) 必须 < temperature_init")
+        result = self.try_validate()
+        if isinstance(result, Err):
+            raise result.error
 
     def to_dict(self) -> dict:
         """转换为字典"""
@@ -1224,35 +1231,40 @@ class SemanticSplitterConfig:
         """获取有效最大深度（供外部使用）"""
         return self._compute_effective_max_level()
 
-    def validate(self) -> None:
-        """验证配置参数的有效性"""
+    def try_validate(self) -> Outcome[None, ConfigError]:
+        """Outcome-returning validator (Phase 1 / AEH)."""
         if self.feature_dim <= 0:
-            raise ValueError(f"feature_dim 必须为正数, got {self.feature_dim}")
+            return Err(ConfigError("feature_dim", f"必须为正数, got {self.feature_dim}"))
         if self.hidden_dim <= 0:
-            raise ValueError(f"hidden_dim 必须为正数, got {self.hidden_dim}")
+            return Err(ConfigError("hidden_dim", f"必须为正数, got {self.hidden_dim}"))
         if self.min_patch_size <= 0:
-            raise ValueError(f"min_patch_size 必须为正数, got {self.min_patch_size}")
+            return Err(ConfigError("min_patch_size", f"必须为正数, got {self.min_patch_size}"))
 
         L_theory = self._compute_theoretical_max_level()
         if self.max_level_limit is not None:
             if self.max_level_limit < 2:
-                raise ValueError(f"max_level_limit >= 2 是推荐配置, got {self.max_level_limit}")
+                return Err(ConfigError("max_level_limit", f">= 2 是推荐配置, got {self.max_level_limit}"))
             if self.max_level_limit > L_theory:
-                raise ValueError(
+                return Err(ConfigError("max_level_limit",
                     f"max_level_limit ({self.max_level_limit}) 超过理论最大值 ({L_theory}), "
-                    f"将自动截断"
-                )
+                    f"将自动截断"))
 
         if not 0 < self.diversity_weight <= 1:
-            raise ValueError(f"diversity_weight 必须在 (0, 1] 范围内, got {self.diversity_weight}")
+            return Err(ConfigError("diversity_weight", f"必须在 (0, 1] 范围内, got {self.diversity_weight}"))
         if not 0 < self.reconstruction_weight <= 1:
-            raise ValueError("reconstruction_weight 必须在 (0, 1] 范围内")
+            return Err(ConfigError("reconstruction_weight", "必须在 (0, 1] 范围内"))
         if not 0 < self.split_threshold < 1:
-            raise ValueError(f"split_threshold 必须在 (0, 1) 范围内, got {self.split_threshold}")
+            return Err(ConfigError("split_threshold", f"必须在 (0, 1) 范围内, got {self.split_threshold}"))
         if self.gumbel_temp_end >= self.gumbel_temp_start:
-            raise ValueError(
-                f"gumbel_temp_end ({self.gumbel_temp_end}) 必须 < gumbel_temp_start ({self.gumbel_temp_start})"
-            )
+            return Err(ConfigError("gumbel_temp_order",
+                f"gumbel_temp_end ({self.gumbel_temp_end}) 必须 < gumbel_temp_start ({self.gumbel_temp_start})"))
+        return Ok(None)
+
+    def validate(self) -> None:
+        """验证配置参数的有效性"""
+        result = self.try_validate()
+        if isinstance(result, Err):
+            raise result.error
 
     def to_dict(self) -> dict:
         """转换为字典（用于序列化）"""

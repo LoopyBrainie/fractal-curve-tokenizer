@@ -408,3 +408,43 @@ class TestHilbertSplitterConfigTryValidate:
         cfg = HilbertSplitterConfig(min_patch_size=0)
         with pytest.raises(ValueError, match="min_patch_size"):
             cfg.validate()  # OLD API: still raises
+
+
+class TestNeighborAwareSplitterConfigTryValidate:
+    """Phase 1 (AEH): try_validate() returns Outcome[None, ConfigError]."""
+
+    def test_try_validate_ok_for_valid_config(self):
+        cfg = NeighborAwareSplitterConfig()
+        result = cfg.try_validate()
+        assert isinstance(result, Ok)
+
+    def test_try_validate_err_for_invalid_min_patch(self):
+        cfg = NeighborAwareSplitterConfig(min_patch_size=-1)
+        result = cfg.try_validate()
+        assert isinstance(result, Err)
+        assert result.error.kind == "min_patch_size"
+
+    def test_validate_still_raises(self):
+        cfg = NeighborAwareSplitterConfig(min_patch_size=-1)
+        with pytest.raises(ValueError, match="min_patch_size"):
+            cfg.validate()
+
+
+class TestSemanticSplitterConfigTryValidate:
+    """Phase 1 (AEH): try_validate() returns Outcome[None, ConfigError]."""
+
+    def test_try_validate_ok_for_valid_config(self):
+        cfg = SemanticSplitterConfig()
+        result = cfg.try_validate()
+        assert isinstance(result, Ok)
+
+    def test_try_validate_err_for_invalid_split_threshold(self):
+        cfg = SemanticSplitterConfig(split_threshold=1.5)
+        result = cfg.try_validate()
+        assert isinstance(result, Err)
+        assert result.error.kind == "split_threshold"
+
+    def test_validate_still_raises(self):
+        cfg = SemanticSplitterConfig(split_threshold=1.5)
+        with pytest.raises(ValueError, match="split_threshold"):
+            cfg.validate()
