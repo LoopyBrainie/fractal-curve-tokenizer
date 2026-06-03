@@ -8,10 +8,15 @@ from __future__ import annotations
 
 from typing import Optional, Tuple, Dict
 from pathlib import Path
+import logging
 import torch
 from torch.utils.data import Dataset, IterableDataset
 from torchvision import transforms
 from torchvision.datasets import CIFAR10, CIFAR100, ImageFolder
+
+# Phase 1 (AEH): Outcome-typed factory boundary.
+# See src/vit_pytorch/core/outcome.py for the sealed-sum primitive.
+from vit_pytorch.core.outcome import DataError, Err, Ok, Outcome
 
 # Optional HF datasets import
 try:
@@ -21,6 +26,8 @@ except ImportError:
     HF_AVAILABLE = False
     HFDataset = None
     HFIterableDataset = None
+
+logger = logging.getLogger(__name__)
 
 
 class HFDatasetWrapper(Dataset):
@@ -203,11 +210,22 @@ class HFStreamingDatasetWrapper(IterableDataset):
     random access indexing.
     """
 
+    # FIX 49: 工业标准数据集的真实样本常数空间
+    _DATASET_SIZE_REGISTRY: Dict[str, int] = {
+        "cifar10": 50000,
+        "cifar100": 50000,
+        "tiny-imagenet": 100000,
+        "cub200": 5994,
+        "imagenet": 1281167,
+    }
+
     def __init__(
         self,
         hf_dataset: HFIterableDataset,
         image_size: int = 64,
         augment: bool = True,
+        estimated_length: Optional[int] = None,
+        dataset_name: Optional[str] = None,
     ):
         """Initialize streaming HF Dataset wrapper.
 
@@ -215,10 +233,24 @@ class HFStreamingDatasetWrapper(IterableDataset):
             hf_dataset: Hugging Face IterableDataset (streaming)
             image_size: Target image size
             augment: Whether to apply data augmentation
+            estimated_length: 显式指定的样本总数（最高优先级）
+            dataset_name: 数据集名称，用于自动推断样本总数
         """
         self._dataset = hf_dataset
         self.image_size = image_size
         self.augment = augment
+
+        # 决策链：显式指定 > 注册表推断 > 泛型缺省值
+        if estimated_length is not None:
+            self._estimated_length = estimated_length
+        elif dataset_name and dataset_name.lower() in self._DATASET_SIZE_REGISTRY:
+            self._estimated_length = self._DATASET_SIZE_REGISTRY[dataset_name.lower()]
+        else:
+            self._estimated_length = 50000
+            logger.warning(
+                f"[DATA CONFIG] 未能获取流式数据集的准确长度，激活兜底值: {self._estimated_length}。"
+                f"请检查这是否会引发 Cosine Annealing 学习率相位失真。"
+            )
 
         # Build transform pipeline
         if augment:
@@ -255,15 +287,8 @@ class HFStreamingDatasetWrapper(IterableDataset):
             yield self._apply_transform(item)
 
     def __len__(self) -> int:
-        """Return estimated length for DataLoader compatibility.
-
-        Streaming datasets don't have a finite length, so we return a large
-        estimated value. The DataLoader will iterate until StopIteration is
-        raised by the underlying iterator.
-        """
-        # Return estimated size based on typical CIFAR-10/TinyImageNet sizes
-        # This is used by DataLoader to calculate num_batches
-        return 50000  # Approximate, will stop when iterator exhausted
+        """为 PyTorch DataLoader 和 LR Scheduler 提供高精度的步数对齐基准。"""
+        return self._estimated_length
 
 
 def get_transforms(
@@ -449,6 +474,7 @@ def create_hf_dataset(
             hf_dataset=hf_dataset,
             image_size=image_size,
             augment=augment,
+            dataset_name=name,
         )
     else:
         return HFDatasetWrapper(
@@ -539,9 +565,99 @@ def create_dataset(
         raise ValueError(f"Unknown dataset: {name}. Supported: cifar10, cifar100, tiny-imagenet, cub200, mnist")
 
 
+def try_create_dataset(
+    name: str,
+    split: str = 'train',
+    transform: Optional[transforms.Compose] = None,
+    root: str = './data',
+    image_size: int = 28,
+) -> Outcome[Dataset, DataError]:
+    """Outcome-returning wrapper for create_dataset (Q5: minimal scope).
+
+    Catches the single "Unknown dataset" raise site at line 561. Other
+    exceptions (FileNotFoundError for missing data, ImageFolder errors,
+    torchvision download errors) propagate uncaught — they are
+    programmer/setup errors, not user-input errors.
+
+    Args:
+        name: Dataset name (cifar10, cifar100, tiny-imagenet, cub200, mnist).
+        split: 'train' or 'val'.
+        transform: Optional torchvision transforms.
+        root: Root directory for local datasets.
+        image_size: Target image size (used for MNIST only by default).
+
+    Returns:
+        Ok(Dataset) on success; Err(DataError(kind='unknown_dataset'))
+        if the name is not in the supported list.
+    """
+    try:
+        dataset = create_dataset(
+            name=name,
+            split=split,
+            transform=transform,
+            root=root,
+            image_size=image_size,
+        )
+        return Ok(dataset)
+    except ValueError as e:
+        if "Unknown dataset" in str(e):
+            return Err(DataError("unknown_dataset", str(e)))
+        raise  # programmer error; propagate uncaught
+
+
+def try_create_hf_dataset(
+    name: str,
+    split: str = 'train',
+    image_size: int = 64,
+    augment: bool = True,
+    shuffle: bool = True,
+    buffer_size: int = 1000,
+    seed: int = 42,
+    **kwargs,
+) -> Outcome[Dataset, DataError]:
+    """Outcome-returning wrapper for create_hf_dataset (Q5: minimal scope).
+
+    Catches the ImportError at line 426 (HF library not installed) and
+    the re-raised ValueError at line 458 (no matching split). Other
+    exceptions (network errors, auth failures) propagate uncaught.
+
+    Args:
+        name: HuggingFace dataset path (e.g., 'zh-plus/tiny-imagenet').
+        split: 'train' or 'val'.
+        image_size: Target image size for resizing.
+        augment: Whether to apply data augmentation.
+        shuffle: Whether to apply shuffle buffer.
+        buffer_size: Shuffle buffer size.
+        seed: Random seed for reproducibility.
+        **kwargs: Forwarded to load_dataset.
+
+    Returns:
+        Ok(Dataset) on success; Err(DataError) with kind 'hf_not_installed'
+        or 'load_failure' on the two known user-input errors.
+    """
+    try:
+        dataset = create_hf_dataset(
+            name=name,
+            split=split,
+            image_size=image_size,
+            augment=augment,
+            shuffle=shuffle,
+            buffer_size=buffer_size,
+            seed=seed,
+            **kwargs,
+        )
+        return Ok(dataset)
+    except ImportError as e:
+        return Err(DataError("hf_not_installed", str(e)))
+    except ValueError as e:
+        return Err(DataError("load_failure", str(e)))
+
+
 __all__ = [
     'create_dataset',
     'create_hf_dataset',
+    'try_create_dataset',
+    'try_create_hf_dataset',
     'get_transforms',
     'get_dataset_info',
     'get_hf_path',

@@ -129,3 +129,29 @@ class ConfigError(ValueError):
         self.kind = kind
         self.reason = reason
         super().__init__(f"{kind}: {reason}")
+
+
+DataErrorKind = Literal[
+    "unknown_dataset",
+    "hf_not_installed",
+    "load_failure",
+]
+
+
+class DataError(Exception):
+    """Typed error for dataset loading failures (Q5: minimal scope).
+
+    Deliberately does NOT subclass ValueError or RuntimeError — data-loading
+    failures are a distinct failure class from config validation.
+    Callers pattern-match on `error.kind` via the Outcome.
+
+    Like ConfigError, deliberately does NOT declare __slots__ — see
+    ConfigError docstring for the rationale (BaseException already
+    provides __dict__; __slots__ on Exception subclasses can break
+    pickle/deepcopy/multi-inheritance).
+    """
+
+    def __init__(self, kind: DataErrorKind, reason: str) -> None:
+        self.kind = kind
+        self.reason = reason
+        super().__init__(f"{kind}: {reason}")
