@@ -28,6 +28,9 @@ def _setup_path():
 _setup_path()
 
 from .config import Config, create_config  # noqa: E402
+from vit_pytorch.core.config import try_construct_fractal_config  # noqa: E402  (Phase 1 AEH)
+from vit_pytorch.core.outcome import Err, Ok  # noqa: E402  (Phase 1 AEH)
+from .data import try_create_dataset  # noqa: E402  (Phase 1 AEH)
 from .trainer import (  # noqa: E402
     TrainingState,
     train_one_epoch,
@@ -366,6 +369,10 @@ def main():
     parser.add_argument("--num-train-samples", type=int, default=10000)
     parser.add_argument("--num-val-samples", type=int, default=1000)
     parser.add_argument("--image-size", type=int, default=64)
+    # L1 (AEH Phase 1): min-patch-size feeds try_construct_fractal_config.
+    parser.add_argument("--min-patch-size", type=int, default=4)
+    # L1 (AEH Phase 1): dataset name feeds try_create_dataset.
+    parser.add_argument("--dataset", type=str, default="cifar10")
 
     # System
     parser.add_argument("--device", type=str, default="cuda")
@@ -383,6 +390,22 @@ def main():
     set_seed(args.seed)
     configure_cuda()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Phase 1 (AEH): L1 fractal-config boundary — pattern-match Outcome
+    # with `from err` chain preservation. The L3 training-config call
+    # below is orthogonal (returns Config directly) and stays as-is.
+    # ─────────────────────────────────────────────────────────────────────
+    match try_construct_fractal_config(
+        image_size=args.image_size,
+        min_patch_size=args.min_patch_size,
+    ):
+        case Ok(model_config):
+            pass  # L1 fractal config valid; proceed.
+        case Err(err):
+            raise RuntimeError(
+                "❌ Critical error: Model configuration initialization aborted."
+            ) from err
 
     # Create config
     config = create_config(
@@ -424,8 +447,24 @@ def main():
             num_classes=args.num_classes,
         )
     else:
-        # In real usage, load actual datasets here
-        raise NotImplementedError("Please use --quick-test for now")
+        # ─────────────────────────────────────────────────────────────────
+        # Phase 1 (AEH): L1 dataset-loading boundary — pattern-match Outcome.
+        # Catches: "unknown_dataset", "hf_not_installed", "load_failure".
+        # Uses model_config.image_size (the L1-derived value) so the L1
+        # config and L1 dataset boundaries are end-to-end consistent.
+        # ─────────────────────────────────────────────────────────────────
+        match try_create_dataset(
+            name=args.dataset,
+            split='train',
+            image_size=model_config.image_size,
+        ):
+            case Ok(dataset):
+                train_dataset = dataset
+            case Err(err):
+                raise SystemExit(
+                    f"❌ Execution terminated: Dataset pipeline failed to mount.\n"
+                    f"Details: {err}"
+                ) from err
 
     # Train
     train(
