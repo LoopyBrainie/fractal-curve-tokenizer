@@ -448,3 +448,34 @@ class TestSemanticSplitterConfigTryValidate:
         cfg = SemanticSplitterConfig(split_threshold=1.5)
         with pytest.raises(ValueError, match="split_threshold"):
             cfg.validate()
+
+
+class TestFractalConfigFactory:
+    """Phase 1 (AEH): try_construct_fractal_config() returns Outcome[FractalConfig, ConfigError]."""
+
+    def test_factory_ok_for_valid_args(self):
+        from vit_pytorch.core.config import try_construct_fractal_config
+        result = try_construct_fractal_config(image_size=224, min_patch_size=16)
+        assert isinstance(result, Ok)
+        assert result.value.image_size == 224
+        assert result.value.min_patch_size == 16
+
+    def test_factory_err_for_non_positive_image_size(self):
+        from vit_pytorch.core.config import try_construct_fractal_config
+        result = try_construct_fractal_config(image_size=0, min_patch_size=16)
+        assert isinstance(result, Err)
+        assert result.error.kind == "image_size"
+        assert "必须为正数" in str(result.error)
+
+    def test_factory_err_for_non_divisible(self):
+        from vit_pytorch.core.config import try_construct_fractal_config
+        result = try_construct_fractal_config(image_size=100, min_patch_size=16)
+        assert isinstance(result, Err)
+        assert result.error.kind == "divisibility"
+        assert "必须能被" in str(result.error)
+
+    def test_direct_construction_still_raises(self):
+        """Back-compat: FractalConfig(...) still raises (re-raise with from)."""
+        from vit_pytorch.core.config import FractalConfig
+        with pytest.raises(ValueError, match="必须为正数"):
+            FractalConfig(image_size=0, min_patch_size=16)

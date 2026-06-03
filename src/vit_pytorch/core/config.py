@@ -28,7 +28,13 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional, Tuple
 import math
 
-from vit_pytorch.core.outcome import ConfigError, Err, Ok, Outcome  # noqa: F401  (Phase 1 AEH)
+from vit_pytorch.core.outcome import (  # noqa: F401  (Phase 1 AEH)
+    ConfigError,
+    ConfigErrorKind,
+    Err,
+    Ok,
+    Outcome,
+)
 
 # 导入 I33 相对预算常量
 from .constants import (
@@ -1547,10 +1553,56 @@ class FractalConfig:
         )
 
 
-def create_fractal_config(
+def create_fractal_config(  # type: ignore[no-redef]
     image_size: int,
     min_patch_size: int = 4,
     **kwargs,
 ) -> FractalConfig:
-    """便捷函数：创建 FractalConfig."""
-    return FractalConfig(image_size, min_patch_size, **kwargs)
+    """便捷函数：创建 FractalConfig (back-compat: raises ValueError on failure)."""
+    result = try_construct_fractal_config(
+        image_size=image_size,
+        min_patch_size=min_patch_size,
+        **kwargs,
+    )
+    if isinstance(result, Err):
+        raise result.error
+    return result.value
+
+
+def try_construct_fractal_config(
+    image_size: int,
+    min_patch_size: int = 4,
+    **kwargs,
+) -> Outcome[FractalConfig, ConfigError]:
+    """Factory for FractalConfig that returns Outcome instead of raising.
+
+    Python's __post_init__ cannot return a value, so the 3 ValueError
+    sites in FractalConfig.__post_init__ are structurally incapable of
+    becoming Outcome returns. This factory calls the constructor inside
+    a try/except, classifies the ValueError by message keywords, and
+    returns Outcome. Programmer errors (non-ValueError) propagate.
+
+    Args:
+        image_size: Target image size (positive, divisible by min_patch_size).
+        min_patch_size: Smallest patch size (positive, must divide image_size).
+        **kwargs: Forwarded to FractalConfig.__init__.
+
+    Returns:
+        Ok(FractalConfig) on success, Err(ConfigError) on validation failure.
+    """
+    try:
+        config = FractalConfig(image_size, min_patch_size, **kwargs)
+        return Ok(config)
+    except ConfigError as e:
+        return Err(e)
+    except ValueError as e:
+        msg = str(e)
+        if "必须能被" in msg:
+            kind: ConfigErrorKind = "divisibility"
+        elif "必须为正数" in msg:
+            kind = "image_size"
+        elif "grid_size" in msg:
+            kind = "grid_size"
+        else:
+            kind = "image_size"  # fallback; tests pin exact messages
+        return Err(ConfigError(kind, msg))
