@@ -2,7 +2,7 @@
 from __future__ import annotations
 import pytest
 import torch
-from vit_pytorch.core.outcome import Outcome, Ok, Err
+from vit_pytorch.core.outcome import Outcome, Ok, Err, ConfigError
 
 
 class TestOk:
@@ -57,3 +57,22 @@ class TestTypeAlias:
                 case Err(_): return -1
         assert consumer(Ok(42)) == 42
         assert consumer(Err("x")) == -1
+
+
+class TestConfigError:
+    def test_config_error_is_value_error(self):
+        """Q3: ConfigError must subclass ValueError so all 14 existing
+        pytest.raises(ValueError) sites work unchanged."""
+        err = ConfigError(kind="min_patch_size", reason="must be positive")
+        assert isinstance(err, ValueError)
+
+    def test_config_error_carries_kind_and_reason(self):
+        err = ConfigError(kind="coverage_base", reason="must be in (0, 1]")
+        assert err.kind == "coverage_base"
+        assert err.reason == "must be in (0, 1]"
+
+    def test_config_error_str_includes_field_name(self):
+        """Q3: Chinese/English field names must survive in the message
+        so existing test_config.py match= patterns continue to match."""
+        err = ConfigError(kind="min_patch_size", reason="must be positive")
+        assert "min_patch_size" in str(err)

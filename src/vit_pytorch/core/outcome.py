@@ -86,3 +86,46 @@ class Err(Generic[E]):
 
 # PEP 695 type alias (Python ≥ 3.12)
 type Outcome[T, E] = Ok[T] | Err[E]
+
+
+ConfigErrorKind = Literal[
+    "min_patch_size",
+    "max_level_limit",
+    "coverage_base",
+    "coverage_order",
+    "temperature_min",
+    "temperature_init",
+    "temperature_anneal",
+    "entropy_mode",
+    "feature_dim",
+    "hidden_dim",
+    "diversity_weight",
+    "reconstruction_weight",
+    "split_threshold",
+    "gumbel_temp_order",
+    "image_size",
+    "divisibility",
+    "grid_size",
+]
+
+
+class ConfigError(ValueError):
+    """Typed error for config validation failures (Q3: hybrid).
+
+    Subclasses ValueError so all 14 in-scope pytest.raises(ValueError)
+    sites continue to work. The `kind` Literal enables type-level
+    discrimination for new code; `reason` is the human message.
+
+    Note: deliberately does NOT declare __slots__. The Python built-in
+    BaseException / Exception hierarchy already provides __dict__ in
+    the C-level instance layout, so a __slots__ subclass cannot
+    actually save memory; meanwhile, __slots__ on Exception subclasses
+    can cause conflicts with pickle, copy.deepcopy, and certain
+    multiple-inheritance patterns. We rely on plain attribute
+    assignment (kind, reason) for portability.
+    """
+
+    def __init__(self, kind: ConfigErrorKind, reason: str) -> None:
+        self.kind = kind
+        self.reason = reason
+        super().__init__(f"{kind}: {reason}")
