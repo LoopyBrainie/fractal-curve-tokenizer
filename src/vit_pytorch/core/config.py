@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional, Tuple
 import math
 
+from vit_pytorch.core.outcome import ConfigError, Err, Ok, Outcome  # noqa: F401  (Phase 1 AEH)
+
 # 导入 I33 相对预算常量
 from .constants import (
     K_COVERAGE_BASE,
@@ -271,52 +273,46 @@ class HilbertSplitterConfig:
 
         return K_min, K_max
 
+    def try_validate(self) -> Outcome[None, ConfigError]:
+        """Outcome-returning validator (Phase 1 / AEH).
+
+        Returns Ok(None) on success, Err(ConfigError) on failure.
+        The legacy validate() method (which raises) is preserved for
+        back-compat with the in-scope pytest.raises(ValueError) sites.
+        """
+        if self.min_patch_size <= 0:
+            return Err(ConfigError("min_patch_size", f"必须为正数, got {self.min_patch_size}"))
+        if self.max_level_limit < 2:
+            return Err(ConfigError("max_level_limit", f">= 2 是推荐配置, got {self.max_level_limit}"))
+        if not 0 < self.coverage_base <= 1.0:
+            return Err(ConfigError("coverage_base", f"必须在 (0, 1] 范围内, got {self.coverage_base}"))
+        if not 0 < self.coverage_min < self.coverage_max_hard <= 1.0:
+            return Err(ConfigError("coverage_order",
+                f"coverage_min ({self.coverage_min}) < coverage_max_hard ({self.coverage_max_hard}) "
+                f"且都在 (0, 1] 范围内"))
+        if not 0 < self.temperature_min <= self.temperature_init:
+            return Err(ConfigError("temperature_min",
+                f"temperature_min ({self.temperature_min}) 必须 < "
+                f"temperature_init ({self.temperature_init})"))
+        if self.temperature_min < 0.3:
+            return Err(ConfigError("temperature_init",
+                f"temperature_min ({self.temperature_min}) 必须 >= 0.3 "
+                "以避免梯度消失问题"))
+        if self.temperature_anneal not in ('linear', 'exponential', 'inverse_time'):
+            return Err(ConfigError("temperature_anneal",
+                f"temperature_anneal 必须是 'linear', 'exponential' 或 'inverse_time', "
+                f"got {self.temperature_anneal}"))
+        if self.entropy_mode not in ('adaptive', 'target', 'disabled'):
+            return Err(ConfigError("entropy_mode",
+                f"entropy_mode 必须是 'adaptive', 'target', 或 'disabled', "
+                f"got {self.entropy_mode}"))
+        return Ok(None)
+
     def validate(self) -> None:
         """验证配置参数的有效性 (I111-4: 数学一致性验证)"""
-
-        # Hilbert 曲线参数验证
-        if self.min_patch_size <= 0:
-            raise ValueError(f"min_patch_size 必须为正数, got {self.min_patch_size}")
-        if self.max_level_limit < 2:
-            raise ValueError(
-                f"max_level_limit >= 2 是推荐配置, got {self.max_level_limit}"
-            )
-
-        # 覆盖率参数验证
-        if not 0 < self.coverage_base <= 1.0:
-            raise ValueError(f"coverage_base 必须在 (0, 1] 范围内, got {self.coverage_base}")
-        if not 0 < self.coverage_min < self.coverage_max_hard <= 1.0:
-            raise ValueError(
-                f"coverage_min ({self.coverage_min}) < coverage_max_hard ({self.coverage_max_hard}) "
-                f"且都在 (0, 1] 范围内"
-            )
-
-        # K 边界验证 (I111-4: 覆盖率参数和 K 边界独立设置，不做交叉验证)
-        # 用户可以自由配置覆盖率参数和 K 边界，它们在实际使用时通过 compute_k_bounds() 协调
-
-        # 温度参数验证
-        if not 0 < self.temperature_min <= self.temperature_init:
-            raise ValueError(
-                f"temperature_min ({self.temperature_min}) 必须 < "
-                f"temperature_init ({self.temperature_init})"
-            )
-        if self.temperature_min < 0.3:
-            raise ValueError(
-                f"temperature_min ({self.temperature_min}) 必须 >= 0.3 "
-                "以避免梯度消失问题"
-            )
-        if self.temperature_anneal not in ('linear', 'exponential', 'inverse_time'):
-            raise ValueError(
-                f"temperature_anneal 必须是 'linear', 'exponential' 或 'inverse_time', "
-                f"got {self.temperature_anneal}"
-            )
-
-        # 熵模式验证
-        if self.entropy_mode not in ('adaptive', 'target', 'disabled'):
-            raise ValueError(
-                f"entropy_mode 必须是 'adaptive', 'target', 或 'disabled', "
-                f"got {self.entropy_mode}"
-            )
+        result = self.try_validate()
+        if isinstance(result, Err):
+            raise result.error
 
     def to_dict(self) -> dict:
         """转换为字典 (用于序列化)"""
