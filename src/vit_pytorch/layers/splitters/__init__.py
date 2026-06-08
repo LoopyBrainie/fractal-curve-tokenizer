@@ -17,6 +17,11 @@ from .hilbert_optimal_splitter import (
     HilbertOptimalSplitterConfig,
 )
 
+from .multi_block_hmft_splitter import (
+    MultiBlockHMFTSplitter,
+    MultiBlockHMFTSplitterConfig,
+)
+
 from .hilbert_entmax import (
     HilbertOrderedEntmaxSplitter,
     HilbertLocalComplexity,
@@ -36,6 +41,9 @@ __all__ = [
     # H1SS
     "HilbertOptimalSplitter",
     "HilbertOptimalSplitterConfig",
+    # Multi-Block HMFT (v1.3 §9.1, B.3)
+    "MultiBlockHMFTSplitter",
+    "MultiBlockHMFTSplitterConfig",
     # H-Entmax
     "HilbertOrderedEntmaxSplitter",
     "HilbertLocalComplexity",
