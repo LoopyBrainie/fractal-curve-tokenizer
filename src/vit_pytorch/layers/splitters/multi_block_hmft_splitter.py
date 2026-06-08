@@ -63,8 +63,11 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
         if config is None:
             config = MultiBlockHMFTSplitterConfig(**kwargs)
         self._config = config
-        # Learnable 5-bin block size logits (initialized uniform)
-        self.h_logits = nn.Parameter(torch.zeros(len(config.block_sizes)))
+        # Learnable 5-bin block size logits (small random init to avoid
+        # the entropy-maximum stationary point of uniform distribution)
+        self.h_logits = nn.Parameter(
+            torch.randn(len(config.block_sizes)) * 0.1
+        )
         # Current state
         self._current_epoch: int = 0
         self._current_image_size: Optional[Tuple[int, int]] = None
@@ -149,14 +152,44 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
     def get_coverage_stats(self) -> Dict[str, float]:
         return {"num_candidates": float(self.num_candidates)}
 
-    def _sample_block_size(self, hard: bool) -> int:
-        """Sample a block size from the 5-bin learnable distribution."""
-        probs = torch.softmax(self.h_logits, dim=-1)
-        if hard:
-            idx = int(probs.argmax().item())
+    def _sample_block_size(
+        self,
+        hard: bool,
+        max_h: Optional[int] = None,
+        min_n_cells: int = 1,
+    ) -> int:
+        """Sample a block size from the 5-bin learnable distribution.
+
+        Constraints:
+        - h <= max_h (image size)
+        - n_cells = (H/h) * (W/h) >= min_n_cells
+          → h <= sqrt(H*W / min_n_cells)
+        """
+        if max_h is not None:
+            # Add a soft constraint: ensure h is small enough to give >= min_n_cells
+            # n_cells = (H/h) * (W/h); for square H=W=G, h <= G / sqrt(min_n_cells)
+            min_factor = max(1, int(min_n_cells ** 0.5 + 0.5))
+            effective_max_h = max_h // min_factor
+            valid_sizes = [
+                s for s in self._config.block_sizes
+                if s <= max_h and s <= effective_max_h * 1
+            ]
+            if not valid_sizes:
+                # Fallback: pick largest valid h that's still <= max_h
+                valid_sizes = [s for s in self._config.block_sizes if s <= max_h]
+            if not valid_sizes:
+                return self._config.block_sizes[0]
         else:
-            idx = int(torch.multinomial(probs, 1).item())
-        return self._config.block_sizes[idx]
+            valid_sizes = list(self._config.block_sizes)
+        valid_indices = [
+            self._config.block_sizes.index(s) for s in valid_sizes
+        ]
+        h_probs = torch.softmax(self.h_logits, dim=-1)[valid_indices]
+        if hard:
+            idx = int(h_probs.argmax().item())
+        else:
+            idx = int(torch.multinomial(h_probs, 1).item())
+        return valid_sizes[idx]
 
     def _partition_hilbert(
         self, features: Tensor, h: int
@@ -213,8 +246,10 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
         self.update_candidates(image_size)
         B, C, H, W = features.shape
 
-        # 1) Choose block size h
-        h = self._sample_block_size(hard=hard)
+        # 1) Choose block size h (must give at least K_fixed cells)
+        h = self._sample_block_size(
+            hard=hard, max_h=min(H, W), min_n_cells=self._config.K_fixed,
+        )
 
         # 2) Partition into h×h Hilbert-ordered sub-blocks
         blocks, cell_hilbert_indices = self._partition_hilbert(features, h)
