@@ -82,6 +82,43 @@ def _maybe_build_r12_aux(
     return {"r12": r12_tensor}
 
 
+def _apply_eahbp_gates(model, *, gme, throughput, precision_gain, collector):
+    """Set EAHBP gate signals on all EAHBPAttention modules in `model`,
+    and record G1/G2/G3 decisions into `collector`.
+
+    Silent no-op if EAHBPAttention is unavailable or the model has none.
+    """
+    try:
+        from vit_pytorch.layers.attention.eahbp_attention import EAHBPAttention
+    except ImportError:
+        return
+    for mod in model.modules():
+        if isinstance(mod, EAHBPAttention):
+            try:
+                mod.set_gate_signals(gme, throughput, precision_gain)
+                collector.record("eahbp/g1_pass", float(mod.check_g1()))
+                collector.record("eahbp/g2_pass", float(mod.check_g2()))
+                collector.record("eahbp/g3_rollback", float(mod.check_g3_rollback()))
+            except Exception:
+                pass
+
+
+def _compute_gme_for_model(model) -> float:
+    """Compute GME (||grad|| / ||param||) over all model parameters.
+
+    Returns 0.0 when no gradients are present.
+    """
+    grad_sq_sum = 0.0
+    param_sq_sum = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            grad_sq_sum += float(p.grad.detach().pow(2).sum().item())
+        param_sq_sum += float(p.detach().pow(2).sum().item())
+    if param_sq_sum <= 0.0:
+        return 0.0
+    return (grad_sq_sum ** 0.5) / ((param_sq_sum ** 0.5) + 1e-12)
+
+
 def _padded_levels_to_depth_distribution(padded_levels, max_depth: int = 8):
     """Convert ForwardOutput.padded_levels to a 1D depth probability tensor.
 
@@ -362,6 +399,16 @@ def train_one_epoch(
         # v1.3 STANDARD: post_backward Shadow Monitor hook (computes GME)
         if shadow_hooks is not None:
             shadow_hooks.post_backward(model, optimizer, state.global_step)
+
+        # v1.3 STANDARD: EAHBP 3-gate plumbing (per-step gate signals)
+        if getattr(config.training, "enable_eahbp_3gate", False) and collector is not None:
+            _apply_eahbp_gates(
+                model,
+                gme=_compute_gme_for_model(model),
+                throughput=0.0,  # throughput estimate not yet wired; placeholder
+                precision_gain=0.0,  # accuracy delta not yet wired; placeholder
+                collector=collector,
+            )
 
         # B7.5 FIX: backward 后提取 CPU 侧 TrainingStats (激活显存已释放)
         stats = model.extract_cpu_stats(forward_output, metrics_tensors)
