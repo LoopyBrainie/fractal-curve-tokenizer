@@ -114,7 +114,9 @@ def configure_cuda():
         torch.backends.cuda.matmul.allow_tf32 = True
     if hasattr(torch.backends, 'cudnn'):
         torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
+        # B7.11 FIX: 仅在非确定性模式下启用 benchmark，避免与 set_seed 矛盾
+        if not torch.backends.cudnn.deterministic:
+            torch.backends.cudnn.benchmark = True
 
 
 def create_model(args, device: torch.device) -> nn.Module:
@@ -509,7 +511,7 @@ def train(
 
     # Initialize state
     state = TrainingState()
-    state.patience_counter = 0  # Initialize early stopping counter
+    # patience_counter is now a TrainingState dataclass field (default=0)
 
     # Resume from checkpoint if specified
     if args.resume:
@@ -552,14 +554,18 @@ def train(
     print(f"Checkpoints: {checkpoints_dir}")
     print(f"{'='*60}\n")
 
-    # B1: 拓扑冷启动隔离 - 三参数组分离 (排他性匹配)
-    # 优先级: geo > splitter > backbone (确保参数只属于一个组)
-    # 注意: "splitter.geo_norm" 同时匹配两者, 必须用 elif 确保排他
-    geometry_params = [p for n, p in model.named_parameters() if "geo" in n]
+    # B1: 拓扑冷启动隔离 - 三参数组分离 (精确子模块路径匹配)
+    # Fix 47: 替换弱字符串匹配 "geo" in n 为精确模块路径，消除假阴性/假阳性
+    # geometry 组: GeometryEncoder (path/rotation/area) + fusion.geo_norm + fusion._semantic_ratio
+    # splitter 组: splitter 内除 geometry 以外的所有参数 (feature_proj, depth_embedding, roi_norm, conv1d, logit_scale)
+    # backbone 组: transformer + mlp_head + 其他非 splitter 参数
+    _geo_prefixes = ('splitter.geometry_encoder.', 'splitter.fusion.geo_norm', 'splitter.fusion._semantic_ratio')
+    _splitter_prefix = 'splitter.'
+    geometry_params = [p for n, p in model.named_parameters() if n.startswith(_geo_prefixes)]
     splitter_params = [p for n, p in model.named_parameters()
-                       if "splitter" in n and "geo" not in n]
+                       if n.startswith(_splitter_prefix) and not n.startswith(_geo_prefixes)]
     backbone_params = [p for n, p in model.named_parameters()
-                       if "splitter" not in n and "geo" not in n]
+                       if not n.startswith(_splitter_prefix)]
 
     optimizer = optim.AdamW([
         {'params': backbone_params, 'lr': config.training.base_lr, 'name': 'backbone'},
@@ -651,7 +657,10 @@ def train(
     try:
         from vit_pytorch.models.fractal_vit import TrainingStats
 
-        test_input = torch.randn(2, 3, 64, 64).to(device)
+        # B7.10 FIX: 从 dataloader 获取实际图像尺寸，而非硬编码 64×64
+        _sample_batch = next(iter(train_loader))
+        _actual_h, _actual_w = _sample_batch[0].shape[2], _sample_batch[0].shape[3]
+        test_input = torch.randn(2, 3, _actual_h, _actual_w).to(device)
         test_target = torch.randint(0, model.num_classes if hasattr(model, 'num_classes') else 10, (2,)).to(device)
         test_output = model(test_input)
         if isinstance(test_output, TrainingStats):
@@ -704,7 +713,12 @@ def train(
         state.epoch = epoch
 
         # Phase 4: τ 线性退火 — 唯一保留的调度器
-        warmup_params = _update_tau_only(model, epoch)
+        # B7.9 FIX: 传递 CLI 参数，避免硬编码默认值覆盖用户意图
+        warmup_params = _update_tau_only(
+            model, epoch,
+            tau_end=getattr(args, 'splitter_temp_end', 0.5),
+            tau_epochs=getattr(args, 'tau_epochs', 20),
+        )
 
         # Train one epoch
         train_metrics = train_one_epoch(
@@ -781,16 +795,37 @@ def train(
                 state.best_metric = metric_value
                 print(f"New best metric: {metric_value:.4f}")
 
-        # Early stopping check
+        # ==============================================================================
+        # FIX 46: Max/Min感知的高鲁棒性 Early Stopping 检查体系
+        # ==============================================================================
         if eval_metrics and patience < 999:
-            metric_value = eval_metrics.get(config.checkpoint.monitor_metric, 0.0)
-            if state.best_metric > 0 or config.checkpoint.monitor_mode == "min":
-                if metric_value >= state.best_metric:
+            monitor_metric = config.checkpoint.monitor_metric
+
+            if monitor_metric not in eval_metrics:
+                print(
+                    f"[WARNING] Early stopping 无法在 eval_metrics 中找到监控指标 '{monitor_metric}'。"
+                    f"当前可用指标: {list(eval_metrics.keys())}。跳过本轮检查。"
+                )
+            else:
+                metric_value = eval_metrics[monitor_metric]
+                monitor_mode = config.checkpoint.monitor_mode
+
+                if monitor_mode == "max":
+                    improved = metric_value > state.best_metric
+                elif monitor_mode == "min":
+                    improved = metric_value < state.best_metric
+                else:
+                    raise ValueError(f"未知的 monitor_mode 级别: {monitor_mode}, 必须为 'max' 或 'min'")
+
+                if improved:
                     state.patience_counter = 0
                 else:
-                    state.patience_counter = getattr(state, 'patience_counter', 0) + 1
+                    state.patience_counter = state.patience_counter + 1
                     if state.patience_counter >= patience:
-                        print(f"Early stopping at epoch {epoch + 1}")
+                        print(
+                            f"[EARLY STOPPING] 指标 '{monitor_metric}' 已连续 {state.patience_counter} 个 Epoch 未改善。"
+                            f"当前最佳值: {state.best_metric:.6f}, 当前触发值: {metric_value:.6f}。训练提前终止。"
+                        )
                         break
 
         # Save checkpoint: separate concerns
@@ -1170,14 +1205,39 @@ def add_args(parser: argparse.ArgumentParser):
     parser.add_argument('--quick-test', action='store_true',
                         help='Run quick test with dummy data')
 
+    # ==================== v1.3 STANDARD: opt-in features ====================
+    v13 = parser.add_argument_group("v1.3 STANDARD (opt-in)")
+    v13.add_argument('--enable-shadow-monitor', action='store_true',
+                     help='Enable ShadowMonitor hooks (WBA entropy + RoPE MI)')
+    v13.add_argument('--enable-r12-aux', action='store_true',
+                     help='Enable R12 hierarchical aux loss on top of CE')
+    v13.add_argument('--enable-eahbp-3gate', action='store_true',
+                     help='Enable EAHBP G1/G2/G3 gate signals (rollback-aware)')
+    v13.add_argument('--enable-paced-window', action='store_true',
+                     help='Enable PacedWindow state machine for staged weight rollbacks')
+    v13.add_argument('--shadow-monitor-interval', type=int, default=50,
+                     help='Shadow Monitor step interval')
+    v13.add_argument('--r12-lambda-tree', type=float, default=0.10,
+                     help='R12 L_tree coefficient (overrides default 0.10)')
+    v13.add_argument('--r12-lambda-skew', type=float, default=0.10,
+                     help='R12 L_skew coefficient (overrides default 0.10)')
+    v13.add_argument('--paced-window-fatal-streak', type=int, default=3,
+                     help='PacedWindow D_struct fatal streak (consecutive steps)')
 
-def main():
-    """Main entry point"""
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the full ArgumentParser (extracted from main for testability)."""
     parser = argparse.ArgumentParser(
         description="FractalCurveViT Training",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     add_args(parser)
+    return parser
+
+
+def main():
+    """Main entry point"""
+    parser = build_parser()
     args = parser.parse_args()
 
     # Setup

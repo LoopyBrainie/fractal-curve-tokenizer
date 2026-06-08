@@ -70,6 +70,16 @@ class TrainingHyperparams:
     eval_interval: int = 1
     checkpoint_interval: int = 10
 
+    # v1.3 STANDARD: opt-in features (all default False / design baseline)
+    enable_shadow_monitor: bool = False
+    enable_r12_aux: bool = False
+    enable_eahbp_3gate: bool = False
+    enable_paced_window: bool = False
+    shadow_monitor_interval: int = 50
+    r12_lambda_tree: float = 0.10
+    r12_lambda_skew: float = 0.10
+    paced_window_fatal_streak: int = 3
+
 
 @dataclass
 class NumericalConfig:
