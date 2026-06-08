@@ -29,6 +29,21 @@ def _get_flatten_layer_outputs():
     return flatten_layer_outputs
 
 
+def _extract_attention_for_shadow(forward_output):
+    """Pull attention_scores and rope_embeddings from ForwardOutput for Shadow Monitor.
+
+    Returns (None, None) when EAHBP-style attention is not in use — the
+    Shadow Monitor's post_forward hook handles None inputs by recording
+    zero scalars.
+    """
+    aux = getattr(forward_output, "auxiliary_outputs", None) or {}
+    if not isinstance(aux, dict):
+        return None, None
+    attn = aux.get("attn_scores")
+    rope = aux.get("rope_embeddings")
+    return attn, rope
+
+
 def train_one_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -47,6 +62,8 @@ def train_one_epoch(
     loss_monitor: Optional[LossMonitor] = None,
     defender: Optional[NumericalDefender] = None,
     nan_investigator: Optional[NaNAutoInvestigation] = None,
+    # v1.3 STANDARD: opt-in trainer hooks (Shadow Monitor, EAHBP 3-gate, Paced Window)
+    shadow_hooks: Optional[Any] = None,
 ) -> EpochMetrics:
     """Train for one epoch
 
@@ -109,6 +126,9 @@ def train_one_epoch(
 
     # 用于记录输入数据统计（用于调试）
     _input_stats: Dict[str, float] = {}
+
+    # B7.12 FIX: 梯度累积步数 (默认 1 = 不累积)
+    accum_steps: int = getattr(config.training, 'accumulation_steps', 1)
 
     # Metrics accumulators (I-OPT: tensor accumulation, single .item() at epoch end)
     total_loss: Union[torch.Tensor, float] = 0.0
@@ -196,7 +216,7 @@ def train_one_epoch(
             # MEM-OOM FIX (Suspect 3): OOM 诊断 try-except，快速定位"罪魁祸首"
             # 当 OOM 发生时，打印 Batch 形状和 Token 数量，帮助定位异常样本
             try:
-                outputs = model(images)
+                forward_output, metrics_tensors = model(images)
             except torch.cuda.OutOfMemoryError:
                 # OOM 遥测: 打印致命调试信息
                 print(f"\n[CRITICAL] CUDA OOM at Step {state.global_step}, Batch {batch_idx}")
@@ -216,58 +236,42 @@ def train_one_epoch(
                 torch.cuda.empty_cache()
                 raise
 
-            # Handle TrainingStats from Fractal ViT
-            if hasattr(outputs, 'logits'):
-                logits = outputs.logits
+            # v1.3 STANDARD: post_forward Shadow Monitor hook (no-op when disabled)
+            if shadow_hooks is not None:
+                _attn_scores, _rope = _extract_attention_for_shadow(forward_output)
+                shadow_hooks.post_forward(
+                    _attn_scores, _rope, images.shape[0], state.global_step
+                )
 
-                # Extract token info if available
-                # I-OPT: 延迟 .item()，使用 tensor 累加模式
-                if hasattr(outputs, 'num_tokens'):
-                    num_tokens_raw = outputs.num_tokens
-                    # Handle different types (int, tensor, list)
-                    if isinstance(num_tokens_raw, torch.Tensor):
-                        # I-OPT: 直接累加 tensor，不调用 .item() 强制同步
-                        total_tokens += num_tokens_raw.float().mean().detach()
-                    elif isinstance(num_tokens_raw, (int, float)):
-                        total_tokens += float(num_tokens_raw)
-                    else:
-                        total_tokens += float(sum(num_tokens_raw) / len(num_tokens_raw))
+            # B7.5 FIX: 方案 B+ — forward 返回 (ForwardOutput, MetricsTensors)
+            logits = forward_output.logits
 
-                # 新增: 提取实验详细日志指标
-                # I-AUDIT: 使用计数器跟踪有效值数量，避免平均值计算时除以错误分母
-                if outputs.splitter_logits_mean is not None:
-                    total_splitter_logits_mean = (total_splitter_logits_mean or 0.0) + outputs.splitter_logits_mean.detach()
-                    total_splitter_logits_std = (total_splitter_logits_std or 0.0) + (outputs.splitter_logits_std.detach() if outputs.splitter_logits_std is not None else 0.0)
-                    _splitter_logits_count += 1
-                if outputs.active_ratio is not None:
-                    total_active_ratio = (total_active_ratio or 0.0) + outputs.active_ratio.detach()
-                    _active_ratio_count += 1
-                if outputs.theoretical_flops_reduction is not None:
-                    total_theoretical_flops_reduction = (total_theoretical_flops_reduction or 0.0) + outputs.theoretical_flops_reduction.detach()
-                    _theoretical_flops_count += 1
-                if outputs.mean_abs_logits is not None:
-                    total_mean_abs_logits = (total_mean_abs_logits or 0.0) + outputs.mean_abs_logits.detach()
-                    _mean_abs_logits_count += 1
-                if outputs.raw_budget_error is not None:
-                    total_raw_budget_error = (total_raw_budget_error or 0.0) + outputs.raw_budget_error.detach()
-                    _raw_budget_error_count += 1
-                if outputs.density_regularization is not None:
-                    total_density_regularization = (total_density_regularization or 0.0) + outputs.density_regularization.detach()
-                    _density_reg_count += 1
-
-                # auxiliary_outputs flattening (layer-packaged → trainer-unpacked)
-                if hasattr(outputs, 'auxiliary_outputs') and outputs.auxiliary_outputs:
-                    _flat = _get_flatten_layer_outputs()(outputs.auxiliary_outputs, prefix="train")
-                    for _k, _v in _flat.items():
-                        if _k not in _aux_flat_accum:
-                            _aux_flat_accum[_k] = []
-                        # FIX: flatten_layer_outputs 返回 Dict[str, float]，但防御性检查 tensor
-                        if isinstance(_v, torch.Tensor):
-                            _aux_flat_accum[_k].append(_v.detach().to('cpu', non_blocking=True))
-                        else:
-                            _aux_flat_accum[_k].append(_v)
+            # Extract token info (I-OPT: 延迟 .item()，使用 tensor 累加模式)
+            num_tokens_raw = forward_output.num_tokens
+            if isinstance(num_tokens_raw, torch.Tensor):
+                total_tokens += num_tokens_raw.float().mean().detach()
+            elif isinstance(num_tokens_raw, (int, float)):
+                total_tokens += float(num_tokens_raw)
             else:
-                logits = outputs
+                total_tokens += float(sum(num_tokens_raw) / len(num_tokens_raw))
+
+            # MetricsTensors: 旁路诊断张量直接累加 (无 hasattr 检查, 无 None 分支)
+            total_splitter_logits_mean = (total_splitter_logits_mean or 0.0) + metrics_tensors.splitter_logits_mean.detach()
+            total_splitter_logits_std = (total_splitter_logits_std or 0.0) + metrics_tensors.splitter_logits_std.detach()
+            _splitter_logits_count += 1
+            total_active_ratio = (total_active_ratio or 0.0) + metrics_tensors.active_ratio.detach()
+            _active_ratio_count += 1
+            total_theoretical_flops_reduction = (total_theoretical_flops_reduction or 0.0) + metrics_tensors.theoretical_flops_reduction.detach()
+            _theoretical_flops_count += 1
+            total_mean_abs_logits = (total_mean_abs_logits or 0.0) + metrics_tensors.mean_abs_logits.detach()
+            _mean_abs_logits_count += 1
+            # raw_budget_error / density_regularization: 在 ForwardOutput 中 (参与 loss 计算图)
+            if forward_output.raw_budget_error is not None:
+                total_raw_budget_error = (total_raw_budget_error or 0.0) + forward_output.raw_budget_error.detach()
+                _raw_budget_error_count += 1
+            if forward_output.density_regularization is not None:
+                total_density_regularization = (total_density_regularization or 0.0) + forward_output.density_regularization.detach()
+                _density_reg_count += 1
 
             # Compute loss
             if targets is not None:
@@ -278,10 +282,30 @@ def train_one_epoch(
                 loss_components = {}
 
 # Backward
+        # B7.12 FIX: 梯度累积 — 缩放 loss 使累积梯度等效于大 batch
+        loss_scaled = loss / accum_steps
         if scaler is not None:
-            scaler.scale(loss).backward()
+            scaler.scale(loss_scaled).backward()
         else:
-            loss.backward()
+            loss_scaled.backward()
+
+        # v1.3 STANDARD: post_backward Shadow Monitor hook (computes GME)
+        if shadow_hooks is not None:
+            shadow_hooks.post_backward(model, optimizer, state.global_step)
+
+        # B7.5 FIX: backward 后提取 CPU 侧 TrainingStats (激活显存已释放)
+        stats = model.extract_cpu_stats(forward_output, metrics_tensors)
+
+        # auxiliary_outputs flattening (layer-packaged → trainer-unpacked)
+        if stats.auxiliary_outputs:
+            _flat = _get_flatten_layer_outputs()(stats.auxiliary_outputs, prefix="train")
+            for _k, _v in _flat.items():
+                if _k not in _aux_flat_accum:
+                    _aux_flat_accum[_k] = []
+                if isinstance(_v, torch.Tensor):
+                    _aux_flat_accum[_k].append(_v.detach().to('cpu', non_blocking=True))
+                else:
+                    _aux_flat_accum[_k].append(_v)
 
         # 将 loss component 记录从 forward 路径移到此处，确保 backward 可以先完成
         if config.numerical.record_loss_components and targets is not None:
@@ -292,11 +316,11 @@ def train_one_epoch(
                 else:
                     loss_components_float[k] = v
             loss_components_float["total"] = loss.detach().item()
-            # I-AUDIT: 使用 is not None 检查，TrainingStats 字段现在是 Optional[float] = None
-            if outputs.raw_budget_error is not None:
-                loss_components_float["raw_budget_error"] = outputs.raw_budget_error.detach().item() if isinstance(outputs.raw_budget_error, torch.Tensor) else outputs.raw_budget_error
-            if outputs.density_regularization is not None:
-                loss_components_float["density_regularization"] = outputs.density_regularization.detach().item() if isinstance(outputs.density_regularization, torch.Tensor) else outputs.density_regularization
+            # B7.5 FIX: 使用 stats 中已提取的标量值
+            if stats.raw_budget_error != 0.0:
+                loss_components_float["raw_budget_error"] = stats.raw_budget_error
+            if stats.density_regularization != 0.0:
+                loss_components_float["density_regularization"] = stats.density_regularization
             loss_monitor.record(loss_components_float)
 
         # I-OOM FIX: 调用 finalize 将 GPU tensors 转为 Python floats，释放显存
@@ -308,19 +332,18 @@ def train_one_epoch(
             allocated_mb = torch.cuda.memory_allocated() / 1024**2
             reserved_mb = torch.cuda.memory_reserved() / 1024**2
             max_allocated_mb = torch.cuda.max_memory_allocated() / 1024**2
-            # 获取 num_tokens (从 forward 时获取的 outputs)
+            # 获取 num_tokens (从 forward_output 获取)
             # I-OPT: 使用 .detach().item() 避免阻塞 backward 后的 GPU 流水线
             num_tokens_info = ""
-            if hasattr(outputs, 'num_tokens') and outputs.num_tokens is not None:
-                ntok = outputs.num_tokens
+            if forward_output.num_tokens is not None:
+                ntok = forward_output.num_tokens
                 if isinstance(ntok, torch.Tensor):
                     ntok = ntok.detach().float().mean().item()
                 num_tokens_info = f", tokens={ntok:.0f}"
             print(f"  [MEM] Step {batch_idx+1}: alloc={allocated_mb:.1f}MB, reserved={reserved_mb:.1f}MB, peak={max_allocated_mb:.1f}MB{num_tokens_info}")
 
-            # P4-Fix: 每 50 步清理显存碎片，防止 reserved 持续增长
-            if (batch_idx + 1) % 50 == 0:
-                torch.cuda.empty_cache()
+            # B7.15 FIX: 移除周期性 empty_cache — 破坏 expandable_segments 分配器缓存优化
+            # 仅在 OOM catch 中保留 empty_cache（已存在于 L216）
 
         # Gradient monitoring
         if config.numerical.record_grad_norms:
@@ -411,9 +434,12 @@ def train_one_epoch(
         # 核心原则：无论是否 skip，scaler.update() 都必须在所有路径执行
         # 否则 loss_scale 永不下降，NaN 会像幽灵一样在计算图中循环
 
+        # B7.12 FIX: 梯度累积 — 仅在累积满 accum_steps 时执行 optimizer step
+        _is_accum_boundary = (batch_idx + 1) % accum_steps == 0
+
         if not should_skip_step:
             # Gradient clipping (P0-Fix: 使用配置值替代硬编码max_norm=1.0)
-            if config.training.gradient_clip_norm > 0:
+            if config.training.gradient_clip_norm > 0 and _is_accum_boundary:
                 # P0 修复: 改用 config.gradient_clip_norm，允许临时放宽到 1000 进行诊断
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(),
@@ -424,7 +450,7 @@ def train_one_epoch(
                     print(f"Warning: Gradient norm is {grad_norm}, skipping step!")
                     should_skip_step = True  # 转换为 skip
 
-            if not should_skip_step:
+            if not should_skip_step and _is_accum_boundary:
                 # Update scheduler BEFORE optimizer step
                 if scheduler is not None:
                     scheduler.step(state.global_step)
@@ -442,10 +468,10 @@ def train_one_epoch(
 
         if should_skip_step:
             # I-NAN: 检测到 NaN 或梯度异常！触发自动取证并 skip
-            # 收集 Classification logits 统计（outputs.logits 是分类 logits，不是 splitter 内部 logits）
+            # 收集 Classification logits 统计（forward_output.logits 是分类 logits）
             classification_logits_stats: Dict[str, Any] = {}
-            if hasattr(outputs, 'logits') and outputs.logits is not None:
-                lgt = outputs.logits.detach()
+            if forward_output.logits is not None:
+                lgt = forward_output.logits.detach()
                 classification_logits_stats = {
                     "logits_mean": lgt.mean(),
                     "logits_std": lgt.std(),
@@ -457,8 +483,8 @@ def train_one_epoch(
 
             # 收集特征模长统计 (mlp_head 前的特征) - D1-SYNC: 延迟 .item()
             feature_stats: Dict[str, Any] = {}
-            if hasattr(outputs, 'features') and outputs.features is not None:
-                feat = outputs.features.detach()
+            if forward_output.features is not None:
+                feat = forward_output.features.detach()
                 feature_stats = {
                     "mean": feat.mean(),
                     "std": feat.std(),
@@ -493,7 +519,7 @@ def train_one_epoch(
                 print(f"[CRITICAL] NaN detected! Debug info: {debug_path}")
 
             # Skip this step due to numerical issues
-            # Still need to update scheduler even when skipping
+            # NaN 污染累积梯度，必须立即清零（不等 accumulation boundary）
             if scheduler is not None:
                 scheduler.step(state.global_step)
             optimizer.zero_grad()
@@ -669,11 +695,8 @@ def train_one_epoch_simple(
 
             optimizer.zero_grad()
 
-            outputs = model(images)
-            if hasattr(outputs, 'logits'):
-                outputs = outputs.logits
-
-            loss = torch.nn.functional.cross_entropy(outputs, labels)
+            forward_output, _metrics = model(images)
+            loss = torch.nn.functional.cross_entropy(forward_output.logits, labels)
             loss.backward()
 
             if gradient_clip_norm > 0:
