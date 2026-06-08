@@ -38,4 +38,9 @@ markers = [
     "stability: marks tests for stability verification",
     "数学: marks tests for mathematical verification",
     "benchmark: marks tests as benchmarks (not for CI)",
+    # v1.3 STANDARD: Phase 0/1/2 markers (per plan: 2026-06-08-hilbert-vit-v13-phase0.md)
+    "static_guard: 8 静态代码守卫 (CI-blocking pre-PoC gate, per v1.3 §9.6)",
+    "phase0: Phase 0 — 数学形式化 + CI-blocking 基础设施",
+    "phase1: Phase 1 — Multi-Block HMFT + Polar Voronoi + 集成",
+    "phase2: Phase 2 — EAHBP + 3-gate + Paced Window",
 ]
