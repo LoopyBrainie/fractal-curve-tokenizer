@@ -119,6 +119,83 @@ def _compute_gme_for_model(model) -> float:
     return (grad_sq_sum ** 0.5) / ((param_sq_sum ** 0.5) + 1e-12)
 
 
+def _init_paced_window_buffer(model, state, config) -> None:
+    """Clone model weights into state.staging_state_dict, instantiate PacedWindow.
+
+    Silent no-op if `enable_paced_window` is False or the v1.3 PacedWindow
+    is unavailable. Called once at the start of `train_one_epoch`.
+    """
+    if not getattr(config.training, "enable_paced_window", False):
+        return
+    if state.staging_state_dict is not None:
+        return  # already initialized
+    try:
+        from vit_pytorch.core.paced_window import PacedWindow, PacedWindowConfig
+    except ImportError:
+        return
+    state.staging_state_dict = {
+        k: v.detach().clone()
+        for k, v in model.state_dict().items()
+    }
+    state.paced_window = PacedWindow(
+        PacedWindowConfig(
+            fatal_streak_threshold=getattr(
+                config.training, "paced_window_fatal_streak", 3,
+            ),
+        )
+    )
+
+
+def _paced_window_step(model, state, *, gme, collector) -> None:
+    """Run one PacedWindow update; restore staging weights on rollback.
+
+    Silent no-op if PacedWindow is not initialized for this state.
+    """
+    pw = getattr(state, "paced_window", None)
+    staging = getattr(state, "staging_state_dict", None)
+    if pw is None or staging is None:
+        return
+    try:
+        theta_main_l2 = _state_dict_l2(model.state_dict())
+        theta_stage_l2 = _state_dict_l2(staging)
+        rollback, _reason = pw.update(
+            theta_main=theta_main_l2,
+            theta_stage=theta_stage_l2,
+            gme=gme,
+        )
+    except Exception:
+        return
+    if rollback:
+        try:
+            model.load_state_dict(staging)
+        except Exception:
+            pass
+        prev = collector.get_summary().get("paced/rollback_count", 0.0)
+        collector.record("paced/rollback_count", prev + 1.0)
+    # Always record the current state
+    state.paced_window_state = {
+        "state": pw.state.value,
+        "epoch_in_window": pw.epoch_in_window,
+        "fatal_streak": pw.fatal_streak,
+        "last_d_struct": pw.last_d_struct,
+    }
+
+
+def _state_dict_l2(sd) -> "torch.Tensor":
+    """Flatten and concatenate all tensors in a state_dict.
+
+    PacedWindow.compute_d_struct expects tensor inputs (not L2 scalars) so
+    it can compute ||θ_main - θ_stage||² / ||θ_main_prev||² via tensor ops.
+    """
+    flats = []
+    for v in sd.values():
+        if hasattr(v, "detach") and hasattr(v, "view"):
+            flats.append(v.detach().view(-1).float())
+    if not flats:
+        return torch.zeros(1)
+    return torch.cat(flats)
+
+
 def _padded_levels_to_depth_distribution(padded_levels, max_depth: int = 8):
     """Convert ForwardOutput.padded_levels to a 1D depth probability tensor.
 
@@ -272,6 +349,10 @@ def train_one_epoch(
 
     # Training loop
     pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {state.epoch}", leave=False)
+
+    # v1.3 STANDARD: Paced Window staging buffer (one-time, first epoch)
+    _init_paced_window_buffer(model, state, config)
+
     for batch_idx, batch in pbar:
         # Handle different batch formats
         if isinstance(batch, (list, tuple)):
@@ -407,6 +488,14 @@ def train_one_epoch(
                 gme=_compute_gme_for_model(model),
                 throughput=0.0,  # throughput estimate not yet wired; placeholder
                 precision_gain=0.0,  # accuracy delta not yet wired; placeholder
+                collector=collector,
+            )
+
+        # v1.3 STANDARD: Paced Window step (rollback if D_struct >= T_fatal)
+        if getattr(config.training, "enable_paced_window", False) and collector is not None:
+            _paced_window_step(
+                model, state,
+                gme=_compute_gme_for_model(model),
                 collector=collector,
             )
 

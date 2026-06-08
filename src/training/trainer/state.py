@@ -43,6 +43,10 @@ class TrainingState:
     scheduler_state: Optional[Dict[str, Any]] = None
     splitter_scheduler_state: Optional[Dict[str, Any]] = None  # V4: Splitter 独立 LR scheduler
     sampler_state: Optional[Dict[str, Any]] = None
+    # v1.3 STANDARD: Paced Window staging weights (clone of main weights
+    # at the moment EAHBP was enabled) + the PacedWindow state machine.
+    staging_state_dict: Optional[Dict[str, torch.Tensor]] = None
+    paced_window_state: Optional[Dict[str, Any]] = None
 
     # Metrics history
     metrics_history: Dict[str, List[float]] = field(default_factory=dict)
@@ -50,6 +54,9 @@ class TrainingState:
     # Warning counters
     warning_count: int = 0
     nan_skip_count: int = 0
+
+    # Early stopping
+    patience_counter: int = 0
 
     def __post_init__(self):
         """Initialize default metrics history with bounded deque"""
@@ -89,6 +96,7 @@ class TrainingState:
             "metrics_history": self.metrics_history,
             "warning_count": self.warning_count,
             "nan_skip_count": self.nan_skip_count,
+            "patience_counter": self.patience_counter,
         }
 
     @classmethod
@@ -106,6 +114,7 @@ class TrainingState:
         state.metrics_history = d.get("metrics_history", {})
         state.warning_count = d.get("warning_count", 0)
         state.nan_skip_count = d.get("nan_skip_count", 0)
+        state.patience_counter = d.get("patience_counter", 0)
         return state
 
     def increment_epoch(self) -> None:
@@ -128,6 +137,7 @@ class TrainingState:
         self.sampler_state = None
         self.warning_count = 0
         self.nan_skip_count = 0
+        self.patience_counter = 0
         # Keep metrics_history for reference
 
 
