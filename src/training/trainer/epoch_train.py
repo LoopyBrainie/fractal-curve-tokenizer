@@ -196,6 +196,34 @@ def _state_dict_l2(sd) -> "torch.Tensor":
     return torch.cat(flats)
 
 
+def log_h_probs(splitter, collector, *, epoch: int) -> None:
+    """Per-epoch log of the 5-bin HMFT block-size distribution.
+
+    Pulls `h_probs` from `splitter.get_diagnostics()` (returns dict) and
+    records `hmft/h_prob_bin_{i}` for i in 0..4, plus `hmft/h_probs_epoch`.
+    Silent no-op when the splitter doesn't expose the diagnostic.
+    """
+    diag_fn = getattr(splitter, "get_diagnostics", None)
+    if diag_fn is None:
+        return
+    try:
+        diag = diag_fn() or {}
+    except Exception:
+        return
+    h = diag.get("h_probs") if isinstance(diag, dict) else None
+    if h is None:
+        return
+    for i, p in enumerate(h):
+        try:
+            collector.record(f"hmft/h_prob_bin_{i}", float(p))
+        except Exception:
+            break
+    try:
+        collector.record("hmft/h_probs_epoch", float(epoch))
+    except Exception:
+        pass
+
+
 def _padded_levels_to_depth_distribution(padded_levels, max_depth: int = 8):
     """Convert ForwardOutput.padded_levels to a 1D depth probability tensor.
 
@@ -824,6 +852,10 @@ def train_one_epoch(
     backbone_vs_splitter_ratio = None
     if avg_splitter_grad_norm is not None and avg_splitter_grad_norm > 0:
         backbone_vs_splitter_ratio = avg_backbone_grad_norm / avg_splitter_grad_norm
+
+    # v1.3 STANDARD: HMFT h_probs logging (per-epoch, no opt-in flag)
+    if collector is not None and hasattr(model, "splitter"):
+        log_h_probs(model.splitter, collector, epoch=state.epoch)
 
     # Create metrics
     metrics = EpochMetrics(
