@@ -44,6 +44,71 @@ def _extract_attention_for_shadow(forward_output):
     return attn, rope
 
 
+def _maybe_build_r12_aux(
+    logits: torch.Tensor,
+    forward_output,
+    config,
+):
+    """Build the R12 aux-loss tensor when `enable_r12_aux=True`.
+
+    Returns:
+        None when the feature is disabled (no-op path); otherwise a dict
+        `{"r12": tensor}` ready to pass to `compute_loss(aux_losses=...)`.
+
+    Falls back to None if the v1.3 R12AuxLoss is unavailable or the
+    model has no `parent_logits` / `child_logits` in its auxiliary outputs.
+    """
+    if not getattr(config.training, "enable_r12_aux", False):
+        return None
+    try:
+        from vit_pytorch.core.measure_auxiliary_loss import R12AuxLoss
+    except ImportError:
+        return None
+    aux = getattr(forward_output, "auxiliary_outputs", None) or {}
+    parent = (
+        aux.get("parent_logits") if isinstance(aux, dict) else None
+    ) or logits
+    child = (
+        aux.get("child_logits") if isinstance(aux, dict) else None
+    ) or logits
+    depth_dist = _padded_levels_to_depth_distribution(
+        getattr(forward_output, "padded_levels", None), max_depth=8,
+    )
+    r12 = R12AuxLoss()
+    try:
+        r12_tensor = r12(parent, child, depth_dist)
+    except Exception:
+        return None
+    return {"r12": r12_tensor}
+
+
+def _padded_levels_to_depth_distribution(padded_levels, max_depth: int = 8):
+    """Convert ForwardOutput.padded_levels to a 1D depth probability tensor.
+
+    `padded_levels` is a Tensor [B, max_N, D+1] with padding=-1; we ignore
+    padding and average the D+1 routing values per image.
+    """
+    if padded_levels is None or (hasattr(padded_levels, "numel") and padded_levels.numel() == 0):
+        return torch.zeros(max_depth + 1)
+    if not hasattr(padded_levels, "view"):
+        return torch.zeros(max_depth + 1)
+    # Use the last column (D+1 routing) averaged across batch & tokens
+    try:
+        flat = padded_levels.view(-1, padded_levels.shape[-1]).float()
+        depth = flat[:, -1]
+        # Bucket into max_depth+1 bins
+        out = torch.zeros(max_depth + 1)
+        for v in depth.tolist():
+            idx = max(0, min(int(v), max_depth))
+            out[idx] += 1.0
+        total = out.sum()
+        if total > 0:
+            out = out / total
+        return out
+    except Exception:
+        return torch.zeros(max_depth + 1)
+
+
 def train_one_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -275,7 +340,12 @@ def train_one_epoch(
 
             # Compute loss
             if targets is not None:
-                loss, loss_components = compute_loss(logits, targets)
+                aux_losses = _maybe_build_r12_aux(
+                    logits, forward_output, config,
+                )
+                loss, loss_components = compute_loss(
+                    logits, targets, aux_losses=aux_losses,
+                )
             else:
                 # Fallback if no targets
                 loss = torch.tensor(0.0, device=device)
