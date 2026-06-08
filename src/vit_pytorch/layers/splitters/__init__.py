@@ -24,6 +24,14 @@ from .hilbert_entmax import (
     entmax,
 )
 
+from .polar_voronoi_splitter import (
+    PolarVoronoiSplitter,
+    PolarVoronoiSplitterConfig,
+    compute_sigma,
+    compute_soft_switch,
+    compute_wba_64,
+)
+
 __all__ = [
     # H1SS
     "HilbertOptimalSplitter",
@@ -33,4 +41,10 @@ __all__ = [
     "HilbertLocalComplexity",
     "entmax_1_5",
     "entmax",
+    # Polar Voronoi (v1.3 §9.7, B.8)
+    "PolarVoronoiSplitter",
+    "PolarVoronoiSplitterConfig",
+    "compute_sigma",
+    "compute_soft_switch",
+    "compute_wba_64",
 ]
