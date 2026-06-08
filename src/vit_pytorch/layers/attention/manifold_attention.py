@@ -115,9 +115,7 @@ class ManifoldNativeAttention(nn.Module):
         heads: int,
         dim_head: int = 64,
         max_level: int = 8,
-        beta: float = 4.0,
         dropout: float = 0.0,
-        use_banded: bool = True,
         # v7.1: 宏观/微观频率配置 (用于 DirectionAwareSubspacedRoPE)
         macro_ratio: float = 0.5,
         macro_base: float = 1000.0,
@@ -128,9 +126,7 @@ class ManifoldNativeAttention(nn.Module):
         self.heads = heads
         self.dim_head = dim_head
         self.max_level = max_level
-        self.beta = beta
         self.dropout = dropout
-        self.use_banded = use_banded
         # v7.1: 存储宏观频率配置
         self.macro_ratio = macro_ratio
         self.macro_base = macro_base
@@ -171,29 +167,16 @@ class ManifoldNativeAttention(nn.Module):
         else:
             self.rope_fractal = None
 
-        # 诊断缓冲区
-        self._last_attn_weights: Optional[torch.Tensor] = None
-        self._nan_count = 0
-        self._total_count = 0
-
         # torch.compile 缓存修复
         self._stats_cache: dict = {}
-
-    def clear_diagnostics(self) -> None:
-        """清除诊断缓冲区，防止显存泄漏。"""
-        self._last_attn_weights = None
 
     def forward(
         self,
         x: torch.Tensor,
         levels_info: Optional["LevelsInfo"] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        regions: Optional[torch.Tensor] = None,
-        image_size: Optional[int] = None,
-        geometry_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        前向传播 (兼容 HilbertAwareMultiScaleAttention 接口)。
+        前向传播。
 
         参数
         ----
@@ -201,14 +184,6 @@ class ManifoldNativeAttention(nn.Module):
             输入特征 [B, N, D]
         levels_info : LevelsInfo
             层级信息
-        attention_mask : torch.Tensor
-            注意力掩码
-        regions : torch.Tensor
-            区域边界 [B, N, 4]
-        image_size : int
-            图像尺寸
-        geometry_emb : torch.Tensor
-            几何嵌入
 
         返回
         ----
@@ -314,8 +289,8 @@ class ManifoldNativeAttention(nn.Module):
 
         # 🚀 Stage 2: 对物理场应用 Cartesian2DRoPE
         if coords is not None and self.rope_cartesian is not None:
-            cos_θ, sin_θ = self.rope_cartesian(coords)
-            q_phys, k_phys = self.rope_cartesian.apply_rotation(q_phys, k_phys, cos_θ, sin_θ)
+            angles = self.rope_cartesian(coords)
+            q_phys, k_phys = self.rope_cartesian.apply_rotation(q_phys, k_phys, angles)
 
         # 🚀 Stage 2: 对拓扑场应用 DirectionAwareSubspacedRoPE
         if levels_info is not None and self.rope_fractal is not None:
@@ -365,9 +340,6 @@ class ManifoldNativeAttention(nn.Module):
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_dropout(attn)
 
-        # 存储注意力权重用于诊断
-        self._last_attn_weights = attn.detach()
-
         # 注意力加权
         out = attn @ v  # [B, H, N, d]
 
@@ -378,53 +350,24 @@ class ManifoldNativeAttention(nn.Module):
         out = self.proj(out)
         out = self.proj_dropout(out)
 
-        # NaN 检测
-        if not out.isfinite().all():
-            self._nan_count += 1
-        self._total_count += 1
-
-        # 清除诊断引用，防止显存泄漏
-        self.clear_diagnostics()
-
         return out
 
     @torch.no_grad()
     @torch._dynamo.disable
     def get_stats(self) -> dict:
-        """获取诊断统计信息（延迟求值，GPU tensor 直接返回）。
+        """获取诊断统计信息。
 
         返回
         ----
         dict
-            - nan_rate: NaN/Inf 出现比例
-            - attn_sparsity: 注意力权重稀疏度
+            - (当前无活跃诊断指标)
         """
-        cache = self._stats_cache
-        cache.clear()
-
-        # 注意力权重稀疏度
-        if self._last_attn_weights is not None:
-            attn = self._last_attn_weights.detach()
-            attn_sum = attn.sum(dim=-1, keepdim=True)
-            l2_norm_sq = (attn ** 2).sum(dim=-1, keepdim=True)
-            cache["attn_sparsity"] = (l2_norm_sq / (attn_sum ** 2 + 1e-8)).mean()
-
-        # nan_rate
-        if self._total_count > 0:
-            cache["nan_rate"] = self._nan_count / self._total_count
-
-        return cache
-
-    @property
-    def attn_output(self) -> dict:
-        """兼容性别名，推荐使用 get_stats()"""
-        return self.get_stats()
+        return self._stats_cache
 
     def extra_repr(self) -> str:
         return (
             f"dim={self.dim}, heads={self.heads}, dim_head={self.dim_head}, "
-            f"max_level={self.max_level}, beta={self.beta}, "
-            f"use_banded={self.use_banded}"
+            f"max_level={self.max_level}"
         )
 
 

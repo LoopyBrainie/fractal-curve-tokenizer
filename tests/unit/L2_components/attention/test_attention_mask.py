@@ -47,13 +47,13 @@ class TestAttentionMaskEffectiveness:
         with torch.no_grad():
             x = torch.randn(2, 3, 32, 32)
 
-            # 第一次前向
-            output1 = model(x)
-            logits1 = output1.logits if hasattr(output1, 'logits') else output1
+            # 第一次前向 (forward 返回 tuple)
+            forward_output1, _metrics1 = model(x)
+            logits1 = forward_output1.logits
 
             # 第二次前向（相同输入）
-            output2 = model(x)
-            logits2 = output2.logits if hasattr(output2, 'logits') else output2
+            forward_output2, _metrics2 = model(x)
+            logits2 = forward_output2.logits
 
             # 验证确定性
             assert torch.allclose(logits1, logits2, atol=1e-6), \
@@ -74,10 +74,10 @@ class TestAttentionMaskEffectiveness:
             # 确保 x2 与 x1 不同
             x2 = x1 + 10.0
 
-            out1 = model(x1)
-            logits1 = out1.logits if hasattr(out1, 'logits') else out1
-            out2 = model(x2)
-            logits2 = out2.logits if hasattr(out2, 'logits') else out2
+            forward_output1, _metrics1 = model(x1)
+            logits1 = forward_output1.logits
+            forward_output2, _metrics2 = model(x2)
+            logits2 = forward_output2.logits
 
             assert logits1.shape == (1, 10)
             assert logits2.shape == (1, 10)
@@ -183,7 +183,7 @@ class TestGlobalAttentionMask:
             mask[1, 0, 0, 8:] = False
 
             levels = torch.zeros(2, 10, 5, dtype=torch.long)
-            out = transformer(x, levels, mask)
+            out = transformer(x, levels)
 
             assert out.shape == x.shape
             assert not torch.isnan(out).any()
