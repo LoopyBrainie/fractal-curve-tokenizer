@@ -50,6 +50,17 @@ from .constants import (
     LEVEL_BIAS_SCALE,
     SPLITTER_TEMP_START,
     SPLITTER_TEMP_END,
+    # v1.3 STANDARD: Phase 1-2 calibration constants
+    V13_T_FATAL,
+    V13_ALPHA_TREE,
+    V13_ALPHA_SKEW,
+    V13_GAMMA_KINETIC,
+    V13_DELTA_WASHOUT,
+    V13_EPSILON_LEAK_FACTOR,
+    PACED_WINDOW_FATAL_STREAK,
+    PACED_WINDOW_MAX_EPOCHS,
+    R12_LAMBDA_TREE,
+    R12_LAMBDA_SKEW,
 )
 
 
@@ -57,12 +68,13 @@ from .constants import (
 
 # 温度退火调度类型
 # I122-7: 移除 'cosine' (无理论依据)，新增 'inverse_time'
-AnnealSchedule = Literal['linear', 'exponential', 'inverse_time']
+AnnealSchedule = Literal["linear", "exponential", "inverse_time"]
 # Tokenizer 类型 (I145: 移除废弃的 streaming_v1/streaming_v2)
-TokenizerType = Literal['streaming_v3']
+TokenizerType = Literal["streaming_v3"]
 
 
 # ==================== Splitter 配置 ====================
+
 
 @dataclass
 class HilbertSplitterConfig:
@@ -149,7 +161,7 @@ class HilbertSplitterConfig:
     # 'adaptive': H_target = log(D) × (1 - 1/√D) (推荐)
     # 'target': H_target = 固定值
     # 'disabled': 不使用熵正则化
-    entropy_mode: str = 'adaptive'
+    entropy_mode: str = "adaptive"
     entropy_weight_base: float = 0.1  # 基础权重 (动态调整)
     entropy_target: Optional[float] = None  # 固定目标 (target 模式)
 
@@ -165,7 +177,7 @@ class HilbertSplitterConfig:
     # I122-7: 默认使用 'linear' 调度 (恒定变化率，行为可预测)
     temperature_init: float = SPLITTER_TEMP_START  # 1.0
     temperature_min: float = SPLITTER_TEMP_END  # 0.4
-    temperature_anneal: str = 'linear'  # I122-7: 移除 'cosine'，默认 'linear'
+    temperature_anneal: str = "linear"  # I122-7: 移除 'cosine'，默认 'linear'
     learnable_temperature: bool = True
     temperature_warmup_steps: int = 1000
 
@@ -212,7 +224,7 @@ class HilbertSplitterConfig:
     enable_soft_threshold: bool = True
     soft_threshold_warmup_epochs: int = 10
     soft_threshold_max: float = 0.5
-    soft_threshold_schedule: str = 'linear'
+    soft_threshold_schedule: str = "linear"
 
     # ==================== 验证与工具方法 ====================
 
@@ -266,15 +278,11 @@ class HilbertSplitterConfig:
             scale_factor = 1.0
 
         # 计算 K_min
-        K_min = max(
-            self.K_min_abs,
-            int(math.ceil(self.coverage_min * N))
-        )
+        K_min = max(self.K_min_abs, int(math.ceil(self.coverage_min * N)))
 
         # 计算 K_max
         K_max = min(
-            self.K_max_hard,
-            int(math.ceil(self.coverage_max_hard * scale_factor * N))
+            self.K_max_hard, int(math.ceil(self.coverage_max_hard * scale_factor * N))
         )
 
         return K_min, K_max
@@ -287,31 +295,61 @@ class HilbertSplitterConfig:
         back-compat with the in-scope pytest.raises(ValueError) sites.
         """
         if self.min_patch_size <= 0:
-            return Err(ConfigError("min_patch_size", f"必须为正数, got {self.min_patch_size}"))
+            return Err(
+                ConfigError("min_patch_size", f"必须为正数, got {self.min_patch_size}")
+            )
         if self.max_level_limit < 2:
-            return Err(ConfigError("max_level_limit", f">= 2 是推荐配置, got {self.max_level_limit}"))
+            return Err(
+                ConfigError(
+                    "max_level_limit", f">= 2 是推荐配置, got {self.max_level_limit}"
+                )
+            )
         if not 0 < self.coverage_base <= 1.0:
-            return Err(ConfigError("coverage_base", f"必须在 (0, 1] 范围内, got {self.coverage_base}"))
+            return Err(
+                ConfigError(
+                    "coverage_base", f"必须在 (0, 1] 范围内, got {self.coverage_base}"
+                )
+            )
         if not 0 < self.coverage_min < self.coverage_max_hard <= 1.0:
-            return Err(ConfigError("coverage_order",
-                f"coverage_min ({self.coverage_min}) < coverage_max_hard ({self.coverage_max_hard}) "
-                f"且都在 (0, 1] 范围内"))
+            return Err(
+                ConfigError(
+                    "coverage_order",
+                    f"coverage_min ({self.coverage_min}) < coverage_max_hard ({self.coverage_max_hard}) "
+                    f"且都在 (0, 1] 范围内",
+                )
+            )
         if not 0 < self.temperature_min <= self.temperature_init:
-            return Err(ConfigError("temperature_min",
-                f"temperature_min ({self.temperature_min}) 必须 < "
-                f"temperature_init ({self.temperature_init})"))
+            return Err(
+                ConfigError(
+                    "temperature_min",
+                    f"temperature_min ({self.temperature_min}) 必须 < "
+                    f"temperature_init ({self.temperature_init})",
+                )
+            )
         if self.temperature_min < 0.3:
-            return Err(ConfigError("temperature_init",
-                f"temperature_min ({self.temperature_min}) 必须 >= 0.3 "
-                "以避免梯度消失问题"))
-        if self.temperature_anneal not in ('linear', 'exponential', 'inverse_time'):
-            return Err(ConfigError("temperature_anneal",
-                f"temperature_anneal 必须是 'linear', 'exponential' 或 'inverse_time', "
-                f"got {self.temperature_anneal}"))
-        if self.entropy_mode not in ('adaptive', 'target', 'disabled'):
-            return Err(ConfigError("entropy_mode",
-                f"entropy_mode 必须是 'adaptive', 'target', 或 'disabled', "
-                f"got {self.entropy_mode}"))
+            return Err(
+                ConfigError(
+                    "temperature_init",
+                    f"temperature_min ({self.temperature_min}) 必须 >= 0.3 "
+                    "以避免梯度消失问题",
+                )
+            )
+        if self.temperature_anneal not in ("linear", "exponential", "inverse_time"):
+            return Err(
+                ConfigError(
+                    "temperature_anneal",
+                    f"temperature_anneal 必须是 'linear', 'exponential' 或 'inverse_time', "
+                    f"got {self.temperature_anneal}",
+                )
+            )
+        if self.entropy_mode not in ("adaptive", "target", "disabled"):
+            return Err(
+                ConfigError(
+                    "entropy_mode",
+                    f"entropy_mode 必须是 'adaptive', 'target', 或 'disabled', "
+                    f"got {self.entropy_mode}",
+                )
+            )
         return Ok(None)
 
     def validate(self) -> None:
@@ -323,47 +361,47 @@ class HilbertSplitterConfig:
     def to_dict(self) -> dict:
         """转换为字典 (用于序列化)"""
         return {
-            'min_patch_size': self.min_patch_size,
-            'max_level_limit': self.max_level_limit,
-            'coverage_base': self.coverage_base,
-            'coverage_min': self.coverage_min,
-            'coverage_max_hard': self.coverage_max_hard,
-            'K_min_abs': self.K_min_abs,
-            'K_max_hard': self.K_max_hard,
-            'adaptive_reference_size': self.adaptive_reference_size,
-            'feature_dim': self.feature_dim,
-            'hidden_dim': self.hidden_dim,
-            'intermediate_dim': self.intermediate_dim,
-            'pool_size': self.pool_size,
-            'use_dynamic_k': self.use_dynamic_k,
-            'dropout': self.dropout,
-            'elastic_lambda_target': self.elastic_lambda_target,
-            'elastic_lambda_boundary': self.elastic_lambda_boundary,
-            'enable_learnable_quota': self.enable_learnable_quota,
-            'quota_init_logits': self.quota_init_logits,
-            'quota_entropy_weight': self.quota_entropy_weight,
-            'quota_min_ratio': self.quota_min_ratio,
-            'quota_min_lambda': self.quota_min_lambda,
-            'entropy_mode': self.entropy_mode,
-            'entropy_weight_base': self.entropy_weight_base,
-            'entropy_target': self.entropy_target,
+            "min_patch_size": self.min_patch_size,
+            "max_level_limit": self.max_level_limit,
+            "coverage_base": self.coverage_base,
+            "coverage_min": self.coverage_min,
+            "coverage_max_hard": self.coverage_max_hard,
+            "K_min_abs": self.K_min_abs,
+            "K_max_hard": self.K_max_hard,
+            "adaptive_reference_size": self.adaptive_reference_size,
+            "feature_dim": self.feature_dim,
+            "hidden_dim": self.hidden_dim,
+            "intermediate_dim": self.intermediate_dim,
+            "pool_size": self.pool_size,
+            "use_dynamic_k": self.use_dynamic_k,
+            "dropout": self.dropout,
+            "elastic_lambda_target": self.elastic_lambda_target,
+            "elastic_lambda_boundary": self.elastic_lambda_boundary,
+            "enable_learnable_quota": self.enable_learnable_quota,
+            "quota_init_logits": self.quota_init_logits,
+            "quota_entropy_weight": self.quota_entropy_weight,
+            "quota_min_ratio": self.quota_min_ratio,
+            "quota_min_lambda": self.quota_min_lambda,
+            "entropy_mode": self.entropy_mode,
+            "entropy_weight_base": self.entropy_weight_base,
+            "entropy_target": self.entropy_target,
             # LookAheadHead 参数 (I113-2)
-            'lookahead_dim': self.lookahead_dim,
-            'target_ratio': self.target_ratio,
-            'max_ratio': self.max_ratio,  # I113-2: 最大分裂率上限
-            'gamma': self.gamma,
-            'lambda_div': self.lambda_div,
+            "lookahead_dim": self.lookahead_dim,
+            "target_ratio": self.target_ratio,
+            "max_ratio": self.max_ratio,  # I113-2: 最大分裂率上限
+            "gamma": self.gamma,
+            "lambda_div": self.lambda_div,
             # 温度参数
-            'temperature_init': self.temperature_init,
-            'temperature_min': self.temperature_min,
-            'temperature_anneal': self.temperature_anneal,
-            'learnable_temperature': self.learnable_temperature,
-            'temperature_warmup_steps': self.temperature_warmup_steps,
-            'freeze_quota': self.freeze_quota,
+            "temperature_init": self.temperature_init,
+            "temperature_min": self.temperature_min,
+            "temperature_anneal": self.temperature_anneal,
+            "learnable_temperature": self.learnable_temperature,
+            "temperature_warmup_steps": self.temperature_warmup_steps,
+            "freeze_quota": self.freeze_quota,
             # I120-2: DeterministicTopK 配置
-            'use_deterministic_topk': self.use_deterministic_topk,
-            'deterministic_temperature': self.deterministic_temperature,
-            'deterministic_ste_alpha': self.deterministic_ste_alpha,
+            "use_deterministic_topk": self.use_deterministic_topk,
+            "deterministic_temperature": self.deterministic_temperature,
+            "deterministic_ste_alpha": self.deterministic_ste_alpha,
         }
 
     # ==================== L2 绝对值计算方法 (I113-2) ====================
@@ -401,7 +439,9 @@ class HilbertSplitterConfig:
 
         return N_target
 
-    def compute_absolute_targets(self, image_size: Optional[Tuple[int, int]] = None) -> dict:
+    def compute_absolute_targets(
+        self, image_size: Optional[Tuple[int, int]] = None
+    ) -> dict:
         """计算所有绝对目标值 (L2)
 
         Returns:
@@ -417,10 +457,10 @@ class HilbertSplitterConfig:
         N_max = min(int(N_base * self.max_ratio), K_max)
 
         return {
-            'N_base': N_base,        # 绝对: 基础候选数
-            'N_target': N_target,    # 绝对: 目标Token数
-            'N_min': max(8, K_min),  # 绝对: 最小Token数
-            'N_max': N_max,          # 绝对: 最大Token数 (L1: max_ratio × N_base)
+            "N_base": N_base,  # 绝对: 基础候选数
+            "N_target": N_target,  # 绝对: 目标Token数
+            "N_min": max(8, K_min),  # 绝对: 最小Token数
+            "N_max": N_max,  # 绝对: 最大Token数 (L1: max_ratio × N_base)
         }
 
 
@@ -433,6 +473,7 @@ SplitterConfig = HilbertSplitterConfig
 # I130-3: NeighborAwareSplitter 的配置类
 # I160-1: 重命名为 DeterministicNeighborSplitter，使用确定性选择
 # 注意：DeterministicNeighborSplitter 已废弃（2026-03-23），现使用 HilbertOptimalSplitter
+
 
 @dataclass
 class NeighborAwareSplitterConfig:
@@ -515,14 +556,10 @@ class NeighborAwareSplitterConfig:
         else:
             scale_factor = 1.0
 
-        K_min = max(
-            self.K_min_abs,
-            int(math.ceil(self.coverage_min * N))
-        )
+        K_min = max(self.K_min_abs, int(math.ceil(self.coverage_min * N)))
 
         K_max = min(
-            self.K_max_hard,
-            int(math.ceil(self.coverage_max_hard * scale_factor * N))
+            self.K_max_hard, int(math.ceil(self.coverage_max_hard * scale_factor * N))
         )
 
         return K_min, K_max
@@ -530,15 +567,35 @@ class NeighborAwareSplitterConfig:
     def try_validate(self) -> Outcome[None, ConfigError]:
         """Outcome-returning validator (Phase 1 / AEH)."""
         if self.min_patch_size <= 0:
-            return Err(ConfigError("min_patch_size", f"必须为正数, got {self.min_patch_size}"))
+            return Err(
+                ConfigError("min_patch_size", f"必须为正数, got {self.min_patch_size}")
+            )
         if self.max_level_limit < 2:
-            return Err(ConfigError("max_level_limit", f">= 2 是推荐配置, got {self.max_level_limit}"))
+            return Err(
+                ConfigError(
+                    "max_level_limit", f">= 2 是推荐配置, got {self.max_level_limit}"
+                )
+            )
         if not 0 < self.coverage_base <= 1.0:
-            return Err(ConfigError("coverage_base", f"必须在 (0, 1] 范围内, got {self.coverage_base}"))
+            return Err(
+                ConfigError(
+                    "coverage_base", f"必须在 (0, 1] 范围内, got {self.coverage_base}"
+                )
+            )
         if not 0 < self.coverage_min < self.coverage_max_hard <= 1.0:
-            return Err(ConfigError("coverage_order", f"coverage_min ({self.coverage_min}) < coverage_max_hard"))
+            return Err(
+                ConfigError(
+                    "coverage_order",
+                    f"coverage_min ({self.coverage_min}) < coverage_max_hard",
+                )
+            )
         if not 0 < self.temperature_min <= self.temperature_init:
-            return Err(ConfigError("temperature_min", f"temperature_min ({self.temperature_min}) 必须 < temperature_init"))
+            return Err(
+                ConfigError(
+                    "temperature_min",
+                    f"temperature_min ({self.temperature_min}) 必须 < temperature_init",
+                )
+            )
         return Ok(None)
 
     def validate(self) -> None:
@@ -550,28 +607,29 @@ class NeighborAwareSplitterConfig:
     def to_dict(self) -> dict:
         """转换为字典"""
         return {
-            'min_patch_size': self.min_patch_size,
-            'max_level_limit': self.max_level_limit,
-            'coverage_base': self.coverage_base,
-            'coverage_min': self.coverage_min,
-            'coverage_max_hard': self.coverage_max_hard,
-            'K_min_abs': self.K_min_abs,
-            'K_max_hard': self.K_max_hard,
-            'adaptive_reference_size': self.adaptive_reference_size,
-            'feature_dim': self.feature_dim,
-            'hidden_dim': self.hidden_dim,
-            'pool_size': self.pool_size,
-            'neighbor_threshold': self.neighbor_threshold,
-            'alpha_init': self.alpha_init,
-            'learnable_alpha': self.learnable_alpha,
-            'temperature_init': self.temperature_init,
-            'temperature_min': self.temperature_min,
-            'learnable_temperature': self.learnable_temperature,
-            'enable_learnable_quota': self.enable_learnable_quota,
-            'quota_init_logits': self.quota_init_logits,
-            'quota_entropy_weight': self.quota_entropy_weight,
-            'locality_weight': self.locality_weight,
-        }# ==================== Attention 配置 ====================
+            "min_patch_size": self.min_patch_size,
+            "max_level_limit": self.max_level_limit,
+            "coverage_base": self.coverage_base,
+            "coverage_min": self.coverage_min,
+            "coverage_max_hard": self.coverage_max_hard,
+            "K_min_abs": self.K_min_abs,
+            "K_max_hard": self.K_max_hard,
+            "adaptive_reference_size": self.adaptive_reference_size,
+            "feature_dim": self.feature_dim,
+            "hidden_dim": self.hidden_dim,
+            "pool_size": self.pool_size,
+            "neighbor_threshold": self.neighbor_threshold,
+            "alpha_init": self.alpha_init,
+            "learnable_alpha": self.learnable_alpha,
+            "temperature_init": self.temperature_init,
+            "temperature_min": self.temperature_min,
+            "learnable_temperature": self.learnable_temperature,
+            "enable_learnable_quota": self.enable_learnable_quota,
+            "quota_init_logits": self.quota_init_logits,
+            "quota_entropy_weight": self.quota_entropy_weight,
+            "locality_weight": self.locality_weight,
+        }  # ==================== Attention 配置 ====================
+
 
 @dataclass
 class AttentionConfig:
@@ -583,6 +641,7 @@ class AttentionConfig:
     暴露参数:
     - hilbert_bias_scale: impact=0.1 → 可选暴露
     """
+
     # 注意力维度
     dim: int = 256
     heads: int = 8
@@ -608,11 +667,13 @@ class AttentionConfig:
 
 # ==================== Tokenizer 配置 ====================
 
+
 @dataclass
 class TokenizerConfig:
     """
     StreamingFractalTokenizerV3 配置
     """
+
     # 图像参数
     image_size: Tuple[int, int] = (64, 64)
     channels: int = 3
@@ -640,11 +701,13 @@ class TokenizerConfig:
 
 # ==================== Transformer 配置 ====================
 
+
 @dataclass
 class TransformerConfig:
     """
     FractalTransformer 配置
     """
+
     dim: int = 256
     num_layers: int = 8
     heads: int = 8
@@ -673,6 +736,7 @@ class TransformerConfig:
 
 # ==================== 模型主配置 ====================
 
+
 @dataclass
 class FractalViTConfig:
     """
@@ -680,6 +744,7 @@ class FractalViTConfig:
 
     组合所有子组件配置，支持 YAML 序列化 + CLI 覆盖
     """
+
     # 任务参数
     num_classes: int = 1000
 
@@ -700,54 +765,57 @@ class FractalViTConfig:
     def from_yaml(cls, path: str) -> "FractalViTConfig":
         """从 YAML 文件加载配置"""
         import yaml
-        with open(path, 'r') as f:
+
+        with open(path, "r") as f:
             data = yaml.safe_load(f)
         return cls(**data)
 
     def to_yaml(self, path: str) -> None:
         """保存配置到 YAML 文件"""
         import yaml
-        with open(path, 'w') as f:
+
+        with open(path, "w") as f:
             yaml.dump(self.as_dict(), f, indent=2)
 
     def as_dict(self) -> dict:
         """转换为字典（用于序列化）"""
         return {
-            'num_classes': self.num_classes,
-            'tokenizer_config': {
-                'image_size': self.tokenizer_config.image_size,
-                'channels': self.tokenizer_config.channels,
-                'patch_size': self.tokenizer_config.patch_size,
-                'embed_dim': self.tokenizer_config.embed_dim,
-                'max_level': self.tokenizer_config.max_level,
-                'use_hilbert_order': self.tokenizer_config.use_hilbert_order,
-                'splitter_config': {
-                    'enable_learnable_quota': self.tokenizer_config.splitter_config.enable_learnable_quota,
-                    'quota_init_logits': self.tokenizer_config.splitter_config.quota_init_logits,
-                    'quota_min_ratio': self.tokenizer_config.splitter_config.quota_min_ratio,
-                    'quota_min_lambda': self.tokenizer_config.splitter_config.quota_min_lambda,
-                    'K_min_abs': self.tokenizer_config.splitter_config.K_min_abs,
-                    'K_max_hard': self.tokenizer_config.splitter_config.K_max_hard,
-                    'coverage_base': self.tokenizer_config.splitter_config.coverage_base,
-                    'coverage_min': self.tokenizer_config.splitter_config.coverage_min,
-                    'coverage_max_hard': self.tokenizer_config.splitter_config.coverage_max_hard,
-                    'target_ratio': self.tokenizer_config.splitter_config.target_ratio,
-                    'max_ratio': self.tokenizer_config.splitter_config.max_ratio,
+            "num_classes": self.num_classes,
+            "tokenizer_config": {
+                "image_size": self.tokenizer_config.image_size,
+                "channels": self.tokenizer_config.channels,
+                "patch_size": self.tokenizer_config.patch_size,
+                "embed_dim": self.tokenizer_config.embed_dim,
+                "max_level": self.tokenizer_config.max_level,
+                "use_hilbert_order": self.tokenizer_config.use_hilbert_order,
+                "splitter_config": {
+                    "enable_learnable_quota": self.tokenizer_config.splitter_config.enable_learnable_quota,
+                    "quota_init_logits": self.tokenizer_config.splitter_config.quota_init_logits,
+                    "quota_min_ratio": self.tokenizer_config.splitter_config.quota_min_ratio,
+                    "quota_min_lambda": self.tokenizer_config.splitter_config.quota_min_lambda,
+                    "K_min_abs": self.tokenizer_config.splitter_config.K_min_abs,
+                    "K_max_hard": self.tokenizer_config.splitter_config.K_max_hard,
+                    "coverage_base": self.tokenizer_config.splitter_config.coverage_base,
+                    "coverage_min": self.tokenizer_config.splitter_config.coverage_min,
+                    "coverage_max_hard": self.tokenizer_config.splitter_config.coverage_max_hard,
+                    "target_ratio": self.tokenizer_config.splitter_config.target_ratio,
+                    "max_ratio": self.tokenizer_config.splitter_config.max_ratio,
                 },
             },
-            'transformer_config': {
-                'dim': self.transformer_config.dim,
-                'num_layers': self.transformer_config.num_layers,
-                'heads': self.transformer_config.heads,
-                'mlp_ratio': self.transformer_config.mlp_ratio,
-                'use_swiglu': self.transformer_config.use_swiglu,
-                'dropout': self.transformer_config.dropout,
-                'drop_path': self.transformer_config.drop_path,
+            "transformer_config": {
+                "dim": self.transformer_config.dim,
+                "num_layers": self.transformer_config.num_layers,
+                "heads": self.transformer_config.heads,
+                "mlp_ratio": self.transformer_config.mlp_ratio,
+                "use_swiglu": self.transformer_config.use_swiglu,
+                "dropout": self.transformer_config.dropout,
+                "drop_path": self.transformer_config.drop_path,
             },
         }
 
 
 # ==================== I98-3: 编码器配置类 ====================
+
 
 @dataclass
 class ShapeScaleEncoderConfig:
@@ -767,6 +835,7 @@ class ShapeScaleEncoderConfig:
     其中 r_norm = tanh(r / (1 + |r|)) ∈ (-1, 1)
           s_log = log(s + ε) ∈ (-∞, 0]
     """
+
     enabled: bool = True  # I31-P2: 启用/禁用开关
     hidden_dim: int = 64
     output_dim: int = 256
@@ -774,10 +843,10 @@ class ShapeScaleEncoderConfig:
 
     def to_dict(self) -> dict:
         return {
-            'enabled': self.enabled,
-            'hidden_dim': self.hidden_dim,
-            'output_dim': self.output_dim,
-            'weight_init': self.weight_init,
+            "enabled": self.enabled,
+            "hidden_dim": self.hidden_dim,
+            "output_dim": self.output_dim,
+            "weight_init": self.weight_init,
         }
 
 
@@ -801,6 +870,7 @@ class AreaEncoderConfig:
         g_k = CosineGate(freq_k, L_norm) (软截断门控)
         cutoff_ratio = omega_cutoff / omega_nyquist (Nyquist频率裁剪比例)
     """
+
     fourier_levels: int = 4
     freq_base: float = 2.0
     hidden_dim: int = 32
@@ -812,11 +882,11 @@ class AreaEncoderConfig:
 
     def to_dict(self) -> dict:
         return {
-            'fourier_levels': self.fourier_levels,
-            'freq_base': self.freq_base,
-            'hidden_dim': self.hidden_dim,
-            'output_dim': self.output_dim,
-            'cutoff_ratio': self.cutoff_ratio,
+            "fourier_levels": self.fourier_levels,
+            "freq_base": self.freq_base,
+            "hidden_dim": self.hidden_dim,
+            "output_dim": self.output_dim,
+            "cutoff_ratio": self.cutoff_ratio,
         }
 
 
@@ -835,15 +905,16 @@ class LCAEncoderConfig:
 
     其中 d 为四叉树深度，scale_factor 控制整体缩放。
     """
+
     embedding_dim: int = 128
     scale_init_factor: float = 0.1  # 替代硬编码 0.1
     temperature: Optional[float] = None  # None = 自动
 
     def to_dict(self) -> dict:
         return {
-            'embedding_dim': self.embedding_dim,
-            'scale_init_factor': self.scale_init_factor,
-            'temperature': self.temperature,
+            "embedding_dim": self.embedding_dim,
+            "scale_init_factor": self.scale_init_factor,
+            "temperature": self.temperature,
         }
 
 
@@ -866,15 +937,12 @@ class AttentionEncoderConfig:
     2. 可组合: 支持灵活组合不同编码器
     3. 可禁用: fourier_levels=0 禁用 AreaEncoder
     """
+
     shape_scale: ShapeScaleEncoderConfig = field(
         default_factory=ShapeScaleEncoderConfig
     )
-    area: AreaEncoderConfig = field(
-        default_factory=AreaEncoderConfig
-    )
-    lca: LCAEncoderConfig = field(
-        default_factory=LCAEncoderConfig
-    )
+    area: AreaEncoderConfig = field(default_factory=AreaEncoderConfig)
+    lca: LCAEncoderConfig = field(default_factory=LCAEncoderConfig)
 
     # 偏置缩放 (从 constants.py 独立，I98-3)
     hilbert_bias_scale: float = 0.1
@@ -887,25 +955,26 @@ class AttentionEncoderConfig:
     # 修复前: raw = log(scale)，对应 scale=0.1 和 scale=0.05
     # 修复后: 初始 scale=1.0，配合 √d_k 量纲对齐后有效 scale ≈ √d_k ≈ 5.66
     hilbert_bias_init: float = 0.0  # ln(1.0)
-    level_bias_init: float = 0.0    # ln(1.0)
+    level_bias_init: float = 0.0  # ln(1.0)
     # 可禁用能量注入（用于消融实验）
     energy_injection_enabled: bool = True
 
     def to_dict(self) -> dict:
         return {
-            'shape_scale': self.shape_scale.to_dict(),
-            'area': self.area.to_dict(),
-            'lca': self.lca.to_dict(),
-            'hilbert_bias_scale': self.hilbert_bias_scale,
-            'level_bias_scale': self.level_bias_scale,
-            'level_scale_init': self.level_scale_init,
-            'hilbert_bias_init': self.hilbert_bias_init,
-            'level_bias_init': self.level_bias_init,
-            'energy_injection_enabled': self.energy_injection_enabled,
+            "shape_scale": self.shape_scale.to_dict(),
+            "area": self.area.to_dict(),
+            "lca": self.lca.to_dict(),
+            "hilbert_bias_scale": self.hilbert_bias_scale,
+            "level_bias_scale": self.level_bias_scale,
+            "level_scale_init": self.level_scale_init,
+            "hilbert_bias_init": self.hilbert_bias_init,
+            "level_bias_init": self.level_bias_init,
+            "energy_injection_enabled": self.energy_injection_enabled,
         }
 
 
 # ==================== 工厂函数 (I111-4) ====================
+
 
 def create_splitter_config(
     # 核心参数
@@ -1156,6 +1225,7 @@ def create_splitter_config(
 
 # ==================== I110-5: 语义冗余分裂器配置 ====================
 
+
 @dataclass
 class SemanticSplitterConfig:
     """语义冗余分裂器配置 (I110-5)
@@ -1240,30 +1310,57 @@ class SemanticSplitterConfig:
     def try_validate(self) -> Outcome[None, ConfigError]:
         """Outcome-returning validator (Phase 1 / AEH)."""
         if self.feature_dim <= 0:
-            return Err(ConfigError("feature_dim", f"必须为正数, got {self.feature_dim}"))
+            return Err(
+                ConfigError("feature_dim", f"必须为正数, got {self.feature_dim}")
+            )
         if self.hidden_dim <= 0:
             return Err(ConfigError("hidden_dim", f"必须为正数, got {self.hidden_dim}"))
         if self.min_patch_size <= 0:
-            return Err(ConfigError("min_patch_size", f"必须为正数, got {self.min_patch_size}"))
+            return Err(
+                ConfigError("min_patch_size", f"必须为正数, got {self.min_patch_size}")
+            )
 
         L_theory = self._compute_theoretical_max_level()
         if self.max_level_limit is not None:
             if self.max_level_limit < 2:
-                return Err(ConfigError("max_level_limit", f">= 2 是推荐配置, got {self.max_level_limit}"))
+                return Err(
+                    ConfigError(
+                        "max_level_limit",
+                        f">= 2 是推荐配置, got {self.max_level_limit}",
+                    )
+                )
             if self.max_level_limit > L_theory:
-                return Err(ConfigError("max_level_limit",
-                    f"max_level_limit ({self.max_level_limit}) 超过理论最大值 ({L_theory}), "
-                    f"将自动截断"))
+                return Err(
+                    ConfigError(
+                        "max_level_limit",
+                        f"max_level_limit ({self.max_level_limit}) 超过理论最大值 ({L_theory}), "
+                        f"将自动截断",
+                    )
+                )
 
         if not 0 < self.diversity_weight <= 1:
-            return Err(ConfigError("diversity_weight", f"必须在 (0, 1] 范围内, got {self.diversity_weight}"))
+            return Err(
+                ConfigError(
+                    "diversity_weight",
+                    f"必须在 (0, 1] 范围内, got {self.diversity_weight}",
+                )
+            )
         if not 0 < self.reconstruction_weight <= 1:
             return Err(ConfigError("reconstruction_weight", "必须在 (0, 1] 范围内"))
         if not 0 < self.split_threshold < 1:
-            return Err(ConfigError("split_threshold", f"必须在 (0, 1) 范围内, got {self.split_threshold}"))
+            return Err(
+                ConfigError(
+                    "split_threshold",
+                    f"必须在 (0, 1) 范围内, got {self.split_threshold}",
+                )
+            )
         if self.gumbel_temp_end >= self.gumbel_temp_start:
-            return Err(ConfigError("gumbel_temp_order",
-                f"gumbel_temp_end ({self.gumbel_temp_end}) 必须 < gumbel_temp_start ({self.gumbel_temp_start})"))
+            return Err(
+                ConfigError(
+                    "gumbel_temp_order",
+                    f"gumbel_temp_end ({self.gumbel_temp_end}) 必须 < gumbel_temp_start ({self.gumbel_temp_start})",
+                )
+            )
         return Ok(None)
 
     def validate(self) -> None:
@@ -1275,19 +1372,19 @@ class SemanticSplitterConfig:
     def to_dict(self) -> dict:
         """转换为字典（用于序列化）"""
         return {
-            'feature_dim': self.feature_dim,
-            'hidden_dim': self.hidden_dim,
-            'image_size': self.image_size,
-            'min_patch_size': self.min_patch_size,
-            'max_level_limit': self.max_level_limit,
-            'diversity_weight': self.diversity_weight,
-            'reconstruction_weight': self.reconstruction_weight,
-            'split_threshold': self.split_threshold,
-            'use_gumbel_softmax': self.use_gumbel_softmax,
-            'gumbel_temp_start': self.gumbel_temp_start,
-            'gumbel_temp_end': self.gumbel_temp_end,
-            'learnable_temperature': self.learnable_temperature,
-            '_effective_max_level': self.get_max_level(),
+            "feature_dim": self.feature_dim,
+            "hidden_dim": self.hidden_dim,
+            "image_size": self.image_size,
+            "min_patch_size": self.min_patch_size,
+            "max_level_limit": self.max_level_limit,
+            "diversity_weight": self.diversity_weight,
+            "reconstruction_weight": self.reconstruction_weight,
+            "split_threshold": self.split_threshold,
+            "use_gumbel_softmax": self.use_gumbel_softmax,
+            "gumbel_temp_start": self.gumbel_temp_start,
+            "gumbel_temp_end": self.gumbel_temp_end,
+            "learnable_temperature": self.learnable_temperature,
+            "_effective_max_level": self.get_max_level(),
         }
 
 
@@ -1452,7 +1549,7 @@ class FractalConfig:
     min_patch_size: int = 4
 
     # ========== Tokenizer 配置 ==========
-    tokenizer_type: TokenizerType = 'streaming_v3'
+    tokenizer_type: TokenizerType = "streaming_v3"
 
     # ========== RoPE 宏观/微观频率配置 ==========
     # macro_ratio: 宏观子空间占比 (前 macro_ratio*D 维为宏观, 低频)
@@ -1470,6 +1567,32 @@ class FractalConfig:
 
     # 混合策略阈值: ρ* = 4/3
     PADDING_RATIO_THRESHOLD: float = 4 / 3
+
+    # ========== v1.3 STANDARD: opt-in flags for new components ==========
+    # EAHBP Attention (Phase 2)
+    enable_eahbp: bool = False
+    # Polar Voronoi Splitter (Phase 1)
+    enable_polar: bool = False
+    # MambaVision-Lite distillation (Phase 1)
+    distillation: bool = False
+    # 1024² benchmark (Phase 1, OFF by default per R11)
+    benchmark_1024: bool = False
+
+    # ========== v1.3 STANDARD: 6 base calibration values (PoC items) ==========
+    v13_t_fatal: float = V13_T_FATAL
+    v13_alpha_tree: float = V13_ALPHA_TREE
+    v13_alpha_skew: float = V13_ALPHA_SKEW
+    v13_gamma_kinetic: float = V13_GAMMA_KINETIC
+    v13_delta_washout: float = V13_DELTA_WASHOUT
+    v13_epsilon_leak_factor: float = V13_EPSILON_LEAK_FACTOR
+
+    # ========== v1.3 STANDARD: Paced Window state machine ==========
+    v13_paced_fatal_streak: int = PACED_WINDOW_FATAL_STREAK
+    v13_paced_max_epochs: int = PACED_WINDOW_MAX_EPOCHS
+
+    # ========== v1.3 STANDARD: R12 Auxiliary Loss coefficients ==========
+    v12_lambda_tree: float = R12_LAMBDA_TREE
+    v12_lambda_skew: float = R12_LAMBDA_SKEW
 
     def __post_init__(self) -> None:
         """从基础参数推导所有配置."""
@@ -1495,13 +1618,15 @@ class FractalConfig:
         else:
             max_level = 0
 
-        object.__setattr__(self, 'max_level', max_level)
-        object.__setattr__(self, 'num_scales', max_level + 1)
-        object.__setattr__(self, 'patch_sizes', tuple(
-            self.min_patch_size * (2 ** i) for i in range(max_level + 1)
-        ))
-        object.__setattr__(self, 'grid_size', ratio)
-        object.__setattr__(self, 'num_tokens', ratio * ratio)
+        object.__setattr__(self, "max_level", max_level)
+        object.__setattr__(self, "num_scales", max_level + 1)
+        object.__setattr__(
+            self,
+            "patch_sizes",
+            tuple(self.min_patch_size * (2**i) for i in range(max_level + 1)),
+        )
+        object.__setattr__(self, "grid_size", ratio)
+        object.__setattr__(self, "num_tokens", ratio * ratio)
 
         # 确定 Hilbert 策略
         is_power_of_2 = ratio > 0 and (ratio & (ratio - 1) == 0)
@@ -1514,7 +1639,7 @@ class FractalConfig:
             padding_ratio = (n * n) / (ratio * ratio)
             uses_pseudo = padding_ratio >= self.PADDING_RATIO_THRESHOLD
 
-        object.__setattr__(self, 'uses_pseudo_hilbert', uses_pseudo)
+        object.__setattr__(self, "uses_pseudo_hilbert", uses_pseudo)
 
     def scale_to_depth(self, scale_idx: int) -> int:
         """将尺度索引转换为四叉树深度."""
@@ -1533,8 +1658,12 @@ class FractalConfig:
         return self.image_size // self.patch_sizes[scale_idx]
 
     def __repr__(self) -> str:
-        hilbert_strategy = "Pseudo-Hilbert" if self.uses_pseudo_hilbert else "Standard Hilbert"
-        is_power_of_2 = self.grid_size > 0 and (self.grid_size & (self.grid_size - 1) == 0)
+        hilbert_strategy = (
+            "Pseudo-Hilbert" if self.uses_pseudo_hilbert else "Standard Hilbert"
+        )
+        is_power_of_2 = self.grid_size > 0 and (
+            self.grid_size & (self.grid_size - 1) == 0
+        )
         grid_note = "" if is_power_of_2 else f" (非 2^k, 使用 {hilbert_strategy})"
 
         return (

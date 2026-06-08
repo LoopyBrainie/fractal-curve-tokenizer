@@ -35,6 +35,26 @@ from __future__ import annotations
 #: 嵌入层权重初始化标准差
 EMBEDDING_INIT_STD: float = 0.02
 
+# ==================== Splitter Bias 初始化 (v1.2 spec 决策 #5, alpha-A-R3) ====================
+
+#: 决策 #5 默认值 — 经验魔数 +0.5
+#: 选择依据: 历史 production 配置 (production-tuned)；C0 锁定基线
+#: v1.2 spec: alpha-S-NEW 预注册伪证方案中 C0 条件
+SPLITTER_BIAS_CONSTANT_DEFAULT: float = 0.5
+
+#: 决策 #5 Kaiming/He-derived 替换策略的 b_d_init 公式
+#: 数学:  b_{d,init} = σ_W · sqrt(2 · log(K_target))
+#: 来源: He et al. 2015 (arXiv:1502.01852) — 标准 Kaiming/He 初始化
+#:        实证扩展: 用 log(K_target) 替代 1/n_in，标定到 splitter 的 token 预算目标
+#: 默认 K_target = 16 (splitter 默认 K_fixed)
+#: σ_W 取决于 .weight 形状 (fan_in):
+#:   - 默认生产路径 (HilbertDistanceDecayConv1D.pointwise, kernel=1, in=256):
+#:       n_in = 256 * 1 = 256, σ_W ≈ 0.0361, b_{d,init}(K=16) ≈ 0.085
+#:   - 标准 Conv1d 路径 (kernel=5, in=256):
+#:       n_in = 256 * 5 = 1280, σ_W ≈ 0.0161, b_{d,init}(K=16) ≈ 0.038
+#: C0 vs C2 比较条件: 评估 +0.5 是否可由 Kaiming/He-derived 替代
+SPLITTER_BIAS_KAIMING_HE_FORMULA: str = "sigma_W * sqrt(2 * log(K_target))"
+
 # ==================== 注意力缩放常量 ====================
 
 #: Hilbert 路径偏置的缩放因子
@@ -219,87 +239,6 @@ import math  # noqa: E402
 from typing import Optional, Tuple  # noqa: E402
 
 
-def compute_max_level(image_size: int, min_patch_size: int) -> int:
-    """计算四叉树最大深度。
-
-    .. deprecated::
-        I145: 此函数已废弃。请使用 `depth_utils.compute_max_depth()`，
-        它支持元组形式的 image_size 和 hard_limit 参数。
-
-    数学形式化:
-        max_depth = ceil(log2(min(H, W) / min_patch_size))
-
-    推导:
-        - 深度 d 的 patch 尺寸 = min_patch_size × 2^d
-        - 目标: min_patch_size × 2^max_depth ≈ min(H, W)
-        - 解: max_depth ≈ log2(min(H, W) / min_patch_size)
-
-    示例:
-        224×224 图像, min_patch_size=4
-        -> 224/4 = 56
-        -> log2(56) ≈ 5.81
-        -> ceil = 6
-
-    Args:
-        image_size: 输入图像尺寸（最小边长）
-        min_patch_size: 最小 patch 尺寸
-
-    Returns:
-        四叉树分区的最大递归深度
-
-    Raises:
-        ValueError: 当 image_size 或 min_patch_size 非正数时
-    """
-    import warnings
-    warnings.warn(
-        "constants.compute_max_level() is deprecated. Use depth_utils.compute_max_depth() instead.",
-        DeprecationWarning,
-        stacklevel=2
-    )
-    if image_size <= 0:
-        raise ValueError(f"image_size 必须为正数, 得到 {image_size}")
-    if min_patch_size <= 0:
-        raise ValueError(f"min_patch_size 必须为正数, 得到 {min_patch_size}")
-
-    ratio = image_size // min_patch_size
-    if ratio <= 1:
-        return 0
-
-    return math.ceil(math.log2(ratio))
-
-
-def compute_num_candidates(max_level: int) -> int:
-    """计算四叉树候选节点总数。
-
-    .. deprecated::
-        I145: 此函数已废弃。请使用 `depth_utils.compute_total_candidates()`。
-
-    数学形式化:
-        N_candidates = Σ(4^d), d=0..max_level = (4^(max_level+1) - 1) / 3
-
-    示例:
-        max_level=0: N=1
-        max_level=1: N=1+4=5
-        max_level=2: N=1+4+16=21
-        max_level=6: N=5461
-
-    Args:
-        max_level: 四叉树最大深度
-
-    Returns:
-        候选节点总数
-    """
-    import warnings
-    warnings.warn(
-        "constants.compute_num_candidates() is deprecated. Use depth_utils.compute_total_candidates() instead.",
-        DeprecationWarning,
-        stacklevel=2
-    )
-    if max_level < 0:
-        raise ValueError(f"max_level 必须非负, 得到 {max_level}")
-    return (4 ** (max_level + 1) - 1) // 3
-
-
 def compute_k_bounds(
     max_level: int,
     token_coverage_min: float,
@@ -339,14 +278,14 @@ def compute_k_bounds(
     # I113-2: 处理废弃的 token_coverage_max
     if token_coverage_max is None:
         # 使用 target_ratio 计算 K_max
-        N = compute_num_candidates(max_level)
+        N = (4 ** (max_level + 1) - 1) // 3
         N_target = int(N * target_ratio)
         K_max = max(K_MIN_HARD_LIMIT, min(K_MAX_HARD_LIMIT, N_target))
         K_min = max(K_MIN_HARD_LIMIT, int(math.ceil(N * token_coverage_min)))
         return (K_min, K_max)
 
     # 计算候选节点总数
-    N = compute_num_candidates(max_level)
+    N = (4 ** (max_level + 1) - 1) // 3
 
     # 计算分辨率自适应 scale 因子
     if image_size is not None:
@@ -369,10 +308,6 @@ def compute_k_bounds(
     return K_min, K_max
 
 
-# 向后兼容别名
-compute_max_depth = compute_max_level
-
-
 def clamp_temperature(temperature: float, min_val: float = TEMPERATURE_MIN) -> float:
     """钳制温度参数到安全范围。
 
@@ -389,3 +324,66 @@ def clamp_temperature(temperature: float, min_val: float = TEMPERATURE_MIN) -> f
         钳制后的安全温度值
     """
     return max(temperature, min_val)
+
+
+# ==============================================================================
+# v1.3 STANDARD: Phase 1-2 calibration + component defaults
+# Reference: docs/superpowers/specs/2026-06-08-fractal-hilbert-vit-best-practice-design.md §9.10
+# ==============================================================================
+
+#: v1.3 STANDARD: Multi-Block HMFT 5-bin learnable h block sizes (B.3)
+#: Hilbert 局部性在 4^k 块上保持, 这 5 个 size 对应不同的 quadtree depth
+HMFT_BLOCK_SIZES: Tuple[int, ...] = (8, 16, 32, 64, 128)
+
+#: v1.3 STANDARD: HMFT 硬 K（每张图选中的 sub-block 数量）
+HMFT_K_HARD_GLOBAL_POOL: int = 8
+
+#: v1.3 STANDARD: Polar Voronoi 配置 (B.8-B.9)
+#: 最终 σ 值 (soft to hard 转换)
+POLAR_VORONOI_SIGMA_FINAL: float = 0.7
+#: soft start epoch (开始从 soft 过渡到 hard)
+POLAR_VORONOI_EPOCH_SOFT_START: int = 5
+#: 满载 epoch (完全 hard)
+POLAR_VORONOI_EPOCH_FULL: int = 16
+#: WBA(64) 边界值 (硬门槛) — design 阈值 2.5, 工程边界 2.55
+POLAR_VORONOI_WBA64_BOUNDARY: float = 2.55
+POLAR_VORONOI_WBA64_THRESHOLD: float = 2.5
+
+#: v1.3 STANDARD: EAHBP Attention 配置 (Phase 2)
+EAHBP_BLOCK_SIZE: int = 16
+EAHBP_GLOBAL_POOL: int = 8
+EAHBP_G1_PRECISION_GAIN: float = 0.002  # 0.2% 精度增益门槛
+EAHBP_G2_THROUGHPUT_GAIN: float = 1.4    # 1.4× 吞吐增益门槛
+EAHBP_G2_GME_FLOOR: float = 0.60         # 60% GME floor
+EAHBP_G3_GME_FLOOR: float = 0.40         # 40% GME floor (rollback below this)
+
+#: v1.3 STANDARD: MambaVision-Lite 配置 (B.10)
+MAMBA_LITE_PARAMS_TARGET: int = 44_000_000
+MAMBA_LITE_PARAMS_TOLERANCE: int = 1_000_000
+MAMBA_LITE_DISTILL_ALPHA: float = 0.7
+
+#: v1.3 STANDARD: 6 base parameter values (PoC calibration items, §9.10)
+#: A 值是 PENDING — 5x5 网格搜索可能更新（scripts/calibrate_6_params.py）
+V13_T_FATAL: float = 0.50
+V13_ALPHA_TREE: float = 1.20
+V13_ALPHA_SKEW: float = 0.40
+V13_GAMMA_KINETIC: float = 0.15
+V13_DELTA_WASHOUT: float = 0.05
+#: 运行时乘以 log(B) 给出 MI one-strike 阈值
+V13_EPSILON_LEAK_FACTOR: float = 0.25
+
+#: v1.3 STANDARD: Shadow Monitor 配置 (B.11)
+#: G1 WBA local entropy window size
+SHADOW_MONITOR_WBA_WINDOW: int = 16
+#: partial derivative 每个 epoch 计算一次
+SHADOW_MONITOR_PARTIAL_DERIVATIVE_EPOCH: int = 1
+
+#: v1.3 STANDARD: Paced Window 状态机 (Phase 2)
+#: D_struct circuit breaker: 连续 3 步 D_struct ≥ T_fatal → Hard Rollback
+PACED_WINDOW_FATAL_STREAK: int = 3
+#: Paced Window active 期间最多等待的 epoch 数
+PACED_WINDOW_MAX_EPOCHS: int = 5
+
+#: v1.3 STANDARD: R12 Auxiliary Loss 系数 (B.12)
+R12_LAMBDA_TREE: float = 0.10
+R12_LAMBDA_SKEW: float = 0.10
