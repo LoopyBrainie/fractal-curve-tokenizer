@@ -42,10 +42,10 @@ from .trainer import (  # noqa: E402
 )
 from .scheduler import create_scheduler  # noqa: E402
 from .monitor import (  # noqa: E402
-    GradientMonitor,
     LossMonitor,
 )
-from .callbacks import NaNGuard  # noqa: E402  # PR2: 替换 NumericalDefender
+# PR3: GradientMonitor → GradientMonitorCallback (monitor/gradient_monitor.py 已删除)
+from .callbacks import GradientMonitorCallback as GradientMonitor, NaNGuard
 from .checkpoint import (  # noqa: E402
     save_checkpoint,
     load_checkpoint,

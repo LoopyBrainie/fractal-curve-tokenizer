@@ -23,6 +23,7 @@ from .base import (
 )
 from .nan_guard import NaNGuard
 from .nan_dump import NaNDumpCallback
+from .gradient_monitor import GradientMonitorCallback
 
 __all__ = [
     # PR2 single-def (TrainerContext shared across PR2+PR5)
@@ -31,4 +32,6 @@ __all__ = [
     # PR2 numerical defense triad
     "NaNGuard",
     "NaNDumpCallback",
+    # PR3 gradient monitor
+    "GradientMonitorCallback",
 ]

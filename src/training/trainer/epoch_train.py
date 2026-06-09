@@ -18,11 +18,9 @@ from torch.utils.data import DataLoader
 from ..config import Config
 from .state import TrainingState, EpochMetrics
 from .loss import MixupCutmixLoss, compute_loss
-from ..monitor.gradient_monitor import GradientMonitor
+# PR3: GradientMonitor → GradientMonitorCallback (monitor/gradient_monitor.py 已删除)
+from ..callbacks import GradientMonitorCallback as GradientMonitor, NaNGuard, NaNDumpCallback
 from ..monitor.loss_monitor import LossMonitor
-# PR2: NumericalDefender → NaNGuard, NaNAutoInvestigation → NaNDumpCallback
-# (numerical_defense.py 模块已删除)
-from ..callbacks import NaNGuard, NaNDumpCallback
 
 
 def _get_flatten_layer_outputs():
@@ -304,7 +302,6 @@ def train_one_epoch(
             model=model,
             record_layer_norms=config.numerical.record_layer_grad_norms,
             hooks_enabled=config.numerical.record_grad_norms,
-            collector=collector,
         )
         # I-NAN: 注册梯度 hooks 以启用 layer_norms 追踪
         if config.numerical.record_grad_norms:
@@ -617,15 +614,9 @@ def train_one_epoch(
                     _backbone_grad_count += 1
                     _splitter_grad_count += 1
 
-            # C1: Spectral Norm 监控 - 每 100 步计算一次 Geometry 模块的谱范数
-            # 谱范数 = 权重矩阵的最大奇异值，反映结构健康度
-            # 异常阈值: >10 或突然翻倍预警
-            if (state.global_step + 1) % (config.training.log_interval * 10) == 0:
-                geo_spec_norms = grad_monitor.compute_geometry_spectral_norms()
-                if geo_spec_norms:
-                    for name, spec_norm in geo_spec_norms.items():
-                        if spec_norm > 10.0:
-                            print(f"  [WARN] Spectral norm explosion: {name} = {spec_norm:.2f}")
+            # PR3: SVD-based spectral norm monitoring removed (Q3 decision: SVD off,
+            # compute_geometry_spectral_norms causes GPU fp32 sync 每 100 步, 阻塞训练)。
+            # 改用 GradientMonitorCallback 的 layer_norms 范数监控。
 
         # 显存峰值监控
         if torch.cuda.is_available():

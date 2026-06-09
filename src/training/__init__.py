@@ -88,17 +88,17 @@ from .scheduler import (
 )
 
 from .monitor import (
-    GradientMonitor,
     LossMonitor,
     LossTracker,
     CombinedLossTracker,
 )
 
 # PR2: NaNGuard + NaNDumpCallback replace numerical_defense triad
-# (NumericalDefender / GradientValidator / NaNAutoInvestigation 已删除)
+# PR3: GradientMonitorCallback replaces monitor.gradient_monitor
 from .callbacks import (
     NaNGuard,
     NaNDumpCallback,
+    GradientMonitorCallback,
     TrainerCallback,
     TrainerContext,
 )
@@ -146,13 +146,14 @@ __all__ = [
     "StepScheduler",
     "create_scheduler",
     # Monitor
-    "GradientMonitor",
     "LossMonitor",
     "LossTracker",
     "CombinedLossTracker",
     # PR2 numerical defense (replaces numerical_defense triad)
     "NaNGuard",
     "NaNDumpCallback",
+    # PR3 gradient monitor (replaces monitor.gradient_monitor)
+    "GradientMonitorCallback",
     "TrainerCallback",
     "TrainerContext",
     # Checkpoint

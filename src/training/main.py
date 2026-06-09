@@ -39,9 +39,10 @@ from .trainer import (  # noqa: E402
 )
 from .scheduler import create_scheduler  # noqa: E402
 from .monitor import (  # noqa: E402
-    GradientMonitor,
     LossMonitor,
 )
+# PR3: GradientMonitor → GradientMonitorCallback
+from .callbacks import GradientMonitorCallback as GradientMonitor
 from .checkpoint import (  # noqa: E402
     save_checkpoint,
     load_checkpoint,
