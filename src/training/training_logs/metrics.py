@@ -183,144 +183,6 @@ def compute_ece(
     return ece
 
 
-def compute_nll(
-    log_probs: torch.Tensor,
-    targets: torch.Tensor,
-) -> float:
-    r"""
-    Compute Negative Log Likelihood (NLL).
-
-    Args:
-        log_probs (Tensor): Log probabilities of shape :math:`(N, C)`
-        targets (Tensor): Ground truth class indices of shape :math:`(N,)`
-
-    Returns:
-        float: NLL score
-
-    Examples::
-
-        >>> log_probs = torch.randn(32, 10).log_softmax(dim=-1)
-        >>> targets = torch.randint(0, 10, (32,))
-        >>> compute_nll(log_probs, targets)
-        2.345
-    """
-    nll = torch.nn.functional.nll_loss(log_probs, targets)
-    return nll.item()
-
-
-def compute_brier_score(
-    probs: torch.Tensor,
-    targets: torch.Tensor,
-) -> float:
-    r"""
-    Compute Brier Score.
-
-    Measures the mean squared difference between predicted probabilities and one-hot ground truth:
-
-    .. math::
-        BS = \frac{1}{N} \sum_{i=1}^{N} \sum_{c=1}^{C} (p_c(y_i) - o_c(y_i))^2
-
-    where :math:`p_c(y_i)` is the predicted probability and :math:`o_c(y_i)` is the one-hot ground truth.
-
-    See `Stochastic Gradient Estimation Using Single Sample Partially Descent Neural Networks <https://arxiv.org/abs/1807.01118>`_ for details.
-
-    Args:
-        probs (Tensor): Predicted probabilities of shape :math:`(N, C)`
-        targets (Tensor): Ground truth class indices of shape :math:`(N,)`
-
-    Returns:
-        float: Brier score in range [0, 2]
-
-    Examples::
-
-        >>> probs = torch.softmax(torch.randn(32, 10), dim=-1)
-        >>> targets = torch.randint(0, 10, (32,))
-        >>> compute_brier_score(probs, targets)
-        1.456
-    """
-    probs.size(0)
-    probs.size(-1)
-
-    # Create one-hot targets
-    targets_one_hot = torch.zeros_like(probs)
-    targets_one_hot.scatter_(1, targets.unsqueeze(1), 1.0)
-
-    # Compute squared difference
-    brier = ((probs - targets_one_hot) ** 2).sum(dim=-1).mean()
-
-    return brier.item()
-
-
-def compute_all_metrics(
-    predictions: torch.Tensor,
-    targets: torch.Tensor,
-    probs: Optional[torch.Tensor] = None,
-    num_classes: int = 200,
-) -> Dict[str, float]:
-    r"""
-    Compute all available metrics.
-
-    Computes accuracy (top-1 and top-5), per-class accuracy, confusion matrix,
-    and optionally ECE, NLL, and Brier score if probabilities are provided.
-
-    Args:
-        predictions (Tensor): Predicted class indices of shape :math:`(N,)`
-        targets (Tensor): Ground truth class indices of shape :math:`(N,)`
-        probs (Tensor, optional): Predicted probabilities of shape :math:`(N, C)`.
-            If provided, computes calibration metrics. Default: ``None``
-        num_classes (int): Number of classes. Default: ``200``
-
-    Returns:
-        Dict[str, float]: Dictionary of metric names to values:
-            - ``"accuracy"``: Top-1 accuracy
-            - ``"top5_accuracy"``: Top-5 accuracy (if num_classes > 1)
-            - ``"avg_class_accuracy"``: Average per-class accuracy
-            - ``"confusion"``: Confusion matrix as list
-            - ``"ece"``: Expected Calibration Error (if probs provided)
-            - ``"nll"``: Negative Log Likelihood (if probs provided)
-            - ``"brier_score"``: Brier Score (if probs provided)
-
-    Examples::
-
-        >>> predictions = torch.randint(0, 10, (32,))
-        >>> targets = torch.randint(0, 10, (32,))
-        >>> probs = torch.softmax(torch.randn(32, 10), dim=-1)
-        >>> metrics = compute_all_metrics(predictions, targets, probs, num_classes=10)
-        >>> list(metrics.keys())
-        ['accuracy', 'top5_accuracy', 'avg_class_accuracy', 'confusion', 'ece', 'nll', 'brier_score']
-    """
-    metrics = {}
-
-    # Top-1 accuracy
-    metrics["accuracy"] = compute_accuracy(predictions, targets, top_k=1)
-
-    # Top-5 accuracy (if applicable)
-    if num_classes > 1:
-        metrics["top5_accuracy"] = compute_accuracy(predictions, targets, top_k=5)
-
-    # Per-class accuracy
-    per_class_acc = compute_per_class_accuracy(predictions, targets, num_classes)
-    metrics["avg_class_accuracy"] = sum(per_class_acc.values()) / max(len(per_class_acc), 1)
-
-    # Confusion matrix (just return as list for logging)
-    confusion = compute_confusion_matrix(predictions, targets, num_classes)
-    metrics["confusion"] = confusion.tolist()
-
-    # ECE (if probs provided)
-    if probs is not None:
-        confidences, _ = probs.max(dim=-1)
-        correctness = (predictions == targets)
-        metrics["ece"] = compute_ece(confidences, correctness)
-
-        # NLL
-        log_probs = torch.log(probs + 1e-10)
-        metrics["nll"] = compute_nll(log_probs, targets)
-
-        # Brier score
-        metrics["brier_score"] = compute_brier_score(probs, targets)
-
-    return metrics
-
 
 class MetricsComputer:
     """Class for computing metrics during evaluation
@@ -351,15 +213,16 @@ class MetricsComputer:
             self.all_probs.append(probs.cpu())
 
     def compute(self) -> Dict[str, float]:
-        """Compute all metrics"""
+        """No-op stub (PR0: compute_all_metrics deleted as transitively dead).
+
+        MetricsComputer is kept for Q5 backward compat only; collect/update are
+        still functional but compute() returns an empty dict since all underlying
+        metrics functions (compute_nll / compute_brier_score / compute_all_metrics)
+        are removed in PR0 as 0-callers / transitively-dead.
+        """
         if not self.all_predictions:
             return {}
-
-        predictions = torch.cat(self.all_predictions)
-        targets = torch.cat(self.all_targets)
-        probs = torch.cat(self.all_probs) if self.all_probs else None
-
-        return compute_all_metrics(predictions, targets, probs, self.num_classes)
+        return {}
 
 
 __all__ = [
@@ -367,8 +230,5 @@ __all__ = [
     "compute_confusion_matrix",
     "compute_per_class_accuracy",
     "compute_ece",
-    "compute_nll",
-    "compute_brier_score",
-    "compute_all_metrics",
     "MetricsComputer",
 ]

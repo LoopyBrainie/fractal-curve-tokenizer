@@ -340,46 +340,8 @@ class GradientMonitor:
         self.clear_hooks()
 
 
-class GradientStatisticsTracker:
-    """Track gradient statistics over time
-
-    Aggregates gradient statistics across multiple steps.
-    """
-
-    def __init__(self, window_size: int = 100):
-        self.window_size = window_size
-        self.history: List[float] = []
-
-    def add(self, norm: float) -> None:
-        """Add a gradient norm value"""
-        self.history.append(norm)
-        if len(self.history) > self.window_size:
-            self.history.pop(0)
-
-    def get_statistics(self) -> Dict[str, float]:
-        """Get statistics over the window
-
-        Returns:
-            Dictionary of statistics
-        """
-        if not self.history:
-            return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
-
-        return {
-            "mean": sum(self.history) / len(self.history),
-            "std": (sum((x - sum(self.history)/len(self.history))**2 for x in self.history) / len(self.history)) ** 0.5,
-            "min": min(self.history),
-            "max": max(self.history),
-        }
-
-    def reset(self) -> None:
-        """Clear history"""
-        self.history.clear()
-
-
 __all__ = [
     "GradientMonitor",
-    "GradientStatisticsTracker",
     "EnhancedGradientMonitor",
 ]
 

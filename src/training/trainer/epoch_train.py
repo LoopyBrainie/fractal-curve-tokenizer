@@ -897,66 +897,6 @@ def train_one_epoch(
     return metrics
 
 
-def train_one_epoch_simple(
-    model: nn.Module,
-    dataloader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    num_epochs: int = 1,
-    gradient_clip_norm: float = 1.0,
-    log_interval: int = 50,
-) -> Dict[str, float]:
-    """Simplified training loop (minimal version)
-
-    For quick testing without full config.
-
-    Args:
-        model: Model to train
-        dataloader: Data loader
-        optimizer: Optimizer
-        device: Device
-        num_epochs: Number of epochs
-        gradient_clip_norm: Gradient clipping threshold
-        log_interval: Logging interval
-
-    Returns:
-        Dictionary of metrics
-    """
-    model.train()
-    total_loss = 0.0
-    num_batches = 0
-
-    for epoch in range(num_epochs):
-        for batch_idx, batch in enumerate(dataloader):
-            images = batch[0].to(device, non_blocking=True)
-            labels = batch[1].to(device, non_blocking=True)
-
-            optimizer.zero_grad()
-
-            forward_output, _metrics = model(images)
-            loss = torch.nn.functional.cross_entropy(forward_output.logits, labels)
-            loss.backward()
-
-            if gradient_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
-
-            optimizer.step()
-
-            total_loss += loss.item()
-            num_batches += 1
-
-            if (batch_idx + 1) % log_interval == 0:
-                print(f"Epoch [{epoch + 1}/{num_epochs}] "
-                      f"Batch [{batch_idx + 1}] "
-                      f"Loss: {loss.item():.4f}")
-
-    return {
-        "avg_loss": total_loss / max(num_batches, 1),
-    }
-
-
 __all__ = [
     "train_one_epoch",
-    "train_one_epoch_simple",
-
 ]

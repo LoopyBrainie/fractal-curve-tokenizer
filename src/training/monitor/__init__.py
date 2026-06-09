@@ -3,7 +3,7 @@
 Numerical monitoring and defense.
 """
 
-from .gradient_monitor import GradientMonitor, GradientStatisticsTracker
+from .gradient_monitor import GradientMonitor
 from .loss_monitor import LossMonitor, LossTracker, CombinedLossTracker
 from .numerical_defense import (
     AnomalyDetectionContext,
@@ -16,7 +16,6 @@ from .unified import UnifiedMonitor
 
 __all__ = [
     "GradientMonitor",
-    "GradientStatisticsTracker",
     "LossMonitor",
     "LossTracker",
     "CombinedLossTracker",

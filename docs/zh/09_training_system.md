@@ -18,14 +18,14 @@ src/training/
 ├── config.py           # Config, TrainingHyperparams, NumericalConfig 等
 ├── train_fractal_vit.py # 主训练入口
 ├── trainer/
-│   ├── epoch_train.py  # train_one_epoch, train_one_epoch_simple
-│   ├── epoch_eval.py   # evaluate, evaluate_simple
+│   ├── epoch_train.py  # train_one_epoch
+│   ├── epoch_eval.py   # evaluate
 │   ├── loss.py         # MixupCutmixLoss, compute_loss
 │   └── state.py        # TrainingState, EpochMetrics
 ├── scheduler/
 │   └── lr_scheduler.py # WarmupCosineScheduler, create_scheduler
 ├── monitor/
-│   ├── gradient_monitor.py   # GradientMonitor, GradientStatisticsTracker
+│   ├── gradient_monitor.py   # GradientMonitor
 │   ├── loss_monitor.py       # LossMonitor, LossTracker
 │   └── numerical_defense.py   # NumericalDefender, GradientValidator
 ├── checkpoint/
@@ -33,7 +33,7 @@ src/training/
 │   └── loader.py       # load_checkpoint, find_latest_checkpoint
 └── training_logs/
     ├── epoch_logger.py  # EpochLogger
-    └── metrics.py       # MetricsTracker, compute_* 函数
+    └── metrics.py       # compute_accuracy, compute_ece, MetricsComputer (Q5 kept)
 ```
 
 ---
@@ -417,25 +417,7 @@ best = find_best_checkpoint('./checkpoints')
 
 ## 9.9 指标和日志
 
-### MetricsTracker
-
-```python
-from src.training.training_logs import MetricsTracker, compute_accuracy
-
-tracker = MetricsTracker()
-
-# 训练期间
-for outputs, targets in dataloader:
-    tracker.update(outputs=outputs, targets=targets)
-
-# 计算指标
-metrics = tracker.compute()
-# {
-#     'top1_accuracy': 0.85,
-#     'top5_accuracy': 0.98,
-#     'num_samples': 1000,
-# }
-```
+> **PR0 (trainer refactor)**: `MetricsTracker` 已删除（0 调用者 + transitively dead chain）。EpochLogger 仍保留，承担完整日志职责。如需自定义指标累加，建议直接使用 `EpochLogger.log()` 或在 PR2 之后使用 `LossComponentsAccumulator` callback。
 
 ### compute_accuracy
 
@@ -568,7 +550,7 @@ for images, labels in train_loader:
 | `save_checkpoint` | ✅ 完成 | `src/training/checkpoint/saver.py` |
 | `load_checkpoint` | ✅ 完成 | `src/training/checkpoint/loader.py` |
 | `EpochLogger` | ✅ 完成 | `src/training/logging/epoch_logger.py` |
-| `MetricsTracker` | ✅ 完成 | `src/training/logging/metrics.py` |
+|  | 🗑️ PR0 删除 | (transitively dead, 0 callers) |
 
 ---
 

@@ -202,63 +202,6 @@ class EpochLogger:
         return best_epoch
 
 
-class MetricsTracker:
-    """Track metrics over training with summary statistics"""
-
-    def __init__(self):
-        self.metrics: Dict[str, list] = {}
-
-    def add(self, name: str, value: float) -> None:
-        """Add a metric value"""
-        if name not in self.metrics:
-            self.metrics[name] = []
-        self.metrics[name].append(value)
-
-    def get_history(self, name: str) -> list:
-        """Get history of a metric"""
-        return self.metrics.get(name, [])
-
-    def get_latest(self, name: str, default: float = 0.0) -> float:
-        """Get latest value of a metric"""
-        history = self.metrics.get(name, [])
-        return history[-1] if history else default
-
-    def get_best(self, name: str, mode: str = "max") -> float:
-        """Get best value of a metric"""
-        history = self.metrics.get(name, [])
-        if not history:
-            return 0.0
-        return max(history) if mode == "min" else max(history)
-
-    def get_average(self, name: str, window: Optional[int] = None) -> float:
-        """Get average of a metric over window"""
-        history = self.metrics.get(name, [])
-        if not history:
-            return 0.0
-
-        if window is not None:
-            history = history[-window:]
-
-        return sum(history) / len(history)
-
-    def summary(self) -> Dict[str, Dict[str, float]]:
-        """Get summary statistics for all metrics"""
-        summary_dict = {}
-
-        for name, values in self.metrics.items():
-            if values:
-                summary_dict[name] = {
-                    "latest": values[-1],
-                    "mean": sum(values) / len(values),
-                    "min": min(values),
-                    "max": max(values),
-                    "count": len(values),
-                }
-
-        return summary_dict
-
-
 __all__ = [
     "EpochLogger",
-    "MetricsTracker",
 ]

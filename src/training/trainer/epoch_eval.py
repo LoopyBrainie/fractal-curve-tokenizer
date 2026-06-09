@@ -287,63 +287,7 @@ def compute_ece_score(
     return ece
 
 
-def evaluate_simple(
-    model: nn.Module,
-    dataloader: DataLoader,
-    device: torch.device,
-    num_classes: int = 200,
-) -> Dict[str, float]:
-    """Simplified evaluation (minimal version)
-
-    For quick testing without full config.
-
-    Args:
-        model: Model to evaluate
-        dataloader: Data loader
-        device: Device
-        num_classes: Number of classes
-
-    Returns:
-        Dictionary of metrics
-    """
-    model.eval()
-
-    total_correct = 0
-    total_top5_correct = 0
-    total_samples = 0
-
-    total_batches = len(dataloader)
-
-    with torch.no_grad():
-        for batch_idx, batch in tqdm(enumerate(dataloader), total=total_batches, desc="Evaluating", leave=False):
-            images = batch[0].to(device, non_blocking=True)
-            labels = batch[1].to(device, non_blocking=True)
-
-            outputs = model(images)
-            if hasattr(outputs, 'logits'):
-                outputs = outputs.logits
-
-            pred = outputs.argmax(dim=-1)
-            total_correct += (pred == labels).sum().item()
-
-            if num_classes > 1:
-                _, top5_pred = outputs.topk(min(5, num_classes), dim=-1)
-                top5_correct = (top5_pred == labels.unsqueeze(-1)).any(dim=-1).sum().item()
-                total_top5_correct += top5_correct
-
-            total_samples += labels.size(0)
-
-    accuracy = total_correct / total_samples
-    top5_accuracy = total_top5_correct / total_samples if total_samples > 0 else 0.0
-
-    return {
-        "accuracy": accuracy,
-        "top5_accuracy": top5_accuracy,
-    }
-
-
 __all__ = [
     "evaluate",
-    "evaluate_simple",
     "compute_ece_score",
 ]

@@ -261,47 +261,6 @@ def compute_loss(
     return loss, components
 
 
-def compute_label_smoothing_loss(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    num_classes: int,
-    smoothing: float = 0.1,
-) -> torch.Tensor:
-    r"""
-    Compute cross entropy with label smoothing.
-
-    Formula:
-        :math:`y'_c = (1 - \epsilon) \cdot y_c + \epsilon / C`
-        :math:`CE_{smoothed} = -\sum_c y'_c \cdot \log(p_c)`
-
-    Args:
-        logits (Tensor): Model outputs of shape :math:`(B, C)`
-        labels (Tensor): Class labels of shape :math:`(B,)`
-        num_classes (int): Number of classes
-        smoothing (float): Smoothing factor :math:`\epsilon`. Default: ``0.1``
-
-    Returns:
-        Tensor: Scalar loss
-
-    Examples::
-
-        >>> logits = torch.randn(32, 10)
-        >>> labels = torch.randint(0, 10, (32,))
-        >>> loss = compute_label_smoothing_loss(logits, labels, num_classes=10, smoothing=0.1)
-        >>> loss.item()
-        2.123
-    """
-    log_probs = F.log_softmax(logits, dim=-1)
-
-    # Create smoothed labels
-    with torch.no_grad():
-        true_dist = torch.zeros_like(log_probs)
-        true_dist.fill_(smoothing / num_classes)
-        true_dist.scatter_(1, labels.unsqueeze(1), 1.0 - smoothing)
-
-    return torch.mean(torch.sum(-true_dist * log_probs, dim=-1))
-
-
 class AuxiliaryLossTracker:
     """Track auxiliary losses during training
 
@@ -400,7 +359,6 @@ class UnifiedLoss:
 __all__ = [
     "MixupCutmixLoss",
     "compute_loss",
-    "compute_label_smoothing_loss",
     "AuxiliaryLossTracker",
     "UnifiedLoss",
 ]
