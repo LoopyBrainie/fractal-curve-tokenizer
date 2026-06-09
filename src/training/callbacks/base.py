@@ -93,6 +93,11 @@ class TrainerContext:
     should_skip_step: bool = False
     warmup_params: dict = field(default_factory=dict)
 
+    # === PR5c skeleton↔callback 契约字段 (骨架写入, 回调读取) ===
+    aux_forward: Any = None         # ForwardOutput (供 FractalTreeRegCallback 读 parent_logits)
+    loss_components_batch: Any = None  # per-batch components dict (供 LossComponentsAccumulator.on_batch_end 累加)
+    epoch_num_batches: int = 0      # LossComponentsAccumulator.on_epoch_end 归一化分母
+
 
 class TrainerCallback:
     """外延功能挂点。所有方法默认 no-op。
@@ -169,6 +174,7 @@ class TrainerCallback:
         Returns:
             bool: True = 已处理,False = 未处理 (re-raise)
         """
+        del ctx, exc  # 默认不处理, 参数保留以满足 LSP + 允许子类重写
         return False
 
 

@@ -41,11 +41,13 @@ from .trainer import (  # noqa: E402
     MixupCutmixLoss,
 )
 from .scheduler import create_scheduler  # noqa: E402
-from .monitor import (  # noqa: E402
-    LossMonitor,
+# PR5c: monitor/ 子包已删除, loss_monitor → LossComponentsAccumulator (PR4 收敛)
+# grad_monitor → GradientMonitorCallback (PR3 收敛), defender → NaNGuard (PR2 保留)
+from .callbacks import (  # noqa: E402
+    NaNGuard,
+    TrainerContext,
+    build_callbacks,
 )
-# PR3: GradientMonitor → GradientMonitorCallback (monitor/gradient_monitor.py 已删除)
-from .callbacks import GradientMonitorCallback as GradientMonitor, NaNGuard
 from .checkpoint import (  # noqa: E402
     save_checkpoint,
     load_checkpoint,
@@ -624,15 +626,7 @@ def train(
         )
 
     # Create monitors - I-OOM FIX: 移到循环外，只创建一次
-    grad_monitor = GradientMonitor(
-        model=model,
-        record_layer_norms=config.numerical.record_layer_grad_norms,
-        hooks_enabled=config.numerical.record_grad_norms,
-    )
-    # I-OOM FIX: 注册 hooks 一次，不再每 epoch 重复注册
-    if config.numerical.record_grad_norms:
-        grad_monitor.register_hooks(model)
-    loss_monitor = LossMonitor()
+    # PR5c: grad_monitor / loss_monitor → callbacks (PR3/PR4); defender → NaNGuard (PR2)
     defender = NaNGuard(
         model=model,
         detect_anomaly=config.numerical.detect_anomaly,
@@ -720,27 +714,42 @@ def train(
             tau_epochs=getattr(args, 'tau_epochs', 20),
         )
 
-        # Train one epoch
+        # PR5c: 一次性构建 TrainerContext (callbacks + nan_guard 注入)
+        # 在 epoch loop 外构建可避免每 epoch 重建 callback 列表 (PR4 收敛)
+        if epoch == state.epoch:
+            # 仅首 epoch 构建, 后续 epoch 复用同一 ctx
+            callbacks = build_callbacks(config)
+            ctx = TrainerContext(
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                scheduler=scheduler,
+                state=state,
+                nan_guard=defender,
+                callbacks=callbacks,
+                epoch=epoch,
+                global_step=state.global_step,
+                device=device,
+                config=config,
+                mixup=mixup_cutmix,
+                amp=config.amp.enabled,
+                grad_clip=float(config.training.gradient_clip_norm),
+            )
+        else:
+            ctx.epoch = epoch  # 同步 ctx.epoch
+            ctx.global_step = state.global_step
+
+        # PR5c skeleton: 4-hook, 6-param 签名
         train_metrics = train_one_epoch(
             model=model,
             dataloader=train_loader,
             optimizer=optimizer,
             scaler=scaler,
             state=state,
-            config=config,
-            device=device,
-            scheduler=scheduler,
-            mixup_cutmix=mixup_cutmix,
-            debug_dir=str(output_dir / "debug"),
-            warmup_params=warmup_params,
-            grad_monitor=grad_monitor,
-            loss_monitor=loss_monitor,
-            defender=defender,
+            ctx=ctx,
         )
 
-        # Reset monitors
-        grad_monitor.reset()
-        loss_monitor.reset()
+        # PR5c: grad_monitor / loss_monitor reset 走 callback 内部, 骨架不再管
         defender.clear()  # I-SLOW FIX: 清理 NaNGuard._pending_stats_tensors 中的 GPU tensor 引用
 
         # Evaluate

@@ -21,35 +21,36 @@ from .hmft_h_probs import HMFTHProbsCallback
 from .loss_components import LossComponentsAccumulator
 
 
-def build_callbacks(args: Any, _model=None, _ctx=None) -> List[TrainerCallback]:
-    """Construct the default callback list from CLI args + ctx.
+def build_callbacks(config: Any) -> List[TrainerCallback]:
+    """Construct the default callback list from `config` (PR5c+).
 
     Always-on:
       - LossComponentsAccumulator (PR4 contract, PR5c wires it)
 
-    Opt-in (CLI flags, default False):
-      - FractalTreeRegCallback (T3 R12, --enable-r12-aux)
-      - HMFTHProbsCallback (T6 HMFT, default-on behavior retained in PR5c)
+    Opt-in (config flags, default off):
+      - FractalTreeRegCallback (T3 R12, `config.training.enable_r12_aux`)
+      - HMFTHProbsCallback (T6 HMFT, `config.training.enable_hmft_h_probs`, default-on)
 
     NaN / gradient monitoring is wired separately via `ctx.nan_guard`
     and `GradientMonitorCallback` — they are not constructed here.
     """
     cbs: List[TrainerCallback] = []
+    training_cfg = getattr(config, "training", None)
 
     # Always-on: loss components accumulator
     cbs.append(LossComponentsAccumulator())
 
-    # T3 R12 (opt-in)
-    if bool(getattr(args, "enable_r12_aux", False)):
+    # T3 R12 (opt-in via config.training.enable_r12_aux)
+    if bool(getattr(training_cfg, "enable_r12_aux", False)):
         cbs.append(
             FractalTreeRegCallback(
-                lambda_tree=float(getattr(args, "r12_lambda_tree", 1.0)),
-                lambda_skew=float(getattr(args, "r12_lambda_skew", 1.0)),
+                lambda_tree=float(getattr(training_cfg, "r12_lambda_tree", 1.0)),
+                lambda_skew=float(getattr(training_cfg, "r12_lambda_skew", 1.0)),
             )
         )
 
     # T6 HMFT h_probs (default-on in v1.3 STANDARD)
-    if bool(getattr(args, "enable_hmft_h_probs", True)):
+    if bool(getattr(training_cfg, "enable_hmft_h_probs", True)):
         cbs.append(HMFTHProbsCallback())
 
     # Sort by priority (stable; preserves insertion order for ties)

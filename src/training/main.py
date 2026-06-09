@@ -38,11 +38,13 @@ from .trainer import (  # noqa: E402
     MixupCutmixLoss,
 )
 from .scheduler import create_scheduler  # noqa: E402
-from .monitor import (  # noqa: E402
-    LossMonitor,
+# PR5c/PR6: LossMonitor / monitor/ 子包已删除, 数值防御走 ctx.nan_guard (NaNGuard)
+# + LossComponentsAccumulator callback, 梯度监控走 GradientMonitorCallback
+from .callbacks import (  # noqa: E402
+    NaNGuard,
+    TrainerContext,
+    build_callbacks,
 )
-# PR3: GradientMonitor → GradientMonitorCallback
-from .callbacks import GradientMonitorCallback as GradientMonitor
 from .checkpoint import (  # noqa: E402
     save_checkpoint,
     load_checkpoint,
@@ -214,18 +216,35 @@ def train(
             mixup_prob=config.training.mixup_cutmix_prob,
         )
 
-    # Create monitors
-    grad_monitor = GradientMonitor(
-        model=model,
-        record_layer_norms=config.numerical.record_layer_grad_norms,
-    )
-    loss_monitor = LossMonitor()
-
     # Create logger
     logger = EpochLogger(output_dir=str(output_dir))
 
     # Move model to device
     model = model.to(device)
+
+    # PR5c: 构建 TrainerContext (callbacks + nan_guard 一次性组装)
+    nan_guard = NaNGuard(
+        model=model,
+        detect_anomaly=config.numerical.detect_anomaly,
+        skip_on_nan=config.numerical.skip_on_nan_grad,
+    )
+    callbacks = build_callbacks(config)
+    ctx = TrainerContext(
+        model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+        scheduler=scheduler,
+        state=state,
+        nan_guard=nan_guard,
+        callbacks=callbacks,
+        epoch=state.epoch,
+        global_step=state.global_step,
+        device=device,
+        config=config,
+        mixup=mixup_cutmix,
+        amp=config.amp.enabled,
+        grad_clip=float(config.training.gradient_clip_norm),
+    )
 
     # Training loop
     print(f"\n{'='*60}")
@@ -234,23 +253,17 @@ def train(
 
     for epoch in range(state.epoch, config.training.num_epochs):
         state.epoch = epoch
+        ctx.epoch = epoch  # 同步 ctx.epoch (callback 读)
 
-        # Train one epoch
+        # PR5c skeleton: 4-hook, 6-param 签名
         train_metrics = train_one_epoch(
             model=model,
             dataloader=train_loader,
             optimizer=optimizer,
             scaler=scaler,
             state=state,
-            config=config,
-            device=device,
-            scheduler=scheduler,
-            mixup_cutmix=mixup_cutmix,
+            ctx=ctx,
         )
-
-        # Reset monitors
-        grad_monitor.reset()
-        loss_monitor.reset()
 
         # Evaluate
         eval_metrics = None
