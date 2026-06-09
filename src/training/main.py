@@ -41,7 +41,6 @@ from .scheduler import create_scheduler  # noqa: E402
 from .monitor import (  # noqa: E402
     GradientMonitor,
     LossMonitor,
-    NumericalDefender,
 )
 from .checkpoint import (  # noqa: E402
     save_checkpoint,
@@ -220,11 +219,6 @@ def train(
         record_layer_norms=config.numerical.record_layer_grad_norms,
     )
     loss_monitor = LossMonitor()
-    NumericalDefender(
-        model=model,
-        detect_anomaly=config.numerical.detect_anomaly,
-        skip_on_nan=config.numerical.skip_on_nan_grad,
-    )
 
     # Create logger
     logger = EpochLogger(output_dir=str(output_dir))

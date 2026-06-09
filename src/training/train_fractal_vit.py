@@ -44,8 +44,8 @@ from .scheduler import create_scheduler  # noqa: E402
 from .monitor import (  # noqa: E402
     GradientMonitor,
     LossMonitor,
-    NumericalDefender,
 )
+from .callbacks import NaNGuard  # noqa: E402  # PR2: 替换 NumericalDefender
 from .checkpoint import (  # noqa: E402
     save_checkpoint,
     load_checkpoint,
@@ -633,7 +633,7 @@ def train(
     if config.numerical.record_grad_norms:
         grad_monitor.register_hooks(model)
     loss_monitor = LossMonitor()
-    defender = NumericalDefender(
+    defender = NaNGuard(
         model=model,
         detect_anomaly=config.numerical.detect_anomaly,
         skip_on_nan=config.numerical.skip_on_nan_grad,
@@ -741,7 +741,7 @@ def train(
         # Reset monitors
         grad_monitor.reset()
         loss_monitor.reset()
-        defender.clear()  # I-SLOW FIX: 清理 NumericalDefender.stats 中的 GPU tensor 引用
+        defender.clear()  # I-SLOW FIX: 清理 NaNGuard._pending_stats_tensors 中的 GPU tensor 引用
 
         # Evaluate
         eval_metrics = None

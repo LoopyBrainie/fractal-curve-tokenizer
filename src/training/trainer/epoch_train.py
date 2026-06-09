@@ -20,7 +20,9 @@ from .state import TrainingState, EpochMetrics
 from .loss import MixupCutmixLoss, compute_loss
 from ..monitor.gradient_monitor import GradientMonitor
 from ..monitor.loss_monitor import LossMonitor
-from ..monitor.numerical_defense import NumericalDefender, NaNAutoInvestigation
+# PR2: NumericalDefender → NaNGuard, NaNAutoInvestigation → NaNDumpCallback
+# (numerical_defense.py 模块已删除)
+from ..callbacks import NaNGuard, NaNDumpCallback
 
 
 def _get_flatten_layer_outputs():
@@ -267,8 +269,8 @@ def train_one_epoch(
     # I-OOM FIX: Monitors now passed from outside to prevent O(N^2) hook leak
     grad_monitor: Optional[GradientMonitor] = None,
     loss_monitor: Optional[LossMonitor] = None,
-    defender: Optional[NumericalDefender] = None,
-    nan_investigator: Optional[NaNAutoInvestigation] = None,
+    defender: Optional[NaNGuard] = None,
+    nan_investigator: Optional[NaNDumpCallback] = None,
     # v1.3 STANDARD: opt-in trainer hooks (Shadow Monitor, EAHBP 3-gate, Paced Window)
     shadow_hooks: Optional[Any] = None,
 ) -> EpochMetrics:
@@ -312,11 +314,10 @@ def train_one_epoch(
         loss_monitor = LossMonitor(collector=collector)
 
     if defender is None:
-        defender = NumericalDefender(
+        defender = NaNGuard(
             model=model,
             detect_anomaly=config.numerical.detect_anomaly,
             skip_on_nan=config.numerical.skip_on_nan_grad,
-            collector=collector,
         )
         defender.register_discovery_hooks()
 
@@ -325,7 +326,7 @@ def train_one_epoch(
     # I-OOM FIX: Only create if not provided
     if nan_investigator is None:
         _debug_dir = debug_dir if debug_dir else "experiments/debug"
-        nan_investigator = NaNAutoInvestigation(
+        nan_investigator = NaNDumpCallback(
             model=model,
             debug_dir=_debug_dir,
             enabled=True,  # 始终启用，用于捕获第一次 NaN
@@ -737,18 +738,25 @@ def train_one_epoch(
             current_loss_components = loss_monitor.get_last_components() if hasattr(loss_monitor, 'get_last_components') else {}
 
             # 触发 NaN 自动取证
-            debug_path = nan_investigator.investigate(
+            # PR2: NaNDumpCallback.investigate(ctx) 取代旧 explicit-kwargs API。
+            # 用 SimpleNamespace 构造最小 ctx, PR5 骨架会传入真正的 TrainerContext。
+            from types import SimpleNamespace
+            _nan_ctx = SimpleNamespace(
                 epoch=state.epoch,
-                step=state.global_step,
-                loss_value=loss.item(),
-                pre_clip_grad_norm=pre_clip_grad_norm,
-                input_stats=_input_stats,
-                classification_logits_stats=classification_logits_stats,
-                feature_stats=feature_stats,
-                amp_loss_scale=amp_loss_scale,
-                learning_rate=current_lr,
+                global_step=state.global_step,
+                metrics={
+                    "train/inputs_has_nan": _input_stats.get("images_has_nan", False) if _input_stats else False,
+                    "train/logits_has_nan": classification_logits_stats.get("logits_has_nan", False) if classification_logits_stats else False,
+                    "train/logits_has_inf": classification_logits_stats.get("logits_has_inf", False) if classification_logits_stats else False,
+                    "train/feature_max": feature_stats.get("max", 0.0) if feature_stats else 0.0,
+                    "train/feature_has_nan": feature_stats.get("has_nan", False) if feature_stats else False,
+                    "train/feature_has_inf": feature_stats.get("has_inf", False) if feature_stats else False,
+                    "train/amp_loss_scale": amp_loss_scale,
+                },
                 loss_components=current_loss_components,
+                nan_guard=defender,
             )
+            debug_path = nan_investigator.investigate(_nan_ctx)
             if debug_path:
                 print(f"[CRITICAL] NaN detected! Debug info: {debug_path}")
 

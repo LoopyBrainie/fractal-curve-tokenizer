@@ -26,8 +26,12 @@ src/training/
 │   └── lr_scheduler.py # WarmupCosineScheduler, create_scheduler
 ├── monitor/
 │   ├── gradient_monitor.py   # GradientMonitor (PR3: → GradientMonitorCallback)
-│   ├── loss_monitor.py       # LossMonitor, LossTracker
-│   └── numerical_defense.py   # NumericalDefender, GradientValidator (PR2: → NaNGuard)
+│   └── loss_monitor.py       # LossMonitor, LossTracker (PR5: → callbacks/LossComponentsAccumulator)
+├── callbacks/                   (PR2 新建)
+│   ├── base.py                 # TrainerContext (single-def) + TrainerCallback ABC
+│   ├── nan_guard.py            # NaNGuard (骨架硬依赖, 替换 numerical_defense 三件套)
+│   ├── nan_dump.py             # NaNDumpCallback (--debug 启用, 默认 off)
+│   └── __init__.py             # 4 公共符号 re-export
 ├── checkpoint/
 │   ├── saver.py        # save_checkpoint, save_epoch_stats
 │   └── loader.py       # load_checkpoint, find_latest_checkpoint
@@ -37,6 +41,8 @@ src/training/
 ```
 
 > **PR1 (trainer refactor)**: 整个 `metrics/` 子包(640 行)、`monitor/unified.py`(257 行)、`monitor/shadow.py`(Q2 决议铲除 v1.3 Shadow Monitor)、`training_logs/pipeline.py`(102 行)、`trainer/loss.py` 中的 `AuxiliaryLossTracker` + `UnifiedLoss`(共 -93 行)已删除。`shadow.py` 删除同时使依赖 `MetricsCollector` 的 `ShadowMonitorTrainerHooks` 失效,这是 Q2 决策的预期级联。详见 `plan fluffy-watching-turing.md §3 PR1`。
+
+> **PR2 (trainer refactor)**: `monitor/numerical_defense.py`(810 行)整文件删除,合并为 `callbacks/NaNGuard`(257 行)+ `callbacks/NaNDumpCallback`(328 行)。`TrainerContext` + `TrainerCallback` 在 `callbacks/base.py` PR2 唯一单一定义,供 PR5 共享使用。`epoch_train.py` 已部分迁移到 `NaNGuard` (defender 参数) + `NaNDumpCallback` (nan_investigator 参数) 新 API,旧 `NumericalDefender` / `NaNAutoInvestigation` 引用 0 命中。`SimpleNamespace` 临时 ctx 包装用于 nan_investigator.investigate 调用,PR5 骨架会传入真 `TrainerContext`。详见 `plan fluffy-watching-turing.md §3 PR2`。
 
 ---
 

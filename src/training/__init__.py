@@ -92,10 +92,15 @@ from .monitor import (
     LossMonitor,
     LossTracker,
     CombinedLossTracker,
-    AnomalyDetectionContext,
-    GradientValidator,
-    NumericalDefender,
-    check_tensor_numerical_health,
+)
+
+# PR2: NaNGuard + NaNDumpCallback replace numerical_defense triad
+# (NumericalDefender / GradientValidator / NaNAutoInvestigation 已删除)
+from .callbacks import (
+    NaNGuard,
+    NaNDumpCallback,
+    TrainerCallback,
+    TrainerContext,
 )
 
 from .checkpoint import (
@@ -145,10 +150,11 @@ __all__ = [
     "LossMonitor",
     "LossTracker",
     "CombinedLossTracker",
-    "AnomalyDetectionContext",
-    "GradientValidator",
-    "NumericalDefender",
-    "check_tensor_numerical_health",
+    # PR2 numerical defense (replaces numerical_defense triad)
+    "NaNGuard",
+    "NaNDumpCallback",
+    "TrainerCallback",
+    "TrainerContext",
     # Checkpoint
     "save_checkpoint",
     "save_epoch_stats",
