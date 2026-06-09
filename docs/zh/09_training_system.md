@@ -20,14 +20,14 @@ src/training/
 ├── trainer/
 │   ├── epoch_train.py  # train_one_epoch
 │   ├── epoch_eval.py   # evaluate
-│   ├── loss.py         # MixupCutmixLoss, compute_loss
+│   ├── loss.py         # MixupCutmixLoss, compute_loss (PR1: AuxiliaryLossTracker/UnifiedLoss 删)
 │   └── state.py        # TrainingState, EpochMetrics
 ├── scheduler/
 │   └── lr_scheduler.py # WarmupCosineScheduler, create_scheduler
 ├── monitor/
-│   ├── gradient_monitor.py   # GradientMonitor
+│   ├── gradient_monitor.py   # GradientMonitor (PR3: → GradientMonitorCallback)
 │   ├── loss_monitor.py       # LossMonitor, LossTracker
-│   └── numerical_defense.py   # NumericalDefender, GradientValidator
+│   └── numerical_defense.py   # NumericalDefender, GradientValidator (PR2: → NaNGuard)
 ├── checkpoint/
 │   ├── saver.py        # save_checkpoint, save_epoch_stats
 │   └── loader.py       # load_checkpoint, find_latest_checkpoint
@@ -35,6 +35,8 @@ src/training/
     ├── epoch_logger.py  # EpochLogger
     └── metrics.py       # compute_accuracy, compute_ece, MetricsComputer (Q5 kept)
 ```
+
+> **PR1 (trainer refactor)**: 整个 `metrics/` 子包(640 行)、`monitor/unified.py`(257 行)、`monitor/shadow.py`(Q2 决议铲除 v1.3 Shadow Monitor)、`training_logs/pipeline.py`(102 行)、`trainer/loss.py` 中的 `AuxiliaryLossTracker` + `UnifiedLoss`(共 -93 行)已删除。`shadow.py` 删除同时使依赖 `MetricsCollector` 的 `ShadowMonitorTrainerHooks` 失效,这是 Q2 决策的预期级联。详见 `plan fluffy-watching-turing.md §3 PR1`。
 
 ---
 

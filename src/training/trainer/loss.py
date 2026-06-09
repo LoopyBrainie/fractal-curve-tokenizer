@@ -5,7 +5,10 @@ Following the three-layer parameter principle, this module only handles
 Layer 3 (hyperparameters) for loss computation.
 
 Updates:
-- Phase 3: Simplified to UnifiedLoss (CE + batch-wise entropy)
+- PR1 (trainer refactor): UnifiedLoss + AuxiliaryLossTracker removed (Q5 decision).
+  aux loss aggregation is now done via ctx.loss_components in callbacks
+  (PR4+: LossComponentsAccumulator). compute_loss retains its dynamic-weight
+  aux integration (grad_fn preserved per F-X3 / loss.py:256-257).
 """
 
 from __future__ import annotations
@@ -261,104 +264,7 @@ def compute_loss(
     return loss, components
 
 
-class AuxiliaryLossTracker:
-    """Track auxiliary losses during training
-
-    Useful for Fractal ViT which may have multiple loss components.
-    """
-
-    def __init__(self):
-        self.losses: dict = {}
-        self.counts: dict = {}
-
-    def add(self, name: str, value: float) -> None:
-        """Add a loss component"""
-        if name not in self.losses:
-            self.losses[name] = 0.0
-            self.counts[name] = 0
-        self.losses[name] += value
-        self.counts[name] += 1
-
-    def get_components(self) -> dict:
-        """Get averaged loss components"""
-        return {
-            name: self.losses[name] / max(self.counts[name], 1)
-            for name in self.losses
-        }
-
-    def reset(self) -> None:
-        """Reset for new epoch"""
-        self.losses.clear()
-        self.counts.clear()
-
-class UnifiedLoss:
-    """Unified loss: Cross-Entropy + optional batch-wise entropy regularization.
-
-    数学形式:
-        L = -Σ y_i log(ŷ_i) - λ · H(p_bar)
-        其中 p_bar = mean_batch(probs), H = -Σ p_bar log(p_bar)
-
-    为什么用 Batch-wise 熵而非逐样本熵？
-        逐样本熵: H_i = -Σ p_i log p_i, 最小化 → 每个样本的 probs 趋于均匀
-        → 模糊单个样本的 Top-K 选择边界，降低 token 质量的区分度
-
-        Batch-wise 熵: H_batch = -Σ p_bar log p_bar, p_bar = mean_i(probs_i)
-        → 强制跨样本多样性: 每个候选区域在整个 batch 中有机会被选中
-        → 不强制单样本内部均匀，Top-K 边界保持清晰
-        → 有效防止"只选图像中心"的局部最优解
-
-    Args:
-        num_classes: 分类类别数
-        entropy_weight: 熵正则化权重 (default: 0.01)
-        label_smoothing: 标签平滑因子 (default: 0.0)
-    """
-
-    def __init__(
-        self,
-        num_classes: int,
-        entropy_weight: float = 0.01,
-        label_smoothing: float = 0.0,
-    ):
-        self.num_classes = num_classes
-        self.entropy_weight = entropy_weight
-        self.label_smoothing = label_smoothing
-
-    def __call__(
-        self,
-        logits,
-        targets,
-        probs=None,
-    ):
-        """计算统一损失。
-
-        Args:
-            logits: [B, num_classes] 模型输出
-            targets: [B] 标签 (class indices)
-            probs: [B, N] splitter 输出选择概率 (mask_soft)，可选
-
-        Returns:
-            loss: 标量损失
-            components: dict of loss components (用于日志)
-        """
-        ce = F.cross_entropy(logits, targets, label_smoothing=self.label_smoothing)
-        components = {'ce_loss': ce.detach()}
-
-        if probs is not None:
-            # Batch-wise 熵最大化: H(mean_batch(probs))
-            from vit_pytorch.core.constants import EPS
-            p_bar = probs.mean(dim=0).clamp(min=EPS)  # [N]
-            entropy = -(p_bar * torch.log(p_bar)).sum()  # 标量
-            loss = ce - self.entropy_weight * entropy  # 负号: 最大化熵 → 促进多样性
-            components['entropy_loss'] = entropy.detach()
-            components['total_loss'] = loss.detach()
-            return loss, components
-
-        components['total_loss'] = ce.detach()
-        return ce, components
-
 __all__ = [
     "MixupCutmixLoss",
     "compute_loss",
-    "AuxiliaryLossTracker",
-    "UnifiedLoss",
 ]

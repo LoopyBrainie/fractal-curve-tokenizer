@@ -30,9 +30,15 @@ evaluate_simple = _trainer_deprecated_stub("evaluate_simple")
 # === End F-X1 shim ===
 
 from .state import TrainingState, EpochMetrics, EvaluationMetrics
-from .loss import MixupCutmixLoss, compute_loss, AuxiliaryLossTracker, UnifiedLoss
+from .loss import MixupCutmixLoss, compute_loss
 from .epoch_train import train_one_epoch
 from .epoch_eval import evaluate, compute_ece_score
+
+# === PR1 (trainer refactor): AuxiliaryLossTracker + UnifiedLoss removed ===
+# 0 callers in repo; half-finished abstractions deleted per Q5 decision.
+# aux loss aggregation is now done via ctx.loss_components in callbacks
+# (PR4+: LossComponentsAccumulator callback).
+# See plan fluffy-watching-turing.md §3 PR1.
 
 __all__ = [
     "TrainingState",
@@ -40,8 +46,6 @@ __all__ = [
     "EvaluationMetrics",
     "MixupCutmixLoss",
     "compute_loss",
-    "AuxiliaryLossTracker",
-    "UnifiedLoss",
     "train_one_epoch",
     "evaluate",
     "compute_ece_score",
