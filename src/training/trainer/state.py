@@ -173,9 +173,8 @@ class EpochMetrics:
     inf_count: int = 0
     skipped_steps: int = 0
 
-    # Memory
-    memory_allocated_mb: float = 0.0
-    memory_reserved_mb: float = 0.0
+    # Memory (PR5a: memory_allocated_mb / memory_reserved_mb 已被铲除,
+    # 仅保留 peak_memory_mb 供 to_dict() 序列化)
     peak_memory_mb: float = 0.0
 
     # === 新增: 实验详细日志记录指标 ===

@@ -61,7 +61,7 @@ def train_one_epoch(
     mixup_cutmix: Optional[MixupCutmixLoss] = None,
     debug_dir: Optional[str] = None,
     collector: Optional[Any] = None,  # NEW: Optional MetricsCollector
-    warmup_params: Optional[dict] = None,  # Phase 4: only {'tau': current_tau}
+    warmup_params: Optional[dict] = None,  # Phase 4: only {'tau': current_tau} (PR5a: only reader 已被铲除, 待 PR5c 进一步清理)
     # I-OOM FIX: Monitors now passed from outside to prevent O(N^2) hook leak
     grad_monitor: Optional[GradientMonitor] = None,
     loss_monitor: Optional[LossMonitor] = None,
@@ -659,16 +659,14 @@ def train_one_epoch(
         auxiliary_flat_metrics=auxiliary_flat_metrics,
     )
 
-    # Memory stats
+    # PR5a: memory_allocated_mb / memory_reserved_mb / current_tau
+    # 均为无 reader 的 dead writes, 已从 EpochMetrics 中铲除。
     if torch.cuda.is_available():
-        metrics.memory_allocated_mb = torch.cuda.memory_allocated() / 1024**2
-        metrics.memory_reserved_mb = torch.cuda.memory_reserved() / 1024**2
         # Reset peak memory for next epoch
         torch.cuda.reset_peak_memory_stats()
 
-    # Phase 4: 仅记录 τ
-    if warmup_params:
-        metrics.current_tau = warmup_params.get('tau', 1.0)
+    # PR5a: warmup_params 暂时保留形参以避免外部 API breaking, 留待 PR5c 彻底移除。
+    del warmup_params  # 标记为有意未使用 (LSP 兼容)
 
     return metrics
 
