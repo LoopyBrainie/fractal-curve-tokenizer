@@ -12,8 +12,13 @@
   3. NaNGuard 是骨架硬依赖 (`ctx.nan_guard`),不通过 callback 列表注入
   4. AMP scaler / DDP sync / optimizer step → 骨架内联
 
+=== PR4 ===
+  T3 R12 (FractalTreeRegCallback) + T6 HMFT (HMFTHProbsCallback) 升格为 callback;
+  LossComponentsAccumulator 接管 per-component 累加;`build_callbacks()` factory
+  集中 CLI flag → callback 映射。
+
 See:
-  - plan: C:\\Users\\LamKo\\.claude\\plans\\fluffy-watching-turing.md §3 PR2
+  - plan: C:\\Users\\LamKo\\.claude\\plans\\fluffy-watching-turing.md §3 PR2 + PR4
   - design: docs/superpowers/specs/2026-06-08-fractal-vit-trainer-refactor-design.md
 """
 
@@ -24,6 +29,10 @@ from .base import (
 from .nan_guard import NaNGuard
 from .nan_dump import NaNDumpCallback
 from .gradient_monitor import GradientMonitorCallback
+from .fractal_tree_reg import FractalTreeRegCallback
+from .hmft_h_probs import HMFTHProbsCallback
+from .loss_components import LossComponentsAccumulator
+from .registry import build_callbacks
 
 __all__ = [
     # PR2 single-def (TrainerContext shared across PR2+PR5)
@@ -34,4 +43,9 @@ __all__ = [
     "NaNDumpCallback",
     # PR3 gradient monitor
     "GradientMonitorCallback",
+    # PR4 v1.3 opt-in callbacks (T3 R12, T6 HMFT)
+    "FractalTreeRegCallback",
+    "HMFTHProbsCallback",
+    "LossComponentsAccumulator",
+    "build_callbacks",
 ]

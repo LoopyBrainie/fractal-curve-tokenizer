@@ -3,6 +3,11 @@
 Implements independent train_one_epoch function.
 Following the three-layer parameter principle, this module
 handles Layer 3 (hyperparameters) for training loop.
+
+=== PR4 (trainer refactor) ===
+T3 R12 (FractalTreeRegCallback) + T6 HMFT (HMFTHProbsCallback) 已升格为 callback
+(见 `src/training/callbacks/`)。本文件不再包含 R12/HMFT 内联实现。
+EAHBP 3-gate (T4) + Paced Window (T5) + Shadow (T2) inline 代码已铲除 (Q2 决议)。
 """
 
 from __future__ import annotations
@@ -42,213 +47,6 @@ def _extract_attention_for_shadow(forward_output):
     attn = aux.get("attn_scores")
     rope = aux.get("rope_embeddings")
     return attn, rope
-
-
-def _maybe_build_r12_aux(
-    logits: torch.Tensor,
-    forward_output,
-    config,
-):
-    """Build the R12 aux-loss tensor when `enable_r12_aux=True`.
-
-    Returns:
-        None when the feature is disabled (no-op path); otherwise a dict
-        `{"r12": tensor}` ready to pass to `compute_loss(aux_losses=...)`.
-
-    Falls back to None if the v1.3 R12AuxLoss is unavailable or the
-    model has no `parent_logits` / `child_logits` in its auxiliary outputs.
-    """
-    if not getattr(config.training, "enable_r12_aux", False):
-        return None
-    try:
-        from vit_pytorch.core.measure_auxiliary_loss import R12AuxLoss
-    except ImportError:
-        return None
-    aux = getattr(forward_output, "auxiliary_outputs", None) or {}
-    parent = (
-        aux.get("parent_logits") if isinstance(aux, dict) else None
-    ) or logits
-    child = (
-        aux.get("child_logits") if isinstance(aux, dict) else None
-    ) or logits
-    depth_dist = _padded_levels_to_depth_distribution(
-        getattr(forward_output, "padded_levels", None), max_depth=8,
-    )
-    r12 = R12AuxLoss()
-    try:
-        r12_tensor = r12(parent, child, depth_dist)
-    except Exception:
-        return None
-    return {"r12": r12_tensor}
-
-
-def _apply_eahbp_gates(model, *, gme, throughput, precision_gain, collector):
-    """Set EAHBP gate signals on all EAHBPAttention modules in `model`,
-    and record G1/G2/G3 decisions into `collector`.
-
-    Silent no-op if EAHBPAttention is unavailable or the model has none.
-    """
-    try:
-        from vit_pytorch.layers.attention.eahbp_attention import EAHBPAttention
-    except ImportError:
-        return
-    for mod in model.modules():
-        if isinstance(mod, EAHBPAttention):
-            try:
-                mod.set_gate_signals(gme, throughput, precision_gain)
-                collector.record("eahbp/g1_pass", float(mod.check_g1()))
-                collector.record("eahbp/g2_pass", float(mod.check_g2()))
-                collector.record("eahbp/g3_rollback", float(mod.check_g3_rollback()))
-            except Exception:
-                pass
-
-
-def _compute_gme_for_model(model) -> float:
-    """Compute GME (||grad|| / ||param||) over all model parameters.
-
-    Returns 0.0 when no gradients are present.
-    """
-    grad_sq_sum = 0.0
-    param_sq_sum = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            grad_sq_sum += float(p.grad.detach().pow(2).sum().item())
-        param_sq_sum += float(p.detach().pow(2).sum().item())
-    if param_sq_sum <= 0.0:
-        return 0.0
-    return (grad_sq_sum ** 0.5) / ((param_sq_sum ** 0.5) + 1e-12)
-
-
-def _init_paced_window_buffer(model, state, config) -> None:
-    """Clone model weights into state.staging_state_dict, instantiate PacedWindow.
-
-    Silent no-op if `enable_paced_window` is False or the v1.3 PacedWindow
-    is unavailable. Called once at the start of `train_one_epoch`.
-    """
-    if not getattr(config.training, "enable_paced_window", False):
-        return
-    if state.staging_state_dict is not None:
-        return  # already initialized
-    try:
-        from vit_pytorch.core.paced_window import PacedWindow, PacedWindowConfig
-    except ImportError:
-        return
-    state.staging_state_dict = {
-        k: v.detach().clone()
-        for k, v in model.state_dict().items()
-    }
-    state.paced_window = PacedWindow(
-        PacedWindowConfig(
-            fatal_streak_threshold=getattr(
-                config.training, "paced_window_fatal_streak", 3,
-            ),
-        )
-    )
-
-
-def _paced_window_step(model, state, *, gme, collector) -> None:
-    """Run one PacedWindow update; restore staging weights on rollback.
-
-    Silent no-op if PacedWindow is not initialized for this state.
-    """
-    pw = getattr(state, "paced_window", None)
-    staging = getattr(state, "staging_state_dict", None)
-    if pw is None or staging is None:
-        return
-    try:
-        theta_main_l2 = _state_dict_l2(model.state_dict())
-        theta_stage_l2 = _state_dict_l2(staging)
-        rollback, _reason = pw.update(
-            theta_main=theta_main_l2,
-            theta_stage=theta_stage_l2,
-            gme=gme,
-        )
-    except Exception:
-        return
-    if rollback:
-        try:
-            model.load_state_dict(staging)
-        except Exception:
-            pass
-        prev = collector.get_summary().get("paced/rollback_count", 0.0)
-        collector.record("paced/rollback_count", prev + 1.0)
-    # Always record the current state
-    state.paced_window_state = {
-        "state": pw.state.value,
-        "epoch_in_window": pw.epoch_in_window,
-        "fatal_streak": pw.fatal_streak,
-        "last_d_struct": pw.last_d_struct,
-    }
-
-
-def _state_dict_l2(sd) -> "torch.Tensor":
-    """Flatten and concatenate all tensors in a state_dict.
-
-    PacedWindow.compute_d_struct expects tensor inputs (not L2 scalars) so
-    it can compute ||θ_main - θ_stage||² / ||θ_main_prev||² via tensor ops.
-    """
-    flats = []
-    for v in sd.values():
-        if hasattr(v, "detach") and hasattr(v, "view"):
-            flats.append(v.detach().view(-1).float())
-    if not flats:
-        return torch.zeros(1)
-    return torch.cat(flats)
-
-
-def log_h_probs(splitter, collector, *, epoch: int) -> None:
-    """Per-epoch log of the 5-bin HMFT block-size distribution.
-
-    Pulls `h_probs` from `splitter.get_diagnostics()` (returns dict) and
-    records `hmft/h_prob_bin_{i}` for i in 0..4, plus `hmft/h_probs_epoch`.
-    Silent no-op when the splitter doesn't expose the diagnostic.
-    """
-    diag_fn = getattr(splitter, "get_diagnostics", None)
-    if diag_fn is None:
-        return
-    try:
-        diag = diag_fn() or {}
-    except Exception:
-        return
-    h = diag.get("h_probs") if isinstance(diag, dict) else None
-    if h is None:
-        return
-    for i, p in enumerate(h):
-        try:
-            collector.record(f"hmft/h_prob_bin_{i}", float(p))
-        except Exception:
-            break
-    try:
-        collector.record("hmft/h_probs_epoch", float(epoch))
-    except Exception:
-        pass
-
-
-def _padded_levels_to_depth_distribution(padded_levels, max_depth: int = 8):
-    """Convert ForwardOutput.padded_levels to a 1D depth probability tensor.
-
-    `padded_levels` is a Tensor [B, max_N, D+1] with padding=-1; we ignore
-    padding and average the D+1 routing values per image.
-    """
-    if padded_levels is None or (hasattr(padded_levels, "numel") and padded_levels.numel() == 0):
-        return torch.zeros(max_depth + 1)
-    if not hasattr(padded_levels, "view"):
-        return torch.zeros(max_depth + 1)
-    # Use the last column (D+1 routing) averaged across batch & tokens
-    try:
-        flat = padded_levels.view(-1, padded_levels.shape[-1]).float()
-        depth = flat[:, -1]
-        # Bucket into max_depth+1 bins
-        out = torch.zeros(max_depth + 1)
-        for v in depth.tolist():
-            idx = max(0, min(int(v), max_depth))
-            out[idx] += 1.0
-        total = out.sum()
-        if total > 0:
-            out = out / total
-        return out
-    except Exception:
-        return torch.zeros(max_depth + 1)
 
 
 def train_one_epoch(
@@ -376,8 +174,8 @@ def train_one_epoch(
     # Training loop
     pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {state.epoch}", leave=False)
 
-    # v1.3 STANDARD: Paced Window staging buffer (one-time, first epoch)
-    _init_paced_window_buffer(model, state, config)
+    # PR4: Paced Window (T5) 已被铲除 (Q2 决议); EAHBP 3-gate (T4) 同步铲除。
+    # 保留的 v1.3 STANDARD 特性: HMFT h_probs 通过 HMFTHProbsCallback 收集 (PR5c 接入)。
 
     for batch_idx, batch in pbar:
         # Handle different batch formats
@@ -483,12 +281,11 @@ def train_one_epoch(
                 _density_reg_count += 1
 
             # Compute loss
+            # PR4: T3 R12 aux-loss 移至 FractalTreeRegCallback.on_loss_computed
+            # (PR5c skeleton 会调用该 callback 注入 ctx.aux_losses['r12'])。
             if targets is not None:
-                aux_losses = _maybe_build_r12_aux(
-                    logits, forward_output, config,
-                )
                 loss, loss_components = compute_loss(
-                    logits, targets, aux_losses=aux_losses,
+                    logits, targets, aux_losses=None,
                 )
             else:
                 # Fallback if no targets
@@ -503,27 +300,9 @@ def train_one_epoch(
         else:
             loss_scaled.backward()
 
-        # v1.3 STANDARD: post_backward Shadow Monitor hook (computes GME)
-        if shadow_hooks is not None:
-            shadow_hooks.post_backward(model, optimizer, state.global_step)
-
-        # v1.3 STANDARD: EAHBP 3-gate plumbing (per-step gate signals)
-        if getattr(config.training, "enable_eahbp_3gate", False) and collector is not None:
-            _apply_eahbp_gates(
-                model,
-                gme=_compute_gme_for_model(model),
-                throughput=0.0,  # throughput estimate not yet wired; placeholder
-                precision_gain=0.0,  # accuracy delta not yet wired; placeholder
-                collector=collector,
-            )
-
-        # v1.3 STANDARD: Paced Window step (rollback if D_struct >= T_fatal)
-        if getattr(config.training, "enable_paced_window", False) and collector is not None:
-            _paced_window_step(
-                model, state,
-                gme=_compute_gme_for_model(model),
-                collector=collector,
-            )
+        # PR4: Shadow Monitor (T2) hook, EAHBP 3-gate (T4), Paced Window (T5)
+        # 全部 inline 代码已铲除 (Q2 决议)。Shadow 仍由 `shadow_hooks` 形参控
+        # 制但内联实现已不在本文件中 (PR5+ 进一步清理)。
 
         # B7.5 FIX: backward 后提取 CPU 侧 TrainingStats (激活显存已释放)
         stats = model.extract_cpu_stats(forward_output, metrics_tensors)
@@ -852,9 +631,7 @@ def train_one_epoch(
     if avg_splitter_grad_norm is not None and avg_splitter_grad_norm > 0:
         backbone_vs_splitter_ratio = avg_backbone_grad_norm / avg_splitter_grad_norm
 
-    # v1.3 STANDARD: HMFT h_probs logging (per-epoch, no opt-in flag)
-    if collector is not None and hasattr(model, "splitter"):
-        log_h_probs(model.splitter, collector, epoch=state.epoch)
+    # PR4: HMFT h_probs logging 移至 HMFTHProbsCallback.on_epoch_end (PR5c 接入)。
 
     # Create metrics
     metrics = EpochMetrics(

@@ -43,10 +43,7 @@ class TrainingState:
     scheduler_state: Optional[Dict[str, Any]] = None
     splitter_scheduler_state: Optional[Dict[str, Any]] = None  # V4: Splitter 独立 LR scheduler
     sampler_state: Optional[Dict[str, Any]] = None
-    # v1.3 STANDARD: Paced Window staging weights (clone of main weights
-    # at the moment EAHBP was enabled) + the PacedWindow state machine.
-    staging_state_dict: Optional[Dict[str, torch.Tensor]] = None
-    paced_window_state: Optional[Dict[str, Any]] = None
+    # PR4: Paced Window (T5) 已被铲除, staging_state_dict + paced_window_state 字段随之删除。
 
     # Metrics history
     metrics_history: Dict[str, List[float]] = field(default_factory=dict)
