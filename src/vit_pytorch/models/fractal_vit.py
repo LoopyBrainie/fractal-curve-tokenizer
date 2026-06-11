@@ -47,6 +47,8 @@ if TYPE_CHECKING:
 from vit_pytorch.modules.tokenizer import StreamingFractalTokenizerV3
 from vit_pytorch.modules.base_tokenizer import BaseTokenizer, TokenizerOutput
 from vit_pytorch.modules.transformer_block import FractalTransformer, FFNType
+from vit_pytorch.modules.alpha_modulator import AlphaModulator  # R7-A
+from vit_pytorch.modules.lca_bias_subtractor import LCABiasSubtractor  # R7-Beta-C
 from vit_pytorch.core.utils import pair
 from vit_pytorch.core.constants import (
     EPS, DIVISION_EPSILON, PROB_EPSILON,
@@ -445,6 +447,14 @@ class FractalCurveViT(nn.Module):
         # v7.1: DirectionAwareSubspacedRoPE 宏观/微观频率配置
         macro_ratio: float = 0.5,  # 宏观子空间占比 (前 macro_ratio*D 维为宏观)
         macro_base: float = 1000.0,  # 宏观频率基准 (比 micro base 小 10x)
+
+        # === R7 设计参数 ===
+        # R7-A (AlphaModulator): 深度相关 logit 缩放
+        logit_scale: float = 1.0,  # 基础 logit 缩放因子
+        # R7-Beta-C (LCABiasSubtractor): T14-gated, default-ON with kill-switch
+        bias_subtract_lca: bool = True,  # R7-Beta-C 启用开关
+        beta_c_emergency_off: bool = False,  # R7-Beta-C 紧急关闭 (kill-switch)
+        max_depth: int = 64,  # R7-Beta-C 偏置表深度上限
     ) -> None:
         """初始化 FractalCurveViT。
 
@@ -810,6 +820,22 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             # I165-OOM FIX: 使用已解析的 resolved_mlp_dim
             self.mlp_dim = resolved_mlp_dim
 
+        # === R7-A: AlphaModulator (UNCONDITIONAL SHIP) ===
+        # 1 个可学习参数 alpha_raw init=0 → 恒等映射
+        self.alpha_modulator = AlphaModulator(logit_scale=logit_scale, eps=EPS)
+
+        # === R7-Beta-C: LCABiasSubtractor (T14-gated, default-ON) ===
+        # bias_table: [max_depth+1, max_depth+1] = (65, 65) 共 4225 个共享参数
+        # kill-switch 通过 config.beta_c_emergency_off 控制
+        self.lca_bias_subtractor = LCABiasSubtractor(
+            max_depth=max_depth,
+            enabled=bias_subtract_lca and not beta_c_emergency_off,
+        )
+        # R7-Beta-C 配置标志 (用于 kill-switch 运行时切换)
+        self._beta_c_emergency_off = bool(beta_c_emergency_off)
+        self._bias_subtract_lca = bool(bias_subtract_lca)
+        self._r7_max_depth = int(max_depth)
+
         # 权重初始化 - 关键改进，防止类别偏差
         self._init_weights()
 
@@ -1041,6 +1067,39 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         """Cleanup hooks on deletion"""
         if hasattr(self, '_cls_token_hook') or hasattr(self, '_all_nan_grad_hooks'):
             self.remove_hooks()
+
+    def _compute_alpha_modulator(
+        self,
+        levels_info: "LevelsInfo",
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """R7-A: 计算 AlphaModulator 因子 M (避免重算 SharedConv 特征)
+
+        从 levels_info.depths 推导 H/H_max 比率:
+            H = mean(depths) (batch-wise 归一化 Hilbert 索引的代理)
+            H_max = self.max_level
+
+        Args:
+            levels_info: LevelsInfo 实例 (含 depths)
+            batch_size: 批次大小
+            device: 计算设备
+
+        Returns:
+            M: [B] 调制因子 (mlp_head(pooled) * M.unsqueeze(-1))
+        """
+        # 防御: levels_info 为空时退化为 logit_scale * ones
+        if levels_info is None or levels_info.depths.numel() == 0:
+            return torch.ones(batch_size, device=device) * self.alpha_modulator.logit_scale
+
+        # 推导 H/H_max: 用 batch-wise 平均深度作为 H 的代理
+        # depths: [B, N], clamp 防止 padding (-1) 影响
+        depths = levels_info.depths.clamp(min=0, max=self.max_level)
+        # H = 每个样本的平均有效深度
+        H = depths.float().mean(dim=1)  # [B]
+        # 调用 AlphaModulator
+        M = self.alpha_modulator(H, H_max=float(self.max_level))  # [B]
+        return M
 
     def _init_transformer_weights(self):
         """初始化 Transformer 层的权重"""
@@ -1560,6 +1619,36 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             batch_size, x.shape[1], lengths, device
         )
 
+        # === R7-Beta-C: LCABiasSubtractor 在 attention 之前应用 ===
+        # 推导: 1) 计算 LCA 矩阵 (来自 levels_info)
+        #       2) 构造 depths 张量 (含 CLS, 深度为 0)
+        #       3) attn_mask = attn_mask + (B_LCA - lambda_bounded * B_sub)
+        if self.lca_bias_subtractor.enabled:
+            # 同步 kill-switch (允许 config.beta_c_emergency_off 运行时切换)
+            if self._beta_c_emergency_off:
+                self.lca_bias_subtractor.enabled = False
+            else:
+                # depths: 含 CLS, 深度为 0
+                # levels_info.depths: [B, MaxLen] (不含 CLS)
+                cls_depths = torch.zeros(
+                    batch_size, 1, dtype=levels_info.depths.dtype, device=device
+                )
+                depths_with_cls = torch.cat([cls_depths, levels_info.depths], dim=1)  # [B, 1+N]
+                # LCA 矩阵 (来自 levels_info): [B, N, N] → 需要为 CLS 扩展
+                # 使用 matrix_extension: 给现有 levels 添加 CLS 行/列
+                # 简单做法: 重新构造 levels_info_with_cls 然后计算 LCA
+                B_LCA_full = levels_info.get_lca_matrix()  # [B, N, N]
+                N = B_LCA_full.shape[-1]
+                # LCA matrix 扩展: 为 CLS 添加 0 行 0 列 (CLS depth=0, 但 LCA 与自身之外为 0)
+                zero_row = B_LCA_full.new_zeros(B, 1, N)
+                zero_col = B_LCA_full.new_zeros(B, N + 1, 1)
+                B_LCA_with_cls = torch.cat([
+                    zero_row,  # CLS 行
+                    torch.cat([zero_col, B_LCA_full], dim=-1)  # 原 N 行 + CLS 列
+                ], dim=1)  # [B, 1+N, 1+N]
+                # 应用 LCABiasSubtractor
+                attn_mask = self.lca_bias_subtractor(attn_mask, depths_with_cls, B_LCA_with_cls)
+
         # ============================================================
         # I162-1: 双路径插件模式 vs 串行模式
         # ============================================================
@@ -1576,7 +1665,10 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                 hilbert_order=hilbert_order,
             )
             transformer_tokens = fused_tokens  # [B, N, 2D]
-            final_output = self.mlp_head(pooled)  # [B, num_classes]
+            # === R7-A: AlphaModulator (插件模式) ===
+            # 从 levels_info.depths 推导 H/H_max (避免重算 SharedConv)
+            alpha_M = self._compute_alpha_modulator(levels_info, batch_size, device)
+            final_output = self.mlp_head(pooled) * alpha_M.unsqueeze(-1)  # [B, num_classes]
             pooled_for_stats = pooled  # 保存用于 stats
 
         elif self.pattern_encoder is not None and hilbert_order is not None:
@@ -1634,7 +1726,10 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
 
             # 5. 池化 + 分类
             pooled = self._apply_pooling(x, key_padding_mask, split_probs)
-            final_output = self.mlp_head(pooled)
+            # === R7-A: AlphaModulator (非插件模式) ===
+            # 从 levels_info.depths 推导 H/H_max (避免重算 SharedConv)
+            alpha_M = self._compute_alpha_modulator(levels_info, batch_size, device)
+            final_output = self.mlp_head(pooled) * alpha_M.unsqueeze(-1)
             pooled_for_stats = pooled
 
         # 6. 构建 TrainingStats

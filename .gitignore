@@ -170,3 +170,6 @@ benchmark_results
 .claude
 .sparv
 .firecrawl
+docs/superpowers
+.codegraph
+.adversarial
