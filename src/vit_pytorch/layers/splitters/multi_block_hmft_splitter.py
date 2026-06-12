@@ -222,6 +222,60 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
         blocks = blocks[:, sorted_order, :, :]
         return blocks, hilbert_indices[sorted_order]
 
+    def _gumbel_ste_topk(
+        self,
+        score_head: Tensor,
+        K: int,
+        hard: bool = False,
+        logit_scale: float = 1.0,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Gumbel-STE TopK selection (Axiom A2: deterministic when hard=True).
+
+        Args:
+            score_head: [B, n_cells] per-cell scalar scores
+            K: number of cells to select
+            hard: if True, skip Gumbel noise and use deterministic argmax path.
+                This is the A2 axiom contract: hard=True must be reproducible
+                across calls regardless of training mode.
+            logit_scale: optional scaling factor for logits before softmax
+                (default 1.0; H1SS exposes this as a learnable parameter)
+
+        Returns:
+            mask_hard: [B, n_cells] binary 0/1 selection mask (discrete)
+            mask_soft: [B, n_cells] softmax probabilities (differentiable surrogate)
+            mask_ste: [B, n_cells] STE bridge = (hard - soft).detach() + soft
+                (forward = hard, backward = soft)
+            topk_indices: [B, K] selected cell indices
+        """
+        # Optional logit scaling (preserves H1SS-style learnable temperature)
+        if logit_scale != 1.0:
+            score_head = score_head * logit_scale
+
+        # Gumbel noise injection — gated ONLY by hard (A2 axiom):
+        #   hard=True → no noise, fully deterministic regardless of training mode
+        #   hard=False + training → explore via Gumbel
+        #   hard=False + eval → no noise (eval is deterministic by default)
+        if not hard and self._is_training_mode:
+            gumbel_noise = -torch.log(
+                -torch.log(torch.rand_like(score_head) + 1e-9) + 1e-9
+            )
+            score_head = (score_head + gumbel_noise) / max(self._temperature, 1e-3)
+
+        # TopK selection
+        topk_indices = torch.topk(score_head, K, dim=-1).indices
+
+        # Hard mask: 1 for selected, 0 otherwise (discrete forward)
+        mask_hard = torch.zeros_like(score_head)
+        mask_hard.scatter_(-1, topk_indices, 1.0)
+
+        # Soft mask: softmax probabilities (differentiable surrogate)
+        mask_soft = torch.softmax(score_head, dim=-1)
+
+        # STE bridge: forward=hard, backward=soft (gradient flows through soft)
+        mask_ste = (mask_hard - mask_soft).detach() + mask_soft
+
+        return mask_hard, mask_soft, mask_ste, topk_indices
+
     def forward(
         self,
         features: Tensor,
@@ -260,22 +314,11 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
         cell_features = blocks.mean(dim=2)  # [B, n_cells, C]
         # Project to a scalar score per cell via simple mean over channels
         score_head = cell_features.mean(dim=-1)  # [B, n_cells]
-        # Add learnable noise via Gumbel
-        if self.training and not hard:
-            gumbel_noise = -torch.log(
-                -torch.log(torch.rand_like(score_head) + 1e-9) + 1e-9
-            )
-            score_head = (score_head + gumbel_noise) / max(self._temperature, 1e-3)
-        # TopK selection
+        # TopK selection via Gumbel-STE helper (A2: deterministic when hard=True)
         K = min(self._config.K_fixed, n_cells)
-        topk_scores, topk_indices = torch.topk(score_head, K, dim=-1)
-        # Hard mask: 1 for selected, 0 otherwise
-        mask_hard = torch.zeros_like(score_head)
-        mask_hard.scatter_(-1, topk_indices, 1.0)
-        # Soft mask: softmax scores
-        mask_soft = torch.softmax(score_head, dim=-1)
-        # STE: forward hard, backward soft
-        mask_ste = (mask_hard - mask_soft).detach() + mask_soft
+        mask_hard, mask_soft, mask_ste, topk_indices = self._gumbel_ste_topk(
+            score_head, K, hard=hard,
+        )
 
         # 4) Gather selected blocks: [B, K, h*h, C]
         selected_blocks = torch.gather(
