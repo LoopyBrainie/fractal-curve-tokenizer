@@ -31,11 +31,27 @@ from vit_pytorch.core.splitter_protocol import CoreSplitter, SplitResult
 
 @dataclass
 class MultiBlockHMFTSplitterConfig:
-    """Configuration for MultiBlockHMFTSplitter."""
-    feature_dim: int = 256
+    """Configuration for MultiBlockHMFTSplitter.
+
+    V3 protocol dim semantics (must match H1SS line 245-248):
+        feature_dim_in: input feature channel count (e.g., stem output of model)
+        feature_dim:    V3 d_model — output dim of feature_proj, equals
+                        ``roi_features_raw.shape[-1]`` and should match the
+                        model's ``dim`` when wired through FractalCurveViT
+        hidden_dim:     dim of internal hidden representations (default 64,
+                        matches H1SS line 248)
+
+    Defaults preserve backward compat with the existing
+    ``tests/unit/L2_components/splitters/test_multi_block_hmft_eas.py``
+    which feeds 256-channel features standalone (no model wiring). When
+    wired through ``FractalCurveViT`` (Commit 5), all three are explicitly
+    injected at construction time to match the model's d_model.
+    """
+    feature_dim_in: int = 256  # input feature channels (stem output)
+    feature_dim: int = 256     # V3 d_model (post-projection output)
     min_patch_size: int = 4
     max_level_limit: int = 8
-    hidden_dim: int = 64
+    hidden_dim: int = 64       # internal hidden dim (matches H1SS default)
     K_fixed: int = 16
     # 5-bin learnable h block sizes (Power-of-4 alignment)
     block_sizes: Tuple[int, ...] = HMFT_BLOCK_SIZES
@@ -57,11 +73,22 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
     def __init__(
         self,
         config: Optional[MultiBlockHMFTSplitterConfig] = None,
+        feature_dim_in: Optional[int] = None,
+        feature_dim: Optional[int] = None,
+        hidden_dim: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
         if config is None:
-            config = MultiBlockHMFTSplitterConfig(**kwargs)
+            # Allow per-kwarg override of config (matches H1SS line 245-248)
+            cfg_kwargs = dict(kwargs)
+            if feature_dim_in is not None:
+                cfg_kwargs["feature_dim_in"] = feature_dim_in
+            if feature_dim is not None:
+                cfg_kwargs["feature_dim"] = feature_dim
+            if hidden_dim is not None:
+                cfg_kwargs["hidden_dim"] = hidden_dim
+            config = MultiBlockHMFTSplitterConfig(**cfg_kwargs)
         self._config = config
         # Learnable 5-bin block size logits (small random init to avoid
         # the entropy-maximum stationary point of uniform distribution)
@@ -94,6 +121,24 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
             self.hilbert_conv1d.weight[0, 0, 2] = 1.0  # center tap = 1
             if self.hilbert_conv1d.bias is not None:
                 self.hilbert_conv1d.bias.zero_()
+
+        # ====================================================================
+        # V3 protocol: feature_proj (per-cell C → d_model) + roi_norm
+        # STATICALLY PRE-REGISTERED in __init__ (NOT in forward) so the
+        # optimizer can find these parameters via model.parameters() at
+        # instantiation time. See I170 Risks §0 for the P0 lazy-build trap.
+        # ====================================================================
+        self.feature_proj = nn.Linear(config.feature_dim_in, config.feature_dim)
+        nn.init.orthogonal_(
+            self.feature_proj.weight,
+            gain=nn.init.calculate_gain('relu'),
+        )
+        nn.init.zeros_(self.feature_proj.bias)
+        # LayerNorm on the d_model dim (post-projection) — matches H1SS
+        # line 323 `self.roi_norm = nn.LayerNorm(hidden_dim)`. The dim
+        # argument uses config.feature_dim (the V3 d_model, not hidden_dim)
+        # so that the normalize-then-use pattern is consistent with H1SS.
+        self.roi_norm = nn.LayerNorm(config.feature_dim)
 
     @property
     def max_level_limit(self) -> int:
@@ -370,7 +415,7 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
         if image_size is None:
             image_size = (features.shape[-2], features.shape[-1])
         self.update_candidates(image_size)
-        B, C, H, W = features.shape
+        B, _C, H, W = features.shape
 
         # 1) Choose block size h (must give at least K_fixed cells)
         h = self._sample_block_size(
@@ -391,9 +436,42 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
             score_head, K, hard=hard,
         )
 
-        # 4) Gather selected blocks: [B, K, h*h, C]
-        selected_blocks = torch.gather(
-            blocks, 1, topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, h * h, C)
+        # 4) V3 protocol: compute pre-gather per-cell features for the tokenizer
+        # Per-cell spatial pool: [B, n_cells, h*h, C] → [B, n_cells, C]
+        cell_features = blocks.mean(dim=2)  # [B, n_cells, C]
+        # Pre-projection candidate pool (tokenizer fast path uses this):
+        #   roi_features_raw = cell_features  (shape [B, n_cells, feature_dim_in])
+        # Post-projection normalized features (T10 keystone — keeps
+        #   feature_proj in the autograd graph even if tokenizer prefers
+        #   roi_features_raw path):
+        #   roi_features = roi_norm(feature_proj(cell_features))
+        #                  shape [B, n_cells, feature_dim]
+        roi_features_raw = cell_features  # pre-projection, for tokenizer fast path
+        roi_features = self.roi_norm(
+            self.feature_proj(cell_features)
+        )  # post-projection, LayerNorm'd
+
+        # T10: shape contract + STE integrity asserts
+        # (a) roi_features_raw must be the per-candidate pool at [B, n_cells, feature_dim_in]
+        assert roi_features_raw.shape == (B, n_cells, self._config.feature_dim_in), (
+            f"T10: roi_features_raw must be [B={B}, N={n_cells}, "
+            f"feature_dim_in={self._config.feature_dim_in}], "
+            f"got {tuple(roi_features_raw.shape)}"
+        )
+        # (b) mask_ste must align with the per-candidate pool [B, n_cells]
+        assert mask_ste.shape == (B, n_cells), (
+            f"T10: mask_ste must be [B={B}, N={n_cells}], got {tuple(mask_ste.shape)}"
+        )
+        # (c) STE gradient must be preserved (no stray .detach())
+        assert mask_ste.requires_grad, (
+            "T10+Review: mask_ste must preserve STE gradient (requires_grad=True). "
+            "Check for stray .detach() in projection/scoring path."
+        )
+        # (d) roi_features must be the post-projection [B, n_cells, d_model]
+        assert roi_features.shape == (B, n_cells, self._config.feature_dim), (
+            f"T10: roi_features must be [B={B}, N={n_cells}, "
+            f"d_model={self._config.feature_dim}], "
+            f"got {tuple(roi_features.shape)}"
         )
 
         # 5) Build SplitResult
@@ -417,7 +495,9 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
             probs=mask_soft,
             K_soft=torch.tensor(float(K), device=features.device),
             mask_ste=mask_ste,
-            roi_features_raw=selected_blocks.view(M, h * h * C),
+            # V3 protocol: pre-gather per-candidate pool, NOT post-gather flatten
+            roi_features_raw=roi_features_raw,  # [B, n_cells, feature_dim_in]
+            roi_features=roi_features,          # [B, n_cells, d_model] (T10 keystone)
             candidate_indices=topk_indices.flatten(),
         )
 
