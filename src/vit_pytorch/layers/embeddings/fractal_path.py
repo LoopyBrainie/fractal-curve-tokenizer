@@ -346,16 +346,12 @@ class OrientationExtractor(nn.Module):
         self.max_level = max_level
         self.embedding_dim = embedding_dim
 
-        # 旋转状态编码: 2 種状态 (旋转/不旋转) → 可学习嵌入
-        self.rotation_embedding = nn.Embedding(2, embedding_dim)
-
         # 旋转方向编码 (4 種: 0°, 90°, 180°, 270°)
         self.direction_embedding = nn.Embedding(4, embedding_dim)
 
         self._init_weights()
 
     def _init_weights(self) -> None:
-        nn.init.normal_(self.rotation_embedding.weight, std=0.02)
         nn.init.normal_(self.direction_embedding.weight, std=0.02)
 
     @staticmethod
@@ -409,20 +405,16 @@ class OrientationExtractor(nn.Module):
         self,
         paths: torch.Tensor,
         depths: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """提取旋转状态和方向
+    ) -> torch.Tensor:
+        """提取旋转方向嵌入
 
         Args:
             paths: [B, N, L] 四叉树路径
             depths: [B, N] 有效深度 (可选)
 
         Returns:
-            rotation_emb: [B, N, embedding_dim] 旋转状态嵌入
             direction_emb: [B, N, embedding_dim] 旋转方向嵌入
         """
-        # 计算旋转状态
-        rotation_states = self.compute_rotation_states(paths)  # [B, N, L]
-
         # 计算旋转方向
         directions = self.compute_rotation_directions(paths)  # [B, N, L]
 
@@ -434,18 +426,15 @@ class OrientationExtractor(nn.Module):
             ).unsqueeze(0).unsqueeze(0)  # [1, 1, L]
             valid_mask = (level_indices < depths.unsqueeze(-1)).float()  # [B, N, L]
 
-            rotation_states = (rotation_states * valid_mask).sum(dim=-1).clamp(0, 1)
             directions = (directions * valid_mask).sum(dim=-1).clamp(0, 3)
         else:
             # 使用平均
-            rotation_states = rotation_states.mean(dim=-1).clamp(0, 1)
             directions = directions.mean(dim=-1).clamp(0, 3)
 
         # 查找嵌入
-        rotation_emb = self.rotation_embedding(rotation_states.long())  # [B, N, dim]
         direction_emb = self.direction_embedding(directions.long())  # [B, N, dim]
 
-        return rotation_emb, direction_emb
+        return direction_emb
 
     def get_orientation_mask(
         self,
