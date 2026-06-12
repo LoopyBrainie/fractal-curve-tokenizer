@@ -52,9 +52,10 @@ from vit_pytorch.modules.lca_bias_subtractor import LCABiasSubtractor  # R7-Beta
 from vit_pytorch.core.utils import pair
 from vit_pytorch.core.constants import (
     EPS, DIVISION_EPSILON, PROB_EPSILON,
-    compute_num_candidates, compute_k_bounds,
+    compute_k_bounds,
     LOGIT_CLAMP_BOUND,  # I147: 添加钳制边界导入
 )
+from vit_pytorch.core.continuous_utils import compute_num_candidates  # I-FIX-2026-06-11: moved in 9faf546
 from vit_pytorch.core.config import SemanticSplitterConfig  # I110-5
 from vit_pytorch.core.pattern_encoder import (
     create_hilbert_pattern_encoder,
@@ -145,6 +146,11 @@ class LazyDiagnostics:
     实际计算延迟到访问时进行（训练循环不在 cudagraphs 范围内）。
     """
     __slots__ = ('_model', '_filled')
+
+    # 类型标注：_filled 初始为 False (lazy flag)，填充后变为 dict
+    # 使用 Any 是因为它需要同时承载 bool flag 和 dict 两种状态
+    _model: "Any"
+    _filled: "Any"
 
     def __init__(self, model):
         self._model = model
@@ -631,6 +637,61 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         # === Splitter ===
         if splitter is not None:
             # I98-2: 使用注入的 Splitter
+            # I170 Commit 5: HMFT-specific wiring — re-construct with
+            # feature_dim=dim so the V3 protocol's roi_features_raw
+            # shape matches the tokenizer pool buffer (model.dim).
+            # Prevents the silent dim mismatch bug that caused the
+            # [4, 4096] cannot be broadcast to [4, 64] error.
+            # Pattern: constructor injection (NOT post-mutation) to
+            # avoid the P1 trap where nn.LayerNorm caches shape at
+            # __init__ and ignores subsequent config field mutations.
+            # Use class name check to avoid a top-level HMFT import
+            # (splitter imports are kept inline in this file).
+            if splitter.__class__.__name__ == "MultiBlockHMFTSplitter":
+                from vit_pytorch.layers.splitters.multi_block_hmft_splitter import (
+                    MultiBlockHMFTSplitter as _HMFT,
+                    MultiBlockHMFTSplitterConfig as _HMFTCfg,
+                )
+                # Compute max_level_limit for HMFT (duplicated from the
+                # else branch since HMFT path was not previously wired).
+                if tokenizer is not None and hasattr(tokenizer, 'max_level'):
+                    hmft_max_level = tokenizer.max_level
+                else:
+                    from vit_pytorch.core.depth_utils import compute_max_depth
+                    img_h, img_w = self.image_size
+                    hmft_max_level = compute_max_depth(
+                        image_size=(img_h, img_w),
+                        min_patch_size=effective_min_patch_size,
+                        hard_limit=8,
+                    )
+                # Compute K_fixed using the same dynamic formula as H1SS
+                # (Phase 2 spec: K = clamp(computed_k_max, 8, 64))
+                img_h, img_w = self.image_size
+                max_possible_tokens = (
+                    (img_h // effective_min_patch_size)
+                    * (img_w // effective_min_patch_size)
+                )
+                computed_k_min = max(
+                    1, int(max_possible_tokens * splitter_token_ratio_min),
+                )
+                computed_k_max = max(
+                    computed_k_min + 1,
+                    int(max_possible_tokens * splitter_token_ratio_max),
+                )
+                hmft_K_fixed = max(8, min(computed_k_max, 64))
+                # Re-construct HMFT with V3 d_model = model dim.
+                # The user's pre-constructed splitter is intentionally
+                # replaced (constructor injection pattern, same as H1SS
+                # line 686-695 in the else branch) so feature_dim is
+                # guaranteed to match the tokenizer's pool buffer.
+                splitter = _HMFT(_HMFTCfg(
+                    feature_dim_in=dim,  # V3 d_model = model dim
+                    feature_dim=dim,     # V3 d_model = model dim
+                    hidden_dim=64,       # match H1SS line 248 default
+                    min_patch_size=effective_min_patch_size,
+                    max_level_limit=hmft_max_level,
+                    K_fixed=hmft_K_fixed,
+                ))
             self.splitter = splitter
         else:
             # I98-1: 确定 max_level_limit (根据 tokenizer 或默认值)
@@ -1185,7 +1246,8 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                 epoch=getattr(self, '_current_epoch', 0),
             )
             # Tokenizer 使用 Splitter 的结果进行 embedding
-            token_output = self.tokenizer.tokenize(img, split_result)
+            # I107-7: 传入预计算的 features,避免 shared_conv 双重计算 (T9 修复)
+            token_output = self.tokenizer.tokenize(img, split_result, features=features)
         else:
             # 自定义 tokenizer 已处理所有逻辑
             token_output = self.tokenizer.tokenize(img)
@@ -1377,7 +1439,7 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         return_aux_info: bool,
         return_features: bool,
         split_probs: Optional[torch.Tensor] = None,
-    ) -> Tuple[List[Dict[str, Any]], List[torch.Tensor]]:
+    ) -> Tuple[List[Dict[str, Any]], Optional[torch.Tensor]]:
         """准备辅助输出。
 
         Args:
@@ -1418,7 +1480,7 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                 if max_tokens == 0:
                     # I144: 批量转换避免循环中的 .item()
                     # I141: 添加 non_blocking=True 避免同步阻塞
-                    lengths_cpu = lengths.cpu(non_blocking=True) if lengths.is_cuda else lengths
+                    lengths_cpu = lengths.to('cpu', non_blocking=True) if lengths.is_cuda else lengths
                     lengths_list = lengths_cpu.tolist()
                     # I145: 使用模块级 LazyDiagnostics，避免 forward 中的 CPU 同步
                     lazy_diag = LazyDiagnostics(self)
@@ -1471,7 +1533,7 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
 
                 # I144: 向量化计算所有 num_tokens - 完全 GPU 计算，避免循环中的 .item()
                 # lengths 是 GPU tensor，直接在 GPU 上操作
-                lengths_cpu = lengths.cpu(non_blocking=True) if lengths.is_cuda else lengths  # 只在需要时同步一次
+                lengths_cpu = lengths.to('cpu', non_blocking=True) if lengths.is_cuda else lengths  # 只在需要时同步一次
                 lengths_list = lengths_cpu.tolist()  # 单次批量转换
 
                 # I144: 向量化计算 entropy - 完全在 GPU 上计算，避免 Python 循环
@@ -1552,9 +1614,6 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
 
         return aux_infos, features_tensor if return_features else None
 
-    @overload
-    def forward(self, img: torch.Tensor) -> TrainingStats: ...
-
     def forward(
         self,
         img: torch.Tensor,
@@ -1620,34 +1679,21 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         )
 
         # === R7-Beta-C: LCABiasSubtractor 在 attention 之前应用 ===
-        # 推导: 1) 计算 LCA 矩阵 (来自 levels_info)
-        #       2) 构造 depths 张量 (含 CLS, 深度为 0)
-        #       3) attn_mask = attn_mask + (B_LCA - lambda_bounded * B_sub)
+        # 关键: attn_mask 此刻是 [B, H, N, N] (不含 CLS，CLS 在 transformer 内 concat)
+        # 所以 β-C 应在 pre-CLS tokens 上操作，不需要扩展 B_LCA 加 CLS 行/列
         if self.lca_bias_subtractor.enabled:
             # 同步 kill-switch (允许 config.beta_c_emergency_off 运行时切换)
             if self._beta_c_emergency_off:
                 self.lca_bias_subtractor.enabled = False
             else:
-                # depths: 含 CLS, 深度为 0
-                # levels_info.depths: [B, MaxLen] (不含 CLS)
-                cls_depths = torch.zeros(
-                    batch_size, 1, dtype=levels_info.depths.dtype, device=device
+                # B_LCA 来自 levels_info, 形状 [B, N, N] (pre-CLS)
+                B_LCA_full = levels_info.get_lca_matrix()
+                # depths 来自 levels_info, 形状 [B, N] (pre-CLS)
+                attn_mask = self.lca_bias_subtractor(
+                    attn_mask,
+                    levels_info.depths,
+                    B_LCA_full,
                 )
-                depths_with_cls = torch.cat([cls_depths, levels_info.depths], dim=1)  # [B, 1+N]
-                # LCA 矩阵 (来自 levels_info): [B, N, N] → 需要为 CLS 扩展
-                # 使用 matrix_extension: 给现有 levels 添加 CLS 行/列
-                # 简单做法: 重新构造 levels_info_with_cls 然后计算 LCA
-                B_LCA_full = levels_info.get_lca_matrix()  # [B, N, N]
-                N = B_LCA_full.shape[-1]
-                # LCA matrix 扩展: 为 CLS 添加 0 行 0 列 (CLS depth=0, 但 LCA 与自身之外为 0)
-                zero_row = B_LCA_full.new_zeros(B, 1, N)
-                zero_col = B_LCA_full.new_zeros(B, N + 1, 1)
-                B_LCA_with_cls = torch.cat([
-                    zero_row,  # CLS 行
-                    torch.cat([zero_col, B_LCA_full], dim=-1)  # 原 N 行 + CLS 列
-                ], dim=1)  # [B, 1+N, 1+N]
-                # 应用 LCABiasSubtractor
-                attn_mask = self.lca_bias_subtractor(attn_mask, depths_with_cls, B_LCA_with_cls)
 
         # ============================================================
         # I162-1: 双路径插件模式 vs 串行模式
@@ -1942,7 +1988,7 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                 depths = levels_info.depths
                 # D1+D3 AUDIT FIX: 使用 bincount 向量化，将 N 次 .item() 同步减少为 1 次
                 # 原循环: for d in range(max_d): ratio = (depths == d).float().sum().item()
-                max_d = depths.max().int().item() + 1  # 一次性同步，用于确定 minlength
+                max_d = int(depths.max().int().item()) + 1  # 一次性同步，用于确定 minlength
                 # D1+D3 AUDIT FIX: bincount requires non-negative values; clamp to filter out padding sentinel -1
                 depth_counts = depths.flatten().clamp(min=0).long().bincount(minlength=max_d)  # [max_d], fully vectorized
                 total = depth_counts.sum().clamp(min=1)  # prevent div zero
@@ -2112,7 +2158,7 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                     "unique_levels_used": sorted(list(set(all_levels))),
                     "max_level_overall": max(all_levels),
                     # I141: 添加 non_blocking=True 避免同步阻塞
-                    "level_usage_distribution": dict(zip(*torch.unique(level_tensor.cpu(non_blocking=True), return_counts=True))),
+                    "level_usage_distribution": dict(zip(*torch.unique(level_tensor.to('cpu', non_blocking=True) if level_tensor.is_cuda else level_tensor, return_counts=True))),
                 }
             else:
                 analysis["overall_stats"] = {
