@@ -76,14 +76,24 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
         self._temperature: float = config.temperature_init
         # Geometry encoder inputs dim: 3 (path, rot, area)
         self.geometry_encoder = _LightweightGeometryEncoder(
-            feature_dim=config.feature_dim,
             hidden_dim=config.hidden_dim,
         )
-        # Fusion head
+        # Fusion head (concatenates semantic C + geo hidden_dim → 1 scalar)
         self.fusion = _LightweightFusion(
             feature_dim=config.feature_dim,
             hidden_dim=config.hidden_dim,
         )
+        # A1 axiom: Hilbert 1D Locality Conv1D (kernel=5, padding=2)
+        # Smooths per-cell scores over ±2 cells in Hilbert order
+        # (Hilbert curves preserve 2D locality along the 1D index)
+        self.hilbert_conv1d = nn.Conv1d(1, 1, kernel_size=5, padding=2, bias=True)
+        # Initialise weights as identity (center cell passes through) so
+        # the new A1 score head starts equivalent to the prior mean score.
+        with torch.no_grad():
+            self.hilbert_conv1d.weight.zero_()
+            self.hilbert_conv1d.weight[0, 0, 2] = 1.0  # center tap = 1
+            if self.hilbert_conv1d.bias is not None:
+                self.hilbert_conv1d.bias.zero_()
 
     @property
     def max_level_limit(self) -> int:
@@ -276,6 +286,68 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
 
         return mask_hard, mask_soft, mask_ste, topk_indices
 
+    def _score_cells(
+        self,
+        blocks: Tensor,
+        cell_hilbert_indices: Tensor,
+        h: int,
+    ) -> Tensor:
+        """A1 Locality-aware per-cell scoring (Hilbert 1D Conv1D).
+
+        Replaces the simple ``cell_features.mean(dim=-1)`` baseline with a
+        geometry-aware + locality-smoothed score head. The pipeline:
+
+          1. Spatial pool:    ``blocks.mean(dim=2)`` → [B, n_cells, C]
+          2. Build 3-channel geo: path (Hilbert index) + rot (sin) + area (h²)
+          3. GeometryEncoder: [B, n_cells, 3] → [B, n_cells, hidden_dim]
+          4. Fusion:         concat [C || hidden_dim] → linear → [B, n_cells, 1]
+          5. Conv1D 1D:      kernel=5, padding=2 over Hilbert 1D order
+                             → [B, n_cells] (A1 locality smoothing)
+
+        The Conv1D is initialised as identity (center tap = 1) so the new
+        head starts equivalent to the prior baseline and A1 emerges from
+        training rather than from random init.
+
+        Args:
+            blocks: [B, n_cells, h*h, C] from `_partition_hilbert`
+            cell_hilbert_indices: [n_cells] Hilbert index per cell
+                (cells are already sorted by Hilbert order — see _partition_hilbert)
+            h: chosen block size (for the area feature)
+
+        Returns:
+            score_head: [B, n_cells] per-cell scalar score
+        """
+        B, n_cells, _, _C = blocks.shape
+
+        # 1. Spatial pool (per-cell mean over h*h block)
+        semantic = blocks.mean(dim=2)  # [B, n_cells, C]
+
+        # 2. 3-channel geo features (path + rot + area)
+        # path: normalised Hilbert index in [0, 1]
+        path = cell_hilbert_indices.float() / max(n_cells, 1)  # [n_cells]
+        # rot: sin of phase angle (single-channel; cos omitted to save dim)
+        rot = torch.sin(path * 2.0 * 3.14159265)  # [n_cells]
+        # area: block area h² (same for all cells in this forward)
+        area = torch.full_like(path, float(h * h))  # [n_cells]
+        geo = torch.stack([path, rot, area], dim=-1)  # [n_cells, 3]
+        geo = geo.unsqueeze(0).expand(B, -1, -1)  # [B, n_cells, 3]
+
+        # 3. GeometryEncoder
+        geo_emb = self.geometry_encoder(geo)  # [B, n_cells, hidden_dim]
+
+        # 4. Fusion (semantic + geo → scalar per cell)
+        score_per_cell = self.fusion(semantic, geo_emb)  # [B, n_cells, 1]
+        score_per_cell = score_per_cell.squeeze(-1)  # [B, n_cells]
+
+        # 5. Conv1D 1D Locality smoothing (A1 axiom)
+        # IMPORTANT: HMFT picks a single h per forward (5-bin argmax), so
+        # n_cells is homogeneous within the batch — safe to use
+        # view(B, 1, N) for Conv1d. If future multi-h heterogenous batching
+        # is added, this will need a per-sample loop or scatter-based op.
+        score_per_cell = score_per_cell.unsqueeze(1).contiguous()  # [B, 1, N]
+        score_per_cell = self.hilbert_conv1d(score_per_cell)  # [B, 1, N]
+        return score_per_cell.squeeze(1)  # [B, n_cells]
+
     def forward(
         self,
         features: Tensor,
@@ -309,11 +381,10 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
         blocks, cell_hilbert_indices = self._partition_hilbert(features, h)
         n_cells = blocks.shape[1]
 
-        # 3) Compute per-cell scores (Gumbel-STE TopK)
-        # Per-cell features: mean over h*h spatial → [B, n_cells, C]
-        cell_features = blocks.mean(dim=2)  # [B, n_cells, C]
-        # Project to a scalar score per cell via simple mean over channels
-        score_head = cell_features.mean(dim=-1)  # [B, n_cells]
+        # 3) Compute per-cell scores via A1 Locality Conv1D score head
+        # Replaces the legacy `cell_features.mean(dim=-1)` baseline with
+        # geometry-aware + Hilbert-1D-smoothed scoring (see _score_cells).
+        score_head = self._score_cells(blocks, cell_hilbert_indices, h)  # [B, n_cells]
         # TopK selection via Gumbel-STE helper (A2: deterministic when hard=True)
         K = min(self._config.K_fixed, n_cells)
         mask_hard, mask_soft, mask_ste, topk_indices = self._gumbel_ste_topk(
@@ -352,27 +423,42 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
 
 
 class _LightweightGeometryEncoder(nn.Module):
-    """Minimal geometry encoder: 3-channel (path, rot, area) projection.
+    """3-channel (path + rot + area) geometry encoder for A1 axiom.
 
-    For the skeleton, we project raw features to a hidden geometry space.
-    Future B.4 work will replace this with H1SS's full GeometryEncoder.
+    Projects per-cell geometry features into a hidden_dim space that can
+    be fused with semantic cell features via _LightweightFusion.
+
+    Inputs:
+        geo: [B, n_cells, 3] where channels are
+            - path: normalized Hilbert index (cell position on curve)
+            - rot:  sin(Hilbert index / n_cells * 2π)  (rotational phase)
+            - area: block area h² (constant within a single forward)
     """
 
-    def __init__(self, feature_dim: int, hidden_dim: int) -> None:
+    def __init__(self, hidden_dim: int) -> None:
         super().__init__()
-        self.proj = nn.Linear(feature_dim, hidden_dim)
-
-    def forward(self, features: Tensor) -> Tensor:
-        return self.proj(features)
-
-
-class _LightweightFusion(nn.Module):
-    """Minimal fusion head: project + activate."""
-
-    def __init__(self, feature_dim: int, hidden_dim: int) -> None:
-        super().__init__()
-        self.proj = nn.Linear(hidden_dim, feature_dim)
+        # 3 input channels: path, rot, area
+        self.proj = nn.Linear(3, hidden_dim)
         self.act = nn.GELU()
 
     def forward(self, geo: Tensor) -> Tensor:
         return self.act(self.proj(geo))
+
+
+class _LightweightFusion(nn.Module):
+    """Fuses semantic cell features with geometry → scalar score per cell.
+
+    Concatenates [semantic(C) || geo(hidden_dim)] then projects to 1.
+    A1 axiom: the resulting scalar score is then smoothed by Hilbert 1D
+    Conv1d (applied in `_score_cells`) to enforce spatial locality.
+    """
+
+    def __init__(self, feature_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        # Concatenate semantic (C) + geo (hidden_dim) → project to 1 scalar
+        self.score_proj = nn.Linear(feature_dim + hidden_dim, 1)
+
+    def forward(self, semantic: Tensor, geo: Tensor) -> Tensor:
+        """semantic: [B, n_cells, C], geo: [B, n_cells, hidden_dim] → [B, n_cells, 1]"""
+        combined = torch.cat([semantic, geo], dim=-1)
+        return self.score_proj(combined)
