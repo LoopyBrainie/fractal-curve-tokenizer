@@ -167,11 +167,11 @@ def train_one_epoch(
         # === 2. 前向 (AMP 上下文 + OOM) ===
         with amp_autocast("cuda", enabled=ctx.amp):
             try:
-                # 模型 forward 返回 (ForwardOutput, MetricsTensors); MetricsTensors
-                # 中包含的 splitter/active/flops 等统计在 layer-packaged 机制下
+                # 模型 forward 返回 TrainingStats; 旧 MetricsTensors 中包含的
+                # splitter/active/flops 等统计在 layer-packaged 机制下
                 # 已通过 forward_output.auxiliary_outputs 流入 auxiliary_flat_metrics,
-                # 骨架不再直接读取 metrics_tensors (PR5c 收敛)。
-                forward_output, _ = model(images)
+                # 骨架不再需要解包第二元素 (PR5c 收敛)。
+                forward_output = model(images)
             except torch.cuda.OutOfMemoryError as e:
                 handled = False
                 for cb in callbacks:
