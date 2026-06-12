@@ -380,6 +380,7 @@ class SplitResult:
         K_soft: Optional[Tensor] = None,
         mask_ste: Optional[Tensor] = None,
         roi_features_raw: Optional[Tensor] = None,
+        roi_features: Optional[Tensor] = None,
         candidate_indices: Optional[Tensor] = None,
     ):
         """
@@ -409,6 +410,7 @@ class SplitResult:
         self.K_soft = K_soft
         self.mask_ste = mask_ste
         self.roi_features_raw = roi_features_raw
+        self.roi_features = roi_features
         self.candidate_indices = candidate_indices
 
         # I: 添加 split_decision 别名以兼容 tokenizer
