@@ -38,7 +38,7 @@ class TestFractalCurveViTPhase1Integration:
         )
         model.train()
         x = torch.randn(1, 3, 64, 64)
-        forward_output, _metrics = model(x)
+        forward_output = model(x)
         assert forward_output.logits.shape == (1, 10)
 
     def test_fractal_vit_with_multi_block_hmft_splitter(self):
@@ -55,7 +55,7 @@ class TestFractalCurveViTPhase1Integration:
         )
         model.train()
         x = torch.randn(1, 3, 64, 64)
-        forward_output, _metrics = model(x)
+        forward_output = model(x)
         assert forward_output.logits.shape == (1, 10)
 
     def test_fractal_vit_h1ss_baseline_smoke(self):
@@ -70,7 +70,7 @@ class TestFractalCurveViTPhase1Integration:
         )
         model.train()
         x = torch.randn(2, 3, 32, 32)
-        forward_output, _metrics = model(x)
+        forward_output = model(x)
         assert forward_output.logits.shape == (2, 10)
         # num_tokens field exists and is reasonable
         nt = forward_output.num_tokens

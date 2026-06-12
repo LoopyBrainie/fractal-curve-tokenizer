@@ -50,7 +50,7 @@ def test_h1ss_stress_scale_baseline_forward(N: int):
     model.train()
     x = torch.randn(2, 3, N, N)
     # Returns (ForwardOutput, MetricsTensors) per FractalCurveViT design
-    forward_output, _metrics = model(x)
+    forward_output = model(x)
     assert forward_output.logits.shape == (2, 10), (
         f"Expected logits shape (2, 10) at N={N}, got {forward_output.logits.shape}"
     )
@@ -74,7 +74,7 @@ def test_h1ss_stress_scale_token_count_bounds(N: int):
     )
     model.train()
     x = torch.randn(2, 3, N, N)
-    forward_output, _metrics = model(x)
+    forward_output = model(x)
     num_tokens = forward_output.num_tokens
     # num_tokens can be int, list[int], or tensor depending on impl branch.
     # Normalize to per-batch int values for bounds checking.
@@ -109,7 +109,7 @@ def test_h1ss_stress_scale_gradient_flow(N: int):
     )
     model.train()
     x = torch.randn(1, 3, N, N, requires_grad=True)
-    forward_output, _metrics = model(x)
+    forward_output = model(x)
     loss = forward_output.logits.sum()
     loss.backward()
     assert x.grad is not None, f"No gradient at input for N={N}"
