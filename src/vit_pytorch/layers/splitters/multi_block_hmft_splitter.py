@@ -1,4 +1,4 @@
-"""v1.3 STANDARD: Multi-Block HMFT Splitter (alpha-b-rev4).
+"""v1.3 STANDARD: Multi-Block HMFT Splitter (alpha-b-rev4, I170 V3-aligned).
 
 Per docs/superpowers/specs/2026-06-08-fractal-hilbert-vit-best-practice-design.md §9.1
 this is the main path splitter for v1.3. It generalizes H1SS by allowing the
@@ -12,9 +12,37 @@ Key design differences from H1SS:
      docs/superpowers/lemmas/2026-06-08-power-of-4-chunking-proof.md).
   3. **Gumbel-STE TopK**: same as H1SS, but selects K cells from the
      chosen h × h blocks (not from the global Hilbert indices).
+  4. **A1 Locality Conv1D**: ``_score_cells`` applies a kernel-5 Conv1D
+     over the per-cell score sequence (sorted by Hilbert order) so
+     selections favour spatially-adjacent cells.
+
+V3 Protocol Contract (I170, v1.3 STANDARD):
+  ``SplitResult`` fields emitted by this splitter MUST match the
+  V3 protocol that ``HilbertOptimalSplitter`` (H1SS) also satisfies
+  (see ``core/splitter_protocol.py:336-432``):
+
+  - ``roi_features_raw``:  [B, n_cells, feature_dim_in]
+                          pre-gather per-candidate pool, USED by
+                          ``tokenizer.py:1015`` fast path
+  - ``roi_features``:      [B, n_cells, feature_dim]
+                          post-projection LayerNorm'd, T10 keystone
+                          (ensures feature_proj stays in autograd graph)
+  - ``mask_ste``:          [B, n_cells]  Gumbel-STE mask
+  - ``candidate_indices``: [M]          selected token indices
+
+  The fields ``roi_features_raw`` and ``roi_features`` are
+  STATICALLY pre-registered in __init__ (NOT lazily built in forward)
+  so the optimizer can find their parameters via
+  ``model.parameters()`` at instantiation time. See I170 Risks §0.
 
 The 5-block EAS verification (JVP-1) is in
 tests/unit/L2_components/splitters/test_multi_block_hmft_eas.py.
+The V3 protocol verification (I170 Commit 3) is in
+tests/unit/L2_components/splitters/test_multi_block_hmft_v3_protocol.py.
+The A1 axiom tests (I170 Commit 2) are in
+tests/unit/L2_components/splitters/test_multi_block_hmft_a1.py.
+The A2 determinism tests (I170 Commit 1) are in
+tests/unit/L2_components/splitters/test_multi_block_hmft_a2.py.
 """
 from __future__ import annotations
 
@@ -63,11 +91,28 @@ class MultiBlockHMFTSplitterConfig:
 
 
 class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
-    """v1.3 STANDARD: Multi-Block HMFT Splitter (alpha-b-rev4).
+    """v1.3 STANDARD: Multi-Block HMFT Splitter (alpha-b-rev4, I170 aligned).
 
     Splits an input feature map of shape [B, C, H, W] into K sub-blocks
     by choosing a block size h from a learnable 5-bin distribution and
     then applying Gumbel-STE TopK over the resulting (H/h)·(W/h) cells.
+
+    Protocol contract (I170, V3 aligned with H1SS):
+        When wired through ``FractalCurveViT``, the splitter is
+        re-constructed (see ``models/fractal_vit.py`` Commit 5) with
+        ``feature_dim_in=dim, feature_dim=dim, hidden_dim=64`` so
+        ``roi_features_raw.shape[-1] == model.dim`` matches the
+        tokenizer's pool buffer at ``modules/tokenizer.py:1015``.
+
+        When used standalone (e.g. in unit tests), the default config
+        uses ``feature_dim_in=feature_dim=256`` (preserved for backward
+        compat with the existing 5-grid EAS tests).
+
+    A1 + A2 axioms (I170 Commits 1-2):
+        A1 Locality: per-cell scores are computed by ``_score_cells``
+        (geometry + Hilbert 1D Conv1D smoothing, kernel=5).
+        A2 Determinism: Gumbel noise is gated purely on ``not hard``
+        (the helper ``_gumbel_ste_topk`` is the contract surface).
     """
 
     def __init__(
