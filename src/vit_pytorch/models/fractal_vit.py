@@ -42,20 +42,24 @@ import torch.nn as nn
 
 if TYPE_CHECKING:
     from vit_pytorch.core.levels_info import LevelsInfo
+    from vit_pytorch.modules.alpha_modulator import AlphaModulator  # R7-A (type hint only)
+    from vit_pytorch.modules.lca_bias_subtractor import LCABiasSubtractor  # R7-Beta-C (type hint only)
+    from vit_pytorch.core.continuous_utils import compute_num_candidates  # type hint only
 
 # v6.0+: 2D RoPE 已集成到 ManifoldNativeAttention，不再需要 Learned PE
 from vit_pytorch.modules.tokenizer import StreamingFractalTokenizerV3
 from vit_pytorch.modules.base_tokenizer import BaseTokenizer, TokenizerOutput
 from vit_pytorch.modules.transformer_block import FractalTransformer, FFNType
-from vit_pytorch.modules.alpha_modulator import AlphaModulator  # R7-A
-from vit_pytorch.modules.lca_bias_subtractor import LCABiasSubtractor  # R7-Beta-C
 from vit_pytorch.core.utils import pair
 from vit_pytorch.core.constants import (
     EPS, DIVISION_EPSILON, PROB_EPSILON,
     compute_k_bounds,
     LOGIT_CLAMP_BOUND,  # I147: 添加钳制边界导入
 )
-from vit_pytorch.core.continuous_utils import compute_num_candidates  # I-FIX-2026-06-11: moved in 9faf546
+# I-FIX-2026-06-11: compute_num_candidates was moved in 9faf546 to continuous_utils.
+# Lazy-imported inside FractalCurveViT.num_candidates property to break any
+# transitive boot-time import cycle. TYPE_CHECKING guard above keeps static type
+# checkers (Pyright/Ruff) satisfied without runtime cost.
 from vit_pytorch.core.config import SemanticSplitterConfig  # I110-5
 from vit_pytorch.core.pattern_encoder import (
     create_hilbert_pattern_encoder,
@@ -662,21 +666,11 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                         min_patch_size=effective_min_patch_size,
                         hard_limit=8,
                     )
-                # Compute K_fixed using the same dynamic formula as H1SS
-                # (Phase 2 spec: K = clamp(computed_k_max, 8, 64))
-                img_h, img_w = self.image_size
-                max_possible_tokens = (
-                    (img_h // effective_min_patch_size)
-                    * (img_w // effective_min_patch_size)
-                )
-                computed_k_min = max(
-                    1, int(max_possible_tokens * splitter_token_ratio_min),
-                )
-                computed_k_max = max(
-                    computed_k_min + 1,
-                    int(max_possible_tokens * splitter_token_ratio_max),
-                )
-                hmft_K_fixed = max(8, min(computed_k_max, 64))
+                # I170.3 A5: HMFT no longer accepts K_fixed — K is statically
+                # HMFT_K_HARD_GLOBAL_POOL=8 inside the splitter. The dynamic
+                # K computation that previously lived here is now dead code
+                # (H1SS still consumes it via the else branch below; HMFT
+                # gets a fixed K=8 unconditionally).
                 # Re-construct HMFT with V3 d_model = model dim.
                 # The user's pre-constructed splitter is intentionally
                 # replaced (constructor injection pattern, same as H1SS
@@ -688,7 +682,6 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                     hidden_dim=64,       # match H1SS line 248 default
                     min_patch_size=effective_min_patch_size,
                     max_level_limit=hmft_max_level,
-                    K_fixed=hmft_K_fixed,
                 ))
             self.splitter = splitter
         else:
@@ -880,11 +873,14 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
 
         # === R7-A: AlphaModulator (UNCONDITIONAL SHIP) ===
         # 1 个可学习参数 alpha_raw init=0 → 恒等映射
+        # Lazy import: 顶层 TYPE_CHECKING 守卫,运行期按需解包,避免 boot-time 循环引用
+        from vit_pytorch.modules.alpha_modulator import AlphaModulator
         self.alpha_modulator = AlphaModulator(logit_scale=logit_scale, eps=EPS)
 
         # === R7-Beta-C: LCABiasSubtractor (T14-gated, default-ON) ===
         # bias_table: [max_depth+1, max_depth+1] = (65, 65) 共 4225 个共享参数
         # kill-switch 通过 config.beta_c_emergency_off 控制
+        from vit_pytorch.modules.lca_bias_subtractor import LCABiasSubtractor
         self.lca_bias_subtractor = LCABiasSubtractor(
             max_depth=max_depth,
             enabled=bias_subtract_lca and not beta_c_emergency_off,
@@ -965,6 +961,8 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         Returns:
             四叉树候选节点总数
         """
+        # Lazy import: 顶层 TYPE_CHECKING 守卫,运行期按需解包,避免 boot-time 循环引用
+        from vit_pytorch.core.continuous_utils import compute_num_candidates
         max_level = self.max_level if self.max_level is not None else 8
         return compute_num_candidates(max_level)
 
