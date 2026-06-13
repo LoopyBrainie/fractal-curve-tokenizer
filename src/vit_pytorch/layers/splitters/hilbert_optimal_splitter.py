@@ -318,6 +318,13 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         # 4.5. 面积投影
         self.area_proj = nn.Linear(1, hidden_dim)
+        # I-T10-Splitter-C: 平衡 geo_embs 三段量级, 避免 4^{-d} 衰减压制 area 段。
+        # 初始 1.0 等效无 scale, 完全向后兼容, 可直接 load 预训练 checkpoint。
+        # 训练时反向传播会自动拉高 η, 让 area 段贡献到 geo_norm 联合统计量 σ²,
+        # 从而让 ∂L/∂area_proj.weight 获得按 (σ_area/σ_total²)² 数量级提升的梯度。
+        self.area_scale = nn.Parameter(
+            torch.tensor(1.0, dtype=torch.get_default_dtype())
+        )
 
         # 4.6. 分组特征归一化
         self.roi_norm = nn.LayerNorm(hidden_dim)
@@ -665,8 +672,16 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             # 维度匹配：直接使用 rot_proj（初始化为近似恒等映射）
             rot_emb = self.rot_proj(rot_emb)
         # 面积编码 - 4^(-depth) → Linear 投影（消除 expand 导致的秩塌陷）
-        area_enc = self._area_encoding[depths]  # [N]
+        area_enc = self._area_encoding[depths]  # [N], dtype=float32 buffer
+        # I-T10-Splitter-D: 显式 cast 到 area_proj.dtype, 避免 AMP 混合精度。
+        # device 一致性前提: _area_encoding 跟随 splitter.to(device) 落在与
+        # area_proj.weight 同一 device, .to(dtype=...) 是 view-like, 不触发
+        # CPU↔GPU 同步。AMP 下 dtype 是 fp16/bf16, 仍 view-like。
+        area_enc = area_enc.to(dtype=self.area_proj.weight.dtype)
         area_enc = self.area_proj(area_enc.unsqueeze(-1))  # [N] → [N, 1] → [N, hidden_dim]
+        # I-T10-Splitter-C: 可学习 area_scale 平衡 geo_embs 三段量级。
+        # 必须放在 return 之前, 走 autograd 链; 不可在 __init__ 提前乘。
+        area_enc = area_enc * self.area_scale
 
         return path_emb, rot_emb, area_enc
 
@@ -810,6 +825,8 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
             probs=mask_soft,
             mask_ste=mask_ste,
             roi_features_raw=roi_raw,
+            # T10 keystone: post-feature_proj + LayerNorm (与 HMFT 协议层 roi_features 对齐)
+            roi_features=roi_normed,
             candidate_indices=candidate_indices,
         )
 
