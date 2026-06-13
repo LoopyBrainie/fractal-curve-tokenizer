@@ -80,6 +80,19 @@ class TrainingHyperparams:
     r12_lambda_skew: float = 0.10
     paced_window_fatal_streak: int = 3
 
+    # Routing Parameter Aux-Loss (PR: auxiliary-loss-pr-unified-rabbit)
+    # 5 routing params (logit_scale / _semantic_ratio / conv1d_hilbert.weight+bias
+    # / bias_table / alpha_raw) get entropy/budget/locality supervision signals.
+    # 默认 ON (per user decision: 符合原话 "在 auxiliary_losses is None 时 freeze" 字面意思)
+    enable_routing_aux_loss: bool = True
+    freeze_routing_params: bool = True
+    routing_entropy_weight: float = 0.05
+    routing_budget_weight: float = 0.08
+    routing_locality_weight: float = 0.04
+    routing_bias_reg_weight: float = 0.02
+    routing_entropy_target: float = 0.7   # H_target (normalized [0, 1])
+    routing_budget_target: float = 0.25  # K_target fraction ∈ [0, 1]
+
 
 @dataclass
 class NumericalConfig:

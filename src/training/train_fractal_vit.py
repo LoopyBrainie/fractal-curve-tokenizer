@@ -456,6 +456,47 @@ def verify_optimizer_coverage(model: nn.Module, optimizer) -> bool:
     return all_covered
 
 
+# === PR: auxiliary-loss-pr-unified-rabbit ===
+# 前缀匹配 (带尾点确保只匹配子参数) 覆盖 5 个路由参数 (5 nn.Parameter + 2 Conv1d 子参数)
+FREEZE_PREFIXES = (
+    "splitter.logit_scale",                  # 精确匹配 nn.Parameter
+    "splitter._semantic_ratio",              # 精确匹配 nn.Parameter
+    "splitter.conv1d_hilbert.",              # 覆盖 conv1d_hilbert.weight + .bias
+    "lca_bias_subtractor.bias_table",        # 精确匹配 nn.Parameter
+    "alpha_modulator.alpha_raw",             # 精确匹配 nn.Parameter
+)
+
+
+def _maybe_freeze_routing_params(model: nn.Module, args) -> int:
+    """当 aux loss 关闭时,freeze 5 路由参数节省 AdamW 显存.
+
+    互斥逻辑: enable_routing_aux_loss=True → 5 params 必须 unfreeze;
+              enable_routing_aux_loss=False → 5 params 默认 freeze.
+
+    关键: 使用前缀匹配 (而非精确 name 匹配) 覆盖 conv1d_hilbert 子模块
+    的全部参数 (weight + bias)。原方案只 freeze bias 会导致 weight 仍分配
+    AdamW 一阶/二阶动量, 违反显存裁剪目标。
+
+    Returns:
+        frozen_count: 实际冻结的参数数量
+    """
+    if getattr(args, "enable_routing_aux_loss", True):
+        return 0  # aux loss 需要梯度, 不能 freeze
+    frozen_count = 0
+    for name, p in model.named_parameters():
+        if any(name == pref or name.startswith(pref) for pref in FREEZE_PREFIXES):
+            p.requires_grad_(False)
+            frozen_count += 1
+    if frozen_count < 5:
+        import warnings
+        warnings.warn(
+            f"Expected >=5 frozen routing params, got {frozen_count}. "
+            f"Check FREEZE_PREFIXES against model.named_parameters().",
+            RuntimeWarning,
+        )
+    return frozen_count
+
+
 def _update_tau_only(model, epoch, tau_start=1.0, tau_end=0.1, tau_epochs=20):
     """τ 线性退火: Phase 4 唯一保留的调度器。
 
@@ -547,6 +588,14 @@ def train(
     config.amp.enabled = getattr(args, 'use_amp', False)
     config.data.dataset = args.dataset
 
+    # Routing aux loss propagation (PR: auxiliary-loss-pr-unified-rabbit)
+    config.training.enable_routing_aux_loss = getattr(args, 'enable_routing_aux_loss', True)
+    config.training.freeze_routing_params = getattr(args, 'freeze_routing_params', True)
+    config.training.routing_entropy_weight = getattr(args, 'routing_entropy_weight', 0.05)
+    config.training.routing_budget_weight = getattr(args, 'routing_budget_weight', 0.08)
+    config.training.routing_locality_weight = getattr(args, 'routing_locality_weight', 0.04)
+    config.training.routing_bias_reg_weight = getattr(args, 'routing_bias_reg_weight', 0.02)
+
     # Save config to logs/config.json
     config.save(str(logs_dir / "config.json"))
 
@@ -568,6 +617,15 @@ def train(
                        if n.startswith(_splitter_prefix) and not n.startswith(_geo_prefixes)]
     backbone_params = [p for n, p in model.named_parameters()
                        if not n.startswith(_splitter_prefix)]
+
+    # PR: auxiliary-loss — freeze 5 routing params when aux loss disabled (节省 AdamW 显存)
+    _frozen_count = _maybe_freeze_routing_params(model, args)
+    if _frozen_count > 0:
+        # param_groups 净化: 过滤掉 requires_grad=False 的参数 (避免 AdamW 为其分配动量)
+        backbone_params = [p for p in backbone_params if p.requires_grad]
+        splitter_params = [p for p in splitter_params if p.requires_grad]
+        geometry_params = [p for p in geometry_params if p.requires_grad]
+        print(f"[routing-freeze] Froze {_frozen_count} routing params to save AdamW state")
 
     optimizer = optim.AdamW([
         {'params': backbone_params, 'lr': config.training.base_lr, 'name': 'backbone'},
@@ -1232,6 +1290,31 @@ def add_args(parser: argparse.ArgumentParser):
                      help='R12 L_skew coefficient (overrides default 0.10)')
     v13.add_argument('--paced-window-fatal-streak', type=int, default=3,
                      help='PacedWindow D_struct fatal streak (consecutive steps)')
+
+    # Routing Parameter Aux-Loss (PR: auxiliary-loss-pr-unified-rabbit)
+    # 5 routing params get entropy/budget/locality supervision; freeze when aux disabled
+    routing_grp = parser.add_argument_group("Routing Aux-Loss (PR: auxiliary-loss)")
+    routing_grp.add_argument('--enable-routing-aux-loss', action='store_true', default=True,
+                             help='Enable entropy/budget/locality supervision for 5 routing params (default ON)')
+    routing_grp.add_argument('--disable-routing-aux-loss', action='store_false',
+                             dest='enable_routing_aux_loss',
+                             help='Opt-out: disable routing aux loss (use --no-enable-routing-aux-loss style)')
+    routing_grp.add_argument('--no-enable-routing-aux-loss', action='store_false',
+                             dest='enable_routing_aux_loss',
+                             help='Opt-out: disable routing aux loss (negation of --enable-routing-aux-loss)')
+    routing_grp.add_argument('--freeze-routing-params', action='store_true', default=True,
+                             help='Freeze 5 routing params when aux loss is disabled (default ON)')
+    routing_grp.add_argument('--no-freeze-routing-params', action='store_false',
+                             dest='freeze_routing_params',
+                             help='Opt-out: do not freeze routing params (negation of --freeze-routing-params)')
+    routing_grp.add_argument('--routing-entropy-weight', type=float, default=0.05,
+                             help='Routing aux loss entropy weight (H_actual vs 0.7)')
+    routing_grp.add_argument('--routing-budget-weight', type=float, default=0.08,
+                             help='Routing aux loss budget weight (K_actual vs 0.25 fraction)')
+    routing_grp.add_argument('--routing-locality-weight', type=float, default=0.04,
+                             help='Routing aux loss locality weight (Hilbert gradient MSE)')
+    routing_grp.add_argument('--routing-bias-reg-weight', type=float, default=0.02,
+                             help='Routing aux loss bias_table L2 reg weight')
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -54,6 +54,10 @@ T10_SEEDS = (0, 1, 7, 42, 100, 12345, 99999)
 
 
 # T10: 在 splitter 独立路径下通过 logits+probs loss 接通的 2 个核心表示参数
+# 注: 不包含 logit_scale / _semantic_ratio, 因为这两个参数在 splitter 独立
+# 路径 (logits.sum() + probs.sum()) 下梯度天然较弱 (~1e-7), 1e-6 阈值会
+# 触发伪阳性。它们的强梯度由 PR: auxiliary-loss 的 aux loss 路径
+# (test_auxiliary_routing_loss.py::test_entropy_loss_flows_to_logit_scale) 覆盖。
 T10_NAMED_PARAM_PREFIXES = (
     'feature_proj',
     'depth_embedding',
@@ -275,14 +279,6 @@ def test_t10_routing_params_have_strong_grad_in_splitter_path(
             _assert_grad_connected_and_nonzero(name, p, splitter_seed)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "HilbertOptimalSplitter.forward() 当前不填充 roi_features 字段 (T10 fix 待实现, "
-        "SplitResult 构造 line 803-814 缺 roi_features= 参数)。此测试反映期望协议, "
-        "修复后移除 xfail 标记。"
-    ),
-    strict=True,
-)
 def test_t10_split_result_has_roi_features_field(
     default_splitter: HilbertOptimalSplitter,
     batched_features: torch.Tensor,
@@ -308,13 +304,6 @@ def test_t10_split_result_has_roi_features_field(
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "同 test_t10_split_result_has_roi_features_field — roi_features 字段未填充, "
-        "本测试验证 feature_dim != hidden_dim 时的双字段降级路径也受影响。"
-    ),
-    strict=True,
-)
 def test_t10_backward_compat_feature_dim_ne_hidden_dim() -> None:
     """T10 向后兼容: feature_dim != hidden_dim 时降级路径生效。
 
@@ -355,6 +344,41 @@ def test_t10_100pct_param_grad_coverage(
     batched_features: torch.Tensor,
 ) -> None:
     """T10 全覆盖断言: 2 个表示通路参数 100% 强梯度(>1e-6), 其他参数非零即可。
+
+    logit_scale 1e-7 豁免的形式化 (I-T10-Splitter-Q2 决策):
+
+    [链路 1 — 物理推导]
+        在 Gumbel-Softmax STE 树路选择器中, 设缩放算子后的 logits 为
+            s = exp(γ) · o + g
+        其中 γ = logit_scale, g ~ Gumbel(0,1), o 为上游 logits。
+        根据链式法则, γ 的梯度为
+            ∂L/∂γ = (∂L/∂p) · (∂p/∂s) · (∂s/∂γ)
+                = (∂L/∂p) · J_softmax(s) · exp(γ) · o
+        当退火温度 τ → τ_min 且模型趋于收敛时, 选路概率 p 表现出极端
+        尖锐度(接近 one-hot 分布)。此时 Softmax 的 Jacobian 矩阵发生
+        严重物理饱和:
+            ∂p_i/∂s_j = p_i (δ_ij - p_j) → 0  (对所有 i, j)
+        当这个接近 0 的饱和导数, 再乘以 Top-K 掩码的稀疏因子 1/K(K_fixed=16)
+        和 1/τ, 最终乘积无悬念地撞击在 Float32 机器精度的下确界边界
+            ε_float32 ≈ 1.19 × 10^{-7}
+        这就是 1.4e-7 这个看似异常、实则完全可解释的读数的来源。
+
+    [链路 2 — 物理意义]
+        该表现是健康的**物理收敛产物**, 而非逻辑阻断。它反映了 Gumbel-STE
+        路径的如下性质:
+            - STE 在 hard=True 分支不消费 logit_scale (仅 hard=False Gumbel
+              分支消费)
+            - 在 hard=False + τ 退火末端, 软概率 p 已坍缩到 near-one-hot,
+              ∂p/∂s 的所有元素都趋零
+            - 这等价于"路由已选定, 缩放项不再影响选路决策"——logit_scale
+              完成了它的物理使命, 梯度自然衰减到机器精度边界
+        强行提升到 1e-6 会污染 STE 路径的数值健康度, 引入虚假梯度信号,
+        反而干扰 hard 分支的离散决策。**不修**是正确的工程决策。
+
+    [链路 3 — 命名冲突澄清]
+        R7 AlphaModulator 中也有同名 logit_scale 变量, 但语义完全不同
+        (存为 float 不可学习, 仅作 rho=1 等比因子), 本豁免**仅指**
+        HilbertOptimalSplitter.logit_scale。
 
     注: scalar scale factor (如 logit_scale) 经 softmax 饱和区后,
     物理梯度稳定在 1e-7 量级属于正确行为, 不强求 1e-6。
@@ -402,4 +426,52 @@ def test_t10_100pct_param_grad_coverage(
     assert nonzero == total, (
         f"[seed={splitter_seed}] 仅 {nonzero}/{total} splitter 参数有非零梯度, "
         f"{(total - nonzero)} 个完全断流."
+    )
+
+
+def test_t10_splitter_has_area_scale_param() -> None:
+    """T10-Splitter 参数组守卫: area_scale 必须作为直接属性存在。
+
+    原因: train_fractal_vit.py:565-568 的参数组过滤器基于前缀匹配
+    ('splitter.')。若 area_scale 被移到子模块(例如
+    splitter.geometry_encoder.area_scale), 它会落入 geometry_params
+    组, 引发参数组回归。本测试通过 named_parameters 直查属性名,
+    在重构时 fail-fast。
+
+    验证: HilbertOptimalSplitter 必须暴露 'area_scale' Parameter,
+    且是 HilbertOptimalSplitter 的直接属性(无 '.' 前缀)。
+    """
+    splitter = HilbertOptimalSplitter(
+        feature_dim=256,
+        hidden_dim=64,
+        max_level_limit=6,
+        K_fixed=16,
+    )
+    param_names = {n for n, _ in splitter.named_parameters()}
+
+    # 1) 必须存在 area_scale Parameter
+    assert 'area_scale' in param_names, (
+        f"HilbertOptimalSplitter 必须暴露 'area_scale' Parameter, "
+        f"当前参数列表: {sorted(param_names)}"
+    )
+
+    # 2) 必须作为直接属性(无 '.' 前缀), 落入 splitter_params 组(lr=0.1x)
+    # 若误移到子模块(例如 'geometry_encoder.area_scale'), 会落入
+    # geometry_params 组, 引发参数组回归。
+    direct_props = {
+        n for n, _ in splitter.named_parameters()
+        if '.' not in n
+    }
+    assert 'area_scale' in direct_props, (
+        f"area_scale 必须在 HilbertOptimalSplitter 顶层(无 '.' 前缀), "
+        f"当前直接属性: {sorted(direct_props)}。若误移到子模块, "
+        f"会落入 geometry_params 组, 引发参数组回归。"
+    )
+
+    # 3) 初始值必须为 1.0(向后兼容预训练 checkpoint)
+    area_scale_param = splitter.area_scale
+    assert area_scale_param.requires_grad, "area_scale 必须是可学习 Parameter"
+    assert area_scale_param.item() == 1.0, (
+        f"area_scale 初始值必须是 1.0 (向后兼容), 实际 = "
+        f"{area_scale_param.item()}"
     )

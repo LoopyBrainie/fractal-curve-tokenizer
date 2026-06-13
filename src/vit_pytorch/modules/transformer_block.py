@@ -119,7 +119,6 @@ class FractalTransformerBlock(nn.Module):
         max_level: int = 8,
         drop_path: float = 0.0,
         ffn_type: FFNType = 'swiglu',
-        manifold_beta: float = 4.0,
         # v7.1: 宏观/微观频率配置
         macro_ratio: float = 0.5,
         macro_base: float = 1000.0,
@@ -127,7 +126,6 @@ class FractalTransformerBlock(nn.Module):
         super().__init__()
         self.dim = dim
         self.max_level = max_level
-        self.manifold_beta = manifold_beta
 
         # Manifold-Native 注意力
         self.attention = ManifoldNativeAttention(
@@ -135,9 +133,7 @@ class FractalTransformerBlock(nn.Module):
             heads=heads,
             dim_head=dim_head,
             max_level=max_level,
-            beta=manifold_beta,
             dropout=dropout,
-            use_banded=True,
             # v7.1: 传递宏观频率配置
             macro_ratio=macro_ratio,
             macro_base=macro_base,
@@ -274,7 +270,6 @@ class FractalTransformer(nn.Module):
         drop_path_rate: float = 0.1,
         ffn_type: FFNType = 'swiglu',
         use_checkpoint: bool = False,
-        manifold_beta: float = 4.0,
         # v7.1: 宏观/微观频率配置
         macro_ratio: float = 0.5,
         macro_base: float = 1000.0,
@@ -285,7 +280,6 @@ class FractalTransformer(nn.Module):
         self.max_level = max_level
         self.ffn_type = ffn_type
         self.use_checkpoint = use_checkpoint
-        self.manifold_beta = manifold_beta
 
         # P-OPT: Stochastic depth decay rule
         # D1-AUDIT FIX: 使用 .tolist() 避免 .item() 同步（__init__ 中调用，非 forward 热路径但仍需修复）
@@ -302,7 +296,6 @@ class FractalTransformer(nn.Module):
                     max_level=max_level,
                     drop_path=self._drop_path_rates[i],
                     ffn_type=ffn_type,
-                    manifold_beta=manifold_beta,
                     # v7.1: 传递宏观频率配置
                     macro_ratio=macro_ratio,
                     macro_base=macro_base,

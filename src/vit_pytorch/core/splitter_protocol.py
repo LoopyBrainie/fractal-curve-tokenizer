@@ -494,6 +494,14 @@ class SplitResult:
                 -(self.probs * torch.log(self.probs + eps)).sum().item()
             )
 
+        # === 日志快照:路由参数值 (Python float,严禁用于 loss 计算) ===
+        if hasattr(self, "logit_scale") and self.logit_scale is not None:
+            ls_val = self.logit_scale
+            output["logit_scale_snapshot"] = float(ls_val.item()) if hasattr(ls_val, "item") else float(ls_val)
+        if hasattr(self, "_semantic_ratio") and self._semantic_ratio is not None:
+            sr_val = self._semantic_ratio
+            output["semantic_ratio_snapshot"] = float(sr_val.item()) if hasattr(sr_val, "item") else float(sr_val)
+
         # === H1SS / HilbertOptimalSplitter 特有的辅助损失 ===
         # 这些字段来自 get_auxiliary_losses()，由 HilbertOptimalSplitter 调用时填充
         if hasattr(self, "entropy") and self.entropy is not None:

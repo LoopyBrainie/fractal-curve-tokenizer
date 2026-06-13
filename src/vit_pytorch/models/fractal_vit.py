@@ -448,8 +448,6 @@ class FractalCurveViT(nn.Module):
         use_pattern_plugin: bool = False,  # 是否启用双路径插件 (替代串行模式)
         pattern_plugin_config: Optional[dict] = None,  # 插件配置字典
 
-        # Hilbert 带宽参数
-        manifold_beta: float = 4.0,  # Hilbert 带宽系数
         # v7.1: DirectionAwareSubspacedRoPE 宏观/微观频率配置
         macro_ratio: float = 0.5,  # 宏观子空间占比 (前 macro_ratio*D 维为宏观)
         macro_base: float = 1000.0,  # 宏观频率基准 (比 micro base 小 10x)
@@ -837,7 +835,6 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                 drop_path_rate=drop_path_rate,
                 ffn_type=ffn_type,
                 use_checkpoint=use_checkpoint,
-                manifold_beta=manifold_beta,
                 # v7.1: 传递宏观频率配置
                 macro_ratio=macro_ratio,
                 macro_base=macro_base,
@@ -1951,6 +1948,41 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             splitter_out = split_result.splitter_output
             if splitter_out:  # 非空才记录
                 auxiliary_outputs["splitter"] = splitter_out
+
+        # === 路由参数 Tensor 命名空间 (供 callback 计算 loss,保持 autograd 完整) ===
+        # 关键: 所有值必须是 raw Tensor,**严禁 .item() / float()** —— 否则 backward 断裂
+        # 区别于 splitter_output (Python float 日志快照),本命名空间专供梯度流
+        routing_tensors: Dict[str, Any] = {}
+        if hasattr(self, "splitter") and self.splitter is not None:
+            sp = self.splitter
+            if hasattr(sp, "logit_scale") and isinstance(sp.logit_scale, torch.nn.Parameter):
+                routing_tensors["logit_scale"] = sp.logit_scale
+            if hasattr(sp, "_semantic_ratio") and isinstance(sp._semantic_ratio, torch.nn.Parameter):
+                routing_tensors["semantic_ratio"] = sp._semantic_ratio
+            conv = getattr(sp, "conv1d_hilbert", None)
+            if conv is not None:
+                w = getattr(conv, "weight", None)
+                if isinstance(w, torch.nn.Parameter):
+                    routing_tensors["conv1d_hilbert_weight"] = w
+                b = getattr(conv, "bias", None)
+                if isinstance(b, torch.nn.Parameter):
+                    routing_tensors["conv1d_hilbert_bias"] = b
+            probs = getattr(sp, "probs", None)
+            if probs is not None and isinstance(probs, torch.Tensor):
+                routing_tensors["probs"] = probs
+            active_mask = getattr(sp, "selected_mask", None)
+            if active_mask is not None and isinstance(active_mask, torch.Tensor):
+                routing_tensors["active_mask"] = active_mask
+        if hasattr(self, "lca_bias_subtractor") and self.lca_bias_subtractor is not None:
+            bt = getattr(self.lca_bias_subtractor, "bias_table", None)
+            if isinstance(bt, torch.nn.Parameter):
+                routing_tensors["bias_table"] = bt
+        if hasattr(self, "alpha_modulator") and self.alpha_modulator is not None:
+            ar = getattr(self.alpha_modulator, "alpha_raw", None)
+            if isinstance(ar, torch.nn.Parameter):
+                routing_tensors["alpha_raw"] = ar
+        if routing_tensors:
+            auxiliary_outputs["routing_tensors"] = routing_tensors
 
         # I167-1: Decay Conv 输出（验证距离衰减公理）
         # decay_weights_center 应接近 1.0，若偏离说明先验被破坏
