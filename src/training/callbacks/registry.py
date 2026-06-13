@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Any, List
 
 from .base import TrainerCallback
+from .auxiliary_routing_loss import AuxiliaryRoutingLossCallback
 from .fractal_tree_reg import FractalTreeRegCallback
 from .hmft_h_probs import HMFTHProbsCallback
 from .loss_components import LossComponentsAccumulator
@@ -30,6 +31,7 @@ def build_callbacks(config: Any) -> List[TrainerCallback]:
     Opt-in (config flags, default off):
       - FractalTreeRegCallback (T3 R12, `config.training.enable_r12_aux`)
       - HMFTHProbsCallback (T6 HMFT, `config.training.enable_hmft_h_probs`, default-on)
+      - AuxiliaryRoutingLossCallback (PR: auxiliary-loss, `config.training.enable_routing_aux_loss`, default-ON)
 
     NaN / gradient monitoring is wired separately via `ctx.nan_guard`
     and `GradientMonitorCallback` — they are not constructed here.
@@ -52,6 +54,19 @@ def build_callbacks(config: Any) -> List[TrainerCallback]:
     # T6 HMFT h_probs (default-on in v1.3 STANDARD)
     if bool(getattr(training_cfg, "enable_hmft_h_probs", True)):
         cbs.append(HMFTHProbsCallback())
+
+    # AuxiliaryRoutingLoss (PR: auxiliary-loss) — default ON per user decision
+    if bool(getattr(training_cfg, "enable_routing_aux_loss", True)):
+        cbs.append(
+            AuxiliaryRoutingLossCallback(
+                entropy_weight=float(getattr(training_cfg, "routing_entropy_weight", 0.05)),
+                budget_weight=float(getattr(training_cfg, "routing_budget_weight", 0.08)),
+                locality_weight=float(getattr(training_cfg, "routing_locality_weight", 0.04)),
+                bias_reg_weight=float(getattr(training_cfg, "routing_bias_reg_weight", 0.02)),
+                entropy_target=float(getattr(training_cfg, "routing_entropy_target", 0.7)),
+                budget_target=float(getattr(training_cfg, "routing_budget_target", 0.25)),
+            )
+        )
 
     # Sort by priority (stable; preserves insertion order for ties)
     cbs.sort(key=lambda cb: cb.priority)

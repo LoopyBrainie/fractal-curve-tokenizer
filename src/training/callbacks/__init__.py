@@ -32,6 +32,7 @@ from .gradient_monitor import GradientMonitorCallback
 from .fractal_tree_reg import FractalTreeRegCallback
 from .hmft_h_probs import HMFTHProbsCallback
 from .loss_components import LossComponentsAccumulator
+from .auxiliary_routing_loss import AuxiliaryRoutingLossCallback
 from .registry import build_callbacks
 
 __all__ = [
@@ -47,5 +48,7 @@ __all__ = [
     "FractalTreeRegCallback",
     "HMFTHProbsCallback",
     "LossComponentsAccumulator",
+    # PR auxiliary-loss (routing param supervision)
+    "AuxiliaryRoutingLossCallback",
     "build_callbacks",
 ]
