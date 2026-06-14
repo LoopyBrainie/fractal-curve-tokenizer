@@ -11,22 +11,10 @@ This test exercises the new ``_gumbel_ste_topk`` helper extracted in
 Commit 1 of the I170 plan. The helper is the contract surface for A2 — its
 ``hard`` parameter is the only knob that should gate Gumbel noise.
 
-Note: This test imports the splitter directly via ``sys.path.insert`` to
-bypass a pre-existing ``compute_num_candidates`` import error in
-``vit_pytorch.models.fractal_vit`` (unrelated to HMFT).
+Note: Test paths are configured by tests/conftest.py which adds ``src/`` to
+``sys.path`` automatically. No per-test ``sys.path`` manipulation is needed.
 """
 from __future__ import annotations
-
-import sys
-from pathlib import Path
-
-# Path bootstrap: tests live under tests/unit/L2_components/splitters/ but
-# the project root contains src/. Insert src/ so vit_pytorch.layers.splitters
-# can be imported without triggering the broken re-export chain in
-# vit_pytorch/__init__.py.
-_SRC = Path(__file__).resolve().parents[4] / "src"
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
 
 import pytest
 import torch

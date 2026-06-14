@@ -23,18 +23,10 @@ Commit 2. Relaxed threshold: at least 3/5 grids must hit their EAS
 target to allow partial convergence (the remaining 2 are documented
 as future B.8 work).
 
-Note: This test imports the splitter directly via ``sys.path.insert`` to
-bypass a pre-existing ``compute_num_candidates`` import error in
-``vit_pytorch.models.fractal_vit`` (unrelated to HMFT).
+Note: Test paths are configured by tests/conftest.py which adds ``src/`` to
+``sys.path`` automatically. No per-test ``sys.path`` manipulation is needed.
 """
 from __future__ import annotations
-
-import sys
-from pathlib import Path
-
-_SRC = Path(__file__).resolve().parents[4] / "src"
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
 
 import pytest
 import torch

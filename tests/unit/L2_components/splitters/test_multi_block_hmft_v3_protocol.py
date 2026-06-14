@@ -20,18 +20,11 @@ Plus two project rules (P0/P1 from review feedback):
      ``splitter._config.feature_dim`` after instantiation. nn.LayerNorm
      caches shape at init time and will not re-initialise.
 
-This test imports the splitter directly via ``sys.path.insert`` to
-bypass a pre-existing ``compute_num_candidates`` import error in
-``vit_pytorch.models.fractal_vit`` (unrelated to HMFT).
+Note: Test paths are configured by tests/conftest.py which adds ``src/`` to
+``sys.path`` automatically. No per-test ``sys.path`` manipulation is needed.
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-_SRC = Path(__file__).resolve().parents[4] / "src"
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
 
 import pytest
 import torch
@@ -98,8 +91,8 @@ class TestV3ProtocolShapeContract:
         features = torch.randn(2, 256, 32, 32)
         r = splitter(features, image_size=(32, 32), hard=True)
         assert r.candidate_indices.dim() == 1
-        # K ≤ K_fixed=16, so M = B*K ≤ 32
-        assert r.candidate_indices.shape[0] == 2 * 16  # K=K_fixed for n_cells>=16
+        # I170.3 A5: K=HMFT_K_HARD_GLOBAL_POOL=8 statically, so M = B*K
+        assert r.candidate_indices.shape[0] == 2 * 8
 
     def test_mask_ste_ste_preservation(self):
         """T10+Review: mask_ste must preserve STE gradient (no .detach())."""
@@ -234,7 +227,7 @@ class TestV3TokenizerBroadcastCompat:
         features = torch.randn(2, 256, 32, 32)
         r = splitter(features, image_size=(32, 32), hard=True)
         tokens_all = r.roi_features_raw * r.mask_ste.unsqueeze(-1)
-        # Build batch indices for each candidate (B=2, K=16 → M=32)
+        # Build batch indices for each candidate (B=2, K=8 → M=16, I170.3 A5)
         B = r.batch_indices.unique().numel()
         K = r.candidate_indices.shape[0] // B
         batch_idx = torch.arange(B).repeat_interleave(K)

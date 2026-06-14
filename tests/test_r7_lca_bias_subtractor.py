@@ -16,40 +16,10 @@ R7 LCABiasSubtractor Tests
 参考设计文档: docs/superpowers/specs/2026-06-11-fractal-vit-classification-tokenization-synergy-r7-design.md
 """
 
-import importlib.util
-import os
-import sys
-
 import pytest
 import torch
 
-
-def _load_lca_bias_subtractor():
-    """直接加载 LCABiasSubtractor 模块，绕过 vit_pytorch/__init__.py 中
-    fractal_vit.py 触发的 'compute_num_candidates' ImportError。
-
-    注: 该问题源于其他未提交重构，与 LCABiasSubtractor 本体无关。
-    """
-    # 确保 src 在路径上
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    src_path = os.path.join(project_root, "src")
-    if src_path not in sys.path:
-        sys.path.insert(0, src_path)
-
-    module_path = os.path.join(
-        src_path, "vit_pytorch", "modules", "lca_bias_subtractor.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        "_r7_lca_bias_subtractor_under_test", module_path
-    )
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load spec for {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.LCABiasSubtractor
-
-
-LCABiasSubtractor = _load_lca_bias_subtractor()
+from vit_pytorch.modules.lca_bias_subtractor import LCABiasSubtractor
 
 
 class TestLCABiasSubtractorBitExact:

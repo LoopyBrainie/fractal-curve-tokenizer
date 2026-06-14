@@ -19,21 +19,12 @@ AlphaModulator (R7) - 单元测试
 
 from __future__ import annotations
 
-import importlib.util
 import math
-import pathlib
 
 import pytest
 import torch
 
-# 直接加载 alpha_modulator.py, 绕过 vit_pytorch/__init__.py 的链式导入
-_SRC_PATH = pathlib.Path(__file__).resolve().parents[3] / "src" / "vit_pytorch" / "modules" / "alpha_modulator.py"
-_spec = importlib.util.spec_from_file_location("alpha_modulator", _SRC_PATH)
-if _spec is None or _spec.loader is None:
-    raise ImportError(f"Cannot load spec for {_SRC_PATH}")
-_alpha_modulator = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_alpha_modulator)
-AlphaModulator = _alpha_modulator.AlphaModulator
+from vit_pytorch.modules.alpha_modulator import AlphaModulator
 
 
 # =============================================================================
