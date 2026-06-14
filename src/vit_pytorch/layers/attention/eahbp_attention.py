@@ -89,13 +89,16 @@ class EAHBPAttention(nn.Module):
         self._last_precision_gain: float = 0.0
 
     def _block_local_attention(
-        self, q: Tensor, k: Tensor, v: Tensor, b: int
+        self, q: Tensor, k: Tensor, v: Tensor, b: int,
+        attention_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """Compute block-local attention for each b×b block.
 
         Args:
             q, k, v: [B, H, N, d] where N is divisible by b
             b: block size
+            attention_mask: [B, 1, 1, N] bool mask (True=valid, False=masked).
+                Reshaped to [B, 1, n_blocks, b] to apply to per-block key positions.
         Returns:
             out: [B, H, N, d] (concatenation of block-local outputs)
         """
@@ -120,15 +123,26 @@ class EAHBPAttention(nn.Module):
         k_b2 = k_e.view(B, H, n_blocks, b, d)
         # attn[i, n, q, k] = q_b2[n, q, :] · k_b2[n, k, :]
         attn = torch.einsum("bhnqd,bhnkd->bhnqk", q_b2, k_b2) * scale
+
+        # 🚀 Hot path 修复：注入 block-local mask
+        # 形状: attention_mask [B, 1, 1, N] -> [B, 1, n_blocks, b] 应用到 key 轴
+        if attention_mask is not None:
+            mask_block = attention_mask.view(B, 1, n_blocks, b)  # per-block
+            attn = attn.masked_fill(~mask_block.unsqueeze(-2), -1e4)
+
         attn = attn.softmax(dim=-1)
         out = torch.einsum("bhnqk,bhnkd->bhnqd", attn, v_b)
         return out.reshape(B, H, N, d)
 
     def _global_pool_attention(
-        self, q: Tensor, k: Tensor, v: Tensor, g: int
+        self, q: Tensor, k: Tensor, v: Tensor, g: int,
+        attention_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """Compute attention with k, v reduced to g global tokens via mean pool.
 
+        Args:
+            attention_mask: [B, 1, 1, N] bool mask. Aggregated to [B, 1, 1, g]
+                via OR (any-position-valid → global token valid).
         Returns:
             out: [B, H, N, d] (each query attends to g global tokens)
         """
@@ -139,15 +153,29 @@ class EAHBPAttention(nn.Module):
         v_p = v.view(B, H, g, n_per_pool, d).mean(dim=3)
         scale = 1.0 / (d ** 0.5)
         attn = torch.einsum("bhnd,bhgd->bhng", q, k_p) * scale
+
+        # 🚀 Hot path 修复：注入 global pool mask
+        # 形状: attention_mask [B, 1, 1, N] -> reshape & any() -> [B, 1, 1, g]
+        if attention_mask is not None:
+            mask_g = attention_mask.view(B, 1, 1, g, n_per_pool).any(dim=-1)
+            attn = attn.masked_fill(~mask_g, -1e4)
+
         attn = attn.softmax(dim=-1)
         out = torch.einsum("bhng,bhgd->bhnd", attn, v_p)
         return out
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        attention_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         """Forward pass: split into block-local + global pool attention.
 
         Args:
             x: [B, N, D] input tokens
+            attention_mask: [B, 1, 1, N] bool mask (True=valid, False=masked).
+                Best-effort 注入到 block-local 和 global pool 两条路径。
+                契约: 与 ManifoldNativeAttention 保持一致（与 FractalTransformerBlock 对齐）。
         Returns:
             out: [B, N, D] attention output
         """
@@ -160,12 +188,12 @@ class EAHBPAttention(nn.Module):
         v = self.to_v(x).view(B, N, self._config.heads, self._config.dim_head).transpose(1, 2)
         # Block-local attention (only if N divisible by b)
         if N % b == 0:
-            local_out = self._block_local_attention(q, k, v, b)
+            local_out = self._block_local_attention(q, k, v, b, attention_mask=attention_mask)
         else:
             local_out = torch.zeros_like(q)
         # Global pool attention (only if N divisible by g)
         if N % g == 0:
-            global_out = self._global_pool_attention(q, k, v, g)
+            global_out = self._global_pool_attention(q, k, v, g, attention_mask=attention_mask)
         else:
             global_out = torch.zeros_like(q)
         # Combine: out = local + global (residual-style sum)

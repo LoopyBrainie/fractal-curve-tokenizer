@@ -174,6 +174,10 @@ class ManifoldNativeAttention(nn.Module):
         self,
         x: torch.Tensor,
         levels_info: Optional["LevelsInfo"] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        regions: Optional[torch.Tensor] = None,
+        image_size: Optional[int] = None,
+        geometry_emb: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         前向传播。
@@ -184,6 +188,15 @@ class ManifoldNativeAttention(nn.Module):
             输入特征 [B, N, D]
         levels_info : LevelsInfo
             层级信息
+        attention_mask : torch.Tensor, optional
+            注意力掩码 [B, 1, 1, N]，bool 类型（True=允许关注，False=屏蔽）。
+            用于 padding token 隔离与可变长序列处理。
+        regions : torch.Tensor, optional
+            区域边界张量 [B, N, 4]（占位参数，与 FractalTransformerBlock 契约对齐）。
+        image_size : int, optional
+            图像边长（占位参数，与 FractalTransformerBlock 契约对齐）。
+        geometry_emb : torch.Tensor, optional
+            几何嵌入（占位参数，与 FractalTransformerBlock 契约对齐）。
 
         返回
         ----
@@ -337,8 +350,28 @@ class ManifoldNativeAttention(nn.Module):
 
         # 标准缩放点积注意力
         attn = (q @ k.transpose(-2, -1)) * self.scale
+
+        # 🚀 Hot path 修复：注意力掩码注入（解决隐性静默失效）
+        # - bool mask 来自 _create_attention_mask: [B, 1, 1, N], True=允许关注
+        # - float mask 兼容未来 LCA 软偏置（加性）
+        # - 用 -1e4 而非 -inf: 避免"全 mask 行 → softmax 0/0 = NaN"边界
+        if attention_mask is not None:
+            if attention_mask.dtype == torch.bool:
+                attn = attn.masked_fill(~attention_mask, -1e4)
+            else:
+                attn = attn + attention_mask
+
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_dropout(attn)
+
+        # 诊断字段（写入 _stats_cache 与项目诊断模式对齐）
+        # - last_attn_weights: 用于回归测试断言 mask 物理生效
+        # - nan_count / total_count: 监控数值异常（CLAUDE.md 防止 NaN）
+        with torch.no_grad():
+            self._stats_cache["last_attn_weights"] = attn.detach()
+            finite_mask = attn.isfinite()
+            self._stats_cache["nan_count"] = (~finite_mask).sum().item()
+            self._stats_cache["total_count"] = attn.numel()
 
         # 注意力加权
         out = attn @ v  # [B, H, N, d]
