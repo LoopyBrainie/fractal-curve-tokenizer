@@ -25,10 +25,7 @@ I109-10: Elastic Budget与K_bounds对齐验证测试
 import pytest
 import math
 
-
-def compute_num_candidates(max_level: int) -> int:
-    """计算候选节点总数: N = Σ(4^d), d=0..max_level"""
-    return (4 ** (max_level + 1) - 1) // 3
+from vit_pytorch.core.continuous_utils import compute_num_candidates
 
 
 def compute_k_bounds(max_level: int, token_coverage_min: float, token_coverage_max: float,
