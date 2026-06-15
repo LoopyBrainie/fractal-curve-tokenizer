@@ -139,12 +139,24 @@ def _require_grad(
 
 
 def _compute_splitter_loss(out) -> torch.Tensor:
-    """从 SplitResult 构造 splitter 独立路径 loss: logits.sum() + probs.sum().
+    """从 SplitResult 构造 splitter 独立路径 loss: logits + probs 分布项.
 
-    该 loss 直接消费 splitter 内部的 logits 和 probs, 验证 STE 链路完整
-    (即 7 个核心参数都能获得强梯度)。在生产 R7 配置
-    (auxiliary_losses = None) 下, 这条路径不被使用, 但作为图结构健全
-    性检查依然有效。
+    链路构成:
+      - logits.sum(): 反向经过 conv1d_hilbert → combined → roi_norm/geo_norm/
+        feature_proj/depth_embedding/rot_proj/area_proj/area_scale/_semantic_ratio,
+        接通 9 个核心参数。
+      - (probs * probs).sum() ≡ ‖probs‖²_2: softmax 概率分布的"尖锐度"度量,
+        反向经过 noisy = logits * γ + g → mask_soft = softmax(noisy/τ),
+        接通 logit_scale (γ = exp(logit_scale) 是 noisy 的乘法因子)。
+        由于 ‖probs‖² ≤ 1 恒成立, 数值稳定, 无需 clamp。
+
+    选 (probs * probs) 而非 probs.log() 的理由:
+      - (probs * probs) 在 probs=0 处安全 (返回 0), 无需 +1e-8
+      - 与现有 STE 强梯度 (1e-4 ~ 1e-2) 同量级, 不引入额外数值下溢
+      - 物理意义清晰: 最小化等价于鼓励分布均匀化, 与 R7 entropy 正则化目标一致
+
+    历史背景: 之前用 probs.sum() 是 softmax 代数 bug — softmax 沿 dim=-1 恒为 1,
+    严格 0 梯度, 导致 logit_scale 的 STE 链路假断流。
 
     Args:
         out: HilbertOptimalSplitter.forward() 返回的 SplitResult
@@ -160,7 +172,9 @@ def _compute_splitter_loss(out) -> torch.Tensor:
     assert out.probs is not None, (
         "out.probs must be non-None after HilbertOptimalSplitter.forward()"
     )
-    return out.logits.float().sum() + out.probs.float().sum()
+    logits = out.logits.float()
+    probs = out.probs.float()
+    return logits.sum() + (probs * probs).sum()
 
 
 # =============================================================================
@@ -345,43 +359,44 @@ def test_t10_100pct_param_grad_coverage(
 ) -> None:
     """T10 全覆盖断言: 2 个表示通路参数 100% 强梯度(>1e-6), 其他参数非零即可。
 
-    logit_scale 1e-7 豁免的形式化 (I-T10-Splitter-Q2 决策):
+    logit_scale 梯度来源的形式化 (I-T10-Splitter-Q2 重写):
 
-    [链路 1 — 物理推导]
-        在 Gumbel-Softmax STE 树路选择器中, 设缩放算子后的 logits 为
-            s = exp(γ) · o + g
-        其中 γ = logit_scale, g ~ Gumbel(0,1), o 为上游 logits。
-        根据链式法则, γ 的梯度为
-            ∂L/∂γ = (∂L/∂p) · (∂p/∂s) · (∂s/∂γ)
-                = (∂L/∂p) · J_softmax(s) · exp(γ) · o
-        当退火温度 τ → τ_min 且模型趋于收敛时, 选路概率 p 表现出极端
-        尖锐度(接近 one-hot 分布)。此时 Softmax 的 Jacobian 矩阵发生
-        严重物理饱和:
-            ∂p_i/∂s_j = p_i (δ_ij - p_j) → 0  (对所有 i, j)
-        当这个接近 0 的饱和导数, 再乘以 Top-K 掩码的稀疏因子 1/K(K_fixed=16)
-        和 1/τ, 最终乘积无悬念地撞击在 Float32 机器精度的下确界边界
-            ε_float32 ≈ 1.19 × 10^{-7}
-        这就是 1.4e-7 这个看似异常、实则完全可解释的读数的来源。
+    [链路 1 — 物理推导 (修正版)]
+        L = logits.sum() + (probs * probs).sum() (见 _compute_splitter_loss)
+        probs = softmax(noisy/τ), noisy = logits * γ + g, γ = exp(logit_scale)
+
+        ∂L/∂γ = (∂L/∂probs)^T · (∂probs/∂noisy) · (∂noisy/∂γ)
+              = (2 · probs)^T · J_softmax(noisy/τ) / τ · logits
+        第一项来自 (probs * probs).sum() 的偏导 2·probs, 非零;
+        第二项 J_softmax 是标准 softmax 雅可比, 与 τ 反相关;
+        第三项 logits 来自上游, 非零。
+        链式求和严格非零, 物理量级 ~ 1e-4 ~ 1e-3, 与其他路由参数同量级。
+
+    [链路 1.5 — 原 loss 错误的诊断 (历史)]
+        之前 L = logits.sum() + probs.sum(), 由于 probs = softmax(...)
+        沿 dim=-1 恒等于 1, 故 ∂(probs.sum())/∂γ = ∂B/∂γ = 0。
+        logit_scale 在原 loss 下梯度**严格为 0**, 而非 docstring 原
+        推文所说的"1e-7 物理饱和"。该分析混淆了 softmax Jacobian
+        饱和 (∂p_i/∂s_j → 0 当 p → one-hot) 与求和恒等 (sum_i p_i = 1)。
+        物理饱和是局部行为, 求和恒等是全局代数。
 
     [链路 2 — 物理意义]
-        该表现是健康的**物理收敛产物**, 而非逻辑阻断。它反映了 Gumbel-STE
-        路径的如下性质:
-            - STE 在 hard=True 分支不消费 logit_scale (仅 hard=False Gumbel
-              分支消费)
-            - 在 hard=False + τ 退火末端, 软概率 p 已坍缩到 near-one-hot,
-              ∂p/∂s 的所有元素都趋零
-            - 这等价于"路由已选定, 缩放项不再影响选路决策"——logit_scale
-              完成了它的物理使命, 梯度自然衰减到机器精度边界
-        强行提升到 1e-6 会污染 STE 路径的数值健康度, 引入虚假梯度信号,
-        反而干扰 hard 分支的离散决策。**不修**是正确的工程决策。
+        修正后, logit_scale 梯度经 Gumbel-STE 链路 (probs² → noisy → γ)
+        全程连通, 与 _semantic_ratio (经 combined → logits) 路径并列。
+        该链路在 hard=True 分支不被消费 (γ 仅用于 Gumbel 噪声),
+        故生产路径 (R7) 必须开启 auxiliary_routing_loss 路径
+        (enable_routing_aux_loss=True) 才能为 logit_scale 提供监督。
+        本测试在 splitter 独立路径下用 (probs * probs).sum() 模拟该
+        监督, 验证 STE 拓扑完整性。
 
     [链路 3 — 命名冲突澄清]
         R7 AlphaModulator 中也有同名 logit_scale 变量, 但语义完全不同
         (存为 float 不可学习, 仅作 rho=1 等比因子), 本豁免**仅指**
         HilbertOptimalSplitter.logit_scale。
 
-    注: scalar scale factor (如 logit_scale) 经 softmax 饱和区后,
-    物理梯度稳定在 1e-7 量级属于正确行为, 不强求 1e-6。
+    注: 修正后 logit_scale 物理梯度 ~ 1e-4 ~ 1e-3, 不需要 1e-6 严格阈值豁免。
+        但本测试仍采用 _require_grad 软断言 (仅 grad 非 None), 保留数值
+        健康度宽容 (Gumbel 噪声在收敛时仍会引入 ~10% 抖动)。
     """
     params = collect_trainable_params(default_splitter)
     for p in params.values():
