@@ -1674,8 +1674,13 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
         )
 
         # === R7-Beta-C: LCABiasSubtractor 在 attention 之前应用 ===
-        # 关键: attn_mask 此刻是 [B, H, N, N] (不含 CLS，CLS 在 transformer 内 concat)
-        # 所以 β-C 应在 pre-CLS tokens 上操作，不需要扩展 B_LCA 加 CLS 行/列
+        # 关键: attn_mask 此刻是 _create_attention_mask 输出的 bool [B, 1, 1, S]
+        # (True=valid, S=N+1 含 CLS, CLS 在 index 0)。B_LCA / depths 来自
+        # levels_info (其 data 由 _apply_position_and_cls 预拼接了 CLS, 故
+        # get_lca_matrix 返回 [B, S, S]; CLS row/col 因 depth=0 被 LCA 内部
+        # valid_mask 排除自然为 0)。LCABiasSubtractor 用 valid_2d 门控
+        # bias_pre 自身, invalid 端点写入 -1e4, 输出 float [B, 1, S, S] 严格
+        # 匹配 ManifoldNativeAttention 4D 契约 — 避免跨 dtype 广播触发 ValueError。
         if self.lca_bias_subtractor.enabled:
             # 同步 kill-switch (允许 config.beta_c_emergency_off 运行时切换)
             if self._beta_c_emergency_off:
@@ -1689,6 +1694,26 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
                     levels_info.depths,
                     B_LCA_full,
                 )
+
+        # I170.3-MASK-FIX: 修复合并后的 attn_mask 维度契约
+        # LCABiasSubtractor 与 attn_mask 跨 dtype 广播会产生两种非法形态:
+        #   - 3D [B, N, N]  (head 维坍缩)
+        #   - 4D [B, B, N, N] (head 维被 batch 占用: [B,1,1,N] ⊕ [B,N,N] 右起广播)
+        # ManifoldNativeAttention 严格 4D 契约要求:
+        #   - dim() == 4                              (manifold_attention.py:396)
+        #   - shape[1] in (1, attn.shape[1])          (manifold_attention.py:398)
+        # 统一重塑为 [B, 1, N, N], 让 heads 维 = 1 通过 broadcast 共享 LCA 偏置
+        # (LCA 是 depth-based, 与 head 无关).
+        # 注意: 其他合法 4D 形态 ([B,1,1,N+1] bool / [B,1,N,N] float / [B,H,N,N] float)
+        # 不受影响 (shape[1] in (1, attn.shape[1]) 自然满足).
+        if attn_mask is not None:
+            if attn_mask.dim() == 3:
+                # 3D 坍缩: [B, N, N] → [B, 1, N, N]
+                attn_mask = attn_mask.unsqueeze(1)
+            elif attn_mask.dim() == 4 and attn_mask.shape[1] not in (1,):
+                # 广播后 head 维被 batch 占用, 取第一行代表 broadcast 共享值
+                # [B, B, N, N] → [B, 1, N, N]
+                attn_mask = attn_mask[:, 0:1, :, :]
 
         # ============================================================
         # I162-1: 双路径插件模式 vs 串行模式
@@ -1971,6 +1996,24 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             active_mask = getattr(sp, "selected_mask", None)
             if active_mask is not None and isinstance(active_mask, torch.Tensor):
                 routing_tensors["active_mask"] = active_mask
+            # I165-3a: 3 个结构性参数 (rot_proj / roi_norm / geo_norm)
+            # 注入 routing_tensors 命名空间供 callback 计算 L_rot / L_roi / L_geo
+            # 防御: getattr + isinstance,避免非 H1SS splitter 触发 AttributeError
+            rot_proj = getattr(sp, "rot_proj", None)
+            if isinstance(rot_proj, torch.nn.Linear):
+                rp_w = getattr(rot_proj, "weight", None)
+                if isinstance(rp_w, torch.nn.Parameter):
+                    routing_tensors["rot_proj_weight"] = rp_w
+            roi_norm = getattr(sp, "roi_norm", None)
+            if isinstance(roi_norm, torch.nn.LayerNorm):
+                rn_w = getattr(roi_norm, "weight", None)
+                if isinstance(rn_w, torch.nn.Parameter):
+                    routing_tensors["roi_norm_weight"] = rn_w
+            geo_norm = getattr(sp, "geo_norm", None)
+            if isinstance(geo_norm, torch.nn.LayerNorm):
+                gn_w = getattr(geo_norm, "weight", None)
+                if isinstance(gn_w, torch.nn.Parameter):
+                    routing_tensors["geo_norm_weight"] = gn_w
         if hasattr(self, "lca_bias_subtractor") and self.lca_bias_subtractor is not None:
             bt = getattr(self.lca_bias_subtractor, "bias_table", None)
             if isinstance(bt, torch.nn.Parameter):
