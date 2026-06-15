@@ -145,9 +145,23 @@ class TestR7_5SynergyNonRegression:
         )
 
     def test_t8_5synergy_active_model_differs_from_identity(self):
-        """T8.5: 验证 R7 激活配置 vs 恒等配置在 forward 后行为不同 (baseline 健全性).
+        """T8.5: R7-A 激活产生非平凡不同的 logits vs 恒等配置 (健全性 baseline).
 
-        意义: 证明 5-synergy 恒等配置是"有意义的恒等",而非 R7 完全无操作的退化.
+        数学依据 (AlphaModulator.forward, src/vit_pytorch/modules/alpha_modulator.py:62-74):
+            alpha_bounded = 2 * tanh(alpha_raw / 2)
+            rho = 1 + alpha_bounded * (H/H_max - 0.5)
+            M = rho * logit_scale
+            logits = mlp_head(pooled) * M.unsqueeze(-1)
+
+        当 alpha_raw = 0 (init): M = logit_scale (恒等).
+        当 alpha_raw = 0.5: alpha_bounded ≈ 0.492 → rho ∈ [0.754, 1.246],
+        最大 logit 调制幅度 ~24.6%.
+
+        验证: alpha_raw=0.5 时, active 模型 logits 与 identity 模型 logits
+        在 bit-level 不同, 且差异幅度满足非平凡下界.
+
+        镜像 tests/test_r7_lca_bias_subtractor.py 中 TestLCABiasSubtractorKillSwitch
+        的范式: 激活态用 not torch.equal, 恒等态用 torch.equal.
         """
         torch.manual_seed(0)
         model_id = _build_r7_identity_model(image_size=32, num_classes=10)
@@ -155,18 +169,41 @@ class TestR7_5SynergyNonRegression:
         torch.manual_seed(0)
         model_active = _build_r7_active_model(image_size=32, num_classes=10)
 
+        # 预条件验证: 两个模型架构一致, 仅 R7 状态不同
+        assert model_active.alpha_modulator.alpha_raw.item() == 0.0, (
+            "Active 模型 alpha_raw 应初始化为 0"
+        )
+        assert model_id.lca_bias_subtractor.enabled is False, (
+            "Identity 模型 LCABiasSubtractor 应被禁用"
+        )
+        assert model_active.lca_bias_subtractor.enabled is True, (
+            "Active 模型 LCABiasSubtractor 应被启用"
+        )
+        # lambda_raw=0 保证 R7-Beta-C 贡献为 0, logit 差异纯粹来自 R7-A
+        assert model_active.lca_bias_subtractor.lambda_raw.item() == 0.0, (
+            "Active 模型 lambda_raw 应为 0 (R7-Beta-C 关闭)"
+        )
+
         x = torch.randn(2, 3, 32, 32)
 
         with torch.no_grad():
             logits_id = model_id(x).logits
-            # 手动扰动 active 模型的 alpha_raw 让 AlphaModulator 影响输出
-            with torch.no_grad():
-                model_active.alpha_modulator.alpha_raw.fill_(0.5)
+            # 扰动 active 模型的 alpha_raw 让 AlphaModulator 影响输出
+            model_active.alpha_modulator.alpha_raw.fill_(0.5)
             logits_active = model_active(x).logits
 
-        # 两个模型在 alpha_raw=0 时应该 bit-exact 一致
-        assert torch.allclose(logits_id, logits_active, atol=1e-5), (
-            "alpha_raw=0.5 时输出应有显著差异 (R7-A 实际生效)"
+        # 验证 1: R7-A 激活时 logits 在 bit-level 不同 (与 docstring "行为不同" 一致)
+        assert not torch.equal(logits_active, logits_id), (
+            f"R7-A 未生效: alpha_raw=0.5 时 active 与 identity logits bit-exact 一致. "
+            f"max diff = {(logits_active - logits_id).abs().max():.3e}"
+        )
+
+        # 验证 2: 差异幅度非平凡 (alpha_bounded(0.5)≈0.492, 预期 ~0.01-0.5 量级).
+        # 下界 0.01 是用户实测 0.05 的 1/5, 远高于 FP 噪声.
+        max_diff = (logits_active - logits_id).abs().max().item()
+        assert max_diff > 0.01, (
+            f"R7-A 激活但 logit 差异过小: max_diff={max_diff:.3e} (预期 > 0.01). "
+            f"AlphaModulator 可能未正确接入 forward."
         )
 
 
