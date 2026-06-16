@@ -54,7 +54,7 @@ import torch.nn as nn
 
 from .base_tokenizer import BaseTokenizer, TokenizerOutput
 from vit_pytorch.core.config import FractalConfig, SemanticSplitterConfig  # I97-5: 合并 config_fractal.py, I110-5: 语义配置
-from vit_pytorch.core.constants import PROB_EPSILON  # I12-7: 数值稳定性常量
+from vit_pytorch.core.constants import PROB_EPSILON, quadtree_node_count  # I12-7: 数值稳定性常量 + I-DEDUP
 
 # I99-1: 延迟导入 VectorizedPathEncoder 以避免循环导入
 # 使用函数内导入模式，确保在运行时正确加载
@@ -379,6 +379,14 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             hilbert_indices=hilbert_indices,
             token_indices=token_indices,
             complexities=tensor_result.complexities,
+            # I170-3: 透传 fast-path 字段, 避免回退到 ROI-Align 慢路径
+            # 此前 _force_clamp_tensor_result 漏传 mask_ste / roi_features_raw /
+            # candidate_indices, 导致 _embed_with_tensor_result 的 has_fast_path 永远为
+            # False, splitter 输出对 embedding 无贡献, STE 梯度链断裂
+            # (T10 test_t10_splitter_param_receives_gradient 失败根因).
+            mask_ste=tensor_result.mask_ste,
+            roi_features_raw=tensor_result.roi_features_raw,
+            candidate_indices=tensor_result.candidate_indices,
         )
 
     # =====================================================================
@@ -427,8 +435,8 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         split_decision = split_result.split_decision  # [B, N]
 
         # P-OPT: 预分配最大可能大小的 buffer
-        # 最大节点数: 每个 batch 有 4^(max_level+1) - 1 个节点 (四叉树)
-        max_nodes_per_batch = (4 ** (self.max_level + 1) - 1) // 3
+        # 最大节点数: 每个 batch 有 quadtree_node_count(max_level) 个节点 (四叉树)
+        max_nodes_per_batch = quadtree_node_count(self.max_level)
         max_total_nodes = max_nodes_per_batch * B
 
         # 预分配 buffer
@@ -584,6 +592,7 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         self,
         images: torch.Tensor,
         split_result: "SplitResult",
+        features: Optional[torch.Tensor] = None,  # I107-7: 预计算特征，跳过 shared_conv
     ) -> TokenizerOutput:
         """Variable Depth tokenization (P9-1 方案 D: 完全向量化).
 
@@ -591,8 +600,14 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             - Splitter 从外部传入，不再内部创建
             - 职责分离: Tokenizer 只负责 embedding，Splitter 负责分割决策
 
+        I107-7 优化:
+            - 接受外部预计算的 features 跳过 shared_conv 双重计算
+            - 验证 4 个运行时不变量: shape / device / dtype / contiguity
+            - 默认 None 保持向后兼容（旧调用方零侵入）
+
         数学形式化:
-            1. F = SharedConv(I)                    # 特征提取
+            1. F = SharedConv(I)                    # 特征提取（features=None 路径）
+               或 F = F̃                             # features ≠ None 路径
             2. T = _embed_with_tensor_result(F, TensorResult)  # 纯张量嵌入
                其中 TensorResult 来自外部 Splitter
 
@@ -601,6 +616,15 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
             split_result: 外部 Splitter 的输出结果
                 包含: regions, depths, batch_indices, hilbert_indices,
                       selected_mask, logits, probs
+            features: [B, d_model, H/p, W/p] 可选。预计算的特征图
+                （通常来自 self._feature_extractor(images)）。传入时跳过
+                self.shared_conv(images) 重复计算，实现 I107-7 优化。
+                必须满足 4 个不变量:
+                  I1 shape:     == (B, d_model, H/base_patch_size, W/base_patch_size)
+                  I2 device:    == images.device
+                  I3 dtype:     == images.dtype  (防 AMP 静默 upcast)
+                  I4 contiguity: ∈ {default, channels_last}，其他 layout 自动 .contiguous() 归一化
+                传 None 则由 tokenize 内部计算（向后兼容路径）。
 
         Returns:
             TokenizerOutput: 包含 tokens, levels_info, regions 等
@@ -618,15 +642,49 @@ class StreamingFractalTokenizerV3(BaseTokenizer):
         B, C, H, W = images.shape
         device = images.device
 
-        # I35: 转换为 channels_last 以优化卷积性能
-        # I108-2: 使用 is_contiguous() 正确检测内存格式，而非错误的 stride 比较
-        if images.dim() == 4 and not images.is_contiguous(memory_format=torch.channels_last):
-            images = images.to(memory_format=torch.channels_last)
-
-        # 1. 提取共享特征图
-        features = self.shared_conv(images)  # [B, d_model, H/p, W/p]
-        # I107-2: 移除调试缓存，防止显存泄露
-        # 调试可视化可通过回调钩子实现，不应在核心代码中持有引用
+        # 1. 提取或复用共享特征图
+        # I107-7: 若调用方传入预计算的 features，跳过 shared_conv 双重计算
+        if features is None:
+            # 旧路径（向后兼容）：转 channels_last → shared_conv
+            # I35: 转换为 channels_last 以优化卷积性能
+            # I108-2: 使用 is_contiguous() 正确检测内存格式，而非错误的 stride 比较
+            if images.dim() == 4 and not images.is_contiguous(memory_format=torch.channels_last):
+                images = images.to(memory_format=torch.channels_last)
+            features = self.shared_conv(images)  # [B, d_model, H/p, W/p]
+            # I107-2: 移除调试缓存，防止显存泄露
+            # 调试可视化可通过回调钩子实现，不应在核心代码中持有引用
+        else:
+            # 新路径（I107-7）：审计 4 个运行时不变量
+            # I1: 形状不变量
+            p = self.base_patch_size
+            expected_shape = (B, self.d_model, H // p, W // p)
+            if tuple(features.shape) != expected_shape:
+                raise ValueError(
+                    f"StreamingFractalTokenizerV3.tokenize features shape 不匹配: "
+                    f"got {tuple(features.shape)}, expected {expected_shape} "
+                    f"(B={B}, d_model={self.d_model}, H/p={H // p}, W/p={W // p}). "
+                    f"传 None 以自动计算，或确认 features 来自 self._feature_extractor(images)。"
+                )
+            # I2: 设备不变量（防跨设备 ROI-Align 静默失败 / CUDA assert）
+            if features.device != device:
+                raise ValueError(
+                    f"StreamingFractalTokenizerV3.tokenize features device 不匹配: "
+                    f"got {features.device}, expected {device}. "
+                    f"请调用 features.to({device}) 后再传入。"
+                )
+            # I3: 数据类型不变量（防 AMP 静默 upcast，参 T10 keystone abaec33）
+            if features.dtype != images.dtype:
+                raise ValueError(
+                    f"StreamingFractalTokenizerV3.tokenize features dtype 不匹配: "
+                    f"got {features.dtype}, expected {images.dtype}. "
+                    f"请检查 autocast 上下文或显式 features.to({images.dtype})。"
+                )
+            # I4: 连续性不变量（非阻塞，自动归一化）
+            # ROI-Align 需要 contiguous_format；若 features 既非 default contig 也非
+            # channels_last，强制 contiguous 避免下游静默失败
+            if not (features.is_contiguous() or
+                    features.is_contiguous(memory_format=torch.channels_last)):
+                features = features.contiguous()
 
         # 2. I98-1: 使用外部传入的 split_result
         # H1SS 返回 SplitResult → TensorSplitResult
