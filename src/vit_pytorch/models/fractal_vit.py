@@ -1419,6 +1419,24 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             normalized_weights = token_probs / weight_sum
             return (token_x * normalized_weights.unsqueeze(-1)).sum(dim=1)
         else:
+            # I170-3: Path C+ 防御 — 显式标记 pool="cls" 的静默 fallback
+            # 历史: Bug C 调查发现 pool="cls" 在 _apply_pooling 没有专属分支,
+            # 静默回退到 mean pooling. 切碎 splitter 的 split_probs 信号,
+            # 在小模型 (dim=64, num_layers=2) + 随机初始化下产生精确 0 梯度.
+            # 用 FutureWarning + stacklevel=2 让警告指向调用方 (测试 / 训练脚本),
+            # 而不是模型内部的 warnings.warn 行 — 未来维护者一眼看到谁传了 pool="cls".
+            # 注意: 不修改 fallback 行为, 保持 100% 向后兼容.
+            if self.pool == "cls":
+                import warnings
+                warnings.warn(
+                    "Pooling mode 'cls' is not yet implemented for fractal "
+                    "multi-depth tokens; currently falling back to uniform "
+                    "'mean' pooling. This behavior is deprecated and will "
+                    "raise an error in future versions. Please use "
+                    "'weighted' or 'mean'.",
+                    category=FutureWarning,
+                    stacklevel=2,
+                )
             # mean pooling 作为默认
             masked_x = token_x * token_mask.unsqueeze(-1).float()
             valid_counts = token_mask.sum(dim=1, keepdim=True).float().clamp(min=DIVISION_EPSILON)
@@ -1608,6 +1626,33 @@ mlp_dim: MLP 隐藏层维度（默认 None → 使用 Tensor Core 对齐的 8/3 
             features_tensor = pooled
 
         return aux_infos, features_tensor if return_features else None
+
+    def train(self, mode: bool = True):
+        """覆写 nn.Module.train 以在模式切换时同步非标准状态字段 (I170.3-DETERM)。
+
+        核心契约：
+        1. 必须：调用 super().train(mode) 触发 PyTorch 标准子模块状态广播。
+        2. 应当：同步同步下游 splitter._is_training_mode 旗标，确保 eval 模式下完全断开 Gumbel 噪声。
+        3. 不应当：触碰 lca_bias_subtractor.enabled 开关。该字段为用户运行时显式控制的 kill-switch，
+           覆写会破坏生命周期配置语义的正交性。
+        4. 约定：返回 self 以支持链式调用（如 model = model.train()）。
+        """
+        # [必须] 触发 PyTorch 原生子模块广播（自动向下传导标准子模块的 self.training 状态）
+        super().train(mode)
+
+        # [应当] 强同步隐式断流的非标准状态（MultiBlockHMFTSplitter Gumbel 噪声的门控）
+        # 使用 setattr 而非直接赋值：绕过静态类型 narrow 的限制（splitter 是 Union 类型），
+        # 同时与 hasattr 形成完整的安全契约。
+        if (hasattr(self, "splitter")
+                and self.splitter is not None
+                and hasattr(self.splitter, "_is_training_mode")):
+            setattr(self.splitter, "_is_training_mode", mode)
+
+        # [不应当] 保持 self.lca_bias_subtractor.enabled 的幂等性
+        # 绝不在此处修改该状态，严格尊重用户与运行时配置对 kill-switch 的独占控制权
+
+        # [约定] 确保链式调用契约完整
+        return self
 
     def forward(
         self,
