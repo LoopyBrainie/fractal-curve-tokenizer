@@ -298,7 +298,7 @@ class TestR7_STEGradientIntact:
             num_layers=2,
             heads=4,
             mlp_dim=128,
-            pool="cls",
+            pool="weighted",
             min_patch_size=4,
             logit_scale=1.0,
             bias_subtract_lca=False,
