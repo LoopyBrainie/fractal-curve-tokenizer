@@ -106,9 +106,22 @@ All current working-tree content has been committed and frozen under tag `pre-re
 
 ### Phase 2 — New Codebase
 
-Decision: orphan branch in this repo vs new repository — **NOT yet decided**, deferred to the first real reconstruction session. When decided, the choice MUST be recorded here.
+**Decision (2026-08-03)**: new repository at `D:\myProject\fractal-curve-ViT` (separate repo, not orphan branch).
+- First commit: `3a04ec9` on `main`
+- Archive bridge wired — see `## Cross-Repo Bridge` below
 
-Whichever path is chosen, Day-1 setup is **mandatory**:
+Day-1 setup as performed in the new repo:
+- `pyproject.toml` with stripped runtime deps + ruff/mypy **config** (no dev deps installed) — per "refactor first, manage deps later"
+- `pyproject.toml` keeps `requires-python = ">=3.13"` and `[build-system] uv_build`
+- `.gitignore` with Python + PyTorch + `.claude` exclusion
+- `.python-version` = 3.13
+- `README.md` with bootstrap + archive bridge instructions
+- No application code yet; no runtime dependencies yet
+- No `.gitattributes` (relies on per-user git config for default CRLF)
+- Archive remote added in new repo: `git remote add archive https://github.com/LoopyBrainie/fractal-curve-tokenizer.git`
+- Tag persisted locally via explicit refspec: `git fetch archive +refs/tags/pre-reconstruction-baseline-v1:refs/tags/pre-reconstruction-baseline-v1`
+
+Day-1 setup checklist (mandatory for any future touch on the new repo):
 - Lint + formatter + type checker configured **before** any new code is written
 - Empty directory skeleton committed first (architecture over code)
 - CI pipeline in place from the first push
@@ -163,3 +176,46 @@ This entire section (`## Reconstruction Workflow`) is to be removed by an explic
 - (a) reconstruction is feature-complete
 - (b) `pre-reconstruction-baseline-v1` is documented as deprecated but still preserved in `docs/ARCHIVE_INDEX.md` (per its own §6 Removal Conditions)
 - (c) at least one full release has shipped on the new architecture
+
+---
+
+## Cross-Repo Bridge
+
+The new repo at `D:\myProject\fractal-curve-ViT` has the old repo configured as a **read-only** archive remote.
+
+**Setup (already done — listed for reference):**
+
+```bash
+git remote add archive https://github.com/LoopyBrainie/fractal-curve-tokenizer.git
+git fetch archive +refs/tags/pre-reconstruction-baseline-v1:refs/tags/pre-reconstruction-baseline-v1
+```
+
+The `+refs/tags/...:refs/tags/...` refspec is required — plain `git fetch archive <tagname>` only updates `FETCH_HEAD`, not local `refs/tags/`.
+
+### Inspecting old code via worktree (Phase 4 dual-window mode)
+
+```bash
+git worktree add /tmp/legacy-fct pre-reconstruction-baseline-v1
+```
+
+The worktree at `/tmp/legacy-fct` is **read-only** by convention. Do not run `git commit` / `git push` from that directory.
+
+**Single-file extraction** (keeps original author via git):
+
+```bash
+git checkout pre-reconstruction-baseline-v1 -- path/to/file.py
+```
+
+Always rename + re-home extracted files under the new directory tree — original paths are FORBIDDEN in the new codebase.
+
+### Cleaning the bridge
+
+To sever the connection entirely (only after reconstruction is feature-complete, per §Removal above):
+
+```bash
+git remote remove archive
+git tag -d pre-reconstruction-baseline-v1
+git gc --prune=now --aggressive
+```
+
+The git tag itself in this old repo MUST stay forever — history preservation. Only the new repo's bridge may be removed.
