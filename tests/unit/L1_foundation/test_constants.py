@@ -342,3 +342,59 @@ class TestFP16ClampConstants:
         assert LOGIT_CLAMP_BOUND == 10.0
         assert GRAD_CLAMP_BOUND == 20.0
         assert SCALE_CLAMP_BOUND == 15.0
+
+
+class TestQuadtreeNodeCount:
+    """完全四叉树节点总数公式验证 (Single Source of Truth).
+
+    数学形式化:
+        N = Σ_{d=0}^{max_depth} 4^d = (4^{max_depth+1} - 1) / 3
+
+    该函数是 quadtree 节点计数公式的唯一真源,被以下调用方委托:
+        - depth_utils.compute_total_candidates
+        - continuous_utils.compute_num_candidates
+        - HilbertSplitterConfig.compute_candidate_count
+        - NeighborAwareSplitterConfig.compute_candidate_count
+        - constants.compute_k_bounds (TIER 2)
+        - tokenizer.convert_split_result_to_tensor (热路径预分配)
+        - examples/.../hilbert_splitter.py (可视化)
+
+    I-DEDUP: 防止公式漂移的回归测试。
+    """
+
+    def test_base_cases(self):
+        """基本边界值: 深度 0,1,2."""
+        from vit_pytorch.core.constants import quadtree_node_count
+
+        assert quadtree_node_count(0) == 1       # 4^0
+        assert quadtree_node_count(1) == 5       # 1 + 4
+        assert quadtree_node_count(2) == 21      # 1 + 4 + 16
+
+    def test_matches_geometric_series(self):
+        """与暴力求和一致 (独立 ground-truth 验证)."""
+        from vit_pytorch.core.constants import quadtree_node_count
+
+        for d in range(0, 10):
+            assert quadtree_node_count(d) == sum(4 ** i for i in range(d + 1))
+
+    def test_max_depth_four(self):
+        """深度 4: 1 + 4 + 16 + 64 + 256 = 341."""
+        from vit_pytorch.core.constants import quadtree_node_count
+
+        assert quadtree_node_count(4) == 341
+
+    def test_return_type_is_int(self):
+        """返回值类型为 int (调用方依赖此契约)."""
+        from vit_pytorch.core.constants import quadtree_node_count
+
+        assert isinstance(quadtree_node_count(0), int)
+        assert isinstance(quadtree_node_count(8), int)
+
+    def test_growth_rate_geometric(self):
+        """增长因子 = 4^d,验证几何级数性质."""
+        from vit_pytorch.core.constants import quadtree_node_count
+
+        # N(d) - N(d-1) = 4^d
+        for d in range(1, 8):
+            diff = quadtree_node_count(d) - quadtree_node_count(d - 1)
+            assert diff == 4 ** d, f"d={d}: 增量 {diff} != 4^d={4**d}"

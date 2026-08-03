@@ -53,7 +53,12 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from vit_pytorch.core.constants import HMFT_BLOCK_SIZES, HMFT_K_HARD_GLOBAL_POOL
+from vit_pytorch.core.constants import (
+    EPS,
+    HMFT_BLOCK_SIZES,
+    HMFT_K_HARD_GLOBAL_POOL,
+    HMFT_MIN_IMAGE_SIZE,
+)
 from vit_pytorch.core.splitter_protocol import CoreSplitter, SplitResult
 
 
@@ -80,7 +85,6 @@ class MultiBlockHMFTSplitterConfig:
     min_patch_size: int = 4
     max_level_limit: int = 8
     hidden_dim: int = 64       # internal hidden dim (matches H1SS default)
-    K_fixed: int = 16
     # 5-bin learnable h block sizes (Power-of-4 alignment)
     block_sizes: Tuple[int, ...] = HMFT_BLOCK_SIZES
     # Hard K — number of selected sub-blocks per image
@@ -88,6 +92,11 @@ class MultiBlockHMFTSplitterConfig:
     # Gumbel-STE temperature
     temperature_init: float = 1.0
     temperature_min: float = 0.1
+    # I170.3 A5: K_fixed field REMOVED. All K references now unify to
+    # HMFT_K_HARD_GLOBAL_POOL (constant in core/constants.py).
+    # Passing K_fixed=... to MultiBlockHMFTSplitterConfig raises TypeError
+    # (dataclass auto-rejects unknown kwargs), enforcing the no-override
+    # contract.
 
 
 class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
@@ -357,7 +366,7 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
         #   hard=False + eval → no noise (eval is deterministic by default)
         if not hard and self._is_training_mode:
             gumbel_noise = -torch.log(
-                -torch.log(torch.rand_like(score_head) + 1e-9) + 1e-9
+                -torch.log(torch.rand_like(score_head).clamp(min=EPS))
             )
             score_head = (score_head + gumbel_noise) / max(self._temperature, 1e-3)
 
@@ -459,12 +468,27 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
         self._current_epoch = epoch
         if image_size is None:
             image_size = (features.shape[-2], features.shape[-1])
+
+        # I170.3 A5: Input-source guard for K=8 hard contract.
+        # HMFT requires n_cells = (H/h)·(W/h) >= HMFT_K_HARD_GLOBAL_POOL
+        # to satisfy the fixed-K shape contract. Smaller images silently
+        # min(K, n_cells) would break the contract, so we reject them
+        # explicitly at the input boundary and direct the user to
+        # PolarVoronoiSplitter for small-image regimes.
+        if min(image_size) < HMFT_MIN_IMAGE_SIZE:
+            raise ValueError(
+                f"A5: HMFT requires image_size >= {HMFT_MIN_IMAGE_SIZE} "
+                f"to satisfy K={HMFT_K_HARD_GLOBAL_POOL} hard contract. "
+                f"Got image_size={image_size}. "
+                f"Use PolarVoronoiSplitter for small images."
+            )
+
         self.update_candidates(image_size)
         B, _C, H, W = features.shape
 
         # 1) Choose block size h (must give at least K_fixed cells)
         h = self._sample_block_size(
-            hard=hard, max_h=min(H, W), min_n_cells=self._config.K_fixed,
+            hard=hard, max_h=min(H, W), min_n_cells=HMFT_K_HARD_GLOBAL_POOL,
         )
 
         # 2) Partition into h×h Hilbert-ordered sub-blocks
@@ -476,9 +500,22 @@ class MultiBlockHMFTSplitter(nn.Module, CoreSplitter):
         # geometry-aware + Hilbert-1D-smoothed scoring (see _score_cells).
         score_head = self._score_cells(blocks, cell_hilbert_indices, h)  # [B, n_cells]
         # TopK selection via Gumbel-STE helper (A2: deterministic when hard=True)
-        K = min(self._config.K_fixed, n_cells)
+        # I170.3 A5: K is a static constant, no per-call override.
+        K = min(HMFT_K_HARD_GLOBAL_POOL, n_cells)
         mask_hard, mask_soft, mask_ste, topk_indices = self._gumbel_ste_topk(
             score_head, K, hard=hard,
+        )
+
+        # T10 I170.3 A5 keystone asserts: K must equal HMFT_K_HARD_GLOBAL_POOL
+        # unconditionally across all batches, modes, seeds, grid sizes.
+        assert K == HMFT_K_HARD_GLOBAL_POOL, (
+            f"A5: K must equal HMFT_K_HARD_GLOBAL_POOL={HMFT_K_HARD_GLOBAL_POOL}, "
+            f"got K={K}. (n_cells={n_cells}, image_size={image_size})"
+        )
+        assert n_cells >= HMFT_K_HARD_GLOBAL_POOL, (
+            f"A5: n_cells={n_cells} < K={HMFT_K_HARD_GLOBAL_POOL}; "
+            f"image too small for HMFT (should have been caught at "
+            f"image_size < HMFT_MIN_IMAGE_SIZE check above)"
         )
 
         # 4) V3 protocol: compute pre-gather per-cell features for the tokenizer

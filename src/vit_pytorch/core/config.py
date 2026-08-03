@@ -61,6 +61,7 @@ from .constants import (
     PACED_WINDOW_MAX_EPOCHS,
     R12_LAMBDA_TREE,
     R12_LAMBDA_SKEW,
+    quadtree_node_count,  # I-DEDUP
 )
 
 
@@ -244,9 +245,10 @@ class HilbertSplitterConfig:
         """计算四叉树候选节点总数 (I111-4)
 
         数学公式: N = (4^(L+1) - 1) / 3
+        委托: vit_pytorch.core.constants.quadtree_node_count (Single Source of Truth)
         """
         L = self.max_level_limit
-        return (4 ** (L + 1) - 1) // 3
+        return quadtree_node_count(L)
 
     def compute_k_bounds(
         self,
@@ -538,9 +540,12 @@ class NeighborAwareSplitterConfig:
     locality_weight: float = 0.1
 
     def compute_candidate_count(self) -> int:
-        """计算四叉树候选节点总数"""
+        """计算四叉树候选节点总数
+
+        委托: vit_pytorch.core.constants.quadtree_node_count (Single Source of Truth)
+        """
         L = self.max_level_limit
-        return (4 ** (L + 1) - 1) // 3
+        return quadtree_node_count(L)
 
     def compute_k_bounds(
         self,

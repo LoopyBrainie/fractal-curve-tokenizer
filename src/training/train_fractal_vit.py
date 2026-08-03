@@ -596,6 +596,11 @@ def train(
     config.training.routing_locality_weight = getattr(args, 'routing_locality_weight', 0.04)
     config.training.routing_bias_reg_weight = getattr(args, 'routing_bias_reg_weight', 0.02)
 
+    # I165-3a: 3 个结构性参数 (rot_proj / roi_norm / geo_norm) 的联合监督
+    # Grouped Scaling: 单个 global_scale 统一控制,内部 1:1:1 配比
+    config.training.enable_i165_3a_aux_loss = getattr(args, 'enable_i165_3a_aux_loss', True)
+    config.training.i165_3a_global_scale = getattr(args, 'i165_3a_global_scale', 0.05)
+
     # Save config to logs/config.json
     config.save(str(logs_dir / "config.json"))
 
@@ -1315,6 +1320,21 @@ def add_args(parser: argparse.ArgumentParser):
                              help='Routing aux loss locality weight (Hilbert gradient MSE)')
     routing_grp.add_argument('--routing-bias-reg-weight', type=float, default=0.02,
                              help='Routing aux loss bias_table L2 reg weight')
+
+    # I165-3a: 3 个结构性参数 (rot_proj / roi_norm / geo_norm) 的联合监督
+    # Grouped Scaling: 单个 global_scale 统一控制 3 项 (1:1:1 内部配比)
+    # 锚定: rot_proj 正交化 / roi_norm γ²→1 / geo_norm 三段均值平方对齐
+    routing_grp.add_argument('--enable-i165-3a-aux-loss', action='store_true', default=True,
+                             help='Enable Grouped Scaling supervision for 3 structural params (default ON)')
+    routing_grp.add_argument('--disable-i165-3a-aux-loss', action='store_false',
+                             dest='enable_i165_3a_aux_loss',
+                             help='Opt-out: disable I165-3a aux loss')
+    routing_grp.add_argument('--no-enable-i165-3a-aux-loss', action='store_false',
+                             dest='enable_i165_3a_aux_loss',
+                             help='Opt-out: disable I165-3a aux loss (negation of --enable-i165-3a-aux-loss)')
+    routing_grp.add_argument('--i165-3a-global-scale', type=float, default=0.05,
+                             help='I165-3a Grouped Scaling single global scale (default 0.05, '
+                                  '1:1:1 internal ratio for rot/roi/geo losses)')
 
 
 def build_parser() -> argparse.ArgumentParser:

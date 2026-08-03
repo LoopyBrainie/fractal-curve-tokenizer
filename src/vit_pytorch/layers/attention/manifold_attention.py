@@ -302,8 +302,8 @@ class ManifoldNativeAttention(nn.Module):
 
         # 🚀 Stage 2: 对物理场应用 Cartesian2DRoPE
         if coords is not None and self.rope_cartesian is not None:
-            angles = self.rope_cartesian(coords)
-            q_phys, k_phys = self.rope_cartesian.apply_rotation(q_phys, k_phys, angles)
+            cos_θ, sin_θ = self.rope_cartesian(coords)
+            q_phys, k_phys = self.rope_cartesian.apply_rotation(q_phys, k_phys, cos_θ, sin_θ)
 
         # 🚀 Stage 2: 对拓扑场应用 DirectionAwareSubspacedRoPE
         if levels_info is not None and self.rope_fractal is not None:
@@ -352,14 +352,71 @@ class ManifoldNativeAttention(nn.Module):
         attn = (q @ k.transpose(-2, -1)) * self.scale
 
         # 🚀 Hot path 修复：注意力掩码注入（解决隐性静默失效）
-        # - bool mask 来自 _create_attention_mask: [B, 1, 1, N], True=允许关注
-        # - float mask 兼容未来 LCA 软偏置（加性）
+        # - bool mask: [B, 1, 1, N], True=允许关注 → masked_fill(~mask, -1e4)
+        # - float mask (LCA soft-bias): 契约 [B, 1, N, N]，N 可以是 attn.shape[-1]
+        #   或 attn.shape[-1] - 1（pre-CLS，因 LCABiasSubtractor 不感知 transformer
+        #   内的 CLS concat）。后者自动 pad 1 行/列（值 0 = CLS 无 LCA 偏置）。
+        # - 双路径 auto-align: bool 也对称处理（虽然当前 hot path bool 已对齐，
+        #   防御未来 mask 改为 pre-CLS 生成时的静默爆雷）。
+        # - padding 方向: float 右/下补 0 (LCA 语义), bool 左补 True (CLS 在 index 0)
+        # - 其他形状 → 显式 ValueError
         # - 用 -1e4 而非 -inf: 避免"全 mask 行 → softmax 0/0 = NaN"边界
         if attention_mask is not None:
+            attn_n = attn.shape[-1]
             if attention_mask.dtype == torch.bool:
-                attn = attn.masked_fill(~attention_mask, -1e4)
+                # ---------------- 布尔掩码路径 (Sequence Padding) ----------------
+                if (attention_mask.dim() == 4
+                        and attention_mask.shape[0] == attn.shape[0]
+                        and attention_mask.shape[1] == 1
+                        and attention_mask.shape[2] == 1):
+                    mask_n = attention_mask.shape[-1]
+                    if mask_n == attn_n:
+                        # 已对齐
+                        attn = attn.masked_fill(~attention_mask, -1e4)
+                    elif mask_n + 1 == attn_n:
+                        # 防御性: pre-CLS mask 在最后一维左侧补 1 位 True (CLS valid)
+                        padded = F.pad(attention_mask, (1, 0), value=True)
+                        attn = attn.masked_fill(~padded, -1e4)
+                    else:
+                        raise ValueError(
+                            f"ManifoldNativeAttention: bool attention_mask N={mask_n} "
+                            f"incompatible with attn N={attn_n}. Expected N == attn_n "
+                            f"or N == attn_n - 1 (pre-CLS)."
+                        )
+                else:
+                    raise ValueError(
+                        f"ManifoldNativeAttention: bool attention_mask must be "
+                        f"4D [B, 1, 1, N] (N==attn.shape[-1] or attn.shape[-1]-1). "
+                        f"Got shape={tuple(attention_mask.shape)} for attn.shape="
+                        f"{tuple(attn.shape)}."
+                    )
             else:
-                attn = attn + attention_mask
+                # ---------------- 浮点掩码路径 (LCA Soft-Bias) ----------------
+                # I24-2: float LCA 软偏置路径，兼容 pre/post-CLS 形状差
+                if (attention_mask.dim() == 4
+                        and attention_mask.shape[0] == attn.shape[0]
+                        and attention_mask.shape[1] in (1, attn.shape[1])):
+                    mask_n = attention_mask.shape[-1]
+                    if mask_n == attn_n:
+                        # 已对齐，直接相加
+                        attn = attn + attention_mask
+                    elif mask_n + 1 == attn_n:
+                        # LCA 路径常见：mask 是 pre-CLS 的 [B, 1, N, N]，
+                        # attn 已含 CLS → 在最后两维右侧 + 底部 pad 1（值 0 = CLS 无 bias）
+                        attn = attn + F.pad(attention_mask, (0, 1, 0, 1))
+                    else:
+                        raise ValueError(
+                            f"ManifoldNativeAttention: float attention_mask N={mask_n} "
+                            f"not compatible with attn N={attn_n}. Expected N == attn_n "
+                            f"or N == attn_n - 1 (pre-CLS)."
+                        )
+                else:
+                    raise ValueError(
+                        f"ManifoldNativeAttention: float attention_mask must be "
+                        f"4D [B, 1, N, N] (N==attn.shape[-1] or attn.shape[-1]-1). "
+                        f"Got shape={tuple(attention_mask.shape)} for attn.shape="
+                        f"{tuple(attn.shape)}. Bool masks are accepted as [B, 1, 1, N]."
+                    )
 
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_dropout(attn)

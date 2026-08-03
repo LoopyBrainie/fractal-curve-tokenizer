@@ -1,19 +1,21 @@
 """v1.3 STANDARD: Multi-Block HMFT 5-grid EAS + axiom tests (B.4-B.7).
 
 Per docs/superpowers/specs/2026-06-08-fractal-hilbert-vit-best-practice-design.md §9.1
-the JVP-1 5-grid EAS verification table:
+the JVP-1 3-grid EAS verification table (A5 hard contract enforced):
 
   Grid    | EAS  | Status
   --------|------|--------
-  8×8     | ≥0.950 | HARD GATE
-  16×16   | ≥0.971 | STRONG
   32×32   | ≥0.984 | STRONG
   64×64   | ≥0.990 | STRONG
   128×128 | ≥0.967 | STRONG
 
+  Note: 8×8 / 16×16 are NO LONGER VALID grids under the A5 hard contract
+  (HMFT_MIN_IMAGE_SIZE = 32). The HMFT_VALID_GRIDS conftest constant derives
+  the test grid set from production HMFT_BLOCK_SIZES ∩ A5 guard.
+
 The skeleton's EAS depends on the gather pattern (Hilbert-ordered selection
 already gives locality). This test verifies that the forward path is correct
-on all 5 grids; the actual EAS metric is computed via
+on all valid grids; the actual EAS metric is computed via
 compute_eas_from_selection() which measures the contiguity of selected cells
 in Hilbert 1D ordering.
 """
@@ -26,12 +28,12 @@ from vit_pytorch.layers.splitters import (
     MultiBlockHMFTSplitter,
     MultiBlockHMFTSplitterConfig,
 )
+from vit_pytorch.core.constants import HMFT_K_HARD_GLOBAL_POOL
+from .conftest import HMFT_VALID_GRIDS
 
 
-# JVP-1 5-grid EAS verification table
+# JVP-1 3-grid EAS verification table (A5 contract: grids >= 32)
 EAS_HARD_GATE = {
-    8: 0.950,
-    16: 0.971,
     32: 0.984,
     64: 0.990,
     128: 0.967,
@@ -56,7 +58,7 @@ def compute_eas_from_selection(topk_indices: torch.Tensor) -> float:
     return (adjacent.sum(dim=-1) / (K - 1)).mean().item()
 
 
-@pytest.mark.parametrize("grid_size, min_eas", list(EAS_HARD_GATE.items()))
+@pytest.mark.parametrize("grid_size, min_eas", [(g, EAS_HARD_GATE[g]) for g in HMFT_VALID_GRIDS])
 def test_hmft_5grid_eas(grid_size: int, min_eas: float):
     """B.4 JVP-1 5-grid EAS verification.
 
@@ -77,17 +79,18 @@ def test_hmft_5grid_eas(grid_size: int, min_eas: float):
     assert min_eas <= 1.0, f"min_eas={min_eas} must be in (0, 1]"
 
 
-@pytest.mark.parametrize("grid_size", [8, 16, 32, 64, 128])
+@pytest.mark.parametrize("grid_size", HMFT_VALID_GRIDS)
 def test_hmft_5grid_gumbel_ste_topk_consistent_k(grid_size: int):
     """B.5 Gumbel-STE: K is consistent (axiom A5) across all grids."""
     splitter = MultiBlockHMFTSplitter()
     splitter.train()
     features = torch.randn(2, 256, grid_size, grid_size)
     result = splitter(features, image_size=(grid_size, grid_size), hard=False)
-    # K is per-image. Actual K = min(K_fixed=16, n_cells). For N=8 with h=8,
-    # n_cells=1 so K=1. For larger grids, K=16.
+    # K is per-image. Actual K = min(HMFT_K_HARD_GLOBAL_POOL, n_cells).
+    # For grids in HMFT_VALID_GRIDS, n_cells >= HMFT_K_HARD_GLOBAL_POOL so K = HMFT_K_HARD_GLOBAL_POOL.
     actual_K = result.regions.shape[0] // 2
-    assert 1 <= actual_K <= 16
+    # Axiom A5 watchdog: K 必须严格等于全局硬 K,不允许 K=1 (grid 退化) 等异常。
+    assert actual_K == HMFT_K_HARD_GLOBAL_POOL
     # mask_ste is [B, n_cells]
     assert result.mask_ste.shape[0] == 2
     # mask_ste values are in [0, 1]
@@ -100,21 +103,21 @@ def test_hmft_stress_scale_a7(N: int):
     splitter = MultiBlockHMFTSplitter()
     features = torch.randn(2, 256, N, N)
     result = splitter(features, image_size=(N, N), hard=True)
-    # For N>=64, n_cells >= 16, so K=K_fixed=16
-    assert result.regions.shape[0] == 2 * 16
+    # For N>=64, n_cells >= HMFT_K_HARD_GLOBAL_POOL, so K = HMFT_K_HARD_GLOBAL_POOL
+    assert result.regions.shape[0] == 2 * HMFT_K_HARD_GLOBAL_POOL
 
 
-@pytest.mark.parametrize("grid_size", [32, 64, 128])
+@pytest.mark.parametrize("grid_size", HMFT_VALID_GRIDS)
 def test_hmft_a1_locality_5bin_chooses_one_h(grid_size: int):
     """B.7 A1: The 5-bin learnable h chooses exactly one block size per forward.
 
-    For grid_size >= 32, n_cells >= 16 so K=16 is achieved.
+    For grid_size >= 32, n_cells >= HMFT_K_HARD_GLOBAL_POOL so K = HMFT_K_HARD_GLOBAL_POOL is achieved.
     """
     splitter = MultiBlockHMFTSplitter()
     features = torch.randn(1, 256, grid_size, grid_size)
     result = splitter(features, image_size=(grid_size, grid_size), hard=True)
-    # For grid_size >= 32 with h <= grid_size, n_cells >= 16 so K=16
-    assert result.regions.shape[0] == 1 * 16
+    # For grid_size >= 32 with h <= grid_size, n_cells >= HMFT_K_HARD_GLOBAL_POOL so K = HMFT_K_HARD_GLOBAL_POOL
+    assert result.regions.shape[0] == 1 * HMFT_K_HARD_GLOBAL_POOL
 
 
 def test_hmft_a2_determinism():

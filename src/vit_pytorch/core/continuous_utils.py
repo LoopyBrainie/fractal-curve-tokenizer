@@ -21,6 +21,8 @@ import math
 import warnings
 from typing import Tuple
 
+from vit_pytorch.core.constants import quadtree_node_count  # I-DEDUP
+
 
 def compute_optimal_parallel_depth(
     image_size: int,
@@ -67,7 +69,7 @@ def compute_num_candidates(max_depth_parallel: int) -> int:
     Returns:
         num_candidates: 候选区域总数
     """
-    return (4 ** (max_depth_parallel + 1) - 1) // 3
+    return quadtree_node_count(max_depth_parallel)
 
 
 def validate_continuous_config(

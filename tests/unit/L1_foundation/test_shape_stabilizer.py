@@ -167,19 +167,24 @@ class TestShapeStabilizer:
         assert torch.allclose(padding_grad, torch.zeros_like(padding_grad))
 
     def test_no_padding_needed(self):
-        """验证 K 恰好等于桶大小时不进行 padding"""
+        """验证 K 恰好等于桶大小时不进行 padding（保留对象身份）"""
         B, K, D = 2, 256, 64
         tokens = torch.randn(B, K, D)
         levels = torch.randint(0, 8, (B, K))
         lengths = torch.tensor([256, 256])
 
-        tokens_padded, levels_padded, _ = self.stabilizer.pad_to_bucket(tokens, levels, lengths)
+        tokens_padded, levels_padded, lengths_returned = self.stabilizer.pad_to_bucket(
+            tokens, levels, lengths
+        )
 
         # 形状应该不变
         assert tokens_padded.shape == tokens.shape
         assert levels_padded.shape == levels.shape
-        # 应该是同一个对象（没有进行 padding）
+
+        # 严格的 is 身份比较：Python 标量早返命中，无任何 tensor 分配
         assert tokens_padded is tokens
+        assert levels_padded is levels
+        assert lengths_returned is lengths
 
     def test_batch_different_lengths(self):
         """验证批次中不同样本长度的情况"""

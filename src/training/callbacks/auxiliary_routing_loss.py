@@ -40,6 +40,9 @@ if TYPE_CHECKING:
 class AuxiliaryRoutingLossCallback(TrainerCallback):
     """为 5 路由参数注入 entropy/budget/locality 监督信号.
 
+    I165-3a 扩展: 同时为 3 个结构性参数 (rot_proj / roi_norm / geo_norm)
+    注入正交化 / 单位缩放 / 三段对齐监督信号 (Grouped Scaling, 1:1:1 配比).
+
     Attributes:
         entropy_weight: entropy loss 权重 (锚定 logit_scale + alpha_raw)
         budget_weight: budget loss 权重 (锚定 conv1d_hilbert.bias)
@@ -47,6 +50,8 @@ class AuxiliaryRoutingLossCallback(TrainerCallback):
         bias_reg_weight: bias_table L2 正则权重
         entropy_target: 目标 entropy (normalized [0, 1])
         budget_target: 目标 K fraction ∈ [0, 1]
+        i165_3a_global_scale: I165-3a 3 项的全局标量 (Grouped Scaling)
+        _enabled_i165_3a: I165-3a kill-switch 标志
     """
 
     priority: int = 0  # 默认后置 hook
@@ -59,6 +64,7 @@ class AuxiliaryRoutingLossCallback(TrainerCallback):
         bias_reg_weight: float = 0.02,
         entropy_target: float = 0.7,
         budget_target: float = 0.25,
+        i165_3a_global_scale: float = 0.05,
     ) -> None:
         self.entropy_weight = float(entropy_weight)
         self.budget_weight = float(budget_weight)
@@ -66,7 +72,9 @@ class AuxiliaryRoutingLossCallback(TrainerCallback):
         self.bias_reg_weight = float(bias_reg_weight)
         self.entropy_target = float(entropy_target)
         self.budget_target = float(budget_target)
+        self.i165_3a_global_scale = float(i165_3a_global_scale)
         self._enabled: bool = False
+        self._enabled_i165_3a: bool = True  # 默认 ON, kill-switch
         self._eps: float = 1e-6
 
     def on_train_start(self, ctx: TrainerContext) -> None:
@@ -74,6 +82,8 @@ class AuxiliaryRoutingLossCallback(TrainerCallback):
         cfg = getattr(ctx, "config", None)
         training_cfg = getattr(cfg, "training", None)
         self._enabled = bool(getattr(training_cfg, "enable_routing_aux_loss", False))
+        # I165-3a: 即使上层 _enabled=False 也允许 I165-3a 独立开关
+        # (但当前默认架构是 _enabled 包含 I165-3a,所以这里尊重上层)
         if self._enabled:
             try:
                 from vit_pytorch.core.constants import EPS
@@ -88,6 +98,13 @@ class AuxiliaryRoutingLossCallback(TrainerCallback):
                 self.bias_reg_weight = float(getattr(training_cfg, "routing_bias_reg_weight", self.bias_reg_weight))
                 self.entropy_target = float(getattr(training_cfg, "routing_entropy_target", self.entropy_target))
                 self.budget_target = float(getattr(training_cfg, "routing_budget_target", self.budget_target))
+                # I165-3a: Grouped Scaling 单标量 + kill-switch
+                self.i165_3a_global_scale = float(getattr(
+                    training_cfg, "i165_3a_global_scale", self.i165_3a_global_scale
+                ))
+                self._enabled_i165_3a = bool(getattr(
+                    training_cfg, "enable_i165_3a_aux_loss", True
+                ))
 
     def on_loss_computed(
         self, ctx: TrainerContext, loss: "Tensor", components: dict
@@ -176,6 +193,64 @@ class AuxiliaryRoutingLossCallback(TrainerCallback):
         if bias_table is not None and isinstance(bias_table, torch.Tensor) and bias_table.numel() > 0:
             try:
                 ctx.aux_losses["routing_bias_reg"] = self.bias_reg_weight * (bias_table ** 2).mean()
+            except Exception:
+                pass
+
+        # === I165-3a: rot_proj / roi_norm / geo_norm 联合监督 (Grouped Scaling) ===
+        # 设计: 单个 global_scale s 控制 3 项联合强度,内部 1:1:1 等配比
+        # 与 R7-A 4 项 (entropy/budget/locality/bias_reg) 在参数空间正交:
+        #   - L_rot  锚定 rot_proj.weight   (d × d 矩阵正交化)
+        #   - L_roi  锚定 roi_norm.weight   (d 维 γ² → 1 单位缩放)
+        #   - L_geo  锚定 geo_norm.weight   (3d 维三段 γ 均值平方对齐 + 段间方差)
+        # kill-switch: enable_i165_3a_aux_loss=False 或 i165_3a_global_scale=0 都跳过
+        if not (self._enabled_i165_3a and self.i165_3a_global_scale > 0):
+            return  # 跳过 I165-3a 全部 3 项 (Grouped Scaling 整体开/关)
+
+        s = self.i165_3a_global_scale
+
+        # Loss 5: L_rot = ||W^T W - I||_F^2 / d^2
+        # 物理解释: 鼓励 rot_proj 接近正交,保持 Hilbert 旋转嵌入几何结构
+        # 在 W = Q (正交) 时 L_rot = 0, 平衡点正确
+        # ∂L/∂W = 4/d² · (W W^T W - W), 偏离量线性相关,温和稳定
+        rot_w = rt.get("rot_proj_weight")
+        if rot_w is not None and isinstance(rot_w, torch.Tensor) and rot_w.dim() == 2:
+            try:
+                d = int(rot_w.shape[0])
+                # d == d (square), 默认 HilbertOptimalSplitter hidden_dim × hidden_dim
+                if d > 0 and rot_w.shape[0] == rot_w.shape[1]:
+                    gram = rot_w.t() @ rot_w  # [d, d]
+                    eye = torch.eye(d, dtype=gram.dtype, device=gram.device)
+                    # Frobenius 范数平方 / d^2 归一化
+                    ctx.aux_losses["i165_3a_rot"] = s * ((gram - eye) ** 2).sum() / float(d * d)
+            except Exception:
+                pass
+
+        # Loss 6: L_roi = mean((γ² - 1)²)
+        # 物理解释: 鼓励 roi_norm γ 保持单位缩放, 初始 γ=1 → L_roi = 0
+        # ∂L/∂γ_i = (4/d) · γ_i · (γ_i² - 1), γ=1 处梯度为零 (完全平滑引入)
+        # 等价于约束 LN 不放大也不缩小 ROI 特征
+        roi_w = rt.get("roi_norm_weight")
+        if roi_w is not None and isinstance(roi_w, torch.Tensor) and roi_w.dim() == 1:
+            try:
+                ctx.aux_losses["i165_3a_roi"] = s * ((roi_w ** 2 - 1.0) ** 2).mean()
+            except Exception:
+                pass
+
+        # Loss 7: L_geo (三段 γ 均值平方对齐 + 段间方差)
+        # 物理解释: 强制 path/rot/area 三段在 Hilbert 流形上对称, 避免任何一段被 LN 主导
+        # 初始三段 γ=1 → align=0, var=0 → L_geo = 0, 与初始化完全匹配
+        # 段方差权重 0.1 是内部固定常数, 不暴露配置 (YAGNI)
+        geo_w = rt.get("geo_norm_weight")
+        if geo_w is not None and isinstance(geo_w, torch.Tensor) and geo_w.dim() == 1:
+            try:
+                d_total = int(geo_w.shape[0])
+                d = d_total // 3
+                if d > 0 and d_total == 3 * d:
+                    seg = geo_w.view(3, d)  # [3, d]
+                    seg_mean_sq = (seg ** 2).mean(dim=-1)  # [3]
+                    align = ((seg_mean_sq - 1.0) ** 2).mean()
+                    var = seg_mean_sq.var(unbiased=False)
+                    ctx.aux_losses["i165_3a_geo"] = s * (align + 0.1 * var)
             except Exception:
                 pass
 

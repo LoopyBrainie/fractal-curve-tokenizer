@@ -48,6 +48,9 @@ from ..utils.hilbert_utils import (
     xy_to_d,
 )
 
+# 四叉树节点总数 (Single Source of Truth, I-DEDUP)
+from vit_pytorch.core.constants import quadtree_node_count
+
 
 # =============================================================================
 # Shapely 几何工具函数 (增强功能)
@@ -874,7 +877,7 @@ def visualize_mixed_depth_regions(
     ax.set_xlim(0, image_size)
     ax.set_ylim(0, image_size)
     ax.set_aspect('equal')
-    total_candidates = int((4 ** (max_depth + 1) - 1) / 3)
+    total_candidates = quadtree_node_count(max_depth)
     ax.set_title(f'Complete Quadtree Hierarchy\n(All {total_candidates} Candidates)',
                  fontsize=11, fontweight='bold')
     draw_image_background(ax, image, image_size)

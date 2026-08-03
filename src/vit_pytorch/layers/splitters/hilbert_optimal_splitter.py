@@ -777,8 +777,17 @@ class HilbertOptimalSplitter(nn.Module, CoreSplitter):
 
         # 5. 离散选择
         if hard:
+            # I170.3-DETERM: 在 logits 空间注入 1e-6 * arange 严格弱序
+            # GPU topk 在面对并列值时 tie-breaking 是实现定义的;
+            # 1e-6 远大于 float32 机器精度 (1.19e-7) 且远小于典型 logit 差异 (~O(1)),
+            # 强制建立严格弱序, 确保 CPU/GPU 行为一致.
+            _n = logits.shape[-1]
+            _tie_breaker = torch.arange(
+                _n, device=logits.device, dtype=logits.dtype
+            ) * 1e-6
+            _stable_logits = logits + _tie_breaker
             # 确定性 STE: softmax → hard Top-K → STE（无 Gumbel 噪声）
-            mask_soft = F.softmax(logits / self.temperature, dim=-1)
+            mask_soft = F.softmax(_stable_logits / self.temperature, dim=-1)
             _, top_idx = torch.topk(mask_soft, self.K_fixed, dim=-1)
             mask_hard_local = torch.zeros_like(logits).scatter_(-1, top_idx, 1.0)
             mask_ste = (mask_hard_local - mask_soft).detach() + mask_soft

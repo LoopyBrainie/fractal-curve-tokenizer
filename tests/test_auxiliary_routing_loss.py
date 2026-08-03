@@ -77,8 +77,12 @@ class _MockAux:
     auxiliary_outputs: Dict[str, Any]
 
 
-def _make_routing_tensors(B: int = 2, N: int = 16, table_size: int = 65, conv_in: int = 64):
-    """构造 routing_tensors 命名空间中的所有 raw Tensor (供 callback 消费)."""
+def _make_routing_tensors(B: int = 2, N: int = 16, table_size: int = 65, conv_in: int = 64, hidden_dim: int = 64):
+    """构造 routing_tensors 命名空间中的所有 raw Tensor (供 callback 消费).
+
+    I165-3a 扩展: 新增 rot_proj_weight / roi_norm_weight / geo_norm_weight
+    三个结构性参数 (d × d 矩阵, d 维向量, 3d 维向量)
+    """
     return {
         "logit_scale": nn.Parameter(torch.zeros(1)),
         "semantic_ratio": nn.Parameter(torch.zeros(1)),
@@ -88,7 +92,20 @@ def _make_routing_tensors(B: int = 2, N: int = 16, table_size: int = 65, conv_in
         "alpha_raw": nn.Parameter(torch.zeros(1)),
         "probs": torch.softmax(torch.randn(B, N), dim=-1),
         "active_mask": (torch.rand(B, N) > 0.5).float(),
+        # I165-3a: 3 个结构性参数 (默认 HilbertOptimalSplitter hidden_dim=64)
+        # rot_proj 默认 Kaiming uniform (模拟 nn.Linear 默认),保证 L_rot 数值稳定
+        # roi_norm / geo_norm 默认 γ=1 (LayerNorm 默认),保证 L_roi=L_geo=0 (平滑引入)
+        "rot_proj_weight": nn.Parameter(_kaiming_linear_init(hidden_dim, hidden_dim)),
+        "roi_norm_weight": nn.Parameter(torch.ones(hidden_dim)),
+        "geo_norm_weight": nn.Parameter(torch.ones(3 * hidden_dim)),
     }
+
+
+def _kaiming_linear_init(*shape: int) -> "torch.Tensor":
+    """模拟 nn.Linear 默认 Kaiming uniform 初始化 (fan_in, a=sqrt(5))"""
+    t = torch.empty(*shape)
+    torch.nn.init.kaiming_uniform_(t, a=5 ** 0.5)
+    return t
 
 
 def _make_ctx(
@@ -101,6 +118,8 @@ def _make_ctx(
     routing_bias_reg_weight: float = 0.02,
     routing_entropy_target: float = 0.7,
     routing_budget_target: float = 0.25,
+    enable_i165_3a_aux_loss: bool = True,
+    i165_3a_global_scale: float = 0.05,
 ):
     """构造 mock TrainerContext, 含 aux_losses dict 与 config 字段。"""
 
@@ -113,6 +132,9 @@ def _make_ctx(
             self.routing_bias_reg_weight = routing_bias_reg_weight
             self.routing_entropy_target = routing_entropy_target
             self.routing_budget_target = routing_budget_target
+            # I165-3a: Grouped Scaling + kill-switch
+            self.enable_i165_3a_aux_loss = enable_i165_3a_aux_loss
+            self.i165_3a_global_scale = i165_3a_global_scale
 
     class _MockConfig:
         def __init__(self):
@@ -442,3 +464,179 @@ def test_callback_is_importable():
     # 实例化不抛异常
     cb = AuxiliaryRoutingLossCallback()
     assert cb.priority == 0  # 默认 priority
+
+
+# =============================================================================
+# I165-3a: 3 个结构性参数 (rot_proj / roi_norm / geo_norm) 联合监督
+# =============================================================================
+
+
+class TestI1653aAuxLosses:
+    """I165-3a: rot_proj / roi_norm / geo_norm 联合监督测试 (Grouped Scaling).
+
+    验证:
+    - 3 个新 key (i165_3a_rot / i165_3a_roi / i165_3a_geo) 在默认 ON 时被写入
+    - kill-switch (enable_i165_3a_aux_loss=False 或 i165_3a_global_scale=0) 整体关闭
+    - 数学性质: 正交 init 时 L_rot→0, γ=1 时 L_roi=0, 三段 γ=1 时 L_geo=0
+    - 1:1:1 配比: s 翻倍 → 3 个 loss 数值都精确翻倍
+    - 梯度流: 3 个 loss 都涉及 nn.Parameter, 必须保留 grad_fn
+    """
+
+    def _run_callback(self, rt, *, enable_i165_3a_aux_loss=True, i165_3a_global_scale=0.05):
+        """辅助: 跑一次 callback, 返回 ctx.aux_losses 字典"""
+        aux = {"routing_tensors": rt, "splitter": {}}
+        ctx = _make_ctx(
+            aux,
+            enable_i165_3a_aux_loss=enable_i165_3a_aux_loss,
+            i165_3a_global_scale=i165_3a_global_scale,
+        )
+        cb = AuxiliaryRoutingLossCallback()
+        cb.on_train_start(ctx)
+        cb.on_loss_computed(ctx, torch.tensor(0.0), {})
+        return ctx
+
+    def test_three_losses_written_when_enabled(self):
+        """默认 ON (enable_i165_3a_aux_loss=True) 时, aux_losses 应有 3 个新 key"""
+        rt = _make_routing_tensors()
+        ctx = self._run_callback(rt)
+        for key in ("i165_3a_rot", "i165_3a_roi", "i165_3a_geo"):
+            assert key in ctx.aux_losses, f"Missing aux_losses[{key}]"
+            assert isinstance(ctx.aux_losses[key], torch.Tensor)
+            assert ctx.aux_losses[key].dim() == 0  # scalar
+
+    def test_kill_switch_disables_all_three(self):
+        """enable_i165_3a_aux_loss=False → 3 个 key 都不写入 (Grouped Scaling 整体关)"""
+        rt = _make_routing_tensors()
+        ctx = self._run_callback(rt, enable_i165_3a_aux_loss=False)
+        for key in ("i165_3a_rot", "i165_3a_roi", "i165_3a_geo"):
+            assert key not in ctx.aux_losses, f"{key} should NOT be written when kill-switch on"
+
+    def test_zero_global_scale_disables_all_three(self):
+        """i165_3a_global_scale=0.0 → 等价于 kill-switch (整体关闭)"""
+        rt = _make_routing_tensors()
+        ctx = self._run_callback(rt, i165_3a_global_scale=0.0)
+        for key in ("i165_3a_rot", "i165_3a_roi", "i165_3a_geo"):
+            assert key not in ctx.aux_losses, f"{key} should NOT be written when global_scale=0"
+
+    def test_rot_loss_orthogonal_init_near_zero(self):
+        """rot_proj 初始化为正交矩阵时 L_rot 应接近 0 (||Q^T Q - I||_F² / d²)"""
+        d = 64
+        rt = _make_routing_tensors(hidden_dim=d)
+        # 用 orthogonal 初始化 rot_proj_weight
+        torch.nn.init.orthogonal_(rt["rot_proj_weight"].data)
+
+        ctx = self._run_callback(rt, i165_3a_global_scale=1.0)  # s=1.0 便于直接断言 L_rot
+        rot_loss = ctx.aux_losses["i165_3a_rot"]
+        assert rot_loss.item() < 1e-5, f"Orthogonal init should give near-zero L_rot, got {rot_loss.item()}"
+
+    def test_roi_loss_zero_at_init(self):
+        """γ=1 (默认初始化) 时 L_roi 应精确为 0 (完全平滑引入)"""
+        rt = _make_routing_tensors()
+        # roi_norm_weight 默认是 ones(64) → γ=1
+        assert torch.allclose(rt["roi_norm_weight"].data, torch.ones(64))
+
+        ctx = self._run_callback(rt, i165_3a_global_scale=1.0)  # s=1.0
+        roi_loss = ctx.aux_losses["i165_3a_roi"]
+        assert roi_loss.item() == 0.0, f"γ=1 should give L_roi=0, got {roi_loss.item()}"
+
+    def test_geo_loss_zero_at_init(self):
+        """三段 γ=1 (默认初始化) 时 L_geo 应精确为 0 (三段均值平方=1, 段间方差=0)"""
+        rt = _make_routing_tensors()
+        # geo_norm_weight 默认是 ones(3*64)
+        assert torch.allclose(rt["geo_norm_weight"].data, torch.ones(192))
+
+        ctx = self._run_callback(rt, i165_3a_global_scale=1.0)  # s=1.0
+        geo_loss = ctx.aux_losses["i165_3a_geo"]
+        assert geo_loss.item() == 0.0, f"三段 γ=1 should give L_geo=0, got {geo_loss.item()}"
+
+    def test_global_scale_linearly_scales_all_three(self):
+        """s 翻倍时, 3 个 loss 数值都精确翻倍 (1:1:1 内部配比)"""
+        d = 32
+        # 构造非平凡的 rot_proj (非正交) 以让 L_rot ≠ 0
+        rt = _make_routing_tensors(hidden_dim=d)
+        torch.nn.init.normal_(rt["rot_proj_weight"].data, mean=0.0, std=0.1)
+        rt["roi_norm_weight"].data = torch.full((d,), 1.5)  # γ=1.5 → L_roi > 0
+        rt["geo_norm_weight"].data = torch.full((3 * d,), 0.8)  # 三段 γ=0.8 → L_geo > 0
+
+        # 跑两次, scale 翻倍
+        ctx_1x = self._run_callback(rt, i165_3a_global_scale=0.05)
+        ctx_2x = self._run_callback(rt, i165_3a_global_scale=0.10)
+
+        for key in ("i165_3a_rot", "i165_3a_roi", "i165_3a_geo"):
+            v_1x = ctx_1x.aux_losses[key].item()
+            v_2x = ctx_2x.aux_losses[key].item()
+            # 1:1:1 配比下, s 翻倍 → 各项 loss 精确翻倍
+            assert abs(v_2x / v_1x - 2.0) < 1e-5, (
+                f"{key}: s 翻倍应使 loss 翻倍, 实际 {v_1x:.6f} → {v_2x:.6f} (ratio {v_2x / v_1x:.6f})"
+            )
+
+    def test_grad_fn_preserved_for_all_three(self):
+        """3 个 loss 都涉及 nn.Parameter, 必须保留 grad_fn (autograd 图接通)"""
+        rt = _make_routing_tensors()
+        # 模拟非平凡权重以让计算图非平凡
+        d = 64
+        torch.nn.init.normal_(rt["rot_proj_weight"].data, std=0.1)
+        rt["roi_norm_weight"].data = torch.full((d,), 1.2)
+        rt["geo_norm_weight"].data = torch.full((3 * d,), 0.9)
+
+        ctx = self._run_callback(rt)
+        for key in ("i165_3a_rot", "i165_3a_roi", "i165_3a_geo"):
+            loss = ctx.aux_losses[key]
+            assert loss.grad_fn is not None, (
+                f"{key} 失去 grad_fn (autograd 图断裂, 违反 T-blocks 1 修复原则)"
+            )
+
+    def test_rot_loss_grad_flows_to_rot_proj(self):
+        """L_rot 反向传播后, rot_proj.weight.grad 非零 (核心接通断言)"""
+        d = 64
+        rt = _make_routing_tensors(hidden_dim=d)
+        torch.nn.init.normal_(rt["rot_proj_weight"].data, std=0.1)
+
+        ctx = self._run_callback(rt)
+        ctx.aux_losses["i165_3a_rot"].backward()
+        rot_grad = rt["rot_proj_weight"].grad
+        assert rot_grad is not None, "rot_proj.weight.grad 应被 L_rot 触发"
+        assert rot_grad.abs().sum().item() > 0, "rot_proj.weight.grad 应非零"
+
+    def test_roi_loss_grad_flows_to_roi_norm(self):
+        """L_roi 反向传播后, roi_norm.weight.grad 非零 (核心接通断言)"""
+        d = 64
+        rt = _make_routing_tensors(hidden_dim=d)
+        # 让 γ 偏离 1, 让 L_roi 的 ∂L/∂γ 非零
+        rt["roi_norm_weight"].data = torch.full((d,), 1.5)
+
+        ctx = self._run_callback(rt)
+        ctx.aux_losses["i165_3a_roi"].backward()
+        roi_grad = rt["roi_norm_weight"].grad
+        assert roi_grad is not None, "roi_norm.weight.grad 应被 L_roi 触发"
+        assert roi_grad.abs().sum().item() > 0, "roi_norm.weight.grad 应非零"
+
+    def test_geo_loss_grad_flows_to_geo_norm(self):
+        """L_geo 反向传播后, geo_norm.weight.grad 非零 (核心接通断言)"""
+        d = 64
+        rt = _make_routing_tensors(hidden_dim=d)
+        # 让三段 γ 不一致, 让 L_geo 的 ∂L/∂γ 非零
+        rt["geo_norm_weight"].data = torch.cat([
+            torch.full((d,), 1.2),  # 段 0
+            torch.full((d,), 1.0),  # 段 1
+            torch.full((d,), 0.8),  # 段 2
+        ])
+
+        ctx = self._run_callback(rt)
+        ctx.aux_losses["i165_3a_geo"].backward()
+        geo_grad = rt["geo_norm_weight"].grad
+        assert geo_grad is not None, "geo_norm.weight.grad 应被 L_geo 触发"
+        assert geo_grad.abs().sum().item() > 0, "geo_norm.weight.grad 应非零"
+
+    def test_geometry_orthogonality_lost_means_loss_grows(self):
+        """若 rot_proj 偏离正交, L_rot 严格 > 0 (验证 loss 真的在监督正交化)"""
+        d = 16
+        rt = _make_routing_tensors(hidden_dim=d)
+        # 故意让 rot_proj 远不正交 (单位矩阵 + 大扰动)
+        rt["rot_proj_weight"].data = torch.eye(d) + torch.randn(d, d) * 0.5
+
+        ctx = self._run_callback(rt, i165_3a_global_scale=1.0)
+        rot_loss = ctx.aux_losses["i165_3a_rot"].item()
+        assert rot_loss > 0.0, f"非正交矩阵应产生 L_rot > 0, got {rot_loss}"
+        # 数量级检查: d=16 时 1/d² ≈ 0.004,扰动~0.5 → 期望 L_rot 在 0.1 量级
+        assert 0.001 < rot_loss < 10.0, f"L_rot 数量级异常: {rot_loss}"

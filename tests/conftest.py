@@ -128,8 +128,8 @@ def generate_valid_regions(
             # 随机生成有效区域
             x0 = torch.randint(0, max_coord, (1,)).item()
             y0 = torch.randint(0, max_coord, (1,)).item()
-            x1 = torch.randint(x0 + min_size, img_size, (1,)).item()
-            y1 = torch.randint(y0 + min_size, img_size, (1,)).item()
+            x1 = torch.randint(int(x0 + min_size), img_size, (1,)).item()
+            y1 = torch.randint(int(y0 + min_size), img_size, (1,)).item()
             regions.append([x0, y0, x1, y1])
 
     return torch.tensor(regions, dtype=torch.float32).view(B, N, 4)
@@ -284,6 +284,81 @@ def assert_no_nan_inf(tensor: torch.Tensor, msg: Optional[str] = None) -> None:
     """检查张量不包含 NaN 或 Inf."""
     assert not torch.isnan(tensor).any(), f"{msg or 'NaN detected'}: {tensor}"
     assert not torch.isinf(tensor).any(), f"{msg or 'Inf detected'}: {tensor}"
+
+
+# =============================================================================
+# STE 桥梯度活性测试约定 (HMFT I170.4 follow-up)
+# =============================================================================
+#
+# 数学形式化 (softmax 归一化恒等式):
+#
+#   softmax(x) 满足  Σ_k softmax(x)[k] ≡ 1    (归一化)
+#   因此:        ∂(Σ_k softmax(x)[k])/∂x[j]
+#              = Σ_k softmax(x)[k] · (δ_{kj} - softmax(x)[j])
+#              = softmax(x)[j] - softmax(x)[j] · Σ_k softmax(x)[k]
+#              = softmax(x)[j] - softmax(x)[j] · 1
+#              ≡ 0                              (数学恒等式)
+#
+# 反例 — 任何"纯 softmax-sum"的 loss 数学梯度恒为 0:
+#   loss = mask_ste.sum()                  ← 数学梯度 = 0
+#   loss = mask_soft.sum()                 ← 数学梯度 = 0
+#   loss = -mask_soft.log().sum()          ← 数学梯度 = 0
+#   loss = (mask_soft - target).pow(2).sum()  ← 若 target 均匀分布,数学梯度 = 0
+#
+# 唯一能"安全"通过 assert > 0 的 softmax-sum loss 是依赖 FP32 subnormal 噪声(~1e-7),
+# 这就是仓库中 T4 (math_invariants.py:108-144) 历史上"通过但脆弱"的原因 — 在不同
+# 路径/BatchSize/seed 下,FP32 噪声幅度可能 < 1e-38,变成精确 0,触发 flaky 失败。
+#
+# 推荐 loss — (probs * logits).sum():
+#
+#   ∂loss/∂mask_soft[k] = score_head[k]                              (非零)
+#   ∂loss/∂score_head[k] = mask_soft[k]·(1 + score_head[k] - E[score_head])  (非零)
+#
+# 这同时测试:
+#   - mask_ste → mask_soft → score_head → params  (STE 桥反向)
+#   - score_head → hilbert_conv1d → params        (Conv1d 反向)
+#   - score_head → fusion → geometry_encoder → params  (MLP 反向)
+#
+# 三条路径都有数学上非零的梯度,不依赖 FP32 噪声。
+#
+# 历史 flaky 测试 (现已修复):
+#   - test_a1_gradient_flows_to_geometry_modules (a1.py)
+#   - test_mask_ste_bidirectional_contract       (math_invariants.py T4)
+
+
+def ste_gradient_loss(result) -> torch.Tensor:
+    """STE 桥梯度活性测试的标准 loss.
+
+    计算 ``(probs * logits).sum()``,其中:
+      - ``probs``  = ``result.probs`` = ``mask_soft`` = softmax(score_head)
+      - ``logits`` = ``result.logits`` = ``score_head``
+
+    数学上非退化的梯度路径 (见模块级 docstring 的数学推导):
+      ∂loss/∂mask_soft[k] = score_head[k]
+      ∂loss/∂score_head[k] = mask_soft[k]·(1 + score_head[k] - E[score_head])
+
+    使用约定:
+      - 配合 ``torch.manual_seed(42)`` 在 splitter 构造前锁定随机性
+      - 用 ``splitter.train()`` + ``hard=True`` 跳过 Gumbel 噪声 (避免 softmax 退化为 one-hot)
+      - 必须配合 ``result.mask_ste.requires_grad`` keystone 断言 (T10 强制)
+
+    预期输入:
+      result: ``SplitResult`` (来自 MultiBlockHMFTSplitter.forward 或 H1SS.forward)
+
+    Returns:
+        0-dim scalar tensor,可直接 ``loss.backward()``
+
+    Example:
+        >>> torch.manual_seed(42)
+        >>> splitter = make_hmft_splitter()
+        >>> splitter.train()
+        >>> features = torch.randn(2, 256, 32, 32)
+        >>> result = splitter(features, image_size=(32, 32), hard=True)
+        >>> assert result.mask_ste.requires_grad  # T10 keystone
+        >>> ste_gradient_loss(result).backward()
+        >>> assert splitter.hilbert_conv1d.weight.grad.abs().sum() > 0  # 真实梯度,非 FP32 噪声
+    """
+    return (result.probs * result.logits).sum()
 
 
 # =============================================================================

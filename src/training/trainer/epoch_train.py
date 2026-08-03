@@ -40,7 +40,7 @@ See:
 from __future__ import annotations
 
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -312,4 +312,58 @@ def train_one_epoch(
     )
 
 
-__all__ = ["train_one_epoch"]
+def log_h_probs(
+    splitter: Any,
+    collector: Any,
+    epoch: Optional[int] = None,
+) -> None:
+    """Logs the HMFT block-size selection probabilities safely into the collector.
+
+    This side-channel telemetry runs on a best-effort basis and is designed to
+    never raise exceptions to the main training execution loop.
+    """
+    # Step 1: Resolve splitter.get_diagnostics and verify callability
+    get_diagnostics = getattr(splitter, "get_diagnostics", None)
+    if not callable(get_diagnostics):
+        return
+
+    # Step 2: Adversarial execution guard for diagnostics call
+    try:
+        diag = get_diagnostics()
+    except Exception:
+        return
+
+    if diag is None:
+        diag = {}
+
+    # Step 3: Type validation and key extraction
+    if not isinstance(diag, dict):
+        return
+
+    h = diag.get("h_probs")
+    if h is None:
+        return
+
+    # Step 4: Resolve collector.record and verify callability
+    record = getattr(collector, "record", None)
+    if not callable(record):
+        return
+
+    # Step 5: Sequential bin recording with cascading failure mitigation (break)
+    for i, p in enumerate(h):
+        try:
+            record(f"hmft/h_prob_bin_{i}", float(p))
+        except Exception:
+            # Per-bin structural corruption triggers an immediate cascade break
+            # to match HMFTHProbsCallback semantics and avoid spamming loops.
+            break
+
+    # Step 6: Epoch tracking guard (isolated boundary)
+    if epoch is not None:
+        try:
+            record("hmft/h_probs_epoch", int(epoch))
+        except Exception:
+            pass
+
+
+__all__ = ["train_one_epoch", "log_h_probs"]

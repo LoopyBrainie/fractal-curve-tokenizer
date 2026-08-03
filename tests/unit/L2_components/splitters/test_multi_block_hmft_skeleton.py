@@ -33,7 +33,13 @@ class TestMultiBlockHMFTSplitterSkeleton:
         cfg = MultiBlockHMFTSplitterConfig()
         assert cfg.block_sizes == HMFT_BLOCK_SIZES
         assert cfg.G_global_pool == HMFT_K_HARD_GLOBAL_POOL
-        assert cfg.K_fixed == 16
+        # I170.3 A5: K_fixed field REMOVED from MultiBlockHMFTSplitterConfig.
+        # 负向防御: 防止未来开发者"善意复辟"K_fixed 字段,破坏 A5 硬 K 契约。
+        # No-field contract 也验证于 test_multi_block_hmft_a5.py:test_K_config_field_removed。
+        assert not hasattr(cfg, "K_fixed"), (
+            "A5: K_fixed must NOT exist on MultiBlockHMFTSplitterConfig — "
+            "all K references unify to HMFT_K_HARD_GLOBAL_POOL."
+        )
 
     def test_hmft_skeleton_forward_n_64(self):
         """Forward succeeds on N=64 (smallest JVP-1 grid)."""
@@ -47,14 +53,14 @@ class TestMultiBlockHMFTSplitterSkeleton:
         assert result.hilbert_indices.ndim == 1
         assert result.batch_indices.ndim == 1
         # K is per-image, so M = B * K
-        assert result.regions.shape[0] == 2 * 16
+        assert result.regions.shape[0] == 2 * HMFT_K_HARD_GLOBAL_POOL
 
     def test_hmft_skeleton_forward_n_128(self):
         """Forward succeeds on N=128."""
         splitter = MultiBlockHMFTSplitter()
         features = torch.randn(1, 256, 128, 128)
         result = splitter(features, image_size=(128, 128), hard=True)
-        assert result.regions.shape[0] == 1 * 16
+        assert result.regions.shape[0] == 1 * HMFT_K_HARD_GLOBAL_POOL
 
     def test_hmft_skeleton_h_logits_is_5d(self):
         """The 5-bin h_logits parameter is a 5D learnable tensor."""

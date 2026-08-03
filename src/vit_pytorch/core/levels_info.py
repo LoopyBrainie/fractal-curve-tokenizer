@@ -637,7 +637,9 @@ class LevelsInfo:
         # path_ints_all[b, n, d] = Σ_{k=0}^{d} paths[b,n,k] × 4^(d-k)
 
         # torch.gather: 按 actual depth 取对应深度的路径整数
-        depth_for_gather = depths.long().clamp(min=0, max=D - 1)  # [B, N]
+        # I163-off-by-one 修复: path_ints_all[b,n,d] 是 paths[0..d] (长度 d+1) 的 base-4 编码,
+        # 对应 row d 的 LUT 只能容纳 [0, 4^d-1]; 因此应 gather 索引 d-1, 即 paths[0..d-1] (长度 d)
+        depth_for_gather = (depths.long() - 1).clamp(min=0, max=D - 1)  # [B, N]
         path_ints_per_depth = torch.gather(
             path_ints_all, dim=2, index=depth_for_gather.unsqueeze(2)
         ).squeeze(2)  # [B, N]

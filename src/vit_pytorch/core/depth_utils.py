@@ -37,7 +37,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from .constants import SHAPE_NORM_EPSILON  # I102-4
+from .constants import SHAPE_NORM_EPSILON, quadtree_node_count  # I102-4 + I-DEDUP
 
 
 def compute_max_depth(
@@ -263,7 +263,7 @@ def compute_total_candidates(
     >>> compute_total_candidates((224, 224), 4)
     341  # 1 + 4 + 16 + 64 + 256
     """
-    return (4 ** (max_depth + 1) - 1) // 3
+    return quadtree_node_count(max_depth)
 
 
 # ==================== 向后兼容别名 ====================

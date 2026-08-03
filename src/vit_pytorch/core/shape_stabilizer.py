@@ -122,6 +122,18 @@ class ShapeStabilizer:
         """
         B, K, D = tokens.shape
 
+        # === Python 标量层早返：保留 is 身份，避免任何 tensor 分配 ===
+        # K 是 Python int（tokens.shape[1]，零同步）
+        # lengths.max().item() 是本次调用唯一的 sync 点；
+        # 早返命中时整个 tensor 路径完全跳过。
+        # 在典型工作流中 lengths 是 CPU int64 tensor（B 小），同步代价可忽略。
+        k_bucket = self.get_nearest_bucket(int(lengths.max()))  # Python int
+
+        if k_bucket == K:
+            # 既不需要 padding 也不需要 truncation：直接返回原引用
+            return tokens, levels, lengths
+
+        # === 回落：原 tensor 路径（torch.compile 完全兼容） ===
         # Tensor 版本：K_bucket 基于 lengths.max() 计算
         # 避免 .item()，保持图编译兼容
         actual_max_len = lengths.max()  # Tensor

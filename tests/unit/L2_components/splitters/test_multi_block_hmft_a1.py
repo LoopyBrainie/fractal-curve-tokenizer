@@ -8,14 +8,16 @@ the Multi-Block HMFT splitter must satisfy:
   measures the fraction of selected cell pairs that are adjacent in
   Hilbert 1D ordering.
 
-JVP-1 5-grid EAS verification table:
+JVP-1 3-grid EAS verification table (A5 hard contract enforced):
   Grid    | EAS threshold | Status
   --------|---------------|--------
-  8×8     | ≥ 0.950       | HARD GATE
-  16×16   | ≥ 0.971       | STRONG
   32×32   | ≥ 0.984       | STRONG
   64×64   | ≥ 0.990       | STRONG
   128×128 | ≥ 0.967       | STRONG
+
+  Note: 8×8 / 16×16 are NO LONGER VALID grids under the A5 hard contract
+  (HMFT_MIN_IMAGE_SIZE = 32). Small grids should use PolarVoronoiSplitter
+  instead. Grid sizes are derived from HMFT_VALID_GRIDS below.
 
 This test verifies the new ``_score_cells`` A1 score head (geometry
 encoder + fusion + Hilbert 1D Conv1D smoothing) implemented in I170
@@ -31,16 +33,16 @@ from __future__ import annotations
 import pytest
 import torch
 
+from vit_pytorch.core.constants import HMFT_K_HARD_GLOBAL_POOL
 from vit_pytorch.layers.splitters.multi_block_hmft_splitter import (
     MultiBlockHMFTSplitter,
     MultiBlockHMFTSplitterConfig,
 )
+from .conftest import HMFT_VALID_GRIDS
 
 
-# JVP-1 5-grid EAS verification table
+# JVP-1 3-grid EAS verification table (A5 contract: grids >= 32)
 EAS_HARD_GATE = {
-    8: 0.950,
-    16: 0.971,
     32: 0.984,
     64: 0.990,
     128: 0.967,
@@ -62,31 +64,27 @@ def _compute_eas(topk_indices: torch.Tensor) -> float:
     return (adjacent.sum(dim=-1) / (K - 1)).mean().item()
 
 
-def _make_splitter() -> MultiBlockHMFTSplitter:
-    return MultiBlockHMFTSplitter(MultiBlockHMFTSplitterConfig())
-
-
 class TestAxiomA1LocalityScoreHead:
     """A1: New _score_cells head with geometry + Hilbert 1D Conv1D."""
 
-    def test_score_cells_returns_correct_shape(self):
-        """_score_cells returns [B, n_cells] for each grid size."""
-        splitter = _make_splitter()
+    def test_score_cells_returns_correct_shape(self, make_hmft_splitter):
+        """_score_cells returns [B, n_cells] for each grid size (A5: grid >= 32)."""
+        splitter = make_hmft_splitter()
         splitter.eval()
-        for grid in [8, 16, 32, 64, 128]:
+        for grid in HMFT_VALID_GRIDS:
             features = torch.randn(2, 256, grid, grid)
             r = splitter(features, image_size=(grid, grid), hard=True)
             assert r.logits.shape == (2, r.logits.shape[1]), (
                 f"score_head must be [B, n_cells]=[2, ?], got {r.logits.shape}"
             )
 
-    def test_a1_score_head_uses_new_modules(self):
+    def test_a1_score_head_uses_new_modules(self, make_hmft_splitter):
         """A1 wiring: forward path now uses geometry_encoder + fusion + hilbert_conv1d.
 
         Verifies via parameter existence (not just code reading):
         the modules must be registered, accessible, and have the right shapes.
         """
-        splitter = _make_splitter()
+        splitter = make_hmft_splitter()
         # Geometry encoder: 3 input channels (path + rot + area)
         assert splitter.geometry_encoder.proj.in_features == 3
         # Fusion: feature_dim + hidden_dim → 1
@@ -98,10 +96,10 @@ class TestAxiomA1LocalityScoreHead:
         assert splitter.hilbert_conv1d.out_channels == 1
         assert splitter.hilbert_conv1d.kernel_size == (5,)
 
-    def test_a1_conv1d_starts_as_identity(self):
+    def test_a1_conv1d_starts_as_identity(self, make_hmft_splitter):
         """Initial Conv1D weights form identity (center tap = 1) so the new
         score head starts equivalent to the legacy mean baseline."""
-        splitter = _make_splitter()
+        splitter = make_hmft_splitter()
         with torch.no_grad():
             w = splitter.hilbert_conv1d.weight
             assert torch.allclose(w[0, 0, 2], torch.tensor(1.0)), (
@@ -113,7 +111,7 @@ class TestAxiomA1LocalityScoreHead:
             assert torch.allclose(w[0, 0, off_center_mask], torch.zeros(4))
 
     @pytest.mark.parametrize("grid_size, min_eas", list(EAS_HARD_GATE.items()))
-    def test_a1_eas_per_grid(self, grid_size: int, min_eas: float):
+    def test_a1_eas_per_grid(self, make_hmft_splitter, grid_size: int, min_eas: float):
         """A1 EAS verification per JVP-1 5-grid table.
 
         Note: the new score head starts as identity (no training), so EAS
@@ -121,7 +119,7 @@ class TestAxiomA1LocalityScoreHead:
         ``eas >= 0.0`` (sanity) here and rely on the A1 documentation note
         in test_hmft_5grid_eas that the FULL EAS gate requires training.
         """
-        splitter = _make_splitter()
+        splitter = make_hmft_splitter()
         splitter.eval()
         features = torch.randn(2, 256, grid_size, grid_size)
         r = splitter(features, image_size=(grid_size, grid_size), hard=True)
@@ -131,15 +129,39 @@ class TestAxiomA1LocalityScoreHead:
         # Document the design hard-gate target (full gate requires training)
         assert 0.0 <= min_eas <= 1.0, f"min_eas={min_eas} must be in (0, 1]"
 
-    def test_a1_gradient_flows_to_geometry_modules(self):
-        """A1 gradient flow: all three new modules receive non-zero grad."""
-        splitter = _make_splitter()
+    def test_a1_gradient_flows_to_geometry_modules(self, make_hmft_splitter):
+        """A1 gradient flow: all three new modules receive non-zero grad.
+
+        Note: the loss is ``(probs * score_head).sum()`` rather than ``mask_ste.sum()``,
+        because softmax's normalization identity ``Σ softmax(x)[k] ≡ 1`` makes
+        ``d(Σ softmax)/d(x[j]) ≡ 0`` — any loss that's purely a sum of softmax outputs
+        has zero mathematical gradient through softmax. T4 (math_invariants.py:115-144)
+        uses ``mask_ste.sum()`` and passes only via FP32 noise (~1e-7); this test is
+        more robust by using a loss that produces non-trivial gradient via the
+        ``mask_soft * score_head`` interaction.
+        """
+        # 锁定 Gumbel / 采样器 / 参数初值,匹配 T4 测试的确定性种子约定
+        torch.manual_seed(42)
+        splitter = make_hmft_splitter()
+        # 强制高对比度 Logits 使 softmax 严格逼近 one-hot,彻底消除 multinomial 抽样随机性
+        # 用 30.0 而非 1.0 — softmax(1,0,...) ≈ [0.40,0.15,...] 仍有 60% 误抽样概率
+        # device=splitter.h_logits.device 防止 CPU/GPU device mismatch
+        # .copy_() 取代 .data = ... 反模式,保持 Parameter 的 autograd 标识完整
+        with torch.no_grad():
+            splitter.h_logits.copy_(
+                torch.tensor([30.0, 0.0, 0.0, 0.0, 0.0], device=splitter.h_logits.device)
+            )
         splitter.train()
         # requires_grad_(True) simulates the model training path
         features = torch.randn(1, 256, 32, 32).requires_grad_(True)
-        r = splitter(features, image_size=(32, 32), hard=False)
-        # mask_ste is a STE bridge that depends on score_head (grad-tracked)
-        r.mask_ste.sum().backward()
+        # hard=True 跳过 Gumbel 噪声注入 (multi_block_hmft_splitter._gumbel_ste_topk)
+        # 避免 Gumbel max-over-N 极值在 FP32 下让 softmax 退化为 one-hot
+        r = splitter(features, image_size=(32, 32), hard=True)
+        # Loss = (probs * score_head).sum() — 数学非退化的梯度路径:
+        # ∂loss/∂mask_soft[k] = score_head[k] (非零)
+        # ∂loss/∂score_head[k] = mask_soft[k]·(1 + score_head[k] - E[score_head])
+        # 这打破了 softmax 归一化的对称性,产生数学上非零的梯度流
+        (r.probs * r.logits).sum().backward()
         for name, param in [
             ("hilbert_conv1d", splitter.hilbert_conv1d.weight),
             ("geometry_encoder.proj", splitter.geometry_encoder.proj.weight),
@@ -150,17 +172,17 @@ class TestAxiomA1LocalityScoreHead:
                 f"{name}.grad is zero — gradient not flowing through A1 path"
             )
 
-    def test_a1_hilbert_conv1d_shape_constraint(self):
+    def test_a1_hilbert_conv1d_shape_constraint(self, make_hmft_splitter):
         """A1 Conv1D requires homogeneous n_cells in batch (single h per forward).
 
         HMFT picks a single h per forward (5-bin argmax), so this is safe
         by design. This test documents the assumption by verifying
         forward succeeds on standard grid sizes.
         """
-        splitter = _make_splitter()
+        splitter = make_hmft_splitter()
         splitter.train()
-        # Standard 4 grids; all should produce a valid score_head
-        for grid in [16, 32, 64, 128]:
+        # HMFT_VALID_GRIDS 派生自生产 HMFT_BLOCK_SIZES ∩ A5 守卫
+        for grid in HMFT_VALID_GRIDS:
             features = torch.randn(3, 256, grid, grid)  # batch=3
             r = splitter(features, image_size=(grid, grid), hard=True)
             assert r.logits.shape[0] == 3, (

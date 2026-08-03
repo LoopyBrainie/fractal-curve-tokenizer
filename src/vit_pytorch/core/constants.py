@@ -46,7 +46,7 @@ SPLITTER_BIAS_CONSTANT_DEFAULT: float = 0.5
 #: 数学:  b_{d,init} = σ_W · sqrt(2 · log(K_target))
 #: 来源: He et al. 2015 (arXiv:1502.01852) — 标准 Kaiming/He 初始化
 #:        实证扩展: 用 log(K_target) 替代 1/n_in，标定到 splitter 的 token 预算目标
-#: 默认 K_target = 16 (splitter 默认 K_fixed)
+#: 默认 K_target = 8 (I170.3 A5: HMFT 硬 K,统一到 HMFT_K_HARD_GLOBAL_POOL)
 #: σ_W 取决于 .weight 形状 (fan_in):
 #:   - 默认生产路径 (HilbertDistanceDecayConv1D.pointwise, kernel=1, in=256):
 #:       n_in = 256 * 1 = 256, σ_W ≈ 0.0361, b_{d,init}(K=16) ≈ 0.085
@@ -239,6 +239,38 @@ import math  # noqa: E402
 from typing import Optional, Tuple  # noqa: E402
 
 
+def quadtree_node_count(max_depth: int) -> int:
+    """完全四叉树节点总数 (Single Source of Truth).
+
+    数学形式化:
+        N = Σ_{d=0}^{max_depth} 4^d = (4^{max_depth+1} - 1) / 3
+
+    推导:
+        几何级数前 (max_depth + 1) 项求和:
+            S = a_0 · (r^n - 1) / (r - 1)
+              = 1 · (4^{max_depth+1} - 1) / (4 - 1)
+              = (4^{max_depth+1} - 1) / 3
+
+    Args:
+        max_depth: 四叉树最大深度 d ∈ {0, 1, 2, ...}
+
+    Returns:
+        节点总数 N (int, 整除)
+
+    示例:
+        >>> quadtree_node_count(0)
+        1
+        >>> quadtree_node_count(4)
+        341     # 1 + 4 + 16 + 64 + 256
+
+    See Also:
+        - depth_utils.compute_total_candidates
+        - continuous_utils.compute_num_candidates
+        - HilbertSplitterConfig.compute_candidate_count
+    """
+    return (4 ** (max_depth + 1) - 1) // 3
+
+
 def compute_k_bounds(
     max_level: int,
     token_coverage_min: float,
@@ -278,14 +310,14 @@ def compute_k_bounds(
     # I113-2: 处理废弃的 token_coverage_max
     if token_coverage_max is None:
         # 使用 target_ratio 计算 K_max
-        N = (4 ** (max_level + 1) - 1) // 3
+        N = quadtree_node_count(max_level)
         N_target = int(N * target_ratio)
         K_max = max(K_MIN_HARD_LIMIT, min(K_MAX_HARD_LIMIT, N_target))
         K_min = max(K_MIN_HARD_LIMIT, int(math.ceil(N * token_coverage_min)))
         return (K_min, K_max)
 
     # 计算候选节点总数
-    N = (4 ** (max_level + 1) - 1) // 3
+    N = quadtree_node_count(max_level)
 
     # 计算分辨率自适应 scale 因子
     if image_size is not None:
@@ -336,7 +368,19 @@ def clamp_temperature(temperature: float, min_val: float = TEMPERATURE_MIN) -> f
 HMFT_BLOCK_SIZES: Tuple[int, ...] = (8, 16, 32, 64, 128)
 
 #: v1.3 STANDARD: HMFT 硬 K（每张图选中的 sub-block 数量）
+#: I170.3 A5 公理: HMFT 不再暴露 K_fixed 配置项,所有 K 引用统一到此常量。
 HMFT_K_HARD_GLOBAL_POOL: int = 8
+
+#: I170.3 A5: HMFT soft 配额(未来扩展,目前与硬 K 同值,保留语义以区分 hard/soft 路径)
+HMFT_K_SOFT_BUDGET: int = 8
+
+#: I170.3 A5: HMFT 最低输入分辨率(满足 K=8 hard 契约 + Hilbert 2 的幂约束的不可妥协前提)
+#: 在 block_sizes=(8,16,32,64,128) 最小 h=8 时, n_cells = (N/8)² 需 >= 8,
+#: 且 Hilbert 曲线要求 n_h, n_w 是 2 的幂(否则 xy_to_d_batch 抛 ValueError)。
+#: N=32: n_h=n_w=4=2², n_cells=16 ✓ (K=8 满足)
+#: N=24: n_h=n_w=3 非 2 的幂, Hilbert 拒绝
+#: N=16: n_cells=4 < 8
+HMFT_MIN_IMAGE_SIZE: int = 32
 
 #: v1.3 STANDARD: Polar Voronoi 配置 (B.8-B.9)
 #: 最终 σ 值 (soft to hard 转换)

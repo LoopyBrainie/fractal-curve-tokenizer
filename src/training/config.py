@@ -93,6 +93,15 @@ class TrainingHyperparams:
     routing_entropy_target: float = 0.7   # H_target (normalized [0, 1])
     routing_budget_target: float = 0.25  # K_target fraction ∈ [0, 1]
 
+    # I165-3a: 3 个结构性参数 (rot_proj / roi_norm / geo_norm) 的联合监督
+    # 设计: Grouped Scaling — 单个 global_scale 统一控制 3 项,内部 1:1:1 等配比
+    # 默认 ON + kill-switch (与 R7-A "默认 ON" 范式一致)
+    # 3 项都是零锚正则 (W^T W→I, γ²→1, 三段均值平方→1),与 R7-A bias_reg 同质
+    # 锚定参数集合: {rot_proj.weight, roi_norm.weight, geo_norm.weight}
+    # 与 T10 既有 4 项参数空间正交 (不重叠)
+    enable_i165_3a_aux_loss: bool = True  # kill-switch
+    i165_3a_global_scale: float = 0.05    # 与 T10 entropy_weight=0.05 同阶,合理初始
+
 
 @dataclass
 class NumericalConfig:
