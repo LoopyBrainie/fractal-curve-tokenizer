@@ -84,4 +84,82 @@ def _dynamo_safe_lru_cache(maxsize: int = 128):
 
 - [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md): Historical Issue Archive
 - [docs/00_introduction.md](docs/00_introduction.md): 架构入口 (详见 docs/00-10 各章节)
+- [docs/ARCHIVE_INDEX.md](docs/ARCHIVE_INDEX.md): Pre-reconstruction baseline entry point (active during reconstruction)
 - [tests/CLAUDE.md](tests/CLAUDE.md): 测试特定约定 (STE 桥损失、T10 keystone 等)
+
+---
+
+## Reconstruction Workflow (Active — Until Reconstruction Complete)
+
+<!-- TEMPORARY: Active during reconstruction. Remove this section after
+reconstruction is fully complete and old archive is deprecated. -->
+
+**Archive pointer**: tag `pre-reconstruction-baseline-v1`, branch `archive/pre-reconstruction-2026-08-03`. See `docs/ARCHIVE_INDEX.md`.
+
+This section is **binding** for any session that opens this repository until explicitly removed. The five phases below are required procedure, not suggestions.
+
+### Phase 1 — Archive (✅ Completed 2026-08-03)
+
+All current working-tree content has been committed and frozen under tag `pre-reconstruction-baseline-v1` on 2026-08-03. Future "reference to old code" actions MUST go through this tag (or `docs/ARCHIVE_INDEX.md`).
+
+**Do not** delete the archive branch, relocate it, or rewrite its tag. Treat the archive as immutable.
+
+### Phase 2 — New Codebase
+
+Decision: orphan branch in this repo vs new repository — **NOT yet decided**, deferred to the first real reconstruction session. When decided, the choice MUST be recorded here.
+
+Whichever path is chosen, Day-1 setup is **mandatory**:
+- Lint + formatter + type checker configured **before** any new code is written
+- Empty directory skeleton committed first (architecture over code)
+- CI pipeline in place from the first push
+- Re-audit `.gitignore`: keep current `.claude` exclusion; add new exclusions only when justified
+- Re-review `.gitattributes` for Line Ending Normalization across platforms (Windows CRLF warnings observed during archive commit)
+
+### Phase 3 — Selective Migration
+
+For every existing module, classify into exactly one of:
+
+| Decision | Trigger |
+| -------- | ------- |
+| **Rewrite** | Interface changes, or coupling to now-removed abstractions |
+| **Migrate** | Stable math/algorithm (splitters, Hilbert curves, RoPE, Gumbel-STE pipeline); extract via `git checkout archive/pre-reconstruction-2026-08-03 -- <path>` and re-home under the new directory tree |
+| **Discard** | Dead code, replaced by a new abstraction, or only used by tests being rewritten |
+
+**Mandatory rules**:
+- Do **not** migrate test files. Old tests encode the old architecture; write new tests against the new design (use old tests as requirements documents).
+- After extraction, **rename and place in the new directory tree**. Old paths are forbidden in the new codebase — this defeats "rename-as-you-go" muscle memory.
+- Keep an `Old:` comment pointer for non-trivial algorithm ports: `# Ported from legacy: 56cf09e5f6f4a5ee1f38c65b22cf28e73d739dd0` (or similar).
+
+### Phase 4 — Dual-Window Reference Development
+
+For complex ports, mount the archive into a separate directory:
+
+```bash
+git worktree add /tmp/legacy-fct archive/pre-reconstruction-2026-08-03
+```
+
+IDE dual-open. **Process discipline** (NOT "read while typing"):
+
+1. Read the old implementation fully in the legacy worktree window
+2. **Close that window** (or fold the file)
+3. Write the new implementation in the main window — *from understanding, not by copy*
+
+Two worktrees share one `.git` database; do NOT run concurrent `git` mutations (rebase, commit, push) from both. Default to treating the legacy worktree as read-only.
+
+If you discover a bug in old code, record it in `TODO` for the new codebase. **Do not** amend the archive.
+
+### Phase 5 — Common Pitfalls
+
+| Pitfall | Consequence | Prevention |
+| ------- | ----------- | ---------- |
+| "Migrate first, refactor later" | New code becomes old-code-in-new-clothes | Decide new architecture *before* migration; force rename + interface change at extraction |
+| Preserving old directory structure | Architecture inertia locks new design into old shape | Draw new directory skeleton on empty repo before writing logic |
+| Ignoring data/config migration | New system cannot run, old data formats incompatible | Plan migration scripts + rollback strategy from the start |
+| Ghost dependencies | Refactor breaks hidden global-state couplings | Integration verification after each module migration |
+
+### Removal
+
+This entire section (`## Reconstruction Workflow`) is to be removed by an explicit commit **only after** all of these are true:
+- (a) reconstruction is feature-complete
+- (b) `pre-reconstruction-baseline-v1` is documented as deprecated but still preserved in `docs/ARCHIVE_INDEX.md` (per its own §6 Removal Conditions)
+- (c) at least one full release has shipped on the new architecture

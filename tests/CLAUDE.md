@@ -1,5 +1,7 @@
 # tests/CLAUDE.md
 
+> 🔄 **Reconstruction in progress** — for binding workflow rules see root `CLAUDE.md` § "Reconstruction Workflow".
+
 测试目录的 Claude Code 指引。本文件**只涵盖测试特定约定**,通用开发规范见根
 [`CLAUDE.md`](../CLAUDE.md)。
 

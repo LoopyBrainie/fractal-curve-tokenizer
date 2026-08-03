@@ -1,5 +1,7 @@
 # CLAUDE.md — `src/training/`
 
+> 🔄 **Reconstruction in progress** — for binding workflow rules see root `CLAUDE.md` § "Reconstruction Workflow".
+
 Sub-package guide for the training layer. **Only training-specific contracts live here**;
 project-wide rules (L1-L4 imports, `forward()` contract, logging key format, `torch.compile`
 wrapper) and test conventions (STE bridge, assertion style, fixture naming) are in
